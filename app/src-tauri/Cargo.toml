@@ -15,15 +15,15 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
-# cef: this branch runs on tauri-runtime-cef (bundled Chromium) — wry is fully
-# replaced (default-features off drops wry/x11/dbus; compression + dynamic-acl
-# are kept from the defaults). Requires the patched feat/cef checkout
-# (ops/cef-probe/setup.sh appends the [patch.crates-io] section); registry
-# tauri has no `cef` feature yet.
+# The shell runs on the standalone tauri-runtime-cef crate (bundled Chromium)
+# against REGISTRY tauri — wry is fully replaced (default-features off drops
+# wry/x11/dbus; compression + dynamic-acl are kept from the defaults). The
+# runtime is wired explicitly — Builder::<rt::Cef> plus the rt.rs aliases —
+# and main() dispatches CEF subprocesses to run_cef_helper_process, since
+# registry tauri has no cef feature, Cef alias, or cef_entry_point macro.
 # unstable: tauri's multiwebview API (Window::add_child) for the inline
 # gateway view (gateway_window.rs).
 tauri = { version = "2", default-features = false, features = [
-  "cef",
   "unstable",
   "compression",
   "dynamic-acl",
@@ -31,6 +31,9 @@ tauri = { version = "2", default-features = false, features = [
   "tray-icon",
   "image-png",
 ] }
+# Rev-pinned like the plugin above: bump deliberately (push to the repo,
+# update the rev, rebuild to refresh Cargo.lock).
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "cc68ac4ce72abae2ea2d5b4b355373d80fe82dd1" }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,

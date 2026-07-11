@@ -285,7 +285,7 @@ fn serve(server: Arc<Server>) {
 /// its current nonce (the caller reads it from the chain).
 #[tauri::command]
 pub fn enroll_start(
-    window: tauri::WebviewWindow,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     account_id: String,
@@ -334,7 +334,7 @@ pub fn enroll_start(
 /// poll for the phone's result. returns `null` until the phone posts its
 /// signature; then the caller signs the add-member authorizer + submits.
 #[tauri::command]
-pub fn enroll_poll(window: tauri::WebviewWindow) -> Result<Option<(String, String)>, String> {
+pub fn enroll_poll(window: crate::rt::WebviewWindow) -> Result<Option<(String, String)>, String> {
     require_main_window(&window)?;
     Ok(enroll_poll_inner())
 }
@@ -348,7 +348,7 @@ fn enroll_poll_inner() -> Option<(String, String)> {
 
 /// tear the enrollment server down (on success, cancel, or leaving the screen).
 #[tauri::command]
-pub fn enroll_cancel(window: tauri::WebviewWindow) -> Result<(), String> {
+pub fn enroll_cancel(window: crate::rt::WebviewWindow) -> Result<(), String> {
     require_main_window(&window)?;
     enroll_cancel_inner();
     Ok(())

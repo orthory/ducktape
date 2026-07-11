@@ -21,16 +21,17 @@ mod forge_git;
 mod huddle;
 mod menu;
 mod notify;
+mod rt;
 mod tray;
 mod user_identity;
 mod workspaces;
 
-// CEF non-browser processes (renderer/GPU/plugin) re-exec this same binary;
-// the entry-point macro dispatches them to run_cef_helper_process and returns.
-#[tauri::cef_entry_point]
 fn main() {
-    let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
-    let mut builder = tauri::Builder::<tauri::Cef>::default()
+    // Must precede the helper dispatch below AND tauri boot: CEF subprocesses
+    // re-exec this binary and need the same custom-scheme registration, and
+    // the browser process reads the switches/cache identifier at runtime init.
+    tauri_runtime_cef::configure(tauri_runtime_cef::CefConfig {
+        identifier: "com.ducktape.app".into(),
         // Keep Chromium's local-data encryption OFF the OS keychain: os_crypt
         // otherwise prompts macOS for "Chromium Safe Storage" Keychain access
         // (and would hit kwallet/gnome-keyring on Linux). The key only guards
@@ -38,10 +39,36 @@ fn main() {
         // console is a localhost UI whose real data lives in the node, and
         // gateway sessions are incognito. Deliberate: web-content storage is
         // not keychain-protected.
-        .command_line_args([
-            ("--use-mock-keychain", None::<&str>),
-            ("password-store", Some("basic")),
-        ])
+        command_line_args: vec![
+            ("--use-mock-keychain".into(), None),
+            ("password-store".into(), Some("basic".into())),
+        ],
+        ..Default::default()
+    });
+
+    // Chromium permission policy: gateway webviews render remote .duck
+    // content through a localhost session proxy, so the requesting origin
+    // alone cannot distinguish them from the console UI — deny device/prompt
+    // permissions by label. Everything else falls to the runtime default
+    // (app-local origins only), which is what lets the console + huddle
+    // window use real mic/camera without fake-device switches.
+    tauri_runtime_cef::set_permission_policy(|req| {
+        if req.webview_label.starts_with("gateway-") {
+            tauri_runtime_cef::PermissionDecision::Deny
+        } else {
+            tauri_runtime_cef::PermissionDecision::Default
+        }
+    });
+
+    // CEF non-browser processes (renderer/GPU/plugin) re-exec this same
+    // binary; dispatch them to the CEF helper before any app setup.
+    if std::env::args().any(|arg| arg.starts_with("--type=")) {
+        tauri_runtime_cef::run_cef_helper_process();
+        return;
+    }
+
+    let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
+    let mut builder = tauri::Builder::<rt::Cef>::new()
         .manage(node_control)
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,

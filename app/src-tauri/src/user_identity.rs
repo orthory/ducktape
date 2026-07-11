@@ -162,7 +162,7 @@ pub struct IdentityMnemonic {
 
 /// `~/.ducktape/user.key` — a sibling of `workspaces/`, not inside any one of
 /// them: this key outlives and is shared by every workspace on the machine.
-fn user_key_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+fn user_key_path(app: &crate::rt::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(root(app)?.join("user.key"))
 }
 
@@ -242,8 +242,8 @@ fn parse_init_output(stdout: &str) -> Result<(String, String), String> {
 /// command's callers have moved to [`user_identity_state`]).
 #[tauri::command]
 pub async fn user_identity_status(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
 ) -> Result<UserIdentity, String> {
     require_main_window(&window)?;
@@ -253,7 +253,7 @@ pub async fn user_identity_status(
         .await
 }
 
-fn user_identity_status_blocking(app: tauri::AppHandle) -> Result<UserIdentity, String> {
+fn user_identity_status_blocking(app: crate::rt::AppHandle) -> Result<UserIdentity, String> {
     let out = run_verb(&[
         "user-key",
         "status",
@@ -272,8 +272,8 @@ fn user_identity_status_blocking(app: tauri::AppHandle) -> Result<UserIdentity, 
 /// mnemonic-confirmed flag.
 #[tauri::command]
 pub async fn user_identity_state(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
 ) -> Result<IdentityState, String> {
     require_main_window(&window)?;
@@ -281,7 +281,7 @@ pub async fn user_identity_state(
     control.run(move || user_identity_state_blocking(app)).await
 }
 
-fn user_identity_state_blocking(app: tauri::AppHandle) -> Result<IdentityState, String> {
+fn user_identity_state_blocking(app: crate::rt::AppHandle) -> Result<IdentityState, String> {
     let out = run_verb(&[
         "user-key",
         "status",
@@ -308,8 +308,8 @@ fn user_identity_state_blocking(app: tauri::AppHandle) -> Result<IdentityState, 
 /// owes the user the confirm-3-words step).
 #[tauri::command]
 pub async fn user_identity_create(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     password: String,
 ) -> Result<IdentityCreated, String> {
@@ -322,7 +322,7 @@ pub async fn user_identity_create(
 }
 
 fn user_identity_create_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     password: SecretString,
 ) -> Result<IdentityCreated, String> {
     check_password_len(&password)?;
@@ -346,8 +346,8 @@ fn user_identity_create_blocking(
 /// they hold the words by typing them in).
 #[tauri::command]
 pub async fn user_identity_restore(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     mnemonic: String,
     password: String,
@@ -362,7 +362,7 @@ pub async fn user_identity_restore(
 }
 
 fn user_identity_restore_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     mnemonic: SecretString,
     password: SecretString,
 ) -> Result<IdentityPubkey, String> {
@@ -387,8 +387,8 @@ fn user_identity_restore_blocking(
 /// is left untouched. caches `password` only once the verb confirms it.
 #[tauri::command]
 pub async fn user_identity_unlock(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     password: String,
 ) -> Result<IdentityPubkey, String> {
@@ -401,7 +401,7 @@ pub async fn user_identity_unlock(
 }
 
 fn user_identity_unlock_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     password: SecretString,
 ) -> Result<IdentityPubkey, String> {
     let out = run_verb_with_stdin(
@@ -424,8 +424,8 @@ fn user_identity_unlock_blocking(
 /// the identity was unlocked.
 #[tauri::command]
 pub async fn user_identity_reveal(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     password: String,
 ) -> Result<IdentityMnemonic, String> {
@@ -438,7 +438,7 @@ pub async fn user_identity_reveal(
 }
 
 fn user_identity_reveal_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     password: SecretString,
 ) -> Result<IdentityMnemonic, String> {
     let out = run_verb_with_stdin(
@@ -465,8 +465,8 @@ fn user_identity_reveal_blocking(
 /// gate with no way through.
 #[tauri::command]
 pub async fn user_identity_encrypt(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     password: String,
 ) -> Result<IdentityPubkey, String> {
@@ -479,7 +479,7 @@ pub async fn user_identity_encrypt(
 }
 
 fn user_identity_encrypt_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     password: SecretString,
 ) -> Result<IdentityPubkey, String> {
     check_password_len(&password)?;
@@ -502,7 +502,7 @@ fn user_identity_encrypt_blocking(
 /// bind/unbind on an encrypted key will need a fresh unlock.
 #[tauri::command]
 pub async fn user_identity_lock(
-    window: tauri::WebviewWindow,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
 ) -> Result<(), String> {
     require_main_window(&window)?;
@@ -521,7 +521,7 @@ fn user_identity_lock_blocking() -> Result<(), String> {
 /// and absent keys need no password (legacy behavior, unchanged); an
 /// encrypted key needs the session-cached password, or the caller gets the
 /// exact `"identity-locked"` string the app reacts to.
-fn signing_stdin(app: &tauri::AppHandle) -> Result<Vec<SecretString>, String> {
+fn signing_stdin(app: &crate::rt::AppHandle) -> Result<Vec<SecretString>, String> {
     let out = run_verb(&[
         "user-key",
         "status",
@@ -544,8 +544,8 @@ fn signing_stdin(app: &tauri::AppHandle) -> Result<Vec<SecretString>, String> {
 /// (exact string) instead of hanging on a stdin the caller never provides.
 #[tauri::command]
 pub async fn user_sign_bind(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     node_pub: String,
@@ -559,7 +559,7 @@ pub async fn user_sign_bind(
 }
 
 fn user_sign_bind_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     chain_id: String,
     node_pub: String,
     nonce: u64,
@@ -591,8 +591,8 @@ fn user_sign_bind_blocking(
 /// affordance) via store/account-ops.ts.
 #[tauri::command]
 pub async fn user_sign_unbind(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     node_pub: String,
@@ -606,7 +606,7 @@ pub async fn user_sign_unbind(
 }
 
 fn user_sign_unbind_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     chain_id: String,
     node_pub: String,
     nonce: u64,
@@ -635,8 +635,8 @@ fn user_sign_unbind_blocking(
 /// purpose-specific and never exposes a generic signing oracle.
 #[tauri::command]
 pub async fn user_sign_gateway_route(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     statement: String,
 ) -> Result<String, String> {
@@ -648,7 +648,7 @@ pub async fn user_sign_gateway_route(
 }
 
 fn user_sign_gateway_route_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     statement: String,
 ) -> Result<String, String> {
     let stdin_lines = signing_stdin(&app)?;
@@ -674,8 +674,8 @@ fn user_sign_gateway_route_blocking(
 /// uncached key.
 #[tauri::command]
 pub async fn user_sign_possession(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     account_id: String,
@@ -689,7 +689,7 @@ pub async fn user_sign_possession(
 }
 
 fn user_sign_possession_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     chain_id: String,
     account_id: String,
     nonce: u64,
@@ -723,8 +723,8 @@ fn user_sign_possession_blocking(
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn user_sign_add_member(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     account_id: String,
@@ -747,7 +747,7 @@ pub async fn user_sign_add_member(
 
 #[allow(clippy::too_many_arguments)]
 fn user_sign_add_member_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     chain_id: String,
     account_id: String,
     new_pub: String,
@@ -791,8 +791,8 @@ fn user_sign_add_member_blocking(
 /// except the last one. `identity-locked` on an encrypted, uncached key.
 #[tauri::command]
 pub async fn user_sign_remove_member(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     account_id: String,
@@ -807,7 +807,7 @@ pub async fn user_sign_remove_member(
 }
 
 fn user_sign_remove_member_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     chain_id: String,
     account_id: String,
     target_key: String,

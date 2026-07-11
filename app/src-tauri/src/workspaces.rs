@@ -146,7 +146,7 @@ pub struct PhaseReport {
 /// `~/.ducktape` — the registry root. created on demand. `pub(crate)` so
 /// [`crate::user_identity`] can locate `user.key` as a sibling of `workspaces/`
 /// without duplicating this lookup.
-pub(crate) fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn root(app: &crate::rt::AppHandle) -> Result<PathBuf, String> {
     let home = app
         .path()
         .home_dir()
@@ -154,11 +154,11 @@ pub(crate) fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(home.join(".ducktape"))
 }
 
-fn workspaces_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn workspaces_dir(app: &crate::rt::AppHandle) -> Result<PathBuf, String> {
     Ok(root(app)?.join("workspaces"))
 }
 
-fn registry_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn registry_path(app: &crate::rt::AppHandle) -> Result<PathBuf, String> {
     Ok(root(app)?.join("registry.json"))
 }
 
@@ -171,7 +171,7 @@ fn empty_registry() -> Registry {
     }
 }
 
-fn load_registry(app: &tauri::AppHandle) -> Result<Registry, String> {
+fn load_registry(app: &crate::rt::AppHandle) -> Result<Registry, String> {
     load_registry_at(&registry_path(app)?)
 }
 
@@ -203,7 +203,7 @@ fn load_registry_at(path: &Path) -> Result<Registry, String> {
     }
 }
 
-fn save_registry(app: &tauri::AppHandle, reg: &Registry) -> Result<(), String> {
+fn save_registry(app: &crate::rt::AppHandle, reg: &Registry) -> Result<(), String> {
     let dir = root(app)?;
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
     save_registry_at(&registry_path(app)?, reg)
@@ -369,8 +369,8 @@ fn find<'a>(reg: &'a Registry, id: &str) -> Result<&'a Workspace, String> {
 /// every workspace in the registry, in creation order.
 #[tauri::command]
 pub fn workspace_list(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
 ) -> Result<Vec<Workspace>, String> {
     require_main_window(&window)?;
     Ok(load_registry(&app)?.workspaces)
@@ -379,8 +379,8 @@ pub fn workspace_list(
 /// the active workspace, or null on first run / after none is selected.
 #[tauri::command]
 pub fn workspace_active(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
 ) -> Result<Option<Workspace>, String> {
     require_main_window(&window)?;
     let reg = load_registry(&app)?;
@@ -408,8 +408,8 @@ pub struct GatewayLocalRoute {
 /// URL, host, or executable command.
 #[tauri::command]
 pub async fn gateway_route_bind(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     label: Option<String>,
@@ -423,7 +423,7 @@ pub async fn gateway_route_bind(
 }
 
 fn gateway_route_bind_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     label: Option<String>,
     port: u16,
@@ -446,8 +446,8 @@ fn gateway_route_bind_blocking(
 
 #[tauri::command]
 pub async fn gateway_route_unbind(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     label: Option<String>,
@@ -460,7 +460,7 @@ pub async fn gateway_route_unbind(
 }
 
 fn gateway_route_unbind_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     label: Option<String>,
 ) -> Result<(), String> {
@@ -481,8 +481,8 @@ fn gateway_route_unbind_blocking(
 
 #[tauri::command]
 pub async fn gateway_route_list(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<Vec<GatewayLocalRoute>, String> {
@@ -494,7 +494,7 @@ pub async fn gateway_route_list(
 }
 
 fn gateway_route_list_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
 ) -> Result<Vec<GatewayLocalRoute>, String> {
     let reg = load_registry(&app)?;
@@ -515,8 +515,8 @@ fn gateway_route_list_blocking(
 /// [`workspace_select`] next.
 #[tauri::command]
 pub async fn workspace_create(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     name: String,
 ) -> Result<Workspace, String> {
@@ -527,7 +527,7 @@ pub async fn workspace_create(
         .await
 }
 
-fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Workspace, String> {
+fn workspace_create_blocking(app: crate::rt::AppHandle, name: String) -> Result<Workspace, String> {
     let name = name.trim().to_string();
     validate_workspace_name(&name)?;
     let mut reg = load_registry(&app)?;
@@ -613,8 +613,8 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
 /// [`workspace_phase`], not here.
 #[tauri::command]
 pub async fn workspace_join(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     name: String,
     blob: String,
@@ -627,7 +627,7 @@ pub async fn workspace_join(
 }
 
 fn workspace_join_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     name: String,
     blob: String,
 ) -> Result<Workspace, String> {
@@ -728,8 +728,8 @@ fn workspace_join_blocking(
 /// hint. requires the workspace to have been founded/joined (it reads config).
 #[tauri::command]
 pub async fn workspace_invite_blob(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<String, String> {
@@ -740,7 +740,7 @@ pub async fn workspace_invite_blob(
         .await
 }
 
-fn workspace_invite_blob_blocking(app: tauri::AppHandle, id: String) -> Result<String, String> {
+fn workspace_invite_blob_blocking(app: crate::rt::AppHandle, id: String) -> Result<String, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
@@ -754,8 +754,8 @@ fn workspace_invite_blob_blocking(app: tauri::AppHandle, id: String) -> Result<S
 /// frontend gets typed rows.
 #[tauri::command]
 pub async fn workspace_join_requests(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -767,7 +767,7 @@ pub async fn workspace_join_requests(
 }
 
 fn workspace_join_requests_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     let reg = load_registry(&app)?;
@@ -783,8 +783,8 @@ fn workspace_join_requests_blocking(
 /// rpc); the joiner's parked node promotes itself once the epoch cuts over.
 #[tauri::command]
 pub async fn workspace_admit(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     pubkey: String,
@@ -797,7 +797,7 @@ pub async fn workspace_admit(
 }
 
 fn workspace_admit_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
@@ -817,8 +817,8 @@ fn workspace_admit_blocking(
 /// approve, and the removed node drops out at the next epoch cutover.
 #[tauri::command]
 pub async fn workspace_demote(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     pubkey: String,
@@ -831,7 +831,7 @@ pub async fn workspace_demote(
 }
 
 fn workspace_demote_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
@@ -851,8 +851,8 @@ fn workspace_demote_blocking(
 /// the next epoch cutover. same majority ceremony as every membership change.
 #[tauri::command]
 pub async fn workspace_promote(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     pubkey: String,
@@ -865,7 +865,7 @@ pub async fn workspace_promote(
 }
 
 fn workspace_promote_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
@@ -885,8 +885,8 @@ fn workspace_promote_blocking(
 /// is [`workspace_demote`]'s job (the tiers never overlap).
 #[tauri::command]
 pub async fn workspace_resident_remove(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     pubkey: String,
@@ -899,7 +899,7 @@ pub async fn workspace_resident_remove(
 }
 
 fn workspace_resident_remove_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
@@ -938,8 +938,8 @@ fn workspace_resident_remove_blocking(
 /// user asked to submit an on-chain change and deserves to know if it failed).
 #[tauri::command]
 pub async fn workspace_request_leave(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<(), String> {
@@ -950,7 +950,7 @@ pub async fn workspace_request_leave(
         .await
 }
 
-fn workspace_request_leave_blocking(app: tauri::AppHandle, id: String) -> Result<(), String> {
+fn workspace_request_leave_blocking(app: crate::rt::AppHandle, id: String) -> Result<(), String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
@@ -1082,8 +1082,8 @@ fn probe_forget(dir: &Path) -> ForgetVerdict {
 /// none remain.
 #[tauri::command]
 pub async fn workspace_forget(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
     force: bool,
@@ -1096,7 +1096,7 @@ pub async fn workspace_forget(
 }
 
 fn workspace_forget_blocking(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     id: String,
     force: bool,
 ) -> Result<Option<Workspace>, String> {
@@ -1156,8 +1156,8 @@ fn workspace_forget_blocking(
 /// re-selects and the promotion exec-reboot) instead of double-spawning.
 #[tauri::command]
 pub async fn workspace_select(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<Selection, String> {
@@ -1168,7 +1168,7 @@ pub async fn workspace_select(
         .await
 }
 
-fn workspace_select_blocking(app: tauri::AppHandle, id: String) -> Result<Selection, String> {
+fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Selection, String> {
     let mut reg = load_registry(&app)?;
     let ws = find(&reg, &id)?.clone();
     let dir = workspaces_dir(&app)?.join(&ws.id);
@@ -1208,7 +1208,7 @@ fn workspace_select_blocking(app: tauri::AppHandle, id: String) -> Result<Select
 }
 
 fn finish_selection(
-    app: &tauri::AppHandle,
+    app: &crate::rt::AppHandle,
     reg: &mut Registry,
     workspace: Workspace,
     http_url: String,
@@ -1224,7 +1224,7 @@ fn finish_selection(
 /// pulled out of [`workspace_select`] so both the adopt and the fresh-spawn
 /// success paths commit `active` at the same point — after the node is known
 /// to be up, never before.
-fn commit_active(app: &tauri::AppHandle, reg: &mut Registry, id: &str) -> Result<(), String> {
+fn commit_active(app: &crate::rt::AppHandle, reg: &mut Registry, id: &str) -> Result<(), String> {
     if reg.active.as_deref() != Some(id) {
         reg.active = Some(id.to_string());
         save_registry(app, reg)?;
@@ -1238,8 +1238,8 @@ fn commit_active(app: &tauri::AppHandle, reg: &mut Registry, id: &str) -> Result
 /// only falls back to this while the surface is still down.
 #[tauri::command]
 pub fn workspace_phase(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     id: String,
 ) -> Result<PhaseReport, String> {
     require_main_window(&window)?;
@@ -1287,8 +1287,8 @@ pub struct LogTail {
 
 #[tauri::command]
 pub fn workspace_log_tail(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     id: String,
 ) -> Result<LogTail, String> {
     require_main_window(&window)?;
@@ -1326,8 +1326,8 @@ pub struct RuntimeFacts {
 
 #[tauri::command]
 pub fn workspace_runtime_facts(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     id: String,
 ) -> Result<RuntimeFacts, String> {
     require_main_window(&window)?;
@@ -1350,7 +1350,7 @@ pub fn workspace_runtime_facts(
 /// `pub(crate)` so [`crate::user_identity::user_identity_state`] can fold
 /// this UX flag into its reported state without reaching into `Registry`'s
 /// otherwise-private fields.
-pub(crate) fn mnemonic_confirmed(app: &tauri::AppHandle) -> Result<bool, String> {
+pub(crate) fn mnemonic_confirmed(app: &crate::rt::AppHandle) -> Result<bool, String> {
     Ok(load_registry(app)?.mnemonic_confirmed)
 }
 
@@ -1359,7 +1359,7 @@ pub(crate) fn mnemonic_confirmed(app: &tauri::AppHandle) -> Result<bool, String>
 /// set it directly (a restore counts as confirmed — the words were just
 /// typed back in), alongside the [`user_identity_confirm_mnemonic`] command
 /// below for the create-flow's explicit confirmation step.
-pub(crate) fn set_mnemonic_confirmed(app: &tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_mnemonic_confirmed(app: &crate::rt::AppHandle) -> Result<(), String> {
     let mut reg = load_registry(app)?;
     if !reg.mnemonic_confirmed {
         reg.mnemonic_confirmed = true;
@@ -1375,8 +1375,8 @@ pub(crate) fn set_mnemonic_confirmed(app: &tauri::AppHandle) -> Result<(), Strin
 /// `Registry` mutation, same as every other workspace-registry command.
 #[tauri::command]
 pub async fn user_identity_confirm_mnemonic(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
 ) -> Result<(), String> {
     require_main_window(&window)?;
@@ -1711,7 +1711,7 @@ fn stop_workspace_node(
 /// best-effort at the UI boundary, but the underlying stop still verifies pids
 /// and ports so a half-stopped process is visible in stderr instead of silently
 /// surviving.
-pub(crate) fn stop_active_workspace_node(app: &tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn stop_active_workspace_node(app: &crate::rt::AppHandle) -> Result<(), String> {
     stop_active_workspace_node_at(&root(app)?, std::time::Duration::from_secs(2))
 }
 

@@ -41,8 +41,8 @@ fn validate_session_url(value: &str) -> Result<(tauri::Url, String), String> {
 
 #[tauri::command]
 pub fn gateway_open_window(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     url: String,
     title: String,
 ) -> Result<(), String> {
@@ -122,8 +122,8 @@ pub fn gateway_inline_supported() -> bool {
 /// rule: opening inline closes any separate gateway window, and vice versa.
 #[tauri::command]
 pub fn gateway_open_inline(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     url: String,
     rect: InlineRect,
 ) -> Result<(), String> {
@@ -175,8 +175,8 @@ pub fn gateway_open_inline(
 /// Track the Browser pane as it resizes (ResizeObserver on the UI side).
 #[tauri::command]
 pub fn gateway_inline_place(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
     rect: InlineRect,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
@@ -195,7 +195,7 @@ pub fn gateway_inline_place(
 /// Close the inline gateway view (idempotent) — navigation away, view switch,
 /// or the pop-out-to-window control.
 #[tauri::command]
-pub fn gateway_inline_close(app: tauri::AppHandle) -> Result<(), String> {
+pub fn gateway_inline_close(app: crate::rt::AppHandle) -> Result<(), String> {
     use tauri::Manager as _;
     if let Some(existing) = app.get_webview(INLINE_LABEL) {
         existing
@@ -206,7 +206,7 @@ pub fn gateway_inline_close(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn place_inline_webview(
-    webview: &tauri::Webview,
+    webview: &tauri::Webview<crate::rt::Cef>,
     position: tauri::LogicalPosition<f64>,
     size: tauri::LogicalSize<f64>,
 ) -> Result<(), String> {
