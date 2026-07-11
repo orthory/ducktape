@@ -32,6 +32,7 @@ tagging = { workspace = true }
 saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
+evm = { workspace = true }
 files = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
