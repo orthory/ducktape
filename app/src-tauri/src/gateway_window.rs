@@ -11,7 +11,7 @@
 //! user.
 
 use tauri::webview::NewWindowResponse;
-use tauri::WebviewUrl;
+use tauri::{Manager as _, WebviewUrl};
 
 fn validate_session_url(value: &str) -> Result<(tauri::Url, String), String> {
     let url: tauri::Url = value
@@ -59,38 +59,68 @@ pub struct InlineRect {
     pub height: f64,
 }
 
-const INLINE_LABEL: &str = "gateway-inline";
+const INLINE_PREFIX: &str = "gateway-inline-";
+
+fn inline_label(tab_id: &str) -> Result<String, String> {
+    if tab_id.is_empty()
+        || tab_id.len() > 32
+        || !tab_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("gateway tab id must be bounded ASCII".into());
+    }
+    Ok(format!("{INLINE_PREFIX}{tab_id}"))
+}
+
+fn hide_other_inline_webviews(
+    app: &crate::rt::AppHandle,
+    keep: Option<&str>,
+) -> Result<(), String> {
+    for (label, webview) in app.webviews() {
+        if label.starts_with(INLINE_PREFIX) && keep != Some(label.as_str()) {
+            webview
+                .hide()
+                .map_err(|error| format!("hide inactive gateway tab: {error}"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Open (or re-navigate) the inline gateway child webview at `rect`. The
 /// `gateway-inline` label matches no capability, so the embedded child is
 /// fully isolated from the app's command surface.
 #[tauri::command]
-pub fn gateway_open_inline(
+pub async fn gateway_open_inline(
     app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
     url: String,
     title: String,
+    tab_id: String,
     rect: InlineRect,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
 
-    crate::daemon::require_main_window(&window)?;
     let (url, _token) = validate_session_url(&url)?;
     validate_site(&title)?;
-    crate::permissions::note_gateway_site(INLINE_LABEL, &title);
+    let label = inline_label(&tab_id)?;
+    crate::permissions::note_gateway_site(&label, &title);
 
+    hide_other_inline_webviews(&app, Some(&label))?;
     let position = LogicalPosition::new(rect.x, rect.y);
     let size = LogicalSize::new(rect.width, rect.height);
-    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+    if let Some(existing) = app.get_webview(&label) {
         existing
             .navigate(url)
             .map_err(|error| format!("navigate inline gateway view: {error}"))?;
+        existing
+            .show()
+            .map_err(|error| format!("show inline gateway view: {error}"))?;
         return place_inline_webview(&existing, position, size);
     }
 
     let allowed_host = url.host_str().expect("validated host").to_string();
     let allowed_port = url.port().expect("validated port");
-    let builder = tauri::webview::WebviewBuilder::new(INLINE_LABEL, WebviewUrl::External(url))
+    let builder = tauri::webview::WebviewBuilder::new(label, WebviewUrl::External(url))
         .incognito(true)
         .devtools(false)
         .on_navigation(move |candidate| {
@@ -102,9 +132,10 @@ pub fn gateway_open_inline(
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .on_download(|_, _| false);
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "main console window is unavailable".to_string())?;
     window
-        .as_ref()
-        .window()
         .add_child(builder, position, size)
         .map_err(|error| format!("open inline gateway view: {error}"))?;
     Ok(())
@@ -112,15 +143,15 @@ pub fn gateway_open_inline(
 
 /// Track the Browser pane as it resizes (ResizeObserver on the UI side).
 #[tauri::command]
-pub fn gateway_inline_place(
+pub async fn gateway_inline_place(
     app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
+    tab_id: String,
     rect: InlineRect,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
 
-    crate::daemon::require_main_window(&window)?;
-    let Some(existing) = app.get_webview(INLINE_LABEL) else {
+    let label = inline_label(&tab_id)?;
+    let Some(existing) = app.get_webview(&label) else {
         return Ok(()); // already closed — a late resize is not an error
     };
     place_inline_webview(
@@ -132,16 +163,22 @@ pub fn gateway_inline_place(
 
 /// Close the inline gateway view (idempotent) — navigation away or view switch.
 #[tauri::command]
-pub fn gateway_inline_close(app: crate::rt::AppHandle) -> Result<(), String> {
+pub async fn gateway_inline_close(app: crate::rt::AppHandle, tab_id: String) -> Result<(), String> {
     use tauri::Manager as _;
-    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+    let label = inline_label(&tab_id)?;
+    if let Some(existing) = app.get_webview(&label) {
         existing
             .close()
             .map_err(|error| format!("close inline gateway view: {error}"))?;
     }
     // The surface is gone: so are the permissions the user granted it.
-    crate::permissions::forget_webview(INLINE_LABEL);
+    crate::permissions::forget_webview(&label);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn gateway_inline_hide_all(app: crate::rt::AppHandle) -> Result<(), String> {
+    hide_other_inline_webviews(&app, None)
 }
 
 fn place_inline_webview(
@@ -181,6 +218,19 @@ mod tests {
                 validate_session_url(unsafe_url).is_err(),
                 "accepted {unsafe_url}"
             );
+        }
+    }
+
+    #[test]
+    fn inline_labels_are_scoped_to_bounded_tab_ids() {
+        assert_eq!(inline_label("tab-12").unwrap(), "gateway-inline-tab-12");
+        for invalid in [
+            "",
+            "../main",
+            "tab space",
+            "012345678901234567890123456789012",
+        ] {
+            assert!(inline_label(invalid).is_err(), "accepted {invalid}");
         }
     }
 }

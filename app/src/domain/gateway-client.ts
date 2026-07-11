@@ -517,17 +517,21 @@ export interface InlineRect {
 // `title` is the .duck route the user navigated to. The shell needs it because
 // the session origin is a random loopback token: it is the only honest name a
 // permission prompt can put in front of the user (see src-tauri/permissions.rs).
-export const openInline = async (url: string, title: string, rect: InlineRect): Promise<void> => {
+export const openInline = async (url: string, title: string, tabId: string, rect: InlineRect): Promise<void> => {
   if (!isTauri()) throw new Error("executable gateway routes require the desktop app");
-  await invoke<void>("gateway_open_inline", { url, title, rect });
+  await invoke<void>("gateway_open_inline", { url, title, tabId, rect });
 };
 
-export const placeInline = async (rect: InlineRect): Promise<void> => {
-  await invoke<void>("gateway_inline_place", { rect });
+export const placeInline = async (tabId: string, rect: InlineRect): Promise<void> => {
+  await invoke<void>("gateway_inline_place", { tabId, rect });
 };
 
-export const closeInline = async (): Promise<void> => {
-  await invoke<void>("gateway_inline_close").catch(() => undefined);
+export const closeInline = async (tabId: string): Promise<void> => {
+  await invoke<void>("gateway_inline_close", { tabId }).catch(() => undefined);
+};
+
+export const hideAllInline = async (): Promise<void> => {
+  await invoke<void>("gateway_inline_hide_all").catch(() => undefined);
 };
 
 export const contentRoot = (
