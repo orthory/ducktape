@@ -5761,6 +5761,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",
  "tracing-subscriber 0.3.23",

@@ -618,6 +618,9 @@ struct GatewaySession {
 struct BrowserGateway {
     listen: SocketAddr,
     sessions: Arc<tokio::sync::Mutex<HashMap<String, GatewaySession>>>,
+    /// Single-use tokens for the WebSocket side door (audit S3), shared between
+    /// the `/.duck/ws-token` mint and the `/.duck/ws/{token}` upgrade.
+    ws_tokens: Arc<gateway_ws_token::WsTokenStore>,
 }
 
 /// the router's shared state: a command lane into the node actor, the
@@ -742,6 +745,7 @@ impl NodeHandle {
         self.browser_gateway = Some(BrowserGateway {
             listen,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ws_tokens: Arc::new(gateway_ws_token::WsTokenStore::new()),
         });
         self
     }
@@ -1169,6 +1173,8 @@ async fn gateway_session(
 /// no route that can address another `.duck` route with ambient user power.
 pub fn gateway_browser_router(handle: NodeHandle) -> Router {
     Router::new()
+        .route("/.duck/ws-token", post(gateway_ws_token_mint))
+        .route("/.duck/ws/{token}", get(gateway_ws_door))
         .fallback(gateway_browser_proxy)
         .layer(DefaultBodyLimit::max(
             gateway::MAX_REQUEST_BODY_BYTES as usize,
@@ -2536,6 +2542,143 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
 
 /// Serve only isolated gateway-rendering traffic on the pre-bound loopback
 /// listener. The router contains no node API.
+#[derive(Debug, Deserialize)]
+struct WsTokenRequest {
+    account_id: Vec<u8>,
+    name: gateway::RouteName,
+    origin: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WsTokenReply {
+    token: String,
+}
+
+/// Mint a single-use WS side-door token. Called by the duck:// scheme handler
+/// after it has verified the request is same-origin; the handler passes the
+/// page's origin and its resolved route. Native/console-guarded like the other
+/// browser-gateway control routes.
+async fn gateway_ws_token_mint(
+    State(handle): State<NodeHandle>,
+    Json(request): Json<WsTokenRequest>,
+) -> Response {
+    let Some(browser_gateway) = handle.browser_gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
+    };
+    if request.origin.is_empty() || gateway::validate_account_id(&request.account_id).is_err() {
+        return error_response(StatusCode::BAD_REQUEST, "origin and account are required");
+    }
+    let token = browser_gateway
+        .ws_tokens
+        .mint(request.origin, request.account_id, request.name);
+    Json(WsTokenReply { token }).into_response()
+}
+
+/// The WebSocket side door: consume the single-use token (re-checking the
+/// handshake Origin), resolve the route to its publisher, and bridge the
+/// browser socket to the gateway upgrade lane.
+async fn gateway_ws_door(
+    State(handle): State<NodeHandle>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(browser_gateway) = handle.browser_gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
+    };
+    let Some(lane) = handle.gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "no gateway overlay");
+    };
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let Some(grant) = browser_gateway.ws_tokens.consume(&token, &origin) else {
+        return error_response(StatusCode::FORBIDDEN, "invalid or expired websocket token");
+    };
+    let record = match current_route(&handle, &grant.account_id, &grant.name).await {
+        Ok(record) => record,
+        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "route no longer resolves"),
+    };
+    let Ok(publisher) = <[u8; 32]>::try_from(record.statement.publisher_node.as_slice()) else {
+        return error_response(StatusCode::BAD_GATEWAY, "route has an invalid publisher");
+    };
+    let head = gateway::ProxyRequestHead {
+        account_id: grant.account_id,
+        name: grant.name,
+        revision: record.statement.revision,
+        method: gateway::RouteMethod::Get,
+        path_and_query: "/".into(),
+        headers: vec![],
+        body_len: 0,
+        upgrade: true,
+    };
+    upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, lane, publisher, head))
+}
+
+/// Bridge a browser WebSocket to the gateway upgrade lane: translate axum
+/// messages to/from [`GatewayWsMsg`] and drive the two directions until either
+/// closes.
+async fn bridge_axum_ws(
+    socket: WebSocket,
+    lane: GatewayLane,
+    publisher: [u8; 32],
+    head: gateway::ProxyRequestHead,
+) {
+    use futures::{SinkExt as _, StreamExt as _};
+    let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
+    let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
+    if lane
+        .send(GatewayJob::Upgrade {
+            publisher_node: publisher,
+            head,
+            to_browser: to_browser_tx,
+            from_browser: from_browser_rx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let (mut sink, mut stream) = socket.split();
+    let mut browser_to_plane = tokio::spawn(async move {
+        while let Some(Ok(message)) = stream.next().await {
+            let outbound = match message {
+                Message::Text(text) => GatewayWsMsg::Text(text.to_string()),
+                Message::Binary(bytes) => GatewayWsMsg::Binary(bytes.to_vec()),
+                Message::Close(_) => {
+                    let _ = from_browser_tx.send(GatewayWsMsg::Close(1000)).await;
+                    break;
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+            };
+            if from_browser_tx.send(outbound).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut plane_to_browser = tokio::spawn(async move {
+        while let Some(message) = to_browser_rx.recv().await {
+            let outbound = match message {
+                GatewayWsMsg::Text(text) => Message::Text(text.into()),
+                GatewayWsMsg::Binary(bytes) => Message::Binary(bytes.into()),
+                GatewayWsMsg::Close(_) => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+            };
+            if sink.send(outbound).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut browser_to_plane => plane_to_browser.abort(),
+        _ = &mut plane_to_browser => browser_to_plane.abort(),
+    }
+}
+
 pub async fn serve_browser_gateway(
     listener: tokio::net::TcpListener,
     handle: NodeHandle,
