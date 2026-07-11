@@ -6,9 +6,9 @@
 //! module's whole-doc-per-key layout, the qmdb key here is `sha256(block_id)`
 //! and the value is ONE serialized block — so the merkle root commits to every
 //! block individually, and a single block is readable (and one day provable)
-//! by id alone with no page context. that is the addressability contract that
-//! lets other modules hold a [`crate::BlockRef`] today and resolve
-//! it via `Ctx::query(pages, GetBlock { block_id })`.
+//! by id alone with no page context. that is the addressability contract: any
+//! module can resolve a bare block id via `Ctx::query(pages, GetBlock {
+//! block_id })`.
 //!
 //! ## keys are hashed to a fixed width
 //!

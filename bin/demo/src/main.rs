@@ -106,7 +106,10 @@ fn main() {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        );
+        )
+        // the duckfs/files module the portable (v3) composer pins its source
+        // head from (W2) — mandatory for envelope composition.
+        .with_files_module("files");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let mut host = Host::genesis(vec![
             Box::new(kv),

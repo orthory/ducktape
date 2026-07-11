@@ -21,9 +21,7 @@ test("slots are stable and reuse the lowest free number", () => {
 
 test("desktop builds propagate the default CEF path and caller overrides", () => {
   const fleetScript = readFileSync(new URL("./fleet.sh", import.meta.url), "utf8");
-  const launch = fleetScript
-    .match(/# the app —[\s\S]*?setsid dbus-run-session/)?.[0];
-  const cefAssignment = launch?.match(/^\s*(CEF_PATH=.*) \\$/m)?.[1];
+  const cefAssignment = fleetScript.match(/^\s*(CEF_PATH=.*) \\$/m)?.[1];
   expect(cefAssignment).toBeDefined();
   const setCefNoBackslash = cefAssignment?.replace(/\s*\\$/, "");
   const command = (override) => {

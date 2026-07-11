@@ -401,7 +401,28 @@ format = "text"
                 kind: WORK_SPEC_KIND.into(),
                 dispatch_id: "d1".into(),
                 capability: "alpha".into(),
-                payload: b"the whole input".to_vec(),
+                // a minimal v3 run envelope: the oracle's prepare() rejects
+                // marker-less flat payloads post-flag-day. no provisioner is
+                // wired in these tests, so the provider sees the assembled
+                // "GENERIC\n\nCONTRACT\n\nCONVERSATION" input (dormant path).
+                payload: serde_json::json!({
+                    "ducktape_run": 3,
+                    "agent_id": "bot",
+                    "prompt_hash": null,
+                    "thread_key": null,
+                    "instructions": "GENERIC",
+                    "contract": "CONTRACT",
+                    "conversation": "CONVERSATION",
+                    "workspace": {
+                        "kind": "duckfs",
+                        "source_prefix": "/shared/agent-workspaces/bot",
+                        "source_snapshot": null
+                    },
+                    "skills": [],
+                    "result_contract": {"ducktape_runner_result": 1}
+                })
+                .to_string()
+                .into_bytes(),
             }),
             deadline: None,
             assignee: Some(ME.to_vec()),
@@ -467,7 +488,10 @@ format = "text"
                 ..
             } => {
                 assert_eq!((saga_id, attempt), ("job".to_string(), 0));
-                assert_eq!(outcome.unwrap(), b"answer to: the whole input".to_vec());
+                assert_eq!(
+                    outcome.unwrap(),
+                    b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec()
+                );
             }
             other => panic!("expected an OracleResult, got {other:?}"),
         }

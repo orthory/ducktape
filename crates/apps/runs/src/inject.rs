@@ -53,24 +53,7 @@ pub(crate) fn render_item_context(repo: &str, item: &ForgeItem, work_branch: &st
     }
     out.push_str("\nItem body:\n");
     out.push_str(&item.body);
-    truncate_with_marker(out, MAX_CONTEXT_BYTES, TRUNCATION_MARKER)
-}
-
-/// enforce a byte cap: within it, the render is untouched; beyond it, cut
-/// at the largest char boundary that leaves room for the marker, then append
-/// the marker — deterministic, and NEVER a failure.
-fn truncate_with_marker(s: String, cap: usize, marker: &str) -> String {
-    if s.len() <= cap {
-        return s;
-    }
-    let budget = cap - marker.len();
-    let mut cut = budget;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut out = s[..cut].to_string();
-    out.push_str(marker);
-    out
+    crate::truncate_on_boundary(&out, MAX_CONTEXT_BYTES, TRUNCATION_MARKER)
 }
 
 // ---- `[[page:<id>]]` page-spec injection (M2) ---------------------------------
@@ -136,8 +119,8 @@ pub(crate) fn render_pages_section(pages: &[(String, Option<Vec<Block>>)]) -> St
         .iter()
         .map(|(page_id, blocks)| render_page(page_id, blocks.as_deref()))
         .collect();
-    truncate_with_marker(
-        format!("Referenced pages:\n\n{}", rendered.join("\n\n")),
+    crate::truncate_on_boundary(
+        &format!("Referenced pages:\n\n{}", rendered.join("\n\n")),
         PAGE_CONTEXT_BYTES,
         PAGE_TRUNCATION_MARKER,
     )

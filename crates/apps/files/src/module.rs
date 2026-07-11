@@ -10,7 +10,7 @@ use duckfs_core::state::Refs;
 use duckfs_core::store::ObjectStore as _;
 use duckfs_core::{
     FilesMsg, GC_PERIOD_BLOCKS, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
-    decode_sync_req, encode_reply, encode_sync_resp, to_hex,
+    decode_sync_req, encode_reply, encode_sync_resp,
 };
 use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -24,18 +24,6 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle}
 /// trigger test can table-drive the boundary (re-exported via `testkit`).
 pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
     height / GC_PERIOD_BLOCKS > watermark / GC_PERIOD_BLOCKS
-}
-
-/// derive the acting identity from the dispatch origin: a module id verbatim,
-/// `"ext:"` + lowercase hex for an external submitter (the prefix
-/// domain-separates external identities from hex-looking module ids), or
-/// `"system"`. never taken from the payload.
-pub fn owner_of(origin: &Origin) -> String {
-    match origin {
-        Origin::Module(id) => id.clone(),
-        Origin::External(bytes) => format!("ext:{}", to_hex(bytes)),
-        Origin::System => "system".to_string(),
-    }
 }
 
 pub struct Files {
@@ -302,7 +290,8 @@ impl Module for Files {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let env = ctx.env().clone();
-        let actor = owner_of(&env.origin);
+        // the acting identity is origin-derived, never taken from the payload.
+        let actor = env.origin.actor_string();
         // the watch origin gate treats system as a module origin: it may register a
         // watch for ANY module_id (the `actor == "system"` branch of the gate lets
         // it through), so system must map to `is_module = true`. an external
@@ -332,8 +321,8 @@ impl Module for Files {
                         .map_err(Error::Module)?;
                     // watch fan-out: each notification becomes a follow-up msg at
                     // the watching module, re-dispatched after this execute returns
-                    // (never a reentrant call). the payload is the task-9 shape the
-                    // FsCap `decode_notify` reads back.
+                    // (never a reentrant call). the payload is the task-9
+                    // `duckfs_notify` JSON shape.
                     for n in notifications {
                         let payload = serde_json::to_vec(&serde_json::json!({
                             "duckfs_notify": {

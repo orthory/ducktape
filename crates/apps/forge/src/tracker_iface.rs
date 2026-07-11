@@ -141,8 +141,7 @@ pub struct RefHead {
 
 /// one ref command inside an atomic [`crate::ForgeMsg::PushRefs`]: a per-ref
 /// compare-and-swap. `new_oid: None` deletes the branch (never "main");
-/// `prev_oid: None` requires the branch to be unborn. raw 20-byte sha1 oids,
-/// like [`crate::ForgeMsg::Push`].
+/// `prev_oid: None` requires the branch to be unborn. raw 20-byte sha1 oids.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RefUpdate {
     /// the branch SHORT name ("main", "feature/x") — never a full refname.

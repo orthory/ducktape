@@ -19,8 +19,6 @@
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_RUNS_TARGET: &str = "runs";
-
 // ---- watches ------------------------------------------------------------------
 
 /// how a watched channel selects which agents a user post engages.

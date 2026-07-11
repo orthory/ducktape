@@ -373,7 +373,6 @@ impl ForgeWorkspace {
             run_id: String::new(),
             agent_id: None,
             source: self.source.clone(),
-            base_tools: Vec::new(),
             ro_mounts: Vec::new(),
         }
     }

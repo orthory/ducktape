@@ -58,8 +58,26 @@ use tasks::{
     TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
 };
 
-/// the mock oracle's answer: RAW model text (here: a strict AgentResponse
-/// JSON — the agent module's in-consensus normalization accepts it as-is).
+/// the minimal host-assembled runner-result wrapper the oracle now ALWAYS
+/// delivers around the model's raw text (marker-less flat results are a
+/// flag-day reject).
+fn wrap_runner(prose: Vec<u8>) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "ducktape_runner_result": 1,
+        "response_text": String::from_utf8(prose).expect("utf-8 prose"),
+        "workspace_receipt": {
+            "source_prefix": "/shared/agent-workspaces/bot",
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": true
+        }
+    }))
+    .expect("wrapper serializes")
+}
+
+/// the model's RAW text (here: a strict AgentResponse JSON — the runs
+/// module's in-consensus normalization accepts it as-is).
 fn canned_response(run_id: &str) -> Vec<u8> {
     encode_response(&AgentResponse {
         reply_blocks: vec![ReplyBlock {
@@ -474,7 +492,7 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         // block 5: the worker's oracle op. the saga settles, the dispatch
         // module judges the Text contract and commits the outcome into its
         // MAILBOX — and the runs module sees NOTHING this block (never pop-stack).
-        let oracle_op = oracle_op_for(&outcome.effects[0], canned_response(&run_id));
+        let oracle_op = oracle_op_for(&outcome.effects[0], wrap_runner(canned_response(&run_id)));
         host.submit_at(
             at(5, Origin::External(b"oracle".to_vec())),
             oracle_op.clone(),
@@ -661,7 +679,7 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_response() {
 
         let run_id = job_run_id_for("job-1", "duck", 3);
         let raw = job_response("job-task", "complete job");
-        oracle_result(&mut host, &run_id, 10, Ok(raw.clone())).await;
+        oracle_result(&mut host, &run_id, 10, Ok(wrap_runner(raw.clone()))).await;
 
         // the oracle block only committed the mailbox; the NEXT block's
         // delivery finalizes the board and emits the task action.
@@ -710,7 +728,7 @@ fn a_pruned_and_resubmitted_job_id_gets_a_fresh_episode_run() {
             &mut host,
             &first_run_id,
             10,
-            Ok(job_response("first-task", "finish first")),
+            Ok(wrap_runner(job_response("first-task", "finish first"))),
         )
         .await;
         host.submit_at(at(11, alice()), noop_block(11))
@@ -777,7 +795,7 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
             &mut host,
             &stale_run_id,
             1010,
-            Ok(job_response("stale-task", "late stale output")),
+            Ok(wrap_runner(job_response("stale-task", "late stale output"))),
         )
         .await;
         host.submit_at(at(1011, alice()), noop_block(1011))
@@ -943,7 +961,7 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
                     saga_id: saga_id.clone(),
                     attempt: 0,
-                    outcome: Ok(canned_response(&run_id)),
+                    outcome: Ok(wrap_runner(canned_response(&run_id))),
                     usage: None,
                 }),
             },
