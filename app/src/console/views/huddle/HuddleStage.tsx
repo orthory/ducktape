@@ -22,6 +22,7 @@ import { CardNotices } from "../chat/HuddleCard";
 import { CallTiles } from "./CallTiles";
 import { DevicesMenu } from "./DevicesMenu";
 import { HuddleControls } from "./HuddleControls";
+import { SelfCheck } from "./SelfCheck";
 
 // ── glyphs (view controls, kept local) ──────────────────
 
@@ -88,6 +89,9 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
   );
 
   const live = voice.status === "live";
+  // Alone = no one else on the roster: either the roster hasn't settled yet
+  // (length 0) or the only member is us. Drives the self-check surface.
+  const solo = participants.length === 0 || (participants.length === 1 && participants[0].isSelf);
   const overCap = (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS;
 
   const barBtn = (activeOn: boolean): CSSProperties => ({
@@ -167,10 +171,22 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
 
       {/* tiles */}
       <div style={{ flex: 1, minHeight: 0, padding: 14, overflow: "auto" }}>
-        {participants.length === 0 ? (
-          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: color.muted2, font: `500 13px ${font.sans}` }}>
-            connecting…
-          </div>
+        {solo ? (
+          // Alone in the huddle: a device self-check (camera preview + mic meter)
+          // instead of a bare "connecting…" — the local media works even before
+          // the session is server-live, so the user can verify their gear while
+          // they wait for others.
+          <SelfCheck
+            status={voice.status}
+            cameraOn={voice.cameraOn}
+            sharing={voice.sharing}
+            canEncode={videoCapability.canEncode}
+            muted={voice.muted}
+            level={voice.level}
+            speaking={voice.speaking}
+            bindPreview={bindPreview}
+            onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
+          />
         ) : (
           <CallTiles
             layout={mode}

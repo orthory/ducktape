@@ -459,6 +459,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             duckfs_write: vec!["/shared/agent-workspaces/bot".into()],
             tools: vec!["ducktape-files".into()],
             secrets: vec!["vault:ci".into()],
+            pages_write: vec!["*".into()],
             subagent_budget: 2,
         };
         let quackbot_skills = vec![

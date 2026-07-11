@@ -434,21 +434,17 @@ with:
       DUCKTAPE_TAURI_DEV_PORT="$vite" XDG_RUNTIME_DIR="$wsdir" \
 ```
 
-- [ ] **Step 4: Update the dashboard "up" gate (embedded Python)**
+- [ ] **Step 4: Update the dashboard emitter's "up" gate**
 
 Replace:
-```python
-        # "up" means the APP is live (its tauri-mcp socket exists) AND reachable
-        # over VNC — a bare x11vnc on an empty Xvfb is not "up".
-        sock = f"/tmp/tauri-mcp-{wid}.sock"
-        if os.path.exists(sock) and port_open(vnc): node["status"] = "up"
+```javascript
+const socketPath = `/tmp/tauri-mcp-${id}.sock`;
+if (existsSync(socketPath) && (await portOpen(vncPort))) node.status = "up";
 ```
 with:
-```python
-        # "up" means the APP is live (its endpoint registry exists) AND reachable
-        # over VNC — a bare x11vnc on an empty Xvfb is not "up".
-        endpoint = os.path.join(state, wid, "tauri-agent", "com.ducktape.app", "endpoint.json")
-        if os.path.exists(endpoint) and port_open(vnc): node["status"] = "up"
+```javascript
+const endpointPath = join(state, id, "tauri-agent", "com.ducktape.app", "endpoint.json");
+if (existsSync(endpointPath) && (await portOpen(vncPort))) node.status = "up";
 ```
 
 - [ ] **Step 5: Update teardown**
@@ -629,4 +625,4 @@ git add -A && git commit -m "fix(debug): tauri-agent integration fixups from liv
 
 **Placeholder scan:** No TBD/TODO; every code/config step shows exact content; Task 7 skill rewrites specify required content section-by-section (prose docs, not code, so bullet-level content specs are appropriate rather than verbatim full files).
 
-**Type/name consistency:** `com.ducktape.app` used identically everywhere; endpoint path `<runtime>/tauri-agent/com.ducktape.app/endpoint.json` consistent across Rust comment, fleet.sh, dashboard Python, skills, verification; `WebviewAgentInstrumentation({ windowLabel }).install()` matches the ambient shim in Task 3 Step 1; the shim's target flags (`--app/--from-html/--port/--host`) match the CLI surface used in Tasks 4/7/8.
+**Type/name consistency:** `com.ducktape.app` used identically everywhere; endpoint path `<runtime>/tauri-agent/com.ducktape.app/endpoint.json` consistent across Rust comment, fleet.sh, dashboard emitter, skills, verification; `WebviewAgentInstrumentation({ windowLabel }).install()` matches the ambient shim in Task 3 Step 1; the shim's target flags (`--app/--from-html/--port/--host`) match the CLI surface used in Tasks 4/7/8.

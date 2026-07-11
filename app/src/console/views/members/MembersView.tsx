@@ -34,7 +34,7 @@ import {
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 
 type FilterId = "all" | "validators" | "genesis" | "local";
 
@@ -75,14 +75,16 @@ const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
   { id: "local", label: "This Node" },
 ];
 
+// Tinted from status hues so the chips re-skin with the theme (was a set of
+// baked-in pale pastels that stayed bright in dark mode).
 const STATUS_PILLS = {
-  validator: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
+  validator: tint(color.green),
   // amber: standing granted but not seated — the warming, in-between tier.
-  resident: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
+  resident: tint(color.amber),
   genesis: { text: color.onDark, bg: color.dark, border: color.dark },
-  local: { text: color.accentAlt2, bg: "#eef5f0", border: "#cfe3d7" },
+  local: tint(color.accentAlt2),
   muted: { text: color.muted3, bg: color.paper, border: color.borderStrong },
-  unavailable: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
+  unavailable: tint(color.amber),
 } as const;
 
 const initialsOf = (name: string): string => {
@@ -360,8 +362,8 @@ function ProviderPill({ group }: { group: ProviderGroup }) {
 }
 
 function Avatar({ member, size = 32 }: { member: MemberVM; size?: number }) {
-  const bg = member.isFounder ? color.dark : member.isLocal ? "#dfeee4" : color.chip;
-  const fg = member.isFounder ? color.onDark : member.isLocal ? color.accentAlt2 : color.muted3;
+  const bg = member.isFounder ? color.dark : member.isLocal ? STATUS_PILLS.local.bg : color.chip;
+  const fg = member.isFounder ? color.onDark : member.isLocal ? STATUS_PILLS.local.text : color.muted3;
   return (
     <span
       aria-hidden="true"
@@ -421,7 +423,7 @@ function HoverButton({
           ? color.sunken
           : hover
             ? dark
-              ? "#38362e"
+              ? color.filledHover
               : color.titlebar
             : dark
               ? color.dark
@@ -1291,7 +1293,7 @@ export function MembersView() {
         minWidth: 0,
         minHeight: 0,
         display: "flex",
-        background: "#fcfcfc",
+        background: color.canvas,
         overflow: "hidden",
       }}
     >
@@ -1390,7 +1392,7 @@ export function MembersView() {
             minHeight: 0,
             overflowY: "auto",
             padding: "6px 12px",
-            background: "#fcfcfc",
+            background: color.canvas,
           }}
         >
           {visibleRows.length === 0 ? (

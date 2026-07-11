@@ -127,7 +127,7 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         marginTop: 10,
         border: `1px solid ${color.borderSoft}`,
         borderRadius: 6,
-        background: "#fbfaf7",
+        background: color.canvas,
         padding: "8px 10px",
         maxHeight: 220,
         overflow: "auto",
@@ -289,7 +289,7 @@ function RunRow({
           alignItems: "center",
           justifyContent: "center",
           font: `600 9.5px ${font.mono}`,
-          boxShadow: "0 0 0 3px #fcfcfc",
+          boxShadow: `0 0 0 3px ${color.canvas}`,
         }}
       >
         {initialsOf(agentName)}

@@ -1433,7 +1433,8 @@ pub fn open_index_store<S: AsRef<str>>(
                 store
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
+                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages")))
+                    .with_indexer(Box::new(saga::index::UsageIndex::new("saga"))),
             )
         })
         .map_err(|err| {

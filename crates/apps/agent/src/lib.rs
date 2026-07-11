@@ -120,7 +120,7 @@ fn put_str_set(out: &mut Vec<u8>, items: &[String]) {
     }
 }
 
-/// the D3 caps segment: six canonical string sets in field order, then the
+/// the D3 caps segment: seven canonical string sets in field order, then the
 /// budget as u64-le (the field is u32; the decoder range-checks). part of the
 /// runtime-identity tail.
 fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
@@ -130,6 +130,7 @@ fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
     put_str_set(out, &c.duckfs_write);
     put_str_set(out, &c.tools);
     put_str_set(out, &c.secrets);
+    put_str_set(out, &c.pages_write);
     out.extend_from_slice(&(c.subagent_budget as u64).to_le_bytes());
 }
 
@@ -290,6 +291,7 @@ fn take_caps(buf: &mut &[u8]) -> Result<ResourceCaps, String> {
     let duckfs_write = take_str_set(buf)?;
     let tools = take_str_set(buf)?;
     let secrets = take_str_set(buf)?;
+    let pages_write = take_str_set(buf)?;
     let subagent_budget = u32::try_from(take_u64(buf)?)
         .map_err(|_| "snapshot subagent_budget exceeds u32".to_string())?;
     Ok(ResourceCaps {
@@ -299,6 +301,7 @@ fn take_caps(buf: &mut &[u8]) -> Result<ResourceCaps, String> {
         duckfs_write,
         tools,
         secrets,
+        pages_write,
         subagent_budget,
     })
 }
@@ -332,9 +335,9 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
     // per-entry minimum size: an agent costs its id prefix, one origin
     // discriminant, three length prefixes, a prompt-doc tag, an action
     // count, a status byte, two u64s, and the ALWAYS-present runtime-identity
-    // tail (a recipe_hash length prefix, six cap-set counts, the budget u64,
+    // tail (a recipe_hash length prefix, seven cap-set counts, the budget u64,
     // and the skills count).
-    const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 6 * 8 + 8 + 8;
+    const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 7 * 8 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -538,6 +541,7 @@ impl AgentModule {
             &mut caps.duckfs_write,
             &mut caps.tools,
             &mut caps.secrets,
+            &mut caps.pages_write,
         ] {
             if list.iter().any(|s| s.is_empty()) {
                 return Err(Error::Module("cap entries must be non-empty".into()));
@@ -1501,9 +1505,13 @@ mod tests {
     /// encoding over the fixed 2-agent fixture. the record ALWAYS carries the
     /// recipe_hash/caps/skills tail (empty/default here); if the encoding ever
     /// drifts, this fails loudly.
+    ///
+    /// re-pinned for the M2 flag day: `ResourceCaps` grew `pages_write` (a
+    /// seventh cap set), so every agent's caps tail carries one more empty
+    /// u64 count — the old bytes plus 8 zero bytes per agent, nothing else.
     #[test]
     fn committed_bytes_match_the_golden() {
-        const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d312000000000000000070707070707070707070707070707070707070707070707070707070707070702000000000000000900000000000000636861742e706f73740c000000000000007461736b732e6372656174650003000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d312000000000000000070707070707070707070707070707070707070707070707070707070707070700000000000000000003000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d312000000000000000070707070707070707070707070707070707070707070707070707070707070702000000000000000900000000000000636861742e706f73740c000000000000007461736b732e63726561746500030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d3120000000000000000707070707070707070707070707070707070707070707070707070707070707000000000000000000030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
         let m = build_fixture_registry();
         assert_eq!(
             hex(&m.snapshot()),
@@ -1547,6 +1555,7 @@ mod tests {
             duckfs_write: vec!["out".into()],
             tools: vec!["bash".into()],
             secrets: vec!["vault://k".into()],
+            pages_write: vec!["*".into(), "page-1".into()],
             subagent_budget: 2,
         };
         let skills = vec![
@@ -1658,6 +1667,58 @@ mod tests {
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::SpawnSubagent));
         assert!(!empty.permits(&CapRequest::ForgeRead("r")));
+    }
+
+    /// the pages_write matcher is exact-or-`"*"` — page ids are opaque, so a
+    /// grant never implies a prefix (unlike duckfs) and only the literal
+    /// wildcard entry grants every page.
+    #[test]
+    fn permits_pages_write_exact_or_wildcard() {
+        let exact = record_with_caps(ResourceCaps {
+            pages_write: vec!["page-1".into()],
+            ..Default::default()
+        });
+        assert!(exact.permits(&CapRequest::PagesWrite("page-1")));
+        assert!(!exact.permits(&CapRequest::PagesWrite("page-2")));
+        assert!(
+            !exact.permits(&CapRequest::PagesWrite("page-1/child")),
+            "no prefix containment for pages"
+        );
+
+        let wild = record_with_caps(ResourceCaps {
+            pages_write: vec!["*".into()],
+            ..Default::default()
+        });
+        assert!(wild.permits(&CapRequest::PagesWrite("anything")));
+
+        let empty = record_with_caps(ResourceCaps::default());
+        assert!(!empty.permits(&CapRequest::PagesWrite("page-1")));
+    }
+
+    /// the two pages grants are in the vocabulary: a registration granting
+    /// them is admitted (KNOWN_ACTIONS is the admission gate).
+    #[test]
+    fn register_accepts_the_pages_action_grants() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register(
+                "bot",
+                &[ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED],
+            )),
+        )
+        .unwrap();
+        commit(&mut m);
+        let rec = get_agent(&m, "bot").unwrap();
+        assert_eq!(
+            rec.allowed_actions,
+            vec![
+                ACTION_PAGES_COMMENT.to_string(),
+                ACTION_PAGES_SET_CHECKED.to_string()
+            ]
+        );
     }
 
     /// `MAX_AGENT_RECORD_BYTES` counts the runtime-identity fields — an oversized

@@ -20,6 +20,10 @@ jobs = { workspace = true }
 # composer queries for the committed head it pins as source_snapshot (W2).
 # duckfs-core is pure wire (no std::fs), matching runs' other wire-type deps.
 duckfs-core = { workspace = true }
+# the pages wire types (PageQuery::GetPage / PageReply / Block) the injector
+# queries for `[[page:<id>]]` refs (M2). a normal prod-safe dep — pages pulls
+# only commonware-storage (no libgit2), which chat/tasks already pull.
+pages = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

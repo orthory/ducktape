@@ -4,6 +4,7 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 
+import type { ResourceCaps } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import {
@@ -14,6 +15,7 @@ import {
   GroupCard,
   inputStyle,
   monoInputStyle,
+  parsePagesWrite,
   primaryButton,
   secondaryButton,
   SectionLabel,
@@ -35,6 +37,7 @@ export function RegisterAgentForm({
     capability: string;
     prompt: string;
     allowedActions: string[];
+    caps?: ResourceCaps;
   }) => void;
   /** Called after a successful submit (and by Cancel) so the host can close
    *  the create pane. */
@@ -45,6 +48,8 @@ export function RegisterAgentForm({
   const [capability, setCapability] = useState("");
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
+  // The pages_write cap field: page ids (or "*") the agent may write.
+  const [pagesWrite, setPagesWrite] = useState("");
   // The id is derived from the name by default; this reveals the override.
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -64,18 +69,21 @@ export function RegisterAgentForm({
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!ready) return;
+    const pages = parsePagesWrite(pagesWrite);
     onRegister({
       displayName: displayName.trim(),
       agentId,
       capability: capability.trim(),
       prompt,
       allowedActions,
+      ...(pages.length ? { caps: { pages_write: pages } } : {}),
     });
     setDisplayName("");
     setAgentIdInput("");
     setCapability("");
     setPrompt("");
     setAllowedActions(["chat.post"]);
+    setPagesWrite("");
     setShowAdvanced(false);
     onDone?.();
   };
@@ -205,6 +213,29 @@ export function RegisterAgentForm({
                   </label>
                 );
               })}
+            </div>
+            <div>
+              <FieldLabel htmlFor="agent-pages-write">Page write access</FieldLabel>
+              <input
+                id="agent-pages-write"
+                name="agent-pages-write"
+                type="text"
+                spellCheck={false}
+                value={pagesWrite}
+                onChange={(event) => setPagesWrite(event.target.value)}
+                placeholder="page ids, or * for all"
+                style={monoInputStyle}
+              />
+              <div
+                style={{
+                  marginTop: 5,
+                  font: `400 10.5px ${font.sans}`,
+                  color: color.muted2,
+                }}
+              >
+                Pages the agent may comment on or check off. Space-separated ids; * grants
+                every page.
+              </div>
             </div>
           </fieldset>
 

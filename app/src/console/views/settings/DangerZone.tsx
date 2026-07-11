@@ -28,8 +28,8 @@ function DangerRow({
   return (
     <div
       style={{
-        border: "1px solid #ecd6d0",
-        background: "#fdf6f4",
+        border: `1px solid ${color.dangerBorder}`,
+        background: color.dangerSoft,
         borderRadius: radius.lg,
         padding: 15,
         display: "flex",
@@ -55,7 +55,7 @@ function DangerRow({
       <HoverButton
         ariaLabel={ariaLabel}
         onClick={onClick}
-        hoverBg="#8f463d"
+        hoverBg={`color-mix(in srgb, ${color.red} 82%, #000)`}
         disabled={disabled}
         style={{
           all: "unset",

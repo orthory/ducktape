@@ -17,6 +17,7 @@ import { createCallSession } from "../../../domain/call-session";
 import type { CallEvent, CallSession } from "../../../domain/call-session";
 import { keyHex } from "../../../domain/chat-client";
 import { loadDevicePrefs } from "../../../domain/media-devices";
+import type { DevicePrefs } from "../../../domain/media-devices";
 import { callSocketUrl } from "../../../domain/transport";
 import { huddleRecipients } from "../../../domain/voice-session";
 import { buildParticipants } from "../../store/huddle-roster";
@@ -35,12 +36,18 @@ export interface WindowSessionView {
   canScreenShare: boolean;
   /** Transient camera/screen acquire failure — surfaced for a few seconds. */
   mediaNote: "camera-failed" | "screen-failed" | null;
+  /** 0..1 mic level (throttled) — drives the solo self-check meter. */
+  level: number;
+  speaking: boolean;
   participants: HuddleParticipant[];
   peers: Record<string, PeerBeacon>;
   memberNodes: Record<string, string>;
   setMuted(m: boolean): void;
   setCamera(on: boolean): void;
   setScreenShare(on: boolean): void;
+  /** Apply a device choice to THIS window's session (mic/camera swap + speaker
+   *  route). The window persists prefs to the same localStorage main reads. */
+  setDevices(prefs: DevicePrefs): void;
   bindPreview(el: HTMLVideoElement | null): void;
   bindTile(nodeHex: string, el: HTMLCanvasElement | null): void;
 }
@@ -60,6 +67,7 @@ export function useHuddleWindowSession(
   const [status, setStatus] = useState<HuddleStatus>("connecting");
   const [peers, setPeers] = useState<Record<string, PeerBeacon>>({});
   const [speaking, setSpeaking] = useState(false);
+  const [level, setLevel] = useState(0);
   const [mediaNote, setMediaNote] = useState<"camera-failed" | "screen-failed" | null>(null);
   const [sessionStartMs, setSessionStartMs] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
@@ -89,6 +97,10 @@ export function useHuddleWindowSession(
       }
       if (e.kind === "selfSpeaking") {
         setSpeaking(e.speaking);
+        return;
+      }
+      if (e.kind === "selfLevel") {
+        setLevel(e.level);
         return;
       }
       if (e.kind === "selfVideo") {
@@ -124,6 +136,7 @@ export function useHuddleWindowSession(
     setCameraOnState(false);
     setSharingState(false);
     setSpeaking(false);
+    setLevel(0);
     setMediaNote(null);
     setMutedState(seedMuted);
     setSessionStartMs(Date.now());
@@ -171,6 +184,7 @@ export function useHuddleWindowSession(
     setSharingState(on);
     if (on) setCameraOnState(false);
   }, []);
+  const setDevices = useCallback((prefs: DevicePrefs) => sessionRef.current?.setDevices(prefs), []);
   const bindPreview = useCallback((el: HTMLVideoElement | null) => sessionRef.current?.bindPreview(el), []);
   const bindTile = useCallback(
     (nodeHex: string, el: HTMLCanvasElement | null) => sessionRef.current?.bindTile(nodeHex, el),
@@ -201,12 +215,15 @@ export function useHuddleWindowSession(
     canDecode: ctx.canDecode,
     canScreenShare: ctx.canScreenShare,
     mediaNote,
+    level,
+    speaking,
     participants,
     peers,
     memberNodes,
     setMuted,
     setCamera,
     setScreenShare,
+    setDevices,
     bindPreview,
     bindTile,
   };

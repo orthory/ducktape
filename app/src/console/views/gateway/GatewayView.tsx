@@ -345,7 +345,7 @@ export function GatewayView() {
           : health.kind === "disabled" ? "Not checked · HEAD is not allowed"
             : health.kind === "unavailable" ? "Unavailable"
               : "Not checked";
-  const healthColor = health.kind === "serving" ? "#397047"
+  const healthColor = health.kind === "serving" ? color.green
     : health.kind === "failing" || health.kind === "unavailable" ? color.danger
       : color.muted3;
   const displayAddress = (item: RouteSummary): string => {

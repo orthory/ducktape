@@ -10,7 +10,7 @@ import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
 
 import { providersOf } from "../../../domain/capability-client";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import { buildPeers, proposalWindow, type PeerVM } from "./node-health";
 
 type FilterId = "all" | "validators" | "residents" | "active";
@@ -48,7 +48,7 @@ function livenessOf(peer: PeerVM, windowTotal: number): Liveness {
   if (peer.activity) {
     const pct = windowTotal > 0 ? Math.round((peer.activity.count / windowTotal) * 100) : 0;
     return {
-      dot: "#5f9e74",
+      dot: color.green,
       label: "leading",
       note: `led #${peer.activity.lastHeight.toLocaleString()} · ${peer.activity.count} block${
         peer.activity.count === 1 ? "" : "s"
@@ -65,8 +65,8 @@ function livenessOf(peer: PeerVM, windowTotal: number): Liveness {
 // ── atoms ───────────────────────────────────────────────────
 
 function Avatar({ peer }: { peer: PeerVM }) {
-  const bg = peer.isFounder ? color.dark : peer.isSelf ? "#dfeee4" : color.chip;
-  const fg = peer.isFounder ? color.onDark : peer.isSelf ? color.accentAlt2 : color.muted3;
+  const bg = peer.isFounder ? color.dark : peer.isSelf ? tint(color.accentAlt2).bg : color.chip;
+  const fg = peer.isFounder ? color.onDark : peer.isSelf ? tint(color.accentAlt2).text : color.muted3;
   return (
     <span
       aria-hidden="true"
@@ -92,8 +92,8 @@ function RolePill({ peer }: { peer: PeerVM }) {
   const spec = peer.isFounder
     ? { text: color.onDark, bg: color.dark, border: color.dark, label: "genesis" }
     : peer.tier === "validator"
-      ? { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7", label: "validator" }
-      : { text: color.amber, bg: "#fbf4e6", border: "#ecdcae", label: "resident" };
+      ? { text: tint(color.green).text, bg: tint(color.green).bg, border: tint(color.green).border, label: "validator" }
+      : { text: tint(color.amber).text, bg: tint(color.amber).bg, border: tint(color.amber).border, label: "resident" };
   return (
     <span
       style={{
@@ -132,7 +132,7 @@ function ShareBar({ share }: { share: number }) {
           inset: 0,
           width: `${Math.max(share * 100, share > 0 ? 6 : 0)}%`,
           borderRadius: 3,
-          background: "#5f9e74",
+          background: color.green,
         }}
       />
     </div>
@@ -190,8 +190,8 @@ function PeerRow({ peer, windowTotal }: { peer: PeerVM; windowTotal: number }) {
         gap: 12,
         padding: "11px 13px",
         borderRadius: radius.md,
-        border: `1px solid ${peer.isSelf ? "#cfe3d7" : color.border}`,
-        background: peer.isSelf ? "#f6faf7" : color.paper,
+        border: `1px solid ${peer.isSelf ? tint(color.green).border : color.border}`,
+        background: peer.isSelf ? tint(color.green).bg : color.paper,
       }}
     >
       <Avatar peer={peer} />
@@ -207,9 +207,9 @@ function PeerRow({ peer, windowTotal }: { peer: PeerVM; windowTotal: number }) {
               style={{
                 font: `600 9px ${font.mono}`,
                 letterSpacing: ".05em",
-                color: color.accentAlt2,
-                background: "#eef5f0",
-                border: "1px solid #cfe3d7",
+                color: tint(color.green).text,
+                background: tint(color.green).bg,
+                border: `1px solid ${tint(color.green).border}`,
                 borderRadius: 5,
                 padding: "2px 7px",
                 textTransform: "uppercase",
@@ -363,7 +363,7 @@ export function PeersTab() {
       <SectionLabelRow>CONNECTIONS</SectionLabelRow>
       <div style={{ marginTop: 9, display: "flex", gap: 9, flexWrap: "wrap" }}>
         <CountChip label="Peers" value={validatorCount + residentCount} />
-        <CountChip label="Validators" value={validatorCount} tint="#5f9e74" />
+        <CountChip label="Validators" value={validatorCount} tint={color.green} />
         <CountChip label="Residents" value={residentCount} tint={color.amber} />
         <CountChip label="Leading" value={activeCount} tint={color.dark} />
       </div>

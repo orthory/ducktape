@@ -10,8 +10,8 @@
 #   ops/fleet.sh build-console    bun install + vite build the console into dist/
 #   ops/fleet.sh url              print the dashboard URL
 #
-# Userspace only (no root). Reuses the x11vnc/xdotool/noVNC/websockify staged by
-# remote-tauri under ~/.local/opt/remote-tauri. Port bases are offset from the
+# Userspace only (no root). Reuses the x11vnc/xdotool tools staged by remote-tauri
+# under ~/.local/opt/remote-tauri. Port bases are offset from the
 # single-instance remote-tauri (:99/5900/6080) so both can run at once.
 #
 # Per-instance isolation: each app runs with its own HOME so ~/.ducktape (the
@@ -31,7 +31,6 @@ TOKENS="$STATE/tokens"
 NODE_BIN="$PREFIX/bin/ducktape-node"   # stable node bin, staged OUTSIDE any target/
 X11VNC="$PREFIX/root/usr/bin/x11vnc"
 XDO="$PREFIX/root/usr/bin/xdotool"
-NOVNC="$PREFIX/noVNC"
 export LD_LIBRARY_PATH="$PREFIX/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
 COMMON_DIR="$(git -C "$SELF" rev-parse --path-format=absolute --git-common-dir)"
@@ -67,21 +66,7 @@ worktrees(){
 }
 
 # ── persistent slot assignment (id → slot, lowest free, reused) ──
-slot_for(){ python3 - "$STATE/slots.json" "$1" <<'PY'
-import json, os, sys
-path, idv = sys.argv[1], sys.argv[2]
-try:    d = json.load(open(path))
-except Exception: d = {}
-if idv not in d:
-    used = set(d.values())
-    i = 0
-    while i in used: i += 1
-    d[idv] = i
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    json.dump(d, open(path, "w"))
-print(d[idv])
-PY
-}
+slot_for(){ bun "$SELF/fleet.mjs" slot "$STATE/slots.json" "$1"; }
 
 # ── isolation: stable node bin + a seeded solo workspace per instance ───
 # Without these the app boots REMOTE and every tile shares 127.0.0.1:8844. The
@@ -108,11 +93,7 @@ seed_workspace(){
   [ -f "$reg" ] && return 0
   mkdir -p "$dir"
   local p1 p2 p3
-  read -r p1 p2 p3 < <(python3 -c "import socket
-s=[socket.socket() for _ in range(3)]
-[x.bind(('127.0.0.1',0)) for x in s]
-print(*[x.getsockname()[1] for x in s])
-[x.close() for x in s]")
+  read -r p1 p2 p3 < <(bun "$SELF/fleet.mjs" ports 3)
   local chain pub
   chain="$("$NODE_BIN" init --name "$id" --dir "$dir" \
     --listen 127.0.0.1:$p1 --advertised 127.0.0.1:$p1 --http 127.0.0.1:$p2 --rpc 127.0.0.1:$p3 \
@@ -200,10 +181,9 @@ focus_fill(){
 up_web(){
   port_up "$WEB_PORT" && { log "web :$WEB_PORT already up"; return; }
   [ -f "$DIST/index.html" ] || { log "console not built — run '$0 build-console' first"; return 1; }
-  ( cd "$NOVNC/utils/websockify" && setsid nohup python3 -m websockify \
-      --web "$DIST" \
-      --token-plugin websockify.token_plugins.TokenFile --token-source "$TOKENS" \
-      "$TSIP:$WEB_PORT" >"$STATE/websockify.log" 2>&1 < /dev/null & )
+  setsid nohup bun "$SELF/fleet.mjs" serve "$DIST" "$TOKENS" "$TSIP" "$WEB_PORT" \
+    >"$STATE/web.log" 2>&1 < /dev/null &
+  echo $! >"$STATE/web.pid"
   sleep 2
   log "web :$WEB_PORT up (console + token router)"
 }
@@ -211,102 +191,9 @@ up_web(){
 # ── fleet.json (served at /fleet.json) ──────────────────
 emit_json(){
   MAIN_ROOT="$MAIN_ROOT" BASE_BRANCH="$BASE_BRANCH" TSIP="$TSIP" WEB_PORT="$WEB_PORT" \
-  DISP_BASE="$DISP_BASE" VITE_BASE="$VITE_BASE" VNC_BASE="$VNC_BASE" \
+  DISP_BASE="$DISP_BASE" VNC_BASE="$VNC_BASE" \
   STATE="$STATE" DIST="$DIST" TAURI_AGENT_APP_ID="com.ducktape.app" \
-  python3 - <<'PY'
-import json, os, socket, subprocess, datetime, re
-env = os.environ
-main, base = env["MAIN_ROOT"], env["BASE_BRANCH"]
-tsip, web = env["TSIP"], int(env["WEB_PORT"])
-disp_b, vite_b, vnc_b = int(env["DISP_BASE"]), int(env["VITE_BASE"]), int(env["VNC_BASE"])
-state, dist = env["STATE"], env["DIST"]
-agent_app_id = env["TAURI_AGENT_APP_ID"]
-
-def slug(s): return re.sub(r"-+","-", re.sub(r"[^a-z0-9]","-", s.lower())).strip("-")
-def sh(*a):
-    try: return subprocess.run(a, capture_output=True, text=True, timeout=8).stdout.strip()
-    except Exception: return ""
-def port_open(p):
-    s = socket.socket(); s.settimeout(0.3)
-    try: return s.connect_ex(("127.0.0.1", p)) == 0
-    finally: s.close()
-
-try: slots = json.load(open(os.path.join(state, "slots.json")))
-except Exception: slots = {}
-
-# discover worktrees
-raw = sh("git", "-C", main, "worktree", "list", "--porcelain")
-wts, cur = [], {}
-for line in raw.splitlines():
-    if line.startswith("worktree "): cur = {"path": line[9:]}
-    elif line.startswith("branch "): cur["branch"] = line[7:].replace("refs/heads/", "")
-    elif line == "detached": cur["branch"] = None
-    elif line == "" and cur:
-        wts.append(cur); cur = {}
-if cur: wts.append(cur)
-
-out = []
-for w in wts:
-    path, branch = w.get("path"), w.get("branch")
-    if not branch or not os.path.isdir(os.path.join(path, "app")): continue
-    wid = slug(branch)
-    sha = sh("git", "-C", path, "rev-parse", "--short", "HEAD")
-    subj = sh("git", "-C", path, "log", "-1", "--pretty=%s")
-    ahead = sh("git", "-C", path, "rev-list", "--count", f"{base}..HEAD") or "0"
-    behind = sh("git", "-C", path, "rev-list", "--count", f"HEAD..{base}") or "0"
-    # agent activity: what's been done to this branch. \x1f is a field sep the
-    # commit subject can't contain. dirty = in-progress edits (the live pulse).
-    commits = []
-    for ln in sh("git", "-C", path, "log", "-4", "--pretty=%h\x1f%s\x1f%cr").splitlines():
-        p = ln.split("\x1f")
-        if len(p) == 3:
-            commits.append({"sha": p[0], "subject": p[1], "age": p[2]})
-    dirty = len([l for l in sh("git", "-C", path, "status", "--porcelain").splitlines() if l.strip()])
-    node = {"id": wid, "branch": branch, "path": os.path.relpath(path, main),
-            "head": {"sha": sha, "subject": subj},
-            "parent": base if branch != base else None,
-            "ahead": int(ahead or 0), "behind": int(behind or 0),
-            "activity": {"dirty": dirty, "commits": commits},
-            "status": "down"}
-    if wid in slots:
-        slot = slots[wid]
-        vnc = vnc_b + slot
-        runtime_dir = os.path.join(state, wid)
-        endpoint = os.path.join(runtime_dir, "tauri-agent", agent_app_id, "endpoint.json")
-        node.update({"slot": slot, "display": f":{disp_b+slot}", "vncPort": vnc,
-                     "token": wid,
-                     "agent": {
-                         "appId": agent_app_id,
-                         "runtimeDir": runtime_dir,
-                         "endpointPath": endpoint,
-                         "endpointReady": os.path.exists(endpoint),
-                         "observe": {
-                             "protocol": "tauri-agent-observe-ndjson",
-                             "cwd": os.path.relpath(path, main),
-                             "env": {"XDG_RUNTIME_DIR": runtime_dir},
-                             "argv": [
-                                 "app/scripts/tauri-agent",
-                                 "observe",
-                                 "--app", agent_app_id,
-                                 "--format", "ndjson",
-                             ],
-                         },
-                     }})
-        # "up" means the APP is live (its endpoint registry exists) AND reachable
-        # over VNC — a bare x11vnc on an empty Xvfb is not "up".
-        if os.path.exists(endpoint) and port_open(vnc): node["status"] = "up"
-        elif os.path.isfile(os.path.join(state, wid, "tauri.log")): node["status"] = "building"
-        else: node["status"] = "down"
-    out.append(node)
-
-# base at the front; then by slot then branch
-out.sort(key=lambda n: (n["branch"] != base, n.get("slot", 999), n["branch"]))
-doc = {"generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-       "host": tsip, "webPort": web, "base": base, "worktrees": out}
-os.makedirs(dist, exist_ok=True)
-json.dump(doc, open(os.path.join(dist, "fleet.json"), "w"), indent=2)
-print(f"fleet.json: {len(out)} worktree(s) -> {os.path.join(dist,'fleet.json')}")
-PY
+  bun "$SELF/fleet.mjs" emit
 }
 
 # ── select worktrees from args (branch names) or all ────
@@ -343,7 +230,14 @@ case "$cmd" in
       rm -f "$TOKENS/$id" "$STATE/$id/tauri-agent/com.ducktape.app/endpoint.json"
       log "[$id] stopped"
     done < <(selected "$@")
-    [ "$#" -eq 0 ] && { pkill -f 'python3 -m websockify' 2>/dev/null || true; log "web stopped"; }
+    if [ "$#" -eq 0 ]; then
+      web_pid="$(cat "$STATE/web.pid" 2>/dev/null || true)"
+      case "$(ps -p "$web_pid" -o args= 2>/dev/null)" in
+        *"$SELF/fleet.mjs serve"*) kill "$web_pid" 2>/dev/null || true ;;
+      esac
+      rm -f "$STATE/web.pid"
+      log "web stopped"
+    fi
     emit_json ;;
   refresh) emit_json ;;
   build-console)

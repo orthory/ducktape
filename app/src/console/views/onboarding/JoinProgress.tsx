@@ -6,7 +6,7 @@
 
 import { useEffect, useState, type CSSProperties } from "react";
 
-import { color, font, radius } from "../../theme/tokens";
+import { color, font, radius, tint } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import type { OnboardingPhase } from "../../../domain/workspace-client";
 import { identityState } from "../../../domain/user-identity-client";
@@ -80,13 +80,13 @@ function StepIcon({ state }: { state: "done" | "running" | "pending" | "failed" 
           width: 19,
           height: 19,
           borderRadius: "50%",
-          background: "#eef5f0",
-          border: "1px solid #cfe3d7",
+          background: tint(color.green).bg,
+          border: `1px solid ${tint(color.green).border}`,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
           font: `600 10px ${font.mono}`,
-          color: "#5f9e74",
+          color: tint(color.green).text,
           flexShrink: 0,
         }}
       >
@@ -102,8 +102,8 @@ function StepIcon({ state }: { state: "done" | "running" | "pending" | "failed" 
           width: 19,
           height: 19,
           borderRadius: "50%",
-          background: "#fbeeec",
-          border: "1px solid #eccfc9",
+          background: tint(color.red).bg,
+          border: `1px solid ${tint(color.red).border}`,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -126,9 +126,9 @@ function StepIcon({ state }: { state: "done" | "running" | "pending" | "failed" 
           borderRadius: "50%",
           borderWidth: 2,
           borderStyle: "solid",
-          borderRightColor: "#e3b443",
-          borderBottomColor: "#e3b443",
-          borderLeftColor: "#e3b443",
+          borderRightColor: color.amber,
+          borderBottomColor: color.amber,
+          borderLeftColor: color.amber,
           borderTopColor: "transparent",
           animation: "ik-pulse 1s ease-in-out infinite",
           flexShrink: 0,
@@ -143,7 +143,7 @@ function StepIcon({ state }: { state: "done" | "running" | "pending" | "failed" 
         width: 19,
         height: 19,
         borderRadius: "50%",
-        border: "1px dashed #d5d5d5",
+        border: `1px dashed ${color.borderStrong}`,
         flexShrink: 0,
       }}
     />
@@ -229,7 +229,7 @@ export function JoinProgress() {
           style={{
             height: 5,
             borderRadius: 3,
-            background: "#e9e9e9",
+            background: color.hover,
             marginTop: 18,
             overflow: "hidden",
           }}
@@ -250,7 +250,7 @@ export function JoinProgress() {
             style={{
               font: `600 10px ${font.mono}`,
               letterSpacing: ".1em",
-              color: "#b7b7b7",
+              color: color.muted2,
             }}
           >
             THIS NODE'S KEY
@@ -267,7 +267,7 @@ export function JoinProgress() {
               gap: 10,
               width: "100%",
               border: `1px solid ${color.border}`,
-              background: "#f4f4f4",
+              background: color.sunken,
               borderRadius: radius.md,
               padding: "10px 12px",
             }}
@@ -288,7 +288,7 @@ export function JoinProgress() {
             <span
               style={{
                 font: `600 11px ${font.sans}`,
-                color: copied ? "#5f9e74" : color.accent,
+                color: copied ? color.green : color.accent,
                 flexShrink: 0,
               }}
             >
@@ -331,7 +331,7 @@ export function JoinProgress() {
                   <span
                     style={{
                       font: `400 13.5px ${font.sans}`,
-                      color: failed || done || running ? color.inkSoft : "#aeaeae",
+                      color: failed || done || running ? color.inkSoft : color.muted2,
                     }}
                   >
                     {item.label}
@@ -359,8 +359,8 @@ export function JoinProgress() {
           <div
             style={{
               marginTop: 18,
-              border: "1px solid #eccfc9",
-              background: "#fbeeec",
+              border: `1px solid ${tint(color.red).border}`,
+              background: tint(color.red).bg,
               borderRadius: radius.sm,
               padding: "8px 10px",
               font: `500 11px ${font.mono}`,

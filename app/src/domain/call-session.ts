@@ -71,6 +71,10 @@ const MAX_BITRATE_KBPS = 1200;
  *  indefinitely. Timed from socket open, NOT from start(): getUserMedia's
  *  permission prompt can legitimately hold `start` open for minutes. */
 const CONNECT_TIMEOUT_MS = 12_000;
+/** RMS that reads as a "full" mic meter (0..1). Ordinary speech sits ~0.05–0.15
+ *  (SPEAKING_RMS is 0.02), so this scale gives a lively, reassuring self-check
+ *  bar without pinning to the top on every syllable. */
+const LEVEL_FULL_RMS = 0.25;
 
 export type CallEvent =
   | { kind: "status"; status: VoiceStatus; error?: VoiceError }
@@ -79,6 +83,10 @@ export type CallEvent =
   // speaking ring and the "you're muted while talking" banner. Emitted only on a
   // change (mute keeps capturing, so this fires even while muted).
   | { kind: "selfSpeaking"; speaking: boolean }
+  // Our own mic input level, 0..1 (rms scaled), throttled to ~12 Hz. Drives the
+  // solo self-check meter so a lone user can SEE the mic responds — emitted even
+  // while muted (capture runs regardless), so the check needs no hot-mic moment.
+  | { kind: "selfLevel"; level: number }
   // Our own video-lane state SETTLED — the authoritative source for the slice's
   // cameraOn/sharing (fires on toggle, on a failed acquire, on encoder death, and
   // when the browser's own "Stop sharing" ends a screen share).
@@ -142,6 +150,10 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // Self active-speaker detection off the capture frames (runs even while muted).
   let speaking = false;
   let speakingHoldUntil = 0;
+  // Self mic-level meter (solo self-check): throttle emits and only push when the
+  // displayed level actually moves, so a 50 Hz capture doesn't spam React.
+  let lastLevelAtMs = 0;
+  let lastLevel = -1;
   // recipients requested before the socket was open — flushed on open.
   let pendingRecipients: string[] | null = null;
 
@@ -673,11 +685,21 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
         cap.port.onmessage = (event) => {
           const frame = event.data as Float32Array;
           // Speaking detection first, so it fires even when muted (below).
-          const detected = nextSpeaking(rms(frame), Date.now(), speakingHoldUntil);
+          const now = Date.now();
+          const amplitude = rms(frame);
+          const detected = nextSpeaking(amplitude, now, speakingHoldUntil);
           speakingHoldUntil = detected.holdUntil;
           if (detected.speaking !== speaking) {
             speaking = detected.speaking;
             onEvent({ kind: "selfSpeaking", speaking });
+          }
+          // Meter level: rms scaled so ordinary speech fills a visible chunk.
+          // ~12 Hz + a 0.03 dead-band keeps it smooth without flooding React.
+          const level = Math.min(1, amplitude / LEVEL_FULL_RMS);
+          if (now - lastLevelAtMs > 80 && Math.abs(level - lastLevel) > 0.03) {
+            lastLevelAtMs = now;
+            lastLevel = level;
+            onEvent({ kind: "selfLevel", level });
           }
           if (muted || !socket || socket.readyState !== WebSocket.OPEN) return;
           socket.send(encodeAudioFrame(floatToPcm16(frame)));

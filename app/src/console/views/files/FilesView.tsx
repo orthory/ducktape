@@ -31,7 +31,7 @@ import type { FileEntry, FileUploadEntry } from "../../../domain/files-client";
 import { FILES_WATCH_TOPIC } from "../../../domain/stream";
 import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import { FilePreview } from "./FilePreview";
 import { errMsg, humanBytes } from "./files-format";
 import { HistoryPanel } from "./HistoryPanel";
@@ -207,7 +207,7 @@ function CenterState({ title, detail, muted }: { title: string; detail: string; 
           height: 36,
           borderRadius: radius.md,
           border: `1px solid ${color.border}`,
-          background: muted ? color.sunken : "#eef5f0",
+          background: muted ? color.sunken : tint(color.green).bg,
           color: muted ? color.muted : color.green,
           display: "flex",
           alignItems: "center",
@@ -303,7 +303,7 @@ function UploadNotice({ upload }: { upload: UploadState | null }) {
             height: 34,
             borderRadius: radius.md,
             border: `1px solid ${color.border}`,
-            background: "#eef5f0",
+            background: tint(color.green).bg,
             color: color.green,
             display: "flex",
             alignItems: "center",
@@ -400,7 +400,7 @@ function UploadDropOverlay({ targetDir }: { targetDir: string }) {
             height: 52,
             borderRadius: radius.md,
             border: `1px solid ${color.border}`,
-            background: "#eef5f0",
+            background: tint(color.green).bg,
             color: color.green,
             display: "flex",
             alignItems: "center",
@@ -520,7 +520,7 @@ function EntryRow({
           height: 28,
           borderRadius: radius.sm,
           border: `1px solid ${color.border}`,
-          background: isDir ? "#eef5f0" : color.sunken,
+          background: isDir ? tint(color.green).bg : color.sunken,
           color: isDir ? color.green : color.muted3,
           display: "flex",
           alignItems: "center",

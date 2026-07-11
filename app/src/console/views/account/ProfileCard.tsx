@@ -67,7 +67,7 @@ export function ProfileCard({ accountId }: { accountId: string | undefined }) {
             width: 40,
             height: 40,
             borderRadius: "50%",
-            background: "#cdcdcd",
+            background: color.iconIdle,
             color: color.muted3,
             display: "flex",
             alignItems: "center",

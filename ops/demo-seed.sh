@@ -10,7 +10,7 @@
 # Re-runnable: wipes and recreates the "demo" workspace each time (other
 # workspaces in the registry are untouched). Ports are freshly allocated.
 #
-# It also publishes two gateway web-app routes (see ops/demo-gateway.py): a
+# It also publishes two gateway web-app routes (see ops/demo-gateway.mjs): a
 # NETWORK-hosted static site served from DuckFS, and a USER-hosted route that
 # proxies to a node-local server. The frameless /v1/submit lane stamps the
 # node's own validator key as the op origin, so the local daemon binds an
@@ -27,7 +27,7 @@ ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty a
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
 
-command -v python3 >/dev/null || die "python3 is required"
+command -v bun     >/dev/null || die "bun is required"
 command -v curl    >/dev/null || die "curl is required"
 
 # ── 1. node binary ─────────────────────────────────────────────
@@ -37,40 +37,45 @@ if [ -z "$NODE_BIN" ]; then
   blog="$(mktemp)"
   cargo build -p node-bin >"$blog" 2>&1 || die "node-bin build failed — see $blog"
   NODE_BIN="$(cargo metadata --no-deps --format-version 1 \
-    | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ducktape-node"
+    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape-node"
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 
 # ── 2. fresh demo workspace (idempotent) ───────────────────────
 log "creating a fresh '$ID' workspace at $WSDIR"
 rm -rf "$WSDIR"; mkdir -p "$WSDIR"
-read -r P1 P2 P3 < <(python3 -c "import socket
-s=[socket.socket() for _ in range(3)]
-[x.bind(('127.0.0.1',0)) for x in s]
-print(*[x.getsockname()[1] for x in s])
-[x.close() for x in s]")
+read -r P1 P2 P3 < <(bun "$SCRIPT_DIR/fleet.mjs" ports 3)
+# Gateway serving needs two things the app's workspace_create also sets:
+#   --gateway         binds the isolated browser plane that serves the routes
+#   --wireguard-effect the userspace (TUN-less) overlay — the browser session
+#                      requires an active overlay, and the default "tun" effect
+#                      can't start without /dev/net/tun + privilege.
+# Without both, site/app.<id>.duck render blank. 127.0.0.1:0 = OS-assigned ports.
 CHAIN="$("$NODE_BIN" init --name "$ID" --dir "$WSDIR" \
   --listen 127.0.0.1:$P1 --advertised 127.0.0.1:$P1 \
-  --http 127.0.0.1:$P2 --rpc 127.0.0.1:$P3 2>/dev/null | tail -1)"
+  --http 127.0.0.1:$P2 --rpc 127.0.0.1:$P3 --gateway 127.0.0.1:0 \
+  --wireguard-effect socket --wireguard-listen 127.0.0.1:0 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" keygen --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
 # ── 3. register in ~/.ducktape/registry.json (merge; make it active) ──
-python3 - "$REG" "$ID" "$CHAIN" "$PUB" "$P1" "$P2" "$P3" <<'PY'
-import json, os, sys
-reg_path, idv, chain, pub, p1, p2, p3 = sys.argv[1:8]
-reg = {"version": 1, "active": None, "workspaces": []}
-if os.path.exists(reg_path):
-    try: reg = json.load(open(reg_path))
-    except Exception: pass
-ws = {"id": idv, "name": idv, "chainId": chain, "pubkey": pub,
-      "founder": True, "member": True,
-      "ports": {"listen": int(p1), "http": int(p2), "rpc": int(p3)}}
-reg["workspaces"] = [w for w in reg.get("workspaces", []) if w.get("id") != idv] + [ws]
-reg["active"] = idv
-os.makedirs(os.path.dirname(reg_path), exist_ok=True)
-json.dump(reg, open(reg_path, "w"), indent=2)
-PY
+bun - "$REG" "$ID" "$CHAIN" "$PUB" "$P1" "$P2" "$P3" <<'JS'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+const [path, id, chain, pubkey, listen, http, rpc] = process.argv.slice(2);
+let registry = { version: 1, active: null, workspaces: [] };
+if (existsSync(path)) {
+  try { registry = JSON.parse(readFileSync(path, "utf8")); } catch {}
+}
+const workspace = {
+  id, name: id, chainId: chain, pubkey, founder: true, member: true,
+  ports: { listen: Number(listen), http: Number(http), rpc: Number(rpc) },
+};
+registry.workspaces = [...(registry.workspaces ?? []).filter((item) => item.id !== id), workspace];
+registry.active = id;
+mkdirSync(dirname(path), { recursive: true });
+writeFileSync(path, JSON.stringify(registry, null, 2));
+JS
 log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
 # ── 4. start the node, wait for its http surface ───────────────
@@ -91,7 +96,7 @@ N=0
 submit(){ # submit <module> <payload-json>
   N=$((N+1))
   local body resp code
-  body=$(python3 -c 'import json,sys;print(json.dumps({"target":sys.argv[1],"payload":json.loads(sys.argv[2]),"origin":sys.argv[3]}))' "$1" "$2" "$ORIGIN") \
+  body=$(bun -e 'const [target,payload,origin]=process.argv.slice(1);console.log(JSON.stringify({target,payload:JSON.parse(payload),origin}))' "$1" "$2" "$ORIGIN") \
     || die "op #$N ($1): payload is not valid json"
   resp=$(curl -s -w $'\n%{http_code}' "$URL/v1/submit" -H 'content-type: application/json' -d "$body")
   code=${resp##*$'\n'}
@@ -145,7 +150,7 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"message
 # this node, stages the static site into DuckFS, and signs + submits both routes:
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
-python3 "$SCRIPT_DIR/demo-gateway.py" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" \
+bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" \
   || die "gateway route publish failed"
 
 log "seeded $N ops + 2 gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
@@ -159,7 +164,8 @@ $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
 Gateway web apps published on this node (open in the app's browser):
-  • site.$ID.duck — network-hosted static web app, served from DuckFS. Works now.
+  • site.$ID.duck — a bouncing-DVD web app, served static from DuckFS by
+                    consensus. Works now (the gateway browser plane is live).
   • app.$ID.duck  — user-hosted web app. The route is published, but a
                     user-hosted app is just that: run \`make demo-app\` to serve it
                     on the node's loopback, then it's live.

@@ -4,7 +4,7 @@ import { useRfb } from "../useRfb";
 import { ActivityFeed } from "./ActivityFeed";
 
 // Click-to-interact: a full-size, INTERACTIVE (viewOnly=false) session for one
-// worktree. Same token as its tile — websockify routes it to that VNC.
+// worktree. Same token as its tile — the fleet server routes it to that VNC.
 export function Drawer({
   node,
   onClose,

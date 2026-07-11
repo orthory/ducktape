@@ -286,6 +286,8 @@ describe("AgentView", () => {
       displayName: "Renamed Agent",
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
+      // the caps record rides every save (untouched field -> empty list).
+      caps: { pages_write: [] },
     });
   });
 

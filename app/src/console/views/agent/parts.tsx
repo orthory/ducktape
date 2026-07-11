@@ -9,7 +9,7 @@ import type { Channel } from "../../../domain/chat-client";
 import { sameKey } from "../../../domain/names";
 import type { PendingRun, TurnPolicy } from "../../../domain/runs-client";
 import { Icon } from "../../components/Icon";
-import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
+import { accentVar, color, font, radius, shadow, tint } from "../../theme/tokens";
 
 // ── Static labels ───────────────────────────────────────
 
@@ -17,6 +17,8 @@ export const ACTION_LABEL: Record<string, string> = {
   "chat.post": "Post to chat",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
+  "pages.comment": "Comment on pages",
+  "pages.set_checked": "Check off page todos",
 };
 
 // Permission checkboxes read as plain abilities ("what this agent can do"),
@@ -25,17 +27,24 @@ export const ACTION_HINT: Record<string, string> = {
   "chat.post": "Reply in chat",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
+  "pages.comment": "Comment on pages",
+  "pages.set_checked": "Check off page todos",
 };
+
+/** Parse the pages_write caps field: whitespace/comma-separated page ids,
+ *  the literal "*" allowed. The node canonicalizes (sort + dedup). */
+export const parsePagesWrite = (text: string): string[] =>
+  text.split(/[\s,]+/).filter(Boolean);
 
 export type Tone = { text: string; bg: string; border: string };
 
 export const statusTone = {
-  success: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
-  warning: { text: "#a07b32", bg: "#fbf4e6", border: "#ecdcae" },
-  danger: { text: "#a35248", bg: "#fbeeec", border: "#eccfc9" },
-  neutral: { text: "#7a6f9e", bg: "#f1edf5", border: "#ddd2e6" },
-  blue: { text: "#5f7a9e", bg: "#edf2f7", border: "#cfdae7" },
-  agent: { text: accentVar, bg: "#f9f1ea", border: "#e7d2c4" },
+  success: tint(color.green),
+  warning: tint(color.amber),
+  danger: tint(color.red),
+  neutral: tint(color.purple),
+  blue: tint(color.blue),
+  agent: tint(accentVar),
 } satisfies Record<string, Tone>;
 
 export const inputStyle: CSSProperties = {

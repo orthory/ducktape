@@ -1,6 +1,7 @@
 use super::response::RUNNER_RESULT_VERSION;
 use super::{
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, Deserialize,
+    ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, Deserialize,
     JOB_FINALIZE_PAYLOAD_BYTES, MAX_ACTIONS_PER_RUN, Serialize,
 };
 
@@ -74,9 +75,10 @@ pub(super) fn output_ref_of(receipt: &WorkspaceReceipt) -> Option<String> {
 }
 
 /// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
-/// (`tasks.create` / `tasks.update_status`); the remaining fields carry the
-/// action's payload. mapped to an [`AgentAction`] by [`effects_to_actions`],
-/// where an unknown `kind` fails the run deterministically (R4).
+/// (`tasks.create` / `tasks.update_status` / `pages.comment` /
+/// `pages.set_checked`); the remaining fields carry the action's payload.
+/// mapped to an [`AgentAction`] by [`effects_to_actions`], where an unknown
+/// `kind` fails the run deterministically (R4).
 #[derive(Deserialize, Debug)]
 pub(super) struct WireEffect {
     kind: String,
@@ -86,6 +88,18 @@ pub(super) struct WireEffect {
     title: String,
     #[serde(default)]
     status: String,
+    /// `pages.comment`: the page or block id the comment anchors to.
+    #[serde(default)]
+    target: String,
+    /// `pages.comment`: the comment text.
+    #[serde(default)]
+    body: String,
+    /// `pages.set_checked`: the todo block id.
+    #[serde(default)]
+    block: String,
+    /// `pages.set_checked`: the desired checked state.
+    #[serde(default)]
+    checked: bool,
 }
 
 /// the O1/O2 output sink. internally tagged on `mode`; a MISSING sink field
@@ -194,9 +208,11 @@ pub(super) fn decode_run_result_v1(bytes: &[u8]) -> Result<RunnerResult, String>
 }
 
 /// map host-assembled declarative effects into the validated [`AgentAction`]
-/// vocabulary. v1 vocab == today's two task verbs (chat.post is the message
-/// facet, not an effect). an UNKNOWN kind fails the run deterministically (R4)
-/// — this is the concrete gate for any verb beyond the 3-verb set.
+/// vocabulary: the two task verbs plus the two pages verbs (chat.post is the
+/// message facet, not an effect). an UNKNOWN kind fails the run
+/// deterministically (R4) — this is the concrete gate for any verb beyond the
+/// known set. payload validity is NOT checked here: task payloads are the
+/// strict validator's job, pages payloads degrade per-action at apply.
 pub(super) fn effects_to_actions(effects: &[WireEffect]) -> Result<Vec<AgentAction>, String> {
     if effects.len() > MAX_ACTIONS_PER_RUN {
         return Err(format!(
@@ -214,6 +230,14 @@ pub(super) fn effects_to_actions(effects: &[WireEffect]) -> Result<Vec<AgentActi
             ACTION_TASKS_UPDATE_STATUS => Ok(AgentAction::UpdateTaskStatus {
                 task_id: e.task_id.clone(),
                 status: e.status.clone(),
+            }),
+            ACTION_PAGES_COMMENT => Ok(AgentAction::AddPageComment {
+                target: e.target.clone(),
+                body: e.body.clone(),
+            }),
+            ACTION_PAGES_SET_CHECKED => Ok(AgentAction::SetPageChecked {
+                block: e.block.clone(),
+                checked: e.checked,
             }),
             other => Err(format!("unknown effect kind: {other}")),
         })

@@ -60,7 +60,7 @@ export function AccountView() {
         minHeight: 0,
         display: "flex",
         flexDirection: "column",
-        background: "#fcfcfc",
+        background: color.canvas,
         padding: 22,
         overflowY: "auto",
       }}

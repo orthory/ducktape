@@ -70,6 +70,9 @@
 mod interface;
 pub use interface::*;
 
+// the usage ledger: a node-local derived index over this module's op stream.
+pub mod index;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use capability::{
