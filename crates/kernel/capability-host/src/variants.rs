@@ -459,17 +459,22 @@ resume_args = ["resume", "stale-id"]
             crate::ResumeArgv::Append(vec!["--resume".into(), "{session_id}".into()]),
         );
 
-        // the full matrix is present: 16 codex + 16 claude variants + 2 bases.
-        for model in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
-            for effort in ["low", "medium", "high", "xhigh"] {
+        // the full matrix is present: 19 codex + 16 claude variants + 2 bases.
+        // codex efforts are per-model — the 5.6 family reaches `max`, 5.5 caps
+        // at `xhigh` — so the codex side is not a rectangle.
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
                 get(&format!("codex_{model}_{effort}"));
             }
+        }
+        for effort in ["low", "medium", "high", "xhigh"] {
+            get(&format!("codex_gpt-5.5_{effort}"));
         }
         for model in ["fable", "opus", "sonnet", "haiku"] {
             for effort in ["low", "medium", "high", "max"] {
                 get(&format!("claude_{model}_{effort}"));
             }
         }
-        assert_eq!(specs.len(), 34, "2 bases + 16 codex + 16 claude variants");
+        assert_eq!(specs.len(), 37, "2 bases + 19 codex + 16 claude variants");
     }
 }

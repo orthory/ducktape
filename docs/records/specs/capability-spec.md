@@ -377,9 +377,10 @@ anywhere in the invoke path.
 
 The embedded built-ins use this to ship a curated model/effort matrix:
 `codex` (base) plus
-`codex_{gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex-spark}_{low,medium,high,xhigh}`,
-and `claude` (base) plus
-`claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
+`codex_{gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna}_{low,medium,high,xhigh,max}`
+and `codex_gpt-5.5_{low,medium,high,xhigh}` (the effort set follows what each
+model actually supports, so the codex side is not a rectangle), and `claude`
+(base) plus `claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
 
 ---
 
