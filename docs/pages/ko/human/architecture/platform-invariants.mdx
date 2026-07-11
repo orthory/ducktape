@@ -46,5 +46,5 @@ git-head root, canonical in-memory snapshot 모두 같은 방식으로 합성된
 ## Single-Store Step
 
 결정적 step은 하나의 store에 write한다. cross-store work는 follow-up message
-또는 saga/reactor pattern으로 순서화한다. 이 규칙은 two-phase commit을 피하면서
+또는 saga/worker pattern으로 순서화한다. 이 규칙은 two-phase commit을 피하면서
 호스트가 block-level atomicity를 제공하게 한다.

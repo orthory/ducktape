@@ -91,12 +91,19 @@ same PR when a wire type it speaks changes.
 
 ## Status
 
-- [x] Batch 1 — kernel (PR): state→host, reactor→host (worker seam; dead `Reactor` struct deleted), node gossip cluster deleted, consensus BLS/V2 surface deleted + spawn dedup, statesync/recovery compat-decode deletions (wire + checkpoint flag days), capability-host API diet, indexer trims. 53→51 crates.
-- [ ] Batch 2 — system core
-- [ ] Batch 3 — network cluster
-- [ ] Batch 4 — storage & naming
-- [ ] Batch 5 — apps A
-- [ ] Batch 6 — apps B
-- [ ] Batch 7 — bins
-- [ ] Batch 8 — bin/node
-- [ ] Batch 9 — shell
+- [x] Batch 1 — kernel (PR #391): state→host, reactor→host (worker seam; dead `Reactor` struct deleted), node gossip cluster deleted, consensus BLS/V2 surface deleted + spawn dedup, statesync/recovery compat-decode deletions (wire + checkpoint flag days), capability-host API diet, indexer trims. 53→51 crates.
+- [x] Batch 2 — system core (PR #394): shared `sdk::codec`, `valset::mesh` deleted, section-encoding collapse, dispatch poison fixes, dispatch-oracle prune.
+- [x] Batch 3 — network cluster (PR #400): wireguard-upgrade + wireguard-effect merged into `system/wireguard` (effect submodule), relay/dial-failure apparatus deleted, nat/data-plane/overlay trims.
+- [x] Batch 4 — storage & naming (PR #398): duckdns-core merged into `system/duckdns`, gateway on `sdk::codec`, duckfs trims, bin/fs readdir fix.
+- [x] Batch 5 — apps A (PR #403): chat/forge/pages/agent trims, MoveBlock indexer fix.
+- [x] Batch 6 — apps B (PR #404): v2 run-envelope machinery deleted, small apps on `sdk::codec`, saga-wedge cap, `FsCap` deleted.
+- [x] Batch 7 — bins (PR #407): demo's toy state-sync stack deleted, noded lib split into 7 modules with forge/duckfs reuse.
+- [x] Batch 8 — bin/node (PR #411): config.rs split into `config/`, hex/OverlayBook/members dedup, module-registry compile guard, catchup/drain extraction.
+- [x] Batch 9 — shell (PR #408): dead gateway window path + legacy identity command + notify dead-target machinery deleted, workspaces split.
+
+Bonus fixes surfaced by the sweep: PR #396 (simnode registers `evm` —
+noded↔simnode genesis parity restored), PR #402 (consensus descent
+`debug_assert` regression that panicked a mid-epoch joiner, removed).
+
+Capstone (architecture-docs refresh to the post-refactor crate set): in
+progress.

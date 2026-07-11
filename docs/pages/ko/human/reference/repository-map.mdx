@@ -13,14 +13,20 @@ workspace는 platform layer별로 구성되어 있다.
 ## Kernel
 
 - `crates/kernel/sdk`: module contract, context, message, event, effect, origin,
-  deterministic environment, `StateRoot`.
-- `crates/kernel/state`: 정렬된 module root 위의 global app-hash composition.
+  deterministic environment, `StateRoot`, 공유 snapshot codec(`sdk::codec`).
 - `crates/kernel/host`: registry, dispatch, follow-up drain, block commit/abort
-  lifecycle.
+  lifecycle, global app-hash composition, non-deterministic worker
+  seam(`host::worker`).
 - `crates/kernel/node`: host와 orderer 사이의 loopback 및 ordered node seam.
 - `crates/kernel/consensus`: commonware Simplex orderer, content store, relay,
   finalized inbox, resolver fetch, scheme boundary.
-- `crates/kernel/reactor`: non-deterministic effect를 위한 host-owned worker loop.
+- `crates/kernel/statesync`: network state-sync wire protocol과 p2p binding.
+- `crates/kernel/recovery`: restart durability — op journal, checkpoint,
+  boot-time replay.
+- `crates/kernel/indexer`: finalized op stream에서 파생되는 node-local read
+  index. app-hash에는 절대 포함되지 않는다.
+- `crates/system/capability-host`: capability seam 뒤의 machine-local executor
+  provider.
 
 ## System
 
@@ -28,6 +34,19 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/system/valset`: ed25519 validator membership module.
 - `crates/system/saga`: async workflow의 deterministic continuation state.
 - `crates/system/governance`: valset 위의 validator-set governance.
+- `crates/system/identity`: canonical account, member key, display name, node
+  binding.
+- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming. node나
+  service directory는 없다.
+- `crates/system/wireguard`: validator-set 기반 WireGuard tunnel-upgrade
+  protocol. `wireguard::effect`가 apply layer다.
+- `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
+  hole punch, WireGuard mesh orchestrator, off-consensus byte transport,
+  overlay seam.
+- `crates/system/upgrade`, `capability`, `dispatch`, `tagging`: upgrade state,
+  executor capability, capability-routed dispatch, engagement routing.
+- `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local blob
+  store, `.duck` gateway route state, host-side dispatch worker.
 - wire surface: 각 module이 types-only payload와 query shape를 crate root(`src/interface.rs`)에 공개한다.
 
 ## Apps
@@ -46,10 +65,18 @@ workspace는 platform layer별로 구성되어 있다.
 
 ## Examples and Binaries
 
-- `crates/examples/directory`: test와 demo에서 쓰는 state-based directory module.
+- `crates/examples/directory`: state-based directory module. `bin/node`에
+  production canary로 등록되어 있다.
 - `crates/examples/greeter`: follow-up write를 emit하는 demo module.
+- `crates/examples/evm`: QMDB-backed experimental EVM module.
+  `noded`/`simnode` genesis에 등록되어 있다.
 - `bin/demo`: registered module set의 in-process walkthrough.
 - `bin/node`: real-socket validator process와 two-process demo.
+- `bin/noded`: app HTTP/WebSocket surface 뒤의 daemon.
+- `bin/simnode`: deterministic scenario node — test-scripted block producer 위의
+  noded `/v1` wire.
+- `bin/fs`: `ducktape-fs`, duckfs working-copy CLI(FUSE는 feature gate).
+- `bin/coordinator`: public/private rendezvous·STUN helper.
 
 ## Docs
 

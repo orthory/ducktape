@@ -29,7 +29,7 @@ and the runtime contract
   `DUCKTAPE_PROVIDER_TIMEOUT_SECS=<secs>` on the node process overrides every
   spec's *idle* timeout at once (built-in agentic specs default to 600 s).
   The hard wall-clock cap is always **idle × 6** (`HARD_TIMEOUT_FACTOR`,
-  `crates/kernel/capability-host/src/lib.rs`) — a first `cargo build` in a
+  `crates/system/capability-host/src/lib.rs`) — a first `cargo build` in a
   fresh worktree can exceed the default ceiling, and the child is killed at
   the cap even while producing output.
 
