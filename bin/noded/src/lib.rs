@@ -571,6 +571,16 @@ pub struct GatewayResponse {
     pub body: Vec<u8>,
 }
 
+/// One WebSocket message crossing the browser↔mesh boundary on the caller
+/// side. The WS door translates these to/from axum WebSocket frames; the mesh
+/// caller pump translates them to/from the proxy `WsFrame`/`WsClose` frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayWsMsg {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayFailure {
     Invalid(String),

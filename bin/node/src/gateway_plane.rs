@@ -1013,6 +1013,71 @@ where
     }
 }
 
+/// Caller side of a WebSocket upgrade: bridge the browser's message channels to
+/// the mesh stream (already past the `101` ack). Mirrors [`ws_pump`] with the
+/// roles reversed — the noded WS door owns the browser/axum translation. Kept
+/// here so the two directions of the tunnel share one frame codec.
+#[allow(dead_code)] // consumed by the noded WS door (PR-3, browser-facing).
+async fn caller_ws_pump<S>(
+    mesh: S,
+    to_browser: tokio::sync::mpsc::Sender<noded::GatewayWsMsg>,
+    mut from_browser: tokio::sync::mpsc::Receiver<noded::GatewayWsMsg>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use noded::GatewayWsMsg;
+    let (mut mesh_read, mut mesh_write) = tokio::io::split(mesh);
+    let mut to_browser_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        loop {
+            match read_frame(&mut mesh_read, &mut buf).await {
+                Ok(gateway::ProxyFrame::WsFrame { binary, payload }) => {
+                    let message = if binary {
+                        GatewayWsMsg::Binary(payload)
+                    } else {
+                        GatewayWsMsg::Text(String::from_utf8_lossy(&payload).into_owned())
+                    };
+                    if to_browser.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(gateway::ProxyFrame::WsClose { code }) => {
+                    let _ = to_browser.send(GatewayWsMsg::Close(code)).await;
+                    break;
+                }
+                _ => break,
+            }
+        }
+    });
+    let mut from_browser_task = tokio::spawn(async move {
+        while let Some(message) = from_browser.recv().await {
+            let frame = match message {
+                GatewayWsMsg::Text(text) => gateway::ProxyFrame::WsFrame {
+                    binary: false,
+                    payload: text.into_bytes(),
+                },
+                GatewayWsMsg::Binary(bytes) => gateway::ProxyFrame::WsFrame {
+                    binary: true,
+                    payload: bytes,
+                },
+                GatewayWsMsg::Close(code) => gateway::ProxyFrame::WsClose { code },
+            };
+            let closing = matches!(frame, gateway::ProxyFrame::WsClose { .. });
+            if write_frame(&mut mesh_write, &frame).await.is_err() {
+                break;
+            }
+            let _ = mesh_write.flush().await;
+            if closing {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut to_browser_task => from_browser_task.abort(),
+        _ = &mut from_browser_task => to_browser_task.abort(),
+    }
+}
+
 /// Map a typed failure onto a wire frame, redacting `Unavailable` detail
 /// (which may carry a workspace path / loopback port / library diagnostic).
 fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
@@ -1351,6 +1416,41 @@ mod tests {
             }
             other => panic!("expected an echoed ws frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn caller_ws_pump_bridges_browser_channel_to_mesh() {
+        // A fake publisher end of the mesh that echoes every WsFrame.
+        let (mesh_caller, mesh_publisher) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut publisher = mesh_publisher;
+            let mut buf = Vec::new();
+            loop {
+                match read_frame(&mut publisher, &mut buf).await {
+                    Ok(frame @ gateway::ProxyFrame::WsFrame { .. }) => {
+                        if write_frame(&mut publisher, &frame).await.is_err() {
+                            break;
+                        }
+                        let _ = publisher.flush().await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel(8);
+        let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(caller_ws_pump(mesh_caller, to_browser_tx, from_browser_rx));
+
+        // A browser message crosses to the mesh, is echoed, and comes back.
+        from_browser_tx
+            .send(noded::GatewayWsMsg::Text("hi".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            to_browser_rx.recv().await,
+            Some(noded::GatewayWsMsg::Text("hi".into()))
+        );
     }
 
     #[test]
