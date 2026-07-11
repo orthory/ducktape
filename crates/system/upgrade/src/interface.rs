@@ -96,9 +96,9 @@ pub fn decode_reply(b: &[u8]) -> Result<UpgradeReply, String> {
 
 /// the ONE arming predicate, as a pure/total function of committed coordinates:
 /// no IO, clock, or RNG; identical on every node (live, replay, state-sync). the
-/// module's `Advance` handler and its `effective_version(&self, ..)` helper both
-/// route through this, so the version derivation can never drift from the arm
-/// check (risk R4). returns `pending.to_version` when the pending upgrade is
+/// module's `Advance` handler routes through this, so the version derivation can
+/// never drift from the arm check (risk R4). returns `pending.to_version` when
+/// the pending upgrade is
 /// ARMED at `height` — `pending.is_some()`, `height >= activation_height`,
 /// `boundary_members` non-empty, and every boundary member present in `ready` —
 /// otherwise `current`.

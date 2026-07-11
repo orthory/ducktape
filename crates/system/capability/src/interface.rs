@@ -59,7 +59,9 @@ pub enum CapabilityQuery {
     Providers { capability: String },
     /// the capability set a single node announced (empty if absent).
     Node { node: Vec<u8> },
-    /// the full registry, sorted by node key.
+    /// the full registry, sorted by node key. no Rust constructor exists —
+    /// this is the desktop app's registry-enumeration read (the executor
+    /// picker and per-member capability display), submitted as wire JSON.
     All,
 }
 

@@ -21,22 +21,19 @@
 
 use serde::{Deserialize, Serialize};
 
-/// the conventional module id the tagging plane registers under.
-pub const DEFAULT_TAGGING_TARGET: &str = "tagging";
-
 // ---- consensus constants ----------------------------------------------------
 
 /// hard cap on a container or entity id.
-pub const MAX_ID_BYTES: usize = 128;
+pub(crate) const MAX_ID_BYTES: usize = 128;
 
 /// hard cap on the entity tags one content item may carry; a longer list is
 /// truncated deterministically (first wins), never rejected — the tag intake
 /// is a no-fail arm.
-pub const MAX_TAGS_PER_EVENT: usize = 16;
+pub(crate) const MAX_TAGS_PER_EVENT: usize = 16;
 
 /// hard cap on subscriber modules per (source, container) scope — the bound
 /// on the engagement fan-out one content item can cause.
-pub const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
+pub(crate) const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
 
 // ---- the universal entity reference ------------------------------------------
 
@@ -113,32 +110,6 @@ pub struct EngagementEvent {
     pub tags: Vec<EntityRef>,
 }
 
-// ---- queries --------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaggingQuery {
-    /// every subscription scope with its subscriber set.
-    Subscriptions,
-    /// one scope's subscriber set (empty == no subscription).
-    Subscribers { source: String, container: String },
-}
-
-/// one subscription scope's observable state.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SubscriptionView {
-    pub source: String,
-    pub container: String,
-    pub subscribers: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaggingReply {
-    Subscriptions(Vec<SubscriptionView>),
-    Subscribers(Vec<String>),
-}
-
 // ---- codecs ---------------------------------------------------------------------
 
 pub fn encode_msg(m: &TaggingMsg) -> Vec<u8> {
@@ -151,17 +122,5 @@ pub fn encode_event(e: &EngagementEvent) -> Vec<u8> {
     serde_json::to_vec(e).expect("serializable")
 }
 pub fn decode_event(b: &[u8]) -> Result<EngagementEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
-}
-pub fn encode_query(q: &TaggingQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
-}
-pub fn decode_query(b: &[u8]) -> Result<TaggingQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
-}
-pub fn encode_reply(r: &TaggingReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
-}
-pub fn decode_reply(b: &[u8]) -> Result<TaggingReply, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }

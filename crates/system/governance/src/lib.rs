@@ -43,6 +43,7 @@ use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
+use sdk::codec::{Cursor, push_bytes};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use upgrade::{UpgradeMsg, encode_msg as upgrade_encode_msg};
@@ -116,8 +117,7 @@ pub struct Governance {
     /// read ahead of committed state, merged at `commit_block`.
     pending: BTreeMap<String, Proposal>,
     /// committed invite redemptions by token nonce — the exactly-once set.
-    /// folded into `root()`/`snapshot()` only when non-empty, so every
-    /// pre-invite state keeps its historical root bytes.
+    /// folded into `root()`/`snapshot()` after the proposal section.
     redeemed: BTreeMap<Vec<u8>, Redemption>,
     /// this block's staged redemptions, same discipline as `pending`.
     pending_redeemed: BTreeMap<Vec<u8>, Redemption>,
@@ -179,20 +179,9 @@ impl Governance {
     }
 
     /// the CURRENT member set: the valset module's staged-over-committed
-    /// projection, via the host-routed read lane.
+    /// projection, via the shared `valset::members` read.
     async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
-        let reply = ctx
-            .query(
-                &self.valset_id,
-                &valset_encode_query(&ValsetQuery::Validators),
-            )
-            .await?;
-        match valset_decode_reply(&reply).map_err(Error::Module)? {
-            ValsetReply::Validators(members) => Ok(members),
-            other => Err(Error::Module(format!(
-                "valset answered a Validators query with {other:?}"
-            ))),
-        }
+        valset::members(ctx, &self.valset_id).await
     }
 
     async fn require_member(&self, ctx: &dyn Ctx, key: &[u8]) -> Result<(), Error> {
@@ -482,16 +471,13 @@ impl Governance {
                 out.push(u8::from(*approve));
             }
         }
-        // the redemption section rides ONLY when non-empty: every pre-invite
-        // state keeps its exact historical root and snapshot bytes.
-        if !redeemed.is_empty() {
-            out.extend_from_slice(&(redeemed.len() as u64).to_le_bytes());
-            for (nonce, r) in redeemed {
-                push_bytes(&mut out, nonce);
-                push_bytes(&mut out, &r.joiner);
-                push_bytes(&mut out, &r.issuer);
-                out.extend_from_slice(&r.height.to_le_bytes());
-            }
+        // the redemption section: count, then per sorted nonce its record.
+        out.extend_from_slice(&(redeemed.len() as u64).to_le_bytes());
+        for (nonce, r) in redeemed {
+            push_bytes(&mut out, nonce);
+            push_bytes(&mut out, &r.joiner);
+            push_bytes(&mut out, &r.issuer);
+            out.extend_from_slice(&r.height.to_le_bytes());
         }
         let frozen: Vec<(&String, &Electorate)> = proposals
             .iter()
@@ -903,9 +889,8 @@ impl Governance {
                     target: self.upgrade_id.clone(),
                     payload: upgrade_encode_msg(&UpgradeMsg::Cancel { name: name.clone() }),
                 }),
-                // the staged-admission grant/revoke: valset re-gates on the
-                // protocol version (defense in depth for direct submits) and
-                // owns the validator-overlap rule.
+                // the staged-admission grant/revoke: valset owns the
+                // validator-overlap rule.
                 GovAction::AddResident { key } => ctx.emit_msg(Msg {
                     target: self.valset_id.clone(),
                     payload: valset_encode_msg(&ValsetMsg::Grant { key: key.clone() }),
@@ -1062,9 +1047,9 @@ impl Module for Governance {
         self.id.clone()
     }
 
-    /// sha256 over the canonical encoding of COMMITTED proposals (plus the
-    /// redemption section when non-empty); `ZERO` when none exist (the sdk's
-    /// uninitialized-module sentinel).
+    /// sha256 over the canonical encoding of COMMITTED proposals and
+    /// redemptions; `ZERO` when none exist (the sdk's uninitialized-module
+    /// sentinel).
     fn root(&self) -> StateRoot {
         Self::root_of(
             &self.proposals,
@@ -1166,51 +1151,7 @@ impl Module for Governance {
     }
 }
 
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 // ---- strict snapshot decode (untrusted bytes) -------------------------------
-
-fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
-    let Some((head, rest)) = buf.split_first_chunk::<8>() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    *buf = rest;
-    Ok(u64::from_le_bytes(*head))
-}
-
-fn take_u32(buf: &mut &[u8]) -> Result<u32, Error> {
-    let Some((head, rest)) = buf.split_first_chunk::<4>() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    *buf = rest;
-    Ok(u32::from_le_bytes(*head))
-}
-
-fn take_u8(buf: &mut &[u8]) -> Result<u8, Error> {
-    let Some((head, rest)) = buf.split_first() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    let v = *head;
-    *buf = rest;
-    Ok(v)
-}
-
-fn take_vec(buf: &mut &[u8]) -> Result<Vec<u8>, Error> {
-    let len = take_u64(buf)?;
-    if len > buf.len() as u64 {
-        return Err(Error::Module("snapshot length exceeds buffer".into()));
-    }
-    let (head, rest) = buf.split_at(len as usize);
-    *buf = rest;
-    Ok(head.to_vec())
-}
-
-fn take_string(buf: &mut &[u8]) -> Result<String, Error> {
-    String::from_utf8(take_vec(buf)?).map_err(|_| Error::Module("snapshot: bad utf-8".into()))
-}
 
 type DecodedState = (
     BTreeMap<String, Proposal>,
@@ -1220,49 +1161,47 @@ type DecodedState = (
 );
 
 fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
-    let mut buf = bytes;
-    let count = take_u64(&mut buf)?;
+    let mut cur = Cursor::new(bytes);
+    let count = cur.u64("snapshot proposal count")?;
     // every proposal costs at least its id length prefix — a forged count can
     // never drive allocation past the buffer.
-    if count > (buf.len() / 8) as u64 {
-        return Err(Error::Module("snapshot count exceeds buffer".into()));
-    }
+    cur.bound(count, 8, "snapshot proposal")?;
     let mut proposals = BTreeMap::new();
     let mut prev_id: Option<String> = None;
     for _ in 0..count {
-        let id = take_string(&mut buf)?;
+        let id = cur.string("snapshot proposal id")?;
         // strictly increasing ids: one state has exactly one encoding.
         if prev_id.as_deref().is_some_and(|p| p >= id.as_str()) {
             return Err(Error::Module(
                 "snapshot proposal ids must be strictly increasing".into(),
             ));
         }
-        let action = match take_u8(&mut buf)? {
+        let action = match cur.byte("snapshot action tag")? {
             0 => GovAction::AddValidator {
-                key: take_vec(&mut buf)?,
+                key: cur.bytes("snapshot key")?.to_vec(),
             },
             1 => GovAction::RemoveValidator {
-                key: take_vec(&mut buf)?,
+                key: cur.bytes("snapshot key")?.to_vec(),
             },
             2 => GovAction::Signal {
-                text: take_string(&mut buf)?,
+                text: cur.string("snapshot signal text")?,
             },
             3 => GovAction::ScheduleUpgrade {
-                name: take_string(&mut buf)?,
-                activation_height: take_u64(&mut buf)?,
-                to_version: take_u32(&mut buf)?,
+                name: cur.string("snapshot upgrade name")?,
+                activation_height: cur.u64("snapshot activation height")?,
+                to_version: cur.u32("snapshot to_version")?,
             },
             4 => GovAction::CancelUpgrade {
-                name: take_string(&mut buf)?,
+                name: cur.string("snapshot upgrade name")?,
             },
             5 => GovAction::AddResident {
-                key: take_vec(&mut buf)?,
+                key: cur.bytes("snapshot key")?.to_vec(),
             },
             6 => GovAction::RemoveResident {
-                key: take_vec(&mut buf)?,
+                key: cur.bytes("snapshot key")?.to_vec(),
             },
             7 => {
-                let allocation_count = take_u64(&mut buf)?;
+                let allocation_count = cur.u64("snapshot allocation count")?;
                 if allocation_count == 0 || allocation_count > MAX_SHARE_ACCOUNTS as u64 {
                     return Err(Error::Module(
                         "snapshot initial shares have an invalid account count".into(),
@@ -1271,8 +1210,8 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                 let mut allocations = Vec::with_capacity(allocation_count as usize);
                 let mut powers = BTreeMap::new();
                 for _ in 0..allocation_count {
-                    let account_id = take_vec(&mut buf)?;
-                    let shares = take_u64(&mut buf)?;
+                    let account_id = cur.bytes("snapshot allocation account")?.to_vec();
+                    let shares = cur.u64("snapshot allocation shares")?;
                     if shares == 0 || powers.insert(account_id.clone(), shares).is_some() {
                         return Err(Error::Module(
                             "snapshot initial shares are zero or duplicated".into(),
@@ -1292,49 +1231,35 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                 GovAction::AdoptShares { allocations }
             }
             8 => GovAction::SetShares {
-                account_id: take_vec(&mut buf)?,
-                shares: take_u64(&mut buf)?,
+                account_id: cur.bytes("snapshot account id")?.to_vec(),
+                shares: cur.u64("snapshot shares")?,
             },
             9 => GovAction::SetShareMode {
-                enabled: match take_u8(&mut buf)? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(Error::Module(format!(
-                            "snapshot share-mode action must be 0 or 1, got {other}"
-                        )));
-                    }
-                },
+                enabled: cur.bool("snapshot share-mode action")?,
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };
-        let proposer = take_vec(&mut buf)?;
-        let created_at = take_u64(&mut buf)?;
-        let deadline = take_u64(&mut buf)?;
-        let status = match take_u8(&mut buf)? {
+        let proposer = cur.bytes("snapshot proposer")?.to_vec();
+        let created_at = cur.u64("snapshot created_at")?;
+        let deadline = cur.u64("snapshot deadline")?;
+        let status = match cur.byte("snapshot status tag")? {
             0 => ProposalStatus::Open,
             1 => ProposalStatus::Passed,
             2 => ProposalStatus::Rejected,
             other => return Err(Error::Module(format!("snapshot: bad status tag {other}"))),
         };
-        let vote_count = take_u64(&mut buf)?;
-        if vote_count > (buf.len() / 9) as u64 {
-            return Err(Error::Module("snapshot vote count exceeds buffer".into()));
-        }
+        let vote_count = cur.u64("snapshot vote count")?;
+        cur.bound(vote_count, 9, "snapshot vote")?;
         let mut votes = BTreeMap::new();
         let mut prev_voter: Option<Vec<u8>> = None;
         for _ in 0..vote_count {
-            let voter = take_vec(&mut buf)?;
+            let voter = cur.bytes("snapshot voter")?.to_vec();
             if prev_voter.as_deref().is_some_and(|p| p >= voter.as_slice()) {
                 return Err(Error::Module(
                     "snapshot voters must be strictly increasing".into(),
                 ));
             }
-            let approve = match take_u8(&mut buf)? {
-                0 => false,
-                1 => true,
-                other => return Err(Error::Module(format!("snapshot: bad ballot {other}"))),
-            };
+            let approve = cur.bool("snapshot ballot")?;
             prev_voter = Some(voter.clone());
             votes.insert(voter, approve);
         }
@@ -1352,60 +1277,47 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             },
         );
     }
-    // The legacy optional redemption section comes before the share extension.
-    // An extension without redemptions starts directly with its magic marker.
+    // the redemption section always rides, then the optional share extension.
+    let rcount = cur.u64("snapshot redemption count")?;
+    cur.bound(rcount, 8, "snapshot redemption")?;
     let mut redeemed = BTreeMap::new();
-    if !buf.is_empty() && !buf.starts_with(SHARES_EXT_MAGIC) {
-        let rcount = take_u64(&mut buf)?;
-        if rcount == 0 {
+    let mut prev_nonce: Option<Vec<u8>> = None;
+    for _ in 0..rcount {
+        let nonce = cur.bytes("snapshot redemption nonce")?.to_vec();
+        if prev_nonce.as_deref().is_some_and(|p| p >= nonce.as_slice()) {
             return Err(Error::Module(
-                "snapshot carries an explicit empty redemption section".into(),
+                "snapshot redemption nonces must be strictly increasing".into(),
             ));
         }
-        if rcount > (buf.len() / 8) as u64 {
-            return Err(Error::Module(
-                "snapshot redemption count exceeds buffer".into(),
-            ));
-        }
-        let mut prev_nonce: Option<Vec<u8>> = None;
-        for _ in 0..rcount {
-            let nonce = take_vec(&mut buf)?;
-            if prev_nonce.as_deref().is_some_and(|p| p >= nonce.as_slice()) {
-                return Err(Error::Module(
-                    "snapshot redemption nonces must be strictly increasing".into(),
-                ));
-            }
-            let joiner = take_vec(&mut buf)?;
-            let issuer = take_vec(&mut buf)?;
-            let height = take_u64(&mut buf)?;
-            prev_nonce = Some(nonce.clone());
-            redeemed.insert(
-                nonce,
-                Redemption {
-                    joiner,
-                    issuer,
-                    height,
-                },
-            );
-        }
+        let joiner = cur.bytes("snapshot redemption joiner")?.to_vec();
+        let issuer = cur.bytes("snapshot redemption issuer")?.to_vec();
+        let height = cur.u64("snapshot redemption height")?;
+        prev_nonce = Some(nonce.clone());
+        redeemed.insert(
+            nonce,
+            Redemption {
+                joiner,
+                issuer,
+                height,
+            },
+        );
     }
 
-    let (shares, share_mode) = if buf.is_empty() {
+    let (shares, share_mode) = if cur.remaining() == 0 {
         (None, false)
     } else {
-        if !buf.starts_with(SHARES_EXT_MAGIC) {
+        if cur.array::<8>("snapshot share-extension magic")? != *SHARES_EXT_MAGIC {
             return Err(Error::Module("snapshot carries trailing bytes".into()));
         }
-        buf = &buf[SHARES_EXT_MAGIC.len()..];
-        if take_u8(&mut buf)? != 1 {
+        if cur.byte("snapshot share-extension version")? != 1 {
             return Err(Error::Module(
                 "snapshot has an unsupported governance-share extension".into(),
             ));
         }
-        let shares = match take_u8(&mut buf)? {
+        let shares = match cur.byte("snapshot share-active flag")? {
             0 => None,
             1 => {
-                let share_count = take_u64(&mut buf)?;
+                let share_count = cur.u64("snapshot share count")?;
                 if share_count == 0 || share_count > MAX_SHARE_ACCOUNTS as u64 {
                     return Err(Error::Module(
                         "snapshot share registry has an invalid account count".into(),
@@ -1414,7 +1326,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                 let mut map = BTreeMap::new();
                 let mut previous: Option<Vec<u8>> = None;
                 for _ in 0..share_count {
-                    let account_id = take_vec(&mut buf)?;
+                    let account_id = cur.bytes("snapshot share account")?.to_vec();
                     if previous
                         .as_deref()
                         .is_some_and(|prev| prev >= account_id.as_slice())
@@ -1423,7 +1335,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                             "snapshot share accounts must be strictly increasing".into(),
                         ));
                     }
-                    let power = take_u64(&mut buf)?;
+                    let power = cur.u64("snapshot share power")?;
                     if power == 0 {
                         return Err(Error::Module(
                             "snapshot share power must be positive".into(),
@@ -1442,7 +1354,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             }
         };
 
-        let meta_count = take_u64(&mut buf)?;
+        let meta_count = cur.u64("snapshot electorate count")?;
         if meta_count > proposals.len() as u64 {
             return Err(Error::Module(
                 "snapshot has more electorates than proposals".into(),
@@ -1450,7 +1362,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
         }
         let mut previous_id: Option<String> = None;
         for _ in 0..meta_count {
-            let id = take_string(&mut buf)?;
+            let id = cur.string("snapshot electorate id")?;
             if previous_id
                 .as_deref()
                 .is_some_and(|prev| prev >= id.as_str())
@@ -1459,7 +1371,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                     "snapshot electorate ids must be strictly increasing".into(),
                 ));
             }
-            let voter_kind = match take_u8(&mut buf)? {
+            let voter_kind = match cur.byte("snapshot voter-kind tag")? {
                 0 => VoterKind::ValidatorNode,
                 1 => VoterKind::Account,
                 other => {
@@ -1468,13 +1380,13 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                     )));
                 }
             };
-            let rule = match take_u8(&mut buf)? {
+            let rule = match cur.byte("snapshot voting-rule tag")? {
                 0 => VotingRule::DynamicValidatorMajority,
                 1 => VotingRule::Threshold {
-                    required_yes: take_u64(&mut buf)?,
+                    required_yes: cur.u64("snapshot required_yes")?,
                 },
                 2 => VotingRule::ParticipatingMajority {
-                    quorum: take_u64(&mut buf)?,
+                    quorum: cur.u64("snapshot quorum")?,
                 },
                 other => {
                     return Err(Error::Module(format!(
@@ -1482,16 +1394,17 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                     )));
                 }
             };
-            let power_count = take_u64(&mut buf)?;
-            if power_count == 0 || power_count > (buf.len() / 16) as u64 {
+            let power_count = cur.u64("snapshot electorate power count")?;
+            if power_count == 0 {
                 return Err(Error::Module(
                     "snapshot electorate count exceeds buffer".into(),
                 ));
             }
+            cur.bound(power_count, 16, "snapshot electorate power")?;
             let mut powers = BTreeMap::new();
             let mut previous_principal: Option<Vec<u8>> = None;
             for _ in 0..power_count {
-                let principal = take_vec(&mut buf)?;
+                let principal = cur.bytes("snapshot electorate principal")?.to_vec();
                 if previous_principal
                     .as_deref()
                     .is_some_and(|prev| prev >= principal.as_slice())
@@ -1500,7 +1413,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                         "snapshot electorate must be strictly increasing".into(),
                     ));
                 }
-                let power = take_u64(&mut buf)?;
+                let power = cur.u64("snapshot electorate power")?;
                 if power == 0 {
                     return Err(Error::Module(
                         "snapshot electorate power must be positive".into(),
@@ -1549,20 +1462,12 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             });
             previous_id = Some(id);
         }
-        let share_mode = if buf.is_empty() {
+        let share_mode = if cur.remaining() == 0 {
             // Compatibility with the original extension: registry presence
             // implied that account shares governed future proposals.
             shares.is_some()
         } else {
-            match take_u8(&mut buf)? {
-                0 => false,
-                1 => true,
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot share-mode override must be 0 or 1, got {other}"
-                    )));
-                }
-            }
+            cur.bool("snapshot share-mode override")?
         };
         if share_mode && shares.is_none() {
             return Err(Error::Module(
@@ -1571,8 +1476,6 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
         }
         (shares, share_mode)
     };
-    if !buf.is_empty() {
-        return Err(Error::Module("snapshot carries trailing bytes".into()));
-    }
+    cur.finish("snapshot")?;
     Ok((proposals, redeemed, shares, share_mode))
 }

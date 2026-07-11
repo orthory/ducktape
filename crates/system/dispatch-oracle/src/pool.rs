@@ -255,9 +255,6 @@ async fn execute(
         // the tagged source (duckfs subtree or forge repo@commit) crosses to
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
-        // the composer emits SOURCE coords only (D7); the provisioner mints its
-        // own writable cwd, so mount_path is advisory-empty here.
-        mount_path: String::new(),
         base_tools: plan.base_tools,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
     };
@@ -1126,10 +1123,6 @@ format = "text"
                 branch: "agent/item-7".into(),
                 branch_born: false,
             }
-        );
-        assert_eq!(
-            spec.mount_path, "",
-            "the dead-advisory mount_path is NOT propagated for forge"
         );
     }
 

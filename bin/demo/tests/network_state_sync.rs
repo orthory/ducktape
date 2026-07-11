@@ -78,7 +78,7 @@ fn qmdb_target_payload_round_trips_through_frame() {
         resolver.insert_participant(MeshParticipant::validator_set_participant(source.clone()));
 
         let mut kv = Kv::init(context.child("source_kv"), "kv").await;
-        kv.set(b"greeting".to_vec(), b"hello".to_vec()).await;
+        kv.set(b"greeting".to_vec(), b"hello".to_vec()).await.expect("set");
         let target = kv.sync_target().await;
         let root = kv.root();
 

@@ -15,12 +15,11 @@
 //! the set; a [`ValsetMsg::Join`] on a current resident PROMOTES it (adds the
 //! validator, removes the resident, one block).
 //!
-//! ## root/snapshot compatibility
+//! ## root/snapshot encoding
 //!
-//! the root preimage and snapshot append the resident section ONLY when the
-//! resident set is non-empty: every pre-resident state (and every state that
-//! never grants) keeps its exact historical root and snapshot bytes — no
-//! migration, no dual-path root.
+//! the root preimage and snapshot always carry both sections — validators,
+//! then residents — each a count-prefixed sorted key list, so a given state
+//! has exactly one encoding.
 //!
 //! state model mirrors the directory module's host-lent staging seam:
 //! `execute` STAGES into a `pending` overlay (committed state untouched);
@@ -40,13 +39,12 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the validator mesh wire surface, kept as its own namespace.
-pub mod mesh;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
+use sdk::codec;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
@@ -63,8 +61,7 @@ pub struct Valset {
     /// merged into committed state (and `root()`) only on `commit_block`.
     pending: BTreeMap<Vec<u8>, bool>,
     /// committed RESIDENT standing (mesh + statesync, no quorum seat). folded
-    /// into `root()`/`snapshot()` only when non-empty — see the module doc's
-    /// compatibility note.
+    /// into `root()`/`snapshot()` as the second section.
     residents: BTreeSet<Vec<u8>>,
     /// resident changes staged during the current block, same discipline as
     /// `pending`.
@@ -155,34 +152,26 @@ impl Valset {
 
     /// canonical bytes of the COMMITTED state — exactly the byte stream `root()`
     /// hashes: the validator section (count u64-le, then per sorted key its len
-    /// u64-le + key bytes), then — ONLY when the resident set is non-empty — the
-    /// resident section in the same shape. the conditional append is the
-    /// compatibility invariant: with no residents this is byte-for-byte the
-    /// historical validators-only stream, so every pre-resident state keeps its
-    /// exact root. so for non-empty state `sha256(snapshot()) == root()`; fully
-    /// empty state snapshots to a lone zero count (root still `ZERO`, unhashed).
-    /// pending is deliberately excluded — a snapshot ships what consensus
-    /// committed to, and staged-but-uncommitted changes are not that.
+    /// u64-le + key bytes), then the resident section in the same shape. so for
+    /// non-empty state `sha256(snapshot()) == root()`; fully empty state
+    /// snapshots to two zero counts (root still `ZERO`, unhashed). pending is
+    /// deliberately excluded — a snapshot ships what consensus committed to,
+    /// and staged-but-uncommitted changes are not that.
     pub fn snapshot(&self) -> Vec<u8> {
-        let sized = |set: &BTreeSet<Vec<u8>>| 8 + set.iter().map(|k| 8 + k.len()).sum::<usize>();
-        let mut out = Vec::with_capacity(
-            sized(&self.validators)
-                + if self.residents.is_empty() {
-                    0
-                } else {
-                    sized(&self.residents)
-                },
-        );
-        let section = |out: &mut Vec<u8>, set: &BTreeSet<Vec<u8>>| {
+        Self::encode_membership(&self.validators, &self.residents)
+    }
+
+    /// the shared canonical encoding behind `snapshot` and `root_of`.
+    fn encode_membership(
+        validators: &BTreeSet<Vec<u8>>,
+        residents: &BTreeSet<Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for set in [validators, residents] {
             out.extend_from_slice(&(set.len() as u64).to_le_bytes());
             for k in set {
-                out.extend_from_slice(&(k.len() as u64).to_le_bytes());
-                out.extend_from_slice(k);
+                codec::push_bytes(&mut out, k);
             }
-        };
-        section(&mut out, &self.validators);
-        if !self.residents.is_empty() {
-            section(&mut out, &self.residents);
         }
         out
     }
@@ -209,45 +198,22 @@ impl Valset {
     }
 
     /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them):
-    /// the validator section, then an OPTIONAL resident section (present iff
-    /// bytes remain — the encoder omits it when empty, and an explicit empty
-    /// section is rejected so a given state has exactly one valid encoding).
-    /// the count and every key length are checked against the remaining buffer
-    /// BEFORE any allocation, truncation and trailing bytes both reject, and
-    /// keys must arrive strictly increasing per section — a peer cannot mint
-    /// alternative byte streams for one state.
+    /// the validator section, then the resident section. the count and every
+    /// key length are checked against the remaining buffer BEFORE any
+    /// allocation, truncation and trailing bytes both reject, and keys must
+    /// arrive strictly increasing per section — a peer cannot mint alternative
+    /// byte streams for one state.
     fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotMembership, Error> {
-        fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
-            let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
-                return Err(Error::Module("snapshot truncated".into()));
-            };
-            *buf = rest;
-            Ok(u64::from_le_bytes(*head))
-        }
-
-        fn take_section(buf: &mut &[u8]) -> Result<BTreeSet<Vec<u8>>, Error> {
-            let count = take_u64(buf)?;
+        fn take_section(cur: &mut codec::Cursor, what: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
+            let count = cur.u64(what)?;
             // each entry costs at least its 8-byte length prefix, so a count the
             // remaining bytes cannot possibly hold is rejected up front — a forged
             // count never drives allocation.
-            if count > (buf.len() / 8) as u64 {
-                return Err(Error::Module(format!(
-                    "snapshot count {count} exceeds the {} remaining bytes",
-                    buf.len()
-                )));
-            }
+            cur.bound(count, 8, what)?;
             let mut set = BTreeSet::new();
             let mut prev: Option<Vec<u8>> = None;
             for _ in 0..count {
-                let len = take_u64(buf)?;
-                if len > buf.len() as u64 {
-                    return Err(Error::Module(format!(
-                        "snapshot key length {len} exceeds the {} remaining bytes",
-                        buf.len()
-                    )));
-                }
-                let (key, rest) = buf.split_at(len as usize);
-                *buf = rest;
+                let key = cur.bytes(what)?;
                 if prev.as_deref().is_some_and(|p| p >= key) {
                     return Err(Error::Module(
                         "snapshot keys must be strictly increasing".into(),
@@ -259,51 +225,37 @@ impl Valset {
             Ok(set)
         }
 
-        let mut buf = bytes;
-        let validators = take_section(&mut buf)?;
-        let residents = if buf.is_empty() {
-            BTreeSet::new()
-        } else {
-            let residents = take_section(&mut buf)?;
-            if residents.is_empty() {
-                // the encoder omits an empty resident section — an explicit
-                // zero count would be a second encoding of the same state.
-                return Err(Error::Module(
-                    "snapshot carries an explicit empty resident section".into(),
-                ));
-            }
-            residents
-        };
-        if !buf.is_empty() {
-            return Err(Error::Module(format!(
-                "snapshot carries {} trailing bytes",
-                buf.len()
-            )));
-        }
+        let mut cur = codec::Cursor::new(bytes);
+        let validators = take_section(&mut cur, "snapshot validator")?;
+        let residents = take_section(&mut cur, "snapshot resident")?;
+        cur.finish("snapshot")?;
         Ok((validators, residents))
     }
 
     /// the state-based commitment: `ZERO` when both sets are empty, else sha256
-    /// over exactly the bytes `snapshot` emits (resident section only when
-    /// non-empty — the compatibility invariant). shared by `root()` (committed
+    /// over exactly the bytes `snapshot` emits. shared by `root()` (committed
     /// state) and `install` (a decoded candidate), so the two can never drift.
     fn root_of(validators: &BTreeSet<Vec<u8>>, residents: &BTreeSet<Vec<u8>>) -> StateRoot {
         if validators.is_empty() && residents.is_empty() {
             return StateRoot::ZERO;
         }
-        let mut h = Sha256::new();
-        let mut section = |set: &BTreeSet<Vec<u8>>| {
-            h.update((set.len() as u64).to_le_bytes());
-            for k in set {
-                h.update((k.len() as u64).to_le_bytes());
-                h.update(k);
-            }
-        };
-        section(validators);
-        if !residents.is_empty() {
-            section(residents);
-        }
-        StateRoot(h.finalize().into())
+        StateRoot(Sha256::digest(Self::encode_membership(validators, residents)).into())
+    }
+}
+
+/// the CURRENT member set of the valset module at `valset`: its
+/// staged-over-committed Validators projection, via the host-routed read lane.
+/// the one shared read every membership-gated module (governance, upgrade, …)
+/// funnels through.
+pub async fn members(ctx: &dyn Ctx, valset: &str) -> Result<Vec<Vec<u8>>, Error> {
+    let reply = ctx
+        .query(valset, &encode_query(&ValsetQuery::Validators))
+        .await?;
+    match decode_reply(&reply).map_err(Error::Module)? {
+        ValsetReply::Validators(members) => Ok(members),
+        other => Err(Error::Module(format!(
+            "valset answered a Validators query with {other:?}"
+        ))),
     }
 }
 
@@ -314,8 +266,8 @@ impl Module for Valset {
     }
 
     /// state-based commitment over the COMMITTED state: a length-prefixed
-    /// sha256 over the sorted validators (plus the resident section only when
-    /// non-empty). order-independent (BTreeSet) and idempotent. fully empty
+    /// sha256 over the sorted validators, then the sorted residents.
+    /// order-independent (BTreeSet) and idempotent. fully empty
     /// state reports `ZERO` — an empty/uninitialized module (matching the sdk
     /// `StateRoot::ZERO` doc and forge's unborn-repo root).
     fn root(&self) -> StateRoot {
@@ -818,8 +770,8 @@ mod tests {
         let bytes = src.snapshot();
         assert_eq!(
             bytes,
-            0u64.to_le_bytes().to_vec(),
-            "an empty set is a lone zero count"
+            [0u8; 16].to_vec(),
+            "an empty state is two zero section counts"
         );
 
         let mut dst = Valset::new("valset");
@@ -862,9 +814,9 @@ mod tests {
 
     #[test]
     fn grant_folds_the_root_only_while_residents_exist() {
-        // the compatibility invariant end to end: a validators-only state
-        // keeps its exact historical root; granting moves it; revoking the
-        // last resident returns it BYTE-IDENTICAL to the validators-only root.
+        // deterministic encoding end to end: granting moves the root; revoking
+        // the last resident returns it BYTE-IDENTICAL to the validators-only
+        // root and snapshot.
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::at_version(3);
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
@@ -951,8 +903,8 @@ mod tests {
         assert_eq!(validators(&dst), validators(&src));
         assert_eq!(residents(&dst), residents(&src));
 
-        // an EXPLICIT empty resident section is a second encoding of a
-        // validators-only state — reject it (single-encoding invariant).
+        // bytes past the resident section are trailing garbage — reject them
+        // (single-encoding invariant).
         let mut two_encodings = Valset::new("valset");
         let mut c2 = TestCtx::new();
         futures::executor::block_on(two_encodings.execute(&mut c2, &join(&valid_key(3)))).unwrap();
@@ -961,7 +913,7 @@ mod tests {
         padded.extend_from_slice(&0u64.to_le_bytes());
         let err = dst.install(&padded, two_encodings.root()).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("empty resident section")),
+            matches!(err, Error::Module(ref m) if m.contains("trailing bytes")),
             "got {err:?}"
         );
     }

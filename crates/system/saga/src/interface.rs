@@ -29,6 +29,7 @@
 //! the requester in the SAME block — requesters depend only on this crate to
 //! decode it. reads go via [`SagaQuery`] -> [`SagaReply`].
 
+use sdk::codec;
 use serde::{Deserialize, Serialize};
 
 /// a saga's stable id, chosen by the trigger.
@@ -80,6 +81,39 @@ pub enum SagaOrigin {
     System,
 }
 
+/// append a [`SagaOrigin`] in its canonical byte form: a single-byte
+/// discriminant, plus the length-prefixed key/module id for the carrying
+/// variants. shared with every module that folds a `SagaOrigin` into its own
+/// root preimage (dispatch's recipe owner), so the byte form exists once.
+pub fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
+    match origin {
+        SagaOrigin::External(key) => {
+            out.push(0);
+            codec::push_bytes(out, key);
+        }
+        SagaOrigin::Module(module) => {
+            out.push(1);
+            codec::push_str(out, module);
+        }
+        SagaOrigin::System => out.push(2),
+    }
+}
+
+/// decode a [`put_origin`] encoding off the cursor; unknown discriminants
+/// reject, so a state has exactly one valid encoding.
+pub fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, sdk::Error> {
+    Ok(match cur.byte("origin discriminant")? {
+        0 => SagaOrigin::External(cur.bytes("origin key")?.to_vec()),
+        1 => SagaOrigin::Module(cur.string("origin module")?),
+        2 => SagaOrigin::System,
+        d => {
+            return Err(sdk::Error::Module(format!(
+                "unknown origin discriminant {d}"
+            )));
+        }
+    })
+}
+
 /// ops targeting the saga module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -119,8 +153,7 @@ pub enum SagaMsg {
         /// set) is recorded but does not influence assignment. a dark pinned
         /// node burns attempts through lease expiry until the saga fails or
         /// times out — that is what static binding means. must be non-empty
-        /// when set. defaults to `None` so pre-existing encodings decode.
-        #[serde(default)]
+        /// when set.
         pinned_assignee: Option<Vec<u8>>,
     },
     /// worker completion for one attempt, submitted as an op. `outcome` is
@@ -267,7 +300,6 @@ pub struct SagaView {
     pub max_attempts: u32,
     pub assignee: Option<Vec<u8>>,
     /// the trigger's static binding, echoed onto every attempt's lease.
-    #[serde(default)]
     pub pinned_assignee: Option<Vec<u8>>,
     pub lease_views: Option<u64>,
     pub lease_expires_at: Option<u64>,

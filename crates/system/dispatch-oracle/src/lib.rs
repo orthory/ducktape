@@ -18,17 +18,12 @@
 //! assignment would be a no-op result, so not spawning is what turns
 //! N-nodes-each-paying-for-the-same-call into one call.
 //!
-//! two workers share ONE gate ([`gate`], so their verdicts can never drift):
-//!
-//! - [`DispatchWorker`] awaits the provider INLINE — the simple embedding for
-//!   tests and in-process reactors.
-//! - [`DispatchPool`] hands execution to a spawned background
-//!   task and returns immediately — what real hosts run, so a minutes-long
-//!   CLI call never stalls the host's event loop.
+//! the one worker is [`DispatchPool`]: it gates inline ([`gate`]), hands
+//! execution to a spawned background task, and returns immediately — so a
+//! minutes-long CLI call never stalls the host's event loop.
 
 use capability_host::ProviderSet;
 use dispatch::{WorkSpec, decode_work_spec};
-use host::worker::{WorkOutcome, Worker};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
 
@@ -36,21 +31,18 @@ mod envelope;
 mod pool;
 mod provision;
 mod workspace_source;
-pub use envelope::{BlobResolver, Prepared, RUN_ENVELOPE_VERSION, RUNNER_RESULT_VERSION};
-pub use pool::{
-    DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
-};
+pub use envelope::BlobResolver;
+pub use pool::{DeliverFn, DispatchPool, SpawnFn};
 pub use provision::{
-    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink,
-    Status, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result,
-    bind_workspace, effects_from_response_text,
+    ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
+    WorkspaceSpec,
 };
 pub use workspace_source::WorkspaceSource;
 
 /// everything a provider execution needs, extracted by the gate so the
 /// expensive run can happen away from the effect-offer callsite (on a spawned
 /// task, or inline — the gate does not care).
-pub struct ExecJob {
+pub(crate) struct ExecJob {
     pub saga_id: String,
     pub attempt: u32,
     pub capability: String,
@@ -61,7 +53,7 @@ pub struct ExecJob {
 /// the fast, deterministic half of the worker step: decode routing plus the
 /// lease gate. everything here is cheap; only [`Gated::Execute`] carries work
 /// that costs real time.
-pub enum Gated {
+pub(crate) enum Gated {
     /// not a dispatch `WorkSpec` effect — offer it to the next worker.
     NotMine,
     /// ours, deliberately not run (foreign lease, or an announcement this
@@ -76,7 +68,7 @@ pub enum Gated {
 }
 
 /// decode + lease-gate one effect against this host's provider surface.
-pub fn gate(providers: &ProviderSet, node_key: &[u8], effect: &Effect) -> Gated {
+pub(crate) fn gate(providers: &ProviderSet, node_key: &[u8], effect: &Effect) -> Gated {
     let request = match decode_worker_request(&effect.0) {
         Ok(request) => request,
         Err(_) => return Gated::NotMine,
@@ -136,73 +128,6 @@ fn gate_own_lease(providers: &ProviderSet, request: &WorkerRequest, work: WorkSp
         capability: work.capability,
         input,
     })
-}
-
-/// Inline worker for dispatch `WorkSpec` saga effects: gate, then await the
-/// provider on the caller's own task. real hosts run [`DispatchPool`]
-/// instead — an inline await stalls the host loop for the provider's whole
-/// runtime.
-pub struct DispatchWorker {
-    providers: ProviderSet,
-    /// this node's external submit key — compared against a request's
-    /// `assignee` to decide whether the lease is ours to execute.
-    node_key: Vec<u8>,
-    /// blob reads for envelope prompt resolution; `None` (the default) fails
-    /// prompt-pinned envelopes loudly — see [`envelope::prepare`].
-    resolver: Option<BlobResolver>,
-}
-
-impl DispatchWorker {
-    pub fn new(providers: ProviderSet, node_key: Vec<u8>) -> Self {
-        Self {
-            providers,
-            node_key,
-            resolver: None,
-        }
-    }
-
-    pub fn with_resolver(mut self, resolver: BlobResolver) -> Self {
-        self.resolver = Some(resolver);
-        self
-    }
-
-    async fn answer(&self, capability: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-        // payload shape first: this verdict must not depend on what happens
-        // to be installed on this host.
-        let input = String::from_utf8(payload.to_vec())
-            .map_err(|_| "dispatch payload is not utf-8; providers take text".to_string())?;
-        let provider = self.providers.resolve(capability)?;
-        // envelope payloads assemble (real prompt, run context); legacy flat
-        // strings pass through verbatim with a default context. the inline
-        // worker has no provisioner seam, so a v3 plan (if any) is ignored —
-        // it never materializes a portable mount; the real portable path is
-        // DispatchPool.
-        let Prepared { input, ctx, .. } = envelope::prepare(&input, self.resolver.as_ref()).await?;
-        let text = provider.run(&input, &ctx).await?;
-        Ok(text.into_bytes())
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Worker for DispatchWorker {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, host::worker::Error> {
-        match gate(&self.providers, &self.node_key, effect) {
-            Gated::NotMine => Ok(WorkOutcome::NotMine),
-            Gated::Skip => Ok(WorkOutcome::Handled(None)),
-            Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
-            Gated::Execute(job) => {
-                let outcome = self
-                    .answer(&job.capability, job.input.as_bytes())
-                    .await
-                    .map_err(clean_error);
-                Ok(WorkOutcome::Handled(Some(oracle_result(
-                    &job.saga_id,
-                    job.attempt,
-                    outcome,
-                ))))
-            }
-        }
-    }
 }
 
 /// the follow-up op that carries one attempt's outcome back through the
@@ -293,39 +218,26 @@ format = "text"
         })
     }
 
-    #[tokio::test]
-    async fn foreign_specs_are_not_mine_and_foreign_leases_are_skipped() {
-        let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
+    #[test]
+    fn foreign_specs_are_not_mine_and_foreign_leases_are_skipped() {
+        let providers = mock_specs_only();
 
         // a foreign spec shape (no kind field) is NotMine, never guessed at.
         let foreign = effect_for(br#"{"run_id":"r","agent_id":"a"}"#.to_vec(), None);
-        assert!(matches!(
-            worker.run(&foreign).await.unwrap(),
-            WorkOutcome::NotMine
-        ));
+        assert!(matches!(gate(&providers, b"me", &foreign), Gated::NotMine));
 
         // someone else's lease: claimed but deliberately not run.
-        match worker
-            .run(&effect_for(work_spec(), Some(b"peer")))
-            .await
-            .unwrap()
-        {
-            WorkOutcome::Handled(None) => {}
-            other => panic!("a foreign lease must be a claimed skip, got {other:?}"),
-        }
+        let peer = effect_for(work_spec(), Some(b"peer"));
+        assert!(matches!(gate(&providers, b"me", &peer), Gated::Skip));
     }
 
-    #[tokio::test]
-    async fn an_own_lease_executes_to_a_clean_missing_capability_error() {
-        let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
-        // the spec is loaded but no binary installed: the spawn path is taken
-        // and errors by capability name — proving execution was attempted.
-        match worker
-            .run(&effect_for(work_spec(), Some(b"me")))
-            .await
-            .unwrap()
-        {
-            WorkOutcome::Handled(Some(msg)) => {
+    #[test]
+    fn an_own_lease_with_an_unresolvable_capability_errors_inline() {
+        // the spec is loaded but no binary installed: the gate answers with
+        // the error result by capability name — never an Execute job.
+        let providers = mock_specs_only();
+        match gate(&providers, b"me", &effect_for(work_spec(), Some(b"me"))) {
+            Gated::Immediate(msg) => {
                 let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
@@ -333,7 +245,7 @@ format = "text"
                 let err = outcome.unwrap_err();
                 assert!(err.contains("\"alpha\" is not provided"), "got: {err}");
             }
-            other => panic!("an executable lease must produce an op, got {other:?}"),
+            _ => panic!("an unresolvable own lease must answer inline"),
         }
     }
 
@@ -353,9 +265,9 @@ format = "text"
         }
     }
 
-    #[tokio::test]
-    async fn an_unassigned_request_is_claimed_not_run() {
-        // an announcement this host CAN serve: the worker answers with an
+    #[test]
+    fn an_unassigned_request_is_claimed_not_run() {
+        // an announcement this host CAN serve: the gate answers with an
         // Accept claim, never an execution — the saga's first-accept-wins
         // rule is what turns N capable nodes into one run.
         let spec = capability_host::CapabilitySpec::parse(
@@ -378,70 +290,44 @@ format = "text"
             capability_host::SpecSet::from_specs(vec![spec]),
             vec![Box::new(StubProvider)],
         );
-        let worker = DispatchWorker::new(providers, b"me".to_vec());
-        match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
-            WorkOutcome::Handled(Some(msg)) => match saga::decode_msg(&msg.payload).unwrap() {
+        match gate(&providers, b"me", &effect_for(work_spec(), None)) {
+            Gated::Immediate(msg) => match saga::decode_msg(&msg.payload).unwrap() {
                 SagaMsg::Accept { saga_id, attempt } => {
                     assert_eq!(saga_id, "s");
                     assert_eq!(attempt, 0);
                 }
                 other => panic!("expected an Accept claim, got {other:?}"),
             },
-            other => panic!("a claimable announcement must produce an op, got {other:?}"),
+            _ => panic!("a claimable announcement must produce an op"),
         }
 
         // an announcement this host CANNOT serve (spec loaded, nothing
         // installed): a quiet skip — never a claim it could not honor.
-        let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
-        match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
-            WorkOutcome::Handled(None) => {}
-            other => panic!("an unservable announcement must be a skip, got {other:?}"),
-        }
+        let providers = mock_specs_only();
+        assert!(matches!(
+            gate(&providers, b"me", &effect_for(work_spec(), None)),
+            Gated::Skip
+        ));
     }
 
-    /// live end-to-end against a REAL locally installed CLI (BYO auth):
-    /// the payload goes to the provider VERBATIM and the raw answer comes
-    /// back — the whole opinion-free contract. ignored by default; name the
-    /// capability tag your host provides:
-    /// `DUCKTAPE_LIVE_CAPABILITY=<tag> cargo test -p dispatch-oracle -- --ignored live_run`.
-    #[tokio::test]
-    #[ignore]
-    async fn live_run_feeds_the_payload_verbatim_to_a_local_cli() {
-        let capability = std::env::var("DUCKTAPE_LIVE_CAPABILITY")
-            .expect("set DUCKTAPE_LIVE_CAPABILITY to a capability this host provides");
-        let worker = DispatchWorker::new(
-            capability_host::discover(Default::default(), None).expect("capability specs load"),
-            b"live".to_vec(),
-        );
-        let payload = b"Reply with exactly one word: quack".to_vec();
-        let answer = worker
-            .answer(&capability, &payload)
-            .await
-            .expect("the provider answered");
-        assert!(
-            !answer.is_empty(),
-            "the raw answer must be non-empty (got zero bytes)"
-        );
-    }
-
-    #[tokio::test]
-    async fn non_utf8_payloads_error_cleanly() {
-        let worker = DispatchWorker::new(mock_specs_only(), b"me".to_vec());
+    #[test]
+    fn non_utf8_payloads_error_cleanly() {
+        let providers = mock_specs_only();
         let spec = encode_work_spec(&WorkSpec {
             kind: WORK_SPEC_KIND.into(),
             dispatch_id: "d1".into(),
             capability: "alpha".into(),
             payload: vec![0xff, 0xfe],
         });
-        match worker.run(&effect_for(spec, Some(b"me"))).await.unwrap() {
-            WorkOutcome::Handled(Some(msg)) => {
+        match gate(&providers, b"me", &effect_for(spec, Some(b"me"))) {
+            Gated::Immediate(msg) => {
                 let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };
                 assert!(outcome.unwrap_err().contains("not utf-8"));
             }
-            other => panic!("expected a submitted error, got {other:?}"),
+            _ => panic!("expected a submitted error"),
         }
     }
 }
