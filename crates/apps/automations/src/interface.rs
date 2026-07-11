@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 /// trigger-kind byte so a future non-chat trigger can join that codec without
 /// a state break.)
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+// deny_unknown_fields is load-bearing: every field is an Option, so without
+// it the RETIRED tagged shape ({"message_posted":{...}}) would silently parse
+// as an all-None trigger that fires on every message — a quiet-corruption
+// hazard, not a flag day. Unknown keys must reject loudly.
+#[serde(deny_unknown_fields)]
 pub struct Trigger {
     /// an exact channel id, or `None` for any channel.
     pub channel_id: Option<String>,

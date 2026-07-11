@@ -377,7 +377,50 @@ pub fn assemble_runner_result(
     }
     // the non-prose facets alone exceed the cap (a pathological effects/data
     // payload): drop them — a degraded-but-landing result beats a wedged saga.
-    encode(&note, None, Vec::new())
+    let bare = encode(&note, None, Vec::new());
+    if bare.len() <= saga::MAX_RESULT_BYTES {
+        return bare;
+    }
+    // last rung: even the receipt+sink alone exceed the cap (an unbounded
+    // commit_error or sink title/body). replace the receipt's free-form
+    // strings with short notes and drop the sink payload — the result MUST
+    // land under the cap or the saga wedges until deadline (the exact
+    // failure this cap exists to prevent).
+    let stub = WorkspaceReceipt {
+        commit_error: receipt
+            .commit_error
+            .as_ref()
+            .map(|e| format!("[commit error truncated ({} bytes)]", e.len())),
+        branch: receipt.branch.clone(),
+        output_commit: receipt.output_commit.clone(),
+        ..receipt_stub(receipt)
+    };
+    serde_json::to_vec(&RunnerResultWire {
+        ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
+        response_text: &note,
+        workspace_receipt: &stub,
+        data: None,
+        effects: Vec::new(),
+        sink: Sink::Chain,
+        status,
+    })
+    .expect("runner result serializes")
+}
+
+/// the bounded core of a receipt: everything except the free-form strings
+/// the last degrade rung replaces.
+fn receipt_stub(r: &WorkspaceReceipt) -> WorkspaceReceipt {
+    WorkspaceReceipt {
+        source_prefix: r.source_prefix.clone(),
+        output_snapshot: r.output_snapshot.clone(),
+        source_snapshot: r.source_snapshot.clone(),
+        commit_height: r.commit_height,
+        rebased: r.rebased,
+        no_changes: r.no_changes,
+        commit_error: None,
+        branch: None,
+        output_commit: None,
+    }
 }
 
 /// LIFT the model's `tasks.create` / `tasks.update_status` /
@@ -481,6 +524,46 @@ fn outermost_json_object(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pathological_receipt_still_fits_the_saga_cap() {
+        // even when the receipt's free-form strings alone exceed the cap
+        // (an unbounded commit_error), the last degrade rung must land the
+        // result under saga::MAX_RESULT_BYTES — an oversized Ok wedges the
+        // saga until deadline.
+        let receipt = super::WorkspaceReceipt {
+            source_prefix: "p".into(),
+            source_snapshot: None,
+            output_snapshot: None,
+            commit_height: None,
+            rebased: false,
+            no_changes: false,
+            commit_error: Some("x".repeat(saga::MAX_RESULT_BYTES + 4096)),
+            branch: None,
+            output_commit: None,
+        };
+        let out = super::assemble_runner_result(
+            "answer",
+            &receipt,
+            None,
+            Vec::new(),
+            super::Sink::Chain,
+            super::Status::Ok,
+        );
+        assert!(
+            out.len() <= saga::MAX_RESULT_BYTES,
+            "degraded result must fit the cap, got {} bytes",
+            out.len()
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v["workspace_receipt"]["commit_error"]
+                .as_str()
+                .unwrap()
+                .contains("truncated"),
+            "the oversized commit_error is replaced with a bounded note"
+        );
+    }
+
     use super::*;
 
     fn spec() -> WorkspaceSpec {

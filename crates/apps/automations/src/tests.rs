@@ -2,6 +2,23 @@
 //! `execute` (probes included), the codec round-trips, and install validation.
 
 use super::*;
+
+#[test]
+fn retired_tagged_trigger_shape_rejects_loudly() {
+    // the pre-flag-day wire wrapped the trigger in a single-variant enum tag;
+    // an all-Option flat struct would otherwise parse it as an all-None
+    // fire-on-everything rule. deny_unknown_fields turns it into a loud error.
+    let old = serde_json::json!({
+        "add_rule": {
+            "rule_id": "r1",
+            "trigger": {"message_posted": {"channel_id": "general"}},
+            "action": {"post_message": {"channel_id": "general", "text": "hi"}}
+        }
+    });
+    let err = decode_msg(&serde_json::to_vec(&old).unwrap());
+    assert!(err.is_err(), "retired tagged trigger shape must not decode");
+}
+
 use std::collections::BTreeSet;
 
 use crate::{AutomationsReply, decode_reply, encode_msg, encode_query};
