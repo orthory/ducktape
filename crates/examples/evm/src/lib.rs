@@ -1,0 +1,506 @@
+//! Experimental stateful EVM backed by QMDB rather than Ethereum's MPT.
+//!
+//! The module executes ordinary Prague create/call transactions through REVM.
+//! Its canonical account, code, and storage snapshot lives under one key in the
+//! existing QMDB [`kv::Kv`], whose merkle root is this module's [`StateRoot`].
+
+mod interface;
+pub use interface::*;
+
+use commonware_runtime::BufferPooler;
+use commonware_storage::Context as StorageContext;
+use kv::Kv;
+use revm::{
+    Context as RevmContext, ExecuteCommitEvm, MainBuilder, MainContext,
+    bytecode::Bytecode,
+    context::{TxEnv, result::ExecutionResult},
+    database::{AccountState, InMemoryDB},
+    primitives::{Address, B256, KECCAK_EMPTY, Log, TxKind, U256, hardfork::SpecId, keccak256},
+    state::AccountInfo,
+};
+use sdk::{
+    Ctx, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    StateSyncHandle,
+};
+use serde::{Deserialize, Serialize};
+
+const STATE_KEY: &[u8] = b"evm/state/v1";
+pub const MAX_INIT_CODE_BYTES: usize = 49_152;
+pub const MAX_INPUT_BYTES: usize = 128 * 1024;
+pub const MAX_GAS_LIMIT: u64 = 10_000_000;
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotAccount {
+    address: [u8; 20],
+    balance: [u8; 32],
+    nonce: u64,
+    code: Vec<u8>,
+    storage: Vec<SnapshotSlot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotSlot {
+    key: [u8; 32],
+    value: [u8; 32],
+}
+
+pub struct EvmModule<E>
+where
+    E: StorageContext + BufferPooler,
+{
+    id: ModuleId,
+    store: Kv<E>,
+    committed: InMemoryDB,
+    pending: Option<InMemoryDB>,
+}
+
+impl<E> EvmModule<E>
+where
+    E: StorageContext + BufferPooler,
+{
+    pub async fn init(context: E, id: impl Into<ModuleId>) -> Result<Self, Error> {
+        let id = id.into();
+        let store = Kv::init(context, id.clone()).await;
+        let committed = match store.get(STATE_KEY).await {
+            Some(bytes) => decode_snapshot(&bytes)?,
+            None => InMemoryDB::default(),
+        };
+        Ok(Self {
+            id,
+            store,
+            committed,
+            pending: None,
+        })
+    }
+
+    fn active(&self) -> &InMemoryDB {
+        self.pending.as_ref().unwrap_or(&self.committed)
+    }
+
+    fn run(
+        mut db: InMemoryDB,
+        tx: EvmTx,
+        origin: &Origin,
+        height: u64,
+        consensus_time: u64,
+    ) -> Result<(EvmResult, InMemoryDB), Error> {
+        let (kind, data, gas_limit) = match tx {
+            EvmTx::Create {
+                init_code,
+                gas_limit,
+            } => {
+                if init_code.len() > MAX_INIT_CODE_BYTES {
+                    return Err(Error::Module(format!(
+                        "EVM init code too large: {} bytes exceeds {MAX_INIT_CODE_BYTES}",
+                        init_code.len()
+                    )));
+                }
+                (TxKind::Create, init_code, gas_limit)
+            }
+            EvmTx::Call {
+                to,
+                input,
+                gas_limit,
+            } => {
+                if input.len() > MAX_INPUT_BYTES {
+                    return Err(Error::Module(format!(
+                        "EVM input too large: {} bytes exceeds {MAX_INPUT_BYTES}",
+                        input.len()
+                    )));
+                }
+                (TxKind::Call(Address::from(to)), input, gas_limit)
+            }
+        };
+        if !(21_000..=MAX_GAS_LIMIT).contains(&gas_limit) {
+            return Err(Error::Module(format!(
+                "EVM gas limit must be between 21000 and {MAX_GAS_LIMIT}"
+            )));
+        }
+
+        let caller = origin_address(origin);
+        let nonce = db
+            .cache
+            .accounts
+            .get(&caller)
+            .filter(|account| account.account_state != AccountState::NotExisting)
+            .map(|account| account.info.nonce);
+        let nonce = nonce.unwrap_or_else(|| {
+            db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance: U256::MAX,
+                    ..Default::default()
+                },
+            );
+            0
+        });
+
+        let context = RevmContext::mainnet()
+            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(SpecId::PRAGUE))
+            .modify_block_chained(|block| {
+                block.number = U256::from(height);
+                block.timestamp = U256::from(consensus_time);
+            })
+            .with_db(db);
+        let tx = TxEnv::builder()
+            .caller(caller)
+            .kind(kind)
+            .gas_limit(gas_limit)
+            .data(data.into())
+            .nonce(nonce)
+            .chain_id(None)
+            .build()
+            .map_err(|e| Error::Module(format!("invalid EVM transaction: {e}")))?;
+        let mut evm = context.build_mainnet();
+        let result = evm
+            .transact_commit(tx)
+            .map_err(|e| Error::Module(format!("EVM transaction rejected: {e}")))?;
+        let db = evm.ctx.journaled_state.database;
+        Ok((execution_result(result), db))
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<E> Module for EvmModule<E>
+where
+    E: StorageContext + BufferPooler,
+{
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    fn root(&self) -> StateRoot {
+        self.store.root()
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.store.state_sync_handle()
+    }
+
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.store.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.store.resolver_sync_target().await
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let EvmMsg::Execute(tx) = decode_msg(&msg.payload).map_err(Error::Module)?;
+        let env = ctx.env();
+        let (result, db) = Self::run(
+            self.active().clone(),
+            tx,
+            &env.origin,
+            env.height,
+            env.consensus_time,
+        )?;
+        // ponytail: one whole-state QMDB value keeps the experiment tiny; split
+        // accounts/storage into individual keys when the 1 MiB Kv value cap matters.
+        self.store
+            .stage(STATE_KEY.to_vec(), encode_snapshot(&db)?)?;
+        self.pending = Some(db);
+        ctx.emit_event(Event {
+            source: self.id.clone(),
+            payload: encode_result(&result),
+        });
+        Ok(())
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let EvmQuery::Simulate(tx) = decode_query(req).map_err(Error::Module)?;
+        Self::run(self.active().clone(), tx, &Origin::System, 0, 0)
+            .map(|(result, _)| encode_result(&result))
+    }
+
+    async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let EvmQuery::Simulate(tx) = decode_query(req).map_err(Error::Module)?;
+        let env = ctx.env();
+        Self::run(
+            self.active().clone(),
+            tx,
+            &env.origin,
+            env.height,
+            env.consensus_time,
+        )
+        .map(|(result, _)| encode_result(&result))
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        self.store.commit_block().await?;
+        if let Some(db) = self.pending.take() {
+            self.committed = db;
+        }
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.store.abort_block().await?;
+        self.pending = None;
+        Ok(())
+    }
+}
+
+fn origin_address(origin: &Origin) -> Address {
+    let mut preimage = Vec::new();
+    match origin {
+        Origin::External(id) => {
+            preimage.extend_from_slice(b"external\0");
+            preimage.extend_from_slice(id);
+        }
+        Origin::Module(id) => {
+            preimage.extend_from_slice(b"module\0");
+            preimage.extend_from_slice(id.as_bytes());
+        }
+        Origin::System => preimage.extend_from_slice(b"system"),
+    }
+    let hash = keccak256(preimage);
+    Address::from_slice(&hash[12..])
+}
+
+fn execution_result(result: ExecutionResult) -> EvmResult {
+    match result {
+        ExecutionResult::Success {
+            gas, output, logs, ..
+        } => EvmResult {
+            status: EvmStatus::Success,
+            gas_used: gas.tx_gas_used(),
+            created_address: output.address().map(address_bytes),
+            output: output.into_data().to_vec(),
+            logs: logs.into_iter().map(evm_log).collect(),
+        },
+        ExecutionResult::Revert {
+            gas, output, logs, ..
+        } => EvmResult {
+            status: EvmStatus::Revert,
+            gas_used: gas.tx_gas_used(),
+            output: output.to_vec(),
+            created_address: None,
+            logs: logs.into_iter().map(evm_log).collect(),
+        },
+        ExecutionResult::Halt {
+            reason, gas, logs, ..
+        } => EvmResult {
+            status: EvmStatus::Halt {
+                reason: format!("{reason:?}"),
+            },
+            gas_used: gas.tx_gas_used(),
+            output: Vec::new(),
+            created_address: None,
+            logs: logs.into_iter().map(evm_log).collect(),
+        },
+    }
+}
+
+fn evm_log(log: Log) -> EvmLog {
+    let (topics, data) = log.data.split();
+    EvmLog {
+        address: address_bytes(&log.address),
+        topics: topics.iter().map(word_bytes).collect(),
+        data: data.to_vec(),
+    }
+}
+
+fn encode_snapshot(db: &InMemoryDB) -> Result<Vec<u8>, Error> {
+    let mut accounts: Vec<_> = db
+        .cache
+        .accounts
+        .iter()
+        .filter(|(_, account)| account.account_state != AccountState::NotExisting)
+        .filter(|(_, account)| {
+            !account.info.is_empty() || account.storage.values().any(|value| !value.is_zero())
+        })
+        .collect();
+    accounts.sort_by_key(|(address, _)| **address);
+
+    let accounts: Result<Vec<_>, Error> = accounts
+        .into_iter()
+        .map(|(address, account)| {
+            let code = account
+                .info
+                .code
+                .as_ref()
+                .or_else(|| db.cache.contracts.get(&account.info.code_hash))
+                .map(|code| code.original_byte_slice().to_vec())
+                .or_else(|| (account.info.code_hash == KECCAK_EMPTY).then(Vec::new))
+                .ok_or_else(|| Error::Module("EVM account code missing from cache".into()))?;
+            let mut storage: Vec<_> = account
+                .storage
+                .iter()
+                .filter(|(_, value)| !value.is_zero())
+                .map(|(key, value)| SnapshotSlot {
+                    key: key.to_be_bytes(),
+                    value: value.to_be_bytes(),
+                })
+                .collect();
+            storage.sort_by_key(|slot| slot.key);
+            Ok(SnapshotAccount {
+                address: address_bytes(address),
+                balance: account.info.balance.to_be_bytes(),
+                nonce: account.info.nonce,
+                code,
+                storage,
+            })
+        })
+        .collect();
+    serde_json::to_vec(&accounts?).map_err(|e| Error::Module(e.to_string()))
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<InMemoryDB, Error> {
+    let accounts: Vec<SnapshotAccount> =
+        serde_json::from_slice(bytes).map_err(|e| Error::Module(e.to_string()))?;
+    if accounts
+        .windows(2)
+        .any(|pair| pair[0].address >= pair[1].address)
+    {
+        return Err(Error::Module(
+            "EVM snapshot accounts are not strictly sorted".into(),
+        ));
+    }
+
+    let mut db = InMemoryDB::default();
+    for account in accounts {
+        if account
+            .storage
+            .windows(2)
+            .any(|pair| pair[0].key >= pair[1].key)
+        {
+            return Err(Error::Module(
+                "EVM snapshot storage is not strictly sorted".into(),
+            ));
+        }
+        let address = Address::from(account.address);
+        let code = Bytecode::new_raw_checked(account.code.into())
+            .map_err(|e| Error::Module(format!("invalid EVM snapshot bytecode: {e}")))?;
+        db.insert_account_info(
+            address,
+            AccountInfo::default()
+                .with_balance(U256::from_be_bytes(account.balance))
+                .with_nonce(account.nonce)
+                .with_code(code),
+        );
+        for slot in account.storage {
+            db.insert_account_storage(
+                address,
+                U256::from_be_bytes(slot.key),
+                U256::from_be_bytes(slot.value),
+            )
+            .expect("the in-memory EVM database is infallible");
+        }
+    }
+    Ok(db)
+}
+
+fn address_bytes(address: &Address) -> [u8; 20] {
+    let mut bytes = [0; 20];
+    bytes.copy_from_slice(address.as_slice());
+    bytes
+}
+
+fn word_bytes(word: &B256) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(word.as_slice());
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use host::Host;
+
+    use super::*;
+
+    fn storage_contract_init_code() -> Vec<u8> {
+        let runtime = [
+            0x36, 0x15, 0x60, 0x0c, 0x57, 0x60, 0x00, 0x35, 0x60, 0x00, 0x55, 0x00, 0x5b, 0x60,
+            0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        [
+            &[
+                0x60,
+                runtime.len() as u8,
+                0x60,
+                0x0c,
+                0x60,
+                0x00,
+                0x39,
+                0x60,
+            ][..],
+            &[runtime.len() as u8, 0x60, 0x00, 0xf3],
+            &runtime,
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn deploys_and_persists_contract_storage_in_qmdb() {
+        deterministic::Runner::default().start(|context| async move {
+            let evm = EvmModule::init(context.child("evm"), "evm").await.unwrap();
+            let mut host = Host::genesis(vec![Box::new(evm)]).unwrap();
+            let root_before = host.module_root("evm").unwrap();
+
+            let deploy = host
+                .submit(Msg {
+                    target: "evm".into(),
+                    payload: encode_msg(&EvmMsg::Execute(EvmTx::Create {
+                        init_code: storage_contract_init_code(),
+                        gas_limit: 500_000,
+                    })),
+                })
+                .await
+                .unwrap();
+            let deployed = decode_result(&deploy.events[0].payload).unwrap();
+            assert_eq!(deployed.status, EvmStatus::Success);
+            let contract = deployed.created_address.unwrap();
+            let root_after_deploy = host.module_root("evm").unwrap();
+            assert_ne!(root_before, root_after_deploy);
+
+            let mut value = vec![0; 32];
+            value[31] = 42;
+            host.submit(Msg {
+                target: "evm".into(),
+                payload: encode_msg(&EvmMsg::Execute(EvmTx::Call {
+                    to: contract,
+                    input: value.clone(),
+                    gas_limit: 100_000,
+                })),
+            })
+            .await
+            .unwrap();
+            assert_ne!(host.module_root("evm").unwrap(), root_after_deploy);
+
+            let reply = host
+                .query(
+                    "evm",
+                    &encode_query(&EvmQuery::Simulate(EvmTx::Call {
+                        to: contract,
+                        input: Vec::new(),
+                        gas_limit: 100_000,
+                    })),
+                )
+                .await
+                .unwrap();
+            let reply = decode_result(&reply).unwrap();
+            assert_eq!(reply.status, EvmStatus::Success);
+            assert_eq!(reply.output, value);
+
+            let committed_root = host.module_root("evm").unwrap();
+            drop(host);
+            let reopened = EvmModule::init(context.child("evm"), "evm").await.unwrap();
+            assert_eq!(reopened.root(), committed_root);
+            let reopened = Host::genesis(vec![Box::new(reopened)]).unwrap();
+            let reply = reopened
+                .query(
+                    "evm",
+                    &encode_query(&EvmQuery::Simulate(EvmTx::Call {
+                        to: contract,
+                        input: Vec::new(),
+                        gas_limit: 100_000,
+                    })),
+                )
+                .await
+                .unwrap();
+            assert_eq!(decode_result(&reply).unwrap().output, value);
+        });
+    }
+}

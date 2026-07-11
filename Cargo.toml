@@ -57,7 +57,7 @@ members = [
     "crates/apps/files",
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
-    "crates/examples/directory", "crates/examples/greeter",
+    "crates/examples/directory", "crates/examples/greeter", "crates/examples/evm",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
@@ -78,6 +78,7 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+revm = { version = "41", default-features = false, features = ["std"] }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -186,6 +187,7 @@ duckfs-client = { path = "crates/duckfs/client" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
+evm = { path = "crates/examples/evm" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 wireguard-effect = { path = "crates/system/wireguard-effect" }
