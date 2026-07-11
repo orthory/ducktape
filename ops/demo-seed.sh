@@ -45,16 +45,25 @@ fi
 log "creating a fresh '$ID' workspace at $WSDIR"
 rm -rf "$WSDIR"; mkdir -p "$WSDIR"
 read -r P1 P2 P3 < <(bun "$SCRIPT_DIR/fleet.mjs" ports 3)
-# Gateway serving needs two things the app's workspace_create also sets:
-#   --gateway         binds the isolated browser plane that serves the routes
-#   --wireguard-effect the userspace (TUN-less) overlay — the browser session
-#                      requires an active overlay, and the default "tun" effect
-#                      can't start without /dev/net/tun + privilege.
-# Without both, site/app.<id>.duck render blank. 127.0.0.1:0 = OS-assigned ports.
+# A free UDP port for the overlay's WireGuard socket. This MUST be concrete: the
+# reachability plane refuses to start on port 0 ("wireguard_listen needs a
+# concrete UDP port — plane not started"), which leaves the overlay down.
+WGP="$(bun -e 'const s=require("node:dgram").createSocket("udp4");s.bind(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
+# Gateway serving needs the app's workspace_create posture:
+#   --gateway            binds the isolated browser plane that serves the routes
+#   --wireguard-effect   the userspace (TUN-less) overlay — no /dev/net/tun, no
+#     socket             privilege; the default "tun" effect can't start without them
+#   --wireguard-listen   a CONCRETE UDP port (0.0.0.0 = endpoint-less/roaming,
+#     0.0.0.0:$WGP       like the app), so the overlay comes up instead of being
+#                        skipped on port 0
+#   --primary-coordinator a self-contained local demo does NOT phone home to the
+#     none               public rendezvous coordinator; keeps network.toml (which
+#                        the app reboots from) fully local.
 CHAIN="$("$NODE_BIN" init --name "$ID" --dir "$WSDIR" \
   --listen 127.0.0.1:$P1 --advertised 127.0.0.1:$P1 \
   --http 127.0.0.1:$P2 --rpc 127.0.0.1:$P3 --gateway 127.0.0.1:0 \
-  --wireguard-effect socket --wireguard-listen 127.0.0.1:0 2>/dev/null | tail -1)"
+  --primary-coordinator none \
+  --wireguard-effect socket --wireguard-listen 0.0.0.0:$WGP 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" keygen --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
@@ -165,8 +174,14 @@ Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
 Gateway web apps published on this node (open in the app's browser):
   • site.$ID.duck — a bouncing-DVD web app, served static from DuckFS by
-                    consensus. Works now (the gateway browser plane is live).
-  • app.$ID.duck  — user-hosted web app. The route is published, but a
-                    user-hosted app is just that: run \`make demo-app\` to serve it
-                    on the node's loopback, then it's live.
+                    consensus. Works now — nothing else to run.
+  • app.$ID.duck  — user-hosted web app. The route is published, but its upstream
+                    is a plain process YOU host. It shows "Unavailable" in the
+                    Gateway view until you serve it, and goes Unavailable again if
+                    that process stops:
+
+                        make demo-app        # keep this running (foreground)
+
+                    Re-run it after every \`make demo-seed\` (a re-seed wipes the
+                    workspace and re-mints the loopback binding).
 EOF
