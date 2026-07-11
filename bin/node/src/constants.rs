@@ -121,8 +121,9 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
-/// every module in the production genesis set, in status-report order. keep in
-/// sync with [`genesis_host`] — status endpoints report exactly these roots.
+/// every module in the production genesis set, in status-report order. pinned
+/// to the `host_state::ProductionModules` registry by the parity test in
+/// `host_state` — status endpoints report exactly these roots.
 pub(crate) const MODULE_IDS: [&str; 24] = [
     "kv",
     "pages",

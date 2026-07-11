@@ -119,27 +119,7 @@ fn digest_hex(hex: &str) -> Option<[u8; 32]> {
     digest_bytes(&bytes)
 }
 
-pub fn encode_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut out, "{byte:02x}").expect("write to String");
-    }
-    out
-}
-
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err("blob chunk hex must have even length".into());
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|_| "blob chunk contains non-hex bytes".to_string())
-        })
-        .collect()
-}
+pub use duckfs_core::{to_hex as encode_hex, unhex as decode_hex};
 
 /// Ordered, bounded assembly for one accepted blob offer. The digest check is
 /// completed before bytes enter the shared blob store.

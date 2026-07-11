@@ -35,14 +35,12 @@
 //! degrade to the mesh on transport failure, and log every fallback — the
 //! plane's steady-state degradation must be diagnosable, never silent.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use commonware_cryptography::ed25519;
 use data_plane::{
-    AddressBook, AdmissionPolicy, BulkPacer, FlowId, OverlaySockets, PeerId, Service,
-    StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
+    BulkPacer, FlowId, OverlaySockets, PeerId, Service, StreamPacing, StreamPlaneSpec,
+    StreamPolicy, StreamService, bind_stream_plane,
 };
 use statesync::dataplane::{DataPlaneSyncClient, statesync_flow};
 use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
@@ -83,81 +81,19 @@ pub fn shared_bulk_pacer() -> BulkPacer {
     BulkPacer::new(BULK_BYTES_PER_SEC, BULK_BURST_BYTES)
 }
 
-/// derive a peer's overlay ULA from its raw ed25519 key bytes — the same
-/// `(namespace, identity)` function the reachability plane routes by.
-fn ula_of(namespace: &str, raw_key: &[u8; 32]) -> std::net::Ipv6Addr {
-    wireguard::ula_v6_member_addr(namespace, wireguard::ValidatorIdentity(*raw_key))
-}
+/// the statesync plane's tag for the shared [`crate::overlay_book::OverlayBook`]:
+/// admission permits exactly the statesync service + flow, from the tracked
+/// peer set (members + standbys — exactly who the mesh serves statesync to).
+pub struct StateSyncPlane;
 
-/// the address book AND admission policy for the statesync plane, one object:
-/// both answer from the same tracked peer set (members + standbys — exactly
-/// who the mesh serves statesync to), maintained by the node at boot and at
-/// every cutover re-track. forward resolution derives (ULA is a pure function
-/// of identity); reverse resolution and admission consult the set.
-pub struct OverlayBook {
-    namespace: String,
-    /// source `/128` -> authenticated peer, rebuilt on every `set_peers`.
-    reverse: RwLock<HashMap<IpAddr, PeerId>>,
-}
-
-impl OverlayBook {
-    pub fn new(namespace: String) -> Arc<Self> {
-        Arc::new(OverlayBook {
-            namespace,
-            reverse: RwLock::new(HashMap::new()),
-        })
-    }
-
-    /// replace the tracked peer set (members + standbys of the current view).
-    pub fn set_peers<'a>(&self, keys: impl Iterator<Item = &'a ed25519::PublicKey>) {
-        let mut reverse = HashMap::new();
-        for key in keys {
-            let raw: [u8; 32] = key.as_ref().try_into().expect("ed25519 keys are 32 bytes");
-            reverse.insert(
-                IpAddr::V6(ula_of(&self.namespace, &raw)),
-                PeerId(raw),
-            );
-        }
-        *self.reverse.write().expect("book lock") = reverse;
-    }
-
-    /// this node's own overlay `/128` — where the plane's sockets bind.
-    pub fn own_addr(&self, me: &ed25519::PublicKey) -> IpAddr {
-        let raw: [u8; 32] = me.as_ref().try_into().expect("ed25519 keys are 32 bytes");
-        IpAddr::V6(ula_of(&self.namespace, &raw))
+impl crate::overlay_book::Plane for StateSyncPlane {
+    const SERVICE: Service = Service::StateSync;
+    fn flow() -> FlowId {
+        statesync_flow()
     }
 }
 
-impl AddressBook for OverlayBook {
-    fn datagram_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            IpAddr::V6(ula_of(&self.namespace, &peer.0)),
-            Service::StateSync.overlay_datagram_port(),
-        ))
-    }
-    fn stream_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            IpAddr::V6(ula_of(&self.namespace, &peer.0)),
-            Service::StateSync.overlay_stream_port(),
-        ))
-    }
-    fn peer_at(&self, src: IpAddr) -> Option<PeerId> {
-        self.reverse.read().expect("book lock").get(&src).copied()
-    }
-}
-
-impl AdmissionPolicy for OverlayBook {
-    fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == Service::StateSync
-            && flow == statesync_flow()
-            && self
-                .reverse
-                .read()
-                .expect("book lock")
-                .values()
-                .any(|p| *p == peer)
-    }
-}
+pub type OverlayBook = crate::overlay_book::OverlayBook<StateSyncPlane>;
 
 /// the plane's stream service once the overlay bind succeeds — filled by
 /// [`spawn_bring_up`]'s retry task, read by clients and the serve acceptor.
