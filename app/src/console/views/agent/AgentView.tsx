@@ -151,8 +151,8 @@ export function AgentView() {
           style={{
             margin: 0,
             font: `650 18px ${font.sans}`,
-            letterSpacing: "-.01em",
-            color: color.dark,
+            letterSpacing: "0",
+            color: color.ink,
           }}
         >
           Agents

@@ -8,6 +8,7 @@ set -euo pipefail
 app="${1:?usage: check-macos-cef-bundle.sh /path/to/Ducktape.app}"
 contents="$app/Contents"
 framework="$contents/Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework"
+resources="$contents/Frameworks/Chromium Embedded Framework.framework/Resources"
 
 fail() {
   echo "[cef-bundle] invalid $app: $*" >&2
@@ -16,6 +17,7 @@ fail() {
 
 [ -x "$contents/MacOS/ducktape-desktop" ] || fail "missing main executable"
 [ -f "$framework" ] || fail "missing Chromium Embedded Framework"
+[ -f "$resources/icudtl.dat" ] || fail "missing CEF ICU resource icudtl.dat"
 
 # The helper executables must be byte-identical copies of the app binary.
 # CEF registers custom schemes per process; a foreign helper (the old

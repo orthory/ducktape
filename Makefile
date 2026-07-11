@@ -48,7 +48,7 @@ cef-env:
 ## hot-reload) and watches the Rust tree — on any node/kernel change it rebuilds
 ## ducktape-node and restarts the running node in place, which the app re-adopts.
 ## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
-dev: cef-env
+dev: cef-env app/node_modules
 	@$(BUILD_WITH) bash ops/dev.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
@@ -127,7 +127,7 @@ endif
 # node_modules is absent; the touch keeps the dir newer than its prerequisites
 # (bun does not reliably update the dir mtime when nothing needs fetching).
 app/node_modules: app/package.json app/bun.lock
-	cd app && $(BUN) install
+	cd app && $(BUN) install --frozen-lockfile
 	touch app/node_modules
 
 install: install-node install-app
