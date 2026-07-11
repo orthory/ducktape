@@ -862,12 +862,6 @@ struct FinalizedInner {
     /// exactly-once guard on `record` (NOT on `fill_fetched`) — and the replay
     /// guard for the whole ordered lane (see the type doc). unbounded on purpose.
     seen: HashSet<Digest>,
-    /// the last recorded view — memory for the debug-only descent assert in
-    /// `record`. release/ordering correctness rests on the ascending-view
-    /// precondition above; this makes a broken precondition panic in debug
-    /// builds instead of silently forking. debug-only: zero release cost.
-    #[cfg(debug_assertions)]
-    last_view: Option<u64>,
 }
 
 impl FinalizedInbox {
@@ -891,20 +885,12 @@ impl FinalizedInbox {
         if !inner.seen.insert(digest) {
             return false;
         }
-        // the ascending-view precondition made loud (AFTER the seen dedup — a
-        // benign re-finalization re-report of an old digest never reaches
-        // here). the validator path upholds it by engine construction and the
-        // follower by its admission watermark; a violation would fold out of
-        // agreed order and fork the order-dependent root.
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                inner.last_view.is_none_or(|last| view >= last),
-                "finalization recorded out of ascending view order: view {view} after {:?}",
-                inner.last_view,
-            );
-            inner.last_view = Some(view);
-        }
+        // views are deliberately NOT asserted ascending here: a mid-epoch
+        // joiner's (or any lagging validator's) engine reports the live tip
+        // finalization FIRST and then backfills the gap views below it, so
+        // `record` legitimately sees descending views. that is safe
+        // downstream — the node's `drain_delivered` skips frames at or below
+        // its applied floor by agreed height, deterministically everywhere.
         if let Some(bytes) = store.get(&digest) {
             inner.log.push_back((view, digest));
             inner.ready.insert(digest, bytes);

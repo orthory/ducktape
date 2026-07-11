@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,15 @@ test("desktop builds propagate the default CEF path and caller overrides", () =>
   };
   expect(command()).toBe("/real-home/.local/share/cef");
   expect(command("/caller/cef")).toBe("/caller/cef");
+});
+
+test("udp-port emits plain digits when terminal colors are forced", () => {
+  const result = spawnSync("bun", [join(import.meta.dir, "fleet.mjs"), "udp-port"], {
+    encoding: "utf8",
+    env: { ...process.env, FORCE_COLOR: "1" },
+  });
+  expect(result.status).toBe(0);
+  expect(result.stdout).toMatch(/^\d+\n$/);
 });
 
 test("web server serves the console and bridges binary VNC bytes", async () => {
