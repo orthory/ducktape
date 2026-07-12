@@ -420,6 +420,7 @@ fn duplicate_turn_claims_are_deterministic_no_ops() {
             agent_id: "bot".into(),
             channel_id: "general".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap();
@@ -473,6 +474,7 @@ fn a_delivered_turn_stays_claimed_via_the_dispatch_record() {
             agent_id: "bot".into(),
             channel_id: "general".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap();
@@ -519,6 +521,7 @@ fn chat_and_job_run_keys_are_structurally_disjoint_and_reject_separator_inputs()
             agent_id: "bot".into(),
             channel_id: "bad\u{1f}channel".into(),
             anchor_seq: 1,
+            demands: Default::default(),
         }),
     )
     .unwrap_err();

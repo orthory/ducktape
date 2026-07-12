@@ -517,6 +517,7 @@ fn a_request_run_on_a_forge_channel_without_the_cap_rejects_with_the_reason() {
             agent_id: "bot".into(),
             channel_id: "forge:app:7".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap_err();

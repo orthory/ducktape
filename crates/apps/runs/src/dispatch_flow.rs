@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::{
     AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
     DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
@@ -344,6 +346,7 @@ impl RunsModule {
         anchor_seq: u64,
         requester: SagaOrigin,
         prepared: PreparedDispatch,
+        demands: BTreeMap<String, u64>,
     ) {
         let now = ctx.env().consensus_time;
         let dispatch_id = dispatch_id_for(run_id);
@@ -353,7 +356,7 @@ impl RunsModule {
                 dispatch_id: dispatch_id.clone(),
                 recipe_id: recipe_id_for(&agent_id),
                 payload: prepared.payload,
-                demands: Default::default(),
+                demands,
             }),
         });
         self.pending_overlay.insert(
