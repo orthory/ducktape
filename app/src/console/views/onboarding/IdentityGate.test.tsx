@@ -821,6 +821,124 @@ describe("identity gate — link-device flow", () => {
     expect(await screen.findByTestId("console")).toBeInTheDocument();
   });
 
+  // The QR address exactly as the other device's relay mints it (link_relay.rs).
+  const ADDRESS = "http://192.168.1.23:40000/link#0123456789abcdef0123456789abcdef";
+
+  /** Walk the gate to the link wizard and type `input` into the challenge box. */
+  const reachWizardWith = async (input: string) => {
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+    await screen.findByText("Create your account");
+    fireEvent.click(screen.getByText("Link device"));
+    await screen.findByText("Link this device");
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create this device's key"));
+    });
+    await screen.findByText("Approve from your other device");
+    fireEvent.change(screen.getByLabelText("Link challenge code"), {
+      target: { value: input },
+    });
+  };
+
+  it("links over the LAN when the input is the QR address", async () => {
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    const sent: Array<Record<string, unknown>> = [];
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "link_fetch_challenge":
+          return Promise.resolve(CHALLENGE);
+        case "user_sign_possession":
+          return Promise.resolve('{"signature":{"sig":[7,7]}}');
+        case "link_send_response":
+          sent.push(args ?? {});
+          return Promise.resolve(null);
+        default:
+          throw new Error(`unexpected invoke ${cmd}`);
+      }
+    });
+
+    await reachWizardWith(`  ${ADDRESS} `);
+    // The button re-labels once the input reads as an address — the exchange
+    // runs whole from one click: fetch → sign → post back.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Link over the network"));
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("link_fetch_challenge", { url: ADDRESS });
+    expect(invokeMock).toHaveBeenCalledWith("user_sign_possession", {
+      chainId: "team#abcd",
+      accountId: "ab01".repeat(16),
+      nonce: 4,
+    });
+    await screen.findByText(/Reply sent to Eddy's account/);
+    // The verify-before-approve fingerprint: this device's key, for the human
+    // cross-check against what the inviter's approve step shows.
+    expect(screen.getByText(/Seed key · cd34/)).toBeInTheDocument();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].url).toBe(ADDRESS);
+    const blob = String(sent[0].response);
+    expect(blob.startsWith("ducktape-link-response-v1:")).toBe(true);
+    expect(JSON.parse(atob(blob.replace("ducktape-link-response-v1:", "")))).toEqual({
+      pubkey: "cd34",
+      kind: "ed25519",
+      possession: '{"signature":{"sig":[7,7]}}',
+      label: null,
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Continue"));
+    });
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("falls back to the response code when the LAN reply can't be delivered", async () => {
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "link_fetch_challenge":
+          return Promise.resolve(CHALLENGE);
+        case "user_sign_possession":
+          return Promise.resolve('{"signature":{"sig":[7,7]}}');
+        case "link_send_response":
+          return Promise.reject(new Error("timed out reaching the other device"));
+        default:
+          throw new Error(`unexpected invoke ${cmd}`);
+      }
+    });
+
+    await reachWizardWith(ADDRESS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Link over the network"));
+    });
+
+    // The signed reply is not lost: the manual paste screen shows it with the
+    // delivery failure inline.
+    const response = (await screen.findByLabelText("Link response code")) as HTMLTextAreaElement;
+    expect(response.value.startsWith("ducktape-link-response-v1:")).toBe(true);
+    expect(
+      screen.getByText(/couldn't send the reply back automatically/i),
+    ).toBeInTheDocument();
+  });
+
   it("proceeds past the wizard WITHOUT a challenge — linking must never trap onboarding", async () => {
     // Spec §1: linking and joining are independent. A user who started on the
     // new device before fetching the code from their other device continues
@@ -895,8 +1013,10 @@ describe("identity gate — link-device flow", () => {
     });
     fireEvent.click(screen.getByText("Generate link code"));
 
+    // The validation error lands a microtask later — generate is one async
+    // pipeline for both input paths (pasted blob / typed relay address).
     expect(
-      screen.getByText(/doesn't look like a link code/i),
+      await screen.findByText(/doesn't look like a link code/i),
     ).toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalled();
   });

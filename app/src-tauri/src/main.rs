@@ -20,6 +20,8 @@ mod gateway_window;
 mod enroll;
 mod forge_git;
 mod huddle;
+mod lan_http;
+mod link_relay;
 mod menu;
 mod notify;
 mod permissions;
@@ -160,6 +162,11 @@ fn main() {
             enroll::enroll_start,
             enroll::enroll_poll,
             enroll::enroll_cancel,
+            link_relay::link_relay_start,
+            link_relay::link_relay_poll,
+            link_relay::link_relay_cancel,
+            link_relay::link_fetch_challenge,
+            link_relay::link_send_response,
             forge_git::forge_list_repos,
             forge_git::forge_list_branches,
             forge_git::forge_head,
