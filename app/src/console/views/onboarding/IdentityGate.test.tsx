@@ -5,7 +5,7 @@
 // to that module's typed surface, never IPC itself).
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BIP39_ENGLISH_WORDLIST } from "../../../domain/bip39-wordlist";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
@@ -33,12 +33,35 @@ vi.mock("../../../domain/user-identity-client", () => ({
   lockIdentity: vi.fn(),
 }));
 
+// Touch ID lives behind a native shim (Stream B's touchid-client). The gate
+// only ever calls that typed surface, so tests drive it through this mock —
+// availability defaults to false (the Linux/web reality) so every pre-existing
+// test is untouched; the Touch ID tests flip it to true per-case.
+const touchidAvailableMock = vi.hoisted(() => vi.fn());
+const touchidEnrollMock = vi.hoisted(() => vi.fn());
+const touchidUnlockMock = vi.hoisted(() => vi.fn());
+vi.mock("../../../domain/touchid-client", () => ({
+  touchidAvailable: touchidAvailableMock,
+  touchidEnroll: touchidEnrollMock,
+  touchidUnlock: touchidUnlockMock,
+  touchidDisable: vi.fn(),
+  randomPassphrase: () => "RANDOMPASS",
+}));
+
 const markTauri = () => {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
 };
 
 const TEST_MNEMONIC = BIP39_ENGLISH_WORDLIST.slice(0, 24).join(" ");
 const TEST_WORDS = TEST_MNEMONIC.split(" ");
+
+beforeEach(() => {
+  // Off macOS Touch ID is unavailable; the enroll/unlock defaults keep the
+  // async probes from rejecting when a test doesn't exercise them.
+  touchidAvailableMock.mockResolvedValue(false);
+  touchidEnrollMock.mockResolvedValue(undefined);
+  touchidUnlockMock.mockResolvedValue({ pubkey: "ab12" });
+});
 
 afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
@@ -876,5 +899,176 @@ describe("identity gate — link-device flow", () => {
       screen.getByText(/doesn't look like a link code/i),
     ).toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("identity gate — Touch ID create flow", () => {
+  it("hides the Touch ID tab when the shim reports unavailable", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(false);
+    identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    await waitFor(() => expect(touchidAvailableMock).toHaveBeenCalled());
+    expect(screen.queryByText("Use Touch ID")).toBeNull();
+  });
+
+  it("Touch ID create: no password step, shows the phrase, enrolls after confirm", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    touchidEnrollMock.mockResolvedValue(undefined);
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    // the Touch ID tab appears only once the availability probe resolves true.
+    fireEvent.click(await screen.findByText("Use Touch ID"));
+
+    // the Touch ID create screen drops the password step entirely.
+    await screen.findByText("Continue with Touch ID");
+    expect(screen.queryByPlaceholderText("Password (min 8 characters)")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Continue with Touch ID"));
+    });
+    // it feeds createIdentity the machine-generated passphrase, never a typed one.
+    expect(createIdentityMock).toHaveBeenCalledWith("RANDOMPASS");
+
+    // the 24-word grid + confirm ceremony is kept, reframed as recovery.
+    await screen.findByText("Save your recovery phrase");
+    expect(screen.getByText("abandon")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("I've saved it — continue"));
+    await screen.findByText("Confirm your recovery phrase");
+
+    await fillConfirmWords(TEST_WORDS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Confirm"));
+    });
+
+    // enroll runs AFTER the phrase is confirmed (a failed enroll can't strand
+    // the user — the account already exists once confirmMnemonic resolves).
+    expect(confirmMnemonicMock).toHaveBeenCalledTimes(1);
+    expect(touchidEnrollMock).toHaveBeenCalledWith("RANDOMPASS");
+    expect(touchidEnrollMock.mock.invocationCallOrder[0]).toBeGreaterThan(
+      confirmMnemonicMock.mock.invocationCallOrder[0],
+    );
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("a failed enroll is non-fatal — the account still lands in the console", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    touchidEnrollMock.mockRejectedValue(new Error("keychain add failed"));
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.click(await screen.findByText("Use Touch ID"));
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Continue with Touch ID"));
+    });
+    fireEvent.click(await screen.findByText("I've saved it — continue"));
+    await screen.findByText("Confirm your recovery phrase");
+    await fillConfirmWords(TEST_WORDS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Confirm"));
+    });
+
+    expect(touchidEnrollMock).toHaveBeenCalledTimes(1);
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+});
+
+describe("identity gate — unlock with Touch ID", () => {
+  it("offers Touch ID on the locked screen and unlocks with it", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock
+      .mockResolvedValueOnce({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true });
+    touchidUnlockMock.mockResolvedValue({ pubkey: "ab12" });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Unlock with Touch ID"));
+    });
+
+    expect(touchidUnlockMock).toHaveBeenCalledTimes(1);
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("the touchid-unavailable sentinel points the user at the recovery phrase", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock.mockResolvedValue({
+      state: "locked",
+      pubkey: "ab12",
+      mnemonicConfirmed: true,
+    });
+    touchidUnlockMock.mockRejectedValue(new Error("touchid-unavailable"));
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Unlock with Touch ID"));
+    });
+
+    expect(await screen.findByText(/recovery phrase/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("console")).toBeNull();
+  });
+
+  it("no Touch ID button when the shim reports unavailable", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(false);
+    identityStateMock.mockResolvedValue({
+      state: "locked",
+      pubkey: "ab12",
+      mnemonicConfirmed: true,
+    });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await waitFor(() => expect(touchidAvailableMock).toHaveBeenCalled());
+    expect(screen.queryByText("Unlock with Touch ID")).toBeNull();
   });
 });
