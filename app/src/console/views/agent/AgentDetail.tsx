@@ -238,6 +238,52 @@ export function AgentDetail({
   );
 }
 
+/** The right pane when an EXPLICIT selection names an agent the roster doesn't
+ *  hold — a clicked @mention of an agent that has since been removed. Says so,
+ *  rather than quietly showing the first agent's pane as if it were the one
+ *  asked for. */
+export function MissingAgentPane({ agentId, onBack }: { agentId: string; onBack: () => void }) {
+  return (
+    <GroupCard>
+      <div
+        style={{
+          minHeight: 240,
+          padding: "40px 24px",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          textAlign: "center",
+          gap: 10,
+        }}
+      >
+        <span
+          style={{
+            width: 46,
+            height: 46,
+            borderRadius: radius.md,
+            background: color.sunken,
+            color: color.muted2,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="agent" size={22} color="currentColor" strokeWidth={1.6} />
+        </span>
+        <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Agent not found</div>
+        <div style={{ maxWidth: 340, font: `400 12px ${font.sans}`, color: color.muted2, lineHeight: 1.5 }}>
+          <span style={{ font: `500 12px ${font.mono}`, color: color.muted3 }}>{agentId}</span> isn’t in
+          this workspace’s roster — it may have been removed since it was mentioned.
+        </div>
+        <button type="button" onClick={onBack} style={{ ...primaryButton(true), marginTop: 4 }}>
+          Back to the roster
+        </button>
+      </div>
+    </GroupCard>
+  );
+}
+
 /** The right pane when there are no agents at all — a single call to action
  *  instead of an always-present form. */
 export function NoAgentsPane({ onAdd }: { onAdd: () => void }) {
