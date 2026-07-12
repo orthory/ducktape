@@ -30,10 +30,10 @@ import { createInitialState, type ConsoleState } from "../../store/state";
 import { PagesView } from "./PagesView";
 
 const headingTopSpace = vi.fn(() => 0);
-vi.mock("./pages-style", () => ({
-  INDENT: 26,
-  MARKER_HANG: 28,
-  ROW_PAD_Y: 2.5,
+// only headingTopSpace is a spy; everything else is the REAL module, so adding
+// a constant there can never silently break this counter again.
+vi.mock("./pages-style", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./pages-style")>()),
   headingTopSpace: () => headingTopSpace(),
 }));
 

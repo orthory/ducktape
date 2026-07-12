@@ -4,6 +4,7 @@ import type { BlockKind, PageBlock } from "../../../domain/pages-client";
 import {
   buildRows,
   continuationKind,
+  duplicatePlan,
   emptyEnterExits,
   filterSlashKinds,
   indentTarget,
@@ -87,7 +88,19 @@ describe("markdown shortcuts", () => {
     expect(shortcutFor("[ ] buy")).toEqual({ kind: "todo", rest: "buy" });
     expect(shortcutFor("[] buy")).toEqual({ kind: "todo", rest: "buy" });
     expect(shortcutFor("> said")).toEqual({ kind: "quote", rest: "said" });
-    expect(shortcutFor("--- ")).toEqual({ kind: "divider", rest: "" });
+  });
+
+  // The rule these two USED to obey was "--- " and "``` " — with a trailing
+  // space. Nobody types a space after a horizontal rule or a code fence, so
+  // neither shortcut could be reached in practice. They now fire on the
+  // complete token, the way every other editor's do.
+  it("fires the rule and the fence on the bare token, with no trailing space", () => {
+    expect(shortcutFor("---")).toEqual({ kind: "divider", rest: "" });
+    expect(shortcutFor("***")).toEqual({ kind: "divider", rest: "" });
+    expect(shortcutFor("```")).toEqual({ kind: "code", rest: "" });
+    // and the partial tokens on the way there stay literal text.
+    expect(shortcutFor("--")).toBeNull();
+    expect(shortcutFor("``")).toBeNull();
   });
 
   it("requires the trailing space — a bare prefix stays literal text", () => {
@@ -154,5 +167,37 @@ describe("emptyEnterExits", () => {
       expect(continuationKind(kind)).not.toBe(kind);
       expect(emptyEnterExits(kind)).toBe(true);
     }
+  });
+});
+
+describe("duplicatePlan", () => {
+  // ids are minted by the caller (crypto.randomUUID in the app); a counter here
+  // keeps the plan readable.
+  const mint = () => {
+    let n = 0;
+    return () => `copy${(n += 1)}`;
+  };
+
+  it("copies a leaf directly below the original", () => {
+    expect(duplicatePlan(TREE, "a", mint())).toEqual([
+      { blockId: "copy1", parent: "p1", after: "a", kind: "paragraph", text: "first", checked: false },
+    ]);
+  });
+
+  it("deep-copies a subtree in preorder, re-parenting each copy onto its own", () => {
+    // b is a toggle holding c.
+    expect(duplicatePlan(TREE, "b", mint())).toEqual([
+      { blockId: "copy1", parent: "p1", after: "b", kind: "toggle", text: "details", checked: false },
+      { blockId: "copy2", parent: "copy1", after: null, kind: "paragraph", text: "inside", checked: false },
+    ]);
+  });
+
+  it("refuses the page root and an unknown block", () => {
+    expect(duplicatePlan(TREE, "p1", mint())).toEqual([]);
+    expect(duplicatePlan(TREE, "ghost", mint())).toEqual([]);
+  });
+
+  it("caps the burst — every copy is a consensus op", () => {
+    expect(duplicatePlan(TREE, "b", mint(), 1)).toHaveLength(1);
   });
 });

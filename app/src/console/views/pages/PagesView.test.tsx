@@ -6,6 +6,7 @@ import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { color } from "../../theme/tokens";
+import { MAX_PASTE_BLOCKS } from "./page-paste";
 import { EDIT_BOUNDARY_MS, PagesView } from "./PagesView";
 
 const makeActions = () => {
@@ -60,7 +61,7 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
       <PagesView />
     </ConsoleContext.Provider>
   );
-  const { rerender } = render(view(patch));
+  const { rerender, unmount } = render(view(patch));
   // the Proxy mints a spy on first access, so `spies.x` is undefined until the
   // view calls `actions.x`. Asserting "never called" needs the spy to exist:
   // touch it through `actions` first.
@@ -70,6 +71,7 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
   return {
     spies,
     materialize,
+    unmount,
     rerender: (p: Partial<ConsoleState>) => rerender(view(p)),
   };
 };
@@ -457,7 +459,19 @@ describe("subpages", () => {
 
   it("renders no Subpages section when the page has no children", () => {
     renderPagesView();
-    expect(screen.queryByText("Subpages")).toBeNull();
+    // by LABEL, not by text: child pages now render as inline page blocks in
+    // the document flow, so there is no "SUBPAGES" heading left to look for and
+    // a text query would pass vacuously.
+    expect(screen.queryByLabelText("Subpages")).toBeNull();
+  });
+
+  it("renders child pages as inline page blocks, not a boxed-off section", () => {
+    renderPagesView(withChild);
+    const section = screen.getByLabelText("Subpages");
+    // no uppercase mono section header, no underlined title.
+    expect(section.textContent).toBe("Child");
+    const row = within(section).getByRole("button", { name: "Open subpage Child" });
+    expect(row.innerHTML).not.toContain("border-bottom");
   });
 
   it("creates a subpage from /page instead of converting the block", () => {
@@ -706,5 +720,358 @@ describe("the document has one left edge", () => {
     renderPagesView();
     const add = screen.getByRole("button", { name: /add a block|start writing/i });
     expect(add.style.padding).toBe("8px 0px");
+  });
+});
+
+// ── The left gutter: the affordances that replaced a one-click subtree bomb ──
+
+describe("the left hover gutter", () => {
+  const NESTED: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a", "b"] }),
+    blockOf({ id: "a", kind: "toggle", text: "Parent", children: ["a1"] }),
+    blockOf({ id: "a1", parent: "a", text: "Child" }),
+    blockOf({ id: "b", text: "Leaf" }),
+  ];
+
+  const openMenu = (n: number) =>
+    fireEvent.click(screen.getByRole("button", { name: `Block ${n} actions` }));
+
+  it("inserts a paragraph below from the + affordance", () => {
+    const { spies } = renderPagesView();
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Insert block below block 1" }));
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ parent: "p1", after: "a", kind: "paragraph", text: "" }),
+    );
+  });
+
+  it("turns a block into another kind from the handle menu — the slash catalogue, reused", () => {
+    const { spies } = renderPagesView();
+    openMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Heading 1/ }));
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({ blockId: "a", kind: "heading1" });
+  });
+
+  it("never offers Page as a conversion (it would create, not convert)", () => {
+    renderPagesView();
+    openMenu(1);
+    const menu = screen.getByRole("menu", { name: "Block 1 actions" });
+    expect(within(menu).queryByRole("menuitem", { name: /new subpage/i })).toBeNull();
+  });
+
+  it("duplicates a block and its whole subtree", () => {
+    const { spies } = renderPagesView({ activePageBlocks: NESTED });
+    openMenu(1); // the toggle, which holds a child
+    fireEvent.click(screen.getByRole("menuitem", { name: "Duplicate" }));
+    // one insert for the toggle, one for the nested child.
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(2);
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ parent: "p1", after: "a", kind: "toggle", text: "Parent" }),
+    );
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ after: null, kind: "paragraph", text: "Child" }),
+    );
+  });
+
+  it("deletes a childless block outright", () => {
+    const { spies } = renderPagesView({ activePageBlocks: NESTED });
+    openMenu(3); // the leaf
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  // this is the dangerous one: the old bare `X` took the entire subtree with a
+  // single click, no confirm, no undo.
+  it("CONFIRMS before deleting a block that has children", () => {
+    const { spies, materialize } = renderPagesView({ activePageBlocks: NESTED });
+    materialize("removePageBlock");
+    openMenu(1); // the toggle, which holds a child
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    const dialog = screen.getByRole("dialog", { name: /delete this block/i });
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    within(dialog).getByText(/1 nested block/);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /delete block/i }));
+    expect(spies.removePageBlock).toHaveBeenCalledWith("a");
+  });
+
+  it("reserves no column width on the right — the finalization tray hangs out of the row", () => {
+    renderPagesView();
+    const row = screen
+      .getByLabelText("Edit paragraph block 1")
+      .closest('[style*="margin-left"]') as HTMLElement;
+    // the old tray was an in-flow flex item with `min-width: 44px` on EVERY row.
+    expect(row.innerHTML).not.toContain("min-width: 44px");
+    expect(row.querySelector('[style*="left: 100%"]')).not.toBeNull();
+  });
+});
+
+describe("breadcrumbs", () => {
+  const NESTED_PAGES = {
+    pages: [
+      { id: "top", title: "Handbook", parent: null },
+      { id: "mid", title: "Engineering", parent: "top" },
+      { id: "p1", title: "Launch plan", parent: "mid" },
+    ],
+  };
+
+  it("renders the TRUE ancestry, not a hardcoded 'Pages / <title>'", () => {
+    renderPagesView(NESTED_PAGES);
+    const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
+    expect(
+      within(crumbs)
+        .getAllByRole("button")
+        .map((b) => b.textContent),
+    ).toEqual(["Handbook", "Engineering", "Launch plan"]);
+  });
+
+  it("opens an ancestor from its segment; the current page is not a link", () => {
+    const { spies } = renderPagesView(NESTED_PAGES);
+    const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
+    fireEvent.click(within(crumbs).getByRole("button", { name: "Engineering" }));
+    expect(spies.openPage).toHaveBeenCalledWith("mid");
+    expect(within(crumbs).getByRole("button", { name: "Launch plan" })).toBeDisabled();
+  });
+});
+
+describe("pasting a document", () => {
+  const pasteInto = (label: string, text: string, selection?: [number, number]) => {
+    const area = screen.getByLabelText(label) as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    if (selection) area.setSelectionRange(selection[0], selection[1]);
+    fireEvent.paste(area, { clipboardData: { getData: () => text } });
+    return area;
+  };
+
+  it("splits a markdown paste into blocks instead of dumping literal newlines", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({ id: "e", text: "" }),
+      ],
+    });
+    pasteInto("Edit paragraph block 1", "# Title\n\nintro\n- one\n- two");
+
+    // the empty paragraph adopts the first line — kind and text.
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({ blockId: "e", kind: "heading1" });
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "e", text: "Title" });
+    // the rest become their own blocks, in order, each with its own kind.
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(3);
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ kind: "paragraph", text: "intro" }),
+    );
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ kind: "bulleted", text: "one" }),
+    );
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ kind: "bulleted", text: "two" }),
+    );
+  });
+
+  it("leaves a single-line paste to the browser", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    pasteInto("Edit paragraph block 1", "just some words");
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+
+  it("caps the burst and says so — every block is one consensus write", () => {
+    const { spies } = renderPagesView();
+    pasteInto(
+      "Edit paragraph block 1",
+      Array.from({ length: MAX_PASTE_BLOCKS + 5 }, (_, i) => `line ${i}`).join("\n"),
+    );
+    // first line lands in the row itself; the other 59 are inserts.
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(MAX_PASTE_BLOCKS - 1);
+    screen.getByRole("status");
+    expect(screen.getByRole("status").textContent).toMatch(/5 more lines were dropped/);
+  });
+});
+
+describe("toggle collapse", () => {
+  const TOGGLES: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["t", "e"] }),
+    blockOf({ id: "t", kind: "toggle", text: "Parent", children: ["c"] }),
+    blockOf({ id: "c", parent: "t", text: "Child" }),
+    blockOf({ id: "e", kind: "toggle", text: "Childless" }),
+  ];
+
+  it("shows a chevron only on a toggle that has something to hide", () => {
+    renderPagesView({ activePageBlocks: TOGGLES });
+    screen.getByRole("button", { name: /collapse toggle block 1/i });
+    expect(screen.queryByRole("button", { name: /toggle block 3/i })).toBeNull();
+  });
+
+  it("persists the collapsed set per page across a remount", () => {
+    localStorage.clear();
+    const first = renderPagesView({ activePageBlocks: TOGGLES });
+    fireEvent.click(screen.getByRole("button", { name: /collapse toggle block 1/i }));
+    expect(screen.queryByLabelText("Edit paragraph block 2")).toBeNull();
+    first.unmount();
+
+    // a remount used to re-expand every toggle in the document.
+    renderPagesView({ activePageBlocks: TOGGLES });
+    expect(screen.queryByLabelText("Edit paragraph block 2")).toBeNull();
+    screen.getByRole("button", { name: /expand toggle block 1/i });
+  });
+});
+
+describe("the page icon", () => {
+  it("shows the title's leading emoji as an icon, and edits the title without it", () => {
+    renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "🦆 Launch plan", children: [] }),
+      ],
+    });
+    expect(screen.getByLabelText("Page title")).toHaveValue("Launch plan");
+    expect(screen.getByRole("button", { name: "Change page icon" }).textContent).toBe("🦆");
+  });
+
+  it("composes the icon back onto the title when the rename commits", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "🦆 Launch plan", children: [] }),
+      ],
+    });
+    const title = screen.getByLabelText("Page title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Launch plan v2" } });
+    fireEvent.blur(title);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "p1",
+      text: "🦆 Launch plan v2",
+    });
+  });
+
+  it("takes the icon off again — the input alone could never reach it", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "🦆 Launch plan", children: [] }),
+      ],
+    });
+    // the affordance shows on hover, like Notion's.
+    fireEvent.mouseOver(screen.getByLabelText("Page title"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove page icon" }));
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "p1", text: "Launch plan" });
+  });
+});
+
+// RemoveBlock takes the whole subtree with it. Every path that reaches it —
+// the menu, Backspace on an empty block, the merge — has to reckon with that,
+// or a keystroke silently destroys nested work.
+describe("no delete path quietly eats a subtree", () => {
+  const PARENTED: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a", "b"] }),
+    blockOf({ id: "a", text: "First" }),
+    blockOf({ id: "b", kind: "toggle", text: "", children: ["b1"] }),
+    blockOf({ id: "b1", parent: "b", text: "buried note" }),
+  ];
+
+  it("CONFIRMS a Backspace that would delete an empty block holding children", () => {
+    const { spies, materialize } = renderPagesView({ activePageBlocks: PARENTED });
+    materialize("removePageBlock");
+    const area = screen.getByLabelText("Edit toggle block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: /delete this block/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: /delete block/i }));
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  it("hands the children over before merging a block away", () => {
+    const withText: PageBlock[] = [
+      ...PARENTED.slice(0, 2),
+      blockOf({ id: "b", text: "second", children: ["b1"] }),
+      blockOf({ id: "b1", parent: "b", text: "buried note" }),
+    ];
+    const { spies } = renderPagesView({ activePageBlocks: withText });
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // the text merges up…
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "Firstsecond" });
+    // …and the child follows it, instead of dying with its old parent.
+    expect(spies.movePageBlock).toHaveBeenCalledWith({
+      blockId: "b1",
+      parent: "a",
+      after: null,
+    });
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+});
+
+describe("drag to reorder", () => {
+  // jsdom has NO layout engine: getBoundingClientRect is all zeros, so the
+  // before/after edge cannot be exercised here (page-drag.test.ts covers that
+  // geometry as a pure function). What this proves is the WIRING — that the
+  // handle's drag reaches MoveBlock at all, and as exactly ONE op.
+  const dataTransfer = () => {
+    const store = new Map<string, string>();
+    return {
+      effectAllowed: "",
+      dropEffect: "",
+      types: ["application/x-ducktape-block"],
+      setData: (type: string, value: string) => store.set(type, value),
+      getData: (type: string) => store.get(type) ?? "",
+    };
+  };
+
+  it("moves the dragged block with a single MoveBlock op", () => {
+    const { spies } = renderPagesView();
+    const dt = dataTransfer();
+    const rowOf = (label: string) =>
+      screen.getByLabelText(label).closest('[style*="margin-left"]') as HTMLElement;
+
+    // drag block 1 ("First draft") down onto block 2 ("Ship it").
+    fireEvent.dragStart(screen.getByRole("button", { name: "Block 1 actions" }), {
+      dataTransfer: dt,
+    });
+    fireEvent.dragOver(rowOf("Edit todo block 2"), { dataTransfer: dt });
+    fireEvent.drop(rowOf("Edit todo block 2"), { dataTransfer: dt });
+
+    // ONE op for the whole gesture — never one per dragover.
+    expect(spies.movePageBlock).toHaveBeenCalledTimes(1);
+    expect(spies.movePageBlock).toHaveBeenCalledWith({
+      blockId: "a",
+      parent: "p1",
+      after: "b",
+    });
+  });
+
+  it("does not submit an op for a drop that changes nothing", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("movePageBlock");
+    const dt = dataTransfer();
+    const row = screen
+      .getByLabelText("Edit paragraph block 1")
+      .closest('[style*="margin-left"]') as HTMLElement;
+    // block 2 dropped below block 1 — it is already there.
+    fireEvent.dragStart(screen.getByRole("button", { name: "Block 2 actions" }), {
+      dataTransfer: dt,
+    });
+    fireEvent.dragOver(row, { dataTransfer: dt });
+    fireEvent.drop(row, { dataTransfer: dt });
+    expect(spies.movePageBlock).not.toHaveBeenCalled();
+  });
+
+  it("ignores a drag that is not one of our blocks", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("movePageBlock");
+    const foreign = { ...dataTransfer(), types: ["Files"] };
+    const row = screen
+      .getByLabelText("Edit paragraph block 1")
+      .closest('[style*="margin-left"]') as HTMLElement;
+    fireEvent.drop(row, { dataTransfer: foreign });
+    expect(spies.movePageBlock).not.toHaveBeenCalled();
   });
 });

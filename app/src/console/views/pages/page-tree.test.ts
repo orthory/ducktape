@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildForest, flattenVisible, subtreeIds } from "./page-tree";
+import { ancestorChain, buildForest, flattenVisible, subtreeIds } from "./page-tree";
 import type { PageMeta } from "../../../domain/pages-client";
 
 const pm = (id: string, title: string, parent: string | null): PageMeta => ({ id, title, parent });
@@ -30,5 +30,27 @@ describe("page forest", () => {
   it("subtreeIds collects a node and all descendants", () => {
     const forest = buildForest([pm("a", "A", null), pm("b", "B", "a"), pm("c", "C", "b"), pm("d", "D", null)]);
     expect([...subtreeIds(forest, "a")].sort()).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("ancestorChain (the breadcrumb)", () => {
+  const PAGES = [pm("a", "A", null), pm("b", "B", "a"), pm("c", "C", "b"), pm("d", "D", null)];
+
+  it("walks root-first and includes the page itself", () => {
+    expect(ancestorChain(PAGES, "c").map((p) => p.id)).toEqual(["a", "b", "c"]);
+    expect(ancestorChain(PAGES, "d").map((p) => p.id)).toEqual(["d"]);
+  });
+
+  it("is empty for an unknown page", () => {
+    expect(ancestorChain(PAGES, "ghost")).toEqual([]);
+  });
+
+  it("ends the chain at a dangling parent rather than dropping the page", () => {
+    expect(ancestorChain([pm("x", "X", "ghost")], "x").map((p) => p.id)).toEqual(["x"]);
+  });
+
+  it("does not hang on a cycle from a torn enumeration", () => {
+    const cyclic = [pm("x", "X", "y"), pm("y", "Y", "x")];
+    expect(ancestorChain(cyclic, "x").map((p) => p.id)).toEqual(["y", "x"]);
   });
 });

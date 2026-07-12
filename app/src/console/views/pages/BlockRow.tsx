@@ -11,6 +11,7 @@
 //   Down/Right     at the end: hop to the next block, caret at its START
 //   "# " "- " …    markdown prefixes convert a paragraph's kind
 //   "/"            slash menu over every block kind
+//   paste          a multi-line paste becomes BLOCKS, not literal newlines
 //
 // What a keystroke MEANS lives in block-keys.ts as a pure resolveKey(); this
 // file only carries the intent out.
@@ -20,64 +21,37 @@
 // rest of the console's server-authoritative writes. A landing snapshot never
 // overwrites the draft of the block being edited; committed truth reconciles
 // through the next boundary commit instead.
+//
+// The hover affordances hang OUT of the row on both sides (BlockGutter on the
+// left; the finalization mark and comment button on the right), so neither
+// reserves column width and the text column keeps one straight left edge.
 
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { KeyboardEvent, ReactNode } from "react";
+import type { ClipboardEvent, DragEvent, KeyboardEvent } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
 import type { OpRecord } from "../../store/finalization";
-import { accentVar, color, font, radius } from "../../theme/tokens";
+import { accentVar, color, font } from "../../theme/tokens";
 import { EDIT_BOUNDARY_MS, filterSlashKinds, shortcutFor } from "./pages-model";
+import { BlockGutter } from "./BlockGutter";
+import { BlockMarker, BlockShell } from "./BlockShell";
 import { SlashMenu } from "./SlashMenu";
 import type { Row } from "./pages-model";
+import { DRAG_MIME } from "./page-drag";
+import type { DropEdge } from "./page-drag";
 import { FOCUS_NEXT_CARET, FOCUS_PREV_CARET, caretOffset, resolveKey } from "./block-keys";
 import type { Caret } from "./block-keys";
-import { INDENT, MARKER_HANG, ROW_PAD_Y, headingTopSpace } from "./pages-style";
-
-/** Per-kind typography for the block textarea. */
-function kindFont(kind: BlockKind): string {
-  switch (kind) {
-    case "heading1":
-      return `650 24px/1.25 ${font.sans}`;
-    case "heading2":
-      return `650 19px/1.3 ${font.sans}`;
-    case "heading3":
-      return `600 16px/1.35 ${font.sans}`;
-    case "code":
-      return `400 12.5px/1.55 ${font.mono}`;
-    case "quote":
-      return `400 14.5px/1.6 ${font.sans}`;
-    default:
-      return `400 14.5px/1.6 ${font.sans}`;
-  }
-}
-
-/** The placeholder shown ONLY on a focused, empty block. */
-function focusPlaceholder(kind: BlockKind): string {
-  switch (kind) {
-    case "heading1":
-    case "heading2":
-    case "heading3":
-      return "Heading";
-    case "todo":
-      return "To-do";
-    case "bulleted":
-    case "numbered":
-      return "List item";
-    case "toggle":
-      return "Toggle";
-    case "quote":
-      return "Quote";
-    case "code":
-      return "Code";
-    case "callout":
-      return "Callout";
-    default:
-      return "Write, or press '/' for commands";
-  }
-}
+import {
+  GUTTER_WIDTH,
+  INDENT,
+  ROW_PAD_Y,
+  headingTopSpace,
+  kindFont,
+  kindPlaceholder,
+  restPlaceholder,
+} from "./pages-style";
 
 // ── One editable block row ───────────────────────────────
 
@@ -95,7 +69,17 @@ export interface RowHandlers {
   moveDown(row: Row): void;
   setKind(blockId: string, kind: BlockKind): void;
   setChecked(blockId: string, checked: boolean): void;
+  /** Delete the block and its subtree. A block WITH children is confirmed
+   *  first — the guard lives in the handler, so every caller inherits it. */
   remove(blockId: string): void;
+  /** A fresh empty paragraph directly below this row. */
+  insertBelow(row: Row): void;
+  /** Copy this block and its subtree, directly below it. */
+  duplicate(row: Row): void;
+  /** A multi-line paste: `before`/`after` are the text this row keeps around
+   *  the caret. Returns the text THIS row is left holding — the row owns its
+   *  draft, so it adopts the return value. */
+  pasteBlocks(row: Row, before: string, pasted: string, after: string): string;
   toggleCollapse(blockId: string): void;
   focusRelative(row: Row, delta: -1 | 1, caret: Caret): void;
   /** Reported by the row once it has placed a requested caret. */
@@ -103,7 +87,17 @@ export interface RowHandlers {
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
   openComments(blockId: string, anchor: { x: number; y: number }): void;
   createSubpage(): void;
+  dragStart(blockId: string): void;
+  dragOver(blockId: string, edge: DropEdge): void;
+  drop(blockId: string, edge: DropEdge): void;
+  dragEnd(): void;
 }
+
+/** Which half of a row the pointer is in — the drop lands on that side. */
+const edgeOf = (event: DragEvent<HTMLElement>): DropEdge => {
+  const rect = event.currentTarget.getBoundingClientRect();
+  return event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+};
 
 function BlockRowInner({
   row,
@@ -113,6 +107,7 @@ function BlockRowInner({
   expanded,
   op,
   threadCount,
+  dropEdge,
   handlers,
 }: {
   row: Row;
@@ -129,6 +124,8 @@ function BlockRowInner({
   op: OpRecord | undefined;
   /** Number of live comment threads on this block. */
   threadCount: number;
+  /** A drag is hovering this row and would land on this edge. */
+  dropEdge: DropEdge | null;
   handlers: RowHandlers;
 }) {
   const { block, depth } = row;
@@ -234,6 +231,18 @@ function BlockRowInner({
     setDraft(next);
   };
 
+  // A pasted DOCUMENT is blocks, not one wall of literal newlines. A single
+  // line is left to the browser (it is just text at the caret).
+  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = event.clipboardData.getData("text/plain");
+    if (!pasted.includes("\n") || block.kind === "code") return;
+    event.preventDefault();
+    const el = event.currentTarget;
+    const before = draft.slice(0, el.selectionStart ?? 0);
+    const after = draft.slice(el.selectionEnd ?? draft.length);
+    setDraft(handlers.pasteBlocks(row, before, pasted, after));
+  };
+
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     const el = event.currentTarget;
 
@@ -331,186 +340,135 @@ function BlockRowInner({
     }
   };
 
-  const code = block.kind === "code";
-  const quote = block.kind === "quote";
-  const callout = block.kind === "callout";
   const todoDone = block.kind === "todo" && block.checked;
   const blockNumber = index + 1;
 
-  // the left gutter marker per kind (bullet, number, checkbox, chevron).
-  const marker: ReactNode =
-    block.kind === "bulleted" ? (
-      <span style={{ font: `700 14px ${font.sans}`, color: color.muted3 }}>•</span>
-    ) : block.kind === "numbered" ? (
-      <span style={{ font: `500 12.5px ${font.mono}`, color: color.muted3 }}>
-        {row.listIndex ?? 1}.
-      </span>
-    ) : block.kind === "todo" ? (
-      <button
-        type="button"
-        aria-label={`${block.checked ? "Uncheck" : "Check"} to-do block ${blockNumber}`}
-        onClick={() => handlers.setChecked(block.id, !block.checked)}
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          width: 15,
-          height: 15,
-          borderRadius: 4,
-          border: `1.5px solid ${block.checked ? accentVar : color.borderStrong}`,
-          background: block.checked ? accentVar : "transparent",
-          color: "#fff",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        {block.checked ? <Icon name="check" size={10} strokeWidth={2.4} /> : null}
-      </button>
-    ) : block.kind === "toggle" ? (
-      <button
-        type="button"
-        aria-label={`${expanded ? "Collapse" : "Expand"} toggle block ${blockNumber}`}
-        aria-expanded={expanded}
-        onClick={() => handlers.toggleCollapse(block.id)}
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          width: 16,
-          height: 16,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: color.muted3,
-        }}
-      >
-        <Icon
-          name="chevronRight"
-          size={13}
-          strokeWidth={2}
-          style={{ transform: `rotate(${expanded ? 90 : 0}deg)` }}
-        />
-      </button>
-    ) : null;
-
-  const content =
-    block.kind === "divider" ? (
-      <div
-        aria-label={`Divider block ${blockNumber}`}
-        style={{ padding: "10px 0" }}
-      >
-        <div style={{ height: 1, background: color.borderStrong }} />
-      </div>
-    ) : (
-      <div
-        style={{
-          position: "relative",
-          borderLeft: quote ? `3px solid ${color.borderStrong}` : "none",
-          paddingLeft: quote ? 12 : 0,
-          background: code ? color.sunken : callout ? color.sidebar : "transparent",
-          border: code
-            ? `1px solid ${color.border}`
-            : callout
-              ? `1px solid ${color.border}`
-              : undefined,
-          borderRadius: code || callout ? radius.md : 0,
-          padding: code ? "11px 13px" : callout ? "11px 13px" : undefined,
-        }}
-      >
-        <textarea
-          ref={(el) => {
-            areaRef.current = el;
-            handlers.registerInput(block.id, el);
-          }}
-          aria-label={`Edit ${block.kind} block ${blockNumber}`}
-          value={draft}
-          rows={1}
-          onChange={(event) => onChange(event.target.value)}
-          onFocus={() => {
-            focusedRef.current = true;
-            setFocused(true);
-          }}
-          onBlur={() => {
-            focusedRef.current = false;
-            setFocused(false);
-            maybeCommit();
-          }}
-          onKeyDown={onKeyDown}
-          placeholder={focused && draft === "" ? focusPlaceholder(block.kind) : ""}
-          spellCheck={!code}
-          style={{
-            display: "block",
-            width: "100%",
-            boxSizing: "border-box",
-            border: "none",
-            outline: "none",
-            resize: "none",
-            overflow: "hidden",
-            background: "transparent",
-            padding: 0,
-            color: todoDone ? color.muted2 : color.ink,
-            textDecoration: todoDone ? "line-through" : "none",
-            font: kindFont(block.kind),
-          }}
-        />
-        {slashOpen ? (
-          <SlashMenu
-            query={slashQuery}
-            activeIndex={slashIndex}
-            onPick={pickSlash}
-          />
-        ) : null}
-      </div>
-    );
+  const area = (
+    <textarea
+      ref={(el) => {
+        areaRef.current = el;
+        handlers.registerInput(block.id, el);
+      }}
+      aria-label={`Edit ${block.kind} block ${blockNumber}`}
+      value={draft}
+      rows={1}
+      onChange={(event) => onChange(event.target.value)}
+      onPaste={onPaste}
+      onFocus={() => {
+        focusedRef.current = true;
+        setFocused(true);
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        setFocused(false);
+        maybeCommit();
+      }}
+      onKeyDown={onKeyDown}
+      placeholder={
+        draft === ""
+          ? focused
+            ? kindPlaceholder(block.kind)
+            : restPlaceholder(block.kind)
+          : ""
+      }
+      spellCheck={block.kind !== "code"}
+      style={{
+        display: "block",
+        width: "100%",
+        boxSizing: "border-box",
+        border: "none",
+        outline: "none",
+        resize: "none",
+        overflow: "hidden",
+        background: "transparent",
+        padding: 0,
+        color: todoDone ? color.muted2 : color.ink,
+        textDecoration: todoDone ? "line-through" : "none",
+        font: kindFont(block.kind),
+      }}
+    />
+  );
 
   return (
     <div
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      onDragOver={(event) => {
+        if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        handlers.dragOver(block.id, edgeOf(event));
+      }}
+      onDrop={(event) => {
+        if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
+        event.preventDefault();
+        handlers.drop(block.id, edgeOf(event));
+      }}
       style={{
         position: "relative",
         display: "flex",
         alignItems: "flex-start",
-        gap: 8,
         padding: `${ROW_PAD_Y}px 0`,
         marginLeft: depth * INDENT,
         marginTop: headingTopSpace(block.kind),
       }}
     >
+      <BlockGutter
+        blockNumber={blockNumber}
+        kind={block.kind}
+        visible={hover}
+        onInsertBelow={() => handlers.insertBelow(row)}
+        onTurnInto={(kind) => handlers.setKind(block.id, kind)}
+        onDuplicate={() => handlers.duplicate(row)}
+        onRemove={() => handlers.remove(block.id)}
+        onDragStart={(event) => {
+          event.dataTransfer.effectAllowed = "move";
+          // the MIME is the drag's signature: rows only accept a drag that
+          // carries it, so a file or a text selection dragged in from outside
+          // never reorders the document.
+          event.dataTransfer.setData(DRAG_MIME, block.id);
+          handlers.dragStart(block.id);
+        }}
+        onDragEnd={handlers.dragEnd}
+      />
+
       {/* the marker hangs in the left margin instead of sitting in flow, so the
           text column below starts at offset 0 and lines up with the page title.
           Prose kinds render no marker at all and used to pay for the gutter
           anyway — that was the whole reason the body sat 28px right of the
           title. */}
-      {marker ? (
-        <div
-          style={{
-            position: "absolute",
-            left: -MARKER_HANG,
-            // an absolute box offsets from the row's PADDING box, but the
-            // marker used to be a flex item aligned to its CONTENT box — one
-            // row-padding lower. Match it, or every bullet rides high above
-            // its own line.
-            top: ROW_PAD_Y,
-            width: 20,
-            height: 24,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          {marker}
-        </div>
-      ) : null}
-      <div style={{ flex: 1, minWidth: 0 }}>{content}</div>
+      <BlockMarker
+        block={block}
+        blockNumber={blockNumber}
+        listIndex={row.listIndex}
+        expanded={expanded}
+        onSetChecked={(checked) => handlers.setChecked(block.id, checked)}
+        onToggleCollapse={() => handlers.toggleCollapse(block.id)}
+      />
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <BlockShell kind={block.kind} blockNumber={blockNumber} draft={draft}>
+          {area}
+          {slashOpen ? (
+            <SlashMenu query={slashQuery} activeIndex={slashIndex} onPick={pickSlash} />
+          ) : null}
+        </BlockShell>
+      </div>
+
+      {/* the finalization mark and the comment button hang in the RIGHT margin.
+          They used to reserve 44px of every row — on every row, forever — which
+          narrowed the text column and left it ragged. */}
       <div
         style={{
-          flexShrink: 0,
+          position: "absolute",
+          left: "100%",
+          marginLeft: 8,
+          top: ROW_PAD_Y,
+          width: GUTTER_WIDTH,
+          height: 24,
           display: "flex",
           alignItems: "center",
           gap: 3,
-          paddingTop: 3,
-          minWidth: 44,
-          justifyContent: "flex-end",
         }}
       >
         <FinalizationMark op={op} />
@@ -539,28 +497,24 @@ function BlockRowInner({
             {threadCount > 0 ? threadCount : null}
           </button>
         ) : null}
-        {hover ? (
-          <button
-            type="button"
-            aria-label={`Remove block ${blockNumber}`}
-            title="Remove block (and its subtree)"
-            onClick={() => handlers.remove(block.id)}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              width: 20,
-              height: 20,
-              borderRadius: 5,
-              color: color.muted2,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            <Icon name="close" size={11} />
-          </button>
-        ) : null}
       </div>
+
+      {dropEdge ? (
+        <div
+          data-testid={`drop-${dropEdge}`}
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: dropEdge === "before" ? -1 : undefined,
+            bottom: dropEdge === "after" ? -1 : undefined,
+            height: 2,
+            borderRadius: 2,
+            background: accentVar,
+          }}
+        />
+      ) : null}
     </div>
   );
 }
@@ -588,6 +542,9 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     x.kind === y.kind &&
     x.text === y.text &&
     x.checked === y.checked &&
+    // a toggle's chevron exists only while it HAS children, so the row reads
+    // the child count and must re-render when it changes.
+    x.children.length === y.children.length &&
     a.row.depth === b.row.depth &&
     a.row.listIndex === b.row.listIndex &&
     a.index === b.index &&
@@ -596,6 +553,7 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.expanded === b.expanded &&
     a.op === b.op &&
     a.threadCount === b.threadCount &&
+    a.dropEdge === b.dropEdge &&
     a.handlers === b.handlers
   );
 });

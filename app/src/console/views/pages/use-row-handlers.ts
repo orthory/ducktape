@@ -19,14 +19,25 @@ import type { ConsoleActions } from "../../store/actions";
 import { caretOffset, mergeText } from "./block-keys";
 import type { Caret, FocusIntent } from "./block-keys";
 import type { RowHandlers } from "./BlockRow";
+import { dropTarget } from "./page-drag";
+import type { DropEdge } from "./page-drag";
+import { pastePlan } from "./page-paste";
 import {
   continuationKind,
+  duplicatePlan,
   indentTarget,
   moveDownTarget,
   moveUpTarget,
   outdentTarget,
 } from "./pages-model";
 import type { Row } from "./pages-model";
+
+/** A drag in flight: what is moving, and where it would land. */
+export interface DragState {
+  id: string;
+  over: string | null;
+  edge: DropEdge;
+}
 
 export interface RowHandlersDeps {
   actions: ConsoleActions;
@@ -35,11 +46,18 @@ export interface RowHandlersDeps {
   /** The page root — its children are the top-level blocks. */
   root: PageBlock | null;
   activePage: string | null;
+  drag: DragState | null;
   inputs: MutableRefObject<Map<string, HTMLTextAreaElement>>;
   titleRef: MutableRefObject<HTMLInputElement | null>;
   setFocus: Dispatch<SetStateAction<FocusIntent | null>>;
   setCollapsed: Dispatch<SetStateAction<ReadonlySet<string>>>;
+  setDrag: Dispatch<SetStateAction<DragState | null>>;
   openComments: (blockId: string, anchor: { x: number; y: number }) => void;
+  /** Deleting a block WITH CHILDREN takes its whole subtree with it, so it asks
+   *  first. The view owns the dialog. */
+  confirmRemove: (blockId: string) => void;
+  /** A paste past the block cap dropped lines; the view says so. */
+  onPasteCapped: (dropped: number) => void;
 }
 
 export interface RowHandlersApi {
@@ -56,14 +74,18 @@ export function useRowHandlers({
   blocks,
   root,
   activePage,
+  drag,
   inputs,
   titleRef,
   setFocus,
   setCollapsed,
+  setDrag,
   openComments,
+  confirmRemove,
+  onPasteCapped,
 }: RowHandlersDeps): RowHandlersApi {
-  const live = useRef({ rows, blocks, root, actions, activePage: activePage });
-  live.current = { rows, blocks, root, actions, activePage: activePage };
+  const live = useRef({ rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped });
+  live.current = { rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped };
 
   const appendBlock = useCallback(() => {
     const { root, actions } = live.current;
@@ -152,14 +174,27 @@ export function useRowHandlers({
       // Backspace at offset 0: this block's text joins the one above and this
       // one goes away. Same hazard, mirrored — here the *update* is the additive
       // op, so a failed update is compensated by putting this block back.
+      //
+      // RemoveBlock takes the whole subtree with it, so a block with children
+      // must hand them over BEFORE it goes: they are re-parented onto the block
+      // that just absorbed its text, which is where they belong. Without this
+      // the merge quietly destroyed every nested block under the caret.
       mergePrev: (row, text) => {
       const index = live.current.rows.findIndex((r) => r.block.id === row.block.id);
       const prev = editableAbove(index);
       if (!prev) return;
-      const cur = row.block;
+      const cur = live.current.blocks.find((b) => b.id === row.block.id) ?? row.block;
       if (!cur.parent) return;
       const { text: joined, seam } = mergeText(liveText(prev.block), text);
       const merged = live.current.actions.updatePageBlockText({ blockId: prev.block.id, text: joined });
+
+      const adopter = live.current.blocks.find((b) => b.id === prev.block.id);
+      let after = adopter?.children[adopter.children.length - 1] ?? null;
+      for (const child of cur.children) {
+        live.current.actions.movePageBlock({ blockId: child, parent: prev.block.id, after });
+        after = child;
+      }
+
       live.current.actions.removePageBlock(cur.id);
       void merged.then((ok) => {
         if (ok !== false) return;
@@ -180,8 +215,17 @@ export function useRowHandlers({
       const above = live.current.rows[index - 1];
       if (above?.block.kind === "divider") live.current.actions.removePageBlock(above.block.id);
       },
+      // Backspace on an EMPTY block. This is the same destructive act as the
+      // menu's Delete — RemoveBlock takes the subtree — so it takes the same
+      // guard. An empty toggle holding a page of notes must not vanish on one
+      // keystroke.
       removeEmpty: (row) => {
       const index = live.current.rows.findIndex((r) => r.block.id === row.block.id);
+      const cur = live.current.blocks.find((b) => b.id === row.block.id);
+      if (cur && cur.children.length > 0) {
+        live.current.confirmRemove(cur.id);
+        return;
+      }
       live.current.actions.removePageBlock(row.block.id);
       focusRow(editableAbove(index), "end");
       },
@@ -195,7 +239,106 @@ export function useRowHandlers({
       },
       setChecked: (blockId, checked) =>
       live.current.actions.setPageBlockChecked({ blockId, checked }),
-      remove: (blockId) => live.current.actions.removePageBlock(blockId),
+      // Deleting a block takes its ENTIRE SUBTREE with it and there is no undo,
+      // so a block with children asks first. The guard lives HERE, in the one
+      // handler every caller routes through — not in the button that happens to
+      // be wired today.
+      remove: (blockId) => {
+      const block = live.current.blocks.find((b) => b.id === blockId);
+      if (block && block.children.length > 0) {
+        live.current.confirmRemove(blockId);
+        return;
+      }
+      live.current.actions.removePageBlock(blockId);
+      },
+      insertBelow: (row) => {
+      const cur = row.block;
+      if (!cur.parent) return;
+      const blockId = crypto.randomUUID();
+      live.current.actions.insertPageBlock({
+        blockId,
+        parent: cur.parent,
+        after: cur.id,
+        kind: "paragraph",
+        text: "",
+      });
+      setFocus({ id: blockId, caret: "start" });
+      },
+      duplicate: (row) => {
+      const ops = duplicatePlan(live.current.blocks, row.block.id, () => crypto.randomUUID());
+      for (const op of ops) {
+        live.current.actions.insertPageBlock({
+          blockId: op.blockId,
+          parent: op.parent,
+          after: op.after,
+          kind: op.kind,
+          text: op.text,
+        });
+        // InsertBlock carries no `checked` bit, so a checked to-do needs a
+        // second op to come back checked.
+        if (op.checked) live.current.actions.setPageBlockChecked({ blockId: op.blockId, checked: true });
+      }
+      if (ops[0]) setFocus({ id: ops[0].blockId, caret: "end" });
+      },
+      // A multi-line paste becomes BLOCKS: this row keeps the first line, the
+      // rest are inserted below it in order, each converted by the same
+      // markdown grammar typing uses. One op per block, and the plan is capped
+      // — a 500-line paste is a 500-submit burst the ledger cannot even hold.
+      pasteBlocks: (row, before, pasted, after) => {
+      const cur = row.block;
+      const plan = pastePlan(pasted);
+      if (plan.blocks.length === 0 || !cur.parent) return before + after;
+      const [first, ...rest] = plan.blocks;
+      const head = before + first.text + (rest.length === 0 ? after : "");
+
+      live.current.actions.updatePageBlockText({ blockId: cur.id, text: head });
+      // an EMPTY paragraph adopts the first line's kind — pasting a document
+      // into a fresh block must not leave "# Title" sitting as a paragraph.
+      if (cur.kind === "paragraph" && before === "" && first.kind !== "paragraph") {
+        live.current.actions.setPageBlockKind({ blockId: cur.id, kind: first.kind });
+      }
+
+      let afterId = cur.id;
+      rest.forEach((block, i) => {
+        const blockId = crypto.randomUUID();
+        const last = i === rest.length - 1;
+        live.current.actions.insertPageBlock({
+          blockId,
+          parent: cur.parent as string,
+          after: afterId,
+          kind: block.kind,
+          // the text the caret was sitting in front of rides on the last
+          // pasted block, exactly where a plain paste would have left it.
+          text: last ? block.text + after : block.text,
+        });
+        // the caret lands at the END of the pasted content — before the tail.
+        if (last) setFocus({ id: blockId, caret: block.text.length });
+        afterId = blockId;
+      });
+
+      if (plan.dropped > 0) live.current.onPasteCapped(plan.dropped);
+      return head;
+      },
+      dragStart: (blockId) => setDrag({ id: blockId, over: null, edge: "after" }),
+      dragOver: (blockId, edge) =>
+      setDrag((prev) =>
+        // a dragover fires ~60×/s: only re-render when the landing actually moved.
+        !prev || (prev.over === blockId && prev.edge === edge)
+          ? prev
+          : { ...prev, over: blockId, edge },
+      ),
+      // ONE MoveBlock per drop — the wire op reparents and reorders, so the
+      // whole gesture is a single consensus write, never one per dragover.
+      drop: (blockId, edge) => {
+      const { drag, blocks, actions } = live.current;
+      setDrag(null);
+      if (!drag) return;
+      const target = dropTarget(blocks, drag.id, blockId, edge);
+      if (!target) return;
+      actions.movePageBlock({ blockId: drag.id, ...target });
+      setFocus({ id: drag.id, caret: "end" });
+      },
+      dragEnd: () => setDrag(null),
       toggleCollapse: (blockId) =>
       setCollapsed((prev) => {
         const next = new Set(prev);
@@ -226,7 +369,7 @@ export function useRowHandlers({
       // in the title via the fresh-page focus effect above).
       createSubpage: () => live.current.actions.createChildPage(live.current.activePage),
     }),
-    [editableAbove, focusRow, liveText, move, openComments],
+    [editableAbove, focusRow, liveText, move, openComments, setCollapsed, setDrag, setFocus],
   );
 
   return { handlers, appendBlock, focusRow };

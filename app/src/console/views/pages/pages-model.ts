@@ -81,8 +81,6 @@ export interface Shortcut {
 const SHORTCUTS: [string, BlockKind][] = [
   ["[ ] ", "todo"],
   ["### ", "heading3"],
-  ["--- ", "divider"],
-  ["``` ", "code"],
   ["## ", "heading2"],
   ["[] ", "todo"],
   ["# ", "heading1"],
@@ -92,9 +90,23 @@ const SHORTCUTS: [string, BlockKind][] = [
   ["> ", "quote"],
 ];
 
+// Tokens that convert the moment they are COMPLETE, with no trailing space —
+// there is no text after them to keep. They used to be listed as prefixes
+// ("--- ", "``` "), which meant the divider and the code block only appeared if
+// you typed a space onto the end of a rule or a fence. Nobody does, so in
+// practice neither shortcut existed.
+const EXACT: [string, BlockKind][] = [
+  ["---", "divider"],
+  ["***", "divider"],
+  ["```", "code"],
+];
+
 /** Detect a just-typed markdown prefix. The caller applies it only when the
  *  block is still a Paragraph (conversions never chain). */
 export function shortcutFor(text: string): Shortcut | null {
+  for (const [token, kind] of EXACT) {
+    if (text === token) return { kind, rest: "" };
+  }
   for (const [prefix, kind] of SHORTCUTS) {
     if (text.startsWith(prefix)) return { kind, rest: text.slice(prefix.length) };
   }
@@ -195,6 +207,52 @@ export function moveDownTarget(
   const pos = parent.children.indexOf(blockId);
   if (pos === -1 || pos === parent.children.length - 1) return null;
   return { parent: parent.id, after: parent.children[pos + 1] };
+}
+
+/** One insert of a duplicate: the wire's InsertBlock plus the `checked` bit,
+ *  which InsertBlock does not carry (the caller follows with SetChecked). */
+export interface DuplicateOp extends MoveTarget {
+  blockId: string;
+  kind: BlockKind;
+  text: string;
+  checked: boolean;
+}
+
+/** Deep-copy a block and its subtree: preorder inserts with fresh ids, the copy
+ *  landing directly after the original. Empty when the block is unknown or is
+ *  the page root (a page duplicates through the page module, not here).
+ *
+ *  Capped, because every op is a consensus submit — same ceiling as a paste. */
+export function duplicatePlan(
+  blocks: PageBlock[],
+  blockId: string,
+  mintId: () => string,
+  limit = 60,
+): DuplicateOp[] {
+  const map = byId(blocks);
+  const source = map.get(blockId);
+  if (!source || !source.parent) return [];
+
+  const ops: DuplicateOp[] = [];
+  const copy = (srcId: string, parent: string, after: string | null): string | null => {
+    if (ops.length >= limit) return null;
+    const block = map.get(srcId);
+    if (!block) return null;
+    const id = mintId();
+    ops.push({
+      blockId: id,
+      parent,
+      after,
+      kind: block.kind,
+      text: block.text,
+      checked: block.checked,
+    });
+    let prev: string | null = null;
+    for (const child of block.children) prev = copy(child, id, prev) ?? prev;
+    return id;
+  };
+  copy(blockId, source.parent, blockId);
+  return ops;
 }
 
 /** List kinds continue on Enter (a fresh sibling keeps the kind); everything
