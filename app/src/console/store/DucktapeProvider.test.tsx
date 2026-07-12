@@ -740,6 +740,154 @@ describe("DucktapeProvider", () => {
     expect(capturedState!.blocks.length).toBe(0);
   });
 
+  it("ignores an old node hydrate that settles after switching nodes", async () => {
+    const { transport } = makeFakeNode({ agents: [QUACKBOT] });
+    let releaseAgents!: () => void;
+    const agentsGate = new Promise<void>((resolve) => {
+      releaseAgents = resolve;
+    });
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target === "agent") {
+        return agentsGate.then(() => ({ agents: [QUACKBOT] }));
+      }
+      if (target === "pages" && query === "list_pages") {
+        return Promise.resolve({
+          pages: [{ id: "old-page", title: "Old workspace", parent: null }],
+        });
+      }
+      return baseQuery(target, query);
+    });
+
+    renderConsole(transport);
+    await waitFor(() => expect(transport.status).toHaveBeenCalled());
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.agents).toEqual([]);
+    expect(capturedState!.pages).toEqual([]);
+
+    // The old node's full hydrate finishes after the reset. It must be a
+    // no-op: neither its agent roster nor its Pages enumeration belongs to
+    // the newly selected node.
+    await act(async () => {
+      releaseAgents();
+      await agentsGate;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.agents).toEqual([]);
+    expect(capturedState!.pages).toEqual([]);
+  });
+
+  it("ignores an old page load that settles after switching nodes", async () => {
+    const { transport } = makeFakeNode();
+    let releasePage!: () => void;
+    const pageGate = new Promise<void>((resolve) => {
+      releasePage = resolve;
+    });
+    const oldRoot: PageBlock = {
+      id: "old-page",
+      parent: null,
+      page: "old-page",
+      kind: "page",
+      text: "Old workspace",
+      checked: false,
+      children: [],
+    };
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target === "pages" && (query as { get_page?: unknown }).get_page) {
+        return pageGate.then(() => ({ page: [oldRoot] }));
+      }
+      return baseQuery(target, query);
+    });
+
+    renderConsole(transport);
+    await waitFor(() => expect(screen.getByTestId("connected").textContent).toBe("true"));
+    act(() => capturedActions!.openPage("old-page"));
+    expect(capturedState!.activePage).toBe("old-page");
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.activePage).toBeNull();
+
+    await act(async () => {
+      releasePage();
+      await pageGate;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.activePageBlocks).toEqual([]);
+    expect(capturedState!.pageThreads).toEqual([]);
+  });
+
+  it("does not run an old write's UI continuation in the new workspace", async () => {
+    const { transport } = makeFakeNode();
+    let settleCreate!: (receipt: SubmitReceipt) => void;
+    const baseSubmit = vi.mocked(transport.submit).getMockImplementation()!;
+    vi.mocked(transport.submit).mockImplementation((target, payload, origin) => {
+      if (target === "chat" && (payload as { create_channel?: unknown }).create_channel) {
+        return new Promise((resolve) => {
+          settleCreate = resolve;
+        });
+      }
+      return baseSubmit(target, payload, origin);
+    });
+
+    renderConsole(transport);
+    await waitFor(() => expect(screen.getByTestId("connected").textContent).toBe("true"));
+    act(() => capturedActions!.createChannel("Old Room", "open"));
+    await waitFor(() => expect(transport.submit).toHaveBeenCalled());
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.activeChannel).toBeNull();
+
+    // The old create receipt used to continue into enterChannel("old-room")
+    // after the reset, reopening old coordinates against the new node.
+    await act(async () => {
+      settleCreate({ height: 2, appHash: "bb".repeat(32) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.activeChannel).toBeNull();
+    expect(capturedState!.channels).toEqual([]);
+    expect(capturedState!.ops).toEqual({});
+  });
+
+  it("clears every node-scoped projection when switching nodes", async () => {
+    const { transport } = makeFakeNode({ agents: [QUACKBOT] });
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.agents).toEqual([QUACKBOT]));
+
+    // Seed query-driven and secondary slices that the old hand-written reset
+    // lists omitted. They are all owned by the current node/workspace.
+    Object.assign(capturedState!, {
+      tagFilter: { tag: "old", channelId: "general" },
+      pageThreads: [{ target: "old-page", threads: [] }],
+      capabilities: ["old-capability"],
+      capabilitiesByNode: new Map([["old-node", ["old-capability"]]]),
+      runLease: new Map([["old-run", {}]]),
+      forgeRepo: "old-repo",
+      search: { query: "old", chat: [], docs: [] },
+      openTabs: ["old-page"],
+    });
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+
+    expect(capturedState!.tagFilter).toBeNull();
+    expect(capturedState!.pageThreads).toEqual([]);
+    expect(capturedState!.capabilities).toEqual([]);
+    expect(capturedState!.capabilitiesByNode.size).toBe(0);
+    expect(capturedState!.runLease.size).toBe(0);
+    expect(capturedState!.forgeRepo).toBeNull();
+    expect(capturedState!.search).toBeNull();
+    expect(capturedState!.openTabs).toEqual([]);
+  });
+
   it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {
     const { transport } = makeFakeNode();
     renderConsole(transport);

@@ -232,7 +232,8 @@ export interface ConsoleState {
    *  on open. The view derives depth/indent from the parent links. */
   activePageBlocks: PageBlock[];
   /** Ordered ids of the open document tabs. `activePage` is the active tab.
-   *  Persisted (loadDocTabs) and reconciled against the live enumeration. */
+   *  Persisted per workspace/node scope and reconciled against its live
+   *  enumeration. */
   openTabs: string[];
   /** Comment threads for the open page's blocks + the page itself, grouped by
    *  target. Loaded on page open and after any comment op. Not per-block
@@ -507,24 +508,44 @@ export const saveViewMode = (mode: ViewMode): void => {
 
 // ── Doc tab persistence ─────────────────────────────────
 //
-// The open Docs tabs survive restart as a single id list; on load they are
-// filtered against the live page enumeration (a stale id from another workspace
-// simply drops), so no per-workspace keying is needed.
+// Open Docs tabs survive restart, but page ids are only meaningful inside one
+// workspace/node. Persist a map by connection scope so an empty new workspace
+// cannot render another workspace's tabs while its enumeration is empty.
 const DOC_TABS_KEY = "ducktape.docTabs";
 
-export const loadDocTabs = (): string[] => {
+export const docTabsScope = (
+  workspaceId: string | null,
+  nodeUrl: string | null,
+): string =>
+  workspaceId ? `workspace:${workspaceId}` : nodeUrl ? `remote:${nodeUrl}` : "session";
+
+const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
+  if (!raw) return {};
+  const parsed: unknown = JSON.parse(raw);
+  // Pre-scoping builds stored one global array. It cannot safely be assigned
+  // to whichever workspace happens to boot first, so discard it.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  return Object.fromEntries(
+    Object.entries(parsed).filter(
+      (entry): entry is [string, string[]] =>
+        Array.isArray(entry[1]) && entry[1].every((id) => typeof id === "string"),
+    ),
+  );
+};
+
+export const loadDocTabs = (scope: string): string[] => {
   try {
-    const raw = localStorage.getItem(DOC_TABS_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+    return [...(parseDocTabStore(localStorage.getItem(DOC_TABS_KEY))[scope] ?? [])];
   } catch {
     return [];
   }
 };
 
-export const saveDocTabs = (tabs: string[]): void => {
+export const saveDocTabs = (scope: string, tabs: string[]): void => {
   try {
-    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(tabs));
+    const store = parseDocTabStore(localStorage.getItem(DOC_TABS_KEY));
+    store[scope] = [...tabs];
+    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(store));
   } catch {
     // persistence is best-effort; a failed write just doesn't survive restart.
   }
@@ -695,7 +716,9 @@ export const createInitialState = (): ConsoleState => {
     pages: [],
     activePage: null,
     activePageBlocks: [],
-    openTabs: loadDocTabs(),
+    // The active workspace/node is resolved after mount; connectActive or
+    // connectRemote loads that scope's persisted tabs.
+    openTabs: [],
     pageThreads: [],
     agents: [],
     capabilities: [],
@@ -725,6 +748,55 @@ export const createInitialState = (): ConsoleState => {
     inviteBlob: null,
   };
 };
+
+/** Fresh values for every projection owned by the connected node. Workspace
+ * switches keep global UI/preferences and the workspace registry, but no
+ * committed, query-driven, or operation state may cross the node boundary.
+ * Keep this single reset in lockstep with ConsoleState instead of maintaining
+ * subtly different hand-written lists in each switch/delete path. */
+export const resetNodeProjection = (): Partial<ConsoleState> => ({
+  connected: false,
+  status: null,
+  channels: [],
+  activeChannel: null,
+  messages: [],
+  activeThread: null,
+  tagFilter: null,
+  tagHits: [],
+  tagHitsPending: false,
+  channelTags: [],
+  authorNames: {},
+  nodeUsers: {},
+  accountKeys: {},
+  accountHandles: {},
+  members: [],
+  residents: [],
+  proposals: [],
+  governanceShares: { active: false, allocations: [], total: 0 },
+  forgeHead: null,
+  forgeRepo: null,
+  forgeItems: [],
+  forgeBranches: [],
+  pages: [],
+  activePage: null,
+  activePageBlocks: [],
+  openTabs: [],
+  pageThreads: [],
+  agents: [],
+  capabilities: [],
+  watches: [],
+  pendingRuns: [],
+  capabilitiesByNode: new Map(),
+  runLease: new Map(),
+  search: null,
+  searchPending: false,
+  files: [],
+  lastBlock: null,
+  blocks: [],
+  explorerFocus: null,
+  forgeFocus: null,
+  ops: {},
+});
 
 export interface ConsoleSnapshot {
   connected: boolean;

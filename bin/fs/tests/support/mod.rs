@@ -163,6 +163,15 @@ fn run_actor(duckfs_dir: std::path::PathBuf, mut cmd_rx: mpsc::Receiver<NodeComm
                     };
                     let _ = reply.send(result);
                 }
+                // the duckfs CLI submits frameless (the daemon's trusted-client
+                // lane); this files-only actor has no agent, no session key, and
+                // nothing that signs — so the frame lane is refused rather than
+                // faked.
+                NodeCommand::SubmitFrame { reply, .. } => {
+                    let _ = reply.send(Err(
+                        "the files test actor serves no signed-frame lane".into()
+                    ));
+                }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host.query(&target, &req).await.map_err(|e| e.to_string());
                     let _ = reply.send(result);

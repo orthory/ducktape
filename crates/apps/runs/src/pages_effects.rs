@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use agent::CapRequest;
 
 use super::response::allows;
-use super::{AgentAction, AgentRecord, Ctx, Msg, PendingState, RunsModule};
+use super::{AgentAction, AgentRecord, Ctx, Lane, Msg, PendingState, RunsModule};
 use pages::{
     MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES, MAX_THREAD_ID_BYTES,
     MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
@@ -43,8 +43,9 @@ pub(super) fn is_pages_action(action: &AgentAction) -> bool {
 }
 
 /// deterministic ids for an agent comment: derived from the run id and the
-/// action's index in the validated response, so every replaying node mints
-/// the identical thread/comment (never randomness — X2 replay-identity).
+/// action's [`Lane`] slot — its index in the validated response on the settle
+/// path, its session action counter mid-run — so every replaying node mints the
+/// identical thread/comment (never randomness — X2 replay-identity).
 ///
 /// the run id is HASHED (hex sha256, via `dispatch_id_for`) rather than
 /// inlined: a raw run id embeds the reserved `\x1f` run-key separator (a
@@ -52,11 +53,11 @@ pub(super) fn is_pages_action(action: &AgentAction) -> bool {
 /// be neither index-safe nor length-bounded — pages would reject it and the
 /// emitted op would abort the delivery block. the 64-char hex hash is short,
 /// escape-free, and still fully replay-deterministic.
-fn page_thread_id(run_id: &str, index: usize) -> String {
-    format!("agent/{}/thread/{index}", crate::dispatch_id_for(run_id))
+fn page_thread_id(run_id: &str, slot: &str) -> String {
+    format!("agent/{}/thread/{slot}", crate::dispatch_id_for(run_id))
 }
-fn page_comment_id(run_id: &str, index: usize) -> String {
-    format!("agent/{}/comment/{index}", crate::dispatch_id_for(run_id))
+fn page_comment_id(run_id: &str, slot: &str) -> String {
+    format!("agent/{}/comment/{slot}", crate::dispatch_id_for(run_id))
 }
 
 impl RunsModule {
@@ -68,6 +69,7 @@ impl RunsModule {
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
+        lane: Lane,
         actions: &[AgentAction],
     ) {
         if !actions.iter().any(is_pages_action) {
@@ -103,7 +105,15 @@ impl RunsModule {
                 _ => 0,
             };
             match self
-                .pages_action_msg(&*ctx, &pages, &agent, run_id, index, action, already_staged)
+                .pages_action_msg(
+                    &*ctx,
+                    &pages,
+                    &agent,
+                    run_id,
+                    &lane.slot(index),
+                    action,
+                    already_staged,
+                )
                 .await
             {
                 Ok(msg) => {
@@ -122,21 +132,27 @@ impl RunsModule {
         }
     }
 
-    /// one pages action as an emit-ready follow-up, or the reason it degrades.
-    /// gate order: grant → target resolution → cap → payload → freshness
-    /// probes. `already_staged` is how many threads this run has staged to
-    /// this comment's target already (the same-block thread-cap accounting).
+    /// one pages action as an emit-ready follow-up, or the reason it must not be
+    /// emitted. gate order: grant → target resolution → cap → payload →
+    /// freshness probes. `already_staged` is how many threads this run has
+    /// staged to this comment's target already (the same-block thread-cap
+    /// accounting).
+    ///
+    /// THE ONE pages gate. the settle path degrades an `Err` here to a
+    /// breadcrumb (a page annotation is garnish, never worth failing a delivery
+    /// over); the session lane returns it to the submitter as an error. same
+    /// verdict, two failure policies — never two verdicts.
     #[allow(
         clippy::too_many_arguments,
-        reason = "run_id + index derive the deterministic ids; already_staged is the same-block cap counter"
+        reason = "run_id + slot derive the deterministic ids; already_staged is the same-block cap counter"
     )]
-    async fn pages_action_msg(
+    pub(super) async fn pages_action_msg(
         &self,
         ctx: &dyn Ctx,
         pages: &str,
         agent: &AgentRecord,
         run_id: &str,
-        index: usize,
+        slot: &str,
         action: &AgentAction,
         already_staged: usize,
     ) -> Result<Msg, String> {
@@ -165,10 +181,10 @@ impl RunsModule {
                 if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(target) {
                     return Err("target exceeds pages' id length/charset cap".into());
                 }
-                if page_thread_id(run_id, index).len() > MAX_THREAD_ID_BYTES
-                    || page_comment_id(run_id, index).len() > MAX_COMMENT_ID_BYTES
-                    || !id_is_index_safe(&page_thread_id(run_id, index))
-                    || !id_is_index_safe(&page_comment_id(run_id, index))
+                if page_thread_id(run_id, slot).len() > MAX_THREAD_ID_BYTES
+                    || page_comment_id(run_id, slot).len() > MAX_COMMENT_ID_BYTES
+                    || !id_is_index_safe(&page_thread_id(run_id, slot))
+                    || !id_is_index_safe(&page_comment_id(run_id, slot))
                 {
                     return Err("run id yields a comment id pages would reject".into());
                 }
@@ -178,13 +194,13 @@ impl RunsModule {
                 // nowhere — unresolvable, degrade.
                 let block = self.page_block(ctx, pages, target).await?;
                 self.check_pages_write(agent, &block.page)?;
-                self.probe_comment_lands(ctx, pages, run_id, index, target, already_staged)
+                self.probe_comment_lands(ctx, pages, run_id, slot, target, already_staged)
                     .await?;
                 Ok(Msg {
                     target: pages.to_string(),
                     payload: pages_encode_msg(&PageMsg::AddComment {
-                        thread_id: page_thread_id(run_id, index),
-                        comment_id: page_comment_id(run_id, index),
+                        thread_id: page_thread_id(run_id, slot),
+                        comment_id: page_comment_id(run_id, slot),
                         target: target.clone(),
                         text: body.clone(),
                         mentions: Vec::new(),
@@ -259,11 +275,11 @@ impl RunsModule {
         ctx: &dyn Ctx,
         pages: &str,
         run_id: &str,
-        index: usize,
+        slot: &str,
         target: &str,
         already_staged: usize,
     ) -> Result<(), String> {
-        let thread_id = page_thread_id(run_id, index);
+        let thread_id = page_thread_id(run_id, slot);
         let reply = ctx
             .query(
                 pages,
@@ -280,7 +296,7 @@ impl RunsModule {
             }
             _ => return Err("unexpected pages reply for a thread lookup".into()),
         }
-        let comment_id = page_comment_id(run_id, index);
+        let comment_id = page_comment_id(run_id, slot);
         let reply = ctx
             .query(
                 pages,

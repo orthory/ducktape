@@ -19,9 +19,9 @@
 
 use agent::AgentModule;
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentAction, AgentMsg, AgentQuery, AgentReply,
-    AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg, encode_query,
-    encode_response,
+    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentMsg,
+    AgentQuery, AgentReply, AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg,
+    encode_query, encode_response,
 };
 use runs::{RunsModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
 use runs::{
@@ -992,5 +992,338 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
             )]
         );
         assert_eq!(task_ids(&host).await, Vec::<String>::new());
+    });
+}
+
+// ---- the agent session lane, end to end -------------------------------------
+// the one place the mid-run write path meets REAL state: a real dispatch, a
+// real committed saga lease, and a real chat module that decides authorship
+// from the op's origin. the ACL is asserted against what consensus COMMITTED,
+// never against the op that was submitted.
+
+/// the ephemeral keypair's public half — what the executing node binds. (its
+/// private half never leaves that host; nothing in consensus ever sees it.)
+const SESSION_KEY: [u8; 32] = [0x11; 32];
+/// the node that will hold the run's execution lease.
+const WORKER_NODE: &[u8] = b"worker-node";
+
+fn open_session(run_id: &str, session_key: &[u8]) -> Msg {
+    Msg {
+        target: "runs".into(),
+        payload: runs_encode_msg(&RunsMsg::OpenAgentSession {
+            run_id: run_id.into(),
+            session_key: session_key.to_vec(),
+        }),
+    }
+}
+
+fn agent_action(run_id: &str, action: AgentAction) -> Msg {
+    Msg {
+        target: "runs".into(),
+        payload: runs_encode_msg(&RunsMsg::AgentAction {
+            run_id: run_id.into(),
+            action,
+        }),
+    }
+}
+
+async fn agent_sessions(host: &Host) -> Vec<runs::AgentSession> {
+    let reply = host
+        .query("runs", &runs_encode_query(&RunsQuery::AgentSessions))
+        .await
+        .unwrap();
+    match runs_decode_reply(&reply).unwrap() {
+        RunsReply::AgentSessions(sessions) => sessions,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+/// drive the scripted setup + mention post with quackbot granted `actions`,
+/// leaving the run IN FLIGHT (its dispatch announced, awaiting a result).
+async fn in_flight_run(context: deterministic::Context, actions: Vec<String>) -> Host {
+    let mut host = genesis(context).await;
+    let mut ops = scripted_ops();
+    ops[1].2 = register_quackbot(actions);
+    for (height, origin, op) in ops {
+        host.submit_at(at(height, origin), op)
+            .await
+            .expect("setup block");
+    }
+    host
+}
+
+/// `node` claims the run's announced attempt — the REAL lease path (first
+/// accept in consensus order wins). returns the assignee as the DISPATCH
+/// module reports it: read from committed state, never assumed.
+async fn accept_lease(host: &mut Host, run_id: &str, node: &[u8], height: u64) -> Vec<u8> {
+    let saga_id = dispatch_saga_id(host, run_id).await;
+    host.submit_at(
+        at(height, Origin::External(node.to_vec())),
+        Msg {
+            target: "saga".into(),
+            payload: saga_encode_msg(&SagaMsg::Accept {
+                saga_id,
+                attempt: 0,
+            }),
+        },
+    )
+    .await
+    .expect("accept block");
+    let assignee = agent_dispatch(host, run_id)
+        .await
+        .assignee
+        .expect("the accepted attempt holds a committed lease");
+    assert_eq!(assignee, node, "the accepting node holds the run's lease");
+    assignee
+}
+
+#[test]
+fn the_session_lane_binds_to_the_lease_holder_and_its_writes_land_as_the_agent() {
+    let run_id = run_id_for("general", 1, "quackbot");
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = in_flight_run(
+            context,
+            vec![
+                ACTION_CHAT_POST.into(),
+                ACTION_CHAT_POST_MESSAGE.into(),
+                ACTION_TASKS_CREATE.into(),
+            ],
+        )
+        .await;
+        assert!(pending_run(&host, &run_id).await.is_some(), "run in flight");
+
+        // block 5: a capable node claims the announced attempt. the assignee is
+        // now COMMITTED — the saga holds the lease, and the dispatch read facade
+        // resolves it. everything below reads it back rather than assuming it.
+        let assignee = accept_lease(&mut host, &run_id, WORKER_NODE, 5).await;
+
+        // THE CORE AUTHORIZATION TEST: a node that does not hold the lease
+        // cannot open the run's session — not even the human who owns the agent.
+        let err = host
+            .submit_at(at(6, alice()), open_session(&run_id, &SESSION_KEY))
+            .await
+            .expect_err("a non-assignee must not open a session");
+        assert!(
+            format!("{err:?}").contains("lease"),
+            "the refusal names the lease: {err:?}"
+        );
+        assert!(agent_sessions(&host).await.is_empty(), "nothing bound");
+
+        // the lease-holder binds. self-authorizing: no owner interaction, so an
+        // automated run works with nobody at a keyboard.
+        host.submit_at(
+            at(6, Origin::External(assignee.clone())),
+            open_session(&run_id, &SESSION_KEY),
+        )
+        .await
+        .expect("the assignee opens the session");
+        let bound = agent_sessions(&host).await;
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].run_id, run_id);
+        assert_eq!(
+            bound[0].agent_id, "quackbot",
+            "identity from the run, not the payload"
+        );
+        assert_eq!(bound[0].session_key, SESSION_KEY.to_vec());
+
+        // THE CORE ACL TEST: an origin that is not the bound session key cannot
+        // act — the owner cannot, and neither can the executing node itself.
+        for (origin, what) in [
+            (alice(), "the agent's owner"),
+            (Origin::External(assignee.clone()), "the executing node"),
+        ] {
+            let err = host
+                .submit_at(
+                    at(7, origin),
+                    agent_action(
+                        &run_id,
+                        AgentAction::PostMessage {
+                            channel_id: "general".into(),
+                            text: "not from the agent".into(),
+                            thread: None,
+                        },
+                    ),
+                )
+                .await
+                .expect_err("only the bound session key may act");
+            assert!(
+                format!("{err:?}").contains("session key"),
+                "{what}: {err:?}"
+            );
+        }
+
+        // an action OUTSIDE the committed grant is refused — and emits nothing.
+        // quackbot holds tasks.create, never tasks.update_status.
+        let err = host
+            .submit_at(
+                at(7, Origin::External(SESSION_KEY.to_vec())),
+                agent_action(
+                    &run_id,
+                    AgentAction::UpdateTaskStatus {
+                        task_id: "task-1".into(),
+                        status: "done".into(),
+                    },
+                ),
+            )
+            .await
+            .expect_err("an ungranted action must be refused");
+        assert!(
+            format!("{err:?}").contains("not allowed to tasks.update_status"),
+            "{err:?}"
+        );
+        assert!(task_ids(&host).await.is_empty(), "nothing was written");
+
+        // THE HEADLINE: a GRANTED action, signed by the session key, lands as a
+        // real chat message authored by the AGENT — AuthorRef::Agent { runs,
+        // quackbot } — read back out of COMMITTED chat state. the frameless lane
+        // could not produce this attribution at all: it would have been the
+        // executing node's own key, indistinguishable from the human's.
+        host.submit_at(
+            at(8, Origin::External(SESSION_KEY.to_vec())),
+            agent_action(
+                &run_id,
+                AgentAction::PostMessage {
+                    channel_id: "general".into(),
+                    text: "still working — halfway there".into(),
+                    thread: None,
+                },
+            ),
+        )
+        .await
+        .expect("the granted mid-run post lands");
+
+        let posted = chat_message(&host, &runs::post_message_id(&run_id, "s0"))
+            .await
+            .expect("the agent's mid-run message is committed chat state");
+        assert_eq!(
+            posted.head.author,
+            quackbot_ref(),
+            "the mid-run write is attributed to the AGENT, not to the node that ran it"
+        );
+        assert_eq!(
+            posted.head.blocks,
+            vec![Block::paragraph("still working — halfway there")]
+        );
+        assert_ne!(
+            posted.head.message_id,
+            reply_message_id(&run_id),
+            "the mid-run post never squats the run's ONE reply id"
+        );
+        assert_eq!(
+            agent_sessions(&host).await[0].actions,
+            1,
+            "the applied action spent exactly one of the session's budget"
+        );
+
+        // a granted task write, same lane.
+        host.submit_at(
+            at(9, Origin::External(SESSION_KEY.to_vec())),
+            agent_action(
+                &run_id,
+                AgentAction::CreateTask {
+                    task_id: "mid-run-task".into(),
+                    title: "opened while the agent was still running".into(),
+                },
+            ),
+        )
+        .await
+        .expect("the granted mid-run task lands");
+        assert_eq!(task_ids(&host).await, vec!["mid-run-task".to_string()]);
+        assert_eq!(agent_sessions(&host).await[0].actions, 2);
+
+        // the run settles through the ordinary path: the oracle answers, and the
+        // NEXT block injects the delivery.
+        oracle_result(
+            &mut host,
+            &run_id,
+            10,
+            Ok(wrap_runner(canned_response(&run_id))),
+        )
+        .await;
+        host.submit_at(as_user(2, 11), noop_block(1))
+            .await
+            .expect("delivery block");
+        assert!(
+            pending_run(&host, &run_id).await.is_none(),
+            "the run settled"
+        );
+
+        // THE CLOSE-OUT: the session died with its run, and the key is now inert.
+        assert!(
+            agent_sessions(&host).await.is_empty(),
+            "a session must never outlive its run"
+        );
+        let err = host
+            .submit_at(
+                at(12, Origin::External(SESSION_KEY.to_vec())),
+                agent_action(
+                    &run_id,
+                    AgentAction::CreateTask {
+                        task_id: "after-the-fact".into(),
+                        title: "too late".into(),
+                    },
+                ),
+            )
+            .await
+            .expect_err("a settled run's key must not act");
+        assert!(
+            format!("{err:?}").contains("no open agent session"),
+            "{err:?}"
+        );
+        assert!(
+            !task_ids(&host)
+                .await
+                .contains(&"after-the-fact".to_string()),
+            "the settled run's key wrote nothing"
+        );
+    });
+}
+
+#[test]
+fn chat_post_does_not_widen_into_chat_post_message() {
+    // THE ESCALATION GUARD, against the real chat module. `chat.post`
+    // authorizes the run's REPLY — answering where the agent was engaged.
+    // speaking into a channel at will is a wider power, so it has its own name:
+    // every agent registered before it existed must still be refused it.
+    let run_id = run_id_for("general", 1, "quackbot");
+    deterministic::Runner::default().start(|context| async move {
+        let mut host = in_flight_run(context, vec![ACTION_CHAT_POST.into()]).await;
+        let assignee = accept_lease(&mut host, &run_id, WORKER_NODE, 5).await;
+        host.submit_at(
+            at(6, Origin::External(assignee)),
+            open_session(&run_id, &SESSION_KEY),
+        )
+        .await
+        .expect("the assignee opens the session");
+
+        let err = host
+            .submit_at(
+                at(7, Origin::External(SESSION_KEY.to_vec())),
+                agent_action(
+                    &run_id,
+                    AgentAction::PostMessage {
+                        channel_id: "general".into(),
+                        text: "speaking without the grant".into(),
+                        thread: None,
+                    },
+                ),
+            )
+            .await
+            .expect_err("chat.post must not widen into chat.post_message");
+        assert!(
+            format!("{err:?}").contains("not allowed to chat.post_message"),
+            "{err:?}"
+        );
+        assert!(
+            chat_message(&host, &runs::post_message_id(&run_id, "s0"))
+                .await
+                .is_none(),
+            "nothing was posted"
+        );
+        assert_eq!(
+            agent_sessions(&host).await[0].actions,
+            0,
+            "a refusal spends no budget"
+        );
     });
 }

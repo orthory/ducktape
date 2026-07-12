@@ -59,6 +59,7 @@ import {
   applySnapshot,
   createInitialState,
   DEFAULT_AUTHOR,
+  docTabsScope,
   loadRemoteUrl,
   saveDocTabs,
 } from "./state";
@@ -157,7 +158,15 @@ export function DucktapeProvider({
     if (pages.length === 0) return { openTabs: prevTabs, activePage: prevActive };
     const liveIds = new Set(pages.map((p) => p.id));
     const openTabs = prevTabs.filter((id) => liveIds.has(id));
-    if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+    if (openTabs.length !== prevTabs.length) {
+      saveDocTabs(
+        docTabsScope(
+          stateRef.current.workspace?.id ?? null,
+          stateRef.current.nodeUrl,
+        ),
+        openTabs,
+      );
+    }
     const activePage =
       prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
     return { openTabs, activePage };
@@ -181,6 +190,10 @@ export function DucktapeProvider({
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
+    // A node switch cannot cancel the transport's already-issued requests.
+    // Bind this hydrate to the exact transport that started it so a late
+    // response from the previous workspace cannot repopulate cleared slices.
+    const stale = () => nodeRef.current !== live;
     // the pages (docs) slice refreshes by enumeration + the open page's tree.
     const fetchedPage = stateRef.current.activePage;
     // ops submitted at or after this instant cannot be in the snapshot the
@@ -220,6 +233,7 @@ export function DucktapeProvider({
           files,
           blocks,
         ]) => {
+          if (stale()) return;
           // read-your-writes floor (the follow-the-head handoff's bug B): a
           // snapshot below a height this console holds a receipt for would
           // un-render the confirmed write until a later refresh — skip; the
@@ -270,6 +284,7 @@ export function DucktapeProvider({
         },
       )
       .catch((err) => {
+        if (stale()) return;
         dispatch({ type: "patch", patch: { connected: false } });
         fail(err);
       });
@@ -284,10 +299,12 @@ export function DucktapeProvider({
   const refreshScoped = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
+    const stale = () => nodeRef.current !== live;
     const fetchStartedAt = Date.now();
     return Promise.resolve()
       .then(() => live.status())
       .then((status) => {
+        if (stale()) return;
         // read-your-writes floor, checked BEFORE fanning out: a lagging
         // status buys nothing — the next block event retries.
         if (status.height < receiptFloor(stateRef.current.ops)) return;
@@ -328,6 +345,7 @@ export function DucktapeProvider({
               files,
               blocks,
             ]) => {
+              if (stale()) return;
               const holdPages =
                 !pagesSlices || shouldHoldPages(fetchedPage, fetchStartedAt);
               const tabs =
@@ -362,6 +380,7 @@ export function DucktapeProvider({
           );
       })
       .catch((err) => {
+        if (stale()) return;
         dispatch({ type: "patch", patch: { connected: false } });
         fail(err);
       });

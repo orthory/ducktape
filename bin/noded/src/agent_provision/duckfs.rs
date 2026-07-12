@@ -32,12 +32,16 @@ use crate::actor_api::ActorNodeApi;
 /// materialize the duckfs source at `dir` (plus W6 skill ro mounts under the
 /// sibling `ro_root`) and hand back the live workspace. mount names arrive
 /// PRE-VALIDATED by the dispatching provisioner (`mount_dir_name` + dedup).
+/// `node_url` is this node's http base (`None` = no http surface), handed to
+/// the run as `DUCKTAPE_NODE` so its tool plane can dial back.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn provision(
     handle: NodeHandle,
     dir: PathBuf,
     ro_root: PathBuf,
     prefix: String,
     snapshot: Option<String>,
+    node_url: Option<String>,
     spec: &WorkspaceSpec,
 ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
     let api = ActorNodeApi::new(handle.clone());
@@ -71,43 +75,33 @@ pub(super) async fn provision(
     let ro_dir = if spec.ro_mounts.is_empty() {
         None
     } else {
-        let api = ActorNodeApi::new(handle.clone());
+        let mount_handle = handle.clone();
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let checkout_rw = dir.clone();
         tokio::task::spawn_blocking(move || {
-            mounts
-                .iter()
-                .try_for_each(|m| {
-                    checkout_with(
-                        &api,
-                        &checkout_ro.join(&m.mount_subpath),
-                        &m.source_prefix,
-                        m.source_snapshot.as_deref(),
-                        &CheckoutOptions::default(),
-                    )
-                    .map(|_| ())
-                })
-                .inspect_err(|_| {
-                    // W5 again: the run never gets a workspace handle on a
-                    // failed provision, so BOTH trees (the partial ro root
-                    // and the already-materialized rw checkout) must go.
-                    let _ = std::fs::remove_dir_all(&checkout_ro);
-                    let _ = std::fs::remove_dir_all(&checkout_rw);
-                })
+            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
+                // W5 again: the run never gets a workspace handle on a
+                // failed provision, so the already-materialized rw checkout
+                // goes too (the mount helper removed its own partial tree).
+                let _ = std::fs::remove_dir_all(&checkout_rw);
+            })
         })
         .await
-        .map_err(|_| "skill mount checkout task panicked".to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "skill mount checkout task panicked".to_string())??;
         Some(ro_root)
     };
-    let mut env = BTreeMap::new();
-    env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
-    if let Some(ro) = &ro_dir {
-        // the consumer hook: skill trees live under this root, one dir
-        // per mount name. nothing reads it yet.
-        env.insert("DUCKTAPE_RUN_SKILLS".into(), ro.display().to_string());
-    }
+    // the workspace EXISTS now, so ask consensus to bind the run's agent session
+    // — never before: a bind for a run that failed to materialize would spend an
+    // op on a run that never starts.
+    let session = super::session::open(&handle, spec).await;
+    let env = super::run_env(
+        &dir,
+        ro_dir.as_deref(),
+        node_url.as_deref(),
+        spec,
+        session.as_ref(),
+    );
     Ok(Box::new(NodedWorkspace {
         handle,
         dir,
@@ -131,10 +125,11 @@ struct NodedWorkspace {
 
 impl NodedWorkspace {
     /// a receipt-only spec: `commit`/`no_changes` read only the source coords,
-    /// so the run_id/tools/mount are irrelevant here.
+    /// so the run ids/tools/mount are irrelevant here.
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
+            consensus_run_id: None,
             agent_id: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
@@ -153,7 +148,7 @@ impl ProvisionedWorkspace for NodedWorkspace {
     }
 
     fn path_entries(&self) -> Vec<PathBuf> {
-        Vec::new()
+        super::tool_path_entries()
     }
 
     async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
