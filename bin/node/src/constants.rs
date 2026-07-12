@@ -163,8 +163,10 @@ pub(crate) const MODULE_IDS: [&str; 25] = [
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
 pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
-    ("agent", 1),
-    ("automations", 1),
+    // 2: wasm adapter ports — the native canonical snapshot persisted as one
+    // host-KV value, so root()/snapshot bytes changed shape at cutover.
+    ("agent", 2),
+    ("automations", 2),
     ("capability", 2),
     // 1 (UNCHANGED at the wasm cutover): chat/pages are STORE-BACKED ports —
     // the wasm module wraps the SAME host-constructed qmdb store the native
@@ -174,6 +176,9 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
     ("chat", 1),
     ("directory", 1),
+    // 1 (UNCHANGED — dispatch stays NATIVE): its read facade serves
+    // COMMITTED-ONLY state by design (runs' mid-block lease_holder read
+    // depends on it), a view the wasm adapter's staged-fold cannot represent.
     ("dispatch", 1),
     ("duckdns", 2),
     ("files", 1),
@@ -193,7 +198,9 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
     ("runs", 2),
-    ("saga", 1),
+    // 2: the wasm adapter port (saga's empty-map root coincides with the
+    // empty host-KV root, but every written state re-encodes — a break).
+    ("saga", 2),
     ("tagging", 2),
     ("tasks", 2),
     ("upgrade", 1),

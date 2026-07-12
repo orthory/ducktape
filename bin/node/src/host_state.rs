@@ -4,8 +4,6 @@
 //! state into the canonical host. The live node loop only consumes the three
 //! lifecycle operations and output adapter exported below.
 
-use agent::AgentModule;
-use automations::Automations;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use dispatch::DispatchModule;
@@ -17,7 +15,6 @@ use kv::Kv;
 use modreg::Modreg;
 use recovery::Manifest;
 use runs::RunsModule;
-use saga::{LeasePolicy, SagaModule};
 use sha2::Digest as _;
 use sdk::StateRoot;
 use statesync::{fetch_snapshot, qmdb::{QmdbStore, RemoteQmdbResolver}};
@@ -149,6 +146,27 @@ const GOVERNANCE_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/examples/governance-wasm/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
 
+/// saga / agent / automations — adapter-ported tenants of the async engine's
+/// deterministic half and its consumers. every decision in their execute
+/// paths reads staged-over-committed state, so the whole-state fold is
+/// behavior-identical (pinned by their parity proofs); their work-order
+/// events, P6 callbacks, registry hooks, and chat-hook probe reads all cross
+/// the wit seam unchanged. DISPATCH deliberately stays NATIVE: its read
+/// facade (`DispatchQuery::Dispatch`, `PendingDeliveries`) serves
+/// COMMITTED-ONLY state by design — runs' mid-block `lease_holder` read
+/// depends on it — and the adapter's staged-fold cannot represent a
+/// committed-only view (the same class of frozen-committed read that keeps
+/// upgrade native).
+const SAGA_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/saga-wasm/component.wasm");
+const SAGA_MODULE_ID: &str = "saga";
+const AGENT_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/agent-wasm/component.wasm");
+const AGENT_MODULE_ID: &str = "agent";
+const AUTOMATIONS_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/automations-wasm/component.wasm");
+const AUTOMATIONS_MODULE_ID: &str = "automations";
+
 /// pages / chat — the first STORE-BACKED wasm tenants: the native crates are
 /// pure logic over an injected `sdk::MerkleStore`, so the guests compile that
 /// SAME logic over the adapter's `WitStore` while the REAL qmdb store stays
@@ -227,6 +245,18 @@ fn seeded_modreg() -> Modreg {
         CHAT_MODULE_ID,
         sha2::Sha256::digest(CHAT_WASM_COMPONENT).to_vec(),
     );
+    modreg.seed(
+        SAGA_MODULE_ID,
+        sha2::Sha256::digest(SAGA_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        AGENT_MODULE_ID,
+        sha2::Sha256::digest(AGENT_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        AUTOMATIONS_MODULE_ID,
+        sha2::Sha256::digest(AUTOMATIONS_WASM_COMPONENT).to_vec(),
+    );
     modreg
 }
 
@@ -293,6 +323,30 @@ fn genesis_capability_wasm() -> WasmModule {
 fn genesis_duckdns_wasm() -> WasmModule {
     WasmModule::from_bytes(DUCKDNS_MODULE_ID, DUCKDNS_WASM_COMPONENT)
         .expect("embedded duckdns component loads")
+        .with_state_schema_revision(2)
+}
+
+/// saga / agent / automations at their GENESIS code (adapter-ported,
+/// revision 2 — see [`genesis_vaults_wasm`]). the sibling wiring — saga's
+/// valset/capability assignment reads, agent's saga dead-letter + runs hook,
+/// automations' chat/tasks/inbox lanes — is genesis-constant and compiled
+/// into the guests (the exact production constructors these builders used to
+/// call natively).
+fn genesis_saga_wasm() -> WasmModule {
+    WasmModule::from_bytes(SAGA_MODULE_ID, SAGA_WASM_COMPONENT)
+        .expect("embedded saga component loads")
+        .with_state_schema_revision(2)
+}
+
+fn genesis_agent_wasm() -> WasmModule {
+    WasmModule::from_bytes(AGENT_MODULE_ID, AGENT_WASM_COMPONENT)
+        .expect("embedded agent component loads")
+        .with_state_schema_revision(2)
+}
+
+fn genesis_automations_wasm() -> WasmModule {
+    WasmModule::from_bytes(AUTOMATIONS_MODULE_ID, AUTOMATIONS_WASM_COMPONENT)
+        .expect("embedded automations component loads")
         .with_state_schema_revision(2)
 }
 
@@ -404,7 +458,7 @@ struct ProductionModules {
     upgrade: Upgrade,
     modreg: Modreg,
     hello_wasm: WasmModule,
-    saga: SagaModule,
+    saga: WasmModule,
     capability: WasmModule,
     dispatch: DispatchModule,
     tagging: WasmModule,
@@ -416,10 +470,10 @@ struct ProductionModules {
     inbox: WasmModule,
     files: Files,
     jobs: WasmModule,
-    agent: AgentModule,
+    agent: WasmModule,
     runs: RunsModule,
     directory: WasmModule,
-    automations: Automations,
+    automations: WasmModule,
 }
 
 impl ProductionModules {
@@ -492,6 +546,9 @@ pub(super) async fn genesis_host(
     blobs.put_chunk(GOVERNANCE_WASM_COMPONENT.to_vec());
     blobs.put_chunk(PAGES_WASM_COMPONENT.to_vec());
     blobs.put_chunk(CHAT_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(SAGA_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(AGENT_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(AUTOMATIONS_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -530,7 +587,9 @@ pub(super) async fn genesis_host(
         // only the assignee's result lands. an UNASSIGNED attempt (empty
         // provider pool) accepts no result at all: its WorkerRequest is an
         // announcement a capable node must first claim via `SagaMsg::Accept`.
-        saga: SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict),
+        // adapter-ported; the valset/capability wiring and the Strict policy
+        // are compiled into the guest.
+        saga: genesis_saga_wasm(),
         // the network-wide registry of node host capabilities ("codex",
         // "claude", ...): member-gated self-announcements, so every node holds
         // an identical view of who can run what. its genesis contribution is an
@@ -564,7 +623,9 @@ pub(super) async fn genesis_host(
         jobs: genesis_jobs_wasm(),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
-        agent: AgentModule::new("agent", "saga", Some("runs".into())),
+        // adapter-ported; the saga dead-letter + runs hook ids are compiled
+        // into the guest.
+        agent: genesis_agent_wasm(),
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
         runs: RunsModule::new(
@@ -592,8 +653,9 @@ pub(super) async fn genesis_host(
         // implementation, so this cutover left the app-hash untouched.
         directory: genesis_directory_wasm(),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
-        // events and emits chat/tasks follow-ups.
-        automations: Automations::new("automations", "chat", "tasks", "inbox"),
+        // events and emits chat/tasks follow-ups. adapter-ported; the
+        // chat/tasks/inbox lane ids are compiled into the guest.
+        automations: genesis_automations_wasm(),
     }
     .compose()
     .expect("genesis host")
@@ -675,8 +737,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("{HELLO_WASM_MODULE_ID} install: {e}"))?;
 
-    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
-    let (bytes, root) = snapshot_of("saga")?;
+    let mut saga = genesis_saga_wasm();
+    let (bytes, root) = snapshot_of(SAGA_MODULE_ID)?;
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
@@ -752,8 +814,8 @@ pub(super) async fn restore_host(
     jobs.install(bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
-    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
-    let (bytes, root) = snapshot_of("agent")?;
+    let mut agent = genesis_agent_wasm();
+    let (bytes, root) = snapshot_of(AGENT_MODULE_ID)?;
     agent
         .install(bytes, root)
         .map_err(|e| format!("agent install: {e}"))?;
@@ -783,8 +845,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;
 
-    let mut automations = Automations::new("automations", "chat", "tasks", "inbox");
-    let (bytes, root) = snapshot_of("automations")?;
+    let mut automations = genesis_automations_wasm();
+    let (bytes, root) = snapshot_of(AUTOMATIONS_MODULE_ID)?;
     automations
         .install(bytes, root)
         .map_err(|e| format!("automations install: {e}"))?;
@@ -997,8 +1059,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("saga").await?;
-    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+    let (bytes, root) = snapshot_of(SAGA_MODULE_ID).await?;
+    let mut saga = genesis_saga_wasm();
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
@@ -1119,8 +1181,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     jobs.install(&bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("agent").await?;
-    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let (bytes, root) = snapshot_of(AGENT_MODULE_ID).await?;
+    let mut agent = genesis_agent_wasm();
     agent
         .install(&bytes, root)
         .map_err(|e| format!("agent install: {e}"))?;
@@ -1142,8 +1204,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("automations").await?;
-    let mut automations = Automations::new("automations", "chat", "tasks", "inbox");
+    let (bytes, root) = snapshot_of(AUTOMATIONS_MODULE_ID).await?;
+    let mut automations = genesis_automations_wasm();
     automations
         .install(&bytes, root)
         .map_err(|e| format!("automations install: {e}"))?;

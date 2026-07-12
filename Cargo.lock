@@ -4584,7 +4584,9 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "async-trait",
+ "automations",
  "base64 0.22.1",
  "capability",
  "chat",

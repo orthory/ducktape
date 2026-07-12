@@ -10,7 +10,13 @@ version.workspace = true
 # everything that ACTS on agents lives in the runs module.
 [dependencies]
 sdk = { workspace = true }
-saga = { workspace = true }
+# default-features = false: only the wire types (SagaOrigin) cross this edge,
+# and the `agent-wasm` guest builds this crate for wasm32 — saga's native-only
+# index module (indexer -> unix-only IO) must not ride along. a direct path
+# dep because workspace inheritance cannot switch default features off; the
+# workspace's own dep is the same path, and feature unification keeps native
+# binaries (which enable saga's default `native`) whole.
+saga = { path = "../../system/saga", default-features = false }
 capability = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }

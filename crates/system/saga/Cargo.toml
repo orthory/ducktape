@@ -3,6 +3,17 @@ name = "saga"
 edition.workspace = true
 version.workspace = true
 
+# the consensus state machine, wire types, and sdk::Module impl always compile
+# (they are the surface the `saga-wasm` guest ports to wasm32). only the
+# node-local usage-ledger mapper rides the `native` feature: `indexer` drags
+# fluent31's unix-only IO, which cannot cross into a wasm guest — and the
+# ledger is a serving-binary materialized view, never consensus state.
+# `default-features = false` is therefore FULL consensus behavior, minus the
+# index module.
+[features]
+default = ["native"]
+native = ["dep:indexer"]
+
 [dependencies]
 sdk = { workspace = true }
 serde = { workspace = true }
@@ -12,7 +23,7 @@ capability = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 # the usage-ledger mapper (src/index.rs): node-local derived tier, no consensus.
-indexer = { workspace = true }
+indexer = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = { workspace = true }

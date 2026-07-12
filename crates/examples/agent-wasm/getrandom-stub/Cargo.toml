@@ -1,0 +1,32 @@
+# A deterministic stand-in for `getrandom` 0.2 inside the agent GUEST
+# build (wired via `[patch.crates-io]` in ../Cargo.toml, so it applies only to
+# this standalone guest workspace — native builds keep the real crate).
+#
+# WHY: valset -> commonware-cryptography enables getrandom's "js" backend on
+# wasm32-unknown-unknown, which compiles wasm-bindgen shims into the cdylib as
+# unstrippable `__wbindgen_placeholder__` imports — and `wasm-tools component
+# new` (rightly) refuses a module importing an interface the ducktape:module
+# world does not declare. no consensus code path ever CALLS getrandom (modules
+# are deterministic by contract; the guest only reaches valset's pure wire
+# types), so the correct guest backend is one that exists to link and fails
+# deterministically if anything ever does call it: ambient entropy inside a
+# guest would be a consensus fork, never a feature.
+[package]
+name = "getrandom"
+version = "0.2.17"
+edition = "2021"
+publish = false
+
+# feature names dependents may enable must exist; they are all inert here —
+# the stub has exactly one backend: a deterministic refusal.
+[features]
+default = []
+std = []
+js = ["js-sys", "wasm-bindgen"]
+js-sys = []
+wasm-bindgen = []
+custom = []
+rdrand = []
+test-in-browser = []
+
+[workspace]

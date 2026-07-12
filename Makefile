@@ -309,6 +309,27 @@ wasm-modules:
 	cp crates/examples/chat-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/chat.component.wasm
 
+	cd crates/examples/saga-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/saga-wasm/target/wasm32-unknown-unknown/release/saga_wasm.wasm \
+	  -o crates/examples/saga-wasm/component.wasm
+	cp crates/examples/saga-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/saga.component.wasm
+
+	cd crates/examples/agent-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/agent-wasm/target/wasm32-unknown-unknown/release/agent_wasm.wasm \
+	  -o crates/examples/agent-wasm/component.wasm
+	cp crates/examples/agent-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/agent.component.wasm
+
+	cd crates/examples/automations-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/automations-wasm/target/wasm32-unknown-unknown/release/automations_wasm.wasm \
+	  -o crates/examples/automations-wasm/component.wasm
+	cp crates/examples/automations-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/automations.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -344,6 +365,12 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/pages.component.wasm
 	cmp crates/examples/chat-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/chat.component.wasm
+	cmp crates/examples/saga-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/saga.component.wasm
+	cmp crates/examples/agent-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/agent.component.wasm
+	cmp crates/examples/automations-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/automations.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

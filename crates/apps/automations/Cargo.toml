@@ -10,8 +10,15 @@ version.workspace = true
 sdk = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chat = { workspace = true }
-tasks = { workspace = true }
+# default-features = false on chat/tasks: only their consensus wire types
+# cross this edge, and the `automations-wasm` guest builds this crate for
+# wasm32 — the native-only submodules (chat's indexer/voice/tokio, tasks'
+# indexer) must not ride along. direct path deps because workspace
+# inheritance cannot switch default features off; the workspace's own deps
+# are the same paths, and feature unification keeps native binaries (which
+# enable the default `native` features) whole.
+chat = { path = "../chat", default-features = false }
+tasks = { path = "../tasks", default-features = false }
 inbox = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }

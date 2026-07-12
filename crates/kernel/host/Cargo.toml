@@ -67,6 +67,10 @@ valset = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
 # next to a stub receiver.
 saga = { workspace = true }
+# the agent/automations adapter-port parity proofs stand the native modules
+# (and their native saga / chat+tasks+inbox siblings) beside the wasm ports.
+agent = { workspace = true }
+automations = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"

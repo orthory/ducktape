@@ -1,0 +1,24 @@
+# The wasm port of the `automations` module: compiles the NATIVE automations
+# crate to wasm32 and adapts it to the ducktape:module world through
+# guest-adapter — the module's logic stays single-sourced in
+# `crates/apps/automations`. Standalone workspace: guest crates build to
+# `wasm32-unknown-unknown` and are componentized by the module build target,
+# never by the host workspace. automations reaches chat/tasks/inbox through
+# their consensus wire types only (chat/tasks pinned default-features = false
+# in the automations crate itself), so no native-only submodule ever drags
+# into this graph — no getrandom stub needed.
+[package]
+name = "automations-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+automations = { path = "../../apps/automations" }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]

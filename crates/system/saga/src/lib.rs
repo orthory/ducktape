@@ -71,6 +71,9 @@ mod interface;
 pub use interface::*;
 
 // the usage ledger: a node-local derived index over this module's op stream.
+// native-only: `indexer` drags unix-only IO that cannot cross into the wasm
+// guest, and the ledger is a serving-binary view, never consensus state.
+#[cfg(feature = "native")]
 pub mod index;
 
 use std::collections::{BTreeMap, BTreeSet};
