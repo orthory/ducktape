@@ -224,6 +224,10 @@ impl DispatchPool {
                                 // expose — set before execute so BOTH the dormant and
                                 // provisioned paths carry it into provider.run.
                                 prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
+                                // the run's numeric demands ride into RunContext so a
+                                // Podman-backed provider can enforce them as container
+                                // limits; a Direct backend ignores them.
+                                prepared.ctx.limits = job.demands.clone();
                                 execute(&job, prepared, provider, provisioner.as_ref())
                                     .await
                                     .map_err(clean_error)

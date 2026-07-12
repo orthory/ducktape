@@ -50,10 +50,12 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// how long this host keeps paying for one child.
 const HARD_TIMEOUT_FACTOR: u32 = 36;
 
+mod sandbox;
 mod session;
 mod spec;
 mod variants;
 mod workspace;
+pub use sandbox::{SandboxBackend, wrap_podman};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{CapabilitySpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
@@ -85,6 +87,13 @@ pub struct RunContext {
     pub env: BTreeMap<String, String>,
     /// path entries prepended to `PATH` for run-scoped tool bindings.
     pub path_entries: Vec<PathBuf>,
+    /// the run's numeric resource demands (`ExecJob.demands`), keyed by
+    /// dimension (`cores`, `mem_gb`, ...). the pool fills this before
+    /// `provider.run`; under a `Podman` backend the dimensions this backend
+    /// knows how to enforce become container limit flags, the rest are inert
+    /// (scheduling already matched them). Default empty — a Direct backend
+    /// ignores it entirely.
+    pub limits: BTreeMap<String, u64>,
     /// true for portable v3 runs: native CLI sessions are host-local
     /// optimizations and must not be resumed or captured for portable state.
     pub portable: bool,
@@ -283,6 +292,11 @@ pub(crate) struct CliProvider {
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
     output_sink: Option<OutputSink>,
+    /// how the child is spawned: `Direct` (the plain host spawn) or `Podman`
+    /// (every run wrapped in a rootless container that enforces the run's
+    /// numeric limits — see [`sandbox`]). set once at discovery for the whole
+    /// provider set.
+    backend: SandboxBackend,
 }
 
 impl CliProvider {
@@ -302,12 +316,18 @@ impl CliProvider {
             timeout,
             dirs: AgentDirs::default(),
             output_sink: None,
+            backend: SandboxBackend::Direct,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_workdir(mut self, workdir: PathBuf) -> Self {
         self.workdir = workdir;
+        self
+    }
+
+    pub fn with_backend(mut self, backend: SandboxBackend) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -332,54 +352,122 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
     ) -> Result<tokio::process::Command, String> {
-        let mut cmd = tokio::process::Command::new(&self.bin);
-        // argv straight from the spec, fully literal (the resume path's
-        // {session_id} slot is substituted host-side BEFORE this point, with
-        // an id the executor itself minted — never job content). args are
-        // passed verbatim to exec — never shell-interpreted, so nothing in a
-        // job can inject flags or commands.
-        cmd.args(args.iter());
+        // the backend picks HOW the child is spawned; the stdio/kill/cwd
+        // handling below is identical either way. args are passed verbatim to
+        // exec — never shell-interpreted (the resume path's {session_id} slot
+        // was substituted host-side with an executor-minted id, never job
+        // content) — so nothing in a job can inject flags or commands.
+        let mut cmd = match &self.backend {
+            SandboxBackend::Direct => self.direct_command(args, ctx)?,
+            SandboxBackend::Podman { image } => self.podman_command(image, args, workdir, ctx)?,
+        };
         cmd.current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // dropping the wait future (timeout) must kill the child — a hung
-            // CLI never outlives its job.
+            // CLI never outlives its job. under Podman the killed process is
+            // `podman run`, which tears down the container (--rm) with it.
             .kill_on_drop(true);
-        // env handling is the SAME for portable and non-portable runs: an
-        // ADDITIVE overlay on the inherited environment, plus this run's scoped
-        // ctx.env / PATH bindings. providers run the claude/codex CLI HEADLESS
-        // and are BYO-auth — the CLI reads its OWN credentials from the ambient
-        // env (e.g. ANTHROPIC_API_KEY) or a dotfile under HOME (~/.claude,
-        // ~/.codex), per this module's doc — so the child MUST inherit that
-        // environment or it cannot authenticate to the model.
-        //
-        // D7 isolation floor — the env half: hiding the node's ambient secrets
-        // (HOME => ~/.ducktape/user.key, DUCKTAPE_*, the data dir) from the
-        // child WITHOUT also hiding the operator's CLI credentials (which live
-        // under the same HOME) cannot be done with `env_clear` alone — it needs
-        // the ADR's deferred enforcement MECHANISM (a mount namespace, a
-        // bind-only sandbox, or a separate unix user that holds the CLI creds
-        // but not the node data dir). Until that lands, a portable child
-        // inherits the env exactly like a non-portable one (no worse than
-        // today). The ACTIVE D7 measure is the WORKSPACE RELOCATION: a portable
-        // run's cwd is the provisioner's per-run mount OUTSIDE <storage>, so a
-        // `..` from the cwd no longer reaches the key tree.
+        Ok(cmd)
+    }
+
+    /// the plain host spawn: the spec's binary with the spec's argv and an
+    /// ADDITIVE env overlay (the inherited environment plus this run's scoped
+    /// `ctx.env` / PATH bindings). providers run the claude/codex CLI HEADLESS
+    /// and are BYO-auth — the CLI reads its OWN credentials from the ambient
+    /// env (e.g. ANTHROPIC_API_KEY) or a dotfile under HOME (~/.claude,
+    /// ~/.codex), per this module's doc — so the child MUST inherit that
+    /// environment or it cannot authenticate to the model.
+    ///
+    /// D7 isolation floor — the env half: hiding the node's ambient secrets
+    /// (HOME => ~/.ducktape/user.key, DUCKTAPE_*, the data dir) from the child
+    /// WITHOUT also hiding the operator's CLI credentials (same HOME) cannot be
+    /// done with `env_clear` alone — it needs an enforcement MECHANISM. The
+    /// `Podman` backend IS that mechanism (a fresh mount namespace exposing
+    /// only the spec's `[sandbox] rw_dirs` under HOME); under `Direct` the
+    /// ACTIVE D7 measure remains the WORKSPACE RELOCATION (a portable run's cwd
+    /// is the provisioner's per-run mount OUTSIDE <storage>, so a `..` from the
+    /// cwd no longer reaches the key tree).
+    fn direct_command(
+        &self,
+        args: &[String],
+        ctx: &RunContext,
+    ) -> Result<tokio::process::Command, String> {
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.args(args.iter());
         cmd.envs(ctx.env.iter());
-        if !ctx.path_entries.is_empty() {
-            let mut path = ctx.path_entries.clone();
-            if let Some(existing) = std::env::var_os("PATH") {
-                path.extend(std::env::split_paths(&existing));
-            }
-            let joined = std::env::join_paths(path).map_err(|e| {
-                format!(
-                    "run-local PATH for {} contains an invalid path entry: {e}",
-                    self.spec.tag
-                )
-            })?;
-            cmd.env("PATH", joined);
+        if let Some(path) = self.run_path(ctx)? {
+            cmd.env("PATH", path);
         }
         Ok(cmd)
+    }
+
+    /// wrap the same invocation in `podman run`: identical container paths, the
+    /// run's numeric limits enforced, and ONLY the spec's `[sandbox] rw_dirs`
+    /// (the CLI's auth/state) crossing under HOME. HOME is set (so the CLI
+    /// finds its dotfiles at their identical mounted paths) but not itself
+    /// mounted — the node's data dir and user key stay outside (D7).
+    fn podman_command(
+        &self,
+        image: &str,
+        args: &[String],
+        workdir: &Path,
+        ctx: &RunContext,
+    ) -> Result<tokio::process::Command, String> {
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            format!(
+                "{}: the Podman backend needs $HOME set to mount the CLI's auth dirs",
+                self.spec.tag
+            )
+        })?;
+        // env carried into the container: HOME + the run PATH + this run's
+        // scoped ctx.env — deliberately NOT the node's ambient secrets.
+        let mut envs: Vec<(String, String)> = vec![("HOME".into(), home.display().to_string())];
+        if let Some(path) = self.run_path(ctx)? {
+            envs.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        }
+        envs.extend(ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // the CLI's auth/state dirs cross rw at their identical host paths
+        // (spec.rs already rejected absolute / `..` entries, so join is safe).
+        let rw_dirs: Vec<PathBuf> = self
+            .spec
+            .rw_dirs
+            .iter()
+            .map(|d| home.join(d.strip_prefix("~/").unwrap_or(d)))
+            .collect();
+        let (bin, argv) = sandbox::wrap_podman(
+            image,
+            &self.bin,
+            args,
+            workdir,
+            &envs,
+            &ctx.path_entries,
+            &rw_dirs,
+            &ctx.limits,
+        );
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(argv);
+        Ok(cmd)
+    }
+
+    /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
+    /// or `None` when the run adds no entries. shared by both backends (Direct
+    /// sets it as the child's PATH env; Podman exports it via `-e PATH=`).
+    fn run_path(&self, ctx: &RunContext) -> Result<Option<OsString>, String> {
+        if ctx.path_entries.is_empty() {
+            return Ok(None);
+        }
+        let mut path = ctx.path_entries.clone();
+        if let Some(existing) = std::env::var_os("PATH") {
+            path.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(path).map(Some).map_err(|e| {
+            format!(
+                "run-local PATH for {} contains an invalid path entry: {e}",
+                self.spec.tag
+            )
+        })
     }
 
     /// where this run's child executes: the per-agent persistent workspace
@@ -939,6 +1027,7 @@ fn excerpt(s: &str) -> String {
 pub fn discover(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
+    backend: SandboxBackend,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
@@ -952,6 +1041,7 @@ pub fn discover(
         timeout,
         dirs.resolved(&|k| std::env::var_os(k)),
         output_sink,
+        backend,
     ))
 }
 
@@ -983,7 +1073,15 @@ fn discover_with(
     global_timeout: Option<Duration>,
     dirs: AgentDirs,
 ) -> ProviderSet {
-    discover_with_sink(specs, path, env, global_timeout, dirs, None)
+    discover_with_sink(
+        specs,
+        path,
+        env,
+        global_timeout,
+        dirs,
+        None,
+        SandboxBackend::Direct,
+    )
 }
 
 fn discover_with_sink(
@@ -993,6 +1091,7 @@ fn discover_with_sink(
     global_timeout: Option<Duration>,
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
+    backend: SandboxBackend,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -1007,8 +1106,9 @@ fn discover_with_sink(
             continue;
         };
         for spec in group {
-            let mut provider =
-                CliProvider::from_spec((*spec).clone(), bin.clone()).with_agent_dirs(dirs.clone());
+            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone())
+                .with_agent_dirs(dirs.clone())
+                .with_backend(backend.clone());
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }
@@ -1142,6 +1242,63 @@ format = "{format}"
 
     fn mock_provider(tag: &str, format: &str, script: PathBuf, wd: &str) -> CliProvider {
         sh_provider(mock_spec(tag, tag, format), script, wd)
+    }
+
+    // ---- podman backend glue ------------------------------------------------
+
+    #[test]
+    fn podman_backend_wraps_command_with_identical_paths_and_rw_mounts() {
+        // the command() glue that assembles HOME, expands the spec's `~/`
+        // rw_dirs against it, and hands identical container paths to
+        // wrap_podman — asserted through the real command() the same way a run
+        // would build it. wrap_podman's own translation is covered in sandbox.rs.
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "pod"
+[detect]
+bin = "pod"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+[sandbox]
+rw_dirs = ["~/.claude"]
+"#,
+            "test",
+        )
+        .unwrap();
+        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pod"))
+            .with_backend(SandboxBackend::Podman {
+                image: "img".into(),
+            });
+        let ctx = RunContext {
+            limits: BTreeMap::from([("cores".to_string(), 2u64)]),
+            ..RunContext::default()
+        };
+        let cmd = provider
+            .command(&["--go".into()], Path::new("/tmp/wd"), &ctx)
+            .expect("podman command builds");
+        let std = cmd.as_std();
+        assert_eq!(std.get_program(), std::ffi::OsStr::new("podman"));
+        let argv: Vec<String> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = argv.join(" ");
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        // the spec's `~/.claude` expands against the real HOME and mounts rw at
+        // its IDENTICAL container path; the bin mounts ro; limits become flags.
+        assert!(
+            joined.contains(&format!("-v {home}/.claude:{home}/.claude")),
+            "rw mount at identical path: {joined}"
+        );
+        assert!(joined.contains("-v /usr/bin/pod:/usr/bin/pod:ro"), "{joined}");
+        assert!(joined.contains(&format!("-e HOME={home}")), "{joined}");
+        assert!(joined.contains("--cpus 2"), "{joined}");
+        assert!(joined.ends_with("img /usr/bin/pod --go"), "{joined}");
     }
 
     // ---- discovery ----------------------------------------------------------
@@ -1852,6 +2009,7 @@ printf '%s\n' "$PATH"
                 override_dir.display().to_string(),
             )]),
             path_entries: vec![path_entry.clone()],
+            limits: BTreeMap::new(),
             portable: true,
         };
 

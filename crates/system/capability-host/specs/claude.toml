@@ -65,6 +65,16 @@ mode = "persistent"
 capture = "json-result-field:session_id"
 resume_args_append = ["--resume", "{session_id}"]
 
+[sandbox]
+# Under the Podman sandbox backend, HOME is set but NOT mounted — only these
+# home-relative auth/state dirs cross the boundary read-write, so the CLI can
+# authenticate while the node's data dir and user key stay outside (D7).
+# ~/.claude holds the login/session state; ~/.claude.json holds config. Inert
+# under the Direct backend (the child inherits HOME whole). Home-relative
+# ONLY: absolute paths and ".." are rejected at load. Inherited by every
+# [[variants]] tag below.
+rw_dirs = ["~/.claude", "~/.claude.json"]
+
 # ---- curated model/effort matrix -------------------------------------------
 # Base args plus an explicit --model and --effort per variant. The inherited
 # [session] append style adds --resume <id> after each variant's own args on

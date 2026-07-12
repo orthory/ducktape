@@ -4,7 +4,7 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`workspace`/`session` (and `description`) from the parent,
+//! `timeout_secs`/`workspace`/`session`/`rw_dirs` (and `description`) from the parent,
 //! with the variant's own FULL argv (and, optionally, its own `[session]`
 //! resume replacement — see [`RawVariant::resume_args`]). there is no
 //! merging, no placeholder, no substitution — the
@@ -118,6 +118,9 @@ pub(crate) fn expand(
             output: base.output,
             workspace: base.workspace,
             session,
+            // the executor's auth/state dirs are a property of the CLI, not the
+            // model/effort — so a variant sandboxes the same dirs as its parent.
+            rw_dirs: base.rw_dirs.clone(),
         });
     }
     Ok(specs)
@@ -271,6 +274,9 @@ args = ["run", "--model", "m1", "--effort", "high"]
 [workspace]
 mode = "persistent"
 
+[sandbox]
+rw_dirs = ["~/.prov"]
+
 [session]
 capture = "jsonl-events"
 resume_args = ["resume", "{session_id}", "--default"]
@@ -288,9 +294,10 @@ resume_args = ["resume", "{session_id}", "--model", "m1", "--hard"]
         let specs = CapabilitySpec::parse_all(&toml, "t").unwrap();
         let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
 
-        // plain variant: workspace and session inherited verbatim.
+        // plain variant: workspace, sandbox rw_dirs, and session all inherited.
         let v = get("prov_m1_low");
         assert_eq!(v.workspace, crate::WorkspaceMode::Persistent);
+        assert_eq!(v.rw_dirs, vec!["~/.prov"], "sandbox rw_dirs inherited");
         assert_eq!(v.session, get("prov").session, "session inherited");
 
         // resume_args variant: capture inherited, resume argv its own.

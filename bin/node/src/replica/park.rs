@@ -472,6 +472,8 @@ pub(super) async fn park(
     let resident_provider_set = capability_host::discover(
         agent_dirs.clone(),
         Some(run_output_sink(stream_hub.run_output())),
+        // Task 8 wires the operator's sandbox choice here; Direct for now.
+        capability_host::SandboxBackend::Direct,
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let resident_capabilities = resident_provider_set.capabilities();

@@ -92,6 +92,15 @@ resume_args = [
     "-",
 ]
 
+[sandbox]
+# Under the Podman sandbox backend, HOME is set but NOT mounted — only this
+# home-relative auth/state dir crosses the boundary read-write, so the CLI can
+# authenticate while the node's data dir and user key stay outside (D7).
+# ~/.codex holds codex's login/session/config state. Inert under the Direct
+# backend (the child inherits HOME whole). Home-relative ONLY: absolute paths
+# and ".." are rejected at load. Inherited by every [[variants]] tag below.
+rw_dirs = ["~/.codex"]
+
 # ---- curated model/effort matrix -------------------------------------------
 # The models the codex CLI itself lists (0.144.1): the gpt-5.6 family plus
 # gpt-5.5. Each model carries only the efforts that model actually supports —

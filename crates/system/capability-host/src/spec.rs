@@ -101,6 +101,14 @@ pub struct CapabilitySpec {
     /// optional `[session]` thread-continuity plumbing — host-local capture
     /// and resume of the executor's own session id (see [`crate::session`]).
     pub session: Option<SessionSpec>,
+    /// optional `[sandbox] rw_dirs` — the executor's own auth/state dirs
+    /// (e.g. `~/.claude`, `~/.codex`) that must cross into a Podman sandbox
+    /// read-write so the BYO CLI can authenticate. HOME-RELATIVE ONLY
+    /// (validated at parse: absolute paths and `..` are rejected loudly);
+    /// expanded against the real `$HOME` at spawn. empty for the historical
+    /// posture — under the Direct backend it is inert (the child inherits
+    /// HOME whole), under Podman these are the ONLY paths under HOME mounted.
+    pub rw_dirs: Vec<String>,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -136,10 +144,39 @@ struct RawSpec {
     /// optional `[session]` — validated in [`crate::session`].
     #[serde(default)]
     session: Option<session::RawSession>,
+    /// optional `[sandbox]` — the Podman-backend auth/state mounts.
+    #[serde(default)]
+    sandbox: Option<RawSandbox>,
     /// optional `[[variants]]` — finer tags expanded at load time, validated
     /// in [`crate::variants`].
     #[serde(default)]
     variants: Vec<RawVariant>,
+}
+
+/// the on-disk `[sandbox]` shape — a dumb serde mirror; unknown fields fail
+/// loud like everywhere else in the spec format.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSandbox {
+    #[serde(default)]
+    rw_dirs: Vec<String>,
+}
+
+/// validate `[sandbox] rw_dirs`: each entry is a HOME-RELATIVE path (a `~/`
+/// prefix is allowed sugar). absolute paths and any `..` segment are rejected
+/// loudly — the whole point of the sandbox is that only these named dirs under
+/// HOME cross the boundary, so an entry that could escape HOME defeats it.
+fn validate_rw_dirs(raw: &RawSandbox, origin: &str) -> Result<Vec<String>, String> {
+    for entry in &raw.rw_dirs {
+        let rel = entry.strip_prefix("~/").unwrap_or(entry);
+        if rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
+            return Err(format!(
+                "{origin}: sandbox.rw_dirs entry {entry:?} must be home-relative \
+                 (no absolute path, no \"..\")"
+            ));
+        }
+    }
+    Ok(raw.rw_dirs.clone())
 }
 
 #[derive(Deserialize)]
@@ -262,6 +299,11 @@ impl CapabilitySpec {
             .session
             .map(|s| session::parse_session(&s, origin))
             .transpose()?;
+        let rw_dirs = raw
+            .sandbox
+            .map(|s| validate_rw_dirs(&s, origin))
+            .transpose()?
+            .unwrap_or_default();
         Ok((
             Self {
                 tag,
@@ -273,6 +315,7 @@ impl CapabilitySpec {
                 output,
                 workspace,
                 session,
+                rw_dirs,
             },
             raw.variants,
         ))
@@ -507,6 +550,38 @@ resume_args_append = ["--resume", "{{session_id}}"]
             let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
             assert!(err.contains(expect), "wanted {expect:?} in {err:?}");
         }
+    }
+
+    #[test]
+    fn sandbox_rw_dirs_parse_and_reject_absolute_or_traversal() {
+        // absent [sandbox] = no rw_dirs (default empty, v1 posture).
+        let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
+        assert!(plain.rw_dirs.is_empty(), "no [sandbox] = no rw_dirs");
+
+        // a home-relative list parses verbatim.
+        let good = format!(
+            "{}\n[sandbox]\nrw_dirs = [\"~/.claude\", \"~/.claude.json\"]\n",
+            spec_toml("ok")
+        );
+        let spec = CapabilitySpec::parse(&good, "t").unwrap();
+        assert_eq!(spec.rw_dirs, vec!["~/.claude", "~/.claude.json"]);
+
+        // absolute and `..`-carrying entries are rejected loudly (they would
+        // cross the isolation boundary the sandbox exists to hold).
+        for (entry, expect) in [
+            ("/etc/passwd", "home-relative"),
+            ("~/../..", "home-relative"),
+            ("../escape", "home-relative"),
+        ] {
+            let bad = format!("{}\n[sandbox]\nrw_dirs = [\"{entry}\"]\n", spec_toml("ok"));
+            let err = CapabilitySpec::parse(&bad, "t").unwrap_err();
+            assert!(err.contains(expect), "wanted {expect:?} in {err:?}");
+        }
+
+        // an unknown field under [sandbox] fails loud like everywhere else.
+        let typo = format!("{}\n[sandbox]\nrw_dir = [\"~/.claude\"]\n", spec_toml("ok"));
+        let err = CapabilitySpec::parse(&typo, "t").unwrap_err();
+        assert!(err.contains("not a valid spec"), "got {err:?}");
     }
 
     #[test]
