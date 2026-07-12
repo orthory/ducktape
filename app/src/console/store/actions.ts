@@ -58,7 +58,7 @@ import {
 } from "./account-ops";
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
-import { autoBindUserIdentity } from "./auto-bind";
+import { autoBindUserIdentity, type AutoBindResult } from "./auto-bind";
 import { navSnapshotOf } from "./nav-history";
 import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
@@ -165,6 +165,11 @@ export interface ConsoleActions {
   accountRemoveMember(targetKeyHex: string): Promise<void>;
   /** Evict a (lost) node from this account — its first UI consumer. */
   accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Manually re-run the connect-time auto-bind for the active workspace's
+   *  node — the escape hatch when that fire-and-forget pass returned
+   *  locked/deferred/failed and nothing would ever retry. Resolves to the
+   *  same outcome vocabulary so the caller can say WHY a bind didn't land. */
+  accountBindNode(): Promise<AutoBindResult>;
   /** Stand up the LAN QR-enrollment server for this account (fresh nonce);
    *  the card polls enroll-client directly and cancels on unmount. */
   accountPhoneEnrollStart(): Promise<PhoneEnrollment>;
@@ -1590,6 +1595,22 @@ export function createActions({
       Promise.resolve()
         .then(() => unbindNode(accountDeps(), targetNodeHex))
         .then(() => refresh()),
+    accountBindNode: () =>
+      Promise.resolve()
+        .then(() => {
+          const live = getNode();
+          const { workspace } = getState();
+          if (!live || !workspace) throw new Error("not connected to a workspace node");
+          return autoBindUserIdentity(live, workspace);
+        })
+        .then((outcome) =>
+          // A landed (or already-landed) bind repaints the Owned by row from
+          // the refreshed identity projection; the other outcomes carry the
+          // reason back to the button that asked.
+          outcome === "bound" || outcome === "already"
+            ? refresh().then(() => outcome)
+            : outcome,
+        ),
     accountPhoneEnrollStart: () =>
       Promise.resolve().then(() => startPhoneEnrollment(accountDeps())),
     accountPhoneEnrollApprove: (enrollment, newKeyHex, sigHex, label) =>
