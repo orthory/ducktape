@@ -335,6 +335,28 @@ impl WasmModule {
     }
 }
 
+/// canonical `install`-able bytes (and their root) for a host-COMPUTED initial
+/// store — how the host seeds a wasm tenant with state at construction, e.g.
+/// the `sdk::genesis_config` `__config` entry carrying per-network genesis
+/// parameters (a fixed component cannot compile them in). the encoding is the
+/// exact [`WasmModule::encode_state`] shape (count + sorted len-prefixed
+/// pairs), so `initial_state(entries)` feeds straight into
+/// [`WasmModule::install`]: deterministic, sorted, one store per entry set.
+/// duplicate keys are a wiring bug and panic rather than silently collapse.
+pub fn initial_state(entries: &[(&[u8], &[u8])]) -> (Vec<u8>, StateRoot) {
+    let mut committed = BTreeMap::new();
+    for (key, value) in entries {
+        assert!(
+            committed.insert(key.to_vec(), value.to_vec()).is_none(),
+            "initial_state entries must have unique keys"
+        );
+    }
+    (
+        WasmModule::encode_state(&committed),
+        WasmModule::root_of(&committed),
+    )
+}
+
 // ---- strict snapshot decode (untrusted bytes) -------------------------------
 
 fn take_u64(buf: &mut &[u8]) -> Result<u64, SdkError> {

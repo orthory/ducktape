@@ -23,9 +23,12 @@
 //! keep this crate types + traits with no domain deps (async-trait is the one
 //! greenlit exception): everything here is a shared surface for every module.
 //! [`codec`] carries the shared zero-dep snapshot-codec primitives on the same
-//! everyone-needs-it grounds.
+//! everyone-needs-it grounds, and [`genesis_config`] the tiny codec-based
+//! GENESIS-CONFIG encoding the host and wasm guests share (per-network
+//! parameters installed into a wasm tenant's consensus store at genesis).
 
 pub mod codec;
+pub mod genesis_config;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module

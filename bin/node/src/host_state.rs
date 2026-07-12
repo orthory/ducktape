@@ -13,10 +13,7 @@ use dispatch::DispatchModule;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
-use governance::Governance;
-use gateway::Gateway;
 use host::Host;
-use identity::Identity;
 use kv::Kv;
 use modreg::Modreg;
 use pages::Pages;
@@ -136,6 +133,24 @@ const DUCKDNS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/examples/duckdns-wasm/component.wasm");
 const DUCKDNS_MODULE_ID: &str = "duckdns";
 
+/// identity / gateway / governance — adapter-ported tenants whose native
+/// constructors take PER-NETWORK parameters (the identity chain id, the invite
+/// binding). a wasm component is fixed bytes, so those parameters travel as
+/// GENESIS CONFIG: the builders below install an initial store carrying the
+/// reserved `__config` key (`sdk::genesis_config`) at construction, and the
+/// guest decodes it per dispatch. the config is consensus state — identical on
+/// every node, in the module root (hence the app-hash) from genesis, and
+/// carried by checkpoint snapshots like any other store key.
+const IDENTITY_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/identity-wasm/component.wasm");
+const IDENTITY_MODULE_ID: &str = "identity";
+const GATEWAY_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/gateway-wasm/component.wasm");
+const GATEWAY_MODULE_ID: &str = "gateway";
+const GOVERNANCE_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/governance-wasm/component.wasm");
+const GOVERNANCE_MODULE_ID: &str = "governance";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -177,6 +192,18 @@ fn seeded_modreg() -> Modreg {
     modreg.seed(
         DUCKDNS_MODULE_ID,
         sha2::Sha256::digest(DUCKDNS_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        IDENTITY_MODULE_ID,
+        sha2::Sha256::digest(IDENTITY_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        GATEWAY_MODULE_ID,
+        sha2::Sha256::digest(GATEWAY_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        GOVERNANCE_MODULE_ID,
+        sha2::Sha256::digest(GOVERNANCE_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -247,6 +274,67 @@ fn genesis_duckdns_wasm() -> WasmModule {
         .with_state_schema_revision(2)
 }
 
+/// a wasm tenant at its GENESIS code with a host-installed GENESIS-CONFIG
+/// store: the component loads, then adopts an initial snapshot whose one
+/// entry is the reserved `__config` key carrying the canonically-encoded
+/// per-network parameters. install is verify-then-adopt against the
+/// host-computed root, so the constructed module's root commits to the config
+/// from block zero (genesis roots honestly differ per network). the RESTORE /
+/// STATE-SYNC paths construct through the same builder and then install the
+/// checkpoint snapshot over it — the config rides in those bytes, so the
+/// interim config-only store is simply replaced by the same-config checkpoint.
+fn genesis_config_wasm(
+    module_id: &str,
+    component: &[u8],
+    params: &[(&str, &[u8])],
+    what: &str,
+) -> WasmModule {
+    let mut module = WasmModule::from_bytes(module_id, component)
+        .unwrap_or_else(|e| panic!("embedded {what} component loads: {e}"))
+        .with_state_schema_revision(2);
+    let config = sdk::genesis_config::encode_config(params);
+    let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
+    module
+        .install(&bytes, root)
+        .unwrap_or_else(|e| panic!("{what} genesis config installs: {e}"));
+    module
+}
+
+/// identity at its GENESIS code + config (adapter-ported, revision 2 — see
+/// [`genesis_vaults_wasm`]): the per-network chain id rides `__config`.
+fn genesis_identity_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
+    genesis_config_wasm(
+        IDENTITY_MODULE_ID,
+        IDENTITY_WASM_COMPONENT,
+        &[("chain_id", bindings.identity_chain_id.as_bytes())],
+        "identity",
+    )
+}
+
+/// gateway at its GENESIS code + config: routes are chain-scoped, so the same
+/// per-network chain id rides `__config`.
+fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
+    genesis_config_wasm(
+        GATEWAY_MODULE_ID,
+        GATEWAY_WASM_COMPONENT,
+        &[("chain_id", bindings.identity_chain_id.as_bytes())],
+        "gateway",
+    )
+}
+
+/// governance at its GENESIS code + config: the invite binding every token
+/// and join proof verify against rides `__config` (the sibling wiring —
+/// valset/upgrade/identity/modreg — is genesis-constant and compiled into the
+/// guest like every other port's sibling ids).
+fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
+    genesis_config_wasm(
+        GOVERNANCE_MODULE_ID,
+        GOVERNANCE_WASM_COMPONENT,
+        &[("invite", bindings.invite)],
+        "governance",
+    )
+}
+
 pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
     std::sync::Arc::new(move |ctx, line| {
         let Some(run_key) = ctx.run_key.as_deref() else {
@@ -271,7 +359,7 @@ struct ProductionModules {
     chat: Chat,
     forge: Forge,
     valset: Valset,
-    governance: Governance,
+    governance: WasmModule,
     upgrade: Upgrade,
     modreg: Modreg,
     hello_wasm: WasmModule,
@@ -281,9 +369,9 @@ struct ProductionModules {
     tagging: WasmModule,
     tasks: WasmModule,
     vaults: WasmModule,
-    identity: Identity,
+    identity: WasmModule,
     duckdns: WasmModule,
-    gateway: Gateway,
+    gateway: WasmModule,
     inbox: WasmModule,
     files: Files,
     jobs: WasmModule,
@@ -357,6 +445,9 @@ pub(super) async fn genesis_host(
     blobs.put_chunk(TAGGING_WASM_COMPONENT.to_vec());
     blobs.put_chunk(CAPABILITY_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DUCKDNS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(IDENTITY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(GATEWAY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(GOVERNANCE_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -377,9 +468,8 @@ pub(super) async fn genesis_host(
         valset,
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
-        governance: Governance::new("governance", "valset", "upgrade", "identity")
-            .with_invite_binding(bindings.invite)
-            .with_modreg(host::MODREG_MODULE_ID),
+        // adapter-ported; the invite binding rides its GENESIS CONFIG.
+        governance: genesis_governance_wasm(bindings),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
@@ -414,22 +504,15 @@ pub(super) async fn genesis_host(
         // `genesis_vaults_wasm`).
         vaults: genesis_vaults_wasm(),
         // the deterministic user->nodes binding registry: certificates are
-        // chain-scoped (this network's chain id), member-gated binds via valset,
-        // and account display names have this single canonical owner.
-        identity: Identity::new(
-            "identity",
-            Some("valset".into()),
-            bindings.identity_chain_id.to_string(),
-        ),
+        // chain-scoped (this network's chain id, riding its GENESIS CONFIG),
+        // member-gated binds via valset, and account display names have this
+        // single canonical owner.
+        identity: genesis_identity_wasm(bindings),
         duckdns: genesis_duckdns_wasm(),
         // Identity-signed, monotonic gateway routes. DuckDNS owns optional
         // human names, Files owns DuckFS bytes, and loopback ports stay local.
-        gateway: Gateway::new(
-            "gateway",
-            "identity",
-            Some("valset".into()),
-            bindings.identity_chain_id,
-        ),
+        // adapter-ported; the chain id rides its GENESIS CONFIG.
+        gateway: genesis_gateway_wasm(bindings),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         inbox: genesis_inbox_wasm(),
@@ -513,10 +596,12 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
-        .with_invite_binding(bindings.invite)
-        .with_modreg(host::MODREG_MODULE_ID);
-    let (bytes, root) = snapshot_of("governance")?;
+    // wasm tenants with GENESIS CONFIG restore like any other wasm module:
+    // construct through the genesis builder (config-only initial store), then
+    // adopt the checkpoint snapshot — the config rides in those bytes, so the
+    // install simply replaces the interim store with the same-config one.
+    let mut governance = genesis_governance_wasm(bindings);
+    let (bytes, root) = snapshot_of(GOVERNANCE_MODULE_ID)?;
     governance
         .install(bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
@@ -583,12 +668,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
 
-    let mut identity = Identity::new(
-        "identity",
-        Some("valset".into()),
-        bindings.identity_chain_id.to_string(),
-    );
-    let (bytes, root) = snapshot_of("identity")?;
+    let mut identity = genesis_identity_wasm(bindings);
+    let (bytes, root) = snapshot_of(IDENTITY_MODULE_ID)?;
     identity
         .install(bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
@@ -599,13 +680,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;
 
-    let mut gateway = Gateway::new(
-        "gateway",
-        "identity",
-        Some("valset".into()),
-        bindings.identity_chain_id,
-    );
-    let (bytes, root) = snapshot_of("gateway")?;
+    let mut gateway = genesis_gateway_wasm(bindings);
+    let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID)?;
     gateway
         .install(bytes, root)
         .map_err(|e| format!("gateway install: {e}"))?;
@@ -901,10 +977,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
-        .with_invite_binding(bindings.invite)
-        .with_modreg(host::MODREG_MODULE_ID);
+    // wasm tenants with GENESIS CONFIG join like any other wasm module:
+    // construct through the genesis builder (config-only initial store), then
+    // adopt the served snapshot, root-checked — the config rides in it.
+    let (bytes, root) = snapshot_of(GOVERNANCE_MODULE_ID).await?;
+    let mut governance = genesis_governance_wasm(bindings);
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
@@ -944,12 +1021,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("identity").await?;
-    let mut identity = Identity::new(
-        "identity",
-        Some("valset".into()),
-        bindings.identity_chain_id.to_string(),
-    );
+    let (bytes, root) = snapshot_of(IDENTITY_MODULE_ID).await?;
+    let mut identity = genesis_identity_wasm(bindings);
     identity
         .install(&bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
@@ -960,13 +1033,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("gateway").await?;
-    let mut gateway = Gateway::new(
-        "gateway",
-        "identity",
-        Some("valset".into()),
-        bindings.identity_chain_id,
-    );
+    let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID).await?;
+    let mut gateway = genesis_gateway_wasm(bindings);
     gateway
         .install(&bytes, root)
         .map_err(|e| format!("gateway install: {e}"))?;

@@ -274,6 +274,27 @@ wasm-modules:
 	cp crates/examples/duckdns-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
 
+	cd crates/examples/identity-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/identity-wasm/target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+	  -o crates/examples/identity-wasm/component.wasm
+	cp crates/examples/identity-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/identity.component.wasm
+
+	cd crates/examples/gateway-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/gateway-wasm/target/wasm32-unknown-unknown/release/gateway_wasm.wasm \
+	  -o crates/examples/gateway-wasm/component.wasm
+	cp crates/examples/gateway-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/gateway.component.wasm
+
+	cd crates/examples/governance-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/governance-wasm/target/wasm32-unknown-unknown/release/governance_wasm.wasm \
+	  -o crates/examples/governance-wasm/component.wasm
+	cp crates/examples/governance-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/governance.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -299,6 +320,12 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/capability.component.wasm
 	cmp crates/examples/duckdns-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
+	cmp crates/examples/identity-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/identity.component.wasm
+	cmp crates/examples/gateway-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/gateway.component.wasm
+	cmp crates/examples/governance-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/governance.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

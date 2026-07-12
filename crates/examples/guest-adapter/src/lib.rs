@@ -21,6 +21,10 @@
 //!   keys — a STATE-SCHEMA BREAK versus the native module's root, declared by
 //!   bumping the module's state-schema revision in the same change. there is
 //!   no back-compat constraint (beta networks re-genesis on a schema break).
+//! * [`load_config`] — the GENESIS-CONFIG read for tenants whose native
+//!   constructor takes per-network parameters (a chain id, an invite binding):
+//!   the host installs an `sdk::genesis_config`-encoded `__config` store entry
+//!   at genesis construction, and the guest decodes it per dispatch.
 //!
 //! the dispatch shape of a whole-state port: load the snapshot through the
 //! host's staged-overlay reads (read-your-writes across the dispatches of one
@@ -213,4 +217,27 @@ pub fn load_state() -> Option<(Vec<u8>, [u8; ROOT_LEN])> {
 pub fn save_state(bytes: &[u8], root: &[u8; ROOT_LEN]) {
     host::state_set(STATE_KEY, bytes);
     host::state_set(ROOT_KEY, root);
+}
+
+// ============================================================================
+// genesis config — per-network parameters for a fixed component
+// ============================================================================
+
+/// read this tenant's GENESIS-CONFIG bytes: the reserved
+/// [`sdk::genesis_config::CONFIG_KEY`] (`__config`) entry the HOST installed
+/// into the store at genesis construction, carrying the per-network parameters
+/// (a chain id, an invite binding, …) that a fixed wasm component cannot
+/// compile in. decode with [`sdk::genesis_config::decode_config`] and
+/// construct the native module with the decoded parameters each dispatch.
+///
+/// the config is CONSENSUS STATE — installed identically on every node, part
+/// of the module root from genesis, and carried by checkpoint snapshots like
+/// any other store key — so restore and state-sync need nothing special.
+/// `None` means the host never installed one: for a tenant whose constructor
+/// NEEDS parameters that is wiring corruption, and the guest should reject
+/// deterministically rather than guess defaults. the module never writes this
+/// key; `save_state` touches only `__state`/`__root`, so the config persists
+/// untouched across every dispatch.
+pub fn load_config() -> Option<Vec<u8>> {
+    host::state_get(sdk::genesis_config::CONFIG_KEY)
 }

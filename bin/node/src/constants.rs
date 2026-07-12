@@ -172,10 +172,14 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("duckdns", 2),
     ("files", 1),
     ("forge", 1),
-    ("gateway", 1),
-    ("governance", 1),
+    // 2: wasm adapter ports — the native canonical snapshot persisted as one
+    // host-KV value, plus the GENESIS-CONFIG `__config` store entry carrying
+    // the per-network parameters (gateway/identity: chain id; governance: the
+    // invite binding), so root()/snapshot bytes changed shape at cutover.
+    ("gateway", 2),
+    ("governance", 2),
     ("hello", 1),
-    ("identity", 1),
+    ("identity", 2),
     ("inbox", 2),
     ("jobs", 2),
     ("kv", 1),

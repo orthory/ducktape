@@ -4585,6 +4585,7 @@ name = "host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "capability",
  "commonware-cryptography",
  "commonware-runtime",
@@ -4592,12 +4593,15 @@ dependencies = [
  "dispatch",
  "duckdns",
  "futures",
+ "gateway",
+ "governance",
  "greeter",
  "identity",
  "inbox",
  "jobs",
  "kv",
  "modreg",
+ "p256",
  "saga",
  "sdk",
  "serde_json",

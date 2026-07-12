@@ -45,7 +45,16 @@ tagging = { workspace = true }
 capability = { workspace = true }
 duckdns = { workspace = true }
 identity = { workspace = true }
+# the gateway/governance parity proofs stand the native modules (and their
+# native identity/valset/upgrade/modreg siblings) beside the wasm ports.
+gateway = { workspace = true }
+governance = { workspace = true }
 greeter = { workspace = true }
+# the identity parity proof synthesizes WebAuthn passkey assertions exactly as
+# identity's own tests do (deterministic RFC-6979 P-256 signatures — no OS
+# randomness inside a consensus proof).
+p256 = { workspace = true }
+base64 = { workspace = true }
 # the deterministic-activation drain-injection test stands the real upgrade +
 # valset modules on the host and drives a block across an activation boundary.
 valset = { workspace = true }
