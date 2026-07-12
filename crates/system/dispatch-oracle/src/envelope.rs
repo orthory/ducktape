@@ -53,6 +53,10 @@ pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u
 #[derive(Deserialize)]
 struct WireEnvelope {
     agent_id: String,
+    /// additive for v3: old in-flight envelopes fall back to `agent_id`, while
+    /// newly composed runs carry the committed registry display name.
+    #[serde(default)]
+    agent_display_name: Option<String>,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
     /// carries none (the generic `instructions` apply).
     prompt_hash: Option<String>,
@@ -168,6 +172,9 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
         }
     };
 
+    let agent_display_name = envelope
+        .agent_display_name
+        .unwrap_or_else(|| envelope.agent_id.clone());
     let mut ctx = RunContext {
         agent_id: Some(envelope.agent_id),
         thread_key: envelope.thread_key,
@@ -178,6 +185,7 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
         envelope.workspace,
         envelope.skills,
         envelope.result_contract,
+        agent_display_name,
     )?;
     // reading order (coordinator-decided M1 follow-up): system instructions →
     // item context (forge runs only) → output contract → conversation. the
@@ -221,6 +229,7 @@ fn accept_portable_envelope(
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
+    agent_display_name: String,
 ) -> Result<PortablePlan, String> {
     let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
@@ -251,6 +260,7 @@ fn accept_portable_envelope(
     ctx.portable = true;
     Ok(PortablePlan {
         source,
+        agent_display_name,
         // the requested sink rides the plan so the pool can echo it on the
         // assembled RunnerResult; Chain (the default) when the key is absent.
         sink: result_contract.sink,
@@ -297,6 +307,7 @@ mod tests {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "agent_display_name": "BOT",
             "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
@@ -321,6 +332,7 @@ mod tests {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "agent_display_name": "BOT",
             "prompt_hash": null,
             "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
@@ -376,9 +388,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_null_hash_envelope_assembles_instructions_contract_conversation() {
-        let Prepared { input, ctx, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared {
+            input,
+            ctx,
+            workspace,
+        } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
+        assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
 
@@ -462,6 +479,14 @@ mod tests {
         v["a_future_field"] = serde_json::json!("x");
         let Prepared { input, .. } = prepare(&v.to_string(), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_envelope_without_a_display_name_uses_the_agent_id() {
+        let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        v.as_object_mut().unwrap().remove("agent_display_name");
+        let Prepared { workspace, .. } = prepare(&v.to_string(), None).await.unwrap();
+        assert_eq!(workspace.agent_display_name, "bot");
     }
 
     #[tokio::test]
@@ -564,6 +589,7 @@ mod tests {
         );
         assert!(ctx.portable, "a forge run is portable");
         assert_eq!(ctx.thread_key.as_deref(), Some("forge:app:7#2"));
+        assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(
             workspace.source,
             crate::workspace_source::WorkspaceSource::Forge {

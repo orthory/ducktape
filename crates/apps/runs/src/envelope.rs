@@ -48,6 +48,10 @@ Allowed reply block kinds are paragraph, heading, and code. heading is rendered 
 struct RunEnvelope<'a> {
     ducktape_run: u32,
     agent_id: &'a str,
+    /// the committed registry name used for Forge authorship and the
+    /// canonical Ducktape attribution trailer. This travels beside the id so
+    /// the host never has to reconstruct public Git identity from a run key.
+    agent_display_name: &'a str,
     /// lowercase hex of the agent's [`PROMPT_HASH_LEN`]-byte prompt pin, or
     /// null when the record carries none — the host resolves the prompt
     /// content by this digest and falls back to `instructions` on null.
@@ -187,6 +191,7 @@ fn envelope(
     serde_json::to_string(&RunEnvelope {
         ducktape_run: RUN_ENVELOPE_VERSION,
         agent_id: &agent.agent_id,
+        agent_display_name: &agent.display_name,
         prompt_hash: prompt_hash_hex(agent),
         thread_key,
         instructions: DEFAULT_PROMPT,
@@ -411,6 +416,7 @@ mod tests {
 
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
         assert_eq!(v["agent_id"], "bot");
+        assert_eq!(v["agent_display_name"], "BOT");
         assert_eq!(v["prompt_hash"], "07".repeat(PROMPT_HASH_LEN));
         assert_eq!(
             v["thread_key"], "general#1",
@@ -425,7 +431,9 @@ mod tests {
 
         // field order is part of the committed bytes — assert the layout, not
         // just the values.
-        assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#));
+        assert!(payload.starts_with(
+            r#"{"ducktape_run":3,"agent_id":"bot","agent_display_name":"BOT","prompt_hash":"#
+        ));
     }
 
     #[test]
@@ -548,7 +556,9 @@ mod tests {
 
         // field order is stable — the marker leads.
         assert!(
-            payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#),
+            payload.starts_with(
+                r#"{"ducktape_run":3,"agent_id":"bot","agent_display_name":"BOT","prompt_hash":"#
+            ),
             "the marker leads with a stable field order: {payload}"
         );
         let v = parse(&payload);

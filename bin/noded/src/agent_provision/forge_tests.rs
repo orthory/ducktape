@@ -13,6 +13,7 @@ use dispatch_oracle::WorkspaceProvisioner as _;
 const REPO: &str = "app";
 const BRANCH: &str = "agent/item-7";
 const AGENT: &str = "quackbot";
+const AGENT_DISPLAY_NAME: &str = "Quack Agent";
 const NODE_IDENT: &str = "node-f00f";
 
 /// init a repo EXACTLY as forge::git::init does (that fn is crate-private):
@@ -153,6 +154,7 @@ impl Bed {
         WorkspaceSpec {
             run_id: run_id.into(),
             agent_id: Some(AGENT.into()),
+            agent_display_name: Some(AGENT_DISPLAY_NAME.into()),
             source: WorkspaceSource::Forge {
                 repo: REPO.into(),
                 commit: commit.into(),
@@ -167,9 +169,9 @@ impl Bed {
 // ---- construction: probe + config legs -----------------------------------
 
 #[test]
-fn the_probe_passes_on_a_worktree_capable_host_git() {
+fn the_probe_passes_on_a_runtime_compatible_host_git() {
     // the suite itself requires host git; the REAL probe must agree.
-    probe_host_git().expect("this box has a worktree-capable git");
+    probe_host_git().expect("this box has a runtime-compatible git");
 }
 
 #[test]
@@ -179,6 +181,35 @@ fn the_probe_fails_loud_when_git_is_absent() {
         err.contains("probe failed") && err.contains("failed to spawn"),
         "the failure names the probe and the cause: {err}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_probe_rejects_git_without_the_runtime_rebase_options() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shim = tmp.path().join("git-with-old-rebase");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n\
+         for arg in \"$@\"; do\n\
+           case \"$arg\" in\n\
+             --reapply-cherry-picks|--empty=keep)\n\
+               echo \"error: unknown option $arg\" >&2\n\
+               exit 129\n\
+               ;;\n\
+           esac\n\
+         done\n\
+         exec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = probe_host_git_with(shim.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("runtime-compatible git"), "{err}");
+    assert!(err.contains("runtime rebase options"), "{err}");
+    assert!(err.contains("unknown option"), "{err}");
 }
 
 #[tokio::test]
@@ -446,6 +477,67 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
 
 // ---- commit + push --------------------------------------------------------
 
+#[test]
+fn commit_message_normalization_strips_supplied_coauthors_and_owns_attribution() {
+    let message = normalize_commit_message(
+        Some(
+            "Fix the actual bug\r\n\r\nKeep the useful body.\r\n\r\n\
+             Co-Authored-By: Human <human@example.com>\r\n\
+             Co-Authored-By: Old Bot <old@agents.ducktape.local>\r\n\
+             Co-Authored-By: Forged via Ducktape <forged@example.com>",
+        ),
+        "Quack\nAgent <unsafe>",
+        "quack/bot@example",
+    );
+    assert!(message.starts_with("Fix the actual bug\n\nKeep the useful body."));
+    assert!(!message.contains("Human") && !message.contains("Old Bot"));
+    assert!(!message.contains("Forged"));
+    assert_eq!(message.matches("Co-Authored-By:").count(), 1);
+    assert_eq!(message.matches("via Ducktape").count(), 1);
+    let local = attribution_email_local_part("quack/bot@example");
+    assert!(message.ends_with(&format!(
+        "Co-Authored-By: QuackAgent unsafe via Ducktape <{local}@agents.ducktape.network>"
+    )));
+    assert!(!message.contains('\r'));
+}
+
+#[test]
+fn attribution_addresses_hash_the_complete_id_after_a_readable_slug() {
+    let ids = ["qa/luna", "qa luna", "qa@luna"];
+    let locals = ids.map(attribution_email_local_part);
+    for local in &locals {
+        assert!(local.starts_with("qa-luna-"), "{local}");
+        assert!(local.len() <= MAX_AGENT_ID_BYTES, "{local}");
+    }
+    assert_ne!(locals[0], locals[1]);
+    assert_ne!(locals[0], locals[2]);
+    assert_ne!(locals[1], locals[2]);
+    assert_eq!(locals[0], attribution_email_local_part(ids[0]));
+}
+
+#[test]
+fn invalid_empty_and_oversized_proposals_fall_back_without_splitting_identity_utf8() {
+    let oversized = "x".repeat(MAX_COMMIT_MESSAGE_BYTES + 1);
+    for proposal in [
+        None,
+        Some(" \r\n "),
+        Some("dispatch\u{1f}runs\u{1f}private:0"),
+        Some(oversized.as_str()),
+    ] {
+        let long_name = "오리".repeat(100);
+        let safe_name = sanitize_display_name(&long_name);
+        assert!(safe_name.len() <= MAX_DISPLAY_NAME_BYTES);
+        assert!(safe_name.is_char_boundary(safe_name.len()));
+        let message = normalize_commit_message(proposal, &long_name, "bot");
+        assert!(
+            message.starts_with("Apply agent changes\n\n"),
+            "{message:?}"
+        );
+        assert!(!message.contains("dispatch") && message.len() <= MAX_COMMIT_MESSAGE_BYTES);
+        assert!(message.is_char_boundary(message.len()));
+    }
+}
+
 #[tokio::test]
 async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     let bed = bed();
@@ -457,7 +549,7 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
         .expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "the work\n").unwrap();
 
-    let receipt = ws.commit("agent run s1:0").await.expect("commit+push");
+    let receipt = ws.commit("Apply agent changes").await.expect("commit+push");
     assert!(!receipt.no_changes && receipt.commit_error.is_none());
     assert!(!receipt.rebased, "an uncontended push never claims a rebase");
     assert_eq!(receipt.source_prefix, format!("forge:{REPO}"));
@@ -468,12 +560,18 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     let oid = receipt.output_commit.expect("the new commit oid");
     assert_ne!(oid, bed.head);
     // the push CROSSED: the remote's branch is exactly the receipt's oid,
-    // and the commit message is the run bracket's.
+    // and the internal run key never reaches Git text.
     assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
     assert_eq!(
         git_stdout(&ws.workdir(), &["log", "-1", "--format=%s"]),
-        "agent run s1:0"
+        "Apply agent changes"
     );
+    let body = git_stdout(&ws.workdir(), &["log", "-1", "--format=%B"]);
+    assert!(!body.contains("s1:0"));
+    assert!(body.ends_with(&format!(
+        "Co-Authored-By: Quack Agent via Ducktape <{}@agents.ducktape.network>",
+        attribution_email_local_part(AGENT)
+    )));
     ws.cleanup().await;
 }
 
@@ -487,11 +585,14 @@ async fn the_commit_carries_agent_author_and_node_committer() {
         .await
         .expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "the work\n").unwrap();
-    ws.commit("agent run s1:0").await.expect("commit+push");
+    ws.commit("Apply agent changes").await.expect("commit+push");
     // D2: author = the agent (synthetic email), committer = the node identity.
     assert_eq!(
         git_stdout(&ws.workdir(), &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
-        format!("{AGENT}|{AGENT}@agents.ducktape.local|{NODE_IDENT}|node@ducktape.local")
+        format!(
+            "{AGENT_DISPLAY_NAME}|{}@agents.ducktape.network|{NODE_IDENT}|node@ducktape.local",
+            attribution_email_local_part(AGENT)
+        )
     );
     ws.cleanup().await;
 }
@@ -536,7 +637,13 @@ async fn an_agents_own_commits_push_even_with_a_clean_tree() {
     run_git(&dir, &["add", "-A"], &[]).unwrap();
     run_git(
         &dir,
-        &["commit", "-m", "agent's own commit"],
+        &[
+            "commit",
+            "-m",
+            "Fix repository output",
+            "-m",
+            "Keep the agent-selected body.\n\nCo-Authored-By: Human <human@example.com>",
+        ],
         &[
             ("GIT_AUTHOR_NAME", "self"),
             ("GIT_AUTHOR_EMAIL", "self@x"),
@@ -546,15 +653,59 @@ async fn an_agents_own_commits_push_even_with_a_clean_tree() {
     )
     .unwrap();
     let own = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    let own_tree = git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]);
 
-    let receipt = ws.commit("agent run s1:0").await.expect("push");
+    let receipt = ws.commit("Apply agent changes").await.expect("push");
     assert!(!receipt.no_changes);
-    assert_eq!(
-        receipt.output_commit.as_deref(),
-        Some(own.as_str()),
-        "no extra commit was minted — the agent's own head pushed"
+    let normalized = receipt.output_commit.expect("normalized run commit");
+    assert_ne!(normalized, own, "the intermediate commit must not leak");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(normalized.as_str()));
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), bed.head);
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]), own_tree);
+    let body = git_stdout(&dir, &["log", "-1", "--format=%B"]);
+    assert!(
+        body.starts_with("Fix repository output\n\nKeep the agent-selected body."),
+        "{body}"
     );
-    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(own.as_str()));
+    assert!(!body.contains("Human <human@example.com>"), "{body}");
+    assert_eq!(body.matches("Co-Authored-By:").count(), 1, "{body}");
+    assert_eq!(body.matches("via Ducktape").count(), 1, "{body}");
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_invalid_agent_message_falls_back_without_losing_the_agents_tree() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    std::fs::write(dir.join("safe.txt"), "must survive\n").unwrap();
+    run_git(&dir, &["add", "-A"], &[]).unwrap();
+    run_git(
+        &dir,
+        &["commit", "-m", "dispatch\u{1f}runs\u{1f}private-hash:0"],
+        &[
+            ("GIT_AUTHOR_NAME", "attacker"),
+            ("GIT_AUTHOR_EMAIL", "attacker@example.com"),
+            ("GIT_COMMITTER_NAME", "attacker"),
+            ("GIT_COMMITTER_EMAIL", "attacker@example.com"),
+        ],
+    )
+    .unwrap();
+    let final_tree = git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let receipt = ws.commit("ignored internal value").await.expect("push");
+    let oid = receipt.output_commit.expect("normalized output");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]), final_tree);
+    assert_eq!(git_stdout(&dir, &["show", "HEAD:safe.txt"]), "must survive");
+    let body = git_stdout(&dir, &["log", "-1", "--format=%B"]);
+    assert!(body.starts_with("Apply agent changes\n\n"), "{body}");
+    assert!(!body.contains("dispatch") && !body.contains('\u{1f}'), "{body:?}");
     ws.cleanup().await;
 }
 
@@ -586,8 +737,52 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     // … and the rebase preserved the agent author + node committer (D2).
     assert_eq!(
         git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
-        format!("{AGENT}|{AGENT}@agents.ducktape.local|{NODE_IDENT}|node@ducktape.local")
+        format!(
+            "{AGENT_DISPLAY_NAME}|{}@agents.ducktape.network|{NODE_IDENT}|node@ducktape.local",
+            attribution_email_local_part(AGENT)
+        )
     );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_identical_concurrent_patch_keeps_a_normalized_attribution_commit() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let bare_repo = git2::Repository::open(&bare).unwrap();
+    let c2 = odb_commit(&bare_repo, Some(&bed.head), "same.txt", "identical work\n");
+    set_ref(&bare_repo, BRANCH, &c2);
+
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, true))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    std::fs::write(dir.join("same.txt"), "identical work\n").unwrap();
+
+    let receipt = ws
+        .commit("agent run s1:0")
+        .await
+        .expect("rebase-retry push");
+    assert!(receipt.rebased);
+    let oid = receipt.output_commit.expect("normalized output commit");
+    assert_ne!(
+        oid, c2,
+        "the unrelated upstream commit is not the receipt output"
+    );
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), c2);
+    assert_eq!(
+        git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%s"]),
+        format!(
+            "{AGENT_DISPLAY_NAME}|{}@agents.ducktape.network|Apply agent changes",
+            attribution_email_local_part(AGENT)
+        )
+    );
+    let body = git_stdout(&dir, &["log", "-1", "--format=%B"]);
+    assert_eq!(body.matches("Co-Authored-By:").count(), 1, "{body}");
+    assert!(body.contains(" via Ducktape <"), "{body}");
     ws.cleanup().await;
 }
 

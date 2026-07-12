@@ -136,6 +136,7 @@ impl NodedWorkspace {
         WorkspaceSpec {
             run_id: String::new(),
             agent_id: None,
+            agent_display_name: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
         }

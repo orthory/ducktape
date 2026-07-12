@@ -58,6 +58,9 @@ indexer = { workspace = true }
 duckfs-client = { workspace = true }
 # the workspace RPC decodes file-read replies (base64) off the actor lane.
 base64 = { workspace = true }
+# forge attribution emails include a bounded sha256-derived suffix so distinct
+# committed agent ids cannot collapse onto the same synthetic address.
+sha2 = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
@@ -86,9 +89,6 @@ ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
 tokio = { version = "1", features = ["test-util"] }
 # daemon_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
-# daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
-# of the doc's canonical rendering, computed test-side.
-sha2 = { workspace = true }
 # (duckfs-client and base64 are now direct deps above — daemon_e2e drives the
 # `HttpNode` transport through them as the full-stack proof of the client
 # transport, alongside the workspace RPC that uses them at runtime.)
