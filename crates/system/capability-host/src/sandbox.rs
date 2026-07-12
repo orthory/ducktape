@@ -44,9 +44,10 @@ pub enum SandboxBackend {
 /// executor bin ro, each `ro_paths` entry ro (the run's PATH-entry dirs and its
 /// W6 skills tree — see `CliProvider::sandbox_ro_paths`), each `rw_dirs`
 /// entry rw (the spec's CLI auth/state dirs). only the limit dimensions this
-/// backend knows how to enforce (`cores` → `--cpus`, `mem_gb` → `--memory`)
-/// become flags; an unknown dimension (e.g. `gpu`) is silently ignored — the
-/// scheduler already matched it, the backend enforces only what it can.
+/// backend knows how to enforce (`cores` → `--cpus`, `mem_gb` → `--memory` and
+/// `--memory-swap` with the same value) become flags; an unknown dimension
+/// (e.g. `gpu`) is silently ignored — the scheduler already matched it, the
+/// backend enforces only what it can.
 // one flat argument per translation input keeps this a PURE, dependency-free
 // function (no context struct to build in tests); the alternative bundle would
 // exist only to appease the lint.
@@ -72,7 +73,9 @@ pub fn wrap_podman(
         argv.extend(["--cpus".into(), cores.to_string()]);
     }
     if let Some(mem) = limits.get("mem_gb") {
-        argv.extend(["--memory".into(), format!("{mem}g")]);
+        let mem = format!("{mem}g");
+        argv.extend(["--memory".into(), mem.clone()]);
+        argv.extend(["--memory-swap".into(), mem]);
     }
     argv.extend(["-v".into(), format!("{d}:{d}", d = workdir.display())]);
     argv.extend(["-w".into(), workdir.display().to_string()]);
@@ -436,7 +439,7 @@ mod tests {
         let s = argv.join(" ");
         assert!(s.starts_with("run --rm --network=host"), "got: {s}");
         assert!(
-            s.contains("--cpus 4") && s.contains("--memory 8g"),
+            s.contains("--cpus 4") && s.contains("--memory 8g") && s.contains("--memory-swap 8g"),
             "got: {s}"
         );
         assert!(
@@ -474,7 +477,10 @@ mod tests {
             &[("gpu".into(), 1u64)].into_iter().collect(),
         );
         let s = argv.join(" ");
-        assert!(!s.contains("--cpus") && !s.contains("--memory"), "got: {s}");
+        assert!(
+            !s.contains("--cpus") && !s.contains("--memory") && !s.contains("--memory-swap"),
+            "got: {s}"
+        );
         assert!(
             !s.contains("gpu"),
             "an unknown dimension is not a flag: {s}"
@@ -497,6 +503,10 @@ mod tests {
         );
         let s = argv.join(" ");
         assert!(s.starts_with("run --rm --network=host"), "got: {s}");
+        assert!(
+            !s.contains("--memory") && !s.contains("--memory-swap"),
+            "got: {s}"
+        );
         assert!(s.ends_with("img /bin/x"), "got: {s}");
     }
 
