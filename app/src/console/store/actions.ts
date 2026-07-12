@@ -359,8 +359,15 @@ export interface ConsoleActions {
   /** Watch a channel under a turn policy / drop the watch. */
   watchChannel(params: { channelId: string; policy: TurnPolicy }): void;
   unwatchChannel(channelId: string): void;
-  /** Explicitly run an agent against a channel anchor. */
-  requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
+  /** Explicitly run an agent against a channel anchor. Optional `demands` are
+   *  per-run resource requirements (dimension → positive integer); omitted
+   *  from the wire when absent or empty. */
+  requestRun(params: {
+    agentId: string;
+    channelId: string;
+    anchorSeq: number;
+    demands?: Record<string, number>;
+  }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
   /** Fence one attempt and move the run to a different provider. */
@@ -2138,13 +2145,14 @@ export function createActions({
       );
     },
 
-    requestRun: ({ agentId, channelId, anchorSeq }) => {
+    requestRun: ({ agentId, channelId, anchorSeq, demands }) => {
       if (!agentId || !channelId) return;
       submitTracked(opKey.runRequest(agentId), (live) =>
         runsClient.requestRun(live, {
           agentId,
           channelId,
           anchorSeq,
+          demands,
           origin: getState().author,
         }),
       );
