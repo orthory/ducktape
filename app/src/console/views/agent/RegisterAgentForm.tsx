@@ -76,7 +76,7 @@ export function RegisterAgentForm({
   const ready =
     displayName.trim() !== "" &&
     agentId !== "" &&
-    capability.trim() !== "" &&
+    capabilities.includes(capability) &&
     allowedActions.length > 0;
 
   const toggle = (name: string) =>

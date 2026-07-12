@@ -10,8 +10,8 @@
 //   - any other shape               — opaque: selectable verbatim, no cascade.
 //
 // Degrades by registry size:
-//   - none announced → a labelled text field (never blocks setup before a
-//     host has announced);
+//   - none announced → a disabled, actionable empty state (an arbitrary tag
+//     would register an agent that can never run);
 //   - announced → selects; an empty value defaults to the first announced
 //     tag, so a single-executor node needs no choice at all. Providers with
 //     only a base tag collapse Model/Effort to "Default".
@@ -64,10 +64,8 @@ export function RunsOnPicker({
     if (value === "" && capabilities.length > 0) onChange(capabilities[0]);
   }, [value, capabilities, onChange]);
 
-  // No executors announced: free text so a first-time operator can register
-  // before any host announces. Keyed on the registry alone, never on `value` —
-  // a value-gated guard would flip to the select branch on the first keystroke
-  // (unmounting the input mid-word).
+  // The registry is the source of truth. Accepting an arbitrary tag here makes
+  // registration look successful but leaves the agent permanently unrunnable.
   if (capabilities.length === 0) {
     return (
       <>
@@ -75,13 +73,15 @@ export function RunsOnPicker({
           id={id}
           name={id}
           type="text"
-          spellCheck={false}
+          disabled
           value={value}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="e.g. codex"
-          style={monoInputStyle}
+          placeholder="No provider available"
+          aria-describedby={`${id}-unavailable`}
+          style={{ ...monoInputStyle, color: color.muted2, cursor: "not-allowed" }}
         />
         <div
+          id={`${id}-unavailable`}
+          role="status"
           style={{
             marginTop: 5,
             font: `400 10.5px ${font.sans}`,
@@ -89,7 +89,9 @@ export function RunsOnPicker({
             lineHeight: 1.4,
           }}
         >
-          Name of an executor your node can run (for example codex or claude).
+          No LLM provider is available. Install and sign in to Codex or Claude on a node.
+          Under Node → Sandbox, choose a mode, copy the shown node.toml settings, and restart
+          the node. Available providers appear here automatically.
         </div>
       </>
     );

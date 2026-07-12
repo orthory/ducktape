@@ -49,6 +49,7 @@ const renderAgents = (
     connected: true,
     channels,
     activeChannel: "general",
+    capabilities: ["beta"],
     agents: [
       {
         agent_id: "summarizer",
@@ -97,9 +98,11 @@ const renderAgents = (
   };
   const spies: Record<string, (...args: unknown[]) => void> = {};
   const noop = vi.fn() as (...args: unknown[]) => void;
+  let updateCapabilities: (capabilities: string[]) => void;
 
   function Harness() {
-    const [state] = useState(initialState);
+    const [state, setState] = useState(initialState);
+    updateCapabilities = (capabilities) => setState((prev) => ({ ...prev, capabilities }));
     const actions = new Proxy(
       {},
       {
@@ -118,7 +121,10 @@ const renderAgents = (
   }
 
   render(<Harness />);
-  return { spies };
+  return {
+    spies,
+    setCapabilities: (capabilities: string[]) => act(() => updateCapabilities(capabilities)),
+  };
 };
 
 const openTab = (name: RegExp) => fireEvent.click(screen.getByRole("tab", { name }));
@@ -314,8 +320,8 @@ describe("AgentView", () => {
     fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
     expect(screen.queryByLabelText("System prompt")).toBeNull();
 
-    // Agent ID is auto-derived from the name; with no executors announced,
-    // "Runs on" degrades to a text field so setup is never blocked.
+    // Agent ID is auto-derived from the name; the announced executor is
+    // selected without asking the operator to type a routing tag.
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage Agent" },
     });
@@ -676,26 +682,36 @@ describe("AgentView", () => {
     );
   });
 
-  it("keeps Runs on a free-text field across keystrokes when no executors are announced", () => {
-    const { spies } = renderAgents(); // capabilities: [] by default
+  it("blocks dead-agent registration when no provider is available", () => {
+    const { spies } = renderAgents({ capabilities: [] });
 
     fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
-    expect(screen.getByLabelText("Runs on").tagName).toBe("INPUT");
-
-    // A partial value must NOT morph the input into a single-option <select>:
-    // typing one character mid-word previously trapped the field.
-    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "c" } });
-    expect(screen.getByLabelText("Runs on").tagName).toBe("INPUT");
-    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "codex" } });
-    expect(screen.getByLabelText("Runs on")).toHaveValue("codex");
+    expect(screen.getByLabelText("Runs on")).toBeDisabled();
+    expect(screen.getByPlaceholderText("No provider available")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /install and sign in to codex or claude.*node.*sandbox.*node.toml.*restart/i,
+    );
 
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
+    expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
+    expect(spies.registerAgent).not.toHaveBeenCalled();
+  });
+
+  it("blocks registration if the selected provider disappears", () => {
+    const { spies, setCapabilities } = renderAgents({ capabilities: ["codex"] });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage" },
+    });
+    expect(screen.getByRole("button", { name: /register agent/i })).toBeEnabled();
+
+    setCapabilities([]);
+    expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
-    expect(spies.registerAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ capability: "codex" }),
-    );
+    expect(spies.registerAgent).not.toHaveBeenCalled();
   });
 
   it("edits an agent through the inline Edit form", () => {
