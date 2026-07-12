@@ -524,6 +524,16 @@ async fn gateway_browser_proxy(
             builder = builder.header(name, value);
         }
     }
+    // Set-Cookie is the one repeatable response header, so forward every entry
+    // (not just the first). Each already had its `Domain` attribute scrubbed
+    // node-side (`gateway_plane::scrub_cookie_domain`), so a publisher's cookie
+    // is host-only: scoped to its own `<label>.<handle>.duck` origin and never
+    // readable across accounts. CEF stores it against the page's duck origin.
+    for header in &response.head.headers {
+        if header.name == "set-cookie" {
+            builder = builder.header(header::SET_COOKIE, &header.value);
+        }
+    }
     let body = if method == gateway::RouteMethod::Head
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::NOT_MODIFIED

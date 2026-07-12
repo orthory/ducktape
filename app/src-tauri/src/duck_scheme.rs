@@ -23,13 +23,9 @@ use tauri_runtime_cef::{InitiatorOrigin, StreamResponder, register_streaming_sch
 static GATEWAY_BASE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Response headers the node already vetted that we forward verbatim to CEF.
-///
-/// `set-cookie` is deliberately ABSENT: the node's browser-gateway
-/// (`gateway_browser_proxy`) does not forward it downstream, so a duck:// page
-/// never receives one and the `duck://` cookie jar is inert. Wiring cookies
-/// through to the browser is a spec follow-up (the node-side scrub in
-/// `gateway_plane::scrub_cookie_domain` is already in place for when it lands);
-/// until then, forwarding it here would be dead code implying cookies flow.
+/// `set-cookie` is here and repeatable (see the `get_all` in `serve`): the node
+/// forwards each host-only-scrubbed cookie, and CEF stores it against the
+/// page's duck origin (the scheme is registered cookieable).
 const FORWARDED_HEADERS: &[&str] = &[
     "content-type",
     "content-security-policy",
@@ -41,6 +37,7 @@ const FORWARDED_HEADERS: &[&str] = &[
     "permissions-policy",
     "access-control-allow-origin",
     "vary",
+    "set-cookie",
     "etag",
     "last-modified",
     "location",
@@ -173,10 +170,9 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
 
     let mut head = http::Response::builder().status(response.status().as_u16());
     for name in FORWARDED_HEADERS {
-        // Each forwarded header appears at most once on the node's
-        // browser-gateway response (set-cookie, the one repeatable one, is not
-        // forwarded — see FORWARDED_HEADERS).
-        if let Some(value) = response.headers().get(*name) {
+        // set-cookie is the one legitimately repeatable response header; every
+        // other forwarded header appears at most once, so get_all is exact.
+        for value in response.headers().get_all(*name) {
             head = head.header(*name, value);
         }
     }
