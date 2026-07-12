@@ -11,7 +11,7 @@
 import { keyHex } from "../../domain/chat-client";
 import type { ChatBlock, HuddleMember, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import type { PageBlock } from "../../domain/pages-client";
+import type { Comment, PageBlock, TargetThreads, ThreadView } from "../../domain/pages-client";
 import type { ConsoleState } from "./state";
 
 // ── Chat ────────────────────────────────────────────────
@@ -385,6 +385,147 @@ export const pageBlockRemoved = (
       ),
   };
 };
+
+// ── Page comments ───────────────────────────────────────
+//
+// Comment views live in `pageThreads`, grouped by target. The module's
+// committed shapes these projections mirror: authorship derives from the
+// submit origin (so `authorBytes` is the committed self identity, same as
+// chat's postedMessage), `created_at` is the node's consensus_time (local
+// millis here, same as postedMessage — see domain/wire.ts), a delete
+// tombstones the comment and REMOVES the whole thread when no live comment
+// remains, and the query never returns tombstoned comments.
+
+/** Map the thread with `threadId` wherever its group holds it. */
+const mapThreadView = (
+  groups: TargetThreads[],
+  threadId: string,
+  fn: (view: ThreadView) => ThreadView,
+): TargetThreads[] =>
+  groups.map((group) => ({
+    ...group,
+    threads: group.threads.map((view) => (view.thread.id === threadId ? fn(view) : view)),
+  }));
+
+export const commentAdded = (
+  prev: ConsoleState,
+  params: {
+    threadId: string;
+    commentId: string;
+    target: string;
+    text: string;
+    authorBytes: number[];
+    /** LOCAL wall-clock millis (`Date.now()`) — see postedMessage's atMs. */
+    at: number;
+  },
+): Partial<ConsoleState> => {
+  const author = { user: params.authorBytes };
+  const comment: Comment = {
+    id: params.commentId,
+    thread_id: params.threadId,
+    author,
+    text: params.text,
+    created_at: params.at,
+    edited_at: null,
+    deleted: false,
+  };
+  const groups = prev.pageThreads;
+  const exists = groups.some((g) => g.threads.some((v) => v.thread.id === params.threadId));
+  if (exists) {
+    return {
+      pageThreads: mapThreadView(groups, params.threadId, (view) => ({
+        thread: {
+          ...view.thread,
+          comment_ids: [...view.thread.comment_ids, comment.id],
+        },
+        comments: [...view.comments, comment],
+      })),
+    };
+  }
+  // a NEW thread: join the target's group, or open one at the end — the
+  // refresh re-slots it into the module's target order.
+  const view: ThreadView = {
+    thread: {
+      id: params.threadId,
+      target: params.target,
+      opener: author,
+      created_at: params.at,
+      resolved: false,
+      resolved_by: null,
+      comment_ids: [comment.id],
+    },
+    comments: [comment],
+  };
+  return {
+    pageThreads: groups.some((g) => g.target === params.target)
+      ? groups.map((g) =>
+          g.target === params.target ? { ...g, threads: [...g.threads, view] } : g,
+        )
+      : [...groups, { target: params.target, threads: [view] }],
+  };
+};
+
+export const commentEdited = (
+  prev: ConsoleState,
+  commentId: string,
+  text: string,
+  at: number,
+): Partial<ConsoleState> => ({
+  pageThreads: prev.pageThreads.map((group) => ({
+    ...group,
+    threads: group.threads.map((view) =>
+      view.comments.some((c) => c.id === commentId)
+        ? {
+            ...view,
+            comments: view.comments.map((c) =>
+              c.id === commentId ? { ...c, text, edited_at: at } : c,
+            ),
+          }
+        : view,
+    ),
+  })),
+});
+
+export const commentDeleted = (
+  prev: ConsoleState,
+  commentId: string,
+): Partial<ConsoleState> => ({
+  pageThreads: prev.pageThreads
+    .map((group) => ({
+      ...group,
+      threads: group.threads
+        .map((view) =>
+          view.comments.some((c) => c.id === commentId)
+            ? {
+                thread: {
+                  ...view.thread,
+                  comment_ids: view.thread.comment_ids.filter((id) => id !== commentId),
+                },
+                comments: view.comments.filter((c) => c.id !== commentId),
+              }
+            : view,
+        )
+        // the module removes a thread whose last live comment died
+        .filter((view) => view.comments.length > 0),
+    }))
+    .filter((group) => group.threads.length > 0),
+});
+
+export const threadResolved = (
+  prev: ConsoleState,
+  threadId: string,
+  resolved: boolean,
+  resolverBytes: number[],
+): Partial<ConsoleState> => ({
+  pageThreads: mapThreadView(prev.pageThreads, threadId, (view) => ({
+    ...view,
+    thread: {
+      ...view.thread,
+      resolved,
+      resolved_by: resolved ? { user: resolverBytes } : null,
+    },
+  })),
+});
 
 // ── Agents ──────────────────────────────────────────────
 

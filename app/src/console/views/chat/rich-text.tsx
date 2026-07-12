@@ -9,13 +9,14 @@
 // rather than through props: the renderer is used from three views and the
 // context is optional, so a bare component test just gets inert affordances.
 
-import { useContext } from "react";
+import { useContext, useMemo } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
-import { mentionLabel, mentionTarget } from "./mention";
+import { splitMentions } from "./chat-input";
+import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from "./mention";
 import { isPageRef, splitPageRefs } from "./page-ref";
 
 // The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
@@ -128,18 +129,40 @@ export function PageRefChip({ pageId }: { pageId: string }) {
   );
 }
 
-/** Plain text with its `[[page:<id>]]` refs chipped. Pages comments store plain
- *  text on the wire (no marks), so this is all they can carry. */
-export function PageRefText({ text }: { text: string }) {
-  const segments = splitPageRefs(text);
-  if (segments.length === 1 && !isPageRef(segments[0]!)) return <>{text}</>;
+/** A pages COMMENT body: plain text on the wire, so every reference is
+ *  re-derived at render — `[[page:<id>]]` refs chip (as everywhere), and
+ *  @tokens resolve through the SAME resolver + grammar the submit path used
+ *  (`splitMentions` over `mentionResolverOf`), so a handle renders as a live
+ *  mention exactly when the module was told about it. An @word the resolver
+ *  doesn't know stays tinted-inert via LiteralRun — an address nobody claimed.
+ *  Without a store (bare component tests) nothing resolves, everything tints. */
+export function CommentText({ text, names }: { text: string; names: AuthorNames }) {
+  const store = useContext(ConsoleContext);
+  const agents = store?.state.agents;
+  const nodeUsers = store?.state.nodeUsers;
+  const resolver = useMemo(
+    () =>
+      agents && nodeUsers
+        ? mentionResolverOf(agents, mentionableUsers(nodeUsers, agents))
+        : new Map<string, AuthorRef>(),
+    [agents, nodeUsers],
+  );
   return (
     <>
-      {segments.map((segment, i) =>
+      {splitPageRefs(text).map((segment, i) =>
         isPageRef(segment) ? (
           <PageRefChip key={i} pageId={segment.pageId} />
         ) : (
-          <span key={i}>{segment.text}</span>
+          splitMentions({ text: segment.text, marks: [] }, resolver).map((span, j) => {
+            const mark = span.marks.find(
+              (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
+            );
+            return mark ? (
+              <MentionToken key={`${i}:${j}`} mention={mark.mention} names={names} />
+            ) : (
+              <LiteralRun key={`${i}:${j}`} text={span.text} />
+            );
+          })
         ),
       )}
     </>

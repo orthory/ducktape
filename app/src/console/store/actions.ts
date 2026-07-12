@@ -2181,49 +2181,75 @@ export function createActions({
       void loadPageThreads();
     },
 
+    // Comment projections stamp LOCAL wall-clock millis (`Date.now()`) — the
+    // embedded daemon's consensus_time timebase, so the refresh confirms the
+    // stamp rather than moving it; a height-stamping validator replaces it on
+    // refresh and the counter renders as no time label (domain/wire.ts).
+    //
+    // Every comment op reloads threads UNCONDITIONALLY after settling: the
+    // generic refresh() never writes `pageThreads`, so a failed submit's
+    // rollback only happens here — gating the reload on success would leave
+    // the failed op's projection ghost-rendered. loadPageThreads self-guards
+    // on the current node and page.
     addComment: ({ threadId, target, text }) => {
       const clean = text.trim();
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
       const mentions = agentMentions(parseMessageInput(clean, mentionResolver()));
-      submitTracked(opKey.commentThread(tid), (live) =>
-        pagesClient.addComment(live, {
-          threadId: tid,
-          commentId,
-          target,
-          text: clean,
-          mentions,
-        }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.commentThread(tid),
+        (live) =>
+          pagesClient.addComment(live, {
+            threadId: tid,
+            commentId,
+            target,
+            text: clean,
+            mentions,
+          }),
+        (prev) =>
+          optimistic.commentAdded(prev, {
+            threadId: tid,
+            commentId,
+            target,
+            text: clean,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
+            at: Date.now(),
+          }),
+      ).then(() => loadPageThreads());
     },
 
     editComment: ({ commentId, text }) => {
       const clean = text.trim();
       if (!clean) return;
-      submitTracked(opKey.comment(commentId), (live) =>
-        pagesClient.editComment(live, { commentId, text: clean }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.comment(commentId),
+        (live) => pagesClient.editComment(live, { commentId, text: clean }),
+        (prev) =>
+          optimistic.commentEdited(prev, commentId, clean, Date.now()),
+      ).then(() => loadPageThreads());
     },
 
     deleteComment: (commentId) => {
-      submitTracked(opKey.comment(commentId), (live) =>
-        pagesClient.deleteComment(live, commentId),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.comment(commentId),
+        (live) => pagesClient.deleteComment(live, commentId),
+        (prev) => optimistic.commentDeleted(prev, commentId),
+      ).then(() => loadPageThreads());
     },
 
     resolveThread: ({ threadId, resolved }) => {
-      submitTracked(opKey.commentThread(threadId), (live) =>
-        pagesClient.resolveThread(live, { threadId, resolved }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.commentThread(threadId),
+        (live) => pagesClient.resolveThread(live, { threadId, resolved }),
+        (prev) =>
+          optimistic.threadResolved(
+            prev,
+            threadId,
+            resolved,
+            selfAuthorBytes(prev.status, prev.author),
+          ),
+      ).then(() => loadPageThreads());
     },
 
     // Every page-block write goes out through `inPageOrder` — the editor's ops

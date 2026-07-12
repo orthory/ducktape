@@ -12,7 +12,7 @@ import type { PageMeta } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
-import { PageRefText, RichText } from "./rich-text";
+import { CommentText, RichText } from "./rich-text";
 
 const AGENT: AuthorRef = { agent: { module: "runs", agent_id: "quackbot" } };
 const GHOST: AuthorRef = { agent: { module: "runs", agent_id: "ghost" } };
@@ -173,9 +173,9 @@ describe("[[page:<id>]] chips", () => {
   });
 });
 
-describe("PageRefText (plain-text bodies, e.g. page comments)", () => {
+describe("CommentText (plain-text comment bodies)", () => {
   it("chips a ref inside otherwise plain text", () => {
-    const actions = withStore(<PageRefText text="ties into [[page:p1]] here" />, {
+    const actions = withStore(<CommentText text="ties into [[page:p1]] here" names={{}} />, {
       pages: [page("p1", "Launch plan")],
     });
 
@@ -185,9 +185,52 @@ describe("PageRefText (plain-text bodies, e.g. page comments)", () => {
   });
 
   it("passes text with no refs through untouched", () => {
-    withStore(<PageRefText text="no refs here" />);
+    const { container } = render(
+      <CommentText text="no refs here" names={{}} />,
+    );
 
-    expect(screen.getByText("no refs here")).toBeTruthy();
+    expect(container.textContent).toBe("no refs here");
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  // The wire stores plain text: @tokens are re-resolved at render through the
+  // SAME grammar the submit path used, so highlight == what the module saw.
+  it("resolves a rostered agent's @token into a live mention", () => {
+    const actions = withStore(<CommentText text="ping @quackbot please" names={{}} />, {
+      agents: [ROSTERED],
+    });
+
+    const button = screen.getByRole("button", { name: /Open agent quackbot/ });
+    expect(button.textContent).toBe("@Quackbot");
+    fireEvent.click(button);
+
+    expect(actions.openAgent).toHaveBeenCalledWith("quackbot");
+  });
+
+  it("resolves a member's handle into a Members-opening mention", () => {
+    const actions = withStore(<CommentText text="cc @jess-example" names={{ [ACCOUNT_HEX]: "Jess Example" }} />, {
+      nodeUsers: { node1: { accountId: ACCOUNT_HEX, name: "Jess Example" } },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Open Jess Example in Members/ }));
+
+    expect(actions.openMember).toHaveBeenCalledWith(ACCOUNT_HEX);
+  });
+
+  it("leaves an @word nobody claims tinted but inert", () => {
+    withStore(<CommentText text="hi @nobody" names={{}} />, {
+      agents: [ROSTERED],
+    });
+
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.getByText("@nobody")).toBeTruthy();
+  });
+
+  it("ignores a mid-word @ (emails are not mentions)", () => {
+    withStore(<CommentText text="mail quackbot@example.com" names={{}} />, {
+      agents: [ROSTERED],
+    });
+
     expect(screen.queryByRole("button")).toBeNull();
   });
 });
