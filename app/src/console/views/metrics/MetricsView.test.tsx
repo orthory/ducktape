@@ -31,6 +31,7 @@ const withData: NodeMetrics = {
     { module: "tagging", origin: "module", count: 3 },
   ],
   planes: [],
+  syncPeers: [],
 };
 
 const withPlanes: NodeMetrics = {
@@ -65,6 +66,33 @@ const withPlanes: NodeMetrics = {
       streamsOpened: 12,
       streamsAccepted: 7,
       drops: {},
+    },
+  ],
+};
+
+const withSyncPeers: NodeMetrics = {
+  ...withData,
+  blockHeight: 2000,
+  syncPeers: [
+    {
+      peer: "9f3ab2c1d4e5f607a8b9cadbecfd0e1f",
+      ageSeconds: 75,
+      idleSeconds: 1,
+      bytesTx: 5_250_000,
+      framesServed: 40,
+      boundaryHeight: 1500,
+      servedHeight: 1540,
+      requests: { manifest: 1, chunk: 21, frames: 4 },
+    },
+    {
+      peer: "0011223344556677",
+      ageSeconds: 3000,
+      idleSeconds: 9,
+      bytesTx: 4200,
+      framesServed: 0,
+      boundaryHeight: null,
+      servedHeight: null,
+      requests: { tip_coords: 250 },
     },
   ],
 };
@@ -133,6 +161,10 @@ describe("MetricsView charts", () => {
     // no open planes: the Data planes panel says so honestly.
     expect(screen.getByText("Data planes")).toBeInTheDocument();
     expect(screen.getByText(/No open data planes/)).toBeInTheDocument();
+
+    // no served sync peers: the State sync panel says so honestly.
+    expect(screen.getByText("State sync")).toBeInTheDocument();
+    expect(screen.getByText(/state-sync lane is idle/)).toBeInTheDocument();
   });
 
   it("lists every open data plane with its creator and drop accounting", async () => {
@@ -150,5 +182,23 @@ describe("MetricsView charts", () => {
     // the gateway plane's pumps stopped: badged.
     expect(screen.getByText("HALTED")).toBeInTheDocument();
     expect(screen.queryByText(/No open data planes/)).toBeNull();
+  });
+
+  it("lists every served sync peer with its phase and block progression", async () => {
+    renderMetrics(() => Promise.resolve(withSyncPeers));
+
+    await waitFor(() => expect(screen.getByText("serving 2")).toBeInTheDocument());
+    // peers are identified by their leading hex, with the phase under each.
+    expect(screen.getByText("9f3ab2c1…")).toBeInTheDocument();
+    expect(screen.getByText(/replaying frames · 1m 15s/)).toBeInTheDocument();
+    expect(screen.getByText("00112233…")).toBeInTheDocument();
+    expect(screen.getByText(/polling tip · 50m 0s/)).toBeInTheDocument();
+    // the joiner replayed to 1540 of 2000: 77%, 460 blocks left.
+    expect(screen.getByText(/77% · 460 blocks left/)).toBeInTheDocument();
+    // the tip poller has no height-shaped responses — an honest placeholder.
+    expect(screen.getByText(/no block progression yet/)).toBeInTheDocument();
+    // cumulative serve totals per peer.
+    expect(screen.getByText(/5.25 MB · 40 frames/)).toBeInTheDocument();
+    expect(screen.queryByText(/state-sync lane is idle/)).toBeNull();
   });
 });
