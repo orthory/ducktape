@@ -1,7 +1,7 @@
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_notification::NotificationExt;
 
-use super::{engine::Sink, matchers::Notification};
+use super::{engine::Sink, matchers::Notification, state::StoredNotification};
 
 /// The production notification sink backed by the desktop application.
 ///
@@ -45,6 +45,13 @@ impl<R: Runtime> Sink for AppSink<R> {
             serde_json::json!({ "unread": unread }),
         ) {
             eprintln!("notify: could not emit unread update: {err}");
+        }
+    }
+
+    fn item(&self, item: &StoredNotification) {
+        // The sink cannot recover event delivery; log and continue (badge idiom).
+        if let Err(err) = self.0.emit("ducktape://notify-item", item) {
+            eprintln!("notify: could not emit notification item: {err}");
         }
     }
 }

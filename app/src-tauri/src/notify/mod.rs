@@ -1,9 +1,9 @@
 //! Native notification decoding, matching, and unread state for the desktop shell.
 //!
 //! The notifier subscribes live from the tip whenever the app starts, so only the
-//! unread count is persisted. Stream cursors stay in memory for reconnects within
-//! the current session; persisting them could replay history as a burst of stale
-//! desktop notifications on a later app start.
+//! unread count and the bell dropdown's recent ring are persisted. Stream cursors
+//! stay in memory for reconnects within the current session; persisting them could
+//! replay history as a burst of stale desktop notifications on a later app start.
 
 pub mod decode;
 pub mod http;
@@ -14,9 +14,12 @@ pub mod present;
 pub mod stream;
 pub mod state;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tauri::Manager as _;
+
+use state::StoredNotification;
 
 /// Webview-pushed runtime config, shared with the stream task.
 pub struct Shared {
@@ -42,6 +45,9 @@ pub struct NotifyHandles {
     /// is held for the graceful [`stream::StreamHandle::shutdown`] at app exit
     /// rather than for keep-alive.
     pub stream: stream::StreamHandle,
+    /// The engine's recent ring (newest first) read by [`notify_recent`];
+    /// the engine is the only writer.
+    pub recent: Arc<Mutex<VecDeque<StoredNotification>>>,
 }
 
 /// Build the engine over the real [`present::AppSink`], spawn the stream loop,
@@ -53,7 +59,8 @@ pub fn init<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
         .app_data_dir()?
         .join("notify")
         .join("state.json");
-    let engine = engine::Engine::new(present::AppSink(app.clone()), state_path);
+    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let engine = engine::Engine::new(present::AppSink(app.clone()), state_path, recent.clone());
 
     let (cmds, cmds_rx) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
@@ -64,10 +71,12 @@ pub fn init<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
 
     // Native focus backstop: the webview pushes focus through notify_configure
     // too, but a hidden or wedged webview can miss focus/blur. The OS window
-    // event is the floor; last writer wins between the two sources.
+    // event is the floor; last writer wins between the two sources. This only
+    // floors `main_window_focused` (focus-suppression of the viewed channel) —
+    // seen-marking belongs to the bell dropdown (`notify_mark_seen` from the
+    // webview), so focusing the window no longer clears the badge.
     if let Some(main) = app.get_webview_window("main") {
         let focus_shared = shared.clone();
-        let focus_cmds = cmds.clone();
         main.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(focused) = event {
                 focus_shared
@@ -76,11 +85,6 @@ pub fn init<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .main_window_focused = *focused;
                 focus_shared.changed.notify_one();
-                if *focused {
-                    // A closed channel means the stream task is gone
-                    // (app teardown) — nothing left to mark.
-                    let _ = focus_cmds.send(Cmd::MarkSeen);
-                }
             }
         });
     }
@@ -89,6 +93,7 @@ pub fn init<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
         shared,
         cmds,
         stream,
+        recent,
     });
     Ok(())
 }
@@ -119,6 +124,20 @@ pub fn notify_mark_seen(state: tauri::State<'_, NotifyHandles>) -> Result<(), St
     // A closed channel means the stream task is gone (app teardown).
     let _ = state.cmds.send(Cmd::MarkSeen);
     Ok(())
+}
+
+/// Recent presented notifications, newest first, for the in-app bell dropdown.
+#[tauri::command]
+pub fn notify_recent(
+    state: tauri::State<'_, NotifyHandles>,
+) -> Result<Vec<StoredNotification>, String> {
+    Ok(state
+        .recent
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect())
 }
 
 /// Commands crossing from tauri command handlers into the stream task.
