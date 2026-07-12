@@ -1847,8 +1847,20 @@ export function createActions({
         if (getState().voice.channelId !== channelId) return;
         stopVoice();
         // the session is gone — camera/beacon state must not outlive it.
+        // errorNote is cleared, not spread: a consensus refusal has no node
+        // sentence of its own, and the media session may ALREADY have failed
+        // and left one behind (a hub-less node refuses the socket instantly) —
+        // inheriting it would file the mic's reason under the roster's message.
         update((prev) => ({
-          voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
+          voice: {
+            ...prev.voice,
+            status: "error",
+            error: "refused",
+            errorNote: null,
+            cameraOn: false,
+            sharing: false,
+            peers: {},
+          },
         }));
       });
       // start the audio session and reflect "connecting"; push whatever roster
