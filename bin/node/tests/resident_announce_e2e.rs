@@ -182,8 +182,20 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     cluster.env[0] = hermetic_env(fixtures.path(), "founder");
     cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "friend")].concat();
 
+    // serving is opt-in now (default OFF): this test exercises the resident
+    // announce path, so both the founder and the joining resident opt in. the
+    // init/join CLI writes each node.toml (network shape, all top-level keys),
+    // so appending one more top-level key before spawn is safe.
+    fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize) {
+        let path = cluster.config_file(idx);
+        let mut toml = std::fs::read_to_string(&path).expect("read node.toml");
+        toml.push_str("announce_capabilities = true\n");
+        std::fs::write(&path, toml).expect("write node.toml");
+    }
+
     let chain_id = cluster.init_founder("resident-announce");
     assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    opt_in_serving(&cluster, 0);
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -193,6 +205,7 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     let friend_key_hex = cluster.join_friend(&invite);
     assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
     let friend_key = common::unhex(&friend_key_hex);
+    opt_in_serving(&cluster, 1);
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
     cluster.wait_marker(1, "resident: standing granted", CONVERGE);

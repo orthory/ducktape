@@ -59,6 +59,8 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) dev_demo: bool,
     pub(super) checkpoint_blocks: u64,
     pub(super) announce_capabilities: bool,
+    pub(super) sandbox: capability_host::SandboxBackend,
+    pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     pub(super) rpc_listener: Option<std::net::TcpListener>,
     pub(super) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     pub(super) stream_hub: noded::StreamHub,
@@ -160,6 +162,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         rpc_listener,
         http_cmds,
         stream_hub,
@@ -269,8 +273,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let providers = capability_host::discover(
         agent_dirs.clone(),
         Some(run_output_sink(stream_hub.run_output())),
-        // Task 8 wires the operator's sandbox choice here; Direct for now.
-        capability_host::SandboxBackend::Direct,
+        // the operator's `node.toml sandbox` choice: Direct (default) or a
+        // Podman container that enforces this node's announced capacity.
+        sandbox,
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let my_capabilities = providers.capabilities();
@@ -290,6 +295,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // fetch-on-miss over the mesh: a prompt pin staged on another
         // node's blob store resolves here instead of failing the run.
         Some(blob_fetcher),
+        // the announced capacity IS the pool's ledger — one source, so the
+        // scheduler never promises what this node can't seat.
+        sandbox_capacity.clone(),
     );
     let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
     // the readiness self-signaller: polls COMMITTED upgrade state between drains
@@ -301,8 +309,11 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // the capability self-announcer: publishes this node's discovered
     // provider set into the capability registry once (state-driven,
     // idempotent). inert when this host installed no executor CLIs.
-    let announcer =
-        CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
+    let announcer = CapabilityAnnouncer::new(
+        signer.public_key().as_ref().to_vec(),
+        my_capabilities,
+        sandbox_capacity,
+    );
     // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
     // modeled on the `converged` latch: `upgrade armed …` fires when readiness
     // first reaches R==n (every current boundary member signaled) for the

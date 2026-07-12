@@ -65,6 +65,7 @@ mod first_contact_join;
 mod gateway_plane;
 mod gateway_routes;
 mod host_reads;
+mod host_resources;
 mod host_state;
 #[cfg(test)]
 mod joiner_mesh_tests;
@@ -279,6 +280,8 @@ fn run_node(
         dev_demo,
         sync_index,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         promoted,
         joiner,
     } = boot::env::derive(resolved, sync_only);
@@ -464,6 +467,8 @@ fn run_node(
                 checkpoint_blocks,
                 sync_index,
                 announce_capabilities,
+                sandbox,
+                sandbox_capacity,
                 rpc_listener,
                 http_cmds,
                 gateway_requests,
@@ -514,6 +519,8 @@ fn run_node(
             promoted,
             dev_demo,
             announce_capabilities,
+            sandbox,
+            sandbox_capacity,
             rpc_listener,
             http_cmds,
             gateway_requests,
