@@ -394,13 +394,17 @@ fn run_node(
         // recovery-aware boot FIRST: the app state (and with it the epoch to
         // respawn) must be known before the mesh wiring below decides which
         // epochs' channels to live on. everything here is local disk io.
-        let recovery = match Recovery::open(context.child("recovery")).await {
+        let mut recovery = match Recovery::open(context.child("recovery")).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[node {label}] FATAL: cannot open the recovery store: {e}");
                 std::process::exit(1);
             }
         };
+        // code-registry swaps realize through the blob plane: replay, catch-up,
+        // and the live drain (which lifts this off the recovery sink) all fetch
+        // committed component bytes from the node's content-addressed store.
+        recovery.set_code_source(std::sync::Arc::new(host_state::BlobCodeSource(blobs.clone())));
         let manifest = match recovery.manifest() {
             Ok(m) => m,
             Err(e) => {

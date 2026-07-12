@@ -14,10 +14,18 @@ use crate::util::{diag_log, hex};
 pub(crate) async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
+    code_source: &dyn host::CodeSource,
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
     let protocol_version = host.effective_version(served.height).await;
     host.set_active_version(protocol_version);
+    // CODE-SWAP REALIZATION, mirroring the live drain and recovery replay: a
+    // frame sealed after a code-registry swap executed on the NEW component, so
+    // catch-up must swap before re-applying or the served roots cannot
+    // reproduce. fail-closed on missing/tampered bytes.
+    host.realize_module_swaps(served.height, code_source)
+        .await
+        .map_err(|e| format!("code-swap realization at height {}: {e}", served.height))?;
     // the served frame is a BATCH: decode its members and apply as ONE block,
     // exactly like the live drain and recovery replay, so the disposition,
     // roots, and app-hash reproduce what the peer served. disposition is
@@ -102,7 +110,10 @@ where
     node::BlockSink::pre_apply(recovery, frame.height, &frame.frame)
         .await
         .map_err(|e| format!("catch-up WAL write: {e}"))?;
-    let dispatches = apply_verified_suffix_frame(host, frame).await?;
+    // realize swaps through the SAME source replay uses (wired on Recovery), so
+    // every path reconciles code identically.
+    let code_source = recovery.code_source();
+    let dispatches = apply_verified_suffix_frame(host, frame, code_source.as_ref()).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),

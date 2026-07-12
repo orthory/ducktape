@@ -516,7 +516,7 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             app_hash: StateRoot([0xA5; sdk::ROOT_LEN]),
         };
         let mut host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
-        let err = apply_verified_suffix_frame(&mut host, &served)
+        let err = apply_verified_suffix_frame(&mut host, &served, &host::NoCodeSource)
             .await
             .expect_err("served seal mismatch must abort");
         assert!(

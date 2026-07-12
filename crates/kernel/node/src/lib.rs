@@ -803,6 +803,15 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// always a subset of `outstanding` (an un-flushed member is still in
     /// custody), so a cutover rebuilds it from `outstanding` and re-flushes.
     pending_batch: Vec<(FrameId, Vec<u8>)>,
+    /// the out-of-band source of component BYTES for code-registry swaps. the
+    /// drain reconciles running module code against the committed registry
+    /// (`Host::realize_module_swaps`) BEFORE applying each block, fetching any
+    /// newly-designated component through this. defaults to
+    /// [`host::NoCodeSource`]: a net with no armed swap never touches it, and a
+    /// node that never wired a real source FAILS CLOSED at the first armed
+    /// boundary instead of silently running stale code. `Arc` so the node and
+    /// its recovery sink can share the one source.
+    code_source: std::sync::Arc<dyn host::CodeSource>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -832,6 +841,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         }
     }
 
@@ -864,7 +874,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         }
+    }
+
+    /// wire the out-of-band component-byte source for code-registry swaps (the
+    /// node injects a blobstore-backed one; tests inject an in-memory map). the
+    /// default is [`host::NoCodeSource`] — see the field doc.
+    pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
+        self.code_source = src;
     }
 
     /// arm the observation barrier on `module` (see the field doc): every
@@ -1165,6 +1183,25 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     }),
                 }
                 continue;
+            }
+            // CODE-SWAP REALIZATION: reconcile every hot-swappable module's
+            // running code against the committed code registry's decision for
+            // `height`, BEFORE this block journals or applies — its dispatches
+            // must execute the code the registry designates for `height`. keyed
+            // purely on committed state + height, so live, restart-replay, and
+            // catch-up all realize the identical swap points. FAIL-CLOSED: a
+            // node lacking (or holding tampered) bytes for an armed hash must
+            // not apply this block on stale code — put the frame back (nothing
+            // journaled yet) and surface the stall; the drain retries once the
+            // bytes arrive. NEVER a fork: every honest node holding the bytes
+            // realizes identically, and one that doesn't stops here.
+            if let Err(e) = self
+                .host
+                .realize_module_swaps(height, self.code_source.as_ref())
+                .await
+            {
+                self.deferred.push_front((view, frame));
+                return Err(Error::Host(e));
             }
             // below the ceiling this batch RESOLVES here as ONE block at ONE
             // height. WAL discipline: the batch bytes are finalized and about to

@@ -288,6 +288,9 @@ pub enum Error {
     /// a module has no byte-level state-sync serve surface (the default
     /// [`Module::serve_sync`]).
     SyncUnsupported,
+    /// a module's code is the node binary itself — it has no hot-swappable
+    /// component (the default [`Module::swap_code`]).
+    SwapUnsupported,
     /// the local follow-up drain exceeded its dispatch budget (non-termination
     /// guard).
     BudgetExceeded,
@@ -302,6 +305,7 @@ impl core::fmt::Debug for Error {
             Error::SelfQuery => write!(f, "SelfQuery"),
             Error::QueryUnsupported => write!(f, "QueryUnsupported"),
             Error::SyncUnsupported => write!(f, "SyncUnsupported"),
+            Error::SwapUnsupported => write!(f, "SwapUnsupported"),
             Error::BudgetExceeded => write!(f, "BudgetExceeded"),
             Error::Module(m) => write!(f, "Module({m})"),
         }
@@ -474,6 +478,29 @@ pub trait Module {
     /// override it. driven ONLY by the agreed boundary version, so every honest
     /// node sets the identical value — never a wall-clock/IO/RNG input.
     fn set_active_version(&mut self, _version: u32) {}
+
+    /// this module's currently-running CODE identity: the 32-byte content hash
+    /// (sha256) of the component bytes it will execute, or `None` for a native
+    /// module whose code IS the node binary (nothing to hot-swap). the host
+    /// reconciles this against the code registry's committed active hash to
+    /// decide whether a boundary swap is needed — a cheap hash compare, so it
+    /// re-instantiates a component only on an actual change, never every block.
+    /// NEVER a consensus input: code is invisible to `root()` (state, not code,
+    /// composes the app-hash), so this is per-node realization bookkeeping only.
+    fn code_hash(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// hot-swap this module's executable CODE in place, KEEPING its host-owned
+    /// state — the live-update primitive. the host calls this at a code-registry
+    /// activation boundary AFTER it has fetched the out-of-band component bytes
+    /// and verified `sha256(bytes)` equals the consensus-committed hash; because
+    /// durable state is untouched, `root()` is unchanged and the app-hash stays
+    /// continuous across the swap. the default is unsupported — only the wasm
+    /// runtime module overrides it (a native module cannot swap its code).
+    fn swap_code(&mut self, _component_bytes: &[u8]) -> Result<(), Error> {
+        Err(Error::SwapUnsupported)
+    }
 }
 
 #[cfg(test)]

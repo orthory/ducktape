@@ -89,11 +89,17 @@ pub(crate) async fn reopen_recovery(
     context: &commonware_runtime::tokio::Context,
     reopens: &mut u32,
     label: &str,
+    code_source: std::sync::Arc<dyn host::CodeSource>,
 ) -> Recovery<commonware_runtime::tokio::Context> {
     *reopens += 1;
     let child: &'static str = Box::leak(format!("recovery_reopen_{reopens}").into_boxed_str());
     match Recovery::open(context.child(child)).await {
-        Ok(r) => r,
+        Ok(mut r) => {
+            // re-wire the code source: a reopened journal must realize
+            // code-registry swaps exactly like the instance it replaces.
+            r.set_code_source(code_source);
+            r
+        }
         Err(e) => {
             eprintln!("[node {label}] FATAL: cannot reopen the recovery store: {e}");
             std::process::exit(1);

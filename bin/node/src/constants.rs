@@ -129,7 +129,7 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 23] = [
+pub(crate) const MODULE_IDS: [&str; 25] = [
     "kv",
     "pages",
     "chat",
@@ -137,6 +137,8 @@ pub(crate) const MODULE_IDS: [&str; 23] = [
     "valset",
     "governance",
     "upgrade",
+    "modreg",
+    "hello",
     "saga",
     "capability",
     "dispatch",
