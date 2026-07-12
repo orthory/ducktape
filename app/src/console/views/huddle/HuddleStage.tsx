@@ -162,6 +162,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 260, maxWidth: 420 }}>
             <CardNotices
               failure={voice.status === "error" ? (voice.error ?? "connection") : null}
+              failureNote={voice.errorNote}
               mutedWhileTalking={voice.muted && voice.speaking}
               mediaNote={voice.mediaNote}
             />

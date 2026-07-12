@@ -50,6 +50,10 @@ export interface VoiceSlice {
   status: "idle" | "connecting" | "reconnecting" | "live" | "error";
   /** Why `status` is "error" — picks the dock's message. Null otherwise. */
   error: VoiceError | null;
+  /** The node's own refusal sentence, when it sent one (no call hub, overlay
+   *  down). Shown UNDER the message `error` picks: only the node knows which of
+   *  the several ways a huddle can fail actually happened. Null otherwise. */
+  errorNote: string | null;
   /** A transient media failure note (camera/screen acquire failed) — shown for a
    *  few seconds by the card surfaces, then auto-cleared. Never fatal. */
   mediaNote: "camera-failed" | "screen-failed" | null;
@@ -714,6 +718,7 @@ export const createInitialState = (): ConsoleState => {
       muted: false,
       status: "idle",
       error: null,
+      errorNote: null,
       mediaNote: null,
       popped: false,
       cameraOn: false,

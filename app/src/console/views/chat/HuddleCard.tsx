@@ -95,10 +95,15 @@ function RowAvatar({ name, size, ring }: { name: string; size: number; ring: str
  *  headers) render them directly so the three surfaces say the same things. */
 export function CardNotices({
   failure,
+  failureNote,
   mutedWhileTalking,
   mediaNote,
 }: {
   failure: VoiceError | null;
+  /** The node's own refusal sentence, when it sent one — rendered under the
+   *  coded copy. "Voice connection failed." alone cannot tell a node that runs
+   *  no call hub from one whose overlay never came up; this can. */
+  failureNote?: string | null;
   mutedWhileTalking: boolean;
   mediaNote?: "camera-failed" | "screen-failed" | null;
 }) {
@@ -107,6 +112,9 @@ export function CardNotices({
       {failure && (
         <span style={{ font: `400 11px/1.4 ${font.sans}`, color: color.danger }}>
           {ERROR_COPY[failure]}
+          {failureNote && (
+            <span style={{ display: "block", marginTop: 2, color: color.muted }}>{failureNote}</span>
+          )}
         </span>
       )}
 
@@ -239,6 +247,8 @@ export interface HuddleCardProps {
   status: HuddleStatus;
   /** Why `status` is "error" — picks the message row. Null otherwise. */
   error: VoiceError | null;
+  /** The node's own refusal sentence, when it sent one — shown under the row. */
+  errorNote?: string | null;
   /** A transient camera/screen acquire failure to surface (auto-cleared by the
    *  store). Never fatal — renders as a quiet note, not the error row. */
   mediaNote?: "camera-failed" | "screen-failed" | null;
@@ -257,6 +267,7 @@ export function HuddleCard({
   channelName,
   status,
   error,
+  errorNote = null,
   mediaNote = null,
   participants,
   ring = color.paper,
@@ -306,7 +317,12 @@ export function HuddleCard({
         )}
       </div>
 
-      <CardNotices failure={failure} mutedWhileTalking={mutedWhileTalking} mediaNote={mediaNote} />
+      <CardNotices
+        failure={failure}
+        failureNote={errorNote}
+        mutedWhileTalking={mutedWhileTalking}
+        mediaNote={mediaNote}
+      />
 
       {!failure && (
         <Roster participants={participants} ring={ring} maxRows={maxRows} onSweep={onSweep} />

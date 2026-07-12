@@ -171,7 +171,13 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
     let request = CallSessionRequest { channel_id, reply };
     // every refusal path says WHY as a text frame before closing — the client
     // surfaces it as a session error instead of a silent no-op.
-    const NO_HUB: &str = "calls are not available on this node (no live call hub)";
+    // Both lane-closed cases in one sentence, because the handler cannot tell
+    // them apart — and "no live call hub" alone left the user with a red
+    // "Voice connection failed." and nothing to act on.
+    const NO_HUB: &str = "this node runs no call hub, so it cannot host a huddle: either it has \
+                          no mesh overlay (wireguard_listen unset, or the fake effect — huddle \
+                          media rides the overlay) or it is still parked as a joiner and has not \
+                          been admitted yet.";
     let session = match call.send(request).await {
         Ok(()) => match opened.await {
             Ok(Ok(session)) => session,

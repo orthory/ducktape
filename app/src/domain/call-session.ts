@@ -77,7 +77,11 @@ const CONNECT_TIMEOUT_MS = 12_000;
 const LEVEL_FULL_RMS = 0.25;
 
 export type CallEvent =
-  | { kind: "status"; status: VoiceStatus; error?: VoiceError }
+  // `note` is the node's own refusal sentence (the one text frame it sends
+  // before closing — "no live call hub", "the overlay is not up", …). It says
+  // WHY in terms only the node knows, so it is carried to the ui verbatim
+  // rather than collapsed into the generic connection-failed copy.
+  | { kind: "status"; status: VoiceStatus; error?: VoiceError; note?: string }
   | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number }
   // Our own mic went above/below the speaking threshold — drives the self
   // speaking ring and the "you're muted while talking" banner. Emitted only on a
@@ -172,9 +176,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
       connectTimer = null;
     }
   };
-  const setStatus = (next: VoiceStatus, error?: VoiceError) => {
+  const setStatus = (next: VoiceStatus, error?: VoiceError, note?: string) => {
     status = next;
-    onEvent({ kind: "status", status: next, error });
+    onEvent({ kind: "status", status: next, error, note });
   };
   // the first inbound frame that proves the hub is live promotes us out of
   // 'connecting'; anything after error/closed is left alone.
@@ -529,9 +533,11 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     }
     // not a known control frame: the node's refusal note (one plain-text reason,
     // then close). Only a refusal while still connecting; once live, ignore.
+    // The reason rides to the ui — it is the only thing that distinguishes "this
+    // node runs no call hub" from "the overlay never came up" from a dead socket.
     if (status !== "live") {
       failed = true;
-      setStatus("error", "connection");
+      setStatus("error", "connection", text.trim() || undefined);
     }
   };
 
