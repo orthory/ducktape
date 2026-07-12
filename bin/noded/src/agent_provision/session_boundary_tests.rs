@@ -171,10 +171,6 @@ async fn mention_run(host: &mut Host) -> Effect {
                 agent_id: AGENT.into(),
                 display_name: "Quackbot".into(),
                 capability: CAPABILITY.into(),
-                // the registry pins a real 32-byte prompt hash; the pool below
-                // wires a resolver for it (an unresolvable pin fails the run
-                // loudly, and would never reach the provisioner at all).
-                prompt_hash: vec![7u8; 32],
                 allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 recipe_hash: None,
                 caps: None,
@@ -310,9 +306,6 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             // a bare node's ledger fits the demandless jobs it dispatches.
             Default::default(),
         )
-        .with_resolver(Arc::new(|_| {
-            Box::pin(async { Some(b"You are Quackbot.".to_vec()) })
-        }))
         .with_provisioner(Arc::new(
             NodedProvisioner::new(handle, &runs_root)
                 .with_node_url(Some("http://127.0.0.1:8844".into())),

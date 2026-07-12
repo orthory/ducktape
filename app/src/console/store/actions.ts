@@ -118,6 +118,9 @@ export interface ConsoleActions {
    *  hand-off (the explorerFocus idiom). Used by the notification bell; the
    *  navigate deep-link listener patches the same fields. */
   openForgeItem(repo: string, number: number | null): void;
+  /** Jump to the files browser opened on `path` — the same one-shot hand-off,
+   *  used by the agent form to open a skill document in Files. */
+  openFiles(path: string): void;
   /** Jump to an agent's detail — a clicked @agent mention (the forgeFocus idiom). */
   openAgent(agentId: string): void;
   /** Jump to a person in Members — a clicked @user mention. Takes the ACCOUNT id
@@ -374,15 +377,15 @@ export interface ConsoleActions {
   resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
-  /** Upload the prompt text to the blob store, then RegisterAgent with the
-   *  resulting 32-byte digest as its prompt_hash. */
+  /** RegisterAgent with the agent's curated skill set — the `always` skills are
+   *  its persona, inlined into every run; nothing is staged in the blob store. */
   registerAgent(params: {
     displayName: string;
     agentId: string;
     capability: string;
-    prompt: string;
     allowedActions: string[];
     caps?: agentClient.ResourceCaps;
+    skills?: agentClient.SkillRef[];
   }): void;
   /** Pause / resume an agent (owner-gated). */
   pauseAgent(agentId: string): void;
@@ -407,17 +410,18 @@ export interface ConsoleActions {
   cancelRun(runId: string): void;
   /** Fence one attempt and move the run to a different provider. */
   reassignRun(runId: string, attempt: number): void;
-  /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
-   *  the blob store and its digest committed as the new prompt_hash; every
-   *  omitted field keeps its current value. */
+  /** Owner-gated edit of a registered agent. Every omitted field keeps its
+   *  current value. */
   updateAgent(params: {
     agentId: string;
     displayName?: string;
     capability?: string;
-    prompt?: string;
     allowedActions?: string[];
     /** REPLACES the whole caps record when present; omit to keep it. */
     caps?: agentClient.ResourceCaps;
+    /** REPLACES the whole curated skill set when present (an empty array clears
+     *  it); omit to keep it. */
+    skills?: agentClient.SkillRef[];
   }): void;
   /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
    *  can process job-backed runs. */
@@ -1525,6 +1529,15 @@ export function createActions({
       }
     },
 
+    openFiles: (path) => {
+      const section = sectionForScreen("files");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "files", viewMode: section, filesFocus: path });
+      } else {
+        patch({ screen: "files", filesFocus: path });
+      }
+    },
     applyNavSnapshot,
 
     setViewMode: (mode) => {
@@ -2258,28 +2271,23 @@ export function createActions({
     },
 
     // ── Agents ──
-    registerAgent: ({ displayName, agentId, capability, prompt, allowedActions, caps }) => {
+    registerAgent: ({ displayName, agentId, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       const name = displayName.trim();
       const tag = capability.trim();
       if (!id || !name || !tag) return;
+      // No blob upload: the agent's persona is a duckfs document its skill refs
+      // point at, so registration commits pins — never prompt bytes.
       submitTracked(opKey.agent(id), (live) =>
-        // stage the prompt in the node's blob store, then register with its
-        // digest as prompt_hash — the blob is keyed by sha256(bytes), which
-        // IS the hash the oracle worker fetches the prompt by.
-        Promise.resolve()
-          .then(() => live.putBlob(new TextEncoder().encode(prompt)))
-          .then((digest) =>
-            agentClient.registerAgent(live, {
-              agentId: id,
-              displayName: name,
-              capability: tag,
-              promptHash: agentClient.hexToBytes(digest),
-              allowedActions,
-              caps,
-              origin: getState().author,
-            }),
-          ),
+        agentClient.registerAgent(live, {
+          agentId: id,
+          displayName: name,
+          capability: tag,
+          allowedActions,
+          caps,
+          skills,
+          origin: getState().author,
+        }),
       );
     },
 
@@ -2384,33 +2392,23 @@ export function createActions({
       );
     },
 
-    updateAgent: ({ agentId, displayName, capability, prompt, allowedActions, caps }) => {
+    updateAgent: ({ agentId, displayName, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       if (!id) return;
       submitTracked(
         opKey.agent(id),
         (live) =>
-        Promise.resolve()
-          // a provided prompt is re-staged in the blob store; its digest becomes
-          // the new prompt_hash. An absent prompt leaves the hash untouched.
-          .then(() =>
-            prompt !== undefined && prompt.length > 0
-              ? live
-                  .putBlob(new TextEncoder().encode(prompt))
-                  .then((digest) => agentClient.hexToBytes(digest))
-              : null,
-          )
-          .then((promptHash) =>
-            agentClient.updateAgent(live, {
-              agentId: id,
-              displayName: displayName?.trim() || null,
-              capability: capability?.trim() || null,
-              promptHash,
-              allowedActions: allowedActions ?? null,
-              caps: caps ?? null,
-              origin: getState().author,
-            }),
-          ),
+          agentClient.updateAgent(live, {
+            agentId: id,
+            displayName: displayName?.trim() || null,
+            capability: capability?.trim() || null,
+            allowedActions: allowedActions ?? null,
+            caps: caps ?? null,
+            // A provided list REPLACES the curated set wholesale (an empty array
+            // clears it); undefined keeps whatever is committed.
+            skills: skills ?? null,
+            origin: getState().author,
+          }),
         (prev) =>
           optimistic.agentPatched(prev, id, {
             ...(displayName?.trim() ? { display_name: displayName.trim() } : {}),

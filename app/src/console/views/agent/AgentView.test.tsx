@@ -19,8 +19,6 @@ import {
 } from "./parts";
 import type { PendingRun } from "../../../domain/runs-client";
 
-const bytes = (value: number) => Array.from({ length: 32 }, () => value);
-
 const channels: Channel[] = [
   {
     id: "general",
@@ -57,18 +55,23 @@ const renderAgents = (
         owner: "system" as const,
         display_name: "Summary Agent",
         capability: "alpha",
-        prompt_hash: bytes(0xab),
         allowed_actions: ["chat.post", "tasks.create"],
         status: "active" as const,
         created_at: 10,
         updated_at: 20,
+        skills: [
+          {
+            name: "persona",
+            source_prefix: "/shared/agents/summarizer/persona",
+            load: "always" as const,
+          },
+        ],
       },
       {
         agent_id: "qa-agent",
         owner: "system" as const,
         display_name: "QA Agent",
         capability: "beta",
-        prompt_hash: bytes(0xcd),
         allowed_actions: ["chat.post"],
         status: "paused" as const,
         created_at: 11,
@@ -305,9 +308,11 @@ describe("AgentView", () => {
   it("adds an agent through the focused Add-agent pane", () => {
     const { spies } = renderAgents();
 
-    // No always-on register form: it opens on demand.
+    // No always-on register form: it opens on demand. And no prompt textarea —
+    // an agent's persona is a document, not form text.
     expect(screen.queryByLabelText("System prompt")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    expect(screen.queryByLabelText("System prompt")).toBeNull();
 
     // Agent ID is auto-derived from the name; with no executors announced,
     // "Runs on" degrades to a text field so setup is never blocked.
@@ -315,16 +320,270 @@ describe("AgentView", () => {
       target: { value: "Triage Agent" },
     });
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
-    fireEvent.change(screen.getByLabelText("System prompt"), {
-      target: { value: "Summarize incoming incidents." },
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    // Exact match: an agent with no curated skills sends no skills key at all
+    // (and never a prompt). It DOES send the library read cap: that grant is on
+    // by default, and it is what earns the run's assembled context the paragraph
+    // telling the agent the shared library exists.
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      allowedActions: ["chat.post"],
+      caps: { duckfs_read: ["/shared/skills"] },
     });
+  });
+
+  it("grants the skill library by default, and lets the operator withhold it", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The affordance is a plain checkbox, ON out of the box.
+    const grant = screen.getByLabelText(/search the global skill library/i);
+    expect((grant as HTMLInputElement).checked).toBe(true);
+
+    // Unticked, the agent registers with NO duckfs_read grant — and the node's
+    // assembler, asking the same caps, then never tells it the library is there.
+    fireEvent.click(grant);
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith({
       displayName: "Triage Agent",
       agentId: "triage-agent",
       capability: "beta",
-      prompt: "Summarize incoming incidents.",
       allowedActions: ["chat.post"],
+    });
+  });
+
+  it("an agent registered without the library grant can be given it by editing", () => {
+    const { spies } = renderAgents();
+
+    // `summarizer` (the fixture) carries no duckfs_read cap at all.
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    fireEvent.click(within(detail).getByRole("button", { name: /^edit$/i }));
+    const grant = screen.getByLabelText(/search the global skill library/i);
+    expect((grant as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(grant);
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    // caps REPLACE wholesale, so the save carries the library grant alongside
+    // every other cap the record already held.
+    expect(spies.updateAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "summarizer",
+        caps: { pages_write: [], duckfs_read: ["/shared/skills"] },
+      }),
+    );
+  });
+
+  it("curates skills: the persona is always-loaded, the rest on demand", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The persona affordance seeds an always-loaded skill under the agent's own
+    // duckfs folder — the document lives in Files, not in this form.
+    fireEvent.click(screen.getByRole("button", { name: /persona \(always loaded\)/i }));
+    expect(screen.getByLabelText("Skill name")).toHaveValue("persona");
+    expect(screen.getByLabelText("Document folder (duckfs)")).toHaveValue(
+      "/shared/agents/triage-agent/persona",
+    );
+
+    // A second, on-demand skill: named + pointed at a shared skill folder.
+    fireEvent.click(screen.getByRole("button", { name: /skill \(on demand\)/i }));
+    const names = screen.getAllByLabelText("Skill name");
+    const folders = screen.getAllByLabelText("Document folder (duckfs)");
+    fireEvent.change(names[1], { target: { value: "release" } });
+    fireEvent.change(folders[1], { target: { value: "/shared/skills/release" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "triage-agent",
+        skills: [
+          {
+            name: "persona",
+            source_prefix: "/shared/agents/triage-agent/persona",
+            load: "always",
+          },
+          { name: "release", source_prefix: "/shared/skills/release", load: "on_demand" },
+        ],
+      }),
+    );
+  });
+
+  it("the always-load toggle flips a skill between soul and on-demand", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+    fireEvent.click(screen.getByRole("button", { name: /persona \(always loaded\)/i }));
+
+    // Untick "always load": the same document becomes an on-demand skill.
+    fireEvent.click(screen.getByLabelText("Always load persona"));
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        skills: [
+          {
+            name: "persona",
+            source_prefix: "/shared/agents/triage-agent/persona",
+            load: "on_demand",
+          },
+        ],
+      }),
+    );
+  });
+
+  it("opens a curated skill's document in the Files surface", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+
+    // The detail pane names the persona and its document, and hands off to Files.
+    expect(within(detail).getByText("ALWAYS")).toBeInTheDocument();
+    expect(
+      within(detail).getByText("/shared/agents/summarizer/persona/SKILL.md"),
+    ).toBeInTheDocument();
+    fireEvent.click(within(detail).getByRole("button", { name: /^open$/i }));
+    expect(spies.openFiles).toHaveBeenCalledWith("/shared/agents/summarizer/persona");
+  });
+
+  it("seeds a persona document in duckfs — and never clobbers an existing one", async () => {
+    const filesStat = vi.fn().mockResolvedValue(null);
+    const filesCommit = vi
+      .fn()
+      .mockResolvedValue({ height: 2, appHash: "aa".repeat(32) });
+    // The commit's CAS base is the live head, read over the generic query lane.
+    const query = vi.fn().mockResolvedValue({ refs: { head: "beef", pins: {}, window: 1 } });
+    const transport = makeTransportStub({ filesStat, filesCommit, query });
+    renderAgents({}, transport);
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /persona \(always loaded\)/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /create doc/i }));
+    });
+
+    // One ordinary duckfs commit — a put of the starter SKILL.md at the prefix.
+    expect(filesStat).toHaveBeenCalledWith({
+      path: "/shared/agents/triage-agent/persona/SKILL.md",
+    });
+    const body = filesCommit.mock.calls[0][0];
+    expect(body.changes[0].put.path).toBe("/shared/agents/triage-agent/persona/SKILL.md");
+    expect(await screen.findByRole("status")).toHaveTextContent(/Created .*Edit it in Files/);
+
+    // A second click finds the document and refuses to overwrite it.
+    filesStat.mockResolvedValue({ path: "x", kind: "file", size: 1, exec: false, object: "", meta: {} });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /create doc/i }));
+    });
+    expect(filesCommit).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("status")).toHaveTextContent(/already exists/);
+  });
+
+  it("composes an agent out of the global skill library — and publishes into it", async () => {
+    const dir = (path: string) => ({
+      path,
+      kind: "dir" as const,
+      size: 0,
+      exec: false,
+      object: "",
+      meta: {},
+    });
+    const docs: Record<string, string> = {
+      "/shared/skills/release/SKILL.md": "---\nname: release\ndescription: Cut a release.\n---\n",
+      // No frontmatter: still a library skill, listed under its folder name.
+      "/shared/skills/triage/SKILL.md": "# triage\n",
+    };
+    const filesLs = vi.fn().mockResolvedValue({
+      entries: [dir("/shared/skills/release"), dir("/shared/skills/triage")],
+      next: null,
+    });
+    const filesRead = vi.fn(async ({ path }: { path: string }) => ({
+      b64: btoa(docs[path] ?? ""),
+      eof: true,
+    }));
+    const filesStat = vi.fn().mockResolvedValue(null);
+    const filesCommit = vi.fn().mockResolvedValue({ height: 2, appHash: "aa".repeat(32) });
+    const query = vi.fn().mockResolvedValue({ refs: { head: "beef", pins: {}, window: 1 } });
+    const transport = makeTransportStub({ filesLs, filesRead, filesStat, filesCommit, query });
+    const { spies } = renderAgents({}, transport);
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The library is one duckfs directory — browsed with the ordinary files
+    // client, described by each SKILL.md's frontmatter.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /from library/i }));
+    });
+    expect(filesLs).toHaveBeenCalledWith({ path: "/shared/skills" });
+    expect(await screen.findByText("Cut a release.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /add triage from the library/i }),
+    ).toBeInTheDocument();
+
+    // Search narrows the pool; picking curates the skill with its prefix filled in.
+    fireEvent.change(screen.getByLabelText("Search the skill library"), {
+      target: { value: "release" },
+    });
+    expect(screen.queryByRole("button", { name: /add triage from the library/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /add release from the library/i }));
+    expect(screen.getByLabelText("Document folder (duckfs)")).toHaveValue(
+      "/shared/skills/release",
+    );
+
+    // Publishing a skill the library doesn't have yet seeds its SKILL.md through
+    // the same create-doc commit — under the shared root, not the agent's folder.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /from library/i }));
+    });
+    fireEvent.change(screen.getByLabelText("Search the skill library"), {
+      target: { value: "Release Notes" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /publish .*to the library/i }));
+    });
+    const put = filesCommit.mock.calls[0][0].changes[0].put;
+    expect(put.path).toBe("/shared/skills/release-notes/SKILL.md");
+
+    // Exact match: library skills ride the ordinary skills key (with `load`),
+    // and no prompt blob is ever sent.
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      allowedActions: ["chat.post"],
+      caps: { duckfs_read: ["/shared/skills"] },
+      skills: [
+        { name: "release", source_prefix: "/shared/skills/release", load: "on_demand" },
+        {
+          name: "Release Notes",
+          source_prefix: "/shared/skills/release-notes",
+          load: "on_demand",
+        },
+      ],
     });
   });
 
@@ -406,9 +665,6 @@ describe("AgentView", () => {
       target: { value: "Triage Agent" },
     });
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
-    fireEvent.change(screen.getByLabelText("System prompt"), {
-      target: { value: "Do things." },
-    });
 
     // Power users can still pin a specific id under Advanced.
     fireEvent.click(screen.getByRole("button", { name: /^advanced$/i }));
@@ -436,7 +692,6 @@ describe("AgentView", () => {
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
-    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
       expect.objectContaining({ capability: "codex" }),
@@ -456,8 +711,8 @@ describe("AgentView", () => {
     fireEvent.change(nameField, { target: { value: "Renamed Agent" } });
 
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
-    // Exact match proves a blank prompt is omitted (never sent as an empty
-    // string), while the other fields keep their current values.
+    // Exact match: no prompt key survives anywhere in the edit payload, and the
+    // other fields keep their current values.
     expect(spies.updateAgent).toHaveBeenCalledWith({
       agentId: "summarizer",
       displayName: "Renamed Agent",
@@ -465,6 +720,15 @@ describe("AgentView", () => {
       allowedActions: ["chat.post", "tasks.create"],
       // the caps record rides every save (untouched field -> empty list).
       caps: { pages_write: [] },
+      // so does the curated skill set — an update REPLACES it wholesale, so an
+      // untouched form must send the record's own skills back unchanged.
+      skills: [
+        {
+          name: "persona",
+          source_prefix: "/shared/agents/summarizer/persona",
+          load: "always",
+        },
+      ],
     });
   });
 
@@ -599,7 +863,6 @@ describe("RunsOnPicker", () => {
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
-    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
       expect.objectContaining({ capability: "claude" }),
@@ -651,7 +914,6 @@ describe("RunsOnPicker", () => {
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
-    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
       expect.objectContaining({ capability: "claude_opus_max" }),
@@ -688,7 +950,6 @@ describe("RunsOnPicker", () => {
           owner: "system" as const,
           display_name: "Researcher",
           capability: "claude_opus_max",
-          prompt_hash: bytes(0x11),
           allowed_actions: ["chat.post"],
           status: "active" as const,
           created_at: 10,

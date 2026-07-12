@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
+use dispatch_oracle::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::{NodeCommand, ORACLE_ORIGIN};
@@ -35,8 +35,6 @@ fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::Outpu
 /// the daemon's worker set: the dispatch pool (or, in debug builds under
 /// `DUCKTAPE_NODED_ECHO_ORACLE`, the inline echo stand-in).
 ///
-/// `blobs` is the daemon's node-local content-addressed store (the app's
-/// putBlob lane) — run-envelope prompt pins resolve through its read path.
 /// `agent_dirs` roots persistent agent workspaces + session files under the
 /// daemon's storage dir (host-local, never consensus). `storage` keys the
 /// portable run-workspace root's per-node salt and its D7 boot validation.
@@ -49,7 +47,6 @@ pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
     node_handle: noded::NodeHandle,
-    blobs: noded::blobs::BlobHandle,
     agent_dirs: capability_host::AgentDirs,
     storage: &std::path::Path,
     forge_push_base: Option<String>,
@@ -115,15 +112,6 @@ where
         })
     });
 
-    // prompt resolution: a synchronous in-memory read behind the pool's
-    // async seam. `None` (blob absent on this node) fails the run loudly in
-    // the worker — never a silent fallback to the generic instructions.
-    let resolver: BlobResolver = Arc::new(move |digest: &[u8; 32]| {
-        let blobs = blobs.clone();
-        let digest = *digest;
-        Box::pin(async move { blobs.get_chunk(&digest) })
-    });
-
     // the REAL workspace provisioner: portable (v3) runs materialize a per-run
     // duckfs checkout under a root VALIDATED to be outside <storage> (D7),
     // drive it over the daemon's OWN actor lane (no self-dial), commit the
@@ -163,7 +151,6 @@ where
             spawn,
             deliver,
         )
-        .with_resolver(resolver)
         .with_provisioner(provisioner),
     )]
 }

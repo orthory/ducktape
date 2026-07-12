@@ -8,9 +8,10 @@
 //!
 //! the payload is a run ENVELOPE (marker `ducktape_run`, v3-only — legacy
 //! flat strings and v2 envelopes fail the run loudly), assembled host-side:
-//! the agent's registered prompt resolved from the node's blob store by its
-//! committed content hash, plus the contract and conversation the dispatcher
-//! composed. beyond that
+//! the instructions, contract and conversation the dispatcher composed. the
+//! agent's PERSONA is no longer in there — it is a curated skill, and the
+//! provisioner assembles the agent's `always` skills into the run's context
+//! document ([`assemble_context_doc`], the SOUL). beyond that
 //! assembly the crate stays opinion-free: NO prompt text is authored here,
 //! NO output shape is parsed here (the dispatch module judges the recipe's
 //! output contract in consensus), and NO credentials are touched (BYO CLI
@@ -33,13 +34,17 @@ mod envelope;
 mod ledger;
 mod pool;
 mod provision;
+mod soul;
 mod workspace_source;
-pub use envelope::BlobResolver;
 pub use ledger::{ReservationGuard, ResourceLedger};
 pub use pool::{DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env};
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
     WorkspaceSpec,
+};
+pub use soul::{
+    MAX_ALWAYS_BYTES, MAX_DESCRIPTION_CHARS, MAX_INDEXED_SKILLS, SKILL_LIBRARY_PREFIX, SkillDoc,
+    assemble_context_doc, parse_skill_md,
 };
 pub use workspace_source::WorkspaceSource;
 

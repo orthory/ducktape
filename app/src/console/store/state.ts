@@ -300,6 +300,11 @@ export interface ConsoleState {
    *  a repo-only focus. Null when nothing is pending. */
   forgeFocus: { repo: string; number: number | null } | null;
 
+  /** The duckfs path the files browser should open on next render — the same
+   *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an
+   *  operator at a skill document. Null when nothing is pending. */
+  filesFocus: string | null;
+
   /** The agent the agent view should select on next render — a clicked @agent
    *  mention's hand-off (the explorerFocus idiom: the mention sets it, AgentView
    *  consumes it and clears it). Null when nothing is pending. */
@@ -750,6 +755,8 @@ export const createInitialState = (): ConsoleState => {
     blocks: [],
     explorerFocus: null,
     forgeFocus: null,
+    filesFocus: null,
+
     agentFocus: null,
     memberFocus: null,
     ops: {},
@@ -814,6 +821,8 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   blocks: [],
   explorerFocus: null,
   forgeFocus: null,
+  filesFocus: null,
+
   agentFocus: null,
   memberFocus: null,
   ops: {},

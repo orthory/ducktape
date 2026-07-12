@@ -192,6 +192,7 @@ impl Bed {
                 branch_born,
             },
             ro_mounts: Vec::new(),
+            library_readable: false,
         }
     }
 }

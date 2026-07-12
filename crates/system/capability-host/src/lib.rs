@@ -99,7 +99,7 @@ mod variants;
 mod workspace;
 pub use sandbox::{SandboxBackend, wrap_podman, wrap_tart};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
-pub use spec::{BrokerKind, CapabilitySpec, IsolationSpec, OutputFormat, SpecSet};
+pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
 
 /// per-run, host-local context riding beside the prompt: which agent is
@@ -139,6 +139,14 @@ pub struct RunContext {
     /// true for portable v3 runs: native CLI sessions are host-local
     /// optimizations and must not be resumed or captured for portable state.
     pub portable: bool,
+    /// the run's assembled context document — the agent's curated skills, built
+    /// into ONE markdown doc by the provisioner (the "soul"). ONE assembly, TWO
+    /// doors, and the SPEC picks which: a spec declaring `[context]` gets it
+    /// written to the file its CLI already auto-loads (see
+    /// [`ContextLocation`]); one that declares none gets it prepended to the
+    /// stdin prompt. `None` (a probe or legacy run) means neither door does
+    /// anything.
+    pub context_doc: Option<String>,
 }
 
 /// which child stream produced one live output line.
@@ -512,7 +520,7 @@ impl CliProvider {
             args,
             workdir,
             &envs,
-            &self.sandbox_ro_paths(ctx),
+            &self.sandbox_ro_paths(ctx, workdir, auth)?,
             &rw_dirs,
             &ctx.limits,
         );
@@ -541,7 +549,7 @@ impl CliProvider {
             args,
             workdir,
             &envs,
-            &self.sandbox_ro_paths(ctx),
+            &self.sandbox_ro_paths(ctx, workdir, auth)?,
             &rw_dirs,
             &ctx.limits,
         );
@@ -597,10 +605,118 @@ impl CliProvider {
     /// path is right there on the host. inside a container/VM only what we mount
     /// exists — so without this the agent's own skills would be a DANGLING path:
     /// the env var set, the directory simply absent.
-    fn sandbox_ro_paths(&self, ctx: &RunContext) -> Vec<PathBuf> {
+    ///
+    /// the run's context doc joins them when it lands OUTSIDE the workdir (a
+    /// `workspace-parent:` soul does; a `config-home:` one is under the workdir,
+    /// which every backend already mounts, so it crosses for free). without this
+    /// the file would exist on the host and simply not be there for the child —
+    /// a silently unsouled agent, the one failure mode this feature must not have.
+    fn sandbox_ro_paths(
+        &self,
+        ctx: &RunContext,
+        workdir: &Path,
+        auth: &RunAuth<'_>,
+    ) -> Result<Vec<PathBuf>, String> {
         let mut paths = ctx.path_entries.clone();
         paths.extend(ctx.env.get(SKILLS_ROOT_ENV).map(PathBuf::from));
-        paths
+        if ctx.context_doc.is_some()
+            && let Some(doc) = self.context_target(workdir, auth.config_home)?
+            && !doc.starts_with(workdir)
+        {
+            paths.push(doc);
+        }
+        Ok(paths)
+    }
+
+    /// where this run's assembled context doc lands — the spec's [`ContextLocation`]
+    /// resolved against THIS run's directories. `None` when the spec names no
+    /// `[context]` (that spec's door is the stdin prompt instead).
+    fn context_target(
+        &self,
+        workdir: &Path,
+        config_home: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String> {
+        let dir = match &self.spec.context {
+            None => return Ok(None),
+            // parse-time guaranteed: `config-home:` requires isolation.config_home_env,
+            // which is exactly what makes prepare_config_home materialize one. so this
+            // is unreachable-by-construction, and loud rather than silently unsouled.
+            Some(ContextLocation::ConfigHome(file)) => config_home
+                .ok_or_else(|| {
+                    format!(
+                        "{}: context.path names the run's config home, but none was \
+                         prepared for this run",
+                        self.spec.tag
+                    )
+                })?
+                .join(file),
+            Some(ContextLocation::WorkspaceParent(file)) => workdir
+                .parent()
+                .ok_or_else(|| {
+                    format!(
+                        "{}: context.path names the parent of the run's workdir, but \
+                         {} has none",
+                        self.spec.tag,
+                        workdir.display()
+                    )
+                })?
+                .join(file),
+        };
+        Ok(Some(dir))
+    }
+
+    /// write the run's assembled context doc where the spec says the executor
+    /// auto-loads it from, BEFORE the child starts. a write failure fails the run
+    /// loudly — a silently unsouled agent is a different agent, and it would still
+    /// answer, so the failure would never surface.
+    ///
+    /// the returned guard removes the file when it lives outside the workdir (see
+    /// [`ContextGuard`]); a doc inside the workdir needs none.
+    fn deliver_context(
+        &self,
+        workdir: &Path,
+        config_home: Option<&Path>,
+        ctx: &RunContext,
+    ) -> Result<Option<ContextGuard>, String> {
+        let (Some(doc), Some(path)) = (
+            ctx.context_doc.as_ref(),
+            self.context_target(workdir, config_home)?,
+        ) else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "{}: preparing {} for the run's context document failed: {e}",
+                    self.spec.tag,
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(&path, doc).map_err(|e| {
+            format!(
+                "{}: writing the run's context document to {} failed: {e} — refusing \
+                 to run the agent without the context it was assembled with",
+                self.spec.tag,
+                path.display()
+            )
+        })?;
+        // `then`, NOT `then_some`: the guard DELETES the file on drop, and
+        // `then_some` builds its argument eagerly — so a doc inside the workdir
+        // (the false arm) would construct a guard, drop it on the spot, and erase
+        // the soul it had just written. it did, until this line.
+        Ok((!path.starts_with(workdir)).then(|| ContextGuard(path)))
+    }
+
+    /// the prompt as the child receives it: for a spec with NO `[context]` (a raw
+    /// provider — no ambient-instructions convention to use), the assembled doc
+    /// is prepended to the stdin prompt. a spec WITH `[context]` already got it as
+    /// a file, so prepending too would ship the soul twice.
+    fn prompt_with_context(&self, prompt: &str, ctx: &RunContext) -> String {
+        match (&self.spec.context, &ctx.context_doc) {
+            (None, Some(doc)) => format!("{doc}\n\n{prompt}"),
+            _ => prompt.to_string(),
+        }
     }
 
     /// materialize this run's FRESH executor config home — `None` unless the
@@ -885,6 +1001,25 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// removes a run's context document on drop — every exit path (success, error,
+/// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
+/// it sits beside the checkout, where nothing else would ever clean it up, and a
+/// stale soul left there would silently join the NEXT run whose checkout lands in
+/// the same parent. a `config-home:` doc is inside the reserved run-runtime dir
+/// the provisioner already deletes, so it needs no guard.
+struct ContextGuard(PathBuf);
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            eprintln!(
+                "[capability-host] removing the run's context document {} failed: {e}",
+                self.0.display()
+            );
+        }
+    }
+}
+
 /// holds a Tart run's process-wide concurrency permit and deletes its per-run
 /// clone on drop — the run's LAST teardown step, on every exit path (success,
 /// error, timeout, panic). declared before the `tart run` child so the child
@@ -1159,6 +1294,12 @@ impl CliProvider {
         // one broker). `broker` is held here so the endpoint outlives the child
         // and is torn down when this call returns, however it returns.
         let config_home = self.prepare_config_home(&workdir, ctx)?;
+        // the assembled soul, delivered by whichever door the SPEC names: a file
+        // the CLI auto-loads, or the stdin prompt. the guard (held for the whole
+        // call) removes a doc that lives outside the workdir, on every exit path.
+        let _context = self.deliver_context(&workdir, config_home.as_deref(), ctx)?;
+        let prompt_buf = self.prompt_with_context(prompt, ctx);
+        let prompt = prompt_buf.as_str();
         let broker = self.start_broker().await?;
         let auth = RunAuth {
             config_home: config_home.as_deref(),
@@ -1828,6 +1969,186 @@ format = "text"
         let joined = argv_of(&cmd);
         assert!(!joined.contains(SKILLS_ROOT_ENV), "{joined}");
         assert!(!joined.contains("-ro:"), "no ro sibling mount: {joined}");
+    }
+
+    // ---- the assembled context document (the agent's "soul") ----------------
+
+    /// a mock spec plus whatever extra sections the test needs — the `[context]`
+    /// / `[isolation]` shapes below, without a fixture per shape.
+    fn spec_with(tag: &str, extra: &str) -> CapabilitySpec {
+        CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "{tag}"
+[detect]
+bin = "{tag}"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+{extra}
+"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
+    const SOUL: &str = "# soul\nbe kind\n";
+
+    #[tokio::test]
+    async fn a_workspace_parent_context_spec_writes_the_soul_beside_the_checkout_and_cleans_it_up()
+    {
+        // the doc lands at the parent of the run's checkout — where the CLI's own
+        // convention finds it, OUTSIDE the tree `commit` scans, and layered UNDER
+        // a repository's own instructions file rather than overwriting it.
+        let root = scratch("soul-parent");
+        // the mock CLI prints the delivered file, a separator, then its stdin.
+        let script = fake_cli(&root, "soul.sh", "cat ../SOUL.md; echo ---; cat");
+        let provider = sh_provider(
+            spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
+            script,
+            "soul-parent-scratch",
+        );
+        let ctx = RunContext {
+            workdir_override: Some(root.join("checkout")),
+            context_doc: Some(SOUL.to_string()),
+            ..RunContext::default()
+        };
+
+        let out = provider
+            .run("PROMPT", &ctx)
+            .await
+            .expect("the run succeeds");
+        // the soul reached the FILE, and the stdin half is the bare prompt: a
+        // spec with a native context door must not ALSO inflate the prompt.
+        assert_eq!(out, "# soul\nbe kind\n---\nPROMPT");
+        // and the file is gone: it lives outside the workdir, where nothing else
+        // would ever clean it up and a stale soul would join the next run.
+        assert!(
+            !root.join("SOUL.md").exists(),
+            "the context doc is removed when the run ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_home_context_spec_writes_the_soul_into_the_runs_fresh_config_home() {
+        // resolved against the per-run config home [isolation] already materializes
+        // — inside the workdir's reserved runtime dir, which the provisioner deletes
+        // before scanning, so no guard and no artifact.
+        let root = scratch("soul-config-home");
+        let script = fake_cli(
+            &root,
+            "soul.sh",
+            "cat \"$TEST_HOME/AGENTS.md\"; echo ---; cat",
+        );
+        let provider = sh_provider(
+            spec_with(
+                "soul",
+                "[isolation]\nconfig_home_env = \"TEST_HOME\"\n\n\
+                 [context]\npath = \"config-home:AGENTS.md\"\n",
+            ),
+            script,
+            "soul-config-home-scratch",
+        );
+        let workdir = root.join("checkout");
+        let ctx = RunContext {
+            workdir_override: Some(workdir.clone()),
+            context_doc: Some(SOUL.to_string()),
+            ..RunContext::default()
+        };
+
+        let out = provider
+            .run("PROMPT", &ctx)
+            .await
+            .expect("the run succeeds");
+        // the soul reached the CLI's own config home, and the stdin half is the
+        // bare prompt — a native context door must not ALSO inflate the prompt.
+        assert_eq!(out, "# soul\nbe kind\n---\nPROMPT");
+        // no guard for this door: the doc is under the run-runtime dir the
+        // provisioner's commit bracket removes.
+        assert!(workdir.join(RUN_RUNTIME_DIR).is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_spec_with_no_context_section_prepends_the_soul_to_the_prompt() {
+        // the raw-provider door: a CLI with no ambient-instructions convention
+        // (ollama, any plain `text` executor) still gets the soul — on stdin.
+        let root = scratch("soul-prompt");
+        let script = fake_cli(&root, "soul.sh", "cat");
+        let provider = sh_provider(spec_with("raw", ""), script, "soul-prompt-scratch");
+        let ctx = RunContext {
+            context_doc: Some(SOUL.to_string()),
+            ..RunContext::default()
+        };
+
+        let out = provider
+            .run("PROMPT", &ctx)
+            .await
+            .expect("the run succeeds");
+        assert_eq!(out, format!("{SOUL}\n\nPROMPT").trim());
+        // ... and a run with no doc at all is byte-for-byte the old behavior.
+        let out = provider
+            .run("PROMPT", &RunContext::default())
+            .await
+            .expect("the run succeeds");
+        assert_eq!(out, "PROMPT", "no doc, no prepend");
+    }
+
+    #[test]
+    fn a_sandbox_binds_a_workspace_parent_soul_read_only_and_needs_no_bind_for_a_config_home_one() {
+        let ctx = RunContext {
+            context_doc: Some(SOUL.to_string()),
+            ..RunContext::default()
+        };
+
+        // OUTSIDE the workdir mount: without this bind the file would exist on the
+        // host and simply not be there for the child — a silently unsouled agent.
+        let provider = CliProvider::from_spec(
+            spec_with("pod", "[context]\npath = \"workspace-parent:CLAUDE.md\"\n"),
+            PathBuf::from("/usr/bin/pod"),
+        )
+        .with_backend(SandboxBackend::Podman {
+            image: "img".into(),
+        });
+        let cmd = provider
+            .command(&[], Path::new("/tmp/wd"), &ctx, &RunAuth::default())
+            .expect("podman command builds");
+        let joined = argv_of(&cmd);
+        assert!(
+            joined.contains("-v /tmp/CLAUDE.md:/tmp/CLAUDE.md:ro"),
+            "the soul binds ro at its identical path: {joined}"
+        );
+
+        // INSIDE it: a config-home doc lives under the workdir, which every backend
+        // already mounts — no second bind, and none wanted.
+        let provider = CliProvider::from_spec(
+            spec_with(
+                "pod",
+                "[isolation]\nconfig_home_env = \"H\"\n\n\
+                 [context]\npath = \"config-home:AGENTS.md\"\n",
+            ),
+            PathBuf::from("/usr/bin/pod"),
+        )
+        .with_backend(SandboxBackend::Podman {
+            image: "img".into(),
+        });
+        let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
+        let auth = RunAuth {
+            config_home: Some(&config_home),
+            broker: None,
+        };
+        let cmd = provider
+            .command(&[], Path::new("/tmp/wd"), &ctx, &auth)
+            .expect("podman command builds");
+        let joined = argv_of(&cmd);
+        assert!(
+            !joined.contains("AGENTS.md"),
+            "a doc under the workdir crosses for free: {joined}"
+        );
     }
 
     // ---- the credential broker ----------------------------------------------
@@ -2700,6 +3021,7 @@ printf '%s\n' "$PATH"
             path_entries: vec![path_entry.clone()],
             limits: BTreeMap::new(),
             portable: true,
+            context_doc: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();

@@ -5,7 +5,7 @@ use crate::response::{
 };
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
 use agent::{
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PROMPT_HASH_LEN,
+    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
     encode_event as agent_encode_event, encode_reply as agent_encode_reply,
 };
 use chat::{AuthorRef, Channel, MessageHead, decode_msg as chat_decode_msg};
@@ -591,7 +591,6 @@ fn record(agent_id: &str, actions: &[&str]) -> AgentRecord {
         owner: SagaOrigin::External(vec![9; 32]),
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
-        prompt_hash: vec![7u8; PROMPT_HASH_LEN],
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         status: AgentStatus::Active,
         created_at: 0,

@@ -115,6 +115,18 @@ describe("FilesView", () => {
     );
   });
 
+  it("opens on a filesFocus hand-off — the agent form pointing at a skill doc", async () => {
+    const transport = makeTransport();
+    renderView(transport, { filesFocus: "/shared/docs" });
+
+    // The browser lands on the handed-off directory (with its parent column
+    // still there), not on the default /shared.
+    expect(
+      await screen.findByRole("region", { name: /column \/shared\/docs/i }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("plan.md")).toBeInTheDocument();
+  });
+
   it("opens folders as adjacent browser columns without replacing the parent column", async () => {
     const transport = makeTransport();
     renderView(transport);

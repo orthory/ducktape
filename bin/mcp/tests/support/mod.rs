@@ -102,8 +102,8 @@ impl Harness {
                 "agent_id": AGENT_ID,
                 "display_name": "Quackbot",
                 "capability": "codex",
-                // PROMPT_HASH_LEN bytes — the registry rejects any other length.
-                "prompt_hash": vec![7u8; 32],
+                // no prompt pin: an agent IS its curated skills now, and this
+                // one curates none — the tool plane is what it is here to use.
                 "allowed_actions": actions,
             }
         });

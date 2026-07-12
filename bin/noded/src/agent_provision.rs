@@ -36,7 +36,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, RoMount, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
+    assemble_context_doc, parse_skill_md,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 
@@ -268,8 +269,20 @@ fn run_env(
     env
 }
 
+/// the file every skill document is read from, inside its mount — the
+/// convention this repo's own `skills/` already follow.
+const SKILL_DOC: &str = "SKILL.md";
+
 /// materialize the run's W6 skill mounts under `ro_root` — one duckfs checkout
-/// per mount at `<ro_root>/<name>`. the ONE implementation both lanes call.
+/// per mount at `<ro_root>/<name>` — and ASSEMBLE THE RUN'S SOUL from them. the
+/// ONE implementation both lanes call.
+///
+/// the two jobs live together because this is the only place that has both
+/// halves: the committed curation (`mounts`: names, order, load modes) and the
+/// materialized bodies. dispatch-oracle owns the pure assembly
+/// ([`dispatch_oracle::assemble_context_doc`]) but cannot cross the reachability
+/// wall to read a duckfs checkout; the binary can read files but must not decide
+/// the document's shape. so: read here, assemble there.
 ///
 /// the ro root is a SUFFIXED SIBLING of the run's writable tree (`<slug>-ro`),
 /// never a child of it: the duckfs lane's `commit` scans only under the rw dir
@@ -285,16 +298,18 @@ fn run_env(
 /// verify mismatch) after materializing some of the tree, and a failed
 /// provision hands the run no workspace to clean up — so this removes its OWN
 /// debris (the whole ro root) before returning. the caller unwinds the rw tree
-/// it already materialized.
+/// it already materialized. an over-budget soul (a blown context bound) fails on
+/// that same path: the mounts are already on disk when the assembler refuses.
 fn checkout_ro_mounts(
     handle: &NodeHandle,
     ro_root: &Path,
     mounts: &[RoMount],
-) -> Result<(), String> {
+    library_readable: bool,
+) -> Result<String, String> {
     let api = ActorNodeApi::new(handle.clone());
     mounts
         .iter()
-        .try_for_each(|m| {
+        .map(|m| {
             checkout_with(
                 &api,
                 &ro_root.join(&m.mount_subpath),
@@ -302,12 +317,54 @@ fn checkout_ro_mounts(
                 m.source_snapshot.as_deref(),
                 &CheckoutOptions::default(),
             )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            read_skill_doc(ro_root, m)
         })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|docs| assemble_context_doc(&docs, library_readable))
         .inspect_err(|_| {
             let _ = std::fs::remove_dir_all(ro_root);
         })
+}
+
+/// read one materialized mount's `SKILL.md` into the plain-data [`SkillDoc`] the
+/// assembler takes. the mount's COMMITTED name is the heading — never a name
+/// read out of the document, which would let a doc rename itself into another
+/// agent's persona.
+///
+/// the two degrade rules are deliberately asymmetric:
+/// - an `always` skill whose body is missing or unreadable FAILS THE RUN. it is
+///   the agent's persona: running without it would quietly produce a different
+///   agent, which is exactly the class of silent corruption a loud failure is
+///   cheaper than.
+/// - an on-demand skill degrades to a name-only index entry (no body read is
+///   even needed for it beyond its description) — a cosmetic parse must never
+///   cost a run. non-utf8 or frontmatter-less is the same story: index it.
+fn read_skill_doc(ro_root: &Path, mount: &RoMount) -> Result<SkillDoc, String> {
+    let path = ro_root.join(&mount.mount_subpath).join(SKILL_DOC);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if mount.always => {
+            return Err(format!(
+                "skill {:?} is loaded ALWAYS (it is this agent's persona) but its \
+                 {SKILL_DOC} could not be read at {}: {e} — refusing to run a \
+                 different agent",
+                mount.mount_subpath,
+                path.display()
+            ));
+        }
+        // on-demand: the agent is told the skill exists and where to read it;
+        // whether THIS node could read the body now changes nothing about the
+        // run it is about to do.
+        Err(_) => None,
+    };
+    let (description, body) = text.as_deref().map(parse_skill_md).unwrap_or_default();
+    Ok(SkillDoc {
+        name: mount.mount_subpath.clone(),
+        description,
+        body,
+        always: mount.always,
+    })
 }
 
 /// the real provisioner: mints per-run workspaces under `root`, driving the
@@ -494,6 +551,68 @@ mod tests {
         assert_ne!(a0, a1, "attempt 0 and 1 get distinct dirs");
         // deterministic per run_id (idempotent provision + cleanup).
         assert_eq!(run_slug("saga:2"), run_slug("saga:2"));
+    }
+
+    /// a materialized mount on disk — what `checkout_ro_mounts` leaves behind.
+    fn materialize(ro_root: &Path, name: &str, body: Option<&str>) -> RoMount {
+        std::fs::create_dir_all(ro_root.join(name)).unwrap();
+        if let Some(body) = body {
+            std::fs::write(ro_root.join(name).join(SKILL_DOC), body).unwrap();
+        }
+        RoMount {
+            source_prefix: format!("/shared/skills/{name}"),
+            source_snapshot: None,
+            mount_subpath: name.into(),
+            always: false,
+        }
+    }
+
+    #[test]
+    fn an_always_skill_with_no_readable_body_fails_the_run_loudly() {
+        // THE asymmetry: an `always` skill IS the agent's persona. a run that
+        // silently proceeds without it is a DIFFERENT agent answering under the
+        // same name — so the missing body is a loud provision failure, never a
+        // degrade. (an on-demand body is another matter: see below.)
+        let ro_root = std::env::temp_dir().join(format!("soul-always-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ro_root);
+        let mut mount = materialize(&ro_root, "persona", None);
+        mount.always = true;
+
+        let err = read_skill_doc(&ro_root, &mount).unwrap_err();
+        assert!(err.contains("persona"), "names the skill: {err}");
+        assert!(
+            err.contains("refusing to run a different agent"),
+            "states WHY it is fatal: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&ro_root);
+    }
+
+    #[test]
+    fn an_on_demand_skill_degrades_to_a_name_only_entry_rather_than_failing() {
+        // a cosmetic parse (or an unreadable body) on a skill the agent was only
+        // ever going to READ IF RELEVANT must never cost the run: it degrades to
+        // a name-only index entry, and the agent can still go look.
+        let ro_root = std::env::temp_dir().join(format!("soul-ondemand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ro_root);
+
+        let missing = materialize(&ro_root, "gone", None);
+        let doc = read_skill_doc(&ro_root, &missing).expect("an on-demand miss never fails a run");
+        assert_eq!(doc.name, "gone");
+        assert_eq!(doc.description, None);
+        assert!(doc.body.is_empty());
+
+        // frontmatter present ⇒ the description reaches the index, and the
+        // heading is the COMMITTED mount name, never a name from the document.
+        let described = materialize(
+            &ro_root,
+            "release",
+            Some("---\nname: not-my-name\ndescription: Cut a release.\n---\nthe body\n"),
+        );
+        let doc = read_skill_doc(&ro_root, &described).unwrap();
+        assert_eq!(doc.name, "release", "a doc cannot rename itself");
+        assert_eq!(doc.description.as_deref(), Some("Cut a release."));
+        assert_eq!(doc.body, "the body\n");
+        let _ = std::fs::remove_dir_all(&ro_root);
     }
 
     #[test]

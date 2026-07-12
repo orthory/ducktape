@@ -3195,6 +3195,7 @@ dependencies = [
 name = "dispatch-oracle"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "async-trait",
  "capability-host",
  "dispatch",

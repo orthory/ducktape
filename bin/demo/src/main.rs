@@ -411,10 +411,12 @@ fn main() {
                     agent_id: "quackbot".into(),
                     display_name: "Quackbot".into(),
                     capability: "mock-llm-1".into(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                     recipe_hash: None,
                     caps: None,
+                    // the persona is a curated skill now (an `always` one), not a
+                    // prompt blob. the demo's mock provider ignores the composed
+                    // context anyway, so it registers soul-less.
                     skills: None,
                 }),
             },

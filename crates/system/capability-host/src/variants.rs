@@ -4,7 +4,7 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`workspace`/`session`/`rw_dirs`/`isolation` (and `description`) from the parent,
+//! `timeout_secs`/`workspace`/`session`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
 //! with the variant's own FULL argv (and, optionally, its own `[session]`
 //! resume replacement — see [`RawVariant::resume_args`]). there is no
 //! merging, no placeholder, no substitution — the
@@ -125,6 +125,9 @@ pub(crate) fn expand(
             // for every variant by construction.
             rw_dirs: base.rw_dirs.clone(),
             isolation: base.isolation.clone(),
+            // WHERE the CLI auto-loads its ambient instructions is a property of
+            // the CLI, like its auth — not of the model or effort a variant pins.
+            context: base.context.clone(),
         });
     }
     Ok(specs)
@@ -284,6 +287,9 @@ rw_dirs = ["~/.prov"]
 [isolation]
 config_home_env = "PROV_HOME"
 
+[context]
+path = "config-home:AGENTS.md"
+
 [session]
 capture = "jsonl-events"
 resume_args = ["resume", "{session_id}", "--default"]
@@ -314,6 +320,17 @@ resume_args = ["resume", "{session_id}", "--model", "m1", "--hard"]
         );
         assert_eq!(v.isolation.config_home_env.as_deref(), Some("PROV_HOME"));
         assert_eq!(v.session, get("prov").session, "session inherited");
+        // WHERE the soul is delivered is a property of the CLI, not of the model
+        // or effort a variant pins — so it inherits like auth does.
+        assert_eq!(
+            v.context,
+            get("prov").context,
+            "the [context] location is inherited whole"
+        );
+        assert_eq!(
+            v.context,
+            Some(crate::ContextLocation::ConfigHome("AGENTS.md".into()))
+        );
 
         // resume_args variant: capture inherited, resume argv its own.
         let v = get("prov_m1_high");
@@ -493,6 +510,14 @@ resume_args = ["resume", "stale-id"]
             );
             assert!(spec.session.is_some(), "{}: [session] is set", spec.tag);
             assert_eq!(spec.timeout_secs, 600, "{}: agentic timeout", spec.tag);
+            // every shipped executor delivers the assembled soul NATIVELY (a file
+            // its CLI auto-loads), never by inflating the stdin prompt. WHICH file
+            // is spec data — the assertion is that the door exists.
+            assert!(
+                spec.context.is_some(),
+                "{}: an embedded executor names its own context file",
+                spec.tag
+            );
         }
 
         // the shipped AUTH posture, per family, inherited by every variant: codex

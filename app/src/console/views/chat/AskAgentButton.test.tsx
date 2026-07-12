@@ -21,7 +21,6 @@ const agent = (
   owner: { external: [1] },
   display_name: agentId,
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status,
   created_at: 1,
