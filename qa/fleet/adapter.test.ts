@@ -28,6 +28,16 @@ test('Fleet config is CEF-only and points at owned hooks', async () => {
   expect(buildHook).toContain('app/Ducktape.app/Contents/MacOS/ducktape-desktop')
   expect(buildHook).toContain("artifact_cwd='app/Ducktape.app/Contents/MacOS'")
   expect(buildHook).toContain('artifact_env=\'{ "LD_LIBRARY_PATH": "." }\'')
+  const qaSkill = await Bun.file(join(root, 'skills/qa/SKILL.md')).text()
+  const upgradeSkill = await Bun.file(join(root, 'skills/upgrade/SKILL.md')).text()
+  const opsReadme = await Bun.file(join(root, 'ops/README.md')).text()
+  const fleetEntrypoint = 'app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js'
+  expect(qaSkill).toContain(fleetEntrypoint)
+  expect(upgradeSkill).toContain(fleetEntrypoint)
+  expect(opsReadme).toContain(fleetEntrypoint)
+  for (const text of [qaSkill, upgradeSkill, opsReadme]) {
+    expect(text).not.toContain('node_modules/.bin/tauri-agent-fleet')
+  }
   expect(await Bun.file(join(root, 'app/src/main.tsx')).text()).toContain(
     'import.meta.env.VITE_TAURI_AGENT === "1"'
   )
