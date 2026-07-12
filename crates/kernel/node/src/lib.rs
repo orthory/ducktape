@@ -728,6 +728,12 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
     /// `None` until the first frame applies.
     finalized: Option<host::FinalizedBlock>,
+    /// the ENGINE view whose seal set `finalized` — what a recovery layer
+    /// matches finalization certificates against when persisting the floor.
+    /// `None` until a block seals under the CURRENT engine (fresh boot,
+    /// resume, or right after a cutover): a recovered boundary's floor is
+    /// already persisted, and a new epoch's floor waits for its first block.
+    finalized_view: Option<u64>,
     /// the app-height offset of the CURRENT engine's view 0. epoch cutover
     /// respawns the engine with views restarting at 0; the base keeps `Env`
     /// heights and the finalized boundary monotone across epochs
@@ -816,6 +822,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized: None,
+            finalized_view: None,
             view_base: 0,
             last_engine_view: None,
             view_ceiling: None,
@@ -847,6 +854,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized,
+            finalized_view: None,
             view_base,
             last_engine_view: None,
             view_ceiling: None,
@@ -903,6 +911,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
+        // the finalized boundary carries over, but its VIEW belonged to the
+        // torn-down engine's clock — the new epoch's floor waits for its own
+        // first sealed block.
+        self.finalized_view = None;
         self.view_ceiling = None;
         // effects of pre-cutover blocks remain takeable. deferred frames
         // carry OLD-epoch views — stamping them under the new base would
@@ -1366,6 +1378,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     height,
                     app_hash: self.host.app_hash(),
                 });
+                self.finalized_view = Some(view);
             }
         }
         Ok(applied)
@@ -1387,6 +1400,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// from. `None` until the first delivered frame applies.
     pub fn finalized(&self) -> Option<host::FinalizedBlock> {
         self.finalized
+    }
+
+    /// the ENGINE view whose seal set [`OrderedNode::finalized`] — what a
+    /// recovery layer matches finalization certificates against when
+    /// persisting the floor. `None` until a block seals under the current
+    /// engine (fresh boot, resume, or right after a cutover).
+    pub fn finalized_view(&self) -> Option<u64> {
+        self.finalized_view
     }
 
     /// the current app-hash of the wrapped host.

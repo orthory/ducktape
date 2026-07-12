@@ -167,7 +167,11 @@ fn the_follower_admits_in_order_skips_stale_and_refuses_the_unresolvable() {
         Observed::Unresolvable(3)
     );
     assert_eq!(follower.poll_delivered(), vec![]);
-    assert_eq!(follower.unreleased_len(), 0, "nothing may wedge the gate");
+    assert_eq!(
+        follower.min_unreleased_view(),
+        None,
+        "nothing may wedge the gate"
+    );
 
     // and garbage never enters at all.
     assert!(
