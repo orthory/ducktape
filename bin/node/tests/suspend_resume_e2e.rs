@@ -104,6 +104,16 @@ fn a_suspended_resident_resumes_following_within_the_deadline_budget() {
         "resident healed and adopted the post-thaw boundary in {:?}",
         thawed.elapsed()
     );
+    // the heal must have gone through the PERMANENT-gap escalation, not a
+    // lucky frame backfill: the freeze pushes the tip ~25 frames past the
+    // resident's watermark while the source retains only ~16, so the gap is
+    // deterministically pruned and the descend → fresh-boundary re-sync is
+    // the only path home. this pins the RangePruned branch itself.
+    cluster.wait_marker(
+        1,
+        "re-syncing at a fresh boundary",
+        Duration::from_secs(5),
+    );
 
     cluster.kill(1);
     cluster.kill(0);
