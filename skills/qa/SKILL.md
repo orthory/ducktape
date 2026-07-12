@@ -95,7 +95,7 @@ Two providers, both verified green on the `notification-bell` suite:
   condition burns one repetition per retry, so a too-strict budget converts a
   pass-condition bug into `repeated action limit exceeded`.
 
-Worked example: `.tauri-agent/suites/notification-bell.json` (boot-safe button
+Worked example: `.tauri-agent/suites/notification-bell.toon` (boot-safe button
 `expect` + the `notifyDropdownOpen` probe). Diagnose failures from the run
 artifacts under the instance directory: `run.json` (failure + message),
 `actions.jsonl` (what the model actually did), `ipc.jsonl`, `failure.png`.
