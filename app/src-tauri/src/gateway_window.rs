@@ -91,7 +91,7 @@ impl InlineState {
         changed
     }
 
-    fn finish_loading(&mut self) -> Option<InlineRect> {
+    fn reveal_loading(&mut self) -> Option<InlineRect> {
         self.ready = true;
         self.wanted_visible.then_some(self.rect)
     }
@@ -197,19 +197,25 @@ pub async fn gateway_open_inline(
         .incognito(true)
         .devtools(false)
         // CEF paints its default surface before publisher CSS arrives. Match
-        // the Browser pane while the child is kept offscreen until Finished.
+        // the Browser pane while the child is kept offscreen until its first
+        // page-load event.
         .background_color(tauri::webview::Color(252, 252, 252, 255))
-        .on_page_load(move |webview, payload| {
-            if payload.event() != tauri::webview::PageLoadEvent::Finished {
-                return;
-            }
+        .on_page_load(move |webview, _payload| {
+            // CEF does not reliably emit Finished for streaming development
+            // pages (Vite/Vocs is the observed case). Waiting exclusively for
+            // Finished leaves the child at its offscreen staging bounds
+            // forever: the page flashes once, then the Browser pane is blank.
+            // The gateway URL has already passed the duck:// navigation
+            // decision and the isolated child has no app capabilities, so
+            // reveal on the first load event; a later Finished callback is
+            // harmlessly idempotent.
             let visible_rect = {
                 let mut states = inline_states()
                     .lock()
                     .expect("inline gateway state registry poisoned");
                 states
                     .get_mut(&state_label)
-                    .and_then(InlineState::finish_loading)
+                    .and_then(InlineState::reveal_loading)
             };
             if let Some(rect) = visible_rect {
                 let _ = place_inline_webview(
@@ -388,16 +394,20 @@ mod tests {
         };
         let mut state = InlineState::new(first.clone(), rect);
 
-        assert!(state.finish_loading().is_some());
+        assert!(state.reveal_loading().is_some());
         state.wanted_visible = false;
         assert!(!state.open(first, rect), "tab selection must not reload");
         assert!(state.ready);
 
         assert!(state.open(second, rect), "a new session URL must navigate");
-        assert!(!state.ready, "new navigation stays hidden until Finished");
+        assert!(!state.ready, "new navigation starts in the offscreen staging slot");
+        assert!(
+            state.reveal_loading().is_some(),
+            "the first load event reveals streaming pages that never finish"
+        );
         state.wanted_visible = false;
         assert!(
-            state.finish_loading().is_none(),
+            state.reveal_loading().is_none(),
             "a late load cannot reshow a hidden tab"
         );
     }
