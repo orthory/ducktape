@@ -188,7 +188,6 @@ pub async fn gateway_open_inline(
         return Ok(());
     }
 
-    let allowed_host = url.host_str().expect("validated host").to_string();
     inline_states()
         .lock()
         .expect("inline gateway state registry poisoned")
@@ -221,11 +220,24 @@ pub async fn gateway_open_inline(
                 let _ = webview.show();
             }
         })
-        .on_navigation(move |candidate| {
-            candidate.scheme() == "duck"
-                && candidate.host_str() == Some(allowed_host.as_str())
-                && candidate.username().is_empty()
-                && candidate.password().is_none()
+        .on_navigation({
+            let nav_label = label.clone();
+            move |candidate| {
+                // The authority a tab may show is whatever it is showing NOW —
+                // read per navigation, never captured at creation. A tab is
+                // reused across sites (`open()` re-navigates the same child), so
+                // a captured host would pin the tab to its first .duck site for
+                // the life of the webview and silently blank every later one.
+                let allowed = inline_states()
+                    .lock()
+                    .expect("inline gateway state registry poisoned")
+                    .get(&nav_label)
+                    .and_then(|state| state.url.host_str().map(str::to_string));
+                candidate.scheme() == "duck"
+                    && allowed.is_some_and(|host| candidate.host_str() == Some(host.as_str()))
+                    && candidate.username().is_empty()
+                    && candidate.password().is_none()
+            }
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .on_download(|_, _| false);
