@@ -456,10 +456,11 @@ enum CommitOutcome {
 const PUSH_ATTEMPTS: u32 = 3;
 
 /// Normalize an agent proposal and own the final Ducktape attribution. A
-/// proposal containing non-line-ending controls or exceeding the Git-facing
-/// byte cap is discarded wholesale: partially exposing a dispatch key is
-/// worse than using the explicit fallback. Every agent-supplied co-author
-/// trailer is removed; Forge appends the only trusted attribution last.
+/// proposal containing controls beyond line endings and tabs, or exceeding
+/// the Git-facing byte cap, is discarded wholesale: partially exposing a
+/// dispatch key is worse than using the explicit fallback. Every
+/// agent-supplied identity trailer is removed; Forge appends the only
+/// trusted attribution last.
 fn normalize_commit_message(proposal: Option<&str>, display_name: &str, agent_id: &str) -> String {
     let display_name = sanitize_display_name(display_name);
     let agent_id = attribution_email_local_part(agent_id);
@@ -468,13 +469,17 @@ fn normalize_commit_message(proposal: Option<&str>, display_name: &str, agent_id
 
     let candidate = proposal.unwrap_or(FALLBACK_COMMIT_MESSAGE);
     let normalized = candidate.replace("\r\n", "\n").replace('\r', "\n");
-    let invalid = normalized.chars().any(|c| c != '\n' && c.is_control());
+    // tabs are legitimate in bodies (indented snippets); everything else
+    // outside \n stays a wholesale-reject signal.
+    let invalid = normalized
+        .chars()
+        .any(|c| c != '\n' && c != '\t' && c.is_control());
     let mut message = if invalid || normalized.len() > MAX_COMMIT_MESSAGE_BYTES {
         FALLBACK_COMMIT_MESSAGE.to_string()
     } else {
         normalized
             .lines()
-            .filter(|line| !is_co_author_trailer(line))
+            .filter(|line| !is_identity_trailer(line))
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -495,10 +500,22 @@ fn normalize_commit_message(proposal: Option<&str>, display_name: &str, agent_id
     }
 }
 
-fn is_co_author_trailer(line: &str) -> bool {
-    line.trim()
-        .get(.."co-authored-by:".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("co-authored-by:"))
+/// trailers that assert someone's identity or endorsement in public history —
+/// an agent must not be able to forge any of them, not just co-authorship.
+const IDENTITY_TRAILERS: &[&str] = &[
+    "co-authored-by:",
+    "signed-off-by:",
+    "reviewed-by:",
+    "acked-by:",
+    "tested-by:",
+];
+
+fn is_identity_trailer(line: &str) -> bool {
+    let line = line.trim();
+    IDENTITY_TRAILERS.iter().any(|trailer| {
+        line.get(..trailer.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(trailer))
+    })
 }
 
 fn sanitize_display_name(input: &str) -> String {

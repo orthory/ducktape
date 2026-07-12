@@ -478,20 +478,30 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
 // ---- commit + push --------------------------------------------------------
 
 #[test]
-fn commit_message_normalization_strips_supplied_coauthors_and_owns_attribution() {
+fn commit_message_normalization_strips_supplied_identity_trailers_and_owns_attribution() {
     let message = normalize_commit_message(
         Some(
-            "Fix the actual bug\r\n\r\nKeep the useful body.\r\n\r\n\
+            "Fix the actual bug\r\n\r\nKeep the useful body:\r\n\tindented code survives\r\n\r\n\
              Co-Authored-By: Human <human@example.com>\r\n\
              Co-Authored-By: Old Bot <old@agents.ducktape.local>\r\n\
-             Co-Authored-By: Forged via Ducktape <forged@example.com>",
+             Co-Authored-By: Forged via Ducktape <forged@example.com>\r\n\
+             Signed-off-by: Forged DCO <dco@example.com>\r\n\
+             Reviewed-by: Fake Reviewer <fake@example.com>\r\n\
+             Acked-by: Fake Acker <ack@example.com>\r\n\
+             Tested-by: Fake Tester <test@example.com>",
         ),
         "Quack\nAgent <unsafe>",
         "quack/bot@example",
     );
-    assert!(message.starts_with("Fix the actual bug\n\nKeep the useful body."));
+    assert!(
+        message.starts_with("Fix the actual bug\n\nKeep the useful body:\n\tindented code survives"),
+        "{message:?}"
+    );
     assert!(!message.contains("Human") && !message.contains("Old Bot"));
-    assert!(!message.contains("Forged"));
+    assert!(!message.contains("Forged") && !message.contains("Fake"));
+    for trailer in ["Signed-off-by:", "Reviewed-by:", "Acked-by:", "Tested-by:"] {
+        assert!(!message.contains(trailer), "{trailer} leaked: {message:?}");
+    }
     assert_eq!(message.matches("Co-Authored-By:").count(), 1);
     assert_eq!(message.matches("via Ducktape").count(), 1);
     let local = attribution_email_local_part("quack/bot@example");
