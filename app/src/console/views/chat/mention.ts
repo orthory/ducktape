@@ -3,7 +3,15 @@
 // plain function over text/blocks so it unit-tests without a DOM.
 
 import type { AgentRecord } from "../../../domain/agent-client";
-import { keyBytes, type AuthorRef, type ChatBlock, type Span } from "../../../domain/chat-client";
+import {
+  authorName,
+  keyBytes,
+  keyHex,
+  type AuthorNames,
+  type AuthorRef,
+  type ChatBlock,
+  type Span,
+} from "../../../domain/chat-client";
 
 // ── Caret token detection ───────────────────────────────
 
@@ -192,6 +200,44 @@ export const mentionResolverOf = (
     }
   }
   return resolver;
+};
+
+// ── Where a rendered mention navigates ──────────────────
+
+/** The principal a mention mark points at, or null when there is nothing to
+ *  open (a module/system author can't be visited). A User mention carries the
+ *  ACCOUNT id — `mentionResolverOf` above marks it with `keyBytes(accountId)` —
+ *  so the members view resolves it through `nodeUsers`, not as a node key. */
+export type MentionTarget = { agentId: string } | { accountId: string };
+
+export const mentionTarget = (mention: AuthorRef): MentionTarget | null => {
+  if (typeof mention !== "object") return null;
+  if ("agent" in mention) return { agentId: mention.agent.agent_id };
+  if ("user" in mention) return { accountId: keyHex(mention.user) };
+  return null;
+};
+
+/** The name to RENDER for a mention (without the leading `@`).
+ *
+ *  Not `authorName`: that renders an agent as `runs/quackbot` — the module is a
+ *  consensus routing detail (see mentionResolverOf), and nobody writes it. The
+ *  composer inserts `@quackbot`, so the mention reads back as the agent's name.
+ *  An agent missing from the roster (deleted, or not hydrated yet) falls back to
+ *  its agent_id — never to the module path, never to an empty label.
+ *
+ *  A USER mention still goes through `authorName`: its bytes are the account id
+ *  and `names` is keyed by it (see hydration's fetchPeopleSlices). */
+export const mentionLabel = (
+  mention: AuthorRef,
+  names: AuthorNames,
+  agents: AgentRecord[],
+): string => {
+  if (typeof mention === "object" && "agent" in mention) {
+    const agentId = mention.agent.agent_id;
+    const known = agents.find((agent) => agent.agent_id === agentId);
+    return known?.display_name.trim() || agentId;
+  }
+  return authorName(mention, names);
 };
 
 const spanMentionsAgent = (span: Span): boolean =>

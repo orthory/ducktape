@@ -17,3 +17,6 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+# the snapshot root is sha256 over the canonical bytes; the legacy-handle
+# regression test forges snapshot bytes no live `set_handle` can produce.
+sha2 = { workspace = true }

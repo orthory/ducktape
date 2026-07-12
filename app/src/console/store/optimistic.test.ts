@@ -124,6 +124,63 @@ describe("page block projections", () => {
     ]);
   });
 
+  it("moves a block under its previous sibling — the Tab indent", () => {
+    const prev = base({ activePage: "root", activePageBlocks: tree });
+    const out = optimistic.pageBlockMoved(prev, {
+      blockId: "b",
+      parent: "a",
+      after: "a1",
+    });
+    expect(out.activePageBlocks!.map((b) => b.id)).toEqual(["root", "a", "a1", "b"]);
+    expect(out.activePageBlocks![0].children).toEqual(["a"]);
+    expect(out.activePageBlocks![1].children).toEqual(["a1", "b"]);
+    expect(out.activePageBlocks![3].parent).toBe("a");
+  });
+
+  it("moves a block up to its grandparent — the Shift+Tab outdent", () => {
+    const prev = base({ activePage: "root", activePageBlocks: tree });
+    const out = optimistic.pageBlockMoved(prev, {
+      blockId: "a1",
+      parent: "root",
+      after: "a",
+    });
+    expect(out.activePageBlocks!.map((b) => b.id)).toEqual(["root", "a", "a1", "b"]);
+    expect(out.activePageBlocks![0].children).toEqual(["a", "a1", "b"]);
+    expect(out.activePageBlocks![1].children).toEqual([]);
+    expect(out.activePageBlocks![2].parent).toBe("root");
+  });
+
+  it("carries the whole subtree on a same-parent reorder", () => {
+    const prev = base({ activePage: "root", activePageBlocks: tree });
+    const out = optimistic.pageBlockMoved(prev, {
+      blockId: "a",
+      parent: "root",
+      after: "b",
+    });
+    expect(out.activePageBlocks!.map((b) => b.id)).toEqual(["root", "b", "a", "a1"]);
+    expect(out.activePageBlocks![0].children).toEqual(["b", "a"]);
+  });
+
+  it("refuses to render a move into the block's own subtree", () => {
+    const prev = base({ activePage: "root", activePageBlocks: tree });
+    expect(
+      optimistic.pageBlockMoved(prev, { blockId: "a", parent: "a1", after: null }),
+    ).toEqual({});
+  });
+
+  it("defers a torn move snapshot (missing parent or anchor) to the refresh", () => {
+    const prev = base({ activePage: "root", activePageBlocks: tree });
+    expect(
+      optimistic.pageBlockMoved(prev, { blockId: "b", parent: "ghost", after: null }),
+    ).toEqual({});
+    expect(
+      optimistic.pageBlockMoved(prev, { blockId: "b", parent: "a", after: "ghost" }),
+    ).toEqual({});
+    expect(
+      optimistic.pageBlockMoved(prev, { blockId: "ghost", parent: "a", after: null }),
+    ).toEqual({});
+  });
+
   it("removes a block with its whole subtree and unlinks the parent", () => {
     const prev = base({ activePage: "root", activePageBlocks: tree });
     const out = optimistic.pageBlockRemoved(prev, "a");

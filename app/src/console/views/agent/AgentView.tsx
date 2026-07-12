@@ -10,13 +10,13 @@
 // This file is the thin shell — tabs, layout, store wiring. The sections live
 // in sibling files; parts.tsx holds the shared atoms.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
-import { AgentDetail, NoAgentsPane } from "./AgentDetail";
+import { AgentDetail, MissingAgentPane, NoAgentsPane } from "./AgentDetail";
 import { primaryButton, runIsMine, secondaryButton, statusTone } from "./parts";
 import { RegisterAgentForm } from "./RegisterAgentForm";
 import { RosterList } from "./RosterList";
@@ -88,10 +88,20 @@ export function AgentView() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [jobWorkerOn, setJobWorkerOn] = useState(false);
+  // With nothing selected, the first agent is a fine default. But once a
+  // selection is EXPLICIT — the roster, or a clicked @agent mention naming an
+  // agent that has since been removed — falling back to the first agent would
+  // silently show a DIFFERENT agent's pane as if it were the one asked for.
+  // An id we can't resolve is a miss, not a redirect. (`agents` is empty until
+  // the roster loads, which is a miss too — NoAgentsPane covers that.)
+  const explicitMiss =
+    selectedAgentId !== null &&
+    state.agents.length > 0 &&
+    !state.agents.some((agent) => agent.agent_id === selectedAgentId);
   const selectedAgent =
-    state.agents.find((agent) => agent.agent_id === selectedAgentId) ??
-    state.agents[0] ??
-    null;
+    selectedAgentId === null
+      ? (state.agents[0] ?? null)
+      : (state.agents.find((agent) => agent.agent_id === selectedAgentId) ?? null);
 
   const toggleJobWorker = () => {
     const next = !jobWorkerOn;
@@ -107,6 +117,19 @@ export function AgentView() {
     setSelectedAgentId(id);
     setAdding(false);
   };
+
+  // Consume a clicked @agent mention's hand-off (state.agentFocus). One-shot:
+  // cleared on consume, so the same agent can be clicked again after browsing
+  // away. Selection is by id only — the roster may not hold it yet, and the
+  // detail pane already falls back to the first agent when it doesn't.
+  const { agentFocus } = state;
+  useEffect(() => {
+    if (agentFocus === null) return;
+    setTab("agents");
+    setAdding(false);
+    setSelectedAgentId(agentFocus);
+    actions.clearAgentFocus();
+  }, [agentFocus, actions]);
 
   return (
     <div
@@ -222,6 +245,8 @@ export function AgentView() {
                   onResume={actions.resumeAgent}
                   onUpdate={actions.updateAgent}
                 />
+              ) : explicitMiss ? (
+                <MissingAgentPane agentId={selectedAgentId!} onBack={() => setSelectedAgentId(null)} />
               ) : (
                 <NoAgentsPane onAdd={startAdding} />
               )}

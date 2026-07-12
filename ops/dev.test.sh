@@ -51,6 +51,7 @@ NODE_BIN="$TMP/staged/ducktape-node"
 mkdir -p "$TMP/staged" "$TMP/wsdir"
 CFG="$TMP/wsdir/node.toml"
 echo "id=0" >"$CFG"
+DUCKTAPE_DEV_PENDING_RUNS_STATE=idle
 
 # staged (running) node = a long sleeper
 cat >"$NODE_BIN" <<'EOF'
@@ -106,6 +107,78 @@ printf '%s\n' "$OUT" | grep -q 'unchanged — skipping restart' && ok "skips the
 kill "$OLD_PID" 2>/dev/null
 wait "$OLD_PID" 2>/dev/null || true
 OLD_PID=""
+unset DUCKTAPE_DEV_PENDING_RUNS_STATE
+
+echo "pending-run reload fence:"
+# A changed binary may be staged while a provider is active, but the live node
+# must not receive SIGTERM. The watcher keeps the deferred config and retries
+# the Runs projection on later poll ticks.
+cat >"$NODE_BIN" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$NODE_BIN"
+cat >"$NODE_SRC" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$NODE_SRC"
+"$NODE_BIN" --config "$CFG" &
+OLD_PID=$!
+DUCKTAPE_DEV_NODE_PIDS="$OLD_PID"
+DUCKTAPE_DEV_NODE_CONFIG="$CFG"
+CARGO="$TMP/cargo-change-stub"
+cat >"$CARGO" <<EOF
+#!/usr/bin/env bash
+printf '\n# rebuilt %s\n' "\$RANDOM" >>"$NODE_SRC"
+EOF
+chmod +x "$CARGO"
+DUCKTAPE_DEV_PENDING_RUNS_STATE=pending
+DEFERRED_RESTART_CFG=""
+PENDING_OUT="$TMP/pending-restart.out"
+restart_node >"$PENDING_OUT" 2>&1
+sed 's/^/    │ /' "$PENDING_OUT"
+kill -0 "$OLD_PID" 2>/dev/null \
+  && ok "keeps the active provider host alive" \
+  || bad "killed the node while an agent run was pending"
+[ "$DEFERRED_RESTART_CFG" = "$CFG" ] \
+  && ok "records the staged restart for a later idle tick" \
+  || bad "lost the deferred restart"
+grep -q 'deferring node restart' "$PENDING_OUT" \
+  && ok "reports the pending-run deferral" \
+  || bad "did not report the pending-run deferral"
+grep -q 'restarting node' "$PENDING_OUT" \
+  && bad "entered the destructive bounce despite a pending run" \
+  || ok "never entered the destructive bounce"
+kill "$OLD_PID" 2>/dev/null || true
+wait "$OLD_PID" 2>/dev/null || true
+OLD_PID=""
+unset DUCKTAPE_DEV_NODE_PIDS DUCKTAPE_DEV_NODE_CONFIG DUCKTAPE_DEV_PENDING_RUNS_STATE
+DEFERRED_RESTART_CFG=""
+
+echo "pending-run query classification:"
+printf 'http_listen = "127.0.0.1:8844"\n' >"$CFG"
+CURL_REPLY="$TMP/curl-reply"
+CURL_STUB="$TMP/curl-stub"
+cat >"$CURL_STUB" <<'EOF'
+#!/usr/bin/env bash
+cat "$CURL_REPLY"
+EOF
+chmod +x "$CURL_STUB"
+export CURL_REPLY
+CURL="$CURL_STUB"
+printf '{"pending_runs":[]}\n' >"$CURL_REPLY"
+[ "$(pending_agent_runs_state "$CFG")" = idle ] \
+  && ok "recognizes a confirmed idle Runs projection" \
+  || bad "missed an idle Runs projection"
+printf '{"pending_runs":[{"run_id":"r"}]}\n' >"$CURL_REPLY"
+[ "$(pending_agent_runs_state "$CFG")" = pending ] \
+  && ok "recognizes an in-flight run" \
+  || bad "missed an in-flight run"
+printf '{"error":"runs unavailable"}\n' >"$CURL_REPLY"
+[ "$(pending_agent_runs_state "$CFG")" = unknown ] \
+  && ok "fails safe when Runs cannot be classified" \
+  || bad "treated an unreadable Runs reply as safe to restart"
 
 echo "app dependency preflight:"
 APPDIR="$TMP/app"

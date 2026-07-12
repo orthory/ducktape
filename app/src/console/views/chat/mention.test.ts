@@ -10,7 +10,9 @@ import {
   mentionCandidates,
   mentionCandidatesAll,
   mentionableUsers,
+  mentionLabel,
   mentionResolverOf,
+  mentionTarget,
   mentionTokenAt,
 } from "./mention";
 
@@ -282,5 +284,48 @@ describe("user mention parsing", () => {
         ],
       },
     ]);
+  });
+});
+
+describe("mentionTarget", () => {
+  it("points an agent mention at the agent id (the module is not the target)", () => {
+    expect(mentionTarget({ agent: { module: "runs", agent_id: "quackbot" } })).toEqual({
+      agentId: "quackbot",
+    });
+  });
+
+  it("points a user mention at the ACCOUNT id its bytes carry", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    expect(mentionTarget({ user: keyBytes(jessKey) })).toEqual({ accountId: jessKey });
+  });
+
+  it("has nothing to open for a module or system author", () => {
+    expect(mentionTarget({ module: "forge" })).toBeNull();
+    expect(mentionTarget("system")).toBeNull();
+  });
+});
+
+describe("mentionLabel", () => {
+  const roster = [agent("quackbot", "Quackbot")];
+
+  it("renders an agent under its display name — NOT the module path", () => {
+    const ref = { agent: { module: "runs", agent_id: "quackbot" } };
+    expect(mentionLabel(ref, {}, roster)).toBe("Quackbot");
+  });
+
+  it("falls back to the agent_id when the roster doesn't hold it (deleted, or pre-connect)", () => {
+    const ref = { agent: { module: "runs", agent_id: "ghost" } };
+    expect(mentionLabel(ref, {}, roster)).toBe("ghost");
+    expect(mentionLabel(ref, {}, [])).toBe("ghost");
+  });
+
+  it("never renders an empty label for an agent with a blank display name", () => {
+    const ref = { agent: { module: "runs", agent_id: "blank" } };
+    expect(mentionLabel(ref, {}, [agent("blank", "  ")])).toBe("blank");
+  });
+
+  it("resolves a user mention through authorName, keyed by the ACCOUNT id", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    expect(mentionLabel({ user: keyBytes(jessKey) }, { [jessKey]: "Jess K" }, [])).toBe("Jess K");
   });
 });

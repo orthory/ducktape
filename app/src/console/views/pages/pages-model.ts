@@ -81,8 +81,6 @@ export interface Shortcut {
 const SHORTCUTS: [string, BlockKind][] = [
   ["[ ] ", "todo"],
   ["### ", "heading3"],
-  ["--- ", "divider"],
-  ["``` ", "code"],
   ["## ", "heading2"],
   ["[] ", "todo"],
   ["# ", "heading1"],
@@ -92,9 +90,23 @@ const SHORTCUTS: [string, BlockKind][] = [
   ["> ", "quote"],
 ];
 
+// Tokens that convert the moment they are COMPLETE, with no trailing space —
+// there is no text after them to keep. They used to be listed as prefixes
+// ("--- ", "``` "), which meant the divider and the code block only appeared if
+// you typed a space onto the end of a rule or a fence. Nobody does, so in
+// practice neither shortcut existed.
+const EXACT: [string, BlockKind][] = [
+  ["---", "divider"],
+  ["***", "divider"],
+  ["```", "code"],
+];
+
 /** Detect a just-typed markdown prefix. The caller applies it only when the
  *  block is still a Paragraph (conversions never chain). */
 export function shortcutFor(text: string): Shortcut | null {
+  for (const [token, kind] of EXACT) {
+    if (text === token) return { kind, rest: "" };
+  }
   for (const [prefix, kind] of SHORTCUTS) {
     if (text.startsWith(prefix)) return { kind, rest: text.slice(prefix.length) };
   }
@@ -138,7 +150,18 @@ export interface MoveTarget {
 }
 
 /** Where Tab sends a block: last child of its PREVIOUS sibling. Null when
- *  there is no previous sibling to adopt it (already as deep as it can go). */
+ *  there is no previous sibling to adopt it (already as deep as it can go), or
+ *  when that sibling is a DIVIDER.
+ *
+ *  A divider is a horizontal rule, not a container: it renders no textarea, has
+ *  no disclosure, and holds no text a child could belong to. The wire would take
+ *  it — MoveBlock validates only page-match and cycles — and that was a hole with
+ *  teeth. Tab under a divider re-parented the block you were typing in UNDER the
+ *  rule; the caret's row then sat directly below it, so Backspace at offset 0 read
+ *  as "remove the divider above" and RemoveBlock took the divider's whole subtree:
+ *  the rule, your block, and everything nested under it. Refusing the indent shuts
+ *  the door; removeDividerAbove's children guard (use-row-handlers) is the second
+ *  lock, for the dividers that already adopted children before this landed. */
 export function indentTarget(
   blocks: PageBlock[],
   blockId: string,
@@ -150,7 +173,7 @@ export function indentTarget(
   const pos = parent.children.indexOf(blockId);
   if (pos <= 0) return null;
   const prevSibling = map.get(parent.children[pos - 1]);
-  if (!prevSibling) return null;
+  if (!prevSibling || prevSibling.kind === "divider") return null;
   const last = prevSibling.children[prevSibling.children.length - 1] ?? null;
   return { parent: prevSibling.id, after: last };
 }
@@ -197,9 +220,68 @@ export function moveDownTarget(
   return { parent: parent.id, after: parent.children[pos + 1] };
 }
 
+/** One insert of a duplicate: the wire's InsertBlock plus the `checked` bit,
+ *  which InsertBlock does not carry (the caller follows with SetChecked). */
+export interface DuplicateOp extends MoveTarget {
+  blockId: string;
+  kind: BlockKind;
+  text: string;
+  checked: boolean;
+}
+
+/** Deep-copy a block and its subtree: preorder inserts with fresh ids, the copy
+ *  landing directly after the original. Empty when the block is unknown or is
+ *  the page root (a page duplicates through the page module, not here).
+ *
+ *  Capped, because every op is a consensus submit — same ceiling as a paste. */
+export function duplicatePlan(
+  blocks: PageBlock[],
+  blockId: string,
+  mintId: () => string,
+  limit = 60,
+): DuplicateOp[] {
+  const map = byId(blocks);
+  const source = map.get(blockId);
+  if (!source || !source.parent) return [];
+
+  const ops: DuplicateOp[] = [];
+  const copy = (srcId: string, parent: string, after: string | null): string | null => {
+    if (ops.length >= limit) return null;
+    const block = map.get(srcId);
+    if (!block) return null;
+    const id = mintId();
+    ops.push({
+      blockId: id,
+      parent,
+      after,
+      kind: block.kind,
+      text: block.text,
+      checked: block.checked,
+    });
+    let prev: string | null = null;
+    for (const child of block.children) prev = copy(child, id, prev) ?? prev;
+    return id;
+  };
+  copy(blockId, source.parent, blockId);
+  return ops;
+}
+
 /** List kinds continue on Enter (a fresh sibling keeps the kind); everything
  *  else splits into a plain paragraph. */
 export const continuationKind = (kind: BlockKind): BlockKind =>
   kind === "bulleted" || kind === "numbered" || kind === "todo"
     ? kind
     : "paragraph";
+
+/** Kinds you escape by pressing Enter on an empty one, rather than nesting
+ *  another below. This used to be inferred from `continuationKind(k) === k`,
+ *  which is only true of the three list kinds — so an empty quote or callout
+ *  stayed put and grew a paragraph underneath it instead of becoming one. */
+export const emptyEnterExits = (kind: BlockKind): boolean =>
+  kind === "bulleted" ||
+  kind === "numbered" ||
+  kind === "todo" ||
+  kind === "quote" ||
+  kind === "code" ||
+  kind === "callout" ||
+  kind === "toggle";

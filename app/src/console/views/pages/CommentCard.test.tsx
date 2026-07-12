@@ -36,6 +36,8 @@ const renderCard = (over: Partial<Parameters<typeof CommentCard>[0]> = {}) => {
     anchor: { x: 400, y: 300 },
     threads: [] as ThreadView[],
     authorNames: {},
+    // alice IS us: authorKey({ user: [1] }) === "user:1".
+    selfKey: "user:1",
     onClose: vi.fn(),
     onSubmitNew: vi.fn(),
     onReply: vi.fn(),
@@ -114,5 +116,40 @@ describe("CommentCard", () => {
     expect(props.onClose).not.toHaveBeenCalled();
     fireEvent.scroll(document);
     expect(props.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  // The module enforces author-only edit/delete. The buttons used to render on
+  // EVERY comment, so a click on someone else's bought a rejected op and an
+  // error — never an edit.
+  it("offers Edit/Delete only on our own comments", () => {
+    const bob: AuthorRef = { user: [2] };
+    const mixed: ThreadView = {
+      ...thread,
+      comments: [
+        thread.comments[0],
+        { ...thread.comments[0], id: "c2", author: bob, text: "not mine" },
+      ],
+    };
+    const { getAllByRole } = renderCard({ threads: [mixed], selfKey: "user:1" });
+    expect(getAllByRole("button", { name: "Edit comment" })).toHaveLength(1);
+    expect(getAllByRole("button", { name: "Delete comment" })).toHaveLength(1);
+  });
+
+  it("offers neither when nothing in the thread is ours", () => {
+    const { queryByRole } = renderCard({ threads: [thread], selfKey: "user:99" });
+    expect(queryByRole("button", { name: "Edit comment" })).toBeNull();
+    expect(queryByRole("button", { name: "Delete comment" })).toBeNull();
+  });
+
+  it("replies through a multi-line textarea, like the new-thread composer", () => {
+    const { getByLabelText, props } = renderCard({ threads: [thread] });
+    const reply = getByLabelText("Reply to thread");
+    expect(reply.tagName).toBe("TEXTAREA");
+    fireEvent.change(reply, { target: { value: "line one" } });
+    // Shift+Enter breaks a line instead of sending — the composer's grammar.
+    fireEvent.keyDown(reply, { key: "Enter", shiftKey: true });
+    expect(props.onReply).not.toHaveBeenCalled();
+    fireEvent.keyDown(reply, { key: "Enter" });
+    expect(props.onReply).toHaveBeenCalledWith("t1", "line one");
   });
 });

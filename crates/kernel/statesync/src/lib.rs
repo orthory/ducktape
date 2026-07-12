@@ -286,6 +286,9 @@ pub struct Manifest {
     /// joiner's boot preflight fence (`to_version` once `height >=
     /// pending.activation_height`, else `current_version`).
     pub required_min_version: u32,
+    /// Canonical ordered module/state-schema fingerprint of the serving
+    /// binary. A joiner checks this before opening any destination substrate.
+    pub state_schema: [u8; 32],
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -574,6 +577,7 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 None => out.push(0),
             }
             out.extend_from_slice(&m.required_min_version.to_le_bytes());
+            out.extend_from_slice(&m.state_schema);
             out.extend_from_slice(&(m.entries.len() as u64).to_le_bytes());
             for e in &m.entries {
                 wire::put_str(&mut out, &e.module_id);
@@ -706,6 +710,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 t => return Err(WireError::BadTag("pending_upgrade", t)),
             };
             let required_min_version = wire::take_u32(&mut buf)?;
+            let state_schema = wire::take_array::<32>(&mut buf)?;
             let n = wire::take_u64(&mut buf)?;
             // each entry costs at least its id length prefix + root + kind, so
             // a forged count can never drive allocation past the buffer.
@@ -765,6 +770,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 current_version,
                 pending_upgrade,
                 required_min_version,
+                state_schema,
                 entries,
             })
         }
@@ -970,6 +976,7 @@ pub struct BoundaryCoords {
 #[derive(Debug, Clone)]
 struct Capture {
     app_hash: StateRoot,
+    state_schema: [u8; 32],
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
     /// shipped-index archive blobs, keyed by database name — the unverified
@@ -987,6 +994,7 @@ struct Capture {
 #[derive(Debug, Clone)]
 pub struct CaptureData {
     app_hash: StateRoot,
+    state_schema: [u8; 32],
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
 }
@@ -1051,6 +1059,7 @@ pub async fn capture_boundary(
         id,
         CaptureData {
             app_hash: snapshot.app_hash,
+            state_schema: host.state_schema_fingerprint(),
             coords: coords.clone(),
             modules,
         },
@@ -1133,6 +1142,7 @@ impl SyncServer {
                     id,
                     Capture {
                         app_hash: data.app_hash,
+                        state_schema: data.state_schema,
                         coords: data.coords,
                         modules: data.modules,
                         index_blobs: None,
@@ -1184,6 +1194,7 @@ impl SyncServer {
             current_version: capture.coords.current_version,
             pending_upgrade: capture.coords.pending_upgrade.clone(),
             required_min_version,
+            state_schema: capture.state_schema,
             entries: capture
                 .modules
                 .iter()
@@ -1356,6 +1367,7 @@ impl SyncServer {
             id,
             Capture {
                 app_hash: id.app_hash,
+                state_schema: [0; 32],
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
                 index_blobs: None,
@@ -1372,6 +1384,7 @@ impl SyncServer {
             id,
             CaptureData {
                 app_hash: id.app_hash,
+                state_schema: [0; 32],
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
             },
@@ -1969,6 +1982,7 @@ mod tests {
                     to_version: 4,
                 }),
                 required_min_version: 3,
+                state_schema: [0xAB; 32],
                 entries: vec![
                     ManifestEntry {
                         module_id: "kv".into(),
@@ -2002,6 +2016,7 @@ mod tests {
                 current_version: 0,
                 pending_upgrade: None,
                 required_min_version: 0,
+                state_schema: [0xAB; 32],
                 entries: vec![],
             }),
             SyncResponse::Chunk {
@@ -2101,6 +2116,7 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes()); // current_version
         bytes.push(0); // pending_upgrade: None
         bytes.extend_from_slice(&0u32.to_le_bytes()); // required_min_version
+        bytes.extend_from_slice(&[0xAB; 32]); // state_schema
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
     }
@@ -2120,6 +2136,7 @@ mod tests {
             current_version: 3,
             pending_upgrade: None,
             required_min_version: 3,
+            state_schema: [0xAB; 32],
             entries: vec![],
         });
         let bytes = encode_response(&resp);
@@ -2148,6 +2165,7 @@ mod tests {
             current_version: 3,
             pending_upgrade: None,
             required_min_version: 3,
+            state_schema: [0xAB; 32],
             entries: vec![],
         };
         assert!(m.preflight(3).is_ok());

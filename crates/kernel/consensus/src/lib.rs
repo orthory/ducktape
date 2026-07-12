@@ -37,7 +37,7 @@
 //! codec / `RoundOrderer` are all UNCHANGED — `SimplexOrderer` slots in behind
 //! the identical trait.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use commonware_actor::Feedback;
@@ -924,6 +924,22 @@ impl FinalizedInbox {
             .len()
     }
 
+    /// the lowest recorded-but-unreleased view (`None` when fully drained) —
+    /// the RELEASE POINT a floor persistence checks a certificate against: a
+    /// certificate whose view sits strictly below every unreleased slot has
+    /// everything at or below it released. a minimum (not the front) because
+    /// the log is record-ordered, and a backfilling node records descending
+    /// views.
+    pub fn min_unreleased_view(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("finalized inbox poisoned")
+            .log
+            .iter()
+            .map(|(view, _)| *view)
+            .min()
+    }
+
     /// release the longest all-ready PREFIX of the log, in finalization
     /// (ascending-view) order. a slot whose bytes have not resolved yet halts
     /// the prefix; each released slot is POPPED off the queue so every frame
@@ -958,22 +974,60 @@ impl FinalizedInbox {
 /// generic over the certificate scheme `S` so we never name a concrete scheme;
 /// the only `Activity` fields touched are `Finalization::proposal::{payload,
 /// round}`, both scheme-independent.
-/// the newest finalization certificate the reporter has observed, shared with
-/// the orderer: `(engine view, scheme-encoded Finalization bytes)`. a recovery
-/// layer persists this once the app has drained everything at or below its
-/// view; a restart then respawns the engine on it (`Floor::Finalized`), which
-/// suppresses journal-replay re-reports below the floor — without it, a
-/// reopened journal re-reports history into a fresh (empty) content store and
-/// the ordered gate wedges awaiting bytes no peer may hold.
-pub type LatestFinalization = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
+/// the newest finalization certificates observed, retained in a bounded
+/// view-keyed window shared with the orderer: `engine view -> scheme-encoded
+/// Finalization bytes`. a recovery layer persists the newest certificate whose
+/// view has fully drained; a restart then respawns the engine on it
+/// (`Floor::Finalized`), which suppresses journal-replay re-reports below the
+/// floor — without it, a reopened journal re-reports history into a fresh
+/// (empty) content store and the ordered gate wedges awaiting bytes no peer
+/// may hold.
+///
+/// a WINDOW, not a single latest slot, on purpose: on a busy chain the newest
+/// certificate is usually for a block still awaiting release, and a single
+/// slot would have already overwritten the one certificate the recovery layer
+/// may persist — the floor then stops tracking the tip for as long as the
+/// load lasts (and the statesync boundary serve, which requires the floor to
+/// certify exactly the tip, starves every joiner).
+pub type RetainedFinalizations = Arc<Mutex<BTreeMap<u64, Vec<u8>>>>;
+
+/// how many recent finalization certificates the window retains: bounds
+/// memory (a certificate is a few hundred bytes) while comfortably covering
+/// the deepest release backlog a single drain pass works through.
+const RETAINED_FINALIZATIONS: usize = 64;
+
+/// insert `view -> cert` into the retained window, pruning the oldest views
+/// past [`RETAINED_FINALIZATIONS`].
+fn retain_finalization(retained: &RetainedFinalizations, view: u64, cert: Vec<u8>) {
+    let mut window = retained.lock().expect("retained finalizations poisoned");
+    window.insert(view, cert);
+    while window.len() > RETAINED_FINALIZATIONS {
+        window.pop_first();
+    }
+}
+
+/// the newest retained certificate at or below `view` (`None` when the window
+/// holds nothing that old — a fresh epoch, or a backlog deeper than the
+/// retention).
+fn newest_finalization_at_or_below(
+    retained: &RetainedFinalizations,
+    view: u64,
+) -> Option<(u64, Vec<u8>)> {
+    retained
+        .lock()
+        .expect("retained finalizations poisoned")
+        .range(..=view)
+        .next_back()
+        .map(|(v, cert)| (*v, cert.clone()))
+}
 
 #[derive(Clone)]
 pub struct SimplexReporter<S> {
     store: ContentStore,
     pending: Arc<Mutex<VecDeque<Digest>>>,
     inbox: FinalizedInbox,
-    /// the shared latest-finalization slot (see [`LatestFinalization`]).
-    latest_final: LatestFinalization,
+    /// the shared retained-certificate window (see [`RetainedFinalizations`]).
+    retained: RetainedFinalizations,
     /// the catch-up fetch seam, wired only via
     /// [`SimplexOrderer::spawn_with_resolver`]. on a finalization MISS the
     /// reporter fetches through this instead of dropping the frame.
@@ -991,13 +1045,13 @@ impl<S> SimplexReporter<S> {
         pending: Arc<Mutex<VecDeque<Digest>>>,
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
-        latest_final: LatestFinalization,
+        retained: RetainedFinalizations,
     ) -> Self {
         Self {
             store,
             pending,
             inbox,
-            latest_final,
+            retained,
             fetcher: PayloadFetcher::new(mailbox),
             _marker: std::marker::PhantomData,
         }
@@ -1051,11 +1105,7 @@ where
             // surface the certificate for the recovery layer (the respawn
             // floor). encoded here because only the reporter holds the typed
             // Finalization<S, _>.
-            *self
-                .latest_final
-                .lock()
-                .expect("latest finalization poisoned") =
-                Some((view, finalization.encode().to_vec()));
+            retain_finalization(&self.retained, view, finalization.encode().to_vec());
         }
         Feedback::Ok
     }
@@ -1074,8 +1124,8 @@ where
 pub struct SimplexOrderer {
     handle: ConsensusHandle,
     inbox: FinalizedInbox,
-    /// the shared latest-finalization slot (see [`LatestFinalization`]).
-    latest_final: LatestFinalization,
+    /// the shared retained-certificate window (see [`RetainedFinalizations`]).
+    retained: RetainedFinalizations,
     /// the engine task: ABORTED by this orderer's `Drop`. a
     /// [`commonware_runtime::Handle`] does NOT abort on drop by itself, so
     /// without the explicit abort an epoch cutover (which replaces the
@@ -1109,23 +1159,21 @@ impl Drop for SimplexOrderer {
 }
 
 impl SimplexOrderer {
-    /// the newest finalization certificate the engine reported: `(engine
-    /// view, scheme-encoded bytes)`. see [`LatestFinalization`] for why a
-    /// recovery layer persists this.
-    pub fn latest_finalization(&self) -> Option<(u64, Vec<u8>)> {
-        self.latest_final
-            .lock()
-            .expect("latest finalization poisoned")
-            .clone()
+    /// the newest retained finalization certificate at or below `view`:
+    /// `(engine view, scheme-encoded bytes)`. a recovery layer calls this
+    /// with the last SEALED view and persists the answer once it clears
+    /// [`SimplexOrderer::min_unreleased_view`] — see [`RetainedFinalizations`].
+    pub fn finalization_at_or_below(&self, view: u64) -> Option<(u64, Vec<u8>)> {
+        newest_finalization_at_or_below(&self.retained, view)
     }
 
-    /// count of finalized slots not yet released by `poll_delivered`. a
-    /// recovery layer persists a finalization floor only when this is 0 —
-    /// read the certificate FIRST, then this: releases happen only on the
-    /// caller's own drain thread, so a zero here proves everything reported
-    /// before the certificate read has been released (and applied).
-    pub fn unreleased_len(&self) -> usize {
-        self.inbox.unreleased_len()
+    /// the lowest recorded-but-unreleased view (`None` when fully drained).
+    /// a recovery layer persists a certificate only when its view sits
+    /// strictly below this — read the certificate FIRST, then this: releases
+    /// happen only on the caller's own drain thread, so a certificate below
+    /// every slot still pending at the later read is fully applied.
+    pub fn min_unreleased_view(&self) -> Option<u64> {
+        self.inbox.min_unreleased_view()
     }
 
     /// depth of this node's pending FIFO — delegates to the shared
@@ -1250,13 +1298,13 @@ impl SimplexOrderer {
         );
         let handle = automaton.handle(store.clone());
         let (mailbox, fetch_handle) = fetch.unzip();
-        let latest_final = LatestFinalization::default();
+        let retained = RetainedFinalizations::default();
         let reporter = SimplexReporter::<S>::new(
             store.clone(),
             automaton.pending(),
             inbox.clone(),
             mailbox,
-            latest_final.clone(),
+            retained.clone(),
         );
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
@@ -1301,7 +1349,7 @@ impl SimplexOrderer {
         SimplexOrderer {
             handle,
             inbox,
-            latest_final,
+            retained,
             engine: engine_handle,
             resolver_fetch: fetch_handle,
             payload_drain,
@@ -1500,7 +1548,7 @@ impl SimplexOrderer {
 
 /// decode a persisted finalization certificate back to the typed
 /// [`Finalization`] a respawn floor needs, under `scheme`'s certificate codec
-/// bounds. the counterpart of [`SimplexOrderer::latest_finalization`]'s
+/// bounds. the counterpart of the retained window's
 /// encoding; a decode failure means the persisted floor is damaged — callers
 /// FAIL rather than silently fall back to a genesis floor, which would
 /// resurrect the journal-replay wedge the floor exists to prevent.
@@ -1595,12 +1643,11 @@ pub struct FollowerOrderer {
     /// normal and the phase-2 driver cross-checks it against its journal
     /// heights, backfilling any missed finalization over the Frames lane.
     last_admitted: Option<u64>,
-    /// the shared latest-finalization slot (see [`LatestFinalization`]) —
-    /// monotonic by view here, unlike the reporter's blind overwrite: the
-    /// engine reports ascending views by construction, but a follower can be
-    /// handed a REPLAYED old certificate, and regressing the slot would
-    /// persist a stale respawn floor.
-    latest_final: LatestFinalization,
+    /// the shared retained-certificate window (see [`RetainedFinalizations`]).
+    /// a REPLAYED old certificate just lands at its own view key — selection
+    /// is always "newest at or below a released view", so a stale re-observe
+    /// can never regress the persisted respawn floor.
+    retained: RetainedFinalizations,
     /// the catch-up fetch seam, wired only on the [`FollowerOrderer::spawn`] /
     /// [`FollowerOrderer::spawn_resolver`] paths. a finalization MISS without
     /// it drops the slot — the eager-only semantics of the bare constructor.
@@ -1634,7 +1681,7 @@ impl FollowerOrderer {
             store,
             inbox: FinalizedInbox::new(),
             last_admitted: None,
-            latest_final: LatestFinalization::default(),
+            retained: RetainedFinalizations::default(),
             fetcher: PayloadFetcher::new(None),
             resolver_fetch: None,
             payload_drain: None,
@@ -1678,7 +1725,7 @@ impl FollowerOrderer {
             store,
             inbox,
             last_admitted: None,
-            latest_final: LatestFinalization::default(),
+            retained: RetainedFinalizations::default(),
             fetcher: PayloadFetcher::new(Some(mailbox)),
             resolver_fetch: Some(fetch_handle),
             payload_drain: None,
@@ -1787,30 +1834,28 @@ impl FollowerOrderer {
             self.fetcher.fetch_or_defer(digest);
         }
         self.last_admitted = Some(view);
-        let mut latest = self
-            .latest_final
-            .lock()
-            .expect("latest finalization poisoned");
-        if latest.as_ref().is_none_or(|(v, _)| view > *v) {
-            *latest = Some((view, cert_bytes.to_vec()));
-        }
+        retain_finalization(&self.retained, view, cert_bytes.to_vec());
         Ok(Observed::Admitted(view))
     }
 
     /// the newest finalization certificate observed: `(view, encoded bytes)`.
-    /// see [`LatestFinalization`] — the recovery layer persists this as the
-    /// respawn floor once everything at or below it has drained.
+    /// see [`RetainedFinalizations`] — the recovery layer persists a floor
+    /// through [`FollowerOrderer::finalization_at_or_below`]; this is the
+    /// unbounded ("at or below anything") read of the same window.
     pub fn latest_finalization(&self) -> Option<(u64, Vec<u8>)> {
-        self.latest_final
-            .lock()
-            .expect("latest finalization poisoned")
-            .clone()
+        newest_finalization_at_or_below(&self.retained, u64::MAX)
     }
 
-    /// count of finalized slots not yet released by `poll_delivered` — the
-    /// same floor-persistence gate [`SimplexOrderer::unreleased_len`] serves.
-    pub fn unreleased_len(&self) -> usize {
-        self.inbox.unreleased_len()
+    /// the newest retained certificate at or below `view` — the follower
+    /// counterpart of [`SimplexOrderer::finalization_at_or_below`].
+    pub fn finalization_at_or_below(&self, view: u64) -> Option<(u64, Vec<u8>)> {
+        newest_finalization_at_or_below(&self.retained, view)
+    }
+
+    /// the lowest recorded-but-unreleased view — the follower counterpart of
+    /// [`SimplexOrderer::min_unreleased_view`].
+    pub fn min_unreleased_view(&self) -> Option<u64> {
+        self.inbox.min_unreleased_view()
     }
 }
 
@@ -1834,6 +1879,78 @@ mod tests {
     #[test]
     fn default_block_time_is_one_second() {
         assert_eq!(BLOCK_TIME, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retained_finalizations_window_prunes_oldest_and_selects_at_or_below() {
+        let retained = RetainedFinalizations::default();
+        for view in 1..=(RETAINED_FINALIZATIONS as u64 + 8) {
+            retain_finalization(&retained, view, format!("cert-{view}").into_bytes());
+        }
+        // the window holds exactly the cap, oldest views pruned first.
+        assert_eq!(
+            newest_finalization_at_or_below(&retained, 8),
+            None,
+            "views below the retention window are gone"
+        );
+        // selection is "newest at or below": an exact hit and a gap probe.
+        let tip = RETAINED_FINALIZATIONS as u64 + 8;
+        assert_eq!(
+            newest_finalization_at_or_below(&retained, tip),
+            Some((tip, format!("cert-{tip}").into_bytes()))
+        );
+        assert_eq!(
+            newest_finalization_at_or_below(&retained, u64::MAX),
+            Some((tip, format!("cert-{tip}").into_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_released_views_certificate_stays_persistable_while_newer_certs_arrive() {
+        // the busy-chain floor-persistence shape: view 1 released (applied),
+        // view 2's certificate already reported but its slot still awaiting
+        // release. a single latest-cert slot + "inbox empty" gate starves
+        // here forever (the exact livelock that froze the statesync floor
+        // under load); the retained window + release-point check persists
+        // view 1's certificate immediately.
+        let store = ContentStore::new();
+        let retained = RetainedFinalizations::default();
+        let inbox = FinalizedInbox::new();
+
+        let one = store.put(b"block one".to_vec());
+        inbox.record(1, one, &store, false);
+        retain_finalization(&retained, 1, b"cert-one".to_vec());
+        assert_eq!(inbox.drain().len(), 1, "view 1 releases");
+
+        // view 2 finalizes (cert observed, bytes still awaited elsewhere)
+        // BEFORE the floor check runs — the always-busy interleaving.
+        let two = digest_of(b"block two, bytes in flight");
+        inbox.record(2, two, &store, true);
+        retain_finalization(&retained, 2, b"cert-two".to_vec());
+
+        // the release point proves view 1 is fully applied...
+        let sealed_tip = 1;
+        let (view, cert) =
+            newest_finalization_at_or_below(&retained, sealed_tip).expect("cert retained");
+        assert_eq!((view, cert), (1, b"cert-one".to_vec()));
+        assert!(
+            inbox.min_unreleased_view().is_none_or(|pending| pending > view),
+            "everything at or below the selected certificate has released"
+        );
+        // ...even though the inbox is NOT empty (the old gate's starvation).
+        assert_eq!(inbox.unreleased_len(), 1);
+    }
+
+    #[test]
+    fn min_unreleased_view_is_a_minimum_not_the_log_front() {
+        // a backfilling node records DESCENDING views; the release point must
+        // report the lowest pending view, not whatever sits at the log front,
+        // or a floor could persist above an unapplied backfilled block.
+        let store = ContentStore::new();
+        let inbox = FinalizedInbox::new();
+        inbox.record(5, digest_of(b"tip first"), &store, true);
+        inbox.record(3, digest_of(b"backfill below it"), &store, true);
+        assert_eq!(inbox.min_unreleased_view(), Some(3));
     }
 
     #[test]

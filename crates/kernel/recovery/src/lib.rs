@@ -89,6 +89,53 @@ use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_batch, decode_frame};
 use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
+/// Stable machine-readable marker consumed by the native shell when a node
+/// refuses a clean-break-incompatible workspace.
+pub const STATE_SCHEMA_INCOMPATIBLE_MARKER: &str = "DUCKTAPE_STATE_SCHEMA_INCOMPATIBLE";
+
+/// A checkpoint was produced by a different canonical module-state schema.
+/// This is not corruption and is never repaired in place: changing snapshot
+/// bytes would rewrite module roots, the app hash, and sealed history.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{STATE_SCHEMA_INCOMPATIBLE_MARKER}: workspace state schema {found} is incompatible with this binary ({expected}); workspace data was not modified. Archive this workspace and create a fresh workspace. Ducktape identity and account keys are stored outside workspace state and must be preserved."
+)]
+pub struct IncompatibleStateSchema {
+    expected: FingerprintDisplay,
+    found: FingerprintDisplay,
+}
+
+/// Compare a persisted schema fingerprint with the binary's production
+/// schema. `None` names the exact legacy manifest format that predates this
+/// fence.
+pub fn check_state_schema(
+    found: Option<[u8; 32]>,
+    expected: [u8; 32],
+) -> Result<(), IncompatibleStateSchema> {
+    if found == Some(expected) {
+        return Ok(());
+    }
+    Err(IncompatibleStateSchema {
+        expected: FingerprintDisplay(Some(expected)),
+        found: FingerprintDisplay(found),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FingerprintDisplay(Option<[u8; 32]>);
+
+impl std::fmt::Display for FingerprintDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(bytes) = self.0 else {
+            return f.write_str("legacy/unversioned");
+        };
+        for byte in bytes {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// runtime bounds every store here needs (same alias the storage crate uses:
 /// `Storage + Clock + Metrics`).
 pub use commonware_storage::Context;
@@ -458,6 +505,10 @@ pub struct Manifest {
     /// `current_version`). the boot preflight compares the local build's
     /// `MAX_PROTOCOL_VERSION` against this and refuses EARLY when it is lower.
     pub required_min_version: u32,
+    /// Fingerprint of the exact ordered module/state-schema set that produced
+    /// this checkpoint. `None` decodes only legacy manifests written before
+    /// the clean-break fence existed; preflight rejects them actionably.
+    pub state_schema: Option<[u8; 32]>,
 }
 
 impl Manifest {
@@ -501,6 +552,9 @@ impl Manifest {
         }
         put_u32(&mut out, self.required_min_version);
         put_keys(&mut out, &self.residents);
+        if let Some(fingerprint) = self.state_schema {
+            out.extend_from_slice(&fingerprint);
+        }
         out
     }
 
@@ -551,6 +605,18 @@ impl Manifest {
         };
         let required_min_version = c.u32()?;
         let residents = get_keys(&mut c)?;
+        // The exact EOF after `residents` is the pre-schema-manifest format.
+        // Preserve that distinction so boot reports an incompatible workspace,
+        // not damaged/truncated storage. A partial new trailer is corruption.
+        let state_schema = if c.at == c.buf.len() {
+            None
+        } else {
+            Some(
+                c.take(32)?
+                    .try_into()
+                    .expect("state schema fingerprint is 32 bytes"),
+            )
+        };
         c.done()?;
         Ok(Self {
             height,
@@ -567,6 +633,7 @@ impl Manifest {
             current_version,
             pending_upgrade,
             required_min_version,
+            state_schema,
         })
     }
 
@@ -645,6 +712,7 @@ impl Manifest {
             current_version,
             pending_upgrade,
             required_min_version,
+            state_schema: Some(host.state_schema_fingerprint()),
         })
     }
 
@@ -655,6 +723,15 @@ impl Manifest {
     /// it (replica park, sync-only boot, validator boot).
     pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
         sdk::check_required_version(self.required_min_version, max_supported)
+    }
+
+    /// Clean-break state-schema preflight. Call this before opening or
+    /// installing any module substrate.
+    pub fn preflight_state_schema(
+        &self,
+        expected: [u8; 32],
+    ) -> Result<(), IncompatibleStateSchema> {
+        check_state_schema(self.state_schema, expected)
     }
 }
 
@@ -712,6 +789,14 @@ where
     journal: OpJournal<E>,
     manifest_store: Meta<E>,
     cert_store: Meta<E>,
+    /// the out-of-band source of component BYTES for code-registry swaps.
+    /// replay reconciles running module code against the committed registry
+    /// before each re-applied block (`Host::realize_module_swaps`) — a block
+    /// sealed after a swap re-executes on the SAME code it ran live, or its
+    /// sealed roots cannot reproduce. defaults to [`host::NoCodeSource`]:
+    /// fail-closed at the first armed boundary if the node never wired one.
+    /// `Arc` (not `Box`) so the replay loop can share it past `&mut self`.
+    code_source: std::sync::Arc<dyn host::CodeSource>,
 }
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
@@ -774,7 +859,21 @@ where
             journal,
             manifest_store,
             cert_store,
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         })
+    }
+
+    /// wire the out-of-band component-byte source for code-registry swaps (the
+    /// node injects a blobstore-backed one). the default is
+    /// [`host::NoCodeSource`] — see the field doc.
+    pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
+        self.code_source = src;
+    }
+
+    /// the wired code source (the catch-up applier realizes swaps through the
+    /// same source replay uses, so every path reconciles identically).
+    pub fn code_source(&self) -> std::sync::Arc<dyn host::CodeSource> {
+        std::sync::Arc::clone(&self.code_source)
     }
 
     /// the persisted checkpoint, if any. `None` means this storage dir has
@@ -1121,6 +1220,8 @@ where
         manifest: &Manifest,
         mut sink: Option<&mut dyn ReplaySink>,
     ) -> Result<Recovered, Error> {
+        // shared past the `&mut self` journal borrows below (see the field doc).
+        let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.app_hash;
@@ -1349,9 +1450,15 @@ where
                                 sink.opaque_block(height);
                             }
                         } else if all_pre {
-                            let (_, dispatches) =
-                                apply_block(host, height, &frame, protocol_version, Some(disposition))
-                                    .await?;
+                            let (_, dispatches) = apply_block(
+                                host,
+                                height,
+                                &frame,
+                                protocol_version,
+                                Some(disposition),
+                                code_source.as_ref(),
+                            )
+                            .await?;
                             if let Some(sink) = sink.as_mut() {
                                 sink.folded_block(&FoldedBlock {
                                     height,
@@ -1446,6 +1553,7 @@ where
                                 protocol_version,
                                 Some(disposition),
                                 &commit_only,
+                                code_source.as_ref(),
                             )
                             .await?;
                             if let Some(sink) = sink.as_mut() {
@@ -1511,8 +1619,15 @@ where
                 .collect();
             host.set_active_version(protocol_version);
             let disposition = if moved.is_empty() {
-                let (disposition, dispatches) =
-                    apply_block(host, height, &frame, protocol_version, None).await?;
+                let (disposition, dispatches) = apply_block(
+                    host,
+                    height,
+                    &frame,
+                    protocol_version,
+                    None,
+                    code_source.as_ref(),
+                )
+                .await?;
                 if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
                         height,
@@ -1559,6 +1674,7 @@ where
                         protocol_version,
                         None,
                         &commit_only,
+                        code_source.as_ref(),
                     )
                     .await?;
                     // the re-execution's own disposition is NOT a backstop:
@@ -1622,6 +1738,16 @@ where
         if let Some(h) = tip_height {
             let v = host.effective_version(h).await;
             host.set_active_version(v);
+            // the code-space twin: reconcile running module code to the committed
+            // registry at the tip, so a checkpoint AT (or past) a swap boundary —
+            // no replayed frame to realize through — still boots on the committed
+            // code instead of serving stale genesis components until the next
+            // live block. idempotent; fail-closed on missing/tampered bytes.
+            host.realize_module_swaps(h, code_source.as_ref())
+                .await
+                .map_err(|e| {
+                    Error::Verify(format!("code-swap realization at recovered tip {h}: {e}"))
+                })?;
         }
         // THE verification: the recomposed state must be byte-identical to
         // what consensus sealed at the tip. anything else means the recovered
@@ -1661,8 +1787,10 @@ async fn apply_block(
     frame: &[u8],
     protocol_version: u32,
     expect: Option<Disposition>,
+    code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let (disposition, dispatches) = replay_batch(host, height, frame, protocol_version, None).await?;
+    let (disposition, dispatches) =
+        replay_batch(host, height, frame, protocol_version, None, code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1685,9 +1813,10 @@ async fn apply_block_committing(
     protocol_version: u32,
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
+    code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     let (disposition, dispatches) =
-        replay_batch(host, height, frame, protocol_version, Some(commit_only)).await?;
+        replay_batch(host, height, frame, protocol_version, Some(commit_only), code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1738,7 +1867,16 @@ async fn replay_batch(
     frame: &[u8],
     protocol_version: u32,
     commit_only: Option<&BTreeSet<ModuleId>>,
+    code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    // CODE-SWAP REALIZATION, mirroring the live drain: a block sealed after a
+    // code-registry swap executed on the NEW component, so replay must swap
+    // before re-applying or the sealed roots cannot reproduce. keyed purely on
+    // the replayed committed registry state + height — the identical swap
+    // points the live node realized. fail-closed on missing/tampered bytes.
+    host.realize_module_swaps(height, code_source)
+        .await
+        .map_err(|e| Error::Verify(format!("code-swap realization at height {height}: {e}")))?;
     // a batch that never decoded was a whole-block deterministic no-op at runtime
     // too — the live drain sealed it Rejected without touching state.
     let Ok(members) = decode_batch(frame) else {
@@ -1905,6 +2043,7 @@ mod tests {
             current_version: 0,
             pending_upgrade: None,
             required_min_version: 0,
+            state_schema: Some([0xAB; 32]),
         }
     }
 
@@ -1929,6 +2068,32 @@ mod tests {
             ..sample_manifest()
         };
         assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
+    }
+
+    #[test]
+    fn legacy_manifest_decodes_for_actionable_schema_preflight() {
+        let current = sample_manifest();
+        let mut legacy = current.clone();
+        legacy.state_schema = None;
+        let decoded = Manifest::decode(&legacy.encode()).expect("legacy shape is classifiable");
+        assert_eq!(decoded.state_schema, None);
+
+        let error = decoded
+            .preflight_state_schema([0xAB; 32])
+            .expect_err("legacy schema must clean-break");
+        let message = error.to_string();
+        assert!(message.contains(STATE_SCHEMA_INCOMPATIBLE_MARKER));
+        assert!(message.contains("legacy/unversioned"));
+        assert!(message.contains("workspace data was not modified"));
+    }
+
+    #[test]
+    fn schema_revision_changes_the_preflight_identity() {
+        let revision_one = host::state_schema_fingerprint([("runs", 1)]);
+        let revision_two = host::state_schema_fingerprint([("runs", 2)]);
+        assert_ne!(revision_one, revision_two);
+        assert!(check_state_schema(Some(revision_two), revision_two).is_ok());
+        assert!(check_state_schema(Some(revision_one), revision_two).is_err());
     }
 
     #[test]

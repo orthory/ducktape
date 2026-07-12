@@ -179,6 +179,7 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         current_version: host::BASELINE_VERSION,
         pending_upgrade: None,
         required_min_version: host::BASELINE_VERSION,
+        state_schema: [0xAB; 32],
         entries: vec![ManifestEntry {
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),

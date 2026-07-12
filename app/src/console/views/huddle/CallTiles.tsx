@@ -97,7 +97,9 @@ export function StageTile({
     minHeight: big ? 0 : 84,
     borderRadius: radius.md,
     overflow: "hidden",
-    background: color.dark,
+    // scrim, not `color.dark` (= --c-filled, which INVERTS): a video letterbox
+    // must stay dark in both themes, or dark mode letterboxes in near-white.
+    background: color.scrim,
     border: `2px solid ${member.speaking ? color.green : "transparent"}`,
     boxSizing: "border-box",
   };
@@ -138,8 +140,11 @@ export function StageTile({
           gap: 4,
           padding: "2px 7px",
           borderRadius: 999,
-          background: "rgba(38,37,31,.62)",
-          color: color.onDark,
+          // an always-dark chip needs always-light text. `color.onDark` is
+          // --c-on-filled, which flips to near-BLACK in dark mode — the name
+          // then disappeared into the chip.
+          background: color.scrimSoft,
+          color: color.onScrim,
           font: `600 ${big ? 12 : 10.5}px ${font.sans}`,
         }}
       >

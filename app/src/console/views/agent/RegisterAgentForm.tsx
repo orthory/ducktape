@@ -65,7 +65,14 @@ export function RegisterAgentForm({
   // The id is derived from the name by default; this reveals the override.
   const [showAdvanced, setShowAdvanced] = useState(false);
 
+  // `slug` is total: it yields a legal `<id>@agents.duck` label (truncated to
+  // the consensus cap, hyphens trimmed) or nothing at all. Nothing is the one
+  // case the node would reject, so it is the one case to report.
   const agentId = slug(agentIdInput || displayName);
+  const idProblem =
+    (agentIdInput || displayName).trim() !== "" && agentId === ""
+      ? "id needs a letter or a number"
+      : null;
   const ready =
     displayName.trim() !== "" &&
     agentId !== "" &&
@@ -310,6 +317,7 @@ export function RegisterAgentForm({
             </button>
             <span
               translate="no"
+              role={idProblem ? "alert" : undefined}
               style={{
                 flex: 1,
                 minWidth: 0,
@@ -318,10 +326,10 @@ export function RegisterAgentForm({
                 whiteSpace: "nowrap",
                 textAlign: "right",
                 font: `400 11px ${font.mono}`,
-                color: color.muted2,
+                color: idProblem ? color.danger : color.muted2,
               }}
             >
-              saved as {agentId || "—"}
+              {idProblem ?? `saved as ${agentId || "—"}`}
             </span>
             {onDone && (
               <button type="button" onClick={onDone} style={secondaryButton}>

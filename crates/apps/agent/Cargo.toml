@@ -19,3 +19,8 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 futures = "0.3"
+# TEST-ONLY (no layering edge at build time): the agent id rule is a copy of
+# duckdns's `.duck` label rule — because the id IS the local part of
+# `<agent_id>@agents.duck`. `agent_id_shape_matches_the_duckdns_label_rule`
+# pins the copies together so neither can drift alone.
+duckdns = { workspace = true }

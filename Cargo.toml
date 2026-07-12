@@ -32,6 +32,7 @@ members = [
     "crates/kernel/sdk", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
+    "crates/kernel/wasm-host",
     # system — consensus infrastructure modules
     "crates/system/kv", 
     "crates/system/valset", 
@@ -51,6 +52,7 @@ members = [
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging",
+    "crates/system/modreg",
     "crates/system/duckdns",
     "crates/system/gateway",
     "crates/duckfs/core",
@@ -159,6 +161,12 @@ zeroize = "1"
 # default-features = false drops the in-database WASM layer (wasmtime).
 fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
 
+# wasmtime — the frozen-substrate wasm runtime that executes hot-swappable
+# modules inside the host. pinned EXACTLY: the runtime IS the module execution
+# semantics, so it is consensus-affecting and every validator must run the
+# identical build; changing it is a binary upgrade, never a live module swap.
+wasmtime = "=46.0.1"
+
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
 host = { path = "crates/kernel/host" }
@@ -168,6 +176,7 @@ statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
 capability-host = { path = "crates/system/capability-host" }
+wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
@@ -182,6 +191,7 @@ blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
+modreg = { path = "crates/system/modreg" }
 duckdns = { path = "crates/system/duckdns" }
 gateway = { path = "crates/system/gateway" }
 forge = { path = "crates/apps/forge" }

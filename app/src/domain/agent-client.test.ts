@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   agent,
+  agentAddress,
   agents,
   hexToBytes,
   pauseAgent,
@@ -17,6 +18,7 @@ import {
   updateAgent,
 } from "./agent-client";
 import type { AgentRecord, SkillRef } from "./agent-client";
+import { RESERVED_ROOT_LABELS } from "./duckdns-client";
 import { makeTransportStub } from "../test/transport-stub";
 
 const stubTransport = (reply?: unknown) =>
@@ -189,5 +191,40 @@ describe("agent queries", () => {
 
     const absent = stubTransport({ agent: null });
     await expect(agent(absent, "ghost")).resolves.toBeNull();
+  });
+});
+
+// An address the agent cannot be reached at is worse than no address. Consensus
+// admits only DNS-label ids, and those ARE the local part verbatim. A LEGACY
+// agent (registered before that rule) holds any id, and forge addresses it as
+// `<slug>.<hash>@agents.duck` off the complete id — so `<id>@agents.duck` would
+// be a plain lie. Show nothing instead.
+describe("agent address", () => {
+  it("is the id verbatim for every id consensus admits", () => {
+    for (const id of ["quackbot", "qa-luna", "a", "9", "a--b", "x".repeat(63)]) {
+      expect(agentAddress(id)).toBe(`${id}@agents.duck`);
+    }
+  });
+
+  it("is absent for a legacy id, never a false address", () => {
+    for (const legacy of [
+      "qa luna",
+      "QA-Luna",
+      "quack/bot@example",
+      "under_score",
+      "dot.ted",
+      "-lead",
+      "trail-",
+      "",
+      "x".repeat(64),
+    ]) {
+      expect(agentAddress(legacy), legacy).toBeNull();
+    }
+  });
+
+  // the domain is unownable only because `agents` is reserved in duckdns.
+  it("lives under the reserved root label", () => {
+    expect(RESERVED_ROOT_LABELS.has("agents")).toBe(true);
+    expect(agentAddress("quackbot")).toContain("@agents.duck");
   });
 });

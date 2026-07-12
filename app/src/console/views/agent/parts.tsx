@@ -165,11 +165,22 @@ export const onDarkButton: CSSProperties = {
 
 // ── Wire → display helpers ──────────────────────────────
 
+/** Consensus admits only DNS-label agent ids (`validate_agent_id`,
+ *  crates/apps/agent/src/lib.rs) — the id IS the local part of
+ *  `<agent_id>@agents.duck`. The Rust const is the source of truth; the drift
+ *  test in parts.test.ts reads it. */
+export const MAX_AGENT_ID_LEN = 63;
+
+/** Derive an agent id from free text. TOTAL: the result is always a legal
+ *  label or the empty string (the caller's only failure case) — truncation to
+ *  the length cap happens BEFORE the hyphen trim, so a cut mid-word can't
+ *  leave a trailing hyphen. */
 export const slug = (raw: string): string =>
   raw
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
+    .slice(0, MAX_AGENT_ID_LEN)
     .replace(/(^-|-$)/g, "");
 
 /** Present a lowercase executor tag ("codex") as a friendly label ("Codex").

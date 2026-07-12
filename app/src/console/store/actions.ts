@@ -19,6 +19,7 @@ import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
+import { classifyBootError } from "../../domain/boot-error";
 import type { NodeTransport } from "../../domain/transport";
 import { callSocketUrl } from "../../domain/transport";
 // Task 7 moved the huddle session to call-session (typed /v1/call/ws + audio +
@@ -59,6 +60,8 @@ import {
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity } from "./auto-bind";
+import { navSnapshotOf } from "./nav-history";
+import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -118,13 +121,28 @@ export interface ConsoleActions {
   /** Jump to the files browser opened on `path` — the same one-shot hand-off,
    *  used by the agent form to open a skill document in Files. */
   openFiles(path: string): void;
+  /** Jump to an agent's detail — a clicked @agent mention (the forgeFocus idiom). */
+  openAgent(agentId: string): void;
+  /** Jump to a person in Members — a clicked @user mention. Takes the ACCOUNT id
+   *  the mention mark carries; the view resolves it to that account's node rows. */
+  openMember(accountId: string): void;
   /** The explorer calls this once it has consumed (or given up on) a pending
    *  focus hand-off. */
   clearExplorerFocus(): void;
+  /** AgentView / MembersView call these once the mention hand-off is consumed —
+   *  the focus is one-shot, so the same person can be clicked twice. */
+  clearAgentFocus(): void;
+  clearMemberFocus(): void;
   /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
    *  Jumps to the target rail's default surface when the current screen belongs
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
+  /** Apply a browser-history entry's nav snapshot — the popstate half of
+   *  back/forward (see nav-history.ts). Selections re-apply through the
+   *  rehydrating entry points, so a restored surface re-fetches recent data;
+   *  returns the snapshot actually honored (vanished targets are skipped) for
+   *  the caller to re-stamp onto the entry. */
+  applyNavSnapshot(snap: NavSnapshot): NavSnapshot;
   setAccent(accent: string): void;
   /** Flip the light/dark color theme and persist the choice. */
   toggleTheme(): void;
@@ -313,28 +331,37 @@ export interface ConsoleActions {
   /** Close a document tab; activates a neighbor if it was active. */
   closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
-   *  focus to the new block, so it must know the id before the round-trip). */
+   *  focus to the new block, so it must know the id before the round-trip).
+   *
+   *  Resolves true once the op commits, false if it failed (the failure is
+   *  already surfaced). The pages editor's split/merge use this to compensate:
+   *  a failed op is never rolled back, it is erased by the next authoritative
+   *  refresh, so a lost additive op would silently destroy text. */
   insertPageBlock(params: {
     blockId: string;
     parent: string;
     after: string | null;
     kind: PageBlockKind;
     text: string;
-  }): void;
-  /** Replace a block's text; on the page root this renames the page. */
-  updatePageBlockText(params: { blockId: string; text: string }): void;
+  }): Promise<boolean>;
+  /** Replace a block's text; on the page root this renames the page.
+   *  Resolves true once the op commits — see `insertPageBlock`. */
+  updatePageBlockText(params: { blockId: string; text: string }): Promise<boolean>;
   /** Convert a block to another kind (markdown shortcuts, slash menu). */
   setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
   /** Flip a Todo block's checked state. */
   setPageBlockChecked(params: { blockId: string; checked: boolean }): void;
-  /** Move a block under a (possibly new) parent in the active page. */
+  /** Move a block under a (possibly new) parent in the active page.
+   *  Resolves true once the op commits — see `insertPageBlock`. The merge gates
+   *  its RemoveBlock on this: a child that did not make it across to the adopter
+   *  is still under the block about to be deleted, subtree and all. */
   movePageBlock(params: {
     blockId: string;
     parent: string;
     after: string | null;
-  }): void;
-  /** Remove a block and its whole subtree. */
-  removePageBlock(blockId: string): void;
+  }): Promise<boolean>;
+  /** Remove a block AND ITS WHOLE SUBTREE. Resolves true once the op commits. */
+  removePageBlock(blockId: string): Promise<boolean>;
 
   // ── Comments (threads over the `comments` module) ──
   /** Load the open page's comment threads (page + every visible block). */
@@ -866,8 +893,43 @@ export function createActions({
         if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
         fail(err);
-        return refresh().then(() => true);
+        // resolve false rather than reject: a failed op is already surfaced to
+        // the user here, and rejecting would turn every caller that ignores the
+        // result into an unhandled rejection. `false` therefore means "this op
+        // did not land" — whether it failed or the node switched underneath it.
+        // Callers gate their follow-up work on it, so a failed write can no
+        // longer trigger a success-only side effect (the pages editor's
+        // compensating split/merge depends on this, and it stops
+        // `createChildPage` from opening a page that was never created).
+        return refresh().then(() => false);
       });
+  };
+
+  // The transport gives NO ordering guarantee. `/v1/submit` is one independent
+  // HTTP POST per op (transport.ts), and the node's handler pushes each one onto
+  // the mempool as it ARRIVES, so ops drain in arrival order — two submits fired
+  // in the same tick can reach it either way round.
+  //
+  // The pages editor issues ANCHOR-CHAINED ops: a paste inserts each block
+  // `after` the one before it, a duplicate parents each copy under the copy
+  // above it, and a merge re-parents children onto the adopter and only THEN
+  // removes their old parent. Every one of those is a rejected op
+  // (AnchorNotFound / ParentNotFound) or a destroyed subtree if it lands early —
+  // that is how a merge of a parent with two children lost the second one.
+  //
+  // So page-block ops reach the node one at a time, in issue order. Only the
+  // WIRE is serialized: submitTracked applies the optimistic projection before
+  // it ever calls the submit thunk, so a 60-block paste still renders in one
+  // tick. A rejected op must not wedge the queue behind it, so the chain swallows
+  // its outcome (submitTracked still sees the real one).
+  let pageWire: Promise<unknown> = Promise.resolve();
+  const inPageOrder = <T,>(send: () => Promise<T>): Promise<T> => {
+    const sent = pageWire.then(send, send);
+    pageWire = sent.then(
+      () => undefined,
+      () => undefined,
+    );
+    return sent;
   };
 
   // switching channels means: new active channel, thread panel closed, any
@@ -901,10 +963,15 @@ export function createActions({
   // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
   // the post — otherwise the mention commits with nothing routing it to the
   // agent. An existing watch of ANY policy is respected, never overwritten.
-  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<boolean> => {
-    if (!hasAgentMention(blocks)) return Promise.resolve(true);
+  //
+  // It resolves VOID, not the op's outcome, and that is deliberate: the post
+  // waits for the watch but must never be GATED on it. A failed watch is already
+  // surfaced in the ledger and costs the user a routed mention; swallowing the
+  // message they typed costs them the message.
+  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<void> => {
+    if (!hasAgentMention(blocks)) return Promise.resolve();
     if (getState().watches.some((watch) => watch.channel_id === channelId))
-      return Promise.resolve(true);
+      return Promise.resolve();
     return submitTracked(
       opKey.watch(channelId),
       (live) =>
@@ -914,7 +981,7 @@ export function createActions({
           origin: getState().author,
         }),
       (prev) => optimistic.watchSet(prev, { channelId, policy: "mention" }),
-    );
+    ).then(() => undefined);
   };
 
   const mentionResolver = () => {
@@ -939,29 +1006,27 @@ export function createActions({
     const messageId = crypto.randomUUID();
     const blocks = parseMessageInput(body, mentionResolver());
     const author = getState().author;
-    return ensureMentionWatch(channelId, blocks).then((current) =>
-      current
-        ? submitTracked(
-            opKey.message(channelId, messageId),
-            (live) =>
-              chatClient.postMessage(live, {
-                channelId,
-                messageId,
-                blocks,
-                origin: author,
-                ...(thread !== null ? { thread } : {}),
-              }),
-            (prev) =>
-              optimistic.postedMessage(prev, {
-                channelId,
-                messageId,
-                blocks,
-                authorBytes: selfAuthorBytes(prev.status, prev.author),
-                at: Date.now(),
-                thread,
-              }),
-          )
-        : false,
+    return ensureMentionWatch(channelId, blocks).then(() =>
+      submitTracked(
+        opKey.message(channelId, messageId),
+        (live) =>
+          chatClient.postMessage(live, {
+            channelId,
+            messageId,
+            blocks,
+            origin: author,
+            ...(thread !== null ? { thread } : {}),
+          }),
+        (prev) =>
+          optimistic.postedMessage(prev, {
+            channelId,
+            messageId,
+            blocks,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
+            at: Date.now(),
+            thread,
+          }),
+      ),
     );
   };
 
@@ -969,6 +1034,12 @@ export function createActions({
   // have touched the root or a reply. `submitTracked` already refreshed the
   // flat `state.messages` (every sequence, replies included), but the thread
   // panel reads a separate snapshot, so it needs this extra cheap re-query.
+  //
+  // It runs whether the write LANDED OR NOT, and that is the point: an edit /
+  // delete / reaction paints an optimistic projection into the thread panel, and
+  // a failed op is never rolled back — it is erased by the authoritative refresh.
+  // `refresh()` does not cover this per-screen slice. Skipping the resync on
+  // failure is what left a deleted-but-still-there message on screen.
   const resyncOpenThread = (): Promise<void> => {
     const live = getNode();
     const channelId = getState().activeChannel;
@@ -1127,6 +1198,76 @@ export function createActions({
       .catch((err) => {
         if (isCurrentNode(live)) fail(err);
       });
+  };
+
+  // ── Browser-history traversal ──
+  // Apply a history entry's NavSnapshot (see nav-history.ts) — the popstate
+  // half of browser back/forward. Selections route through the same entry
+  // points user clicks take (enterChannel / enterPage / the one-shot focus
+  // hand-offs), so every restored target re-fetches its data from the node
+  // rather than rendering a stale copy. Returns the snapshot actually
+  // honored — a selection whose target vanished from the committed data (or
+  // that another workspace minted) is skipped, and the caller re-stamps the
+  // entry with the honored result so the stack and the store converge.
+  const applyNavSnapshot = (snap: NavSnapshot): NavSnapshot => {
+    const before = getState();
+    // Gated bodies (onboarding, the join waiting room, a boot failure) own
+    // the window — traversal must not fight them.
+    if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
+      return navSnapshotOf(before);
+    }
+
+    // Selections apply only within the scope that minted them, only under the
+    // shell (never through the Home layer), and only when the target still
+    // exists in the recentmost committed data.
+    const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
+    const channel =
+      scopeMatches && snap.channel && before.channels.some((c) => c.id === snap.channel)
+        ? snap.channel
+        : null;
+    const page =
+      scopeMatches && snap.page && before.pages.some((p) => p.id === snap.page)
+        ? snap.page
+        : null;
+    const forge =
+      scopeMatches && snap.screen === "forge" && snap.forgeRepo
+        ? { repo: snap.forgeRepo, number: snap.forgeItem }
+        : null;
+    const explorer =
+      scopeMatches && snap.screen === "explorer" ? snap.explorer : null;
+    const agent = scopeMatches && snap.screen === "agent" ? snap.agent : null;
+    const member = scopeMatches && snap.screen === "members" ? snap.member : null;
+
+    // The entry recorded the LIVE rail, so adopt it verbatim — re-deriving via
+    // sectionForScreen would lose a shell screen's remembered rail.
+    saveViewMode(snap.viewMode);
+    patch({
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      ...(forge ? { forgeFocus: forge } : {}),
+      ...(explorer !== null ? { explorerFocus: explorer } : {}),
+      ...(agent ? { agentFocus: agent } : {}),
+      ...(member ? { memberFocus: member } : {}),
+    });
+    if (channel && channel !== before.activeChannel) enterChannel(channel);
+    if (page && page !== before.activePage) enterPage(page);
+
+    // Built from what was applied, not re-read: the reducer runs on the next
+    // render tick, so getState() here would still see the pre-apply state.
+    return {
+      scope: currentDocTabsScope(),
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      channel: channel ?? before.activeChannel,
+      page: page ?? before.activePage,
+      forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
+      forgeItem: forge ? forge.number : (before.forgeFocus?.number ?? null),
+      explorer: explorer ?? before.explorerFocus,
+      agent: agent ?? before.agentFocus,
+      member: member ?? before.memberFocus,
+    };
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -1297,6 +1438,7 @@ export function createActions({
               // a hollow disconnected console whose toast then vanishes.
               patch({
                 bootError: {
+                  kind: classifyBootError(reason, log.tail),
                   workspaceId: target.id,
                   reason,
                   logPath: log.path,
@@ -1344,6 +1486,37 @@ export function createActions({
       patch({ explorerFocus: null });
     },
 
+    openAgent: (agentId) => {
+      // Same rail-adoption contract as setScreen.
+      const section = sectionForScreen("agent");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "agent", viewMode: section, agentFocus: agentId });
+      } else {
+        patch({ screen: "agent", agentFocus: agentId });
+      }
+    },
+
+    clearAgentFocus: () => {
+      patch({ agentFocus: null });
+    },
+
+    openMember: (accountId) => {
+      // Members lives on the OPERATOR rail — a mention clicked from chat (a user
+      // surface) has to move the rail with it or the sidebar and body disagree.
+      const section = sectionForScreen("members");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "members", viewMode: section, memberFocus: accountId });
+      } else {
+        patch({ screen: "members", memberFocus: accountId });
+      }
+    },
+
+    clearMemberFocus: () => {
+      patch({ memberFocus: null });
+    },
+
     openForgeItem: (repo, number) => {
       // Same rail-adoption contract as setScreen.
       const section = sectionForScreen("forge");
@@ -1365,6 +1538,7 @@ export function createActions({
         patch({ screen: "files", filesFocus: path });
       }
     },
+    applyNavSnapshot,
 
     setViewMode: (mode) => {
       saveViewMode(mode);
@@ -1552,9 +1726,7 @@ export function createActions({
       const channelId = getState().activeChannel;
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
-      void postToChannel(channelId, body, root.seq).then((current) => {
-        if (current) return resyncOpenThread();
-      });
+      void postToChannel(channelId, body, root.seq).then(() => resyncOpenThread());
     },
 
     editMessage: (seq, body) => {
@@ -1582,9 +1754,7 @@ export function createActions({
             origin: getState().author,
           }),
         (prev) => optimistic.editedMessage(prev, channelId, seq, blocks, Date.now()),
-      ).then((current) => {
-        if (current) return resyncOpenThread();
-      });
+      ).then(() => resyncOpenThread());
     },
 
     deleteMessage: (seq) => {
@@ -1595,9 +1765,7 @@ export function createActions({
         (live) =>
           chatClient.deleteMessage(live, { channelId, seq, origin: getState().author }),
         (prev) => optimistic.deletedMessage(prev, channelId, seq),
-      ).then((current) => {
-        if (current) return resyncOpenThread();
-      });
+      ).then(() => resyncOpenThread());
     },
 
     toggleReaction: (seq, emoji) => {
@@ -1629,24 +1797,7 @@ export function createActions({
             : chatClient.addReaction(live, { channelId, seq, emoji, origin }),
         (prev) =>
           optimistic.reactionToggled(prev, channelId, seq, emoji, selfBytes, Boolean(mine)),
-      ).then((current) => {
-        if (!current) return;
-        const live = getNode();
-        const root = getState().activeThread?.root;
-        if (!live || !root) return;
-        return chatClient
-          .thread(live, { channelId, rootSeq: root.seq })
-          .then((activeThread) =>
-            update((prev) =>
-              isCurrentNode(live) && prev.activeThread?.root.seq === root.seq
-                ? { activeThread }
-                : {},
-            ),
-          )
-          .catch((err) => {
-            if (isCurrentNode(live)) fail(err);
-          });
-      });
+      ).then(() => resyncOpenThread());
     },
 
     // ── Huddle ──
@@ -1678,20 +1829,22 @@ export function createActions({
             at: Math.floor(Date.now() / 1000),
           }),
       ).then((current) => {
-        if (!current) return;
-        // consensus refused the join (members-only, roster full): the audio
-        // session must not keep streaming into a huddle we are not in.
-        const settled = getState();
-        if (
-          settled.ops[opKey.huddle(channelId)]?.phase === "failed" &&
-          settled.voice.channelId === channelId
-        ) {
-          stopVoice();
-          // the session is gone — camera/beacon state must not outlive it.
-          update((prev) => ({
-            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
-          }));
-        }
+        if (current) return; // the join landed
+        // The join did NOT land — consensus refused it (members-only, roster
+        // full) or the node went away. The audio session must not keep streaming
+        // into a huddle we are not in.
+        //
+        // This branch used to be gated on `current` being TRUE and then re-read
+        // the op's "failed" phase out of the ledger. Once submitTracked started
+        // resolving FALSE on a failed op, `if (!current) return` bailed out on
+        // exactly the case it was written to catch, and a refused join went on
+        // streaming. The boolean IS the phase; ask it directly.
+        if (getState().voice.channelId !== channelId) return;
+        stopVoice();
+        // the session is gone — camera/beacon state must not outlive it.
+        update((prev) => ({
+          voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
+        }));
       });
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
@@ -2054,17 +2207,21 @@ export function createActions({
       });
     },
 
+    // Every page-block write goes out through `inPageOrder` — the editor's ops
+    // are anchor-chained and the wire has no ordering of its own.
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
       const page = getState().activePage;
-      if (!page) return;
-      submitTracked(
+      if (!page) return Promise.resolve(false);
+      return submitTracked(
         opKey.pageBlock(blockId),
         (live) =>
-          pagesClient.insertBlock(live, {
-            parent,
-            after,
-            block: { id: blockId, kind, text },
-          }),
+          inPageOrder(() =>
+            pagesClient.insertBlock(live, {
+              parent,
+              after,
+              block: { id: blockId, kind, text },
+            }),
+          ),
         (prev) =>
           optimistic.pageBlockInserted(prev, {
             parent,
@@ -2074,41 +2231,41 @@ export function createActions({
       );
     },
 
-    updatePageBlockText: ({ blockId, text }) => {
+    updatePageBlockText: ({ blockId, text }) =>
       submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.updateText(live, { blockId, text }),
+        (live) => inPageOrder(() => pagesClient.updateText(live, { blockId, text })),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
-      );
-    },
+      ),
 
     setPageBlockKind: ({ blockId, kind }) => {
-      submitTracked(
+      void submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.setKind(live, { blockId, kind }),
+        (live) => inPageOrder(() => pagesClient.setKind(live, { blockId, kind })),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { kind }),
       );
     },
 
     setPageBlockChecked: ({ blockId, checked }) => {
-      submitTracked(
+      void submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.setChecked(live, { blockId, checked }),
+        (live) => inPageOrder(() => pagesClient.setChecked(live, { blockId, checked })),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { checked }),
       );
     },
 
-    movePageBlock: ({ blockId, parent, after }) => {
-      submitTracked(opKey.pageBlock(blockId), (live) =>
-        pagesClient.moveBlock(live, { blockId, parent, after }),
-      );
-    },
-
-    removePageBlock: (blockId) => {
-      if (!blockId) return;
+    movePageBlock: ({ blockId, parent, after }) =>
       submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.removeBlock(live, blockId),
+        (live) => inPageOrder(() => pagesClient.moveBlock(live, { blockId, parent, after })),
+        (prev) => optimistic.pageBlockMoved(prev, { blockId, parent, after }),
+      ),
+
+    removePageBlock: (blockId) => {
+      if (!blockId) return Promise.resolve(false);
+      return submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => inPageOrder(() => pagesClient.removeBlock(live, blockId)),
         (prev) => optimistic.pageBlockRemoved(prev, blockId),
       );
     },

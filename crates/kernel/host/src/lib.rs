@@ -67,6 +67,25 @@ pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
     StateRoot(h.finalize().into())
 }
 
+/// Canonical fingerprint of a module set's committed-state schemas.
+///
+/// Entries are sorted by module id before hashing, so registry construction
+/// order is irrelevant. Length-prefixing keeps ids unambiguous; the domain tag
+/// prevents this digest from being confused with an app hash.
+pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, u32)>) -> [u8; 32] {
+    let mut modules: Vec<(&str, u32)> = modules.into_iter().collect();
+    modules.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut h = Sha256::new();
+    h.update(b"ducktape-state-schema-v1");
+    h.update((modules.len() as u64).to_le_bytes());
+    for (id, revision) in modules {
+        h.update((id.len() as u64).to_le_bytes());
+        h.update(id.as_bytes());
+        h.update(revision.to_le_bytes());
+    }
+    h.finalize().into()
+}
+
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
 /// consensus/genesis constant — identical on every node — so the local re-entry
 /// loop is guaranteed to terminate regardless of module behavior.
@@ -82,6 +101,53 @@ pub const UPGRADE_MODULE_ID: &str = "upgrade";
 /// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
 /// a net without the module, in which case nothing is ever injected.
 const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
+
+/// the genesis-constant module id the `modreg` code registry registers under.
+/// read by the boundary code-swap realization ([`Host::realize_module_swaps`])
+/// and the drain's [`Host::pending_modreg_advance`] injection; absent on a net
+/// without the module, in which case no swap is ever realized or injected.
+pub const MODREG_MODULE_ID: &str = modreg::DEFAULT_MODREG_ID;
+
+/// the out-of-band source of component BYTES for a code swap.
+///
+/// the code registry commits only the 32-byte content hash of each module's
+/// active code; the BYTES are content-addressed and distributed off-band
+/// (blobstore, state-sync). the host is HANDED one of these at a swap boundary
+/// rather than owning a byte cache — so it stays registry-only, and a test can
+/// inject a trivial in-memory map while a node injects a blobstore-backed one.
+/// `fetch` returns `None` when this node does not (yet) hold the bytes for a
+/// hash — a fail-closed miss that stops the boundary, never a fork.
+/// `Send + Sync` because the ordered lane holds its source across an executor.
+pub trait CodeSource: Send + Sync {
+    /// component bytes for a content hash, or `None` if absent on this node.
+    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
+}
+
+/// the no-source default: a node wired without any code source. every fetch
+/// misses, so a boundary that actually arms a swap FAILS CLOSED (loudly) rather
+/// than silently running stale code — and a net with no swaps never notices.
+pub struct NoCodeSource;
+
+impl CodeSource for NoCodeSource {
+    fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// sha256 content hash of component bytes — the verify side of a code swap.
+fn sha256(bytes: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).to_vec()
+}
+
+/// lowercase hex of a hash, for fail-closed error messages.
+fn hex32(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 /// the block-constant consensus context for one [`Host::submit_at`]: the agreed
 /// `height` / `consensus_time` (identical on every validator — sourced from the
@@ -182,7 +248,8 @@ pub struct BatchOutcome {
     /// aggregate effect intents, in the same order.
     pub effects: Vec<Effect>,
     /// the dispatch trace from the once-per-block System injections
-    /// (`pending_advance` / `pending_deliveries`), drained once after the members.
+    /// (`pending_advance` / `pending_modreg_advance` / `pending_deliveries`),
+    /// drained once after the members.
     pub system_dispatches: Vec<DispatchRecord>,
 }
 
@@ -385,6 +452,20 @@ impl Host {
         self.registry.insert(module.id(), module);
     }
 
+    /// Sorted module ids and their canonical-state revisions.
+    pub fn state_schema(&self) -> Vec<(ModuleId, u32)> {
+        self.registry
+            .iter()
+            .map(|(id, module)| (id.clone(), module.state_schema_revision()))
+            .collect()
+    }
+
+    /// Fingerprint persisted in recovery/state-sync manifests.
+    pub fn state_schema_fingerprint(&self) -> [u8; 32] {
+        let schema = self.state_schema();
+        state_schema_fingerprint(schema.iter().map(|(id, revision)| (id.as_str(), *revision)))
+    }
+
     /// build a host from a declared module set (registry-as-genesis-state). errors
     /// on a duplicate module id, since dispatch addresses modules by id.
     pub fn genesis(modules: Vec<Box<dyn Module>>) -> Result<Self, Error> {
@@ -573,6 +654,127 @@ impl Host {
     /// daemon, a quiet validator) read this to know a flush block is needed.
     pub async fn has_pending_deliveries(&self) -> bool {
         self.pending_deliveries().await.is_some()
+    }
+
+    /// the SYSTEM-ORIGIN modreg `Advance` the drain injects in-block, or `None`
+    /// when the committed code registry has no armed swap to activate. mirrors
+    /// [`Host::pending_advance`]: it rides the SAME drain that recovery-replay and
+    /// state-sync-install also run, so the committed active-hash flip + pending
+    /// clear reconstruct byte-for-byte on every node (folded into the app-hash —
+    /// the consensus commitment to WHICH code is active). keyed purely on
+    /// committed registry state + `height`: injected iff the committed registry
+    /// holds a pending swap whose `activation_height` has been reached. idempotent
+    /// — the first block at/after `H` clears the pending, so later blocks inject
+    /// nothing. ABSENT until the module is registered (`Status` errors → `None`),
+    /// so the drain is byte-identical on a net without the code registry.
+    async fn pending_modreg_advance(&self, height: u64) -> Option<Msg> {
+        let modules = self.modreg_status().await?;
+        let any_armed = modules.iter().any(|m| {
+            m.pending
+                .as_ref()
+                .is_some_and(|p| height >= p.activation_height)
+        });
+        any_armed.then(|| Msg {
+            target: MODREG_MODULE_ID.into(),
+            payload: modreg::encode_msg(&modreg::ModregMsg::Advance),
+        })
+    }
+
+    /// the code registry's committed per-module code state, or `None` when the
+    /// module is absent / its reply is unreadable — the shared out-of-block
+    /// committed read behind [`Host::pending_modreg_advance`] and
+    /// [`Host::realize_module_swaps`] (mirrors [`Host::effective_version`]'s
+    /// graceful fallback: a missing registry is never an error, just nothing to do).
+    async fn modreg_status(&self) -> Option<Vec<modreg::ModuleCode>> {
+        let req = modreg::encode_query(&modreg::ModregQuery::Status);
+        let bytes = self.query(MODREG_MODULE_ID, &req).await.ok()?;
+        match modreg::decode_reply(&bytes).ok()? {
+            modreg::ModregReply::Status { modules } => Some(modules),
+            _ => None,
+        }
+    }
+
+    /// realize a verified code swap against a single registered module: route to
+    /// its [`Module::swap_code`], keeping its host-owned state. errors if the
+    /// module is not registered, or is native (no swappable code —
+    /// [`Error::SwapUnsupported`]). the LOW-LEVEL seam;
+    /// [`Host::realize_module_swaps`] is the boundary driver that fetches +
+    /// verifies bytes against the committed hash before calling this.
+    pub fn swap_module_code(&mut self, id: &str, component_bytes: &[u8]) -> Result<(), Error> {
+        match self.registry.get_mut(id) {
+            Some(m) => m.swap_code(component_bytes),
+            None => Err(Error::UnknownModule(id.to_string())),
+        }
+    }
+
+    /// reconcile every hot-swappable module's RUNNING code against the code
+    /// registry's committed decision for block `height`, realizing any swap that
+    /// has armed. this is the per-node, NON-consensus half of a live code update;
+    /// the consensus half is the in-block [`Host::pending_modreg_advance`] tick
+    /// that flips the committed active hash into the app-hash. code is invisible
+    /// to `root()`, so a swap keeps the module's state and the app-hash is
+    /// byte-continuous across it.
+    ///
+    /// keyed PURELY on committed registry state + `height`, so it reconstructs
+    /// identically on every path that advances a node to a committed state — live
+    /// drain, recovery replay, state-sync catch-up — and is idempotent: it
+    /// compares [`Module::code_hash`] and re-instantiates a component only on an
+    /// actual change. run it BEFORE applying block `height`, so that block's
+    /// dispatches execute on the code the registry designates for `height`.
+    ///
+    /// the target hash for a module at `height` is a pending hash that has reached
+    /// activation (`activation_height <= height`), else its committed ACTIVE hash
+    /// — the SAME predicate modreg's `Advance` arm-check applies, so this
+    /// out-of-block realization and the in-block commit never disagree on the arm
+    /// set. reading ACTIVE (not only the armed pending) is what lets a state-sync
+    /// joiner — which installs post-activation state with no pending left to arm —
+    /// reconcile to the live code instead of forking on stale genesis code.
+    ///
+    /// FAIL-CLOSED: a designated hash whose bytes this node lacks, or bytes whose
+    /// sha256 does not match the committed hash, is a hard error (the node cannot
+    /// honestly apply `height` without the agreed code) — it returns `Err` with no
+    /// partial swap applied. ABSENT registry → nothing to reconcile, `Ok(())`.
+    pub async fn realize_module_swaps(
+        &mut self,
+        height: u64,
+        src: &dyn CodeSource,
+    ) -> Result<(), Error> {
+        let Some(modules) = self.modreg_status().await else {
+            return Ok(());
+        };
+        for m in modules {
+            // the SAME arm predicate as modreg::handle_advance (height >=
+            // activation_height): pending-if-armed, else the committed active hash.
+            let target = match m.pending {
+                Some(p) if height >= p.activation_height => p.code_hash,
+                _ => m.active_code_hash,
+            };
+            // only reconcile a module this node actually runs AS a hot-swappable
+            // component: an absent id, or a native module (no `code_hash`), is
+            // nothing to realize — its registry entry, if any, is a genesis concern.
+            let Some(current) = self.registry.get(&m.module_id).and_then(|x| x.code_hash()) else {
+                continue;
+            };
+            if current == target {
+                continue; // already on the designated code — idempotent no-op.
+            }
+            let bytes = src.fetch(&target).ok_or_else(|| {
+                Error::Module(format!(
+                    "code bytes absent for module {} (hash {}) — fail-closed",
+                    m.module_id,
+                    hex32(&target),
+                ))
+            })?;
+            if sha256(&bytes) != target {
+                return Err(Error::Module(format!(
+                    "code bytes for module {} do not match committed hash {} — fail-closed",
+                    m.module_id,
+                    hex32(&target),
+                )));
+            }
+            self.swap_module_code(&m.module_id, &bytes)?;
+        }
+        Ok(())
     }
 
     /// the current app-hash: [`global_root`] over the registered modules.
@@ -832,10 +1034,16 @@ impl Host {
         // 1. the once-per-block System injections, computed ONCE against PRE-batch
         // committed state — the "results staged by this very block are invisible
         // here" invariant, evaluated BEFORE any member stages. same order as the
-        // single-op drain: `Advance` then `DeliverPending`. drained once, after
-        // every member, below (step 4).
+        // single-op drain: upgrade `Advance`, then modreg `Advance`, then
+        // `DeliverPending`. drained once, after every member, below (step 4).
         let mut injections: VecDeque<(Origin, Msg)> = VecDeque::new();
         if let Some(advance) = self.pending_advance(height).await {
+            injections.push_back((Origin::System, advance));
+        }
+        // the code-registry boundary tick: flip every armed swap's committed
+        // active hash so the app-hash commits to the new code (the per-node
+        // realization of the actual swap is out-of-block, in realize_module_swaps).
+        if let Some(advance) = self.pending_modreg_advance(height).await {
             injections.push_back((Origin::System, advance));
         }
         if let Some(deliver) = self.pending_deliveries().await {
@@ -1071,6 +1279,16 @@ impl Host {
         // at-most-one-pending slot after activation. INERT until the module is
         // registered — `pending_advance` returns `None` when the module is absent.
         if let Some(advance) = self.pending_advance(height).await {
+            queue.push_back((Origin::System, advance));
+        }
+        // DETERMINISTIC CODE-SWAP ACTIVATION INJECTION: when the committed code
+        // registry holds a pending swap that has reached its activation height,
+        // append EXACTLY ONE System-origin modreg `Advance` so the registry flips
+        // the armed active hash in-block (folded into the app-hash) at the SAME
+        // finalized view on every node — the consensus commitment to the new code.
+        // the actual component swap is realized out-of-block by
+        // `realize_module_swaps`. INERT until the module is registered.
+        if let Some(advance) = self.pending_modreg_advance(height).await {
             queue.push_back((Origin::System, advance));
         }
         // DETERMINISTIC DELIVERY INJECTION: when the committed dispatch
@@ -1324,4 +1542,21 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
     fn emit_event(&mut self, _ev: Event) {}
 
     fn request_effect(&mut self, _eff: Effect) {}
+}
+
+#[cfg(test)]
+mod state_schema_tests {
+    use super::state_schema_fingerprint;
+
+    #[test]
+    fn fingerprint_is_canonically_sorted_and_revision_sensitive() {
+        let first = state_schema_fingerprint([("runs", 2), ("chat", 1)]);
+        let reordered = state_schema_fingerprint([("chat", 1), ("runs", 2)]);
+        let old_runs = state_schema_fingerprint([("chat", 1), ("runs", 1)]);
+        assert_eq!(
+            first, reordered,
+            "registry construction order is irrelevant"
+        );
+        assert_ne!(first, old_runs, "a canonical schema change requires a bump");
+    }
 }

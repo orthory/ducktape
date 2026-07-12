@@ -48,6 +48,17 @@ export const color = {
   // it — the right direction in both themes without a second inline hex.
   filledHover: "color-mix(in srgb, var(--c-filled, #26251f) 85%, var(--c-on-filled, #efefef))",
 
+  // Video scrim — deliberately theme-INVARIANT, and deliberately NOT a `--c-*`
+  // var. A name chip over a video frame, and the letterbox around it, must stay
+  // dark with light text in BOTH themes: the video looks the same either way, so
+  // there is nothing for the chip to invert *against*. `dark`/`onDark` (which
+  // ARE `--c-filled`/`--c-on-filled`) invert with the theme — using them here is
+  // what made participant names vanish and video letterbox in near-white.
+  scrim: "#26251f",
+  // the same scrim, translucent, so the video reads faintly through a chip.
+  scrimSoft: "rgba(38, 37, 31, 0.62)",
+  onScrim: "#efefef",
+
   // accent (overridable via --accent CSS var) — same in both themes
   accent: "#a05a3c",
   accentAlt1: "#3d63b8",

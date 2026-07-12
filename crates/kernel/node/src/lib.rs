@@ -728,6 +728,12 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
     /// `None` until the first frame applies.
     finalized: Option<host::FinalizedBlock>,
+    /// the ENGINE view whose seal set `finalized` — what a recovery layer
+    /// matches finalization certificates against when persisting the floor.
+    /// `None` until a block seals under the CURRENT engine (fresh boot,
+    /// resume, or right after a cutover): a recovered boundary's floor is
+    /// already persisted, and a new epoch's floor waits for its first block.
+    finalized_view: Option<u64>,
     /// the app-height offset of the CURRENT engine's view 0. epoch cutover
     /// respawns the engine with views restarting at 0; the base keeps `Env`
     /// heights and the finalized boundary monotone across epochs
@@ -797,6 +803,15 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// always a subset of `outstanding` (an un-flushed member is still in
     /// custody), so a cutover rebuilds it from `outstanding` and re-flushes.
     pending_batch: Vec<(FrameId, Vec<u8>)>,
+    /// the out-of-band source of component BYTES for code-registry swaps. the
+    /// drain reconciles running module code against the committed registry
+    /// (`Host::realize_module_swaps`) BEFORE applying each block, fetching any
+    /// newly-designated component through this. defaults to
+    /// [`host::NoCodeSource`]: a net with no armed swap never touches it, and a
+    /// node that never wired a real source FAILS CLOSED at the first armed
+    /// boundary instead of silently running stale code. `Arc` so the node and
+    /// its recovery sink can share the one source.
+    code_source: std::sync::Arc<dyn host::CodeSource>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -816,6 +831,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized: None,
+            finalized_view: None,
             view_base: 0,
             last_engine_view: None,
             view_ceiling: None,
@@ -825,6 +841,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         }
     }
 
@@ -847,6 +864,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized,
+            finalized_view: None,
             view_base,
             last_engine_view: None,
             view_ceiling: None,
@@ -856,7 +874,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         }
+    }
+
+    /// wire the out-of-band component-byte source for code-registry swaps (the
+    /// node injects a blobstore-backed one; tests inject an in-memory map). the
+    /// default is [`host::NoCodeSource`] — see the field doc.
+    pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
+        self.code_source = src;
     }
 
     /// arm the observation barrier on `module` (see the field doc): every
@@ -903,6 +929,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
+        // the finalized boundary carries over, but its VIEW belonged to the
+        // torn-down engine's clock — the new epoch's floor waits for its own
+        // first sealed block.
+        self.finalized_view = None;
         self.view_ceiling = None;
         // effects of pre-cutover blocks remain takeable. deferred frames
         // carry OLD-epoch views — stamping them under the new base would
@@ -1154,6 +1184,25 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 }
                 continue;
             }
+            // CODE-SWAP REALIZATION: reconcile every hot-swappable module's
+            // running code against the committed code registry's decision for
+            // `height`, BEFORE this block journals or applies — its dispatches
+            // must execute the code the registry designates for `height`. keyed
+            // purely on committed state + height, so live, restart-replay, and
+            // catch-up all realize the identical swap points. FAIL-CLOSED: a
+            // node lacking (or holding tampered) bytes for an armed hash must
+            // not apply this block on stale code — put the frame back (nothing
+            // journaled yet) and surface the stall; the drain retries once the
+            // bytes arrive. NEVER a fork: every honest node holding the bytes
+            // realizes identically, and one that doesn't stops here.
+            if let Err(e) = self
+                .host
+                .realize_module_swaps(height, self.code_source.as_ref())
+                .await
+            {
+                self.deferred.push_front((view, frame));
+                return Err(Error::Host(e));
+            }
             // below the ceiling this batch RESOLVES here as ONE block at ONE
             // height. WAL discipline: the batch bytes are finalized and about to
             // mutate state — journal them ONCE FIRST, so a crash mid-apply rolls
@@ -1366,6 +1415,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     height,
                     app_hash: self.host.app_hash(),
                 });
+                self.finalized_view = Some(view);
             }
         }
         Ok(applied)
@@ -1387,6 +1437,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// from. `None` until the first delivered frame applies.
     pub fn finalized(&self) -> Option<host::FinalizedBlock> {
         self.finalized
+    }
+
+    /// the ENGINE view whose seal set [`OrderedNode::finalized`] — what a
+    /// recovery layer matches finalization certificates against when
+    /// persisting the floor. `None` until a block seals under the current
+    /// engine (fresh boot, resume, or right after a cutover).
+    pub fn finalized_view(&self) -> Option<u64> {
+        self.finalized_view
     }
 
     /// the current app-hash of the wrapped host.

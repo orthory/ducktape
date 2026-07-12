@@ -4,6 +4,7 @@
 // thread panel).
 
 import type { AgentRecord } from "../../domain/agent-client";
+import type { BootErrorKind } from "../../domain/boot-error";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type { RunLease } from "../../domain/dispatch-client";
 import type {
@@ -104,6 +105,7 @@ export interface TagFilter {
  *  failure. Distinct from `error` (transient, dismissible op failures) and from
  *  a joiner's `onboardingPhase: fatal` (shown in the waiting room). */
 export interface BootError {
+  kind: BootErrorKind;
   workspaceId: string | null;
   reason: string;
   logPath: string | null;
@@ -302,6 +304,17 @@ export interface ConsoleState {
    *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an
    *  operator at a skill document. Null when nothing is pending. */
   filesFocus: string | null;
+
+  /** The agent the agent view should select on next render — a clicked @agent
+   *  mention's hand-off (the explorerFocus idiom: the mention sets it, AgentView
+   *  consumes it and clears it). Null when nothing is pending. */
+  agentFocus: string | null;
+
+  /** The person the members view should select on next render — a clicked @user
+   *  mention's hand-off. An ACCOUNT id, not a node key: a mention mark carries
+   *  the account, and the view maps it back to one of that account's node rows
+   *  through `nodeUsers`. Null when nothing is pending. */
+  memberFocus: string | null;
 
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
@@ -743,6 +756,9 @@ export const createInitialState = (): ConsoleState => {
     explorerFocus: null,
     forgeFocus: null,
     filesFocus: null,
+
+    agentFocus: null,
+    memberFocus: null,
     ops: {},
     error: null,
     bootError: null,
@@ -806,6 +822,9 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   explorerFocus: null,
   forgeFocus: null,
   filesFocus: null,
+
+  agentFocus: null,
+  memberFocus: null,
   ops: {},
   connectionDown: null,
 });

@@ -2,8 +2,11 @@
 // through Settings to switch networks. One row per workspace on this machine:
 // its name, its network id, and (for the CONNECTED one only, since standing is
 // chain-scoped) whether this device's node is a validator, a resident, or has
-// no seat. Enter routes through selectWorkspace, exactly the switch the old
+// no seat. Clicking anywhere on an inactive row — or its Enter button, the
+// keyboard path — routes through selectWorkspace, exactly the switch the old
 // NodesCard "Open" button did. "+ Add workspace" opens the onboarding gate.
+
+import { useState } from "react";
 
 import { normalizeKey } from "../../../domain/names";
 import { useDucktape } from "../../store/use-ducktape";
@@ -55,6 +58,7 @@ const headCell: React.CSSProperties = {
 
 export function WorkspacesTable() {
   const { state, actions } = useDucktape();
+  const [hovered, setHovered] = useState<string | null>(null);
 
   const validators = new Set(state.members.map(normalizeKey));
   const residents = new Set(state.residents.map(normalizeKey));
@@ -90,7 +94,13 @@ export function WorkspacesTable() {
         style={{
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
-          overflow: "hidden",
+          // `overflowX:auto`, NOT `hidden`: the window frame is `overflow:hidden`
+          // end to end, so there is no global scrollbar to catch this table when
+          // the mono chainId column forces it past the container — the right-hand
+          // Active/actions columns were simply clipped away, silently. Scrolling
+          // on this axis still clips to the rounded corners (a scroll container
+          // always does), so the rounded box is preserved.
+          overflowX: "auto",
           background: color.paper,
         }}
       >
@@ -110,7 +120,24 @@ export function WorkspacesTable() {
               const last = i === state.workspaces.length - 1;
               const rowCell = last ? { ...cell, borderBottom: undefined } : cell;
               return (
-                <tr key={w.id}>
+                <tr
+                  key={w.id}
+                  // The whole row enters the workspace; the Enter button is kept
+                  // as the keyboard/AT path and fires its own click, so ignore a
+                  // click that came from it rather than connecting twice
+                  // (connectActive is not idempotent — it drops the transport).
+                  onClick={(e) => {
+                    if (active) return;
+                    if ((e.target as HTMLElement).closest("button")) return;
+                    actions.selectWorkspace(w.id);
+                  }}
+                  onMouseEnter={() => setHovered(w.id)}
+                  onMouseLeave={() => setHovered((h) => (h === w.id ? null : h))}
+                  style={{
+                    cursor: active ? "default" : "pointer",
+                    background: !active && hovered === w.id ? color.titlebar : undefined,
+                  }}
+                >
                   <td style={rowCell}>{w.name}</td>
                   <td style={{ ...rowCell, font: `500 11px ${font.mono}`, color: color.muted }}>
                     {w.chainId}

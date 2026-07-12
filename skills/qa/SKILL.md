@@ -1,6 +1,6 @@
 ---
 name: qa
-description: Use to drive or test isolated real Ducktape CEF desktop instances managed by tauri-agent-fleet. Fleet builds once, launches private instances, exposes loopback VNC, and drives the direct tauri-agent endpoint. For one already-running app outside Fleet, use tauri-debug.
+description: Use to drive or test isolated real Ducktape CEF desktop instances managed by tauri-agent-fleet. Fleet builds once, launches private instances, exposes loopback VNC on Linux or a native window on macOS, and drives the direct tauri-agent endpoint. For one already-running app outside Fleet, use tauri-debug.
 ---
 
 # QA with tauri-agent-fleet
@@ -12,7 +12,7 @@ owns only `.tauri-agent/` and `qa/fleet/`.
 ## Interactive loop
 
 ```bash
-FLEET="${FLEET:-app/node_modules/.bin/tauri-agent-fleet}"
+FLEET="${FLEET:-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js}"
 
 "$FLEET" up HEAD
 "$FLEET" status --json
@@ -27,7 +27,9 @@ app/scripts/tauri-agent find --role button --name Create --app com.ducktape.app
 ```
 
 The opaque instance ID, not the branch, owns HOME, XDG runtime/data, display,
-ports, endpoint, VNC token, and exact process groups. Never find or stop desktop
+ports, endpoint, observation capability, and exact process groups. Linux uses a
+private X display and VNC token. macOS launches the native app with
+`display=native`, `vncPort=0`, and no fake VNC route. Never find or stop desktop
 processes with `pkill -f`. Fleet runs Ducktape's cleanup hook after stopping the
 desktop so its recorded detached workspace-node group cannot survive teardown.
 
@@ -111,10 +113,11 @@ The first form builds each selected revision. The second builds the selected
 revision/CEF runtime once and launches isolated instances from the same cached
 artifact.
 
-## Host prerequisite fallback
+## Linux host prerequisite fallback
 
-Fleet expects `Xvfb` and `x11vnc` on PATH. The existing remote-tauri staging can
-be used during host migration:
+Linux Fleet expects `Xvfb` and `x11vnc` on PATH. macOS must not install or invoke
+either helper; Fleet launches the native application bundle directly. The
+existing remote-tauri staging can be used during Linux host migration:
 
 ```bash
 export FLEET_VNC_COMMAND="$HOME/.local/opt/remote-tauri/root/usr/bin/x11vnc"

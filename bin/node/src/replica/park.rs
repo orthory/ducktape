@@ -27,7 +27,8 @@ use crate::host_reads::{
     read_valset_residents,
 };
 use crate::host_state::{
-    NetworkBindings, SyncSubstrates, restore_host, run_output_sink, sync_all_modules,
+    BlobCodeSource, NetworkBindings, SyncSubstrates, restore_host, run_output_sink,
+    sync_all_modules,
 };
 use crate::lobby;
 use crate::oracle_pool;
@@ -257,6 +258,10 @@ pub(super) async fn park(
     // (epoch cutover / promotion) reopens a fresh handle after the
     // node drops. every path out of this branch diverges (reboot),
     // so the validator path below never observes the move.
+    // the blob-plane code source every recovery/fold instance in this loop
+    // realizes code-registry swaps through (see host_state::BlobCodeSource).
+    let code_source: std::sync::Arc<dyn host::CodeSource> =
+        std::sync::Arc::new(BlobCodeSource(blobs.clone()));
     let mut recovery_slot = Some(recovery);
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:
@@ -314,6 +319,10 @@ pub(super) async fn park(
             );
             std::process::exit(1);
         }
+        if let Err(e) = crate::host_state::preflight_recovery_schema(ckpt) {
+            eprintln!("[node {label}] FATAL: cannot recover — {e}");
+            std::process::exit(1);
+        }
         let restored = restore_host(
             &context,
             &forge_repo,
@@ -363,7 +372,10 @@ pub(super) async fn park(
         let tip = rec.height.unwrap_or(rec.view_base);
         let root = rec.app_hash;
         let follower = consensus::FollowerOrderer::new(replica_store.clone());
-        let node_r = node::OrderedNode::resume(
+        // the replica fold realizes code-registry swaps through the SAME source
+        // recovery replay used (wired at Recovery::open).
+        let code_source = recovery.code_source();
+        let mut node_r = node::OrderedNode::resume(
             host,
             follower,
             recovery,
@@ -373,6 +385,7 @@ pub(super) async fn park(
             }),
             rec.view_base,
         );
+        node_r.set_code_source(code_source);
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
@@ -1054,12 +1067,17 @@ pub(super) async fn park(
                     );
                 }
             }
-            // persist the finalization floor once everything at or
-            // below it has drained — cert first, gate second, same
-            // ordering proof as the validator drain.
-            if let Some((view, cert)) = node_r.orderer().latest_finalization()
+            // persist the finalization floor for the newest certificate
+            // whose view has fully drained — cert first, release point
+            // second, same ordering proof (and the same busy-chain
+            // starvation fix) as the validator drain.
+            if let Some(tip_view) = node_r.finalized_view()
+                && let Some((view, cert)) = node_r.orderer().finalization_at_or_below(tip_view)
                 && view != 0
-                && node_r.orderer().unreleased_len() == 0
+                && node_r
+                    .orderer()
+                    .min_unreleased_view()
+                    .is_none_or(|pending| pending > view)
             {
                 let height = replica_view_base + view;
                 if last_cert_height.is_none_or(|h| height > h) {
@@ -1281,7 +1299,7 @@ pub(super) async fn park(
                 replica_scheme = None;
                 replica_orchestrator = None;
                 recovery_slot =
-                    Some(reopen_recovery(&context, &mut recovery_reopens, &label).await);
+                    Some(reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await);
             }
             if tip.residents.iter().any(|k| k == &me_bytes) {
                 if !resident_standing {
@@ -1429,7 +1447,8 @@ pub(super) async fn park(
                             // lane.
                             let follower =
                                 consensus::FollowerOrderer::new(replica_store.clone());
-                            let node_r = node::OrderedNode::resume(
+                            let code_source = recovery.code_source();
+                            let mut node_r = node::OrderedNode::resume(
                                 host,
                                 follower,
                                 recovery,
@@ -1439,6 +1458,7 @@ pub(super) async fn park(
                                 }),
                                 m.view_base,
                             );
+                            node_r.set_code_source(code_source);
                             replica_scheme =
                                 Some(replica_verifier(&namespace, &m.participants));
                             replica_orchestrator = Some(replica_orchestrator_at(
@@ -1677,7 +1697,7 @@ pub(super) async fn park(
         // served boundary, fabricate its checkpoint, reboot.
         if recovery_slot.is_none() {
             recovery_slot =
-                Some(reopen_recovery(&context, &mut recovery_reopens, &label).await);
+                Some(reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await);
         }
         match sync_all_modules(
             &context,

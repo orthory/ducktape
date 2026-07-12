@@ -7,6 +7,11 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
+// Consensus rejects these handles — a seed that asks for one aborts the demo.
+// Mirrors RESERVED_ROOT_LABELS in crates/system/duckdns/src/wire.rs (the source
+// of truth); app/src/domain/duckdns-client.test.ts pins all three copies.
+const RESERVED_ROOT_LABELS = ["net", "agents"];
+
 const INDEX_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -80,7 +85,7 @@ async function main() {
   await submit("identity", bind);
 
   let handle = requestedHandle;
-  if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(handle) && handle !== "net") {
+  if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(handle) && !RESERVED_ROOT_LABELS.includes(handle)) {
     await submit("duckdns", { set_handle: { handle } });
   } else {
     handle = null;

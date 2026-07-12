@@ -7,6 +7,7 @@
 
 import { createHighlighterCore, type HighlighterCore } from "shiki/core";
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import githubDark from "@shikijs/themes/github-dark";
 import githubLight from "@shikijs/themes/github-light";
 import bash from "@shikijs/langs/bash";
 import css from "@shikijs/langs/css";
@@ -22,11 +23,12 @@ import tsx from "@shikijs/langs/tsx";
 import typescript from "@shikijs/langs/typescript";
 import yaml from "@shikijs/langs/yaml";
 
-const THEME = "github-light";
-
-/** github-light's default foreground — used for text outside any token so the
- *  gutter body stays consistent with the highlighted spans. */
-export const CODE_FG = "#24292e";
+// Tokenize against BOTH github themes at once. With `defaultColor: false` shiki
+// emits no baked-in `color`; each token instead carries `--shiki-light` and
+// `--shiki-dark` custom properties, and the `.code-tok` rule in global.css picks
+// one by the live `data-theme` on <html>. So a theme flip re-paints instantly —
+// no re-tokenize, and no second source of truth for "what theme are we in".
+const THEMES = { light: "github-light", dark: "github-dark" } as const;
 
 // extension (lowercase, no dot) -> a loaded shiki language id. An extension not
 // here renders as plain text — never an error.
@@ -62,7 +64,7 @@ let highlighterPromise: Promise<HighlighterCore> | null = null;
 function highlighter(): Promise<HighlighterCore> {
   if (!highlighterPromise) {
     highlighterPromise = createHighlighterCore({
-      themes: [githubLight],
+      themes: [githubLight, githubDark],
       langs: [
         typescript,
         tsx,
@@ -94,7 +96,9 @@ export function langForFilename(name: string): string | null {
 
 export interface HlToken {
   content: string;
-  color?: string;
+  /** Per-theme colors as CSS custom properties (`--shiki-light` / `--shiki-dark`),
+   *  applied inline; `.code-tok` in global.css resolves them per `data-theme`. */
+  style?: Record<string, string>;
 }
 
 /** Tokenize `code` into per-line colored tokens for `lang`, or null on any
@@ -104,10 +108,11 @@ export async function highlightLines(code: string, lang: string): Promise<HlToke
     const hl = await highlighter();
     const { tokens } = hl.codeToTokens(code, {
       lang,
-      theme: THEME,
+      themes: THEMES,
+      defaultColor: false,
       includeExplanation: false,
     });
-    return tokens.map((line) => line.map((t) => ({ content: t.content, color: t.color })));
+    return tokens.map((line) => line.map((t) => ({ content: t.content, style: t.htmlStyle })));
   } catch {
     return null;
   }

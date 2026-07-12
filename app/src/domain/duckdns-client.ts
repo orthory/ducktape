@@ -9,7 +9,10 @@ import { replyVariant } from "./wire";
 export const TARGET = "duckdns";
 export const MAX_LABEL_LEN = 63;
 export const MAX_QUERY_LIMIT = 256;
-export const RESERVED_ROOT_LABELS = new Set(["net"]);
+/** Mirrors `RESERVED_ROOT_LABELS` in crates/system/duckdns/src/wire.rs — that
+ * const is the source of truth (consensus rejects these handles) and
+ * duckdns-client.test.ts reads it to keep this copy from drifting. */
+export const RESERVED_ROOT_LABELS = new Set(["net", "agents"]);
 
 export interface HandleRegistration {
   handle: string;

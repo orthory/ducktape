@@ -43,6 +43,7 @@ describe("CommentsPanel", () => {
       <CommentsPanel
         threads={threads}
         authorNames={{}}
+        selfKey="user:1"
         composer={null}
         onClose={vi.fn()}
         onSubmitNew={vi.fn()}
@@ -63,6 +64,7 @@ describe("CommentsPanel", () => {
       <CommentsPanel
         threads={[]}
         authorNames={{}}
+        selfKey="user:1"
         composer={null}
         onClose={vi.fn()}
         onSubmitNew={vi.fn()}
@@ -82,6 +84,7 @@ describe("CommentsPanel", () => {
       <CommentsPanel
         threads={[]}
         authorNames={{}}
+        selfKey="user:1"
         composer={{ target: "b1", label: "this block" }}
         onClose={vi.fn()}
         onSubmitNew={onSubmitNew}
@@ -108,6 +111,7 @@ describe("CommentsPanel", () => {
       <CommentsPanel
         threads={[]}
         authorNames={{}}
+        selfKey="user:1"
         composer={{ target: "p1", label: "this page" }}
         onClose={vi.fn()}
         onSubmitNew={onSubmitNew}

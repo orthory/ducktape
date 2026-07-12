@@ -49,6 +49,24 @@ export function flattenVisible(forest: TreeNode[], collapsed: ReadonlySet<string
   return out;
 }
 
+/** A page's ancestry, root-first, INCLUDING the page itself — the breadcrumb.
+ *  The header used to fake this with a literal "Pages / <title>", so a page
+ *  nested three deep looked top-level. Cycle-safe (a self-parent or a loop from
+ *  a torn enumeration ends the walk) and dangling-parent-safe (an unknown
+ *  parent just ends the chain, the same way buildForest surfaces the page). */
+export function ancestorChain(pages: PageMeta[], id: string): PageMeta[] {
+  const byId = new Map(pages.map((p) => [p.id, p]));
+  const chain: PageMeta[] = [];
+  const seen = new Set<string>();
+  let cursor = byId.get(id);
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    chain.unshift(cursor);
+    cursor = cursor.parent ? byId.get(cursor.parent) : undefined;
+  }
+  return chain;
+}
+
 /** Every id in a node's subtree (itself included) — used to forbid moving a
  *  page under one of its own descendants. */
 export function subtreeIds(forest: TreeNode[], id: string): Set<string> {

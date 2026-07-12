@@ -264,15 +264,26 @@ impl ValidatorRuntime<'_> {
             *last_published = Some(f.height);
         }
 
-        // persist the finalization floor once everything at or
-        // below it has drained. read the certificate FIRST, the
-        // gate second: releases happen only on this thread, so a
-        // zero gate proves the cert's view is fully applied — a
-        // floor ahead of app state would suppress replay of
-        // finalized ops a restart still needs.
-        if let Some((view, cert)) = node.orderer().latest_finalization()
+        // persist the finalization floor for the newest certificate
+        // whose view has fully drained. read the certificate FIRST,
+        // the release point second: releases happen only on this
+        // thread, so a certificate strictly below every slot still
+        // pending at the later read is fully applied — a floor ahead
+        // of app state would suppress replay of finalized ops a
+        // restart still needs. matched to the SEALED tip view (not
+        // just the newest certificate) and deliberately NOT gated on
+        // a momentarily empty inbox: on a busy chain a fresh
+        // finalization is (nearly) always in flight, and the empty-
+        // inbox gate starved — the floor stopped tracking the tip and
+        // the statesync boundary serve (floor == tip, exactly)
+        // refused every joiner for as long as the load lasted.
+        if let Some(tip_view) = node.finalized_view()
+            && let Some((view, cert)) = node.orderer().finalization_at_or_below(tip_view)
             && view != 0
-            && node.orderer().unreleased_len() == 0
+            && node
+                .orderer()
+                .min_unreleased_view()
+                .is_none_or(|pending| pending > view)
         {
             let height = orchestrator.app_height(view);
             if last_cert_height.is_none_or(|h| height > h) {
