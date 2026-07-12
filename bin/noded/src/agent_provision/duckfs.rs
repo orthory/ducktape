@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
@@ -75,7 +75,11 @@ pub(super) async fn provision(
     // step assembles the run's SOUL from those mounts (it is the only place
     // that holds both the curation and the materialized bodies).
     let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
-        (None, None)
+        // nothing to mount — but the document still ships. the tool-plane
+        // instruction and the shared-library pointer are facts about the world
+        // the run wakes up in, not part of the agent's curation: a skill-less
+        // agent that is never told the MCP plane exists is a blind one.
+        (None, Some(assemble_context_doc(&[])?))
     } else {
         let mount_handle = handle.clone();
         let mounts = spec.ro_mounts.clone();
@@ -91,7 +95,7 @@ pub(super) async fn provision(
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
-        (Some(ro_root), context_doc)
+        (Some(ro_root), Some(context_doc))
     };
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an

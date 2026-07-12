@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -315,7 +315,10 @@ pub(super) async fn provision(
     // committed with the run's work and PUSHED onto the work branch. beside it,
     // git cannot see them at all.
     let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
-        (None, None)
+        // nothing to mount — but the document still ships (see the duckfs lane):
+        // the tool-plane instruction and the shared-library pointer are ambient,
+        // not curated.
+        (None, Some(assemble_context_doc(&[])?))
     } else {
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
@@ -336,7 +339,7 @@ pub(super) async fn provision(
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
-        (Some(ro_root), context_doc)
+        (Some(ro_root), Some(context_doc))
     };
 
     // the worktree EXISTS now, so ask consensus to bind the run's agent session

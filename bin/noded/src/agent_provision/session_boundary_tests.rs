@@ -171,10 +171,6 @@ async fn mention_run(host: &mut Host) -> Effect {
                 agent_id: AGENT.into(),
                 display_name: "Quackbot".into(),
                 capability: CAPABILITY.into(),
-                // the registry pins a real 32-byte prompt hash; the pool below
-                // wires a resolver for it (an unresolvable pin fails the run
-                // loudly, and would never reach the provisioner at all).
-                prompt_hash: vec![7u8; 32],
                 allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                 recipe_hash: None,
                 caps: None,

@@ -551,7 +551,20 @@ impl AgentModule {
     /// a v4 skill ref must carry a non-empty name and source_prefix; a pinned
     /// snapshot, when present, must be non-empty. order is preserved verbatim
     /// (skills are an ordered override list).
+    ///
+    /// the COUNT is capped ([`MAX_SKILLS_PER_AGENT`]) for the same reason the
+    /// record's bytes are: the list is replicated state, and it is also the run's
+    /// context budget. curation is the whole point of the tier design — a
+    /// 500-skill list is a library, and the library lives in duckfs, not in the
+    /// record.
     fn validate_skills(skills: &[SkillRef]) -> Result<(), Error> {
+        if skills.len() > MAX_SKILLS_PER_AGENT {
+            return Err(Error::Module(format!(
+                "an agent may curate at most {MAX_SKILLS_PER_AGENT} skills, got {}; leave the \
+                 rest in the shared skill library",
+                skills.len()
+            )));
+        }
         for skill in skills {
             if skill.name.is_empty() {
                 return Err(Error::Module("skill name must not be empty".into()));
@@ -1102,6 +1115,28 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
+    }
+
+    /// the COUNT cap, exercised straight against the validator so the record's
+    /// BYTE cap cannot be what rejects it: two rules that both fire is two rules
+    /// that can drift, and this is the one the host-side assembler shares.
+    #[test]
+    fn a_curated_skill_list_over_the_count_cap_is_refused_loudly() {
+        let skills: Vec<SkillRef> = (0..=MAX_SKILLS_PER_AGENT)
+            .map(|i| SkillRef {
+                name: format!("s{i}"),
+                source_prefix: "/p".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            })
+            .collect();
+        let err = AgentModule::validate_skills(&skills).unwrap_err();
+        assert!(
+            matches!(&err, Error::Module(m) if m.contains(&MAX_SKILLS_PER_AGENT.to_string())),
+            "the refusal must name the cap: {err:?}"
+        );
+        // one under is fine — the cap is a ceiling, not an off-by-one trap.
+        assert!(AgentModule::validate_skills(&skills[..MAX_SKILLS_PER_AGENT]).is_ok());
     }
 
     #[test]

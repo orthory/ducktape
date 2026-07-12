@@ -42,7 +42,10 @@ pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
     WorkspaceSpec,
 };
-pub use soul::{SkillDoc, assemble_context_doc, parse_skill_md};
+pub use soul::{
+    MAX_ALWAYS_BYTES, MAX_DESCRIPTION_CHARS, MAX_INDEXED_SKILLS, SKILL_LIBRARY_PREFIX, SkillDoc,
+    assemble_context_doc, parse_skill_md,
+};
 pub use workspace_source::WorkspaceSource;
 
 /// everything a provider execution needs, extracted by the gate so the

@@ -298,12 +298,13 @@ const SKILL_DOC: &str = "SKILL.md";
 /// verify mismatch) after materializing some of the tree, and a failed
 /// provision hands the run no workspace to clean up — so this removes its OWN
 /// debris (the whole ro root) before returning. the caller unwinds the rw tree
-/// it already materialized.
+/// it already materialized. an over-budget soul (a blown context bound) fails on
+/// that same path: the mounts are already on disk when the assembler refuses.
 fn checkout_ro_mounts(
     handle: &NodeHandle,
     ro_root: &Path,
     mounts: &[RoMount],
-) -> Result<Option<String>, String> {
+) -> Result<String, String> {
     let api = ActorNodeApi::new(handle.clone());
     mounts
         .iter()
@@ -319,10 +320,7 @@ fn checkout_ro_mounts(
             read_skill_doc(ro_root, m)
         })
         .collect::<Result<Vec<_>, _>>()
-        .map(|docs| {
-            let doc = assemble_context_doc(&docs);
-            (!doc.is_empty()).then_some(doc)
-        })
+        .and_then(|docs| assemble_context_doc(&docs))
         .inspect_err(|_| {
             let _ = std::fs::remove_dir_all(ro_root);
         })

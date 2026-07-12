@@ -20,13 +20,67 @@
 //! fail a run), while a missing body for an `always` skill fails the run
 //! loudly upstream — that one IS the persona, and running without it silently
 //! produces a different agent.
+//!
+//! THREE TIERS of progressive disclosure, so run context never scales with the
+//! size of the skill collection:
+//! - tier 0, `always`: body inlined. costs O(persona).
+//! - tier 1, curated `on_demand`: one index line + its mount path. costs
+//!   O(curated count).
+//! - tier 2, the GLOBAL LIBRARY under [`SKILL_LIBRARY_PREFIX`] in duckfs: NOT in
+//!   context at all. the run is told, in one paragraph, that it exists and which
+//!   MCP tools search and read it. costs O(1) — a thousand library skills cost
+//!   the same as none.
+//!
+//! the bounds below are what keep tiers 0 and 1 finite. they fail the run rather
+//! than truncate it: a silently trimmed persona is a DIFFERENT AGENT with no
+//! signal, which is strictly worse than a run that stops and says why.
 
-/// the ambient MCP instruction every souled run carries — MOVED verbatim from
-/// the run envelope's runtime section (`runs::envelope`), which this document
-/// replaces. it deliberately does not enumerate the tools: the MCP server ships
-/// its own instructions with the binary, so restating the surface here would
-/// only give the two something to drift apart about.
+/// the ambient MCP instruction every run carries — MOVED verbatim from the run
+/// envelope's runtime section (`runs::envelope`), which this document replaces.
+/// it deliberately does not enumerate the tools: the MCP server ships its own
+/// instructions with the binary, so restating the surface here would only give
+/// the two something to drift apart about.
 const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktape\" is available in this session. It is how you read and write Ducktape state — chat, tasks, pages, forge items, and duckfs files. Call its tools instead of guessing; its own instructions describe every tool it offers.";
+
+/// the duckfs prefix the global skill library lives under, one directory per
+/// skill (`<name>/SKILL.md`). a CONVENTION, not a consensus-enforced namespace:
+/// the library is ordinary duckfs state, and an agent reaches it through the
+/// same `duckfs_read` cap as any other path — so an agent whose caps do not
+/// cover this prefix is told the library exists and is refused when it reads,
+/// which is the honest failure (the alternative is inventing a permission the
+/// caps vocabulary cannot express).
+pub const SKILL_LIBRARY_PREFIX: &str = "/shared/skills/";
+
+/// the tier-2 pointer. named tools with their real parameter names, because a
+/// model that has to guess the call will guess wrong: `ducktape_files_grep`
+/// takes `pattern` + `prefix`, `ducktape_files_read` takes `path`
+/// (`bin/mcp/src/tools/read.rs`).
+const SKILL_LIBRARY_SECTION: &str = "## The shared skill library\nBeyond the skills above, Ducktape carries a shared library of skills in duckfs under `/shared/skills/`, one directory per skill: `/shared/skills/<name>/SKILL.md`, whose YAML frontmatter carries a one-line `description`. It is NOT loaded into this context and costs you nothing until you read it. When your own skills do not cover the task in front of you, search the library with the `ducktape_files_grep` tool (`prefix`: `/shared/skills/`, `pattern`: what you are looking for), then read the skill you want in full with `ducktape_files_read` (`path`: `/shared/skills/<name>/SKILL.md`). Reading one is cheap; guessing at a task the library already answers is not.";
+
+/// hard cap on the TOTAL bytes of inlined `always` bodies — the persona's
+/// context budget. over it the run FAILS: truncating a persona would hand the
+/// owner a different agent than the one they curated, with no signal anywhere
+/// that it happened. 64 KiB is far more prose than any persona should be and
+/// still a small fraction of a modern context window, so hitting it means the
+/// curation is wrong, not that the cap is tight.
+pub const MAX_ALWAYS_BYTES: usize = 64 * 1024;
+
+/// hard cap on a description's rendered length in the on-demand index. over it
+/// the description is TRUNCATED, not refused — unlike a body, a description is
+/// cosmetic: an index line exists to help the agent choose, and half a sentence
+/// still does that. failing a run over a verbose frontmatter line would be
+/// absurd.
+pub const MAX_DESCRIPTION_CHARS: usize = 200;
+
+/// hard cap on the curated on-demand skills the index lists — the SAME number
+/// consensus enforces on an agent's curated list ([`agent::MAX_SKILLS_PER_AGENT`]),
+/// deliberately re-exported rather than restated: two caps that could drift is
+/// how you get a record consensus happily accepts and no run can load.
+///
+/// re-checked here anyway, because the consensus cap only binds at WRITE time —
+/// a record registered before the cap existed still carries whatever it carries,
+/// and the assembler is the last thing standing between it and a run.
+pub use agent::MAX_SKILLS_PER_AGENT as MAX_INDEXED_SKILLS;
 
 /// one curated skill, already materialized. `name` is the CURATED name
 /// consensus committed (`SkillRef.name`), never a name read out of the document
@@ -46,35 +100,61 @@ pub struct SkillDoc {
 /// order — never sorted: an agent's persona is a composed thing, and reordering
 /// it is editing it.
 ///
-/// an EMPTY skill set assembles an EMPTY document: an agent that curated no
-/// skills has no soul to load, and the caller maps that to `None` (no doc is
-/// written, no prompt is prepended).
-// ponytail: that also means a skill-less agent carries no tool-plane sentence,
-// where the retired runtime section gave one to every run. drop this guard (and
-// always emit the instruction) if a skill-less agent must still be told the MCP
-// plane exists.
-pub fn assemble_context_doc(skills: &[SkillDoc]) -> String {
-    if skills.is_empty() {
-        return String::new();
+/// NEVER EMPTY. an agent that curated no skills still gets the two AMBIENT
+/// paragraphs — the tool plane, and the library — because both are facts about
+/// the world it woke up in, not about its curation. (the empty-doc case is how
+/// the retired envelope runtime-section's tool-plane instruction went missing
+/// for skill-less agents in the first place.)
+///
+/// `Err` = a bound was blown: the caller fails the run. checked HERE, in the
+/// pure layer, so both node binaries reach the same verdict from the same
+/// committed record.
+pub fn assemble_context_doc(skills: &[SkillDoc]) -> Result<String, String> {
+    // tier 0. the running total names the skill that CROSSED the cap, which is
+    // the actionable one — "your persona is too big" without a name leaves the
+    // owner to diff bodies by hand.
+    let mut always_bytes = 0usize;
+    for s in skills.iter().filter(|s| s.always) {
+        always_bytes += s.body.len();
+        if always_bytes > MAX_ALWAYS_BYTES {
+            return Err(format!(
+                "the always-loaded skills exceed the {MAX_ALWAYS_BYTES}-byte context budget: {:?} \
+                 takes the inlined total to {always_bytes} bytes. trim it, or curate it as an \
+                 on-demand skill.",
+                s.name
+            ));
+        }
     }
+    // tier 1. the curator must curate: an index of hundreds is a library, and a
+    // library that ships in every prompt is exactly the cost this tiering exists
+    // to avoid — the shared one costs nothing.
+    let on_demand: Vec<&SkillDoc> = skills.iter().filter(|s| !s.always).collect();
+    if on_demand.len() > MAX_INDEXED_SKILLS {
+        return Err(format!(
+            "{} on-demand skills exceed the index cap of {MAX_INDEXED_SKILLS}. curate fewer, or \
+             leave them in the shared skill library at {SKILL_LIBRARY_PREFIX} — an agent pays \
+             nothing for a skill it has not read.",
+            on_demand.len()
+        ));
+    }
+
     let mut sections: Vec<String> = skills
         .iter()
         .filter(|s| s.always)
         .map(|s| format!("# {}\n{}", s.name, s.body.trim_end()))
         .collect();
 
-    let index: Vec<String> = skills
-        .iter()
-        .filter(|s| !s.always)
-        .map(|s| {
-            let where_ = format!("(`$DUCKTAPE_RUN_SKILLS/{}/SKILL.md`)", s.name);
-            match &s.description {
-                Some(d) => format!("- **{}** — {d} {where_}", s.name),
-                None => format!("- **{}** {where_}", s.name),
-            }
-        })
-        .collect();
-    if !index.is_empty() {
+    if !on_demand.is_empty() {
+        let index: Vec<String> = on_demand
+            .iter()
+            .map(|s| {
+                let where_ = format!("(`$DUCKTAPE_RUN_SKILLS/{}/SKILL.md`)", s.name);
+                match &s.description {
+                    Some(d) => format!("- **{}** — {} {where_}", s.name, clip(d)),
+                    None => format!("- **{}** {where_}", s.name),
+                }
+            })
+            .collect();
         sections.push(format!(
             "## Skills available on demand\nRead the full text when the task \
              calls for it; each lives under the directory named by \
@@ -82,8 +162,23 @@ pub fn assemble_context_doc(skills: &[SkillDoc]) -> String {
             index.join("\n")
         ));
     }
+    // the tool plane first, then the library that is READ through it: the
+    // paragraph tells the agent to call tools, so it must already know it has
+    // them.
     sections.push(TOOL_PLANE_INSTRUCTION.to_string());
-    sections.join("\n\n")
+    sections.push(SKILL_LIBRARY_SECTION.to_string());
+    Ok(sections.join("\n\n"))
+}
+
+/// a long description is trimmed to fit the index line. CHARS, not bytes: a byte
+/// slice through a multi-byte codepoint panics, and an index entry is not worth
+/// a crash.
+fn clip(description: &str) -> String {
+    if description.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return description.to_string();
+    }
+    let head: String = description.chars().take(MAX_DESCRIPTION_CHARS).collect();
+    format!("{}…", head.trim_end())
 }
 
 /// split a `SKILL.md` into its frontmatter `description` and its body.
@@ -133,9 +228,15 @@ mod tests {
         }
     }
 
+    /// the AMBIENT half of the document: a skill-less agent still learns that the
+    /// tool plane and the library exist. it is not a soul, but it is a world.
     #[test]
-    fn an_empty_skill_set_assembles_an_empty_document() {
-        assert!(assemble_context_doc(&[]).is_empty());
+    fn a_skill_less_agent_still_gets_the_tool_plane_and_the_library() {
+        let doc = assemble_context_doc(&[]).unwrap();
+        assert_eq!(doc.matches("A Ducktape MCP tool server").count(), 1);
+        assert_eq!(doc.matches("## The shared skill library").count(), 1);
+        // no curation => no headings, no index: exactly the two ambient paragraphs.
+        assert!(!doc.contains("## Skills available on demand"), "got {doc}");
     }
 
     #[test]
@@ -143,21 +244,26 @@ mod tests {
         // curation order, NOT sorted: `zeta` was curated first, so it leads.
         let doc = assemble_context_doc(&[
             skill("zeta", true, Some("z desc"), "You are Zeta.\n"),
-            skill("release", false, Some("cut a release"), "the whole release body"),
+            skill(
+                "release",
+                false,
+                Some("cut a release"),
+                "the whole release body",
+            ),
             skill("alpha", true, None, "Always quack twice."),
-        ]);
-        assert_eq!(
-            doc,
-            "# zeta\nYou are Zeta.\n\n\
-             # alpha\nAlways quack twice.\n\n\
-             ## Skills available on demand\n\
-             Read the full text when the task calls for it; each lives under the \
-             directory named by $DUCKTAPE_RUN_SKILLS.\n\
-             - **release** — cut a release (`$DUCKTAPE_RUN_SKILLS/release/SKILL.md`)\n\n\
-             A Ducktape MCP tool server named \"ducktape\" is available in this session. \
-             It is how you read and write Ducktape state — chat, tasks, pages, forge \
-             items, and duckfs files. Call its tools instead of guessing; its own \
-             instructions describe every tool it offers."
+        ])
+        .unwrap();
+        assert!(
+            doc.starts_with(
+                "# zeta\nYou are Zeta.\n\n\
+                 # alpha\nAlways quack twice.\n\n\
+                 ## Skills available on demand\n\
+                 Read the full text when the task calls for it; each lives under the \
+                 directory named by $DUCKTAPE_RUN_SKILLS.\n\
+                 - **release** — cut a release (`$DUCKTAPE_RUN_SKILLS/release/SKILL.md`)\n\n\
+                 A Ducktape MCP tool server named \"ducktape\""
+            ),
+            "got {doc}"
         );
         // the on-demand skill is INDEXED, never inlined — the whole point of the
         // load mode is that its body does not inflate every prompt.
@@ -167,9 +273,31 @@ mod tests {
         );
     }
 
+    /// the tier-2 pointer, in the form an agent can actually act on: the prefix,
+    /// the layout, and the two tools BY NAME (a model that has to guess the call
+    /// guesses wrong).
+    #[test]
+    fn the_library_paragraph_names_the_prefix_the_layout_and_both_tools() {
+        for doc in [
+            assemble_context_doc(&[]).unwrap(),
+            assemble_context_doc(&[skill("zeta", true, None, "You are Zeta.")]).unwrap(),
+        ] {
+            assert_eq!(doc.matches("## The shared skill library").count(), 1);
+            assert!(doc.contains(SKILL_LIBRARY_PREFIX), "got {doc}");
+            assert!(doc.contains("/shared/skills/<name>/SKILL.md"), "got {doc}");
+            assert!(doc.contains("ducktape_files_grep"), "got {doc}");
+            assert!(doc.contains("ducktape_files_read"), "got {doc}");
+            // the whole point of the tier: it is a POINTER, not a payload.
+            assert!(
+                doc.contains("costs you nothing until you read it"),
+                "got {doc}"
+            );
+        }
+    }
+
     #[test]
     fn a_frontmatterless_skill_degrades_to_a_name_only_index_entry() {
-        let doc = assemble_context_doc(&[skill("qa", false, None, "body")]);
+        let doc = assemble_context_doc(&[skill("qa", false, None, "body")]).unwrap();
         assert!(
             doc.contains("- **qa** (`$DUCKTAPE_RUN_SKILLS/qa/SKILL.md`)"),
             "got {doc}"
@@ -182,13 +310,74 @@ mod tests {
             skill("a", true, None, "A"),
             skill("b", true, None, "B"),
             skill("c", false, Some("c"), "C"),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             doc.matches("A Ducktape MCP tool server").count(),
             1,
-            "the ambient instruction is stated once, at the end: {doc}"
+            "the ambient instruction is stated once: {doc}"
         );
-        assert!(doc.trim_end().ends_with("every tool it offers."));
+    }
+
+    /// tier 0 is the one bound that must never degrade quietly: a truncated
+    /// persona is a DIFFERENT AGENT, and nothing downstream could tell.
+    #[test]
+    fn over_cap_always_bodies_fail_loudly_naming_the_skill_and_the_cap() {
+        let err = assemble_context_doc(&[
+            skill("small", true, None, "tiny"),
+            skill("hog", true, None, &"x".repeat(MAX_ALWAYS_BYTES)),
+        ])
+        .unwrap_err();
+        assert!(err.contains("\"hog\""), "the skill that crossed it: {err}");
+        assert!(
+            err.contains(&MAX_ALWAYS_BYTES.to_string()),
+            "the cap: {err}"
+        );
+        // an on-demand body of any size is FREE — only inlining is budgeted.
+        assert!(
+            assemble_context_doc(&[skill("hog", false, None, &"x".repeat(MAX_ALWAYS_BYTES * 4))])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_over_cap_index_fails_loudly_and_points_at_the_library() {
+        let many: Vec<SkillDoc> = (0..=MAX_INDEXED_SKILLS)
+            .map(|i| skill(&format!("s{i}"), false, None, "b"))
+            .collect();
+        let err = assemble_context_doc(&many).unwrap_err();
+        assert!(err.contains(&MAX_INDEXED_SKILLS.to_string()), "got {err}");
+        assert!(err.contains(SKILL_LIBRARY_PREFIX), "got {err}");
+        assert!(assemble_context_doc(&many[..MAX_INDEXED_SKILLS]).is_ok());
+    }
+
+    /// the asymmetry, stated as a test: a body is load-bearing (fail), a
+    /// description is cosmetic (clip).
+    #[test]
+    fn a_long_description_is_truncated_not_refused() {
+        let long = "é".repeat(MAX_DESCRIPTION_CHARS * 3);
+        let doc = assemble_context_doc(&[skill("verbose", false, Some(&long), "b")]).unwrap();
+        assert!(doc.contains('…'), "got {doc}");
+        assert!(
+            !doc.contains(&long),
+            "the full description must not ship: {doc}"
+        );
+        // multi-byte chars: the clip counts CHARS, so the kept head is exactly
+        // the cap (a byte slice here would have panicked).
+        assert!(
+            doc.contains(&format!(
+                "- **verbose** — {}…",
+                "é".repeat(MAX_DESCRIPTION_CHARS)
+            )),
+            "got {doc}"
+        );
+        // a description AT the cap is untouched — no gratuitous ellipsis.
+        let exact = "a".repeat(MAX_DESCRIPTION_CHARS);
+        let doc = assemble_context_doc(&[skill("exact", false, Some(&exact), "b")]).unwrap();
+        assert!(
+            doc.contains(&format!("- **exact** — {exact} (")),
+            "got {doc}"
+        );
     }
 
     #[test]

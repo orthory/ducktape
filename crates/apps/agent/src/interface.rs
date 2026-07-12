@@ -40,6 +40,20 @@ pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
 /// root preimage and every snapshot, so registration is size-gated up front.
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 
+/// hard cap on the COUNT of skills one agent curates. an unbounded skill list
+/// is unbounded replicated state (it rides the record, hence every snapshot)
+/// AND an unbounded run context — every one of them costs at least an index
+/// line in the assembled context document, and an `Always` one costs its whole
+/// body. [`MAX_AGENT_RECORD_BYTES`] bounds the BYTES and usually bites first;
+/// this bounds the SHAPE, and it is the same number the host-side assembler
+/// checks (`dispatch_oracle::assemble_context_doc`) — one rule, not two that
+/// could drift into a record consensus accepts but no run can load.
+///
+/// deliberately generous, because curation is not the only door: an uncurated
+/// skill belongs in the global library at `/shared/skills/`, which every run is
+/// told about and which costs a run nothing until it reads one.
+pub const MAX_SKILLS_PER_AGENT: usize = 64;
+
 /// hard cap on the serialized CHAT blocks a response's `reply_blocks` map to.
 /// deliberately well under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is
 /// emitted as a chat post inside the delivery block, and a post that chat
