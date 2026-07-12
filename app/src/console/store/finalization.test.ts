@@ -7,6 +7,7 @@ import {
   failOp,
   finalizeOp,
   hasFreshPending,
+  opByHash,
   opForMessage,
   opKey,
   pageSnapshotSuperseded,
@@ -20,9 +21,10 @@ describe("the op ledger", () => {
     ops = beginOp(ops, opKey.file("t1"), 1_000);
     expect(ops["file/t1"]).toMatchObject({ phase: "pending", startedAt: 1_000 });
 
-    ops = finalizeOp(ops, opKey.file("t1"), { height: 42, opHash: "ab".repeat(32) });
+    ops = finalizeOp(ops, opKey.file("t1"), { height: 42, opHash: "ab".repeat(32) }, 1_420);
     expect(ops["file/t1"]).toMatchObject({
       phase: "finalized",
+      settledAt: 1_420,
       height: 42,
       opHash: "ab".repeat(32),
     });
@@ -30,23 +32,24 @@ describe("the op ledger", () => {
 
   it("finalizes without inclusion facts when the write resolved unshaped", () => {
     let ops = beginOp({}, opKey.file("t1"), 0);
-    ops = finalizeOp(ops, opKey.file("t1"), receiptOf("not a receipt"));
+    ops = finalizeOp(ops, opKey.file("t1"), receiptOf("not a receipt"), 1);
     expect(ops["file/t1"].phase).toBe("finalized");
     expect(ops["file/t1"].height).toBeUndefined();
   });
 
   it("records the rejection on failure", () => {
     let ops = beginOp({}, opKey.file("t1"), 0);
-    ops = failOp(ops, opKey.file("t1"), "chat: empty author");
+    ops = failOp(ops, opKey.file("t1"), "chat: empty author", 900);
     expect(ops["file/t1"]).toMatchObject({
       phase: "failed",
+      settledAt: 900,
       error: "chat: empty author",
     });
   });
 
   it("a re-submit on the same entity key supersedes the settled record", () => {
     let ops = beginOp({}, opKey.file("t1"), 0);
-    ops = finalizeOp(ops, opKey.file("t1"), { height: 7 });
+    ops = finalizeOp(ops, opKey.file("t1"), { height: 7 }, 100);
     ops = beginOp(ops, opKey.file("t1"), 5_000);
     expect(ops["file/t1"]).toMatchObject({ phase: "pending", startedAt: 5_000 });
   });
@@ -55,7 +58,7 @@ describe("the op ledger", () => {
     let ops: OpLedger = {};
     for (let i = 0; i < 512; i += 1) {
       ops = beginOp(ops, `file/settled-${i}`, i);
-      ops = finalizeOp(ops, `file/settled-${i}`, { height: i });
+      ops = finalizeOp(ops, `file/settled-${i}`, { height: i }, i);
     }
     ops = beginOp(ops, "file/in-flight", 999);
     expect(Object.keys(ops)).toHaveLength(512);
@@ -67,7 +70,7 @@ describe("the op ledger", () => {
     const ops = beginOp({}, opKey.file("t1"), 1_000);
     expect(hasFreshPending(ops, 1_000 + OP_STALE_MS - 1)).toBe(true);
     expect(hasFreshPending(ops, 1_000 + OP_STALE_MS)).toBe(false);
-    expect(hasFreshPending(finalizeOp(ops, opKey.file("t1"), { height: 1 }), 1_001)).toBe(
+    expect(hasFreshPending(finalizeOp(ops, opKey.file("t1"), { height: 1 }, 1_001), 1_001)).toBe(
       false,
     );
   });
@@ -84,7 +87,7 @@ describe("pageSnapshotSuperseded", () => {
 
   it("an op settled after the fetch began supersedes that snapshot only", () => {
     let ops = beginOp({}, opKey.page("p1"), 1_000);
-    ops = finalizeOp(ops, opKey.page("p1"), { height: 4 });
+    ops = finalizeOp(ops, opKey.page("p1"), { height: 4 }, 1_001);
     // fetched before the op began → predates it.
     expect(pageSnapshotSuperseded(ops, 900, 1_100)).toBe(true);
     // fetched after (the op's own completion refresh) → applies.
@@ -118,6 +121,23 @@ describe("receiptOf", () => {
   });
 });
 
+describe("opByHash", () => {
+  it("resolves a settled op by its content address, newest first", () => {
+    const opHash = "cd".repeat(32);
+    let ops = beginOp({}, opKey.file("t1"), 0);
+    ops = finalizeOp(ops, opKey.file("t1"), { height: 3, opHash }, 10);
+    // an identical resubmit elsewhere lands the same address — newest wins.
+    ops = beginOp(ops, opKey.file("t2"), 20);
+    ops = finalizeOp(ops, opKey.file("t2"), { height: 8, opHash }, 30);
+    expect(opByHash(ops, opHash)?.height).toBe(8);
+  });
+
+  it("resolves nothing for an address the ledger never saw", () => {
+    const ops = beginOp({}, opKey.file("t1"), 0);
+    expect(opByHash(ops, "ee".repeat(32))).toBeUndefined();
+  });
+});
+
 describe("opForMessage", () => {
   const message = (channelId: string, seq: number, messageId: string): MessageView => ({
     channel_id: channelId,
@@ -147,7 +167,7 @@ describe("opForMessage", () => {
 
   it("prefers the newer record when both id and seq keys exist", () => {
     let ops = beginOp({}, opKey.message("general", "m-uuid"), 0);
-    ops = finalizeOp(ops, opKey.message("general", "m-uuid"), { height: 1 });
+    ops = finalizeOp(ops, opKey.message("general", "m-uuid"), { height: 1 }, 5);
     ops = beginOp(ops, opKey.messageSeq("general", 9), 10);
     expect(opForMessage(ops, message("general", 9, "m-uuid"))?.phase).toBe("pending");
   });

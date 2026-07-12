@@ -4,10 +4,11 @@
 // Every consensus write begins an OpRecord under a stable ENTITY key (the row
 // the operation touches), applies its optimistic projection immediately, and
 // flips the record to finalized/failed when the node's submit receipt lands.
-// Views look their entity's record up to draw the inline mark: a pending dot
-// while in flight, a checkmark once included (hover reveals the inclusion
-// height + the op's addressable hash). Nothing here is committed state — a
-// node switch resets the ledger.
+// Views look their entity's record up to draw the inline mark: a single check
+// while in flight (sent + preconfirmed render), a double check once included
+// (clicking reveals the submit/confirm times, the inclusion height and the
+// op's addressable hash). Nothing here is committed state — a node switch
+// resets the ledger.
 
 import type { MessageView } from "../../domain/chat-client";
 
@@ -20,6 +21,9 @@ export interface OpRecord {
   phase: OpPhase;
   /** Wall-clock ms at submit — lets the provider ignore stale pendings. */
   startedAt: number;
+  /** Wall-clock ms when the receipt (or rejection) landed — with `startedAt`,
+   *  the mark's stats popover derives the confirm time and latency. */
+  settledAt?: number;
   /** The op's inclusion height, once the receipt lands. */
   height?: number;
   /** The op's content address (64-hex sha256), when the node returns one. */
@@ -114,6 +118,7 @@ export const finalizeOp = (
   ops: OpLedger,
   key: string,
   receipt: { height: number; opHash?: string } | null,
+  settledAt: number,
 ): OpLedger => {
   const prev = ops[key];
   if (!prev) return ops;
@@ -122,16 +127,22 @@ export const finalizeOp = (
     [key]: {
       ...prev,
       phase: "finalized",
+      settledAt,
       height: receipt?.height,
       opHash: receipt?.opHash,
     },
   };
 };
 
-export const failOp = (ops: OpLedger, key: string, error: string): OpLedger => {
+export const failOp = (
+  ops: OpLedger,
+  key: string,
+  error: string,
+  settledAt: number,
+): OpLedger => {
   const prev = ops[key];
   if (!prev) return ops;
-  return { ...ops, [key]: { ...prev, phase: "failed", error } };
+  return { ...ops, [key]: { ...prev, phase: "failed", settledAt, error } };
 };
 
 /** Any op still in flight and younger than OP_STALE_MS? While true, the
@@ -197,6 +208,18 @@ export const receiptOf = (
   if (typeof height !== "number") return null;
   return { height, opHash: typeof opHash === "string" ? opHash : undefined };
 };
+
+/** The op behind a content address — how hash-addressed surfaces (anything
+ *  rendering a 64-hex sha256 rather than an entity) find their record. Only
+ *  settled ops carry a hash (the receipt brings it), and the ledger is
+ *  session-local: an address submitted elsewhere resolves to nothing. */
+export const opByHash = (ops: OpLedger, opHash: string): OpRecord | undefined =>
+  Object.values(ops)
+    .filter((op) => op.opHash === opHash)
+    .reduce<OpRecord | undefined>(
+      (newest, op) => (newest === undefined || op.seq > newest.seq ? op : newest),
+      undefined,
+    );
 
 /** The freshest op touching a message row: a new post keys by the minted
  *  message id, edits/deletes/reactions by committed seq — the row shows

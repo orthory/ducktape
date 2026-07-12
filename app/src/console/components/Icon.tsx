@@ -63,6 +63,16 @@ const PATHS: Record<string, ReactNode> = {
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M5 12.5l4 4 10-10" />,
+  // double check — the finalization mark's "confirmed" glyph (cf. `check`,
+  // its single-check "sent" counterpart). The ticks sit 10 units apart with
+  // shortened tails: any tighter and they merge into one thick check at the
+  // mark's 11px render size.
+  checks: (
+    <>
+      <path d="M1.5 13l3.5 3.5 8-8.5" />
+      <path d="M11.5 13l3.5 3.5 8-8.5" />
+    </>
+  ),
   code: (
     <>
       <path d="M9 18l-6-6 6-6" />
