@@ -70,6 +70,8 @@ pub(super) async fn park(
     checkpoint_blocks: u64,
     sync_index: bool,
     announce_capabilities: bool,
+    sandbox: capability_host::SandboxBackend,
+    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
     status_public_key: String,
@@ -485,12 +487,16 @@ pub(super) async fn park(
     let resident_provider_set = capability_host::discover(
         agent_dirs.clone(),
         Some(run_output_sink(stream_hub.run_output())),
+        // the operator's `node.toml sandbox` choice (Direct or Podman), same
+        // as the validator boot — a resident sandboxes its runs identically.
+        sandbox,
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let resident_capabilities = resident_provider_set.capabilities();
     let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
         me_bytes.clone(),
         resident_capabilities,
+        sandbox_capacity.clone(),
     );
     let (resident_pool, mut resident_oracle_results) = oracle_pool::build(
         &context,
@@ -501,6 +507,9 @@ pub(super) async fn park(
         // the mesh fetch-on-miss lane (#298, resident side): demuxed
         // through the park loop's sync client's unmatched-frame hook.
         Some(blob_fetcher),
+        // the announced capacity IS the pool's ledger (one source), same as
+        // the validator path.
+        sandbox_capacity,
     );
     let mut resident_dispatch =
         resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());

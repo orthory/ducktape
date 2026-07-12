@@ -54,6 +54,7 @@ impl Module for Caller {
                     dispatch_id: "d1".into(),
                     recipe_id: "summarize".into(),
                     payload: b"the entire input".to_vec(),
+                    demands: Default::default(),
                 }),
             });
         }

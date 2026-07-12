@@ -17,7 +17,7 @@
 //! ([`DeliverFn`]) are the embedding host's business (bin/node's select-loop
 //! mpsc lane, bin/noded's command channel).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,8 +29,8 @@ use tokio::sync::Semaphore;
 
 use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
 use crate::{
-    AttemptOutput, ExecJob, Gated, attempt_output, clean_error, gate, oracle_result_with_usage,
-    renew_lease,
+    AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
+    oracle_result_with_usage, renew_lease,
 };
 
 /// how many provider runs may execute concurrently unless
@@ -105,10 +105,18 @@ pub struct DispatchPool {
     /// node binaries wire a real provisioner, so this is LIVE on every
     /// production agent run.
     provisioner: Option<SharedProvisioner>,
+    /// the host-local load ledger: `gate()` checks `fits()` inline on both
+    /// the own-lease and announcement paths; `spawn_exec` reserves a run's
+    /// demands before the semaphore acquire, releasing via RAII guard held
+    /// to the spawned task's end. `Arc`-wrapped so the spawned task can hold
+    /// its own cheap clone alongside `providers`.
+    ledger: Arc<ResourceLedger>,
 }
 
 impl DispatchPool {
-    /// the production constructor: concurrency cap from the environment.
+    /// the production constructor: concurrency cap from the environment, no
+    /// announced capacity (a bare ledger — demandless jobs only) until a
+    /// later task wires the operator's real numbers in.
     pub fn new(
         providers: Arc<ProviderSet>,
         node_key: Vec<u8>,
@@ -121,16 +129,20 @@ impl DispatchPool {
             spawn,
             deliver,
             max_concurrent_runs_from_env(),
+            Default::default(),
         )
     }
 
-    /// an explicit concurrency cap (tests; embedders with their own policy).
+    /// an explicit concurrency cap (tests; embedders with their own policy)
+    /// and announced resource capacity. an empty `capacity` is the direct
+    /// (bare) node: only demandless jobs ever fit its ledger.
     pub fn with_limit(
         providers: Arc<ProviderSet>,
         node_key: Vec<u8>,
         spawn: SpawnFn,
         deliver: DeliverFn,
         limit: usize,
+        capacity: BTreeMap<String, u64>,
     ) -> Self {
         Self {
             providers,
@@ -141,6 +153,7 @@ impl DispatchPool {
             inflight: Arc::new(Mutex::new(HashSet::new())),
             resolver: None,
             provisioner: None,
+            ledger: Arc::new(ResourceLedger::new(capacity)),
         }
     }
 
@@ -176,7 +189,17 @@ impl DispatchPool {
         let inflight = self.inflight.clone();
         let resolver = self.resolver.clone();
         let provisioner = self.provisioner.clone();
+        let ledger = self.ledger.clone();
         (self.spawn)(Box::pin(async move {
+            // reserve BEFORE the semaphore acquire: capacity was already
+            // promised at gate time, so a run queued behind the cap still
+            // holds its share while it waits. held to the end of THIS task
+            // (the whole async block) via the guard's Drop — every exit path
+            // (ok, error, panic-unwind) releases. demandless jobs (empty
+            // `job.demands`) reserve nothing: `reserve` is a no-op on the
+            // legacy path.
+            let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
+            let _reservation = ledger.reserve(&reservation_key, &job.demands);
             let run = async {
                 // over-cap runs queue HERE, on their own task. the heartbeat
                 // below already runs while they wait, so a healthy local
@@ -201,6 +224,10 @@ impl DispatchPool {
                                 // expose — set before execute so BOTH the dormant and
                                 // provisioned paths carry it into provider.run.
                                 prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
+                                // the run's numeric demands ride into RunContext so a
+                                // Podman-backed provider can enforce them as container
+                                // limits; a Direct backend ignores them.
+                                prepared.ctx.limits = job.demands.clone();
                                 execute(&job, prepared, provider, provisioner.as_ref())
                                     .await
                                     .map_err(clean_error)
@@ -387,7 +414,7 @@ async fn execute(
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchPool {
     async fn run(&self, effect: &Effect) -> Result<WorkOutcome, host::worker::Error> {
-        match gate(&self.providers, &self.node_key, effect) {
+        match gate(&self.providers, &self.node_key, &self.ledger, effect) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
             Gated::Skip => Ok(WorkOutcome::Handled(None)),
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
@@ -550,7 +577,14 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                limit,
+                Default::default(),
+            ),
             rx,
         )
     }
@@ -569,6 +603,7 @@ format = "text"
                 dispatch_id: "d1".into(),
                 capability: "alpha".into(),
                 payload: payload.to_vec(),
+                demands: Default::default(),
             }),
             deadline: None,
             assignee: assignee.map(|a| a.to_vec()),
@@ -864,8 +899,15 @@ format = "text"
             let hit = (*digest == [7u8; 32]).then(|| b"You are Bot.".to_vec());
             Box::pin(async move { hit })
         });
-        let pool = DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, 4)
-            .with_resolver(resolver);
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            4,
+            Default::default(),
+        )
+        .with_resolver(resolver);
 
         let hex = "07".repeat(32);
         let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(Some(&hex)));
@@ -1046,8 +1088,15 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, 4)
-                .with_provisioner(provisioner),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                4,
+                Default::default(),
+            )
+            .with_provisioner(provisioner),
             rx,
         )
     }
@@ -1968,8 +2017,14 @@ format = "text"
                 let _ = tx.unbounded_send(msg);
             })
         });
-        let pool =
-            DispatchPool::with_limit(providers, b"me".to_vec(), Box::new(|_fut| {}), deliver, 0);
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            Box::new(|_fut| {}),
+            deliver,
+            0,
+            Default::default(),
+        );
         // a zero cap would deadlock every run; the pool clamps to 1.
         assert_eq!(pool.semaphore.available_permits(), 1);
     }

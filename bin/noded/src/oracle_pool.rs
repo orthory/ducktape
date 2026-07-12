@@ -67,7 +67,14 @@ where
     // grab the live-output registry BEFORE the provisioner below consumes
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
-    let providers = capability_host::discover(agent_dirs, Some(run_output_sink(run_output)))
+    let providers = capability_host::discover(
+        agent_dirs,
+        Some(run_output_sink(run_output)),
+        // the embedded daemon stays Direct this phase: it exposes no operator
+        // sandbox knobs, so `DispatchPool::new` below keeps the bare (empty
+        // capacity) ledger — the sandbox/capacity plane is bin/node only.
+        capability_host::SandboxBackend::Direct,
+    )
     // BYO: run whatever executor CLIs the capability specs describe and
     // this host has installed — no credential handling here (see
     // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.

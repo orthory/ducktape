@@ -65,6 +65,26 @@ mode = "persistent"
 capture = "json-result-field:session_id"
 resume_args_append = ["--resume", "{session_id}"]
 
+[sandbox]
+# THE WEAK AUTH PATH, and it is weak on purpose: there is no Anthropic-side
+# broker yet, so claude authenticates the only way it knows — by reading its own
+# dotfiles. That means the credential DOES enter the child.
+#
+# Under the Podman sandbox backend, HOME is set but NOT mounted — only these
+# home-relative auth/state dirs cross the boundary read-write, so the CLI can
+# authenticate while the node's data dir and user key stay outside (D7).
+# ~/.claude holds the login/session state; ~/.claude.json holds config. Inert
+# under the Direct backend (the child inherits HOME whole). Home-relative
+# ONLY: absolute paths and ".." are rejected at load. Inherited by every
+# [[variants]] tag below.
+#
+# THIS SECTION DIES THE MOMENT AN ANTHROPIC BROKER LANDS. When one exists, this
+# spec grows an [isolation] block naming it (like codex.toml) and DELETES these
+# rw_dirs in the same edit — declaring both is a hard load error precisely so
+# that swap cannot be half-done, leaving the credential in the child while the
+# spec claims a broker.
+rw_dirs = ["~/.claude", "~/.claude.json"]
+
 [tools]
 # Wires the Ducktape MCP server into every argv this file produces — the base
 # tag and every [[variants]] tag — spliced in at load time IMMEDIATELY AFTER

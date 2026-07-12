@@ -385,7 +385,8 @@ format = "text"
                 let _ = tx.unbounded_send(msg);
             })
         });
-        let pool = DispatchPool::with_limit(providers, ME.to_vec(), spawn, deliver, 4);
+        let pool =
+            DispatchPool::with_limit(providers, ME.to_vec(), spawn, deliver, 4, Default::default());
         (
             ResidentDispatch::new(Box::new(pool), ME.to_vec()),
             rx,
@@ -423,6 +424,7 @@ format = "text"
                 })
                 .to_string()
                 .into_bytes(),
+                demands: Default::default(),
             }),
             deadline: None,
             assignee: Some(ME.to_vec()),

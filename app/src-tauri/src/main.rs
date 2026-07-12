@@ -27,6 +27,7 @@ mod menu;
 mod notify;
 mod permissions;
 mod rt;
+mod sandbox;
 mod touchid;
 mod tray;
 mod user_identity;
@@ -187,6 +188,7 @@ fn main() {
             notify::notify_recent,
             permissions::permission_prompt_state,
             permissions::permission_prompt_decide,
+            sandbox::sandbox_preflight,
         ]);
     builder = builder.plugin(tauri_plugin_notification::init());
     builder = builder

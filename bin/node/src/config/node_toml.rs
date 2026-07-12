@@ -81,6 +81,24 @@ pub struct NodeToml {
     /// today's derivation (`wireguard_listen`'s IP when concrete, endpoint-
     /// less/roaming when unspecified) — bit-identical to today.
     pub wireguard_advertised: Option<String>,
+
+    /// how provider runs are spawned (node-local operator policy, like
+    /// checkpoint_blocks). absent/`"direct"` = the plain host spawn (default);
+    /// `"podman"` = a rootless container that enforces each run's numeric
+    /// limits AND makes this node announce its probed capacity; `"tart"` is
+    /// accepted and reserved (resolves to Direct until a sibling branch lands
+    /// the backend). any other value is a loud config error.
+    pub sandbox: Option<String>,
+    /// the container image the `podman` sandbox runs each provider in;
+    /// default `docker.io/library/node:22-slim`. ignored unless `sandbox =
+    /// "podman"`.
+    pub sandbox_image: Option<String>,
+    /// override the probed core count this node announces as sandbox capacity
+    /// (`podman` only). WINS over the `/proc`/sysctl probe.
+    pub sandbox_cores: Option<u64>,
+    /// override the probed total-memory GiB this node announces as sandbox
+    /// capacity (`podman` only). WINS over the probe.
+    pub sandbox_mem_gb: Option<u64>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside

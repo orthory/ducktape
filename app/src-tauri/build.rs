@@ -92,6 +92,7 @@ fn main() {
         "huddle_pop_in",
         "notify_configure",
         "notify_mark_seen",
+        "sandbox_preflight",
         "notify_recent",
     ];
     // The native permission consent window's own commands. They answer requests

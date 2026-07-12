@@ -18,6 +18,17 @@
 //! announce is what lets dispatch route work to it. without a valset (the
 //! single-node daemon) any external key may self-announce.
 //!
+//! an `Announce` may additionally carry `resources`: announced numeric
+//! capacity per open-set dimension ("cores" -> 8, "mem_gb" -> 32), riding the
+//! same declarative replace as tags. capacity with nothing to execute is
+//! meaningless, so resources without at least one tag is rejected; a
+//! tags-only node stays valid (direct-spawn mode) but never satisfies a
+//! demands-carrying query — absent is never infinite. this moved the
+//! snapshot/root byte encoding to v2 (FLAG DAY: a v1 stream no longer
+//! decodes). [`CapabilityQuery::CapableProviders`] is the read future work
+//! assignment filters on: providers of a capability whose announced
+//! resources cover every demanded dimension.
+//!
 //! state model mirrors valset's host-lent staging seam: `execute` STAGES into
 //! a `pending` overlay (committed state untouched); `query` reads
 //! pending-over-committed (read-your-writes); `commit_block` merges pending
@@ -52,18 +63,32 @@ use valset::{
 /// any real host's executor count.
 const MAX_CAPABILITIES: usize = 64;
 
+/// one node's registry entry (committed or staged): the tag set it announced
+/// plus the numeric capacity it announced per dimension. tags empty means the
+/// node is absent — `announced` never holds an entry that way, and a staged
+/// entry with empty tags stages a removal. resources alone is never a valid
+/// entry: `execute` rejects an announce that carries resources without at
+/// least one tag, so every stored entry with non-empty resources also has
+/// non-empty tags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NodeEntry {
+    tags: BTreeSet<String>,
+    resources: BTreeMap<String, u64>,
+}
+
 pub struct CapabilityRegistry {
     id: ModuleId,
     /// the valset module consulted to gate announcements to current members;
     /// `None` runs ungated (the single-node daemon carries no valset).
     valset_id: Option<ModuleId>,
     /// committed registry — what `root()` and the app-hash commit to. a node
-    /// key never maps to an empty set: empty means absent.
-    announced: BTreeMap<Vec<u8>, BTreeSet<String>>,
-    /// per-block staged replacements: the set stages a full declarative
-    /// replace, an EMPTY set stages a removal. read ahead of `announced`
-    /// (read-your-writes), merged into committed state only on `commit_block`.
-    pending: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    /// key never maps to an entry with empty tags: empty tags means absent.
+    announced: BTreeMap<Vec<u8>, NodeEntry>,
+    /// per-block staged replacements: the entry stages a full declarative
+    /// replace, an entry with EMPTY tags stages a removal. read ahead of
+    /// `announced` (read-your-writes), merged into committed state only on
+    /// `commit_block`.
+    pending: BTreeMap<Vec<u8>, NodeEntry>,
 }
 
 impl CapabilityRegistry {
@@ -131,14 +156,14 @@ impl CapabilityRegistry {
     }
 
     /// the committed registry with this block's staged replacements applied —
-    /// read-your-writes; an empty staged set reads as absent.
-    fn effective(&self) -> BTreeMap<Vec<u8>, BTreeSet<String>> {
+    /// read-your-writes; a staged entry with empty tags reads as absent.
+    fn effective(&self) -> BTreeMap<Vec<u8>, NodeEntry> {
         let mut map = self.announced.clone();
-        for (key, set) in &self.pending {
-            if set.is_empty() {
+        for (key, entry) in &self.pending {
+            if entry.tags.is_empty() {
                 map.remove(key);
             } else {
-                map.insert(key.clone(), set.clone());
+                map.insert(key.clone(), entry.clone());
             }
         }
         map
@@ -152,22 +177,31 @@ impl CapabilityRegistry {
     /// canonical bytes of the COMMITTED registry — exactly the byte stream
     /// `root()` hashes: node count u64-le, then per sorted node key its len
     /// u64-le + key bytes + tag count u64-le, then per sorted tag its len
-    /// u64-le + utf-8 bytes. for a non-empty registry
-    /// `sha256(snapshot()) == root()`; an empty registry snapshots to a lone
-    /// zero count (whose root is still `ZERO`, unhashed). pending is
-    /// deliberately excluded — a snapshot ships what consensus committed to.
+    /// u64-le + utf-8 bytes, then resource count u64-le, then per sorted
+    /// dimension its key len u64-le + utf-8 bytes + value u64-le (v2 — FLAG
+    /// DAY: a v1 stream has no bytes past the tag list, so a v1 snapshot no
+    /// longer decodes). for a non-empty registry `sha256(snapshot()) ==
+    /// root()`; an empty registry snapshots to a lone zero count (whose root
+    /// is still `ZERO`, unhashed); a tags-only node still emits a trailing
+    /// zero resource count, so it round-trips. pending is deliberately
+    /// excluded — a snapshot ships what consensus committed to.
     pub fn snapshot(&self) -> Vec<u8> {
         Self::snapshot_of(&self.announced)
     }
 
-    fn snapshot_of(map: &BTreeMap<Vec<u8>, BTreeSet<String>>) -> Vec<u8> {
+    fn snapshot_of(map: &BTreeMap<Vec<u8>, NodeEntry>) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(map.len() as u64).to_le_bytes());
-        for (key, tags) in map {
+        for (key, entry) in map {
             codec::push_bytes(&mut out, key);
-            out.extend_from_slice(&(tags.len() as u64).to_le_bytes());
-            for tag in tags {
+            out.extend_from_slice(&(entry.tags.len() as u64).to_le_bytes());
+            for tag in &entry.tags {
                 codec::push_str(&mut out, tag);
+            }
+            out.extend_from_slice(&(entry.resources.len() as u64).to_le_bytes());
+            for (dim, value) in &entry.resources {
+                codec::push_str(&mut out, dim);
+                out.extend_from_slice(&value.to_le_bytes());
             }
         }
         out
@@ -195,11 +229,14 @@ impl CapabilityRegistry {
     /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves
     /// them). every count and length is checked against the remaining buffer
     /// BEFORE any allocation, truncation and trailing bytes both reject, node
-    /// keys and tags must arrive strictly increasing, and a node with zero
-    /// tags rejects (empty means absent, so it has no encoding) — a given
-    /// registry has exactly one valid byte stream, so a peer cannot mint
-    /// alternative encodings for one state.
-    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, BTreeSet<String>>, Error> {
+    /// keys, tags, and resource dimensions must each arrive strictly
+    /// increasing, a node with zero tags rejects (empty means absent, so it
+    /// has no encoding), and a zero-valued resource rejects too (the same
+    /// `validate_resources` invariant, held at decode time so a byzantine
+    /// peer cannot mint a dimension no honest announce could produce) — a
+    /// given registry has exactly one valid byte stream, so a peer cannot
+    /// mint alternative encodings for one state.
+    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, NodeEntry>, Error> {
         let mut cur = codec::Cursor::new(bytes);
         let count = cur.u64("snapshot node count")?;
         // each node entry costs at least its 8-byte key-length prefix plus an
@@ -239,7 +276,34 @@ impl CapabilityRegistry {
                     .map_err(|e| Error::Module(format!("snapshot tag is not utf-8: {e}")))?;
                 tags.insert(tag.to_string());
             }
-            map.insert(key.to_vec(), tags);
+
+            let resource_count = cur.u64("snapshot resource count")?;
+            // each dimension costs at least its 8-byte key-length prefix plus
+            // an 8-byte value.
+            cur.bound(resource_count, 16, "snapshot resource")?;
+            let mut resources = BTreeMap::new();
+            let mut prev_dim: Option<&[u8]> = None;
+            for _ in 0..resource_count {
+                let dim = cur.bytes("snapshot resource key")?;
+                if prev_dim.is_some_and(|p| p >= dim) {
+                    return Err(Error::Module(
+                        "snapshot resource keys must be strictly increasing".into(),
+                    ));
+                }
+                prev_dim = Some(dim);
+                let dim = std::str::from_utf8(dim).map_err(|e| {
+                    Error::Module(format!("snapshot resource key is not utf-8: {e}"))
+                })?;
+                let value = cur.u64("snapshot resource value")?;
+                if value == 0 {
+                    return Err(Error::Module(
+                        "snapshot resource value is zero (omit the dimension instead)".into(),
+                    ));
+                }
+                resources.insert(dim.to_string(), value);
+            }
+
+            map.insert(key.to_vec(), NodeEntry { tags, resources });
         }
         cur.finish("snapshot")?;
         Ok(map)
@@ -248,7 +312,7 @@ impl CapabilityRegistry {
     /// the state-based commitment for `map`: `ZERO` when empty, else sha256
     /// over exactly the bytes `snapshot` emits. shared by `root()` (committed
     /// state) and `install` (a decoded candidate), so the two can never drift.
-    fn root_of(map: &BTreeMap<Vec<u8>, BTreeSet<String>>) -> StateRoot {
+    fn root_of(map: &BTreeMap<Vec<u8>, NodeEntry>) -> StateRoot {
         if map.is_empty() {
             return StateRoot::ZERO;
         }
@@ -301,11 +365,17 @@ impl Module for CapabilityRegistry {
             }
         }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            CapabilityMsg::Announce { capabilities } => {
+            CapabilityMsg::Announce { capabilities, resources } => {
                 let tags = Self::validate_tags(capabilities)?;
+                validate_resources(&resources).map_err(Error::Module)?;
+                if tags.is_empty() && !resources.is_empty() {
+                    return Err(Error::Module(
+                        "resources without capabilities (announce at least one tag)".into(),
+                    ));
+                }
                 // declarative replace: the last announcement staged in a block
-                // wins, and an empty set stages a removal.
-                self.pending.insert(node, tags);
+                // wins, and an empty-tags entry stages a removal.
+                self.pending.insert(node, NodeEntry { tags, resources });
             }
         }
         Ok(())
@@ -319,7 +389,7 @@ impl Module for CapabilityRegistry {
             CapabilityQuery::Providers { capability } => {
                 let providers = view
                     .iter()
-                    .filter(|(_, tags)| tags.contains(&capability))
+                    .filter(|(_, e)| e.tags.contains(&capability))
                     .map(|(key, _)| key.clone())
                     .collect();
                 encode_reply(&CapabilityReply::Providers(providers))
@@ -327,14 +397,31 @@ impl Module for CapabilityRegistry {
             CapabilityQuery::Node { node } => {
                 let tags = view
                     .get(&node)
-                    .map(|t| t.iter().cloned().collect())
+                    .map(|e| e.tags.iter().cloned().collect())
                     .unwrap_or_default();
                 encode_reply(&CapabilityReply::Node(tags))
+            }
+            CapabilityQuery::CapableProviders { capability, demands } => {
+                let providers = view
+                    .iter()
+                    .filter(|(_, e)| e.tags.contains(&capability))
+                    .filter(|(_, e)| {
+                        demands
+                            .iter()
+                            .all(|(k, v)| e.resources.get(k).is_some_and(|have| have >= v))
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                encode_reply(&CapabilityReply::Providers(providers))
+            }
+            CapabilityQuery::Resources { node } => {
+                let resources = view.get(&node).map(|e| e.resources.clone()).unwrap_or_default();
+                encode_reply(&CapabilityReply::Resources(resources))
             }
             CapabilityQuery::All => {
                 let all = view
                     .into_iter()
-                    .map(|(key, tags)| (key, tags.into_iter().collect()))
+                    .map(|(key, e)| (key, e.tags.into_iter().collect()))
                     .collect();
                 encode_reply(&CapabilityReply::All(all))
             }
@@ -344,11 +431,11 @@ impl Module for CapabilityRegistry {
     /// merge the block's staged replacements into committed state — `root()`
     /// now reflects them. no-op if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (key, tags) in std::mem::take(&mut self.pending) {
-            if tags.is_empty() {
+        for (key, entry) in std::mem::take(&mut self.pending) {
+            if entry.tags.is_empty() {
                 self.announced.remove(&key);
             } else {
-                self.announced.insert(key, tags);
+                self.announced.insert(key, entry);
             }
         }
         Ok(())
@@ -434,12 +521,29 @@ mod tests {
         fn request_effect(&mut self, _e: sdk::Effect) {}
     }
 
-    fn announce(tags: &[&str]) -> Msg {
+    fn announce_with(tags: &[&str], resources: &[(&str, u64)]) -> Msg {
         Msg {
             target: "capability".into(),
             payload: encode_msg(&CapabilityMsg::Announce {
                 capabilities: tags.iter().map(|t| t.to_string()).collect(),
+                resources: resources.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             }),
+        }
+    }
+    fn announce(tags: &[&str]) -> Msg {
+        announce_with(tags, &[])
+    }
+    fn capable(c: &CapabilityRegistry, capability: &str, demands: &[(&str, u64)]) -> Vec<Vec<u8>> {
+        let reply = futures::executor::block_on(c.query(&encode_query(
+            &CapabilityQuery::CapableProviders {
+                capability: capability.into(),
+                demands: demands.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            },
+        )))
+        .unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            CapabilityReply::Providers(p) => p,
+            other => panic!("expected Providers reply, got {other:?}"),
         }
     }
     fn node_tags(c: &CapabilityRegistry, node: &[u8]) -> Vec<String> {
@@ -813,5 +917,99 @@ mod tests {
         let mut dst = ungated();
         dst.install(&bytes, StateRoot::ZERO).unwrap();
         assert_eq!(dst.root(), StateRoot::ZERO);
+    }
+
+    #[test]
+    fn resources_are_stored_queryable_and_move_the_root() {
+        let mut c = ungated();
+        let me = vec![30u8; 32];
+        let mut ctx = TestCtx::external(&me);
+        futures::executor::block_on(c.execute(&mut ctx, &announce_with(&["codex"], &[])))
+            .unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        let tags_only_root = c.root();
+
+        futures::executor::block_on(
+            c.execute(&mut ctx, &announce_with(&["codex"], &[("cores", 8), ("mem_gb", 32)])),
+        )
+        .unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_ne!(c.root(), tags_only_root, "resources are part of the commitment");
+
+        let reply = futures::executor::block_on(c.query(&encode_query(
+            &CapabilityQuery::Resources { node: me.clone() },
+        )))
+        .unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            CapabilityReply::Resources(r) => {
+                assert_eq!(r.get("cores"), Some(&8));
+                assert_eq!(r.get("mem_gb"), Some(&32));
+            }
+            other => panic!("expected Resources reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capable_providers_filters_per_dimension_and_absent_is_not_infinite() {
+        let mut c = ungated();
+        let big = vec![31u8; 32];
+        let small = vec![32u8; 32];
+        let bare = vec![33u8; 32];
+        futures::executor::block_on(async {
+            c.execute(&mut TestCtx::external(&big),
+                &announce_with(&["codex"], &[("cores", 16), ("mem_gb", 64)])).await.unwrap();
+            c.execute(&mut TestCtx::external(&small),
+                &announce_with(&["codex"], &[("cores", 4), ("mem_gb", 8)])).await.unwrap();
+            // tags-only node (direct mode): never matches ANY demand.
+            c.execute(&mut TestCtx::external(&bare), &announce_with(&["codex"], &[]))
+                .await.unwrap();
+            c.commit_block().await.unwrap();
+        });
+
+        assert_eq!(capable(&c, "codex", &[("cores", 8)]), vec![big.clone()]);
+        // empty demands degrade to plain Providers (all three).
+        assert_eq!(capable(&c, "codex", &[]).len(), 3);
+        // a dimension nobody announced matches nobody.
+        assert!(capable(&c, "codex", &[("gpu", 1)]).is_empty());
+        // both dimensions must hold.
+        assert_eq!(capable(&c, "codex", &[("cores", 4), ("mem_gb", 32)]), vec![big]);
+    }
+
+    #[test]
+    fn resources_without_capabilities_reject_and_malformed_resources_reject() {
+        let mut c = ungated();
+        let me = vec![34u8; 32];
+        let mut ctx = TestCtx::external(&me);
+        // capacity with nothing to execute is meaningless — reject loudly.
+        let err = futures::executor::block_on(
+            c.execute(&mut ctx, &announce_with(&[], &[("cores", 8)])),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+        // zero value / bad key reject via validate_resources.
+        assert!(futures::executor::block_on(
+            c.execute(&mut ctx, &announce_with(&["codex"], &[("cores", 0)]))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn snapshot_round_trip_carries_resources() {
+        let mut src = ungated();
+        let a = vec![35u8; 32];
+        futures::executor::block_on(
+            src.execute(&mut TestCtx::external(&a),
+                &announce_with(&["codex"], &[("cores", 8)])),
+        )
+        .unwrap();
+        futures::executor::block_on(src.commit_block()).unwrap();
+        let bytes = src.snapshot();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(StateRoot(digest), src.root());
+
+        let mut dst = ungated();
+        dst.install(&bytes, src.root()).unwrap();
+        assert_eq!(dst.root(), src.root());
+        assert_eq!(capable(&dst, "codex", &[("cores", 8)]), vec![a]);
     }
 }

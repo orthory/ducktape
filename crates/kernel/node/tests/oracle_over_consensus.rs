@@ -47,6 +47,7 @@ fn trigger(id: &str, spec: &[u8]) -> Msg {
             max_attempts: 1,
             lease_views: None,
             capability: None,
+            demands: Default::default(),
         }),
     }
 }

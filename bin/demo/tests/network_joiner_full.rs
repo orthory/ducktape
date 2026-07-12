@@ -190,6 +190,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                     max_attempts: 1,
                     lease_views: None,
                     capability: None,
+                    demands: Default::default(),
                 }),
             },
         ];

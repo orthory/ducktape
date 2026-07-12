@@ -97,6 +97,23 @@ describe("AskAgentButton", () => {
     expect(screen.queryByText("ASK TO RESPOND")).toBeNull();
   });
 
+  it("passes valid resource demands and drops zero/blank fields", () => {
+    const requestRun = renderRow([agent("scribe")]);
+    fireEvent.click(screen.getByTitle("Ask an agent to respond"));
+
+    fireEvent.change(screen.getByLabelText("CORES"), { target: { value: "4" } });
+    // Zero is invalid on the wire — it must be dropped, not sent as mem_gb: 0.
+    fireEvent.change(screen.getByLabelText("MEMORY (GB)"), { target: { value: "0" } });
+
+    fireEvent.click(screen.getByText("@scribe"));
+    expect(requestRun).toHaveBeenCalledWith({
+      agentId: "scribe",
+      channelId: "general",
+      anchorSeq: 7,
+      demands: { cores: 4 },
+    });
+  });
+
   it("offers nothing when no agent is Active", () => {
     renderRow([agent("idler", "paused")]);
     expect(screen.queryByTitle("Ask an agent to respond")).toBeNull();

@@ -84,6 +84,7 @@ fn trigger(id: &str, reply_to: Option<&str>, max_attempts: u32, deadline: Option
         max_attempts,
         lease_views: Some(4),
         capability: None,
+        demands: Default::default(),
     }
 }
 
@@ -144,6 +145,7 @@ fn source() -> SagaModule {
             max_attempts: 1,
             lease_views: None,
             capability: Some("alpha".into()),
+            demands: Default::default(),
         },
     );
     block_on(m.commit_block()).unwrap();
@@ -398,13 +400,13 @@ fn truncated_or_padded_snapshot_is_rejected() {
 }
 
 /// the canonical bytes of a single minimal saga (System origin, empty spec /
-/// payload, every option absent), with its id — the fixture the
+/// payload, every option absent, no demands), with its id — the fixture the
 /// discriminant-tampering tests index into. the layout is pinned by the
 /// asserted length: count 8, id len 8 + 1, origin 1, reply_to tag 1,
-/// reply_payload len 8, spec len 8, capability tag 1, status 1, attempt 4,
-/// max_attempts 4, seven option tags at [45..52) (assignee, pinned_assignee,
-/// lease_views, lease_expires_at, deadline, result, error), created_at 8,
-/// updated_at 8 = 68 bytes.
+/// reply_payload len 8, spec len 8, capability tag 1, demands count 8,
+/// status 1, attempt 4, max_attempts 4, seven option tags at [53..60)
+/// (assignee, pinned_assignee, lease_views, lease_expires_at, deadline,
+/// result, error), created_at 8, updated_at 8 = 76 bytes.
 fn minimal_snapshot(id: &str) -> Vec<u8> {
     let mut m = SagaModule::new("saga");
     exec(
@@ -421,13 +423,14 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
             max_attempts: 1,
             lease_views: None,
             capability: None,
+            demands: Default::default(),
         },
     );
     block_on(m.commit_block()).unwrap();
     let snap = m.snapshot();
     assert_eq!(
         snap.len(),
-        68,
+        76,
         "the minimal-saga layout this test indexes into"
     );
     snap
@@ -438,10 +441,10 @@ fn unknown_discriminants_and_tags_are_rejected() {
     let empty_root = SagaModule::new("saga").root();
     let snap = minimal_snapshot("a");
 
-    // origin discriminant (byte 17), status discriminant (byte 36), and an
-    // option tag (byte 45, the assignee) each admit exactly their known
+    // origin discriminant (byte 17), status discriminant (byte 44), and an
+    // option tag (byte 53, the assignee) each admit exactly their known
     // values — a state has ONE valid encoding.
-    for (index, what) in [(17usize, "origin"), (36, "status"), (45, "option tag")] {
+    for (index, what) in [(17usize, "origin"), (44, "status"), (53, "option tag")] {
         let mut bad = snap.clone();
         bad[index] = 9;
         let mut dst = SagaModule::new("saga");
@@ -502,6 +505,7 @@ fn non_ascending_or_duplicate_ids_are_rejected() {
                     max_attempts: 1,
                     lease_views: None,
                     capability: None,
+                    demands: Default::default(),
                 },
             );
         }

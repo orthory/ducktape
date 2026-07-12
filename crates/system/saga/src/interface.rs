@@ -31,6 +31,7 @@
 
 use sdk::codec;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// a saga's stable id, chosen by the trigger.
 pub type SagaId = String;
@@ -148,6 +149,11 @@ pub enum SagaMsg {
         /// work hold its lease. `None` keeps valset assignment. an opaque
         /// tag to this module: bounded, never interpreted.
         capability: Option<String>,
+        /// numeric resource demands (e.g. "cores", "mem_gb"). with `capability`
+        /// set, assignment draws from providers whose ANNOUNCED capacity covers
+        /// every dimension; empty = capability-only assignment (legacy).
+        #[serde(default)]
+        demands: BTreeMap<String, u64>,
         /// static binding: when set, EVERY attempt leases to exactly this
         /// node key — no rendezvous, no pool query; `capability` (if also
         /// set) is recorded but does not influence assignment. a dark pinned

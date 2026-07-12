@@ -711,6 +711,10 @@ fn commit_blocking(
     agent_id: &str,
     committer_name: &str,
 ) -> Result<CommitOutcome, String> {
+    // The provider's isolated HOME/auth/temp/target tree lives inside the
+    // disk-backed run worktree but is runtime debris, not authored source.
+    // Delete it before `git add -A` so credentials and caches cannot be pushed.
+    let _ = std::fs::remove_dir_all(run_dir.join(capability_host::RUN_RUNTIME_DIR));
     run_git(run_dir, &["add", "-A"], &[])?;
     let final_tree = run_git(run_dir, &["write-tree"], &[])?;
     let pinned_tree = run_git(

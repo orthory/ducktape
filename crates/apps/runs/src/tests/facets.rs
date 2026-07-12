@@ -890,6 +890,7 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
                 dispatch_id: "d1".into(),
                 recipe_id: "agent/bot".into(),
                 payload: b"in".to_vec(),
+                demands: Default::default(),
             }),
         },
     ))
