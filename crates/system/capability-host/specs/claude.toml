@@ -85,6 +85,25 @@ resume_args_append = ["--resume", "{session_id}"]
 # spec claims a broker.
 rw_dirs = ["~/.claude", "~/.claude.json"]
 
+[context]
+# WHERE THE AGENT'S SOUL LANDS. The host assembles the agent's curated skills
+# into one markdown document per run; this names the file THIS CLI already
+# auto-loads it from, so no Rust ever branches on an executor name.
+#
+# The PARENT of the checkout, not the checkout itself — and that is the whole
+# trick. claude MERGES a parent-directory CLAUDE.md with the project's own
+# (verified live: both reach the model), so a repository the agent works in keeps
+# its instructions and the soul layers UNDERNEATH them. Writing into the checkout
+# would instead OVERWRITE the repo's CLAUDE.md — and land in the agent's commit.
+#
+# Being outside the checkout is also why it stays out of the snapshot: `commit`
+# scans only UNDER the workdir (the same guarantee the -ro skills sibling relies
+# on). The host removes the file when the run ends, and under a sandbox backend
+# it is bind-mounted read-only at its identical path (it is outside the workdir
+# mount, so unlike codex's config-home doc it does NOT cross for free).
+# Inherited by every [[variants]] tag below.
+path = "workspace-parent:CLAUDE.md"
+
 [tools]
 # Wires the Ducktape MCP server into every argv this file produces — the base
 # tag and every [[variants]] tag — spliced in at load time IMMEDIATELY AFTER
