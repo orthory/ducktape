@@ -731,6 +731,7 @@ export function createActions({
         muted: seedMuted,
         status,
         error: null,
+        errorNote: null,
         mediaNote: null,
         cameraOn: false,
         sharing: false,
@@ -794,6 +795,9 @@ export function createActions({
     }
     const status = event.status;
     const error = event.error;
+    // the node's own reason, when it sent one — kept beside the coded error so
+    // the card can say WHICH connection failure this was.
+    const note = event.note;
     if (status === "closed" || status === "error") {
       const prevVoice = getState().voice;
       const channelId = prevVoice.channelId;
@@ -816,6 +820,7 @@ export function createActions({
           popped: false,
           status: "error",
           error: error ?? "connection",
+          errorNote: note ?? null,
           mediaNote: null,
           cameraOn: false,
           sharing: false,
@@ -1869,6 +1874,7 @@ export function createActions({
           muted: true,
           status: "connecting",
           error: null,
+          errorNote: null,
           mediaNote: null,
           cameraOn: false,
           sharing: false,
@@ -1893,6 +1899,7 @@ export function createActions({
           muted: false,
           status: "idle",
           error: null,
+          errorNote: null,
           mediaNote: null,
           popped: false,
           cameraOn: false,

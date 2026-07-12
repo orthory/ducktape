@@ -153,24 +153,66 @@ impl SessionGuard {
     }
 }
 
-/// Build the two overlay media planes on the hub runtime (blocking until the
-/// overlay is up), then serve sessions over them. One shared active-flow set
-/// answers admission for both planes.
+/// How long a join may wait on an overlay that is still coming up before the
+/// hub stops holding it and starts refusing. The bind normally lands in a few
+/// seconds, so this window keeps the "joined the instant the node booted" case
+/// working; past it, the honest answer is a refusal (and it must arrive well
+/// inside the client's own 12 s connect timeout, or the client gives up first
+/// and reports a generic connection failure instead of the reason).
+const OVERLAY_GRACE: Duration = Duration::from_secs(8);
+
+/// Why a join is refused while the overlay is down. Media rides ONLY the
+/// overlay, so with no interface there is no call — the node log's
+/// `[voice-plane]` line carries the underlying os error.
+const OVERLAY_DOWN: &str = "the mesh overlay is not up on this node, and huddle media rides the \
+                            overlay — no call can start. see the node log's [voice-plane] line \
+                            (an unprivileged `tun` effect never comes up: use `socket`).";
+
+/// Build the two overlay media planes on the hub runtime, then serve sessions
+/// over them. One shared active-flow set answers admission for both planes.
+///
+/// The bind waits on the overlay `/128`, which usually takes a few seconds but
+/// can take FOREVER (an unprivileged tun, an epoch that never applies). The
+/// request lane is drained throughout: a request left to rot in it is a huddle
+/// that hangs in "connecting" until the client's own timer gives up — with no
+/// reason on the wire and none in the ui. So joins wait out [`OVERLAY_GRACE`],
+/// and past it every join is refused with [`OVERLAY_DOWN`] until the bind lands.
 async fn hub_loop(
-    requests: mpsc::Receiver<noded::CallSessionRequest>,
+    mut requests: mpsc::Receiver<noded::CallSessionRequest>,
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
 ) {
     let flows = Arc::new(ActiveFlows::default());
-    let (voice_plane, video_plane) = crate::voice_plane::bind_media_planes(
+    let binding = crate::voice_plane::bind_media_planes(
         factory,
         peers,
         me,
         flows.clone() as Arc<dyn AdmissionPolicy>,
-    )
-    .await;
+    );
+    tokio::pin!(binding);
+    let bound = tokio::select! {
+        bound = &mut binding => Some(bound),
+        () = tokio::time::sleep(OVERLAY_GRACE) => None,
+    };
+    let (voice_plane, video_plane) = match bound {
+        Some(bound) => bound,
+        // The overlay is late (or never coming). Whatever queued during the
+        // grace window is answered here, as is every join until the bind lands.
+        None => loop {
+            tokio::select! {
+                bound = &mut binding => break bound,
+                request = requests.recv() => match request {
+                    Some(request) => {
+                        let _ = request.reply.send(Err(OVERLAY_DOWN.to_string()));
+                    }
+                    // the app surface dropped its lane (shutdown).
+                    None => return,
+                },
+            }
+        },
+    };
     // huddle media is the chat module's: both planes report under it.
     planes.register("chat", Service::Voice, voice_plane.watch());
     planes.register("chat", Service::Video, video_plane.watch());

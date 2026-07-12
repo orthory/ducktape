@@ -529,6 +529,13 @@ pub(super) async fn wire(
             );
             Some(peers)
         } else {
+            // Say it at boot: an operator whose node can never host a huddle
+            // otherwise learns it one failed join at a time, from the webview.
+            eprintln!(
+                "[node {label}] calls are DISABLED on this node: huddle media rides the mesh \
+                 overlay, and this node has none (wireguard_listen unset, or the fake effect). \
+                 set wireguard_listen + wireguard_effect = \"socket\" to enable huddles."
+            );
             drop(voice_requests);
             None
         }
