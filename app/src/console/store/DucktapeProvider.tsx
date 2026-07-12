@@ -883,13 +883,12 @@ export function DucktapeProvider({
   //    is focused, and which categories are enabled — all from this webview.
   //    Re-pushed whenever an input changes; the JSON fingerprint (the huddle-
   //    context idiom) swallows the per-block identity churn of re-fetched but
-  //    unchanged projections. The window focus edge also marks everything seen
-  //    — the webview-side complement of the notifier's native focus backstop.
+  //    unchanged projections. Focus feeds ONLY the config (focus-suppression
+  //    of the viewed channel) — seen-marking belongs to the bell dropdown.
   useEffect(() => {
     if (!isTauri()) return;
     const onFocus = () => {
       setWindowFocused(true);
-      void notifyClient.markSeen();
     };
     const onBlur = () => setWindowFocused(false);
     window.addEventListener("focus", onFocus);

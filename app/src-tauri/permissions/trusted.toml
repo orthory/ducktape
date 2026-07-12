@@ -63,4 +63,5 @@ commands.allow = [
   "huddle_pop_in",
   "notify_configure",
   "notify_mark_seen",
+  "notify_recent",
 ]

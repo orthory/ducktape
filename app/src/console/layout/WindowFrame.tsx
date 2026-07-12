@@ -11,6 +11,7 @@ import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
+import { NotificationsBell } from "./NotificationsBell";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { ResizeEdges, WindowControls } from "./WindowChrome";
 
@@ -217,6 +218,7 @@ function TitleBar() {
           overflow: "hidden",
         }}
       >
+        <NotificationsBell />
         <span
           style={{
             display: "flex",

@@ -170,6 +170,7 @@ fn main() {
             huddle::huddle_pop_in,
             notify::notify_configure,
             notify::notify_mark_seen,
+            notify::notify_recent,
             permissions::permission_prompt_state,
             permissions::permission_prompt_decide,
         ]);

@@ -111,6 +111,10 @@ export interface ConsoleActions {
    *  mark's cross-link. Best-effort: if the ring no longer holds that height
    *  the explorer just lands on the list. */
   openExplorerAt(height: number): void;
+  /** Jump to a forge item — the screen switch plus the one-shot forgeFocus
+   *  hand-off (the explorerFocus idiom). Used by the notification bell; the
+   *  navigate deep-link listener patches the same fields. */
+  openForgeItem(repo: string, number: number | null): void;
   /** The explorer calls this once it has consumed (or given up on) a pending
    *  focus hand-off. */
   clearExplorerFocus(): void;
@@ -1318,6 +1322,18 @@ export function createActions({
 
     clearExplorerFocus: () => {
       patch({ explorerFocus: null });
+    },
+
+    openForgeItem: (repo, number) => {
+      // Same rail-adoption contract as setScreen.
+      const section = sectionForScreen("forge");
+      const forgeFocus = { repo, number };
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "forge", viewMode: section, forgeFocus });
+      } else {
+        patch({ screen: "forge", forgeFocus });
+      }
     },
 
     setViewMode: (mode) => {
