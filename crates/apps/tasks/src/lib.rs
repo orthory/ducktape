@@ -11,6 +11,9 @@
 mod interface;
 pub use interface::*;
 // the derived-tier materialized view; registered only by serving binaries.
+// native-only: `indexer` drags unix-only IO, and the index is node-local
+// derived state — the wasm guest (`tasks-wasm`) builds without it.
+#[cfg(feature = "native")]
 pub mod index;
 
 use std::collections::BTreeMap;

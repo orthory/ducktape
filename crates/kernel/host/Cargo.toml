@@ -38,6 +38,9 @@ directory = { workspace = true }
 # vaults module and its wasm port, asserting identical replies + the declared
 # state-schema break.
 vaults = { workspace = true }
+jobs = { workspace = true }
+inbox = { workspace = true }
+tasks = { workspace = true }
 greeter = { workspace = true }
 # the deterministic-activation drain-injection test stands the real upgrade +
 # valset modules on the host and drives a block across an activation boundary.

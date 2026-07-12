@@ -218,6 +218,27 @@ wasm-modules:
 	cp crates/examples/vaults-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/vaults.component.wasm
 
+	cd crates/examples/jobs-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/jobs-wasm/target/wasm32-unknown-unknown/release/jobs_wasm.wasm \
+	  -o crates/examples/jobs-wasm/component.wasm
+	cp crates/examples/jobs-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/jobs.component.wasm
+
+	cd crates/examples/inbox-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/inbox-wasm/target/wasm32-unknown-unknown/release/inbox_wasm.wasm \
+	  -o crates/examples/inbox-wasm/component.wasm
+	cp crates/examples/inbox-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/inbox.component.wasm
+
+	cd crates/examples/tasks-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/tasks-wasm/target/wasm32-unknown-unknown/release/tasks_wasm.wasm \
+	  -o crates/examples/tasks-wasm/component.wasm
+	cp crates/examples/tasks-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/tasks.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -231,6 +252,12 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/directory.component.wasm
 	cmp crates/examples/vaults-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/vaults.component.wasm
+	cmp crates/examples/jobs-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/jobs.component.wasm
+	cmp crates/examples/inbox-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/inbox.component.wasm
+	cmp crates/examples/tasks-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/tasks.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

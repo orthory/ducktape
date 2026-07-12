@@ -19,8 +19,6 @@ use governance::Governance;
 use gateway::Gateway;
 use host::Host;
 use identity::Identity;
-use inbox::Inbox;
-use jobs::Jobs;
 use kv::Kv;
 use modreg::Modreg;
 use pages::Pages;
@@ -31,7 +29,6 @@ use sha2::Digest as _;
 use sdk::StateRoot;
 use statesync::{fetch_snapshot, qmdb::{QmdbStore, RemoteQmdbResolver}};
 use tagging::TaggingModule;
-use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
 use wasm_host::WasmModule;
@@ -113,6 +110,19 @@ const VAULTS_WASM_COMPONENT: &[u8] =
 /// the genesis-constant id the vaults module registers under.
 const VAULTS_MODULE_ID: &str = "vaults";
 
+/// jobs / inbox / tasks GENESIS components — adapter-ported tenants like
+/// vaults (native crate compiled into the guest; canonical snapshot persisted
+/// through the host-KV store; revision 2 in `MODULE_STATE_SCHEMAS`).
+const JOBS_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/jobs-wasm/component.wasm");
+const JOBS_MODULE_ID: &str = "jobs";
+const INBOX_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/inbox-wasm/component.wasm");
+const INBOX_MODULE_ID: &str = "inbox";
+const TASKS_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/tasks-wasm/component.wasm");
+const TASKS_MODULE_ID: &str = "tasks";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -130,6 +140,18 @@ fn seeded_modreg() -> Modreg {
     modreg.seed(
         VAULTS_MODULE_ID,
         sha2::Sha256::digest(VAULTS_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        JOBS_MODULE_ID,
+        sha2::Sha256::digest(JOBS_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        INBOX_MODULE_ID,
+        sha2::Sha256::digest(INBOX_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        TASKS_MODULE_ID,
+        sha2::Sha256::digest(TASKS_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -157,6 +179,26 @@ fn genesis_directory_wasm() -> WasmModule {
 fn genesis_vaults_wasm() -> WasmModule {
     WasmModule::from_bytes(VAULTS_MODULE_ID, VAULTS_WASM_COMPONENT)
         .expect("embedded vaults component loads")
+        .with_state_schema_revision(2)
+}
+
+/// jobs / inbox / tasks at their GENESIS code (adapter-ported, revision 2 —
+/// see [`genesis_vaults_wasm`]).
+fn genesis_jobs_wasm() -> WasmModule {
+    WasmModule::from_bytes(JOBS_MODULE_ID, JOBS_WASM_COMPONENT)
+        .expect("embedded jobs component loads")
+        .with_state_schema_revision(2)
+}
+
+fn genesis_inbox_wasm() -> WasmModule {
+    WasmModule::from_bytes(INBOX_MODULE_ID, INBOX_WASM_COMPONENT)
+        .expect("embedded inbox component loads")
+        .with_state_schema_revision(2)
+}
+
+fn genesis_tasks_wasm() -> WasmModule {
+    WasmModule::from_bytes(TASKS_MODULE_ID, TASKS_WASM_COMPONENT)
+        .expect("embedded tasks component loads")
         .with_state_schema_revision(2)
 }
 
@@ -192,14 +234,14 @@ struct ProductionModules {
     capability: CapabilityRegistry,
     dispatch: DispatchModule,
     tagging: TaggingModule,
-    tasks: Tasks,
+    tasks: WasmModule,
     vaults: WasmModule,
     identity: Identity,
     duckdns: DuckDns,
     gateway: Gateway,
-    inbox: Inbox,
+    inbox: WasmModule,
     files: Files,
-    jobs: Jobs,
+    jobs: WasmModule,
     agent: AgentModule,
     runs: RunsModule,
     directory: WasmModule,
@@ -264,6 +306,9 @@ pub(super) async fn genesis_host(
     blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
     blobs.put_chunk(VAULTS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(JOBS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(INBOX_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -315,7 +360,7 @@ pub(super) async fn genesis_host(
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
         tagging: TaggingModule::new("tagging").with_direct_owner("runs"),
-        tasks: Tasks::new("tasks"),
+        tasks: genesis_tasks_wasm(),
         // the first ADAPTER-ported wasm tenant: the native vaults logic
         // compiled to wasm, whole-state persisted per dispatch (see
         // `genesis_vaults_wasm`).
@@ -339,9 +384,9 @@ pub(super) async fn genesis_host(
         ),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
-        inbox: Inbox::new("inbox"),
+        inbox: genesis_inbox_wasm(),
         files: Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open"),
-        jobs: Jobs::new("jobs"),
+        jobs: genesis_jobs_wasm(),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
         agent: AgentModule::new("agent", "saga", Some("runs".into())),
@@ -474,8 +519,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;
 
-    let mut tasks = Tasks::new("tasks");
-    let (bytes, root) = snapshot_of("tasks")?;
+    let mut tasks = genesis_tasks_wasm();
+    let (bytes, root) = snapshot_of(TASKS_MODULE_ID)?;
     tasks
         .install(bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
@@ -517,8 +562,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("gateway install: {e}"))?;
 
-    let mut inbox = Inbox::new("inbox");
-    let (bytes, root) = snapshot_of("inbox")?;
+    let mut inbox = genesis_inbox_wasm();
+    let (bytes, root) = snapshot_of(INBOX_MODULE_ID)?;
     inbox
         .install(bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
@@ -532,8 +577,8 @@ pub(super) async fn restore_host(
     let files =
         Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
 
-    let mut jobs = Jobs::new("jobs");
-    let (bytes, root) = snapshot_of("jobs")?;
+    let mut jobs = genesis_jobs_wasm();
+    let (bytes, root) = snapshot_of(JOBS_MODULE_ID)?;
     jobs.install(bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
@@ -839,8 +884,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("{HELLO_WASM_MODULE_ID} install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("tasks").await?;
-    let mut tasks = Tasks::new("tasks");
+    let (bytes, root) = snapshot_of(TASKS_MODULE_ID).await?;
+    let mut tasks = genesis_tasks_wasm();
     tasks
         .install(&bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
@@ -878,8 +923,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("gateway install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("inbox").await?;
-    let mut inbox = Inbox::new("inbox");
+    let (bytes, root) = snapshot_of(INBOX_MODULE_ID).await?;
+    let mut inbox = genesis_inbox_wasm();
     inbox
         .install(&bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
@@ -910,8 +955,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     .await
     .map_err(|e| format!("files sync: {e}"))?;
 
-    let (bytes, root) = snapshot_of("jobs").await?;
-    let mut jobs = Jobs::new("jobs");
+    let (bytes, root) = snapshot_of(JOBS_MODULE_ID).await?;
+    let mut jobs = genesis_jobs_wasm();
     jobs.install(&bytes, root)
         .map_err(|e| format!("jobs install: {e}"))?;
 
