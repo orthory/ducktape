@@ -2628,10 +2628,35 @@ where
     /// Merge the join-window invite layer into an assembled peer map: an
     /// invite peer never overrides an entry the stronger layers (validated
     /// plans, restored mesh, pre-warm records) already carry — and once one
-    /// exists for the same identity, the invite entry has served its purpose
-    /// and dissolves.
+    /// with a CONCRETE endpoint exists for the same identity, the invite
+    /// entry has served its purpose and dissolves.
+    ///
+    /// An endpoint-less stronger entry (a NATed peer's record advertises
+    /// nothing) instead has the invite entry's endpoint grafted in: the
+    /// invite endpoint is OBSERVED — the intro datagram's source, or the
+    /// rendezvous-resolved path — and dropping it for `None` on an
+    /// endpoint-less pair leaves BOTH sides unable to initiate, killing the
+    /// live tunnel the join rode (and with it a fresh resident's only
+    /// statesync source, right as its standing lands). The retained endpoint
+    /// is what carries the cutover: a reconfigure-in-place apply keeps the
+    /// tunnel's live sessions outright (same key + same endpoint = unchanged
+    /// config), and the epoch apply's full interface rebuild can re-initiate
+    /// immediately instead of deadlocking endpoint-less.
     fn merge_invite_layer(&mut self, merged: &mut BTreeMap<ValidatorIdentity, PeerTunnelConfig>) {
-        self.invite_peers.retain(|id, _| !merged.contains_key(id));
+        self.invite_peers.retain(|id, invite| match merged.get_mut(id) {
+            Some(entry) => {
+                let graft = entry.endpoint.is_none()
+                    && entry.wireguard_public_key == invite.wireguard_public_key;
+                if graft {
+                    entry.endpoint = invite.endpoint;
+                }
+                // grafting keeps the invite entry (later re-merges rebuild
+                // `merged` from the still-endpoint-less records); a concrete
+                // or re-keyed stronger entry retires it.
+                graft
+            }
+            None => true,
+        });
         for (id, cfg) in &self.invite_peers {
             merged.entry(*id).or_insert_with(|| cfg.clone());
         }

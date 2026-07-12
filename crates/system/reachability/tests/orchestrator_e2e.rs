@@ -16,7 +16,7 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use defguard_wireguard_rs::net::IpAddrMask;
 use nat_traversal::NodeKey;
 use reachability::{
-    EndpointResolver as _, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
+    EndpointResolver as _, InstallReply, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
     ReachabilityEvent, ReachabilityMsg, Resolution, StaticResolver, WireGuardKeypair, binding,
 };
 use tokio::sync::mpsc;
@@ -1504,6 +1504,111 @@ async fn standby_tunnels_prewarm_before_activation() {
                     "node {i}: the epoch apply replaced the pre-warm interface"
                 );
             }
+        })
+        .await;
+}
+
+/// Install `peer` as `node`'s join-window invite tunnel (the intro/bootstrap
+/// path's exact command) and await the applied reply.
+async fn install_invite(
+    node: &TestNode,
+    peer: commonware_cryptography::ed25519::PublicKey,
+    wireguard_public_key: X25519PublicKey,
+    endpoint: SocketAddr,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    node.cmd
+        .send(ReachabilityCommand::InstallInvitePeer {
+            peer,
+            wireguard_public_key,
+            endpoint,
+            reply: InstallReply(tx),
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+}
+
+/// The invite-join cutover regression (statesync went dark the moment
+/// resident standing landed): an endpoint-less member and an endpoint-less
+/// joiner hold a LIVE invite tunnel whose endpoints are OBSERVED (the intro
+/// datagram's source on the inviter; the rendezvous-resolved path on the
+/// joiner). Standing lands, both sides retarget (member + standby), and the
+/// pre-warm records both advertise NO endpoint. The merge must keep the
+/// observed invite endpoints: replacing them with the records' `None` leaves
+/// BOTH sides unable to initiate — the live tunnel the join rode dies, and
+/// with it the joiner's only statesync path.
+#[tokio::test]
+async fn prewarm_merge_keeps_the_invite_tunnels_observed_endpoints() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            // both nodes endpoint-less: the NATed-desktop default shape.
+            let deliver_all: DeliveryFilter = Rc::new(|_, _, _| 1);
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![],
+                deliver_all,
+                vec![],
+                None,
+                &[0, 1],
+                &[],
+            );
+            // pre-create both keystores so each side can install the OTHER
+            // as its invite peer; the nodes load these same files at start.
+            let (wg0, _) =
+                WireGuardKeypair::load_or_generate(&dir.path().join("wg-0.key")).unwrap();
+            let (wg1, _) =
+                WireGuardKeypair::load_or_generate(&dir.path().join("wg-1.key")).unwrap();
+            let observed_joiner: SocketAddr = "203.0.113.9:60579".parse().unwrap();
+            let resolved_member: SocketAddr = "203.0.113.8:51820".parse().unwrap();
+            install_invite(
+                &nodes[0],
+                nodes[1].signer.public_key(),
+                wg1.public_key(),
+                observed_joiner,
+            )
+            .await;
+            install_invite(
+                &nodes[1],
+                nodes[0].signer.public_key(),
+                wg0.public_key(),
+                resolved_member,
+            )
+            .await;
+
+            // the joiner's standing lands: epoch 1 = member 0 + standby 1.
+            retarget_all(&nodes, &[0], &[1], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_prewarmed(&mut collected, &[0], &[(0, 1), (1, 1)], 1).await;
+
+            let member_view = latest_config(&nodes[0]);
+            let entry = member_view
+                .peers
+                .iter()
+                .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
+                .expect("member: joiner peer entry");
+            assert_eq!(entry.public_key.as_array(), wg1.public_key().0);
+            assert_eq!(
+                entry.endpoint,
+                Some(observed_joiner),
+                "member: the joiner's observed invite endpoint survives its endpoint-less record"
+            );
+            let joiner_view = latest_config(&nodes[1]);
+            let entry = joiner_view
+                .peers
+                .iter()
+                .find(|p| p.allowed_ips == vec![ula(nodes[0].identity)])
+                .expect("joiner: member peer entry");
+            assert_eq!(entry.public_key.as_array(), wg0.public_key().0);
+            assert_eq!(
+                entry.endpoint,
+                Some(resolved_member),
+                "joiner: the member's resolved invite endpoint survives its endpoint-less record"
+            );
         })
         .await;
 }
