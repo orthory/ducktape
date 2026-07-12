@@ -91,7 +91,15 @@ export function GatewayView() {
   const [note, setNote] = useState<string | null>(null);
 
   const name = useMemo(() => gateway.routeName(label), [label]);
-  const address = handle
+  const labelError = useMemo(() => {
+    try {
+      gateway.validateRouteName(name);
+      return null;
+    } catch {
+      return "Use lowercase letters, numbers, and hyphens.";
+    }
+  }, [name]);
+  const address = handle && !labelError
     ? `${name.label ? `${name.label}.` : ""}${handle}.duck`
     : null;
   const local = localRoutes.find((route) => route.name.label === name.label);
@@ -139,7 +147,10 @@ export function GatewayView() {
       resetEditor();
       return;
     }
-    gateway.validateRouteName(name);
+    // The label is a live draft. IME composition and ordinary typing may
+    // temporarily make it invalid; do not query (or throw) until it is a
+    // complete route name.
+    if (labelError) return;
     const accountBytes = identity.hexToBytes(accountId);
     const result = await Promise.all([
       gateway.getRoute(transport, accountBytes, name),
@@ -157,7 +168,7 @@ export function GatewayView() {
     setRecords(published);
     setLocalRoutes(routes);
     hydrateEditor(next, routes);
-  }, [transport, accountId, name, workspaceId, hydrateEditor, resetEditor]);
+  }, [transport, accountId, name, labelError, workspaceId, hydrateEditor, resetEditor]);
 
   useEffect(() => {
     setRecord(null);
@@ -342,7 +353,7 @@ export function GatewayView() {
   const canMutate = Boolean(
     transport && isTauri() && workspaceId && accountId && publisherNode && chainId && !busy,
   );
-  const canPublish = canMutate && audience !== "accounts";
+  const canPublish = canMutate && audience !== "accounts" && !labelError;
 
   const healthText = health.kind === "checking" ? "Checking end to end…"
     : health.kind === "serving" ? `Healthy · HTTP ${health.status}`
@@ -444,6 +455,7 @@ export function GatewayView() {
             <label style={{ font: `600 10px ${font.sans}`, color: color.muted3 }}>
               Route label <span style={{ color: color.muted }}>(blank = account apex)</span>
               <input aria-label="Route label" value={label} onChange={(event) => setLabel(event.target.value.toLowerCase())} placeholder="api" spellCheck={false} style={{ ...fieldStyle, display: "block", width: "100%", marginTop: 5 }} />
+              {labelError && <span role="alert" style={{ display: "block", marginTop: 4, color: color.danger, font: `500 9.5px ${font.sans}` }}>{labelError}</span>}
             </label>
             <label style={{ font: `600 10px ${font.sans}`, color: color.muted3 }}>
               Source
@@ -469,9 +481,9 @@ export function GatewayView() {
                 <input aria-label="Default path" value={defaultPath} onChange={(event) => setDefaultPath(event.target.value)} style={{ ...fieldStyle, display: "block", width: "100%", marginTop: 5 }} />
               </label>
               <div style={{ marginTop: 7, color: color.muted, font: `500 9.5px/1.45 ${font.mono}`, overflowWrap: "anywhere" }}>
-                {publisherNode ? gateway.contentRoot(publisherNode, name) : "—"}
+                {publisherNode && !labelError ? gateway.contentRoot(publisherNode, name) : "—"}
               </div>
-              <button disabled={!canMutate} onClick={() => run(createStarter)} style={{ ...buttonStyle(!canMutate), marginTop: 9, width: "100%", textAlign: "center" }}>Create starter file</button>
+              <button disabled={!canMutate || Boolean(labelError)} onClick={() => run(createStarter)} style={{ ...buttonStyle(!canMutate || Boolean(labelError)), marginTop: 9, width: "100%", textAlign: "center" }}>Create starter file</button>
             </div>
           ) : (
             <div style={{ marginTop: 13 }}>
