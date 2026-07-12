@@ -133,9 +133,41 @@ describe("NotificationsBell", () => {
     );
 
     fireEvent.click(screen.getByLabelText("Notifications"));
+    // Both share #general, so they land in one stack — expand it to see them.
+    fireEvent.click(await screen.findByText("#general"));
     // Both survive — the merge keeps the live prepend above the boot items.
-    expect(await screen.findByText("Landed live")).toBeInTheDocument();
+    expect(screen.getByText("Landed live")).toBeInTheDocument();
     expect(screen.getByText("From boot")).toBeInTheDocument();
+  });
+
+  it("stacks items sharing a channel and expands them on click", async () => {
+    markTauri();
+    notifyMocks.recent.mockResolvedValueOnce({
+      unread: 3,
+      items: [
+        item({ title: "Casey mentioned you", at: 3000 }),
+        item({ title: "Ana mentioned you", at: 2000 }),
+        item({ title: "Run done", category: "run", channelId: null, at: 1000 }),
+      ],
+    });
+
+    const { selectChannel, setScreen } = renderBell();
+    fireEvent.click(await screen.findByLabelText("Notifications"));
+
+    // The two #general mentions collapse into one row; the lone run stays flat.
+    const stack = await screen.findByText("#general");
+    expect(screen.getByText("2 messages")).toBeInTheDocument();
+    expect(screen.queryByText("Casey mentioned you")).toBeNull();
+    expect(screen.getByText("Run done")).toBeInTheDocument();
+
+    fireEvent.click(stack);
+    expect(screen.getByText("Casey mentioned you")).toBeInTheDocument();
+    expect(screen.getByText("Ana mentioned you")).toBeInTheDocument();
+
+    // An expanded item still navigates, and collapsing hides them again.
+    fireEvent.click(screen.getByText("Ana mentioned you"));
+    expect(setScreen).toHaveBeenCalledWith("chat");
+    expect(selectChannel).toHaveBeenCalledWith("general");
   });
 
   it("prepends live items and shows the empty state before any arrive", async () => {
