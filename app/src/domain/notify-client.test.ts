@@ -27,7 +27,9 @@ import { DEFAULT_NOTIFY_PREFS } from "../console/store/state";
 import {
   configure,
   markSeen,
+  onItem,
   onUnread,
+  recent,
   type NotifyConfigPayload,
 } from "./notify-client";
 
@@ -156,6 +158,40 @@ describe("notify client", () => {
       error,
     );
     expect(cb).not.toHaveBeenCalled();
+  });
+
+  it("recent returns the command payload and [] on failure", async () => {
+    markTauri();
+    invokeMock.mockResolvedValueOnce([
+      { category: "mention", title: "t", body: "b", channelId: null, at: 1 },
+    ]);
+
+    await expect(recent()).resolves.toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledWith("notify_recent");
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockRejectedValueOnce(new Error("nope"));
+    await expect(recent()).resolves.toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("recent"), expect.any(Error));
+  });
+
+  it("onItem unwraps item events and returns the unlisten", async () => {
+    markTauri();
+    const unlisten = vi.fn();
+    const cb = vi.fn();
+    listenMock.mockImplementation(async (_eventName, handler) => {
+      handler({ payload: { category: "reply", title: "t", body: "b", channelId: "c", at: 2 } });
+      return unlisten;
+    });
+
+    const returned = await onItem(cb);
+    returned();
+
+    expect(listenMock).toHaveBeenCalledWith("ducktape://notify-item", expect.any(Function));
+    expect(cb).toHaveBeenCalledWith(
+      expect.objectContaining({ category: "reply", channelId: "c" }),
+    );
+    expect(unlisten).toHaveBeenCalled();
   });
 });
 

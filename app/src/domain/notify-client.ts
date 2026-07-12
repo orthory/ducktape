@@ -64,3 +64,42 @@ export const onUnread = async (
     return noop;
   }
 };
+
+/** One entry of the notifier's recent ring (the bell dropdown's rows). */
+export interface NotifyItem {
+  category: "mention" | "reply" | "huddle" | "run" | "forge" | "governance";
+  title: string;
+  body: string;
+  channelId: string | null;
+  at: number;
+}
+
+export const recent = async (): Promise<NotifyItem[]> => {
+  if (!isTauri()) return [];
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<NotifyItem[]>("notify_recent");
+  } catch (error) {
+    warnFailure("recent", "notification history is unavailable", error);
+    return [];
+  }
+};
+
+export const onItem = async (
+  cb: (item: NotifyItem) => void,
+): Promise<() => void> => {
+  if (!isTauri()) return noop;
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    return await listen<NotifyItem>("ducktape://notify-item", (event) => {
+      cb(event.payload);
+    });
+  } catch (error) {
+    warnFailure(
+      "onItem",
+      "live notification items are inactive; returning a no-op unlisten",
+      error,
+    );
+    return noop;
+  }
+};
