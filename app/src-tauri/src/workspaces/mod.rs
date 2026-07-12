@@ -30,7 +30,7 @@ mod phase;
 mod ports;
 mod registry;
 
-pub(crate) use lifecycle::{port_listening, stop_active_workspace_node};
+pub(crate) use lifecycle::port_listening;
 pub(crate) use phase::read_tail;
 pub(crate) use registry::root;
 

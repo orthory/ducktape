@@ -8,9 +8,10 @@
 //! workers never execute or wait on the node binary. On macOS, closing the
 //! console window only hides to the menu-bar app instead of killing the
 //! network (close-to-hide is wired in the mac-gated tray init); on
-//! Linux/Windows there is no tray to hide into, so close quits. A real app
-//! quit (tray Quit / Cmd-Q / OS exit / non-mac window close) stops the active
-//! managed node through the workspace pidfile before the shell exits.
+//! Linux/Windows there is no tray to hide into, so close quits. The managed
+//! node is deliberately detached and outlives every shell exit; only explicit
+//! workspace Stop/Forget actions may tear it down. A later shell adopts the
+//! listener through the workspace registry.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -246,9 +247,10 @@ fn main() {
             if let Some(notify) = tauri::Manager::try_state::<notify::NotifyHandles>(app) {
                 notify.stream.shutdown();
             }
-            if let Err(err) = workspaces::stop_active_workspace_node(app) {
-                eprintln!("app exit: could not stop active workspace node: {err}");
-            }
+            // The workspace node is a durable execution host, not a Tauri
+            // child: it is deliberately left running so the next shell adopts
+            // it, and so a dev rebuild or an ordinary quit never kills a live
+            // agent provider. Verified teardown belongs to Stop/Forget alone.
         }
         _ => {}
     });

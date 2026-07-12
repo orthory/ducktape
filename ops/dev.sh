@@ -22,6 +22,7 @@ set -uo pipefail
 
 CARGO="${CARGO:-cargo}"
 BUN="${BUN:-bun}"
+CURL="${CURL:-curl}"
 CEF_CLONE="${CEF_CLONE:-$HOME/.cache/ducktape-cef-probe/tauri-cef}"
 
 log() { printf '\033[36m[dev]\033[0m %s\n' "$*"; }
@@ -125,37 +126,54 @@ spawn_node() { # $1 = config path; detached orphan, mirrors the app's own spawn.
   printf '%s\n' "$SPAWNED_PID" >"$dir/node.pid" 2>/dev/null || true
 }
 
-restart_node() {
-  log "rust changed → rebuilding ducktape-node…"
-  local before after
-  before=$(cksum "$NODE_SRC" 2>/dev/null | cut -d' ' -f1-2)
-  if ! $CARGO build -p node-bin; then
-    log "✗ build failed — leaving the running node up"
-    return
-  fi
-  after=$(cksum "$NODE_SRC" 2>/dev/null | cut -d' ' -f1-2)
-  # Hash-gate: a test/comment/doc edit rebuilds but produces the same binary —
-  # don't bounce the node (dropping ws/huddle state) for a no-op change.
-  if [ -n "$before" ] && [ "$before" = "$after" ]; then
-    log "· node binary unchanged — skipping restart"
-    return
-  fi
+# Resolve the loopback app surface from node.toml. Dev workspaces write the
+# canonical `http_listen = "host:port"` form; wildcard binds are dialed back
+# through loopback just like the desktop does.
+http_base_of_config() { # $1 = config path
+  local listen host port
+  listen=$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1)
+  [ -n "$listen" ] || return 1
+  host="${listen%:*}"
+  port="${listen##*:}"
+  case "$host" in
+    0.0.0.0) host="127.0.0.1" ;;
+    ::|"[::]") host="[::1]" ;;
+  esac
+  printf 'http://%s:%s\n' "$host" "$port"
+}
 
-  local pid cfg dir i=0
-  pid=$(node_pids | head -1)
-  if ! stage_node; then
-    log "✗ could not stage the fresh node to $NODE_BIN — leaving the running node up"
+# Print one of: idle (the Runs projection answered with no in-flight runs),
+# pending, or unknown. Unknown is deliberately fail-safe: a rebuilding dev
+# shell must never kill a provider merely because the status query timed out.
+pending_agent_runs_state() { # $1 = config path
+  if [ -n "${DUCKTAPE_DEV_PENDING_RUNS_STATE:-}" ]; then
+    printf '%s\n' "$DUCKTAPE_DEV_PENDING_RUNS_STATE"
     return
   fi
-  if [ -z "${pid:-}" ]; then
-    log "✓ built + staged; no live node — the app will spawn the fresh binary itself"
-    return
-  fi
-  cfg=$(node_config_of "$pid")
-  [ -n "$cfg" ] || {
-    log "could not read node --config; skipping restart"
+  local base body compact
+  base=$(http_base_of_config "$1") || {
+    printf 'unknown\n'
     return
   }
+  body=$(
+    "$CURL" --silent --show-error --fail --max-time 2 \
+      -H 'content-type: application/json' \
+      --data '{"target":"runs","query":"pending_runs"}' \
+      "$base/v1/query" 2>/dev/null
+  ) || {
+    printf 'unknown\n'
+    return
+  }
+  compact=$(printf '%s' "$body" | tr -d '[:space:]')
+  case "$compact" in
+    *'"pending_runs":[]'*) printf 'idle\n' ;;
+    *'"pending_runs":['*) printf 'pending\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+bounce_node() { # $1 = pid, $2 = config path; fresh binary is already staged.
+  local pid="$1" cfg="$2" dir i=0
   dir="${cfg%/*}"
   log "restarting node (pid $pid) on ${cfg}…"
   kill "$pid" 2>/dev/null || true
@@ -190,6 +208,73 @@ restart_node() {
   log "✓ node back (pid $SPAWNED_PID) on the fresh binary; app reconnects on its next heartbeat"
 }
 
+defer_node_restart() { # $1 = config path, $2 = pending|unknown
+  DEFERRED_RESTART_CFG="$1"
+  case "$2" in
+    pending)
+      log "built + staged; agent run still pending — deferring node restart until Runs is idle"
+      ;;
+    *)
+      log "built + staged; pending-run status unavailable — deferring node restart safely"
+      ;;
+  esac
+}
+
+resume_deferred_restart() {
+  local cfg="${DEFERRED_RESTART_CFG:-}" state pid
+  [ -n "$cfg" ] || return
+  state=$(pending_agent_runs_state "$cfg")
+  [ "$state" = idle ] || return
+  pid=$(node_pids | head -1)
+  DEFERRED_RESTART_CFG=""
+  if [ -z "${pid:-}" ]; then
+    log "deferred node binary is ready; no live node — the app will spawn it"
+    return
+  fi
+  log "pending agent runs drained — applying the staged node binary"
+  bounce_node "$pid" "$cfg"
+}
+
+restart_node() {
+  log "rust changed → rebuilding ducktape-node…"
+  local before after
+  before=$(cksum "$NODE_SRC" 2>/dev/null | cut -d' ' -f1-2)
+  if ! $CARGO build -p node-bin; then
+    log "✗ build failed — leaving the running node up"
+    return
+  fi
+  after=$(cksum "$NODE_SRC" 2>/dev/null | cut -d' ' -f1-2)
+  # Hash-gate: a test/comment/doc edit rebuilds but produces the same binary —
+  # don't bounce the node (dropping ws/huddle state) for a no-op change.
+  if [ -n "$before" ] && [ "$before" = "$after" ]; then
+    log "· node binary unchanged — skipping restart"
+    return
+  fi
+
+  local pid cfg state
+  pid=$(node_pids | head -1)
+  if ! stage_node; then
+    log "✗ could not stage the fresh node to $NODE_BIN — leaving the running node up"
+    return
+  fi
+  if [ -z "${pid:-}" ]; then
+    log "✓ built + staged; no live node — the app will spawn the fresh binary itself"
+    return
+  fi
+  cfg=$(node_config_of "$pid")
+  [ -n "$cfg" ] || {
+    log "could not read node --config; skipping restart"
+    return
+  }
+  state=$(pending_agent_runs_state "$cfg")
+  if [ "$state" != idle ]; then
+    defer_node_restart "$cfg" "$state"
+    return
+  fi
+  DEFERRED_RESTART_CFG=""
+  bounce_node "$pid" "$cfg"
+}
+
 watch_rust() { # zero-dep poll (no cargo-watch/watchexec on this box)
   local stamp
   stamp="$(mktemp)"
@@ -198,6 +283,8 @@ watch_rust() { # zero-dep poll (no cargo-watch/watchexec on this box)
     if [ -n "$(find bin crates -name '*.rs' -newer "$stamp" -print -quit 2>/dev/null)" ]; then
       touch "$stamp"
       restart_node
+    elif [ -n "${DEFERRED_RESTART_CFG:-}" ]; then
+      resume_deferred_restart
     fi
     sleep 2
   done

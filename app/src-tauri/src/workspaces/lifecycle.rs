@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use super::registry::{load_registry_at, Ports};
+use super::registry::Ports;
 
 /// is something accepting connections on this localhost port right now? used as
 /// a liveness probe for an already-running workspace node.
@@ -228,26 +228,6 @@ pub(super) fn stop_workspace_node(
     Ok(())
 }
 
-/// Stop the active workspace's local node while the desktop app exits. This is
-/// best-effort at the UI boundary, but the underlying stop still verifies pids
-/// and ports so a half-stopped process is visible in stderr instead of silently
-/// surviving.
-pub(crate) fn stop_active_workspace_node(app: &crate::rt::AppHandle) -> Result<(), String> {
-    stop_active_workspace_node_at(&super::registry::root(app)?, Duration::from_secs(5))
-}
-
-fn stop_active_workspace_node_at(root: &Path, grace: Duration) -> Result<(), String> {
-    let reg = load_registry_at(&root.join("registry.json"))?;
-    let Some(active) = reg.active.as_deref() else {
-        return Ok(());
-    };
-    let Some(ws) = reg.workspaces.iter().find(|ws| ws.id == active) else {
-        return Ok(());
-    };
-    let dir = root.join("workspaces").join(&ws.id);
-    stop_workspace_node(&dir, &ws.ports, grace)
-}
-
 /// is anything still listening on the ports this workspace owns? the mesh
 /// listener is bound in every phase (parked included); http only once serving.
 fn ports_held(ports: &Ports) -> bool {
@@ -287,7 +267,6 @@ mod tests {
     use std::net::TcpListener;
 
     use super::super::ports::free_port;
-    use super::super::registry::{save_registry_at, Registry, Workspace};
     use super::*;
 
     /// a scratch workspace dir; its path is what pid verification matches.
@@ -437,44 +416,5 @@ mod tests {
         assert!(err.contains("still running"), "{err}");
         drop(listener);
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stops_the_active_workspace_on_app_exit() {
-        let root = scratch_dir("app-exit-root");
-        let id = "active";
-        let dir = root.join("workspaces").join(id);
-        fs::create_dir_all(&dir).unwrap();
-        let ports = closed_ports();
-        let mut child = spawn_fake_node(&dir);
-        fs::write(pidfile(&dir), child.id().to_string()).unwrap();
-
-        let reg = Registry {
-            version: 1,
-            active: Some(id.into()),
-            workspaces: vec![Workspace {
-                id: id.into(),
-                name: "Active".into(),
-                chain_id: "test".into(),
-                pubkey: "pub".into(),
-                founder: true,
-                member: true,
-                ports,
-            }],
-            mnemonic_confirmed: false,
-        };
-        save_registry_at(&root.join("registry.json"), &reg).unwrap();
-
-        stop_active_workspace_node_at(&root, Duration::from_millis(600)).unwrap();
-
-        assert!(
-            died(&mut child, Duration::from_secs(2)),
-            "the app-exit hook must stop the active workspace node"
-        );
-        assert!(
-            !pidfile(&dir).exists(),
-            "the active workspace pidfile should be cleared after shutdown"
-        );
-        let _ = fs::remove_dir_all(&root);
     }
 }
