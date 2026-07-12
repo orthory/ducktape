@@ -1,7 +1,7 @@
 // Typed client for the node's `agent` module — the TS mirror of
 // `crates/apps/agent-interface`. The agent module is the platform's agent
 // REGISTRY and nothing more: a self-contained record book of which agents
-// exist — owner, capability tag, prompt pin, granted actions, status. The
+// exist — owner, capability tag, curated skills, granted actions, status. The
 // acting half of the collaboration loop (watches, runs, cancellation) lives
 // in the runs module — see `runs-client`.
 //
@@ -10,11 +10,12 @@
 //   - ownership is NEVER in a write payload — the module derives an agent's
 //     owner from the block's origin, so every write function takes an
 //     `origin` and passes it to transport.submit, exactly like chat-client.
-//   - prompt CONTENT lives off-registry: RegisterAgent/UpdateAgent commit a
-//     32-byte `prompt_hash` pin — the sha256 of the prompt text. the content
-//     itself is content-addressed in the node's blob store (keyed by that
-//     digest), so every run composes its prompt from the blob the pin resolves
-//     to.
+//   - an agent's SOUL is its curated skill set, not a stored prompt blob.
+//     Each `SkillRef` names a duckfs prefix; `load: "always"` inlines that
+//     document into every run's assembled context (the persona), `on_demand`
+//     only lists it so the agent can read it from its skill mount when the
+//     task calls for it. Consensus pins the prefixes (and optional snapshots);
+//     `prompt_hash` and the blob-store prompt path are gone.
 //
 // Everything is a pure function over an injected NodeTransport.
 
@@ -45,15 +46,30 @@ export interface ResourceCaps {
   subagent_budget?: number;
 }
 
+/** How a curated skill reaches the run. `always` inlines the whole document
+ *  into the assembled context every run — that IS the agent's persona;
+ *  `on_demand` only indexes it, and the agent reads the body from its skill
+ *  mount when the task calls for it. Omitted on the wire ⇒ the node defaults
+ *  to `on_demand`. */
+export type LoadMode = "always" | "on_demand";
+
+/** One curated skill: a duckfs prefix (the skill's directory, holding its
+ *  `SKILL.md`), optionally pinned to a snapshot, plus its load mode. Order is
+ *  meaningful — the assembler inlines `always` bodies in curation order. */
+export interface SkillRef {
+  name: string;
+  source_prefix: string;
+  /** A snapshot pin; omitted/null means the run's head. */
+  source_snapshot?: string | null;
+  load: LoadMode;
+}
+
 export interface AgentRecord {
   agent_id: string;
   /** The registration origin — gates every mutation of the record. */
   owner: SagaOrigin;
   display_name: string;
   capability: string;
-  /** sha256 of the agent's prompt content — exactly 32 bytes. The content is
-   *  content-addressed in the node's blob store under this digest. */
-  prompt_hash: number[];
   /** Granted action names, each from `KNOWN_ACTIONS`; sorted and deduped. */
   allowed_actions: string[];
   status: AgentStatus;
@@ -61,6 +77,8 @@ export interface AgentRecord {
   updated_at: number;
   /** D3 resource caps — absent on the wire when default-empty. */
   caps?: ResourceCaps;
+  /** The curated skill set, in order — absent on the wire when empty. */
+  skills?: SkillRef[];
 }
 
 const TARGET = "agent";
@@ -81,11 +99,11 @@ export const KNOWN_ACTIONS = [
   "pages.set_checked",
 ] as const;
 
-// ── Prompt hashing helper ───────────────────────────────
+// ── Hex helper ──────────────────────────────────────────
 
-/** A 64-char lowercase-hex digest → the 32 byte ints the wire carries as a
- *  `prompt_hash`. The node's blob store keys by sha256(bytes), so the digest
- *  `transport.putBlob` returns for the prompt text IS the hash to register. */
+/** A lowercase-hex string → the byte ints the wire carries. Lives here for
+ *  historical reasons; identity-client and chat-client re-export it under
+ *  their own vocabulary. */
 export const hexToBytes = (hex: string): number[] =>
   Array.from({ length: Math.floor(hex.length / 2) }, (_, i) =>
     parseInt(hex.slice(i * 2, i * 2 + 2), 16),
@@ -99,11 +117,11 @@ export const registerAgent = (
     agentId: string;
     displayName: string;
     capability: string;
-    /** Exactly 32 bytes — see hexToBytes / the prompt-upload flow. */
-    promptHash: number[];
     allowedActions: string[];
     /** D3 resource caps; omit to register with the empty default. */
     caps?: ResourceCaps;
+    /** The curated skill set, in order; omit to register with none. */
+    skills?: SkillRef[];
     origin: string;
   },
 ): Promise<BlockEvent> =>
@@ -114,9 +132,9 @@ export const registerAgent = (
         agent_id: params.agentId,
         display_name: params.displayName,
         capability: params.capability,
-        prompt_hash: params.promptHash,
         allowed_actions: params.allowedActions,
         ...(params.caps ? { caps: params.caps } : {}),
+        ...(params.skills?.length ? { skills: params.skills } : {}),
       },
     },
     params.origin,
@@ -129,11 +147,13 @@ export const updateAgent = (
     agentId: string;
     displayName?: string | null;
     capability?: string | null;
-    promptHash?: number[] | null;
     allowedActions?: string[] | null;
     /** A provided value REPLACES the whole caps record (send the full caps,
      *  not a patch); null/omitted keeps the current one. */
     caps?: ResourceCaps | null;
+    /** A provided list REPLACES the whole curated set (an empty array clears
+     *  it); null/omitted keeps the current one. */
+    skills?: SkillRef[] | null;
     origin: string;
   },
 ): Promise<BlockEvent> =>
@@ -144,9 +164,9 @@ export const updateAgent = (
         agent_id: params.agentId,
         display_name: params.displayName ?? null,
         capability: params.capability ?? null,
-        prompt_hash: params.promptHash ?? null,
         allowed_actions: params.allowedActions ?? null,
         caps: params.caps ?? null,
+        skills: params.skills ?? null,
       },
     },
     params.origin,

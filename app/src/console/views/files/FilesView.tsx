@@ -1022,6 +1022,8 @@ export function FilesView() {
   // dragenter/dragleave fire per descendant, so we count entry depth instead of
   // toggling on each one — the overlay stays put as the pointer crosses columns.
   const dragDepth = useRef(0);
+  // The last consumed filesFocus hand-off (see the deep-link effect below).
+  const consumedFocusRef = useRef<string | null>(null);
 
   const [columns, setColumns] = useState<DirectoryColumn[]>([makeDirectoryColumn(DEFAULT_DIR)]);
   const [snapshot, setSnapshot] = useState<string | null>(null);
@@ -1153,6 +1155,18 @@ export function FilesView() {
       ),
     );
   };
+
+  // Consume a deep-link hand-off (state.filesFocus — the agent form pointing at
+  // a skill document). One-shot: the provider retires it on screen leave, and
+  // the ref keeps a re-render from replaying the jump. A path that does not
+  // exist yet just lands on an empty column, which is the honest answer.
+  useEffect(() => {
+    const focus = state.filesFocus;
+    if (!focus || consumedFocusRef.current === focus) return;
+    consumedFocusRef.current = focus;
+    navigate(focus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- navigate is stable enough (setState only)
+  }, [state.filesFocus]);
 
   const selectSnapshot = (id: string | null) => {
     setSelected(null);

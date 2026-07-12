@@ -1,11 +1,11 @@
-// The inline edit composer inside the agent detail pane. A blank prompt is
-// deliberately omitted from the update payload (keep the current prompt),
-// never sent as an empty string.
+// The inline edit composer inside the agent detail pane. The curated skill set
+// REPLACES wholesale on save (that is the module's update semantics), so the
+// field is seeded from the record and always sent back.
 
 import { useState } from "react";
 import type { FormEvent } from "react";
 
-import type { AgentRecord, ResourceCaps } from "../../../domain/agent-client";
+import type { AgentRecord, ResourceCaps, SkillRef } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import {
@@ -21,6 +21,8 @@ import {
   statusTone,
 } from "./parts";
 import { RunsOnPicker } from "./RunsOnPicker";
+import { cleanSkills } from "./skills";
+import { SkillsField } from "./SkillsField";
 
 export function AgentEditForm({
   agent,
@@ -34,15 +36,15 @@ export function AgentEditForm({
     agentId: string;
     displayName?: string;
     capability?: string;
-    prompt?: string;
     allowedActions?: string[];
     caps?: ResourceCaps;
+    skills?: SkillRef[];
   }) => void;
   onClose: () => void;
 }) {
   const [displayName, setDisplayName] = useState(agent.display_name);
   const [capability, setCapability] = useState(agent.capability);
-  const [prompt, setPrompt] = useState("");
+  const [skills, setSkills] = useState<SkillRef[]>(agent.skills ?? []);
   const [allowedActions, setAllowedActions] = useState<string[]>(agent.allowed_actions);
   const [pagesWrite, setPagesWrite] = useState(
     (agent.caps?.pages_write ?? []).join(" "),
@@ -63,7 +65,7 @@ export function AgentEditForm({
       // caps REPLACE wholesale on update: send the record's current caps
       // with only pages_write swapped so the other grants survive.
       caps: { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
-      ...(prompt.trim() ? { prompt } : {}),
+      skills: cleanSkills(skills),
     });
     onClose();
   };
@@ -188,23 +190,13 @@ export function AgentEditForm({
         </div>
       </fieldset>
 
-      <div style={{ marginTop: 10 }}>
-        <FieldLabel htmlFor="agent-edit-prompt">New prompt</FieldLabel>
-        <textarea
-          id="agent-edit-prompt"
-          name="agent-edit-prompt"
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          rows={4}
-          placeholder="Leave blank to keep the current prompt"
-          style={{
-            ...inputStyle,
-            resize: "vertical",
-            minHeight: 80,
-            lineHeight: 1.45,
-          }}
-        />
-      </div>
+      <SkillsField
+        idPrefix="agent-edit"
+        agentId={agent.agent_id}
+        displayName={displayName}
+        skills={skills}
+        onChange={setSkills}
+      />
 
       <div
         style={{
