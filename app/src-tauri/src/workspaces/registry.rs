@@ -153,7 +153,7 @@ pub(super) fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String
     write_atomic(path, text.as_bytes())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())

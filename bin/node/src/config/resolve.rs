@@ -132,9 +132,8 @@ pub struct Resolved {
 /// resolve the operator's sandbox choice into a spawn backend plus the numeric
 /// capacity a sandboxed node announces. absent/`"direct"` → `Direct` (no
 /// capacity — a direct spawn makes no promise); `"podman"` → `Podman` with the
-/// probed host totals, per-key overrides winning; `"tart"` → `Tart` (macOS
-/// VMs, same capacity model — the live tart pass awaits a real-Mac QA);
-/// anything else is a loud config error.
+/// probed host totals, per-key overrides winning; `"tart"` → `Tart` (ephemeral
+/// macOS VMs, same capacity model); anything else is a loud config error.
 fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
     // podman and tart share the capacity derivation: probed totals with the
     // operator's per-key overrides winning. the map is validated through THE

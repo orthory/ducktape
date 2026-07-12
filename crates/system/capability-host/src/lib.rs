@@ -97,7 +97,7 @@ mod session;
 mod spec;
 mod variants;
 mod workspace;
-pub use sandbox::{SandboxBackend, wrap_podman, wrap_tart};
+pub use sandbox::{SandboxBackend, wrap_podman};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
@@ -363,10 +363,8 @@ pub(crate) struct CliProvider {
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
     output_sink: Option<OutputSink>,
-    /// how the child is spawned: `Direct` (the plain host spawn) or `Podman`
-    /// (every run wrapped in a rootless container that enforces the run's
-    /// numeric limits — see [`sandbox`]). set once at discovery for the whole
-    /// provider set.
+    /// how the child is spawned: `Direct`, rootless `Podman`, or an ephemeral
+    /// Tart VM. set once at discovery for the whole provider set.
     backend: SandboxBackend,
 }
 
@@ -437,9 +435,12 @@ impl CliProvider {
             SandboxBackend::Podman { image } => {
                 self.podman_command(image, &args, workdir, ctx, auth)?
             }
-            // the base image is used at CLONE time (tart_setup), not in the run
-            // argv — the run targets the already-cloned per-run VM.
-            SandboxBackend::Tart { .. } => self.tart_command(&args, workdir, ctx, auth)?,
+            // Tart has a multi-process lifecycle (clone/set/boot, then SSH), so
+            // [`Self::invoke`] constructs it before reaching this single-child
+            // Direct/Podman command seam.
+            SandboxBackend::Tart { .. } => {
+                return Err("internal error: Tart command bypassed its VM lifecycle".into());
+            }
         };
         cmd.current_dir(workdir)
             .stdin(Stdio::piped())
@@ -503,8 +504,8 @@ impl CliProvider {
     ///
     /// a broker composes with this backend: `--network=host` leaves the host's
     /// loopback reachable from inside the container, so the child can dial the
-    /// broker's `127.0.0.1:<port>` at the very address the argv names. (this is
-    /// exactly what a VM guest CANNOT do — see [`Self::start_broker`].)
+    /// broker's `127.0.0.1:<port>` at the very address the argv names. Tart uses
+    /// its separate host-gateway mapping in [`Self::start_broker`].
     fn podman_command(
         &self,
         image: &str,
@@ -529,33 +530,49 @@ impl CliProvider {
         Ok(cmd)
     }
 
-    /// wrap the same invocation in `tart run <per-run-vm>`: the VM was already
-    /// COW-cloned by [`Self::tart_setup`]; this only assembles the run argv, at
-    /// identical host mount paths, with the same HOME/PATH/env + rw_dirs the
-    /// Podman backend crosses (see [`sandbox::wrap_tart`] for tart's guest-exec
-    /// and mount-point simplifications — real-Mac QA deferred).
-    fn tart_command(
+    /// Assemble the real Tart VM boot + guest execution plan. Writable auth
+    /// directories are created before they become virtiofs sources, and the
+    /// executor is canonicalized so a Homebrew symlink cannot point outside
+    /// the read-only mount presented to the guest.
+    fn tart_plan(
         &self,
         args: &[String],
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
-    ) -> Result<tokio::process::Command, String> {
+    ) -> Result<sandbox::TartPlan, String> {
         let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
-        let vm = sandbox::tart_vm_name(workdir);
-        let (bin, argv) = sandbox::wrap_tart(
+        for dir in &rw_dirs {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                format!(
+                    "{}: create Tart auth mount {}: {e}",
+                    self.spec.tag,
+                    dir.display()
+                )
+            })?;
+        }
+        let bin = std::fs::canonicalize(&self.bin).map_err(|e| {
+            format!(
+                "{}: resolve Tart executor {}: {e}",
+                self.spec.tag,
+                self.bin.display()
+            )
+        })?;
+        static NEXT_VM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let vm = format!(
+            "ducktape-{}-{}",
+            std::process::id(),
+            NEXT_VM.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        sandbox::tart_plan(
             &vm,
-            &self.bin,
+            &bin,
             args,
             workdir,
             &envs,
             &self.sandbox_ro_paths(ctx, workdir, auth)?,
             &rw_dirs,
-            &ctx.limits,
-        );
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(argv);
-        Ok(cmd)
+        )
     }
 
     /// the env carried into a sandbox + the spec's `~/` rw_dirs expanded against
@@ -748,32 +765,22 @@ impl CliProvider {
 
     /// start this run's credential broker — `None` unless the spec declares one.
     /// the broker reads the operator's credential HERE, in the host process, and
-    /// serves a loopback endpoint the child dials with an opaque per-run bearer;
-    /// dropping it (any exit path of [`Self::run_output`]) tears the endpoint down.
-    ///
-    /// TART + BROKER IS UNSUPPORTED, loudly. a VM guest has its own network
-    /// stack, so the host's `127.0.0.1:<port>` — the address the broker binds and
-    /// the argv names — resolves inside the guest to the GUEST's own loopback,
-    /// where nothing is listening. the run would fail at the first model call
-    /// with a connection error that looks like a broken login. Podman is fine:
-    /// `--network=host` shares the host's loopback (see [`Self::podman_command`]).
+    /// serves an endpoint the child dials with an opaque per-run bearer; dropping
+    /// it (any exit path of [`Self::run_output`]) tears the endpoint down. Tart
+    /// binds the host side of its private NAT; the guest plan maps that gateway
+    /// to `ducktape-host`. Direct/Podman remain loopback-only.
     async fn start_broker(&self) -> Result<Option<broker::RunBroker>, String> {
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
-        if let SandboxBackend::Tart { .. } = &self.backend {
-            return Err(format!(
-                "{}: the Tart backend cannot host a credential broker — a VM guest \
-                 cannot reach the host's 127.0.0.1, so the broker endpoint would be \
-                 unreachable and every model call would fail as a login error. run \
-                 this spec under the Direct or Podman backend (Podman's --network=host \
-                 shares the host loopback); giving the guest a host-gateway address is \
-                 the upgrade path.",
-                self.spec.tag
-            ));
-        }
         match kind {
-            BrokerKind::CodexResponses => broker::RunBroker::start().await.map(Some),
+            BrokerKind::CodexResponses => {
+                if matches!(self.backend, SandboxBackend::Tart { .. }) {
+                    broker::RunBroker::start_for_tart().await.map(Some)
+                } else {
+                    broker::RunBroker::start().await.map(Some)
+                }
+            }
         }
     }
 
@@ -826,34 +833,34 @@ impl CliProvider {
         argv
     }
 
-    /// the Tart backend's impure per-run lifecycle: acquire the process-wide
-    /// concurrency permit (WAITS past 2, never errors — Apple's 2-VM limit),
-    /// then APFS-COW-clone the base image into this run's VM. returns a guard
-    /// whose Drop deletes the clone on EVERY exit path; `Ok(None)` for the
-    /// Direct/Podman backends (no-op).
-    ///
-    /// REAL-MAC QA DEFERRED: there is no tart or macOS on the build box, so the
-    /// clone/delete spawns are unit-untested — [`sandbox::wrap_tart`]'s pure
-    /// argv is the tested surface, and it documents the guest-exec/mount model
-    /// this lifecycle would need to grow (`tart set`, boot + `ssh`, guest path
-    /// remap) for a live run. clone failure is a LOUD error — no silent
-    /// fallback to unsandboxed execution.
-    async fn tart_setup(&self, workdir: &Path) -> Result<Option<TartGuard>, String> {
+    /// The complete Tart lifecycle up to a guest ready for work: concurrency
+    /// permit, COW clone, `tart set`, headless boot with virtiofs mounts,
+    /// `tart ip --wait`, and a real SSH readiness probe. Every failure after
+    /// clone is guarded by stop/delete cleanup; there is no Direct fallback.
+    async fn tart_setup(
+        &self,
+        plan: Option<&sandbox::TartPlan>,
+        ctx: &RunContext,
+    ) -> Result<Option<TartGuard>, String> {
         let SandboxBackend::Tart { image } = &self.backend else {
             return Ok(None);
         };
-        let vm = sandbox::tart_vm_name(workdir);
+        let plan = plan.ok_or_else(|| "internal error: missing Tart execution plan".to_string())?;
+        let vm = &plan.vm;
         // WAITS if 2 tart runs are already live — this is the cap, not an error.
         let permit = sandbox::tart_semaphore()
             .acquire()
             .await
             .map_err(|e| format!("{}: tart concurrency gate closed: {e}", self.spec.tag))?;
         let status = tokio::process::Command::new("tart")
-            .args(["clone", image, &vm])
+            .args(["clone", image, vm])
             .status()
             .await
             .map_err(|e| {
-                format!("{}: `tart clone {image} {vm}` failed to spawn: {e}", self.spec.tag)
+                format!(
+                    "{}: `tart clone {image} {vm}` failed to spawn: {e}",
+                    self.spec.tag
+                )
             })?;
         if !status.success() {
             return Err(format!(
@@ -861,7 +868,104 @@ impl CliProvider {
                 self.spec.tag
             ));
         }
-        Ok(Some(TartGuard { vm, _permit: permit }))
+        let mut guard = TartGuard {
+            vm: vm.clone(),
+            ip: String::new(),
+            run: None,
+            _permit: permit,
+        };
+
+        if let Some(set_argv) = sandbox::tart_set_argv(vm, &ctx.limits) {
+            let status = tokio::process::Command::new("tart")
+                .args(&set_argv)
+                .status()
+                .await
+                .map_err(|e| format!("{}: `tart set {vm}` failed to spawn: {e}", self.spec.tag))?;
+            if !status.success() {
+                return Err(format!(
+                    "{}: `tart set {vm}` exited with {status}",
+                    self.spec.tag
+                ));
+            }
+        }
+
+        let mut run = tokio::process::Command::new("tart");
+        run.args(&plan.run_argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        guard.run = Some(
+            run.spawn()
+                .map_err(|e| format!("{}: `tart run {vm}` failed to spawn: {e}", self.spec.tag))?,
+        );
+
+        let output = tokio::process::Command::new("tart")
+            .args(["ip", vm, "--wait", "60"])
+            .output()
+            .await
+            .map_err(|e| format!("{}: `tart ip {vm} --wait 60` failed: {e}", self.spec.tag))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{}: `tart ip {vm} --wait 60` exited with {}: {}",
+                self.spec.tag,
+                output.status,
+                excerpt(&String::from_utf8_lossy(&output.stderr))
+            ));
+        }
+        guard.ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if guard.ip.is_empty() {
+            return Err(format!(
+                "{}: `tart ip {vm}` returned no address",
+                self.spec.tag
+            ));
+        }
+
+        for attempt in 0..30 {
+            let status = tokio::process::Command::new("sshpass")
+                .args(sandbox::tart_ssh_argv(&guard.ip, "true"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            match status {
+                Ok(status) if status.success() => return Ok(Some(guard)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!(
+                        "{}: sshpass is required for Tart guest execution; install it with \
+                         `brew install cirruslabs/cli/sshpass`: {error}",
+                        self.spec.tag
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "{}: Tart SSH readiness probe failed: {error}",
+                        self.spec.tag
+                    ));
+                }
+                Ok(_) => {}
+            }
+            if let Some(status) = guard
+                .run
+                .as_mut()
+                .expect("Tart run child is installed")
+                .try_wait()
+                .map_err(|e| format!("{}: inspect `tart run {vm}`: {e}", self.spec.tag))?
+            {
+                return Err(format!(
+                    "{}: `tart run {vm}` exited during boot with {status}",
+                    self.spec.tag
+                ));
+            }
+            if attempt < 29 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(format!(
+            "{}: Tart VM {vm} got IP {} but SSH did not become ready within 30s",
+            self.spec.tag, guard.ip
+        ))
     }
 
     /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
@@ -1020,30 +1124,47 @@ impl Drop for ContextGuard {
     }
 }
 
-/// holds a Tart run's process-wide concurrency permit and deletes its per-run
-/// clone on drop — the run's LAST teardown step, on every exit path (success,
-/// error, timeout, panic). declared before the `tart run` child so the child
-/// drops first (kill_on_drop stops the VM), then this removes the clone and
-/// releases the permit. best-effort: a delete failure is logged, never
-/// surfaced (the run's own result already left).
-/// ponytail: a still-running VM may need `tart stop` before delete; the
-/// real-Mac pass confirms whether killing `tart run` frees the clone.
+/// Owns the boot process and concurrency permit for one ephemeral Tart VM.
+/// Drop performs the documented stop → delete sequence on every exit path.
 struct TartGuard {
     vm: String,
+    ip: String,
+    run: Option<tokio::process::Child>,
     _permit: tokio::sync::SemaphorePermit<'static>,
 }
 
 impl Drop for TartGuard {
     fn drop(&mut self) {
-        // synchronous best-effort cleanup: Drop can't await, and a brief block
-        // to reclaim a VM clone is acceptable teardown.
+        match std::process::Command::new("tart")
+            .args(["stop", &self.vm])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "[capability-host] `tart stop {}` exited with {status}",
+                self.vm
+            ),
+            Err(error) => eprintln!(
+                "[capability-host] `tart stop {}` failed to spawn: {error}",
+                self.vm
+            ),
+        }
+        if let Some(run) = self.run.as_mut() {
+            let _ = run.start_kill();
+        }
         match std::process::Command::new("tart")
             .args(["delete", &self.vm])
             .status()
         {
             Ok(s) if s.success() => {}
-            Ok(s) => eprintln!("[capability-host] `tart delete {}` exited with {s}", self.vm),
-            Err(e) => eprintln!("[capability-host] `tart delete {}` failed to spawn: {e}", self.vm),
+            Ok(s) => eprintln!(
+                "[capability-host] `tart delete {}` exited with {s}",
+                self.vm
+            ),
+            Err(e) => eprintln!(
+                "[capability-host] `tart delete {}` failed to spawn: {e}",
+                self.vm
+            ),
         }
     }
 }
@@ -1120,13 +1241,29 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
     ) -> Result<Invocation, String> {
-        // Tart backend: acquire the concurrency permit + COW-clone the base
-        // image BEFORE spawning; the guard (declared first, so it drops LAST —
-        // after the `tart run` child) deletes the clone on every exit path. a
-        // no-op guard for Direct/Podman. clone failure aborts the run loudly.
-        let _tart_guard = self.tart_setup(workdir).await?;
-        let mut child = self
-            .command(args, workdir, ctx, auth)?
+        let tart_plan = matches!(self.backend, SandboxBackend::Tart { .. })
+            .then(|| {
+                let args = self.broker_argv(args, workdir, auth);
+                self.tart_plan(&args, workdir, ctx, auth)
+            })
+            .transpose()?;
+        // Declared before the SSH child so VM stop/delete runs after the child
+        // is dropped on success, error, or timeout.
+        let tart_guard = self.tart_setup(tart_plan.as_ref(), ctx).await?;
+        let mut command = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
+            let mut command = tokio::process::Command::new("sshpass");
+            command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script));
+            command
+        } else {
+            self.command(args, workdir, ctx, auth)?
+        };
+        command
+            .current_dir(workdir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
             .spawn()
             .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
         let mut stdin = child
@@ -1831,11 +1968,7 @@ rw_dirs = ["~/.claude"]
     }
 
     #[test]
-    fn tart_backend_wraps_command_with_identical_mount_paths_and_rw_dirs() {
-        // the command() glue for Tart: HOME assembled, the spec's `~/` rw_dirs
-        // expanded against it, identical host mount paths handed to wrap_tart.
-        // wrap_tart's own translation is covered in sandbox.rs; the clone/delete
-        // lifecycle is real-Mac-QA-deferred (no tart on this box).
+    fn tart_backend_builds_a_boot_then_ssh_plan() {
         let spec = CapabilitySpec::parse(
             r#"
 spec = 1
@@ -1848,48 +1981,31 @@ args = []
 prompt = "stdin"
 [output]
 format = "text"
-[sandbox]
-rw_dirs = ["~/.claude"]
 "#,
             "test",
         )
         .unwrap();
-        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/vm"))
-            .with_backend(SandboxBackend::Tart {
-                image: "ghcr.io/example/macos-base:latest".into(),
-            });
+        let root = scratch("tart-plan");
+        let bin = root.join("vm");
+        std::fs::write(&bin, b"vm").unwrap();
+        let workdir = root.join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let provider = CliProvider::from_spec(spec, bin).with_backend(SandboxBackend::Tart {
+            image: "ghcr.io/example/macos-base:latest".into(),
+        });
         let ctx = RunContext {
             limits: BTreeMap::from([("mem_gb".to_string(), 4u64)]),
             ..RunContext::default()
         };
-        // workdir's final component becomes the (deterministic) per-run VM name.
-        let cmd = provider
-            .command(
-                &["--go".into()],
-                Path::new("/tmp/ducktape-run-7"),
-                &ctx,
-                &RunAuth::default(),
-            )
-            .expect("tart command builds");
-        let std = cmd.as_std();
-        assert_eq!(std.get_program(), std::ffi::OsStr::new("tart"));
-        let joined: Vec<String> = std
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let joined = joined.join(" ");
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        // the spec's `~/.claude` expands against the real HOME and mounts rw at
-        // its identical host path (source); memory is MB; HOME rides the env
-        // prefix; the run targets the per-run VM named for the workdir.
-        assert!(
-            joined.contains(&format!(":{home}/.claude ")),
-            "rw mount source at identical path: {joined}"
-        );
-        assert!(joined.contains("--memory 4096"), "{joined}");
-        assert!(joined.contains("ducktape-run-7 env "), "per-run vm name: {joined}");
-        assert!(joined.contains(&format!("HOME={home}")), "{joined}");
-        assert!(joined.ends_with("/usr/bin/vm --go"), "{joined}");
+        let plan = provider
+            .tart_plan(&["--go".into()], &workdir, &ctx, &RunAuth::default())
+            .expect("Tart plan builds");
+        assert!(plan.vm.starts_with("ducktape-"), "{}", plan.vm);
+        assert_eq!(plan.run_argv.first().map(String::as_str), Some("run"));
+        assert_eq!(plan.run_argv.last(), Some(&plan.vm));
+        assert!(!plan.guest_script.contains("ssh"));
+        assert!(plan.guest_script.contains("--go"));
+        assert!(plan.guest_script.contains("rsync -a --delete"));
     }
 
     /// a sandbox spec with no auth section — the shape both skills tests want.
@@ -2188,40 +2304,25 @@ broker = "codex-responses"
     }
 
     #[tokio::test]
-    async fn tart_plus_a_broker_fails_loudly_rather_than_mysteriously() {
-        // a VM guest has its own network stack, so the broker's host-loopback
-        // endpoint is simply unreachable from inside it — the run would die at
-        // the first model call with what LOOKS like a broken login. so the
-        // combination is refused up front, by name, with the upgrade path.
-        let provider = CliProvider::from_spec(broker_spec("vm"), PathBuf::from("/usr/bin/vm"))
-            .with_backend(SandboxBackend::Tart {
-                image: "ghcr.io/example/macos-base:latest".into(),
-            });
-        // (no `unwrap_err`: RunBroker holds a live credential and deliberately
-        // has no Debug — a panic message must never be able to print one.)
-        let Err(err) = provider.start_broker().await else {
-            panic!("Tart + broker must be refused, not started");
-        };
-        assert!(err.contains("Tart"), "names the backend: {err:?}");
-        assert!(err.contains("127.0.0.1"), "names the limitation: {err:?}");
-        assert!(err.contains("host-gateway"), "names the upgrade path: {err:?}");
-
-        // Podman is fine — --network=host shares the host's loopback — and so is
-        // Direct. (neither actually starts here: with no host credential the
-        // broker refuses, which is itself the proof we got PAST the backend gate.)
+    async fn every_backend_accepts_the_credential_broker_shape() {
+        // A missing host credential may still fail startup, but no backend is
+        // structurally rejected: Tart now exposes the broker through its NAT
+        // gateway while Direct/Podman retain loopback.
         for backend in [
             SandboxBackend::Direct,
             SandboxBackend::Podman {
                 image: "img".into(),
             },
+            SandboxBackend::Tart {
+                image: "ghcr.io/example/macos-base:latest".into(),
+            },
         ] {
-            let provider =
-                CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"))
-                    .with_backend(backend.clone());
+            let provider = CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"))
+                .with_backend(backend.clone());
             if let Err(e) = provider.start_broker().await {
                 assert!(
                     !e.contains("cannot host a credential broker"),
-                    "{backend:?} must not be refused for Tart's reason: {e:?}"
+                    "{backend:?} reached credential loading, not a backend veto: {e:?}"
                 );
             }
         }
@@ -3368,10 +3469,9 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
     }
 
     /// a portable run INHERITS the ambient `$HOME` — same as a non-portable run
-    /// — so the headless claude/codex CLI finds its BYO credentials. (The env
-    /// half of the D7 isolation floor needs the ADR's deferred sandbox
-    /// mechanism; the ACTIVE D7 measure is the workspace relocation, i.e. the
-    /// cwd being the per-run mount outside <storage>, not an env rewrite.)
+    /// — so the headless claude/codex CLI finds its BYO credentials. This test
+    /// covers the direct backend; Podman and Tart cross the D7 filesystem
+    /// boundary only through their explicit auth and workspace mounts.
     #[tokio::test]
     async fn portable_runs_inherit_the_ambient_home_for_byo_auth() {
         let dir = scratch("portable-home");

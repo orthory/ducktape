@@ -13,13 +13,14 @@ import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
 import { MetricsView } from "../views/metrics/MetricsView";
+import { SandboxView } from "../views/sandbox/SandboxView";
 import { StatusView } from "../views/status/StatusView";
 import type { AppModule, NavSection } from "./module-def";
 
 // The sidebar's view-mode toggle partitions these into two rails:
 //   USER          — the participant apps (chat, pages, files, forge, agents)
 //   NODE OPERATOR — the node/network surfaces (members, governance, modules,
-//                   gateway, node, metrics, explorer)
+//                   gateway, node, sandbox, metrics, explorer)
 // `order` is a sort key WITHIN a section, so the two rails number from 0
 // independently. Cross-module search is NOT a module — it is the ⌘K overlay
 // the shell owns (see SearchModal), reachable from either rail.
@@ -37,8 +38,9 @@ export const MODULES: AppModule[] = [
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 2, section: "operator" }, Screen: ModulesView },
   { id: "gateway", nav: { icon: "link", label: "Gateway", order: 3, section: "operator" }, Screen: GatewayView },
   { id: "status", nav: { icon: "node", label: "Node", order: 4, section: "operator" }, Screen: StatusView },
-  { id: "metrics", nav: { icon: "metrics", label: "Metrics", order: 5, section: "operator" }, Screen: MetricsView },
-  { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 6, section: "operator" }, Screen: ExplorerView },
+  { id: "sandbox", nav: { icon: "sandbox", label: "Sandbox", order: 5, section: "operator" }, Screen: SandboxView },
+  { id: "metrics", nav: { icon: "metrics", label: "Metrics", order: 6, section: "operator" }, Screen: MetricsView },
+  { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 7, section: "operator" }, Screen: ExplorerView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

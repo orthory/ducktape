@@ -45,7 +45,10 @@ use forget::{probe_forget, ForgetVerdict};
 use lifecycle::{node_uptime_secs, pidfile, read_pid, recorded_pid_alive, stop_workspace_node};
 use phase::{classify, PhaseReport};
 use ports::{allocate_ports, reserved_ports};
-use registry::{load_registry, save_registry, workspaces_dir, Ports, Registry, Selection, Workspace};
+use registry::{
+    load_registry, save_registry, workspaces_dir, write_atomic, Ports, Registry, Selection,
+    Workspace,
+};
 
 const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
 
@@ -864,6 +867,62 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     // start the node must not repoint `active` at a workspace the next boot
     // then can't launch (which would strand the app on that dead workspace).
     finish_selection(&app, &mut reg, ws, http_url)
+}
+
+/// Atomically apply one sandbox mode and restart the managed node. A failed
+/// boot restores the old config and attempts to bring the old node back before
+/// returning the error, so a bad apply does not strand the workspace.
+#[tauri::command]
+pub async fn workspace_sandbox_apply(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    mode: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_sandbox_apply_blocking(app, id, mode))
+        .await
+}
+
+fn workspace_sandbox_apply_blocking(
+    app: crate::rt::AppHandle,
+    id: String,
+    mode: String,
+) -> Result<(), String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?.clone();
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let config = node_toml(&dir);
+    let original = fs::read_to_string(&config)
+        .map_err(|err| format!("read {config:?}: {err}"))?;
+    let updated = crate::sandbox::config_with_mode(&original, &mode)?;
+    if updated == original {
+        return Ok(());
+    }
+
+    stop_workspace_node(&dir, &ws.ports, std::time::Duration::from_secs(6))?;
+    if let Err(err) = write_atomic(&config, updated.as_bytes()) {
+        let recovery = workspace_select_blocking(app, id)
+            .map(|_| "the previous node was restarted".to_string())
+            .unwrap_or_else(|restart| format!("the previous node also failed to restart: {restart}"));
+        return Err(format!("apply sandbox config: {err}; {recovery}"));
+    }
+
+    if let Err(apply) = workspace_select_blocking(app.clone(), id.clone()) {
+        let recovery = match write_atomic(&config, original.as_bytes()) {
+            Ok(()) => workspace_select_blocking(app, id)
+                .map(|_| "the previous config was restored and restarted".to_string())
+                .unwrap_or_else(|restart| {
+                    format!("the previous config was restored but failed to restart: {restart}")
+                }),
+            Err(restore) => format!("the previous config could not be restored: {restore}"),
+        };
+        return Err(format!("restart with sandbox mode {mode:?}: {apply}; {recovery}"));
+    }
+    Ok(())
 }
 
 fn finish_selection(
