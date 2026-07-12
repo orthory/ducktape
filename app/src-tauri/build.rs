@@ -1,4 +1,16 @@
 fn main() {
+    // Pin the CEF runtime lookup to the binary's own directory. cef-dll-sys
+    // stages libcef.so and its support files next to the binary on every
+    // build, and the Linux `make install-app` stages the same set beside the
+    // installed binary. --disable-new-dtags emits DT_RPATH, which ld.so
+    // consults BEFORE LD_LIBRARY_PATH — deliberate: the app is ABI-pinned to
+    // its CEF distribution, and an ambient path to a system CEF (e.g.
+    // /usr/lib/cef) boots via API-versioning but silently drops features
+    // (cef-vaapi-bin 150 has no GTK input-method integration, killing IME).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
     // tauri_build validates bundle.externalBin at COMPILE time, but the node
     // sidecar is another workspace crate's artifact and cargo gives no build
     // ordering between them. materialize an empty placeholder so plain
