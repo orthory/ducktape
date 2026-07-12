@@ -4,7 +4,7 @@
 // node prunes entries the moment a result lands, at which point the run
 // reappears under HISTORY.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
@@ -38,6 +38,7 @@ import {
   StatusPill,
 } from "./parts";
 import {
+  appendActivityEntry,
   parseActivityLog,
   type ActivityLogEntry,
   type ActivityLogRow,
@@ -88,8 +89,6 @@ const shortOutputRef = (ref: string): string => {
   return ref.length > 16 ? `${ref.slice(0, 16)}…` : ref;
 };
 
-const MAX_OUTPUT_LINES = 1_000;
-
 function RunOutputPane({ run }: { run: PendingRun }) {
   const { transport } = useDucktape();
   const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
@@ -111,7 +110,7 @@ function RunOutputPane({ run }: { run: PendingRun }) {
           stream: frame.item.stream,
           text: frame.item.line,
         };
-        setEntries((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
+        setEntries((prev) => appendActivityEntry(prev, line));
       },
       onLagged: (laggedTopic, cursor) => {
         if (laggedTopic !== topic) return;
@@ -122,12 +121,12 @@ function RunOutputPane({ run }: { run: PendingRun }) {
           kind: "gap",
           text: `output gap: dropped older lines before cursor ${cursor}`,
         };
-        setEntries((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
+        setEntries((prev) => appendActivityEntry(prev, line));
       },
     });
   }, [transport, run.dispatch_id]);
 
-  const rows = parseActivityLog(entries);
+  const rows = useMemo(() => parseActivityLog(entries), [entries]);
 
   useEffect(() => {
     if (pane.current) pane.current.scrollTop = pane.current.scrollHeight;
