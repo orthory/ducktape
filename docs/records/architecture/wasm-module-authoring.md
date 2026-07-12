@@ -3,8 +3,13 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/examples/hello-wasm` (v1) and
-`crates/examples/hello-wasm-v2` (its live-update target).
+the reference modules are `crates/examples/hello-wasm` (v1),
+`crates/examples/hello-wasm-v2` (its live-update target), and
+`crates/examples/sibling-wasm` (the cross-module-read reference). The first
+REAL production tenant is `crates/examples/directory-wasm` — the wasm port of
+the `directory` module, bytes-compatible with the native implementation it
+replaced (same root, same snapshot encoding: the cutover left the app-hash
+untouched).
 
 ## The model (design-B: host-owned state, guest as pure logic)
 
@@ -31,13 +36,39 @@ Implement the two exports:
 - `execute(payload) -> result<_, error>` — apply one op addressed to this
   module. Reject unknown ops with `error::rejected(..)`; a rejection is a clean
   deterministic no-op, never a fork.
-- `query(req) -> result<list<u8>, error>` — a read-only projection over
-  committed state (the host serves it with no staging overlay).
+- `query(req) -> result<list<u8>, error>` — a read-only projection over LIVE
+  state (the staged overlay on committed — the same read-your-writes surface a
+  native module's query serves; out of block the overlay is empty).
 
 And use the imports deliberately: `get-env` for the deterministic block env
 (`height`, `consensus-time`, `protocol-version`, `origin`, `me`); `state-*` for
 durable state; `emit-msg` for write intents at sibling modules (drained as
 follow-up ops, never reentrant); `emit-event` for observability records.
+
+### Sibling reads (`module-root` / `query-module`)
+
+Cross-module READS work from inside a guest: `module-root(target)` is the
+sibling's snapshot root as of dispatch start, `query-module(target, req)` a
+live host-routed read (self-query is rejected; query cycles are rejected by the
+host). Mechanically they are **memoized replay**: the sync guest world cannot
+await the host's async ctx, so a read the per-dispatch memo cannot answer
+pauses the run, the host resolves it, and the pure guest re-runs with the
+answer memoized. Design consequences:
+
+- Reads are answered CONSISTENTLY within one dispatch (the memo), and a
+  repeated read costs nothing extra.
+- Keep reads bounded: a dispatch may touch at most `MAX_SIBLING_READS` (64)
+  DISTINCT reads — one more is a deterministic rejection. Every distinct read
+  also costs one replay of your `execute`, so put cheap guards before
+  expensive read chains.
+- `execute` must stay pure over its inputs (state + env + payload + read
+  answers) — that is what makes the replay invisible. Guest globals/statics
+  were already worthless (fresh instance per dispatch); the replay is one more
+  reason.
+- The ctx-less direct `Module::query` path (not host-routed) is SEALED: there,
+  `module-root` answers none and `query-module` answers `unsupported`.
+  Host-routed queries (`ctx.query` from a native peer, external node queries)
+  resolve sibling reads for real.
 
 ## State layout is the compatibility contract
 
@@ -106,12 +137,29 @@ block.
 ## Testing a module
 
 - Runtime-level: `crates/kernel/wasm-host/tests/dispatch.rs` — the
-  staged-writes / commit / abort / determinism / hot-swap / snapshot proofs.
+  staged-writes / commit / abort / determinism / hot-swap / snapshot proofs —
+  and `crates/kernel/wasm-host/tests/sibling.rs` — the sibling-read proofs
+  (replay convergence, memoization, no staging leak across replays, budget).
 - Host-level: `crates/kernel/host/tests/module_swap.rs` — the full live-update
   boundary (schedule → realize at H → new logic over kept state, fail-closed,
-  joiner reconciliation, cross-node determinism).
+  joiner reconciliation, cross-node determinism) — plus
+  `crates/kernel/host/tests/cross_module.rs` (a native peer composing with a
+  wasm module) and `crates/kernel/host/tests/wasm_cutover_parity.rs` (the
+  native↔wasm byte-compatibility proof for the directory cutover).
 - Authorization-level: `crates/system/governance/tests/
   governance_schedules_module_update.rs` — ballot → registry acceptance.
+
+## Porting a native module (the cutover pattern)
+
+The `directory` port is the template: split the native crate so its wire types
+compile standalone (`default-features = false`, the `files`/`duckfs-core`
+shape), author the guest against those SAME wire types (drift is then a compile
+error), and choose the guest's state layout so the host store's canonical
+encoding reproduces the native root — if the native module already hashes
+`le-u64 count ‖ sorted (len‖key ‖ len‖value)`, storing the raw key/value bytes
+makes root(), snapshot(), and install() BYTE-IDENTICAL across the cutover: the
+app-hash does not move and pre-cutover workspaces restore unchanged. Pin that
+claim with a parity test before wiring the module into `host_state`.
 
 Point your module's tests at a committed fixture (`include_bytes!`) so the
 proof is self-contained, and register the fixture in `make wasm-modules` so it

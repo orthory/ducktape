@@ -7,9 +7,10 @@ showAskAi: false
 import { ArchitectureStack } from '../../../../components/diagram/ArchitectureStack.client'
 import { ModuleLifecycle } from '../../../../components/diagram/ModuleLifecycle.client'
 
-A module is an isolated state machine behind a small native Rust contract. The
-pattern borrows the isolation shape of CosmWasm, but the current implementation
-is native Rust rather than Wasm.
+A module is an isolated state machine behind a small contract. The pattern
+borrows the isolation shape of CosmWasm; a module runs either as native Rust or
+as a Wasm component on the module runtime (the cutover is underway — directory
+is the first production Wasm tenant, and most modules are still native Rust).
 
 <ArchitectureStack />
 

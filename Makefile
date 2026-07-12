@@ -201,6 +201,16 @@ wasm-modules:
 	wasm-tools component new \
 	  crates/examples/hello-wasm-v2/target/wasm32-unknown-unknown/release/hello_wasm_v2.wasm \
 	  -o crates/kernel/host/tests/fixtures/hello-v2.component.wasm
+	cd crates/examples/directory-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/directory-wasm/target/wasm32-unknown-unknown/release/directory_wasm.wasm \
+	  -o crates/examples/directory-wasm/component.wasm
+	cp crates/examples/directory-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/directory.component.wasm
+	cd crates/examples/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
+	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
@@ -211,6 +221,8 @@ wasm-modules-check:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cmp crates/examples/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	cmp crates/examples/directory-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/directory.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

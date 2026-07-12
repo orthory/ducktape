@@ -1,6 +1,8 @@
 //! proves typed cross-module composition end-to-end through the host: a greeter
 //! module QUERIES a directory module and, from the result, WRITES a greeting to
-//! both directory and kv — using only the modules' interface crates.
+//! both directory and kv — using only the modules' interface crates. runs the
+//! directory both NATIVE and as the `directory-wasm` component (the first real
+//! wasm tenant): the composing peer cannot tell which runtime serves it.
 
 use commonware_runtime::{Runner as _, deterministic};
 use directory::Directory;
@@ -8,6 +10,11 @@ use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_que
 use greeter::Greeter;
 use host::Host;
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
+use wasm_host::WasmModule;
+
+/// GENERATED artifact — built from `crates/examples/directory-wasm` by the
+/// module build target; committed so this proof is self-contained.
+const DIRECTORY_WASM: &[u8] = include_bytes!("fixtures/directory.component.wasm");
 
 struct QueryCycler {
     id: &'static str,
@@ -35,11 +42,26 @@ impl Module for QueryCycler {
 
 #[test]
 fn greeter_reads_directory_and_writes_a_derived_greeting() {
+    greet_through(|| Box::new(Directory::new("directory")));
+}
+
+/// the same composition with the directory served by the WASM runtime: the
+/// native greeter's `ctx.query` routes into the component (memoized-replay
+/// sibling read on the greeter side is not needed — the WASM side here is the
+/// QUERIED one), and the typed `DirMsg::Set` follow-up executes in the guest.
+#[test]
+fn greeter_composes_with_a_wasm_directory() {
+    greet_through(|| {
+        Box::new(WasmModule::from_bytes("directory", DIRECTORY_WASM).expect("load component"))
+    });
+}
+
+fn greet_through(directory: impl Fn() -> Box<dyn Module> + Send + 'static) {
     deterministic::Runner::default().start(|context| async move {
         let kv = kv::Kv::init(context, "kv").await;
         let mut host = Host::genesis(vec![
             Box::new(kv),
-            Box::new(Directory::new("directory")),
+            directory(),
             Box::new(Greeter::new("greeter")),
         ])
         .expect("genesis");

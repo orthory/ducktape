@@ -10,7 +10,6 @@ use capability::CapabilityRegistry;
 use chat::Chat;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
-use directory::Directory;
 use dispatch::DispatchModule;
 use duckdns::DuckDns;
 use duckfs_disk::SyncScratch;
@@ -93,15 +92,30 @@ impl host::CodeSource for BlobCodeSource {
     }
 }
 
-/// genesis-seed the code registry: the reference wasm module's initial active
-/// code hash, identical on every node (the embedded component IS the hash's
-/// preimage). shared by the genesis / restore / state-sync host builders so all
-/// three compose the same registry shape.
+/// the directory module's GENESIS component — the first REAL production tenant
+/// of the module runtime. bytes-compatible with the retired native
+/// implementation (`directory-wasm` stores the same keys/values under the same
+/// canonical encoding), so root(), snapshots, and pre-cutover workspace
+/// restores are all continuous across the cutover.
+const DIRECTORY_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/directory-wasm/component.wasm");
+
+/// the genesis-constant id the directory module registers under.
+const DIRECTORY_MODULE_ID: &str = "directory";
+
+/// genesis-seed the code registry: every wasm tenant's initial active code
+/// hash, identical on every node (the embedded components ARE the hashes'
+/// preimages). shared by the genesis / restore / state-sync host builders so
+/// all three compose the same registry shape.
 fn seeded_modreg() -> Modreg {
     let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
     modreg.seed(
         HELLO_WASM_MODULE_ID,
         sha2::Sha256::digest(HELLO_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        DIRECTORY_MODULE_ID,
+        sha2::Sha256::digest(DIRECTORY_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -113,6 +127,13 @@ fn seeded_modreg() -> Modreg {
 fn genesis_hello_wasm() -> WasmModule {
     WasmModule::from_bytes(HELLO_WASM_MODULE_ID, HELLO_WASM_COMPONENT)
         .expect("embedded hello component loads")
+}
+
+/// the directory module at its GENESIS code (same reconciliation story as
+/// [`genesis_hello_wasm`]).
+fn genesis_directory_wasm() -> WasmModule {
+    WasmModule::from_bytes(DIRECTORY_MODULE_ID, DIRECTORY_WASM_COMPONENT)
+        .expect("embedded directory component loads")
 }
 
 pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
@@ -157,7 +178,7 @@ struct ProductionModules {
     jobs: Jobs,
     agent: AgentModule,
     runs: RunsModule,
-    directory: Directory,
+    directory: WasmModule,
     automations: Automations,
 }
 
@@ -216,9 +237,10 @@ pub(super) async fn genesis_host(
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
-    // seed the blob plane with the genesis component, so this node can serve
-    // (and re-fetch) the reference wasm module's initial code by content hash.
+    // seed the blob plane with the genesis components, so this node can serve
+    // (and re-fetch) every wasm tenant's initial code by content hash.
     blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -320,7 +342,9 @@ pub(super) async fn genesis_host(
         // the pages module the composer renders [[page:<id>]] refs from
         // and the pages effects lane writes to; unwired, both degrade.
         .with_pages_module("pages"),
-        directory: Directory::new("directory"),
+        // the first real wasm tenant: bytes-compatible with the retired native
+        // implementation, so this cutover left the app-hash untouched.
+        directory: genesis_directory_wasm(),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
         automations: Automations::new("automations", "chat", "tasks", "inbox"),
@@ -508,8 +532,10 @@ pub(super) async fn restore_host(
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
-    let mut directory = Directory::new("directory");
-    let (bytes, root) = snapshot_of("directory")?;
+    // pre-cutover checkpoints install unchanged: the wasm directory's snapshot
+    // encoding is byte-identical to the retired native implementation's.
+    let mut directory = genesis_directory_wasm();
+    let (bytes, root) = snapshot_of(DIRECTORY_MODULE_ID)?;
     directory
         .install(bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;
@@ -704,8 +730,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         }
     };
 
-    let (bytes, root) = snapshot_of("directory").await?;
-    let mut directory = Directory::new("directory");
+    let (bytes, root) = snapshot_of(DIRECTORY_MODULE_ID).await?;
+    let mut directory = genesis_directory_wasm();
     directory
         .install(&bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;

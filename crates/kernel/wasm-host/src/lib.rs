@@ -12,6 +12,13 @@
 //!     module staging contract.
 //!   * determinism is by construction: fresh instance (no memory carryover),
 //!     fuel-metered termination, no ambient host imports, integer/bytes ABI.
+//!   * cross-module reads (`module-root` / `query-module`) are MEMOIZED REPLAY:
+//!     the sync guest world cannot await the host's async `Ctx`, so a read the
+//!     per-dispatch memo can't answer pauses the run (a deterministic trap), the
+//!     wrapper resolves it through `Ctx`, and the pure guest re-runs with the
+//!     answer memoized — every round re-treads the identical prefix, so the
+//!     replay converges in (distinct reads + 1) rounds, bounded by
+//!     [`MAX_SIBLING_READS`].
 
 use std::collections::BTreeMap;
 
@@ -28,6 +35,14 @@ mod bindings {
     wasmtime::component::bindgen!({
         world: "module",
         path: "../module-guest/wit",
+        // the two sibling-read imports may TRAP: a read the per-dispatch memo
+        // cannot answer pauses the run (deterministically — same point on every
+        // validator), the async wrapper resolves it through the host `Ctx`, and
+        // the pure guest is replayed with the answer memoized. see `SiblingMemo`.
+        imports: {
+            "ducktape:module/host.module-root": trappable,
+            "ducktape:module/host.query-module": trappable,
+        },
     });
 }
 
@@ -39,17 +54,76 @@ use bindings::ducktape::module::host::{self, Env as WitEnv, Error as WitError, O
 /// all of them — a trap is a deterministic rejection, not a per-node fork.
 pub const DEFAULT_FUEL: u64 = 2_000_000_000;
 
+/// per-dispatch bound on DISTINCT sibling reads (`module-root` + `query-module`).
+/// each unresolved read replays the pure guest once with the answer memoized, so
+/// this caps both the replay count and the memo size. a protocol constant: an op
+/// that needs more is rejected identically on every validator.
+pub const MAX_SIBLING_READS: usize = 64;
+
+/// trap message for a sibling read the memo cannot answer yet. never surfaces to
+/// consensus: the execute/query drivers intercept the run (via
+/// [`HostData::pending`]) and replay with the answer resolved.
+const PENDING_READ_TRAP: &str = "pending sibling read (host resolves and replays)";
+
 // ============================================================================
 // per-dispatch host state — owned (no borrows), so `Store<T>` stays `'static`.
 // The committed/staged maps are MOVED in before a call and MOVED back out
 // after, mirroring the host's own remove-execute-reinsert dispatch trick.
 // ============================================================================
 
+/// one sibling read the guest attempted that the memo could not answer yet.
+enum PendingRead {
+    Root(String),
+    Query(String, Vec<u8>),
+}
+
+/// resolved sibling-read answers, accumulated across the replay rounds of ONE
+/// dispatch/query. the guest is pure and its inputs are fixed for the whole
+/// dispatch, so each round re-treads the identical prefix; a memo hit returns
+/// exactly what the earlier round saw, and each round discovers at most one new
+/// read. answers are stable within a dispatch (nothing else runs in between).
+#[derive(Default)]
+struct SiblingMemo {
+    roots: BTreeMap<String, Option<Vec<u8>>>,
+    queries: BTreeMap<(String, Vec<u8>), Result<Vec<u8>, WitError>>,
+}
+
+impl SiblingMemo {
+    fn len(&self) -> usize {
+        self.roots.len() + self.queries.len()
+    }
+
+    /// resolve one pending read against the host ctx and memoize the answer.
+    /// errors are answers too: a deterministic rejection (unknown module,
+    /// unsupported query, cycle) memoizes as the wit error the guest will see.
+    async fn resolve(&mut self, ctx: &dyn Ctx, read: PendingRead) {
+        match read {
+            PendingRead::Root(target) => {
+                let answer = ctx.module_root(&target).map(|r| r.as_bytes().to_vec());
+                self.roots.insert(target, answer);
+            }
+            PendingRead::Query(target, req) => {
+                let answer = ctx.query(&target, &req).await.map_err(to_wit_error);
+                self.queries.insert((target, req), answer);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct HostData {
     env: Option<WitEnv>,
     committed: BTreeMap<Vec<u8>, Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    memo: SiblingMemo,
+    /// set when the guest hits a sibling read the memo can't answer: the run is
+    /// paused (host trap) and the driver resolves + replays. always `None` when
+    /// a run finishes cleanly.
+    pending: Option<PendingRead>,
+    /// a ctx-less run (plain [`Module::query`]) has no resolver: a memo miss
+    /// answers the pre-cutover stub surface (root `None`, query `unsupported`)
+    /// instead of pausing the run.
+    sealed: bool,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
 }
@@ -78,19 +152,49 @@ impl host::Host for HostData {
     fn state_delete(&mut self, key: Vec<u8>) {
         self.staged.insert(key, None);
     }
-    fn module_root(&mut self, _target: String) -> Option<Vec<u8>> {
-        // TODO(v2): cross-module snapshot root, threaded from the host `Ctx`.
-        None
+    fn module_root(&mut self, target: String) -> wasmtime::Result<Option<Vec<u8>>> {
+        if let Some(answer) = self.memo.roots.get(&target) {
+            return Ok(answer.clone());
+        }
+        if self.sealed {
+            return Ok(None);
+        }
+        self.pending = Some(PendingRead::Root(target));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
-    fn query_module(&mut self, _target: String, _req: Vec<u8>) -> Result<Vec<u8>, WitError> {
-        // TODO(v2): host-routed sibling read, threaded from the host `Ctx`.
-        Err(WitError::Unsupported)
+    fn query_module(
+        &mut self,
+        target: String,
+        req: Vec<u8>,
+    ) -> wasmtime::Result<Result<Vec<u8>, WitError>> {
+        let key = (target, req);
+        if let Some(answer) = self.memo.queries.get(&key) {
+            return Ok(answer.clone());
+        }
+        if self.sealed {
+            return Ok(Err(WitError::Unsupported));
+        }
+        self.pending = Some(PendingRead::Query(key.0, key.1));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
     fn emit_msg(&mut self, target: String, payload: Vec<u8>) {
         self.out_msgs.push((target, payload));
     }
     fn emit_event(&mut self, source: String, payload: Vec<u8>) {
         self.out_events.push((source, payload));
+    }
+}
+
+/// map a host-ctx read error onto the deterministic wit error surface a guest
+/// sees. every arm is host-computed and identical on all validators.
+fn to_wit_error(e: SdkError) -> WitError {
+    match e {
+        SdkError::UnknownModule(_) => WitError::NotFound,
+        SdkError::QueryUnsupported | SdkError::SyncUnsupported | SdkError::SwapUnsupported => {
+            WitError::Unsupported
+        }
+        SdkError::Module(m) => WitError::Rejected(m),
+        other => WitError::Rejected(other.to_string()),
     }
 }
 
@@ -178,6 +282,42 @@ impl WasmModule {
         self.committed = decoded;
         self.staged.clear();
         Ok(())
+    }
+
+    /// one round of the guest's `query` export over LIVE state — the staged
+    /// overlay on committed, the same read-your-writes surface a native module's
+    /// query serves from its live struct (out of block the overlay is empty, so
+    /// this is the committed projection). writes a guest attempts here land in
+    /// the round's own copy and are dropped: read-only by construction. returns
+    /// the outcome plus the memo and any pending sibling read the round paused on.
+    fn query_round(
+        &self,
+        env: WitEnv,
+        memo: SiblingMemo,
+        sealed: bool,
+        req: &[u8],
+    ) -> (Result<Vec<u8>, SdkError>, SiblingMemo, Option<PendingRead>) {
+        let data = HostData {
+            env: Some(env),
+            committed: self.committed.clone(),
+            staged: self.staged.clone(),
+            memo,
+            pending: None,
+            sealed,
+            out_msgs: Vec::new(),
+            out_events: Vec::new(),
+        };
+        let mut store = Store::new(&self.engine, data);
+        let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(self.fuel) {
+            Err(e) => Err(module_err(e)),
+            Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
+                Err(e) => Err(module_err(e)),
+                Ok(inst) => inst.call_query(&mut store, req).map_err(module_err),
+            },
+        };
+        let data = store.into_data();
+        let outcome = call.and_then(|r| r.map_err(wit_err));
+        (outcome, data.memo, data.pending)
     }
 }
 
@@ -304,67 +444,107 @@ impl Module for WasmModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), SdkError> {
-        // move committed + staged into owned per-dispatch data.
-        let data = HostData {
-            env: Some(to_wit_env(ctx.env())),
-            committed: std::mem::take(&mut self.committed),
-            staged: std::mem::take(&mut self.staged),
-            out_msgs: Vec::new(),
-            out_events: Vec::new(),
-        };
-        let mut store = Store::new(&self.engine, data);
+        let env = to_wit_env(ctx.env());
+        // every replay round re-runs the pure guest over the SAME pre-dispatch
+        // stage: an aborted round's writes must not leak into the next, or a
+        // replay could observe (e.g. double-apply) its own discarded effects.
+        let staged0 = std::mem::take(&mut self.staged);
+        let mut memo = SiblingMemo::default();
+        while memo.len() <= MAX_SIBLING_READS {
+            // move committed + memo into owned per-round data; staged is a copy.
+            let data = HostData {
+                env: Some(env.clone()),
+                committed: std::mem::take(&mut self.committed),
+                staged: staged0.clone(),
+                memo: std::mem::take(&mut memo),
+                pending: None,
+                sealed: false,
+                out_msgs: Vec::new(),
+                out_events: Vec::new(),
+            };
+            let mut store = Store::new(&self.engine, data);
 
-        let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(self.fuel) {
-            Err(e) => Err(module_err(e)),
-            Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
+            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(self.fuel) {
                 Err(e) => Err(module_err(e)),
-                Ok(inst) => inst.call_execute(&mut store, &msg.payload).map_err(module_err),
-            },
-        };
+                Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
+                {
+                    Err(e) => Err(module_err(e)),
+                    Ok(inst) => inst.call_execute(&mut store, &msg.payload).map_err(module_err),
+                },
+            };
 
-        // reclaim state regardless of outcome (a trap leaves the moved-in state
-        // in the store; take it back so the module is never left empty).
-        let data = store.into_data();
-        self.committed = data.committed;
-        self.staged = data.staged;
+            // reclaim state regardless of outcome (a trap leaves the moved-in
+            // state in the store; take it back so the module is never left empty).
+            let data = store.into_data();
+            self.committed = data.committed;
+            memo = data.memo;
 
-        match call {
-            Ok(Ok(())) => {
-                // only a clean execute publishes its intents; a rejection leaks nothing.
-                for (target, payload) in data.out_msgs {
-                    ctx.emit_msg(Msg { target, payload });
-                }
-                for (source, payload) in data.out_events {
-                    ctx.emit_event(Event { source, payload });
-                }
-                Ok(())
+            // a paused run: resolve the read through the host ctx and replay.
+            if let Some(read) = data.pending {
+                memo.resolve(&*ctx, read).await;
+                continue;
             }
-            Ok(Err(e)) => Err(wit_err(e)),
-            Err(e) => Err(e),
+
+            return match call {
+                Ok(Ok(())) => {
+                    self.staged = data.staged;
+                    // only a clean execute publishes its intents; a rejection leaks nothing.
+                    for (target, payload) in data.out_msgs {
+                        ctx.emit_msg(Msg { target, payload });
+                    }
+                    for (source, payload) in data.out_events {
+                        ctx.emit_event(Event { source, payload });
+                    }
+                    Ok(())
+                }
+                // a rejected op stages nothing: the pre-dispatch overlay is
+                // restored (the host aborts the whole block on any execute
+                // error, so this only keeps the module-local invariant clean).
+                Ok(Err(e)) => {
+                    self.staged = staged0;
+                    Err(wit_err(e))
+                }
+                Err(e) => {
+                    self.staged = staged0;
+                    Err(e)
+                }
+            };
         }
+        self.staged = staged0;
+        Err(SdkError::Module(format!(
+            "sibling-read budget exceeded ({MAX_SIBLING_READS})"
+        )))
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
-        // read-only projection over COMMITTED state (no staging overlay).
-        let data = HostData {
-            env: Some(WitEnv {
-                height: 0,
-                consensus_time: 0,
-                protocol_version: 0,
-                me: self.id.clone(),
-                origin: WitOrigin::System,
-            }),
-            committed: self.committed.clone(),
-            staged: BTreeMap::new(),
-            out_msgs: Vec::new(),
-            out_events: Vec::new(),
+        // ctx-less direct read: no resolver, so sibling reads answer the sealed
+        // stub surface (root `None`, query `unsupported`). host-routed reads go
+        // through `query_with` instead, which resolves them for real.
+        let env = WitEnv {
+            height: 0,
+            consensus_time: 0,
+            protocol_version: 0,
+            me: self.id.clone(),
+            origin: WitOrigin::System,
         };
-        let mut store = Store::new(&self.engine, data);
-        store.set_fuel(self.fuel).map_err(module_err)?;
-        let inst =
-            ModuleWorld::instantiate(&mut store, &self.component, &self.linker).map_err(module_err)?;
-        let res = inst.call_query(&mut store, req).map_err(module_err)?;
-        res.map_err(wit_err)
+        let (outcome, _, _) = self.query_round(env, SiblingMemo::default(), true, req);
+        outcome
+    }
+
+    async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, SdkError> {
+        let mut memo = SiblingMemo::default();
+        while memo.len() <= MAX_SIBLING_READS {
+            let (outcome, returned, pending) =
+                self.query_round(to_wit_env(ctx.env()), memo, false, req);
+            memo = returned;
+            match pending {
+                Some(read) => memo.resolve(ctx, read).await,
+                None => return outcome,
+            }
+        }
+        Err(SdkError::Module(format!(
+            "sibling-read budget exceeded ({MAX_SIBLING_READS})"
+        )))
     }
 
     async fn commit_block(&mut self) -> Result<(), SdkError> {
