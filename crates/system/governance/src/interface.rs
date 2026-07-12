@@ -43,6 +43,21 @@ pub enum GovAction {
     /// revoke resident standing: emits `ValsetMsg::Revoke { key }` on
     /// execution.
     RemoveResident { key: Vec<u8> },
+    /// AUTHORIZE a height-gated wasm module code swap: emits `ModregMsg::
+    /// Schedule { name, module_id, activation_height, code_hash }` on execution.
+    /// governance only authorizes — the code registry is the sole authority for
+    /// the min-lead / at-most-one / no-op-swap gates, and the swap arms purely
+    /// on height (the bytes travel out-of-band, content-addressed by the hash).
+    UpdateModule {
+        name: String,
+        module_id: String,
+        activation_height: u64,
+        /// sha256 of the target component bytes (32 bytes).
+        code_hash: Vec<u8>,
+    },
+    /// AUTHORIZE clearing a pending module code swap before its boundary: emits
+    /// `ModregMsg::Cancel { name, module_id }` on execution.
+    CancelModuleUpdate { name: String, module_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

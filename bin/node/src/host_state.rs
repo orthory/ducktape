@@ -23,8 +23,11 @@ use identity::Identity;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
+use modreg::Modreg;
 use pages::Pages;
 use recovery::Manifest;
+use sha2::Digest as _;
+use wasm_host::WasmModule;
 use runs::RunsModule;
 use saga::{LeasePolicy, SagaModule};
 use sdk::StateRoot;
@@ -49,6 +52,52 @@ pub(super) struct SyncSubstrates<'a> {
     pub(super) forge_repo: &'a std::path::Path,
     pub(super) duckfs_dir: &'a std::path::Path,
     pub(super) blobs: blobstore::BlobHandle,
+}
+
+/// the reference wasm module's GENESIS component — embedded so every node
+/// constructs the identical module from the identical bytes (its sha256 is the
+/// genesis-seeded active hash in the code registry). live updates arrive
+/// out-of-band as governance-committed hashes + blob-plane bytes; this is only
+/// where the story starts.
+const HELLO_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/hello-wasm/component.wasm");
+
+/// the genesis-constant id the reference wasm module registers under.
+const HELLO_WASM_MODULE_ID: &str = "hello";
+
+/// the blobstore-backed [`host::CodeSource`]: component bytes for a code swap
+/// are content-addressed chunks on the node's blob plane (staged there before
+/// the governance schedule, exactly like a forge Push packfile). a hash the
+/// store lacks is a `None` — the boundary fails closed rather than forking.
+pub(super) struct BlobCodeSource(pub(super) blobstore::BlobHandle);
+
+impl host::CodeSource for BlobCodeSource {
+    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
+        let digest: [u8; 32] = code_hash.try_into().ok()?;
+        self.0.get_chunk(&digest)
+    }
+}
+
+/// genesis-seed the code registry: the reference wasm module's initial active
+/// code hash, identical on every node (the embedded component IS the hash's
+/// preimage). shared by the genesis / restore / state-sync host builders so all
+/// three compose the same registry shape.
+fn seeded_modreg() -> Modreg {
+    let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
+    modreg.seed(
+        HELLO_WASM_MODULE_ID,
+        sha2::Sha256::digest(HELLO_WASM_COMPONENT).to_vec(),
+    );
+    modreg
+}
+
+/// the reference wasm module at its GENESIS code. restarted/synced nodes still
+/// construct from the embedded bytes — the boot-time code reconciliation
+/// (`Host::realize_module_swaps`) swaps to the committed active component when
+/// the registry has moved past genesis.
+fn genesis_hello_wasm() -> WasmModule {
+    WasmModule::from_bytes(HELLO_WASM_MODULE_ID, HELLO_WASM_COMPONENT)
+        .expect("embedded hello component loads")
 }
 
 pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
@@ -82,6 +131,9 @@ pub(super) async fn genesis_host(
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
+    // seed the blob plane with the genesis component, so this node can serve
+    // (and re-fetch) the reference wasm module's initial code by content hash.
+    blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -103,12 +155,21 @@ pub(super) async fn genesis_host(
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
         Box::new(
-            Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite),
+            Governance::new("governance", "valset", "upgrade")
+                .with_invite_binding(bindings.invite)
+                .with_modreg(host::MODREG_MODULE_ID),
         ),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
         Box::new(Upgrade::new("upgrade", "valset")),
+        // the module code registry: the consensus commitment to WHICH component
+        // each hot-swappable wasm module runs, seeded with the genesis hashes.
+        // governance schedules height-gated swaps into it; the host realizes
+        // them at the boundary through the blobstore-backed CodeSource.
+        Box::new(seeded_modreg()),
+        // the reference wasm module — the live-update machinery's first tenant.
+        Box::new(genesis_hello_wasm()),
         // capability-aware strict leases: a saga whose trigger names a
         // capability is assigned over that tag's announced providers, and
         // only the assignee's result lands. an UNASSIGNED attempt (empty
@@ -236,8 +297,9 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance =
-        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
+    let mut governance = Governance::new("governance", "valset", "upgrade")
+        .with_invite_binding(bindings.invite)
+        .with_modreg(host::MODREG_MODULE_ID);
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -248,6 +310,23 @@ pub(super) async fn restore_host(
     upgrade
         .install(bytes, root)
         .map_err(|e| format!("upgrade install: {e}"))?;
+
+    // the code registry + the wasm module restore like any in-memory module:
+    // construct at genesis shape, adopt the checkpoint snapshot. the wasm module
+    // is rebuilt on its EMBEDDED genesis component here — recovery's boot-time
+    // code reconciliation swaps it to the checkpoint's committed active code
+    // (state installs independently of code, so the roots check out either way).
+    let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
+    let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID)?;
+    modreg
+        .install(bytes, root)
+        .map_err(|e| format!("modreg install: {e}"))?;
+
+    let mut hello_wasm = genesis_hello_wasm();
+    let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID)?;
+    hello_wasm
+        .install(bytes, root)
+        .map_err(|e| format!("{HELLO_WASM_MODULE_ID} install: {e}"))?;
 
     let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
     let (bytes, root) = snapshot_of("saga")?;
@@ -373,6 +452,8 @@ pub(super) async fn restore_host(
         Box::new(valset),
         Box::new(governance),
         Box::new(upgrade),
+        Box::new(modreg),
+        Box::new(hello_wasm),
         Box::new(saga),
         Box::new(capability),
         Box::new(dispatch),
@@ -578,8 +659,9 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance =
-        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
+    let mut governance = Governance::new("governance", "valset", "upgrade")
+        .with_invite_binding(bindings.invite)
+        .with_modreg(host::MODREG_MODULE_ID);
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
@@ -589,6 +671,23 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     upgrade
         .install(&bytes, root)
         .map_err(|e| format!("upgrade install: {e}"))?;
+
+    // the code registry + the wasm module join like any in-memory module: adopt
+    // the served snapshot, root-checked. the wasm module joins on its EMBEDDED
+    // genesis component — a post-swap network's committed active hash differs,
+    // and the joiner's first code reconciliation (before it applies any block)
+    // swaps it to the committed component, fetched off the blob plane.
+    let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID).await?;
+    let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
+    modreg
+        .install(&bytes, root)
+        .map_err(|e| format!("modreg install: {e}"))?;
+
+    let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID).await?;
+    let mut hello_wasm = genesis_hello_wasm();
+    hello_wasm
+        .install(&bytes, root)
+        .map_err(|e| format!("{HELLO_WASM_MODULE_ID} install: {e}"))?;
 
     let (bytes, root) = snapshot_of("tasks").await?;
     let mut tasks = Tasks::new("tasks");
@@ -721,6 +820,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(valset),
         Box::new(governance),
         Box::new(upgrade),
+        Box::new(modreg),
+        Box::new(hello_wasm),
         Box::new(saga),
         Box::new(capability),
         Box::new(dispatch),

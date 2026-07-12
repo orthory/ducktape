@@ -22,7 +22,7 @@ export CEF_PATH ?= $(HOME)/.local/share/cef
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
+.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean wasm-modules wasm-modules-check
 
 all: node web
 
@@ -130,13 +130,47 @@ stream-types: cef-env
 ## a real spawned daemon over http/ws), then the app suites with the daemon
 ## binary staged so the live-daemon wire-parity e2e RUNS instead of skipping,
 ## and the sim node staged so the provider scenario suite runs too.
-test: cef-env app/node_modules
+test: cef-env app/node_modules wasm-modules-check
 	$(CARGO) test --workspace
 	$(MAKE) stream-types
 	git diff --exit-code -- app/src/domain/stream.gen.ts
 	$(CARGO) build -p noded -p simnode
 	cd app && $(BUN) run typecheck
 	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) DUCKTAPE_SIMNODE_BIN=$(abspath target/debug/ducktape-simnode) $(BUN) run test
+
+## rebuild every wasm guest module into its componentized artifact and refresh
+## EVERY committed copy in one sweep (the canonical node-embedded artifact +
+## the kernel test fixtures), so the copies can never drift apart. requires
+## the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)
+## and wasm-tools (cargo install wasm-tools). component bytes are toolchain-
+## dependent: a rebuild on a different rustc may legitimately differ from the
+## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
+## guards mutual consistency, not reproducibility. standalone guest workspaces:
+## no cef-env needed.
+wasm-modules:
+	cd crates/examples/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
+	  -o crates/examples/hello-wasm/component.wasm
+	cp crates/examples/hello-wasm/component.wasm \
+	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
+	cp crates/examples/hello-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	cd crates/examples/hello-wasm-v2 && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/hello-wasm-v2/target/wasm32-unknown-unknown/release/hello_wasm_v2.wasm \
+	  -o crates/kernel/host/tests/fixtures/hello-v2.component.wasm
+
+## the drift gate for the committed component artifacts: every copy of the SAME
+## module must be byte-identical (bin/node embeds the canonical artifact; the
+## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
+## the pre-push `test` gate; run `make wasm-modules` to refresh the set.
+wasm-modules-check:
+	cmp crates/examples/hello-wasm/component.wasm \
+	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
+	cmp crates/examples/hello-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	@echo "wasm module artifacts are mutually consistent"
 
 clean:
 	$(CARGO) clean

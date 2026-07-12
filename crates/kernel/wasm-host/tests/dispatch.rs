@@ -120,6 +120,34 @@ async fn deterministic_root_across_instances() {
 }
 
 #[tokio::test]
+async fn snapshot_install_round_trip() {
+    let mut src = WasmModule::from_bytes("hello", HELLO).expect("load");
+    let mut ctx = MockCtx::new("hello");
+    inc(&mut src, &mut ctx).await;
+    inc(&mut src, &mut ctx).await;
+    src.commit_block().await.expect("commit");
+    let root = src.root();
+
+    // sha256(snapshot()) IS the root — the checkpoint ships the exact preimage.
+    let bytes = src.snapshot();
+    let mut dst = WasmModule::from_bytes("hello", HELLO).expect("load");
+    dst.install(&bytes, root).expect("verify-then-adopt");
+    assert_eq!(dst.root(), root, "installed root equals the source root");
+    assert_eq!(count(dst.query(b"").await.expect("query")), 2);
+
+    // tampered / truncated / trailing bytes are refused, target untouched.
+    let mut flipped = bytes.clone();
+    let mid = flipped.len() / 2;
+    flipped[mid] ^= 0x01;
+    assert!(dst.install(&flipped, root).is_err());
+    assert!(dst.install(&bytes[..bytes.len() - 1], root).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(dst.install(&trailing, root).is_err());
+    assert_eq!(dst.root(), root, "failed installs left the target untouched");
+}
+
+#[tokio::test]
 async fn hot_swap_keeps_state() {
     let mut m = WasmModule::from_bytes("hello", HELLO).expect("load");
     let mut ctx = MockCtx::new("hello");

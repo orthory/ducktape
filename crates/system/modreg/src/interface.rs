@@ -10,6 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// the genesis-constant module id the code registry registers under. the host
+/// reads it (via `Host::realize_module_swaps`) to reconcile running code against
+/// the committed active hashes; governance addresses its `Schedule` follow-ups
+/// here.
+pub const DEFAULT_MODREG_ID: &str = "modreg";
+
 /// the length of a code hash: sha256 over the component bytes.
 pub const CODE_HASH_LEN: usize = 32;
 

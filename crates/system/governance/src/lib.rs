@@ -41,6 +41,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
+use modreg::{ModregMsg, encode_msg as modreg_encode_msg};
 use upgrade::{UpgradeMsg, encode_msg as upgrade_encode_msg};
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -79,6 +80,11 @@ pub struct Governance {
     /// the id of the upgrade module a passing `ScheduleUpgrade`/`CancelUpgrade`
     /// authorizes. genesis wiring — identical on every node.
     upgrade_id: ModuleId,
+    /// the id of the code registry a passing `UpdateModule`/`CancelModuleUpdate`
+    /// authorizes. genesis wiring — identical on every node; `None` (a net
+    /// without the registry) rejects those proposals at the door,
+    /// deterministically.
+    modreg_id: Option<ModuleId>,
     /// the network binding invite tokens sign over (the genesis namespace).
     /// genesis wiring — identical on every node of the same network. `None`
     /// (a shape without a descriptor) refuses every `Redeem` with a clear
@@ -107,12 +113,21 @@ impl Governance {
             id: id.into(),
             valset_id: valset_id.into(),
             upgrade_id: upgrade_id.into(),
+            modreg_id: None,
             invite_binding: None,
             proposals: BTreeMap::new(),
             pending: BTreeMap::new(),
             redeemed: BTreeMap::new(),
             pending_redeemed: BTreeMap::new(),
         }
+    }
+
+    /// wire the code registry a passing `UpdateModule`/`CancelModuleUpdate`
+    /// authorizes. genesis wiring — every node of a network must wire the same
+    /// id (or none), or nodes diverge on whether those proposals are accepted.
+    pub fn with_modreg(mut self, modreg_id: impl Into<ModuleId>) -> Self {
+        self.modreg_id = Some(modreg_id.into());
+        self
     }
 
     /// wire the network binding invite tokens verify against (the genesis
@@ -240,6 +255,23 @@ impl Governance {
                     out.push(6);
                     push_bytes(&mut out, key);
                 }
+                GovAction::UpdateModule {
+                    name,
+                    module_id,
+                    activation_height,
+                    code_hash,
+                } => {
+                    out.push(7);
+                    push_bytes(&mut out, name.as_bytes());
+                    push_bytes(&mut out, module_id.as_bytes());
+                    out.extend_from_slice(&activation_height.to_le_bytes());
+                    push_bytes(&mut out, code_hash);
+                }
+                GovAction::CancelModuleUpdate { name, module_id } => {
+                    out.push(8);
+                    push_bytes(&mut out, name.as_bytes());
+                    push_bytes(&mut out, module_id.as_bytes());
+                }
             }
             push_bytes(&mut out, &p.proposer);
             out.extend_from_slice(&p.created_at.to_le_bytes());
@@ -339,6 +371,36 @@ impl Governance {
             && name.is_empty()
         {
             return Err(Error::Module("upgrade name must not be empty".into()));
+        }
+        // module-update authorizations: shape-checked at the door (a proposal
+        // that can never execute is rejected here, not at tally time); the code
+        // registry's min-lead / at-most-one / no-op gates are NOT duplicated —
+        // modreg is their sole authority at ingest. a net without a wired code
+        // registry deterministically rejects these (genesis wiring is identical
+        // on every node).
+        if let GovAction::UpdateModule { name, module_id, .. }
+        | GovAction::CancelModuleUpdate { name, module_id } = &action
+        {
+            if self.modreg_id.is_none() {
+                return Err(Error::Module(
+                    "no code registry wired: module updates are not available on this network"
+                        .into(),
+                ));
+            }
+            if name.is_empty() {
+                return Err(Error::Module("module update name must not be empty".into()));
+            }
+            if module_id.is_empty() {
+                return Err(Error::Module("module_id must not be empty".into()));
+            }
+        }
+        if let GovAction::UpdateModule { code_hash, .. } = &action
+            && code_hash.len() != modreg::CODE_HASH_LEN
+        {
+            return Err(Error::Module(format!(
+                "code_hash must be {} bytes (sha256 of the component)",
+                modreg::CODE_HASH_LEN
+            )));
         }
         if self.get(&proposal_id).is_some() {
             return Err(Error::Module(format!(
@@ -471,6 +533,41 @@ impl Governance {
                     target: self.upgrade_id.clone(),
                     payload: upgrade_encode_msg(&UpgradeMsg::Cancel { name: name.clone() }),
                 }),
+                // a passing module-update authorization is PERFORMED the same
+                // way: emit the modreg op as a follow-up, accepted because the
+                // origin is Module(governance). governance only authorizes; the
+                // code registry owns the min-lead / at-most-one / no-op gates,
+                // and the swap arms purely on height. Propose door-checks the
+                // wiring, so an unwired registry here means the proposal was
+                // adopted from a peer snapshot minted under DIFFERENT genesis
+                // wiring — reject it cleanly rather than emit into the void.
+                GovAction::UpdateModule {
+                    name,
+                    module_id,
+                    activation_height,
+                    code_hash,
+                } => match &self.modreg_id {
+                    Some(modreg) => ctx.emit_msg(Msg {
+                        target: modreg.clone(),
+                        payload: modreg_encode_msg(&ModregMsg::Schedule {
+                            name: name.clone(),
+                            module_id: module_id.clone(),
+                            activation_height: *activation_height,
+                            code_hash: code_hash.clone(),
+                        }),
+                    }),
+                    None => proposal.status = ProposalStatus::Rejected,
+                },
+                GovAction::CancelModuleUpdate { name, module_id } => match &self.modreg_id {
+                    Some(modreg) => ctx.emit_msg(Msg {
+                        target: modreg.clone(),
+                        payload: modreg_encode_msg(&ModregMsg::Cancel {
+                            name: name.clone(),
+                            module_id: module_id.clone(),
+                        }),
+                    }),
+                    None => proposal.status = ProposalStatus::Rejected,
+                },
                 // the staged-admission grant/revoke: valset re-gates on the
                 // protocol version (defense in depth for direct submits) and
                 // owns the validator-overlap rule.
@@ -767,6 +864,16 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             },
             6 => GovAction::RemoveResident {
                 key: take_vec(&mut buf)?,
+            },
+            7 => GovAction::UpdateModule {
+                name: take_string(&mut buf)?,
+                module_id: take_string(&mut buf)?,
+                activation_height: take_u64(&mut buf)?,
+                code_hash: take_vec(&mut buf)?,
+            },
+            8 => GovAction::CancelModuleUpdate {
+                name: take_string(&mut buf)?,
+                module_id: take_string(&mut buf)?,
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };

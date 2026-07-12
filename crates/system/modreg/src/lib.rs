@@ -78,6 +78,27 @@ impl Modreg {
         }
     }
 
+    /// GENESIS seeding: install a module's initial active code hash directly
+    /// into committed state, BEFORE the host registers this instance — the same
+    /// pattern as `Valset::insert`. deterministic and identical on every node
+    /// (a different seed set composes a different genesis app-hash and the
+    /// network forks at genesis). never valid after genesis: live changes go
+    /// through `Register`/`Schedule` ops.
+    pub fn seed(&mut self, module_id: impl Into<String>, code_hash: Vec<u8>) {
+        assert_eq!(
+            code_hash.len(),
+            CODE_HASH_LEN,
+            "genesis code hash must be {CODE_HASH_LEN} bytes"
+        );
+        self.committed.modules.insert(
+            module_id.into(),
+            ModuleEntry {
+                active_code_hash: code_hash,
+                pending: None,
+            },
+        );
+    }
+
     /// staged-over-committed read (read-your-writes within a block).
     fn read(&self) -> &ModregState {
         self.staged.as_ref().unwrap_or(&self.committed)

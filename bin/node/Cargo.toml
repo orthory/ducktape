@@ -29,6 +29,10 @@ governance = { workspace = true }
 # the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
 # committed boundary snapshot; the module itself is genesis-wired post-retrofit).
 upgrade = { workspace = true }
+# the module code registry + the wasm runtime it governs: genesis-wired, with
+# height-gated live code swaps realized through the blobstore-backed CodeSource.
+modreg = { workspace = true }
+wasm-host = { workspace = true }
 saga = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side
 # provider discovery announces this node's installed executor CLIs into it.

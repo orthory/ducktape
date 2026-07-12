@@ -745,6 +745,14 @@ where
     journal: OpJournal<E>,
     manifest_store: Meta<E>,
     cert_store: Meta<E>,
+    /// the out-of-band source of component BYTES for code-registry swaps.
+    /// replay reconciles running module code against the committed registry
+    /// before each re-applied block (`Host::realize_module_swaps`) — a block
+    /// sealed after a swap re-executes on the SAME code it ran live, or its
+    /// sealed roots cannot reproduce. defaults to [`host::NoCodeSource`]:
+    /// fail-closed at the first armed boundary if the node never wired one.
+    /// `Arc` (not `Box`) so the replay loop can share it past `&mut self`.
+    code_source: std::sync::Arc<dyn host::CodeSource>,
 }
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
@@ -807,7 +815,21 @@ where
             journal,
             manifest_store,
             cert_store,
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         })
+    }
+
+    /// wire the out-of-band component-byte source for code-registry swaps (the
+    /// node injects a blobstore-backed one). the default is
+    /// [`host::NoCodeSource`] — see the field doc.
+    pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
+        self.code_source = src;
+    }
+
+    /// the wired code source (the catch-up applier realizes swaps through the
+    /// same source replay uses, so every path reconciles identically).
+    pub fn code_source(&self) -> std::sync::Arc<dyn host::CodeSource> {
+        std::sync::Arc::clone(&self.code_source)
     }
 
     /// the persisted checkpoint, if any. `None` means this storage dir has
@@ -1154,6 +1176,8 @@ where
         manifest: &Manifest,
         mut sink: Option<&mut dyn ReplaySink>,
     ) -> Result<Recovered, Error> {
+        // shared past the `&mut self` journal borrows below (see the field doc).
+        let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.app_hash;
@@ -1382,9 +1406,15 @@ where
                                 sink.opaque_block(height);
                             }
                         } else if all_pre {
-                            let (_, dispatches) =
-                                apply_block(host, height, &frame, protocol_version, Some(disposition))
-                                    .await?;
+                            let (_, dispatches) = apply_block(
+                                host,
+                                height,
+                                &frame,
+                                protocol_version,
+                                Some(disposition),
+                                code_source.as_ref(),
+                            )
+                            .await?;
                             if let Some(sink) = sink.as_mut() {
                                 sink.folded_block(&FoldedBlock {
                                     height,
@@ -1479,6 +1509,7 @@ where
                                 protocol_version,
                                 Some(disposition),
                                 &commit_only,
+                                code_source.as_ref(),
                             )
                             .await?;
                             if let Some(sink) = sink.as_mut() {
@@ -1544,8 +1575,15 @@ where
                 .collect();
             host.set_active_version(protocol_version);
             let disposition = if moved.is_empty() {
-                let (disposition, dispatches) =
-                    apply_block(host, height, &frame, protocol_version, None).await?;
+                let (disposition, dispatches) = apply_block(
+                    host,
+                    height,
+                    &frame,
+                    protocol_version,
+                    None,
+                    code_source.as_ref(),
+                )
+                .await?;
                 if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
                         height,
@@ -1592,6 +1630,7 @@ where
                         protocol_version,
                         None,
                         &commit_only,
+                        code_source.as_ref(),
                     )
                     .await?;
                     // the re-execution's own disposition is NOT a backstop:
@@ -1655,6 +1694,16 @@ where
         if let Some(h) = tip_height {
             let v = host.effective_version(h).await;
             host.set_active_version(v);
+            // the code-space twin: reconcile running module code to the committed
+            // registry at the tip, so a checkpoint AT (or past) a swap boundary —
+            // no replayed frame to realize through — still boots on the committed
+            // code instead of serving stale genesis components until the next
+            // live block. idempotent; fail-closed on missing/tampered bytes.
+            host.realize_module_swaps(h, code_source.as_ref())
+                .await
+                .map_err(|e| {
+                    Error::Verify(format!("code-swap realization at recovered tip {h}: {e}"))
+                })?;
         }
         // THE verification: the recomposed state must be byte-identical to
         // what consensus sealed at the tip. anything else means the recovered
@@ -1694,8 +1743,10 @@ async fn apply_block(
     frame: &[u8],
     protocol_version: u32,
     expect: Option<Disposition>,
+    code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let (disposition, dispatches) = replay_batch(host, height, frame, protocol_version, None).await?;
+    let (disposition, dispatches) =
+        replay_batch(host, height, frame, protocol_version, None, code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1718,9 +1769,10 @@ async fn apply_block_committing(
     protocol_version: u32,
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
+    code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     let (disposition, dispatches) =
-        replay_batch(host, height, frame, protocol_version, Some(commit_only)).await?;
+        replay_batch(host, height, frame, protocol_version, Some(commit_only), code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1771,7 +1823,16 @@ async fn replay_batch(
     frame: &[u8],
     protocol_version: u32,
     commit_only: Option<&BTreeSet<ModuleId>>,
+    code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    // CODE-SWAP REALIZATION, mirroring the live drain: a block sealed after a
+    // code-registry swap executed on the NEW component, so replay must swap
+    // before re-applying or the sealed roots cannot reproduce. keyed purely on
+    // the replayed committed registry state + height — the identical swap
+    // points the live node realized. fail-closed on missing/tampered bytes.
+    host.realize_module_swaps(height, code_source)
+        .await
+        .map_err(|e| Error::Verify(format!("code-swap realization at height {height}: {e}")))?;
     // a batch that never decoded was a whole-block deterministic no-op at runtime
     // too — the live drain sealed it Rejected without touching state.
     let Ok(members) = decode_batch(frame) else {

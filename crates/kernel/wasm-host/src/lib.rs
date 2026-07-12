@@ -21,7 +21,7 @@ use wasmtime::{Config, Engine, Store};
 
 use sdk::{
     Ctx, Env as SdkEnv, Error as SdkError, Event, Module, ModuleId, Msg, Origin as SdkOrigin,
-    StateRoot,
+    StateRoot, StateSyncHandle,
 };
 
 mod bindings {
@@ -105,6 +105,10 @@ pub struct WasmModule {
     engine: Engine,
     linker: Linker<HostData>,
     component: Component,
+    /// sha256 of the component bytes currently loaded — the CODE identity the
+    /// host reconciles against the registry's committed active hash. NOT part of
+    /// `root()` (code is invisible to the app-hash); per-node realization only.
+    code_hash: Vec<u8>,
     committed: BTreeMap<Vec<u8>, Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     fuel: u64,
@@ -123,37 +127,106 @@ impl WasmModule {
             engine,
             linker,
             component,
+            code_hash: sha256(component_bytes),
             committed: BTreeMap::new(),
             staged: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
         })
     }
 
-    /// Replace the component code IN PLACE, keeping the host-owned state store.
-    /// This is the live-update primitive: same store, new logic. Staged (yet
-    /// uncommitted) writes are discarded — a swap is a clean block boundary.
-    pub fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
-        let component = Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
-        self.component = component;
-        self.staged.clear();
-        Ok(())
+    /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
+    /// pairs — the exact preimage of [`WasmModule::root_of`], and therefore the
+    /// snapshot format (verify-then-adopt against the root, like modreg).
+    fn encode_state(committed: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(committed.len() as u64).to_le_bytes());
+        for (k, v) in committed {
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k);
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        out
     }
 
-    /// The authenticated root of the committed store: a length-prefixed SHA-256
-    /// over sorted `(key, value)` pairs. Deterministic and idempotent — the same
+    /// The authenticated root of the committed store: SHA-256 over
+    /// [`WasmModule::encode_state`]. Deterministic and idempotent — the same
     /// scheme the native map-backed modules use, so it composes into the global
     /// app-hash exactly like any other module root.
     fn root_of(committed: &BTreeMap<Vec<u8>, Vec<u8>>) -> StateRoot {
         let mut h = Sha256::new();
-        h.update((committed.len() as u64).to_le_bytes());
-        for (k, v) in committed {
-            h.update((k.len() as u64).to_le_bytes());
-            h.update(k);
-            h.update((v.len() as u64).to_le_bytes());
-            h.update(v);
-        }
+        h.update(Self::encode_state(committed));
         StateRoot(h.finalize().into())
     }
+
+    /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
+    /// this is what checkpoint capture ships (see [`Module::state_sync_handle`]).
+    pub fn snapshot(&self) -> Vec<u8> {
+        Self::encode_state(&self.committed)
+    }
+
+    /// verify-then-adopt a peer/checkpoint snapshot: strict-decode, recompute
+    /// the root, refuse on mismatch — committed state and stage untouched on any
+    /// error. code is NOT part of the snapshot (the registry owns the code
+    /// commitment; the host reconciles running code separately), so install
+    /// never touches the loaded component.
+    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), SdkError> {
+        let decoded = decode_state(bytes)?;
+        if Self::root_of(&decoded) != expected {
+            return Err(SdkError::Module("snapshot root mismatch".into()));
+        }
+        self.committed = decoded;
+        self.staged.clear();
+        Ok(())
+    }
+}
+
+// ---- strict snapshot decode (untrusted bytes) -------------------------------
+
+fn take_u64(buf: &mut &[u8]) -> Result<u64, SdkError> {
+    let Some((head, rest)) = buf.split_first_chunk::<8>() else {
+        return Err(SdkError::Module("snapshot truncated".into()));
+    };
+    *buf = rest;
+    Ok(u64::from_le_bytes(*head))
+}
+
+fn take_vec(buf: &mut &[u8]) -> Result<Vec<u8>, SdkError> {
+    let len = take_u64(buf)?;
+    if len > buf.len() as u64 {
+        return Err(SdkError::Module("snapshot length exceeds buffer".into()));
+    }
+    let (head, rest) = buf.split_at(len as usize);
+    *buf = rest;
+    Ok(head.to_vec())
+}
+
+fn decode_state(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, SdkError> {
+    let mut buf = bytes;
+    let count = take_u64(&mut buf)?;
+    // each entry costs at least two 8-byte length prefixes — a forged count can
+    // never over-allocate.
+    if count > (buf.len() / 16) as u64 {
+        return Err(SdkError::Module("snapshot entry count exceeds buffer".into()));
+    }
+    let mut committed = BTreeMap::new();
+    let mut prev: Option<Vec<u8>> = None;
+    for _ in 0..count {
+        let key = take_vec(&mut buf)?;
+        // strictly increasing keys: one state has exactly one encoding.
+        if prev.as_deref().is_some_and(|p| p >= key.as_slice()) {
+            return Err(SdkError::Module(
+                "snapshot keys must be strictly increasing".into(),
+            ));
+        }
+        let value = take_vec(&mut buf)?;
+        prev = Some(key.clone());
+        committed.insert(key, value);
+    }
+    if !buf.is_empty() {
+        return Err(SdkError::Module("snapshot carries trailing bytes".into()));
+    }
+    Ok(committed)
 }
 
 /// The determinism envelope for module execution. Fuel-metered termination, no
@@ -193,6 +266,12 @@ fn wit_err(e: WitError) -> SdkError {
     SdkError::Module(format!("{e:?}"))
 }
 
+/// the 32-byte content hash of a component — the code identity the registry
+/// commits to and the host verifies before a swap.
+fn sha256(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
+}
+
 #[async_trait::async_trait(?Send)]
 impl Module for WasmModule {
     fn id(&self) -> ModuleId {
@@ -201,6 +280,27 @@ impl Module for WasmModule {
 
     fn root(&self) -> StateRoot {
         Self::root_of(&self.committed)
+    }
+
+    fn code_hash(&self) -> Option<Vec<u8>> {
+        Some(self.code_hash.clone())
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, SdkError> {
+        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    }
+
+    /// Replace the component code IN PLACE, keeping the host-owned state store.
+    /// This is the live-update primitive: same store, new logic, and the root is
+    /// computed from the (untouched) store — so app-hash is continuous across the
+    /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
+    /// driven at a clean block boundary, never mid-block.
+    fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
+        let component = Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
+        self.component = component;
+        self.code_hash = sha256(component_bytes);
+        self.staged.clear();
+        Ok(())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), SdkError> {

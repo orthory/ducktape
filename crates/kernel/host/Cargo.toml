@@ -19,8 +19,17 @@ upgrade = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
 dispatch = { workspace = true }
+# WIRE-TYPES-ONLY dep, same shape: the boundary code-swap realization reads the
+# code registry's committed active/pending hashes and injects its Advance tick.
+# host never constructs or registers the modreg impl — only its crate-root types.
+modreg = { workspace = true }
+# verify fetched component bytes against the committed content hash before a swap.
+sha2 = { workspace = true }
 
 [dev-dependencies]
+# the live-code-update proof stands a real wasm module on the host and swaps its
+# component across a code-registry activation boundary (modreg is a normal dep).
+wasm-host = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
 kv = { workspace = true }

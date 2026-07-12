@@ -202,6 +202,9 @@ pub(super) async fn resume(
         boot_floor.map(|c| c.cert),
     );
     let view_base = resumed.as_ref().map(|r| r.view_base).unwrap_or(0);
+    // the drain realizes code-registry swaps through the SAME source recovery
+    // replay used (wired at Recovery::open) — lift it off before the move.
+    let code_source = recovery.code_source();
     let mut node = match resumed {
         Some(rec) => OrderedNode::resume(
             host,
@@ -215,6 +218,7 @@ pub(super) async fn resume(
         ),
         None => OrderedNode::with_sink(host, orderer, recovery),
     };
+    node.set_code_source(code_source);
     // the observation barrier: every drain batch ends AT a block that
     // moves the valset root, so the orchestration step below observes a
     // membership change at exactly its block's view — the same view on
