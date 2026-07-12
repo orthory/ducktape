@@ -121,6 +121,21 @@ pub struct NetworkShapeCluster {
 }
 
 impl NetworkShapeCluster {
+    /// freeze (`SIGSTOP`) or thaw (`SIGCONT`) a running node — the closest a
+    /// test gets to a laptop sleeping mid-run: the process vanishes from the
+    /// scheduler while its kernel keeps its sockets ESTABLISHED, exactly the
+    /// silent half-open shape a slept machine leaves its peers holding.
+    pub fn signal(&self, idx: usize, signal: &str) {
+        let node = self.nodes[idx].as_ref().expect("node not running");
+        let pid = node.child.id();
+        let status = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{signal} {pid} failed");
+    }
+
     pub fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("network-shape tempdir");
         let ports = alloc_ports(6);
@@ -281,6 +296,12 @@ impl NetworkShapeCluster {
     /// kill node `idx`'s process (reaped by NodeProc's drop).
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None;
+    }
+
+    /// node `idx`'s captured stdout+stderr — for a failing test to preserve
+    /// evidence before the cluster tempdir (and the logs in it) is dropped.
+    pub fn log_path(&self, idx: usize) -> PathBuf {
+        self.nodes[idx].as_ref().expect("node not running").log.clone()
     }
 
     /// one json-lines rpc against node `idx` — the NetworkShapeCluster
