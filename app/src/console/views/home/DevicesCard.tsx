@@ -48,7 +48,7 @@ import {
   outlineButton,
   SectionLabel,
 } from "../settings/parts";
-import { encodeLinkChallenge } from "../account/link-device";
+import { decodeLinkResponse, encodeLinkChallenge } from "../account/link-device";
 import type { LinkChallenge } from "../account/link-device";
 import { CustodyPanel } from "./CustodyCard";
 
@@ -83,6 +83,7 @@ function LinkInviterPanel({ onDone }: { onDone: () => void }) {
   const [challenge, setChallenge] = useState<LinkChallenge | null>(null);
   const [relayUrl, setRelayUrl] = useState<string | null>(null);
   const [response, setResponse] = useState("");
+  const [delivered, setDelivered] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -117,19 +118,23 @@ function LinkInviterPanel({ onDone }: { onDone: () => void }) {
 
   // Poll for the new device's reply while the QR is up — it lands in the same
   // response field a manual paste would fill. Best-effort: a missed tick just
-  // means the next one picks it up.
+  // means the next one picks it up. `delivered` latches polling off for good:
+  // clearing the box to paste a different reply must not refill it.
   useEffect(() => {
-    if (!relayUrl || response.length > 0) return;
+    if (!relayUrl || delivered || response.length > 0) return;
     const timer = setInterval(() => {
       linkRelayPoll().then(
         (blob) => {
-          if (blob) setResponse(blob);
+          if (blob) {
+            setDelivered(true);
+            setResponse(blob);
+          }
         },
         () => {},
       );
     }, 1200);
     return () => clearInterval(timer);
-  }, [relayUrl, response]);
+  }, [relayUrl, delivered, response]);
 
   if (error && !challenge) {
     return <span style={errorTextStyle}>{error}</span>;
@@ -139,6 +144,7 @@ function LinkInviterPanel({ onDone }: { onDone: () => void }) {
   }
 
   const encoded = encodeLinkChallenge(challenge);
+  const parsedReply = decodeLinkResponse(response);
   const copy = () => {
     void navigator.clipboard?.writeText(encoded).then(
       () => setCopied(true),
@@ -197,6 +203,20 @@ function LinkInviterPanel({ onDone }: { onDone: () => void }) {
         rows={3}
         style={blobStyle}
       />
+      {/* The human check the ceremony's security rests on: the approval must
+          be of THIS key, verified against the fingerprint the new device
+          shows — a LAN interloper's reply won't match it. */}
+      {parsedReply && (
+        <>
+          <span style={{ ...hintStyle, marginBottom: 0 }}>
+            Approve only if the new device shows this same key:
+          </span>
+          <span style={{ ...monoValue, maxWidth: "100%" }} title={parsedReply.pubkey}>
+            {KIND_LABEL[parsedReply.kind]} · {shortKey(parsedReply.pubkey)}
+            {parsedReply.label ? ` · ${parsedReply.label}` : ""}
+          </span>
+        </>
+      )}
       {error && <span style={errorTextStyle}>{error}</span>}
       <button
         onClick={() => {

@@ -885,6 +885,9 @@ describe("identity gate — link-device flow", () => {
       nonce: 4,
     });
     await screen.findByText(/Reply sent to Eddy's account/);
+    // The verify-before-approve fingerprint: this device's key, for the human
+    // cross-check against what the inviter's approve step shows.
+    expect(screen.getByText(/Seed key · cd34/)).toBeInTheDocument();
     expect(sent).toHaveLength(1);
     expect(sent[0].url).toBe(ADDRESS);
     const blob = String(sent[0].response);

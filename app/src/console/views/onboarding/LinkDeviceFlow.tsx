@@ -13,6 +13,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { linkFetchChallenge, linkSendResponse } from "../../../domain/link-relay-client";
+import { shortKey } from "../../../domain/names";
 import { identityState } from "../../../domain/user-identity-client";
 import { color, font } from "../../theme/tokens";
 import { decodeLinkChallenge, encodeLinkResponse, isLinkUrl } from "../account/link-device";
@@ -49,6 +50,7 @@ export function LinkDeviceFlow({
   const [label, setLabel] = useState("");
   const [response, setResponse] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
+  const [sentKey, setSentKey] = useState<string | null>(null);
   const [accountName, setAccountName] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -68,6 +70,7 @@ export function LinkDeviceFlow({
           nonce: challenge.nonce,
         }).then((possession) => {
           setAccountName(challenge.name);
+          setSentKey(pubkey);
           return encodeLinkResponse({
             pubkey,
             kind: "ed25519",
@@ -142,8 +145,22 @@ export function LinkDeviceFlow({
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <span style={hintStyle}>
           Reply sent{accountName ? ` to ${accountName}'s account` : ""} —
-          approve the link on your other device. This device joins the account
-          once that lands — you can continue in the meantime.
+          approve the link on your other device. Before approving there, check
+          it shows this device&apos;s key:
+        </span>
+        {/* The human check the ceremony's security rests on: the approval on
+            the other device must be of THIS key, not a LAN interloper's. */}
+        {sentKey && (
+          <span
+            style={{ ...hintStyle, font: `600 11.5px ${font.mono}`, textAlign: "center" }}
+            title={sentKey}
+          >
+            Seed key · {shortKey(sentKey)}
+          </span>
+        )}
+        <span style={hintStyle}>
+          This device joins the account once that lands — you can continue in
+          the meantime.
         </span>
         <button onClick={onDone} style={primaryButtonStyle(false)}>
           {doneLabel}

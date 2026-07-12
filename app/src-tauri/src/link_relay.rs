@@ -130,7 +130,9 @@ fn challenge(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// POST /link/response {token,response} → store the new device's response blob
-/// for the inviter UI to pick up via `link_relay_poll`.
+/// for the inviter UI to pick up via `link_relay_poll`. First response wins:
+/// a later post (honest retry or interloper) can never displace the reply the
+/// inviter may already be looking at — it re-runs the ceremony instead.
 fn response(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     let Some(body) = read_json::<ResponseReq>(req) else {
         return status(400);
@@ -141,6 +143,9 @@ fn response(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     };
     if !token_matches(&s.token, &body.token) || !valid_blob(&body.response, RESPONSE_PREFIX) {
         return status(403);
+    }
+    if s.response.is_some() {
+        return status(409);
     }
     s.response = Some(body.response);
     json(r#"{"ok":true}"#.to_string())
@@ -261,6 +266,7 @@ fn http_client() -> Result<reqwest::Client, String> {
 fn relay_status_error(code: u16) -> String {
     match code {
         410 => "the link panel was closed on the other device — reopen it there and retry".into(),
+        409 => "a reply already reached the other device — re-run the link from step 1 there".into(),
         403 => "the other device didn't accept this address — retype it exactly as shown".into(),
         code => format!("the other device answered unexpectedly (HTTP {code})"),
     }
@@ -275,13 +281,15 @@ fn unreachable_error(err: &reqwest::Error) -> String {
 }
 
 /// POST to the relay and hand back the body, bounded — a rogue endpoint must
-/// not stream unbounded data into the shell.
+/// not stream unbounded data into the shell, so the body is read chunk by
+/// chunk against a hard cap (content-length alone misses chunked replies).
 async fn post_bounded(
     client: &reqwest::Client,
     url: String,
     body: String,
 ) -> Result<(u16, String), String> {
-    let resp = client
+    const MAX_REPLY_BYTES: usize = 16 * 1024;
+    let mut resp = client
         .post(url)
         .header("content-type", "application/json")
         .body(body)
@@ -289,13 +297,15 @@ async fn post_bounded(
         .await
         .map_err(|e| unreachable_error(&e))?;
     let code = resp.status().as_u16();
-    if resp.content_length().is_some_and(|len| len > 16 * 1024) {
-        return Err("the other device sent an oversized reply".into());
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| unreachable_error(&e))? {
+        if bytes.len() + chunk.len() > MAX_REPLY_BYTES {
+            return Err("the other device sent an oversized reply".into());
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    let text = resp.text().await.map_err(|e| unreachable_error(&e))?;
-    if text.len() > 16 * 1024 {
-        return Err("the other device sent an oversized reply".into());
-    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "the other device sent an unexpected reply".to_string())?;
     Ok((code, text))
 }
 
@@ -436,6 +446,13 @@ mod tests {
         assert_eq!(rt.block_on(fetch_challenge_from(&good)).unwrap(), challenge_blob());
         assert!(link_relay_poll_inner().is_none());
         rt.block_on(send_response_to(&good, &response_blob())).unwrap();
+        assert_eq!(link_relay_poll_inner(), Some(response_blob()));
+
+        // first response wins: a second valid post is refused (409) and the
+        // stored reply is untouched.
+        let second = format!("{RESPONSE_PREFIX}eyJwdWJrZXkiOiJlZTk5In0=");
+        let refused = rt.block_on(send_response_to(&good, &second)).unwrap_err();
+        assert!(refused.contains("already reached"), "got: {refused}");
         assert_eq!(link_relay_poll_inner(), Some(response_blob()));
 
         // a malformed response blob is refused server-side even with the token.
