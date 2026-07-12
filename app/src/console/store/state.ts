@@ -321,6 +321,9 @@ export interface ConsoleState {
   workspace: Workspace | null;
   /** Desktop with no active workspace → show the onboarding gate. */
   needsOnboarding: boolean;
+  /** The account-centric Home layer is showing (the workspace shell is hidden).
+   *  Not a disconnect — the node connection is kept alive underneath. */
+  atHome: boolean;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
   /** The last guarded forget couldn't confirm the node left its valset (node
@@ -741,6 +744,7 @@ export const createInitialState = (): ConsoleState => {
     workspaces: [],
     workspace: null,
     needsOnboarding: false,
+    atHome: false,
     onboardingBusy: false,
     forgetNeedsForce: false,
     deleteNeedsForce: null,
