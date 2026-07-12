@@ -139,6 +139,30 @@ export function useRowHandlers({
     return undefined;
   }, []);
 
+  /** Delete a block — THE path every "remove this" intent routes through.
+   *
+   *  RemoveBlock takes the block's ENTIRE SUBTREE with it (block_ops.rs runs
+   *  delete_subtree) and there is no undo, so a block with children asks first.
+   *  The guard lives here, in the one function all three intents call, not in
+   *  whichever caller someone remembered: `removeDividerAbove` was written
+   *  without it and could destroy a divider, the block holding the caret, and
+   *  everything under that — a Backspace, no dialog, no undo. The menu's Delete
+   *  and Backspace-on-empty had the guard; the third path did not, and the suite
+   *  missed it because it only ever tested a CHILDLESS divider.
+   *
+   *  Returns false when it deferred to the dialog instead of removing. The merge
+   *  does NOT come through here — it hands the children to the adopter first, so
+   *  by the time it removes there is no subtree left to warn about. */
+  const removeBlock = useCallback((blockId: string): boolean => {
+    const block = live.current.blocks.find((b) => b.id === blockId);
+    if (block && block.children.length > 0) {
+      live.current.confirmRemove(blockId);
+      return false;
+    }
+    void live.current.actions.removePageBlock(blockId);
+    return true;
+  }, []);
+
   const handlers: RowHandlers = useMemo(
     () => ({
       commitText: (blockId, text) => {
@@ -172,48 +196,103 @@ export function useRowHandlers({
       setFocus({ id: blockId, caret: "start" });
       },
       // Backspace at offset 0: this block's text joins the one above and this
-      // one goes away. Same hazard, mirrored — here the *update* is the additive
-      // op, so a failed update is compensated by putting this block back.
+      // one goes away. Same hazard as the split, mirrored — here the *update* is
+      // the additive op, so a failed update is compensated by putting this block
+      // back.
       //
       // RemoveBlock takes the whole subtree with it, so a block with children
       // must hand them over BEFORE it goes: they are re-parented onto the block
-      // that just absorbed its text, which is where they belong. Without this
-      // the merge quietly destroyed every nested block under the caret.
+      // that just absorbed its text, which is where they belong.
+      //
+      // Handing them over is not enough on its own, and this is where the merge
+      // was still losing work. The ops are ANCHOR-CHAINED (child 2 lands `after`
+      // child 1, and the remove must follow both), but the transport orders
+      // nothing: /v1/submit is one independent POST per op and the node drains
+      // them as they ARRIVE. A merge of a parent with two children really did
+      // lose the second one. Two things fix it, and both are needed:
+      //
+      //   1. actions.ts sends page-block ops through a wire FIFO, so they reach
+      //      the node in issue order and every anchor exists when it is needed.
+      //   2. the remove WAITS for the merge and every adoption to actually land.
+      //      Order alone does not save a child whose move was REJECTED: it would
+      //      still be sitting under `cur` when RemoveBlock ran, and go with it.
+      //
+      // Hence the two branches below. A childless merge — the common one, and the
+      // one under the caret — keeps its instant remove, because there is no
+      // subtree to lose and a failed merge can simply put the block back. A merge
+      // that inherits children issues NOTHING destructive until the text has a
+      // home and the children have a new parent.
       mergePrev: (row, text) => {
       const index = live.current.rows.findIndex((r) => r.block.id === row.block.id);
       const prev = editableAbove(index);
       if (!prev) return;
       const cur = live.current.blocks.find((b) => b.id === row.block.id) ?? row.block;
-      if (!cur.parent) return;
+      const parent = cur.parent;
+      if (!parent) return;
       const { text: joined, seam } = mergeText(liveText(prev.block), text);
       const merged = live.current.actions.updatePageBlockText({ blockId: prev.block.id, text: joined });
+      setFocus({ id: prev.block.id, caret: seam });
 
-      const adopter = live.current.blocks.find((b) => b.id === prev.block.id);
-      let after = adopter?.children[adopter.children.length - 1] ?? null;
-      for (const child of cur.children) {
-        live.current.actions.movePageBlock({ blockId: child, parent: prev.block.id, after });
-        after = child;
+      if (cur.children.length === 0) {
+        // Nothing to adopt: the row must vanish under the caret NOW. A failed
+        // merge puts the block back — the wire FIFO keeps that re-insert behind
+        // this remove, so the id is free by the time it lands. Worst case is a
+        // visible duplicate, never a silent loss.
+        void live.current.actions.removePageBlock(cur.id);
+        void merged.then((ok) => {
+          if (ok === false) {
+            void live.current.actions.insertPageBlock({
+              blockId: cur.id,
+              parent,
+              after: prev.block.id,
+              kind: cur.kind,
+              text,
+            });
+          }
+        });
+        return;
       }
 
-      live.current.actions.removePageBlock(cur.id);
-      void merged.then((ok) => {
-        if (ok !== false) return;
-        live.current.actions.insertPageBlock({
-          blockId: cur.id,
-          parent: cur.parent as string,
-          after: prev.block.id,
-          kind: cur.kind,
-          text,
-        });
+      // `cur` holds children. Adopt them onto the block that took its text, in
+      // document order, each chained on the last — then, and only then, remove
+      // `cur`. Seeded on `merged`: if the text never reached the adopter, not one
+      // destructive op is issued and `cur` simply stays put, text and children
+      // and all. There is nothing to compensate, and nothing to lose.
+      //
+      // It costs the merged row one commit on screen. A duplicate row is
+      // recoverable; a deleted subtree is not.
+      const adopter = live.current.blocks.find((b) => b.id === prev.block.id);
+      let after = adopter?.children[adopter.children.length - 1] ?? null;
+      const adopted = cur.children.reduce<Promise<boolean>>((chain, child) => {
+        const anchor = after;
+        after = child;
+        return chain.then((ok) =>
+          ok
+            ? live.current.actions.movePageBlock({
+                blockId: child,
+                parent: prev.block.id,
+                after: anchor,
+              })
+            : false,
+        );
+      }, merged);
+
+      void adopted.then((ok) => {
+        // a child did not make it across — it is still under `cur`, and
+        // RemoveBlock would take it. Keep `cur`.
+        if (ok) void live.current.actions.removePageBlock(cur.id);
       });
-      setFocus({ id: prev.block.id, caret: seam });
       },
       // a divider owns no textarea, so it can never be focused and deleted on
-      // its own. Backspace from the block below is its only keyboard exit.
+      // its own. Backspace from the block below is its only keyboard exit — and
+      // it goes through `removeBlock`, because a divider CAN hold children (a
+      // pre-existing document may carry one that Tab adopted under it before
+      // indentTarget refused to). Deleting it bare took the caret's own block
+      // with it.
       removeDividerAbove: (row) => {
       const index = live.current.rows.findIndex((r) => r.block.id === row.block.id);
       const above = live.current.rows[index - 1];
-      if (above?.block.kind === "divider") live.current.actions.removePageBlock(above.block.id);
+      if (above?.block.kind === "divider") removeBlock(above.block.id);
       },
       // Backspace on an EMPTY block. This is the same destructive act as the
       // menu's Delete — RemoveBlock takes the subtree — so it takes the same
@@ -221,13 +300,7 @@ export function useRowHandlers({
       // keystroke.
       removeEmpty: (row) => {
       const index = live.current.rows.findIndex((r) => r.block.id === row.block.id);
-      const cur = live.current.blocks.find((b) => b.id === row.block.id);
-      if (cur && cur.children.length > 0) {
-        live.current.confirmRemove(cur.id);
-        return;
-      }
-      live.current.actions.removePageBlock(row.block.id);
-      focusRow(editableAbove(index), "end");
+      if (removeBlock(row.block.id)) focusRow(editableAbove(index), "end");
       },
       indent: (row) => move(row.block.id, indentTarget(live.current.blocks, row.block.id)),
       outdent: (row) => move(row.block.id, outdentTarget(live.current.blocks, row.block.id)),
@@ -239,17 +312,10 @@ export function useRowHandlers({
       },
       setChecked: (blockId, checked) =>
       live.current.actions.setPageBlockChecked({ blockId, checked }),
-      // Deleting a block takes its ENTIRE SUBTREE with it and there is no undo,
-      // so a block with children asks first. The guard lives HERE, in the one
-      // handler every caller routes through — not in the button that happens to
-      // be wired today.
+      // the menu's Delete — the same guarded path as Backspace-on-empty and
+      // Backspace-onto-a-divider.
       remove: (blockId) => {
-      const block = live.current.blocks.find((b) => b.id === blockId);
-      if (block && block.children.length > 0) {
-        live.current.confirmRemove(blockId);
-        return;
-      }
-      live.current.actions.removePageBlock(blockId);
+      removeBlock(blockId);
       },
       insertBelow: (row) => {
       const cur = row.block;
@@ -264,6 +330,12 @@ export function useRowHandlers({
       });
       setFocus({ id: blockId, caret: "start" });
       },
+      // The plan is a PREORDER of inserts: a copied child names its freshly
+      // minted parent, and a copied sibling anchors `after` the copy before it.
+      // Neither exists on the node until its own op lands, so these must arrive
+      // in plan order — the wire FIFO (actions.ts) is what guarantees that.
+      // Submitted out of order they are rejected (ParentNotFound / AnchorNotFound)
+      // and the duplicate comes back with holes in it.
       duplicate: (row) => {
       const ops = duplicatePlan(live.current.blocks, row.block.id, () => crypto.randomUUID());
       for (const op of ops) {
@@ -284,6 +356,11 @@ export function useRowHandlers({
       // rest are inserted below it in order, each converted by the same
       // markdown grammar typing uses. One op per block, and the plan is capped
       // — a 500-line paste is a 500-submit burst the ledger cannot even hold.
+      //
+      // Each insert anchors `after` the one before it, so — like duplicate —
+      // the paste only survives because the wire FIFO (actions.ts) delivers them
+      // in issue order. Fired in parallel, a line whose anchor had not landed yet
+      // was simply rejected, and dropped out of the pasted document.
       pasteBlocks: (row, before, pasted, after) => {
       const cur = row.block;
       const plan = pastePlan(pasted);
@@ -369,7 +446,7 @@ export function useRowHandlers({
       // in the title via the fresh-page focus effect above).
       createSubpage: () => live.current.actions.createChildPage(live.current.activePage),
     }),
-    [editableAbove, focusRow, liveText, move, openComments, setCollapsed, setDrag, setFocus],
+    [editableAbove, focusRow, liveText, move, openComments, removeBlock, setCollapsed, setDrag, setFocus],
   );
 
   return { handlers, appendBlock, focusRow };

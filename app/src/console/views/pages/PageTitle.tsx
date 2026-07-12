@@ -48,8 +48,29 @@ export function PageTitle({
   // onto another.
   useEffect(() => setDraft(splitTitleEmoji(raw).title), [pageId]);
 
+  // Two bugs lived in this commit, and they share one cause: `icon` is re-derived
+  // from the STORE on every render, while `draft` is a local copy of an older
+  // store. Composing the two is only sound while the invariant "the draft carries
+  // no icon" holds — and typing breaks it.
+  //
+  //  1. THE EMOJI DOUBLED. Type "🚀 plan" into the input: it commits verbatim
+  //     (raw had no icon), and now raw's LEADING EMOJI — its icon — is 🚀, while
+  //     the still-focused draft (the focus guard blocks the store sync) also
+  //     holds it. The next boundary composed 🚀 onto "🚀 plan" → "🚀 🚀 plan",
+  //     and the one after that added another. So the draft is split too: a
+  //     leading emoji in the DRAFT is the icon, and commit is idempotent.
+  //
+  //  2. IT RENAMED PAGES YOU ONLY OPENED. splitTitleEmoji eats the whitespace
+  //     after the emoji and composeTitle always re-emits exactly one space, so
+  //     the round-trip is not the identity for a title like "🦆Launch" — and the
+  //     old boundary condition (`composeTitle(icon, draft) !== raw`) was
+  //     therefore TRUE on mount, with no keystroke anywhere near it. Opening the
+  //     page committed a rename. An untouched draft now commits nothing, ever:
+  //     that is the only honest trigger for an edit boundary.
   const commit = () => {
-    const next = composeTitle(icon, draft);
+    if (draft === title) return; // untouched — never rewrite a title nobody typed in
+    const typed = splitTitleEmoji(draft);
+    const next = composeTitle(typed.icon ?? icon, typed.title);
     if (next !== raw) onCommit(next);
   };
   // the ref keeps the boundary timer from resetting on unrelated store
@@ -57,10 +78,10 @@ export function PageTitle({
   const commitRef = useRef(() => {});
   commitRef.current = commit;
   useEffect(() => {
-    if (composeTitle(icon, draft) === raw) return;
+    if (draft === title) return;
     const timer = setTimeout(() => commitRef.current(), EDIT_BOUNDARY_MS);
     return () => clearTimeout(timer);
-  }, [draft, raw, icon, pageId]);
+  }, [draft, title, pageId]);
 
   return (
     <div
@@ -98,8 +119,9 @@ export function PageTitle({
             title="Remove icon"
             // the input holds the title WITHOUT the icon, so the emoji is
             // unreachable from the keyboard — without this it could never be
-            // taken off again.
-            onClick={() => onCommit(draft)}
+            // taken off again. The draft is split first: if the user typed an
+            // emoji into it, committing it verbatim would just re-make an icon.
+            onClick={() => onCommit(splitTitleEmoji(draft).title)}
             style={{
               all: "unset",
               cursor: "pointer",
@@ -114,7 +136,9 @@ export function PageTitle({
         ) : null}
         {picking ? (
           <EmojiPicker
-            onPick={(emoji) => onCommit(composeTitle(emoji, draft))}
+            // same split: the picked emoji is THE icon, never a second one in
+            // front of an emoji the user already typed into the title.
+            onPick={(emoji) => onCommit(composeTitle(emoji, splitTitleEmoji(draft).title))}
             onClose={() => setPicking(false)}
           />
         ) : null}
@@ -131,6 +155,11 @@ export function PageTitle({
         onBlur={() => {
           focusedRef.current = false;
           commit();
+          // an emoji the user typed at the front IS the icon now (commit just
+          // wrote it as one), and the input holds the title WITHOUT the icon. The
+          // focus guard blocks the store sync while the input is live, so leaving
+          // it is the moment to drop it — during typing it would yank the caret.
+          setDraft((current) => splitTitleEmoji(current).title);
         }}
         onKeyDown={(event) => {
           if (event.key !== "Enter" && event.key !== "ArrowDown") return;

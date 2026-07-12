@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 
 import type { PageBlock } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
@@ -68,13 +68,37 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
   const materialize = (...names: (keyof ConsoleActions)[]) => {
     for (const name of names) void actions[name];
   };
+  // Make an op NOT LAND — the action resolves false, exactly as submitTracked
+  // does for a write the node rejected or never answered. The editor's whole
+  // safety net (the compensating split, the merge that refuses to remove a block
+  // whose children did not make it across) hangs off that boolean, so this is the
+  // ONLY way to exercise it. Without it the net was never once tested.
+  const fails = (...names: (keyof ConsoleActions)[]) => {
+    materialize(...names);
+    for (const name of names) {
+      (spies[name as string] as unknown as Mock).mockReturnValue(Promise.resolve(false));
+    }
+  };
   return {
     spies,
     materialize,
+    fails,
     unmount,
     rerender: (p: Partial<ConsoleState>) => rerender(view(p)),
   };
 };
+
+/** Drain the microtask queue (the compensations and the merge's adoption chain
+ *  hang off promise `.then`s, several deep) and let React commit what they
+ *  patched. A bare `await` only runs one tick of the chain. */
+const settle = () =>
+  act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+/** The order calls were made in, across DIFFERENT spies. */
+const callOrder = (spy: (...args: unknown[]) => void): number[] =>
+  (spy as unknown as Mock).mock.invocationCallOrder;
 
 describe("PagesView", () => {
   it("enumerates pages on mount and via the refresh control", () => {
@@ -682,6 +706,33 @@ describe("a divider is reachable from the keyboard", () => {
     // the text is not merged into a divider, and this block survives.
     expect(spies.updatePageBlockText).not.toHaveBeenCalled();
   });
+
+  // THE BLOCKER. `indentTarget` had no kind check and MoveBlock validates only
+  // page-match + cycles, so Tab really could make a DIVIDER the parent of the
+  // block you were typing in. That block's row then sits directly under the rule,
+  // so Backspace at offset 0 reads as "remove the divider above" — and the old
+  // removeDividerAbove called removePageBlock bare, with no children check and no
+  // confirm. RemoveBlock runs delete_subtree: it took the divider, the block
+  // holding the caret, and everything under it. One keystroke, no dialog, no undo.
+  //
+  // The suite passed because it only ever tested a CHILDLESS divider (above).
+  it("CONFIRMS instead of deleting a divider that adopted the caret's own block", () => {
+    const adopted: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["d"] }),
+      blockOf({ id: "d", kind: "divider", children: ["x"] }),
+      blockOf({ id: "x", parent: "d", text: "the text I am typing" }),
+    ];
+    const { spies, materialize } = renderPagesView({ activePageBlocks: adopted });
+    materialize("removePageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // it must NOT go straight to the wire — that op destroys "x" too.
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    within(screen.getByRole("dialog", { name: /delete this block/i })).getByText(/1 nested block/);
+  });
 });
 
 describe("the document has one left edge", () => {
@@ -960,6 +1011,80 @@ describe("the page icon", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove page icon" }));
     expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "p1", text: "Launch plan" });
   });
+
+  const pageTitled = (text: string) => ({
+    activePageBlocks: [blockOf({ id: "p1", parent: null, kind: "page", text, children: [] })],
+  });
+
+  // The icon is derived from the STORE every render; the draft is a local copy of
+  // an older store. Type an emoji and it commits verbatim — and now it is BOTH
+  // the store's leading emoji (the icon) and still in the focused draft, which the
+  // draft-protection guard refuses to resync. commit() then composed one onto the
+  // other, and did it again at every boundary: "🚀 plan" -> "🚀 🚀 plan" -> …
+  it("does not double an emoji typed into the title", () => {
+    vi.useFakeTimers();
+    try {
+      const { spies, rerender } = renderPagesView(pageTitled("Launch plan"));
+      const title = screen.getByLabelText("Page title");
+      fireEvent.focus(title);
+      fireEvent.change(title, { target: { value: "🚀 Launch plan" } });
+      act(() => {
+        vi.advanceTimersByTime(EDIT_BOUNDARY_MS);
+      });
+      expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+        blockId: "p1",
+        text: "🚀 Launch plan",
+      });
+
+      // the commit lands: the store now reads the emoji as the page's ICON, while
+      // the still-focused input keeps it in the draft. This is the exact state the
+      // old commit doubled from.
+      rerender(pageTitled("🚀 Launch plan"));
+      act(() => {
+        vi.advanceTimersByTime(EDIT_BOUNDARY_MS * 3);
+      });
+      expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+      expect(spies.updatePageBlockText).not.toHaveBeenCalledWith(
+        expect.objectContaining({ text: "🚀 🚀 Launch plan" }),
+      );
+
+      // and leaving the field moves it out of the input for good — the icon
+      // button shows it, the input holds the title.
+      fireEvent.blur(title);
+      expect(title).toHaveValue("Launch plan");
+      expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // splitTitleEmoji eats the whitespace after the emoji and composeTitle re-emits
+  // exactly one space, so the round-trip is NOT the identity for "🦆Launch plan".
+  // The boundary condition was `composeTitle(icon, draft) !== raw`, which is
+  // therefore true on MOUNT — merely opening the page renamed it, with no
+  // keystroke anywhere near the input.
+  it("never rewrites a title on open, however it is spaced", () => {
+    vi.useFakeTimers();
+    try {
+      const { spies, materialize } = renderPagesView(pageTitled("🦆Launch plan"));
+      materialize("updatePageBlockText");
+      act(() => {
+        vi.advanceTimersByTime(EDIT_BOUNDARY_MS * 3);
+      });
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+
+      // a focus and a blur are not an edit either.
+      const title = screen.getByLabelText("Page title");
+      fireEvent.focus(title);
+      fireEvent.blur(title);
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+      // it still READS as an icon + title, it is only not rewritten.
+      expect(screen.getByRole("button", { name: "Change page icon" }).textContent).toBe("🦆");
+      expect(title).toHaveValue("Launch plan");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // RemoveBlock takes the whole subtree with it. Every path that reaches it —
@@ -986,7 +1111,7 @@ describe("no delete path quietly eats a subtree", () => {
     expect(spies.removePageBlock).toHaveBeenCalledWith("b");
   });
 
-  it("hands the children over before merging a block away", () => {
+  it("hands the children over before merging a block away", async () => {
     const withText: PageBlock[] = [
       ...PARENTED.slice(0, 2),
       blockOf({ id: "b", text: "second", children: ["b1"] }),
@@ -997,6 +1122,7 @@ describe("no delete path quietly eats a subtree", () => {
     fireEvent.focus(area);
     area.setSelectionRange(0, 0);
     fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
 
     // the text merges up…
     expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "Firstsecond" });
@@ -1007,6 +1133,149 @@ describe("no delete path quietly eats a subtree", () => {
       after: null,
     });
     expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  // Reported by a live-QA pass: merging a parent with TWO children lost the
+  // second one. Both children ride an anchor chain (child 2 lands `after` child
+  // 1) and the remove has to follow both — and the wire orders NOTHING, so the
+  // three ops raced. RemoveBlock reaching the node before child 2's move took
+  // child 2 down with the subtree.
+  const TWO_CHILDREN: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a", "b"] }),
+    blockOf({ id: "a", text: "First" }),
+    blockOf({ id: "b", text: "second", children: ["b1", "b2"] }),
+    blockOf({ id: "b1", parent: "b", text: "child one" }),
+    blockOf({ id: "b2", parent: "b", text: "child two" }),
+  ];
+
+  it("adopts BOTH children of a merged parent, in order, and removes it only after", async () => {
+    const { spies, materialize } = renderPagesView({ activePageBlocks: TWO_CHILDREN });
+    materialize("movePageBlock", "removePageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // NOTHING destructive goes out in this tick. The ops used to be fired off
+    // together and left to race — which is the bug: each one's anchor is the op
+    // before it, and the wire orders nothing. Every one of these waits for the op
+    // it depends on to actually LAND.
+    expect(spies.movePageBlock).not.toHaveBeenCalled();
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    await settle();
+
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "Firstsecond" });
+    // CHILD2 is the one that went missing. Its anchor is CHILD1, so it can only
+    // be issued once CHILD1 has actually landed.
+    expect(spies.movePageBlock).toHaveBeenNthCalledWith(1, {
+      blockId: "b1",
+      parent: "a",
+      after: null,
+    });
+    expect(spies.movePageBlock).toHaveBeenNthCalledWith(2, {
+      blockId: "b2",
+      parent: "a",
+      after: "b1",
+    });
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+    // and the remove is issued LAST — it deletes a subtree, so it can never
+    // precede the moves that empty it.
+    expect(Math.max(...callOrder(spies.movePageBlock))).toBeLessThan(
+      callOrder(spies.removePageBlock)[0],
+    );
+  });
+
+  it("keeps the merged block when a child's adoption never lands", async () => {
+    const { spies, fails, materialize } = renderPagesView({ activePageBlocks: TWO_CHILDREN });
+    materialize("removePageBlock");
+    fails("movePageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    // the chain stops at the first move that did not land: child 2's anchor was
+    // never created, so issuing its move would only add a second rejection.
+    expect(spies.movePageBlock).toHaveBeenCalledTimes(1);
+    // and the block is NOT removed — its children are still under it, and
+    // RemoveBlock takes the whole subtree. A duplicate row is recoverable.
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+  });
+
+});
+
+// The headline of this whole change: an op that does not land must never cost
+// the user text. Every additive op is compensated, and the compensation had
+// never once been exercised — `submitTracked` resolving false is the seam, and
+// the suite could not reach it until `fails()` existed.
+describe("a write that never lands does not eat your text", () => {
+  const caretAt = (area: HTMLTextAreaElement, at: number) => {
+    fireEvent.focus(area);
+    area.setSelectionRange(at, at);
+  };
+
+  it("restores the whole line when the split's insert never lands", async () => {
+    const { spies, fails } = renderPagesView();
+    fails("insertPageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    caretAt(area, 5); // "First| draft"
+    fireEvent.keyDown(area, { key: "Enter" });
+
+    // the truncation commits immediately — the right half now lives ONLY in the
+    // insert that is about to fail.
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "First" });
+    await settle();
+    // …so when it fails, the whole line goes back. A failed op is never rolled
+    // back — it is erased by the next authoritative refresh — so without this the
+    // right half is gone for good.
+    expect(spies.updatePageBlockText).toHaveBeenLastCalledWith({
+      blockId: "a",
+      text: "First draft",
+    });
+  });
+
+  it("does not compensate a split that DID land", async () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    caretAt(area, 5);
+    fireEvent.keyDown(area, { key: "Enter" });
+    await settle();
+
+    // one truncation, and no "restore" behind it — a compensation that always
+    // fires would resurrect the right half as a duplicate on every Enter.
+    expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "First" });
+  });
+
+  it("puts a merged-away block back when the merge never lands", async () => {
+    const { spies, fails } = renderPagesView();
+    fails("updatePageBlockText");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // the block is removed on the spot: the row has to vanish under the caret.
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+    await settle();
+    // its text went nowhere, so the block comes back — kind, text and all. (The
+    // wire is a FIFO, so this re-insert reaches the node behind the remove and
+    // the id is free.)
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "b", parent: "p1", after: "a", kind: "todo", text: "Ship it" }),
+    );
+  });
+
+  it("does not resurrect a merged-away block when the merge DID land", async () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
   });
 });
 

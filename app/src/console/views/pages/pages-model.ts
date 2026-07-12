@@ -150,7 +150,18 @@ export interface MoveTarget {
 }
 
 /** Where Tab sends a block: last child of its PREVIOUS sibling. Null when
- *  there is no previous sibling to adopt it (already as deep as it can go). */
+ *  there is no previous sibling to adopt it (already as deep as it can go), or
+ *  when that sibling is a DIVIDER.
+ *
+ *  A divider is a horizontal rule, not a container: it renders no textarea, has
+ *  no disclosure, and holds no text a child could belong to. The wire would take
+ *  it — MoveBlock validates only page-match and cycles — and that was a hole with
+ *  teeth. Tab under a divider re-parented the block you were typing in UNDER the
+ *  rule; the caret's row then sat directly below it, so Backspace at offset 0 read
+ *  as "remove the divider above" and RemoveBlock took the divider's whole subtree:
+ *  the rule, your block, and everything nested under it. Refusing the indent shuts
+ *  the door; removeDividerAbove's children guard (use-row-handlers) is the second
+ *  lock, for the dividers that already adopted children before this landed. */
 export function indentTarget(
   blocks: PageBlock[],
   blockId: string,
@@ -162,7 +173,7 @@ export function indentTarget(
   const pos = parent.children.indexOf(blockId);
   if (pos <= 0) return null;
   const prevSibling = map.get(parent.children[pos - 1]);
-  if (!prevSibling) return null;
+  if (!prevSibling || prevSibling.kind === "divider") return null;
   const last = prevSibling.children[prevSibling.children.length - 1] ?? null;
   return { parent: prevSibling.id, after: last };
 }

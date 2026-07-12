@@ -65,6 +65,21 @@ describe("move targets", () => {
     expect(indentTarget(TREE, "a")).toBeNull();
   });
 
+  // A divider is a rule, not a container — it renders no textarea and holds no
+  // text a child could belong to. The wire would take the move anyway (MoveBlock
+  // checks only page-match and cycles), and that had teeth: Tab under a divider
+  // re-parented the block you were typing in UNDER the rule, and Backspace at
+  // offset 0 then read as "remove the divider above" and took the whole subtree —
+  // the rule, your block, and everything below it.
+  it("never makes a DIVIDER the parent — Tab under a rule is a no-op", () => {
+    const ruled: PageBlock[] = [
+      block({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["r", "x"] }),
+      block({ id: "r", kind: "divider" }),
+      block({ id: "x", text: "typing here" }),
+    ];
+    expect(indentTarget(ruled, "x")).toBeNull();
+  });
+
   it("outdents to the grandparent, landing right after the old parent", () => {
     expect(outdentTarget(TREE, "c")).toEqual({ parent: "p1", after: "b" });
     // top-level blocks (parent == root) cannot outdent further.
