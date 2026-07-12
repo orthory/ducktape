@@ -39,6 +39,7 @@ export function NodeFailed() {
 
   const name = state.workspace?.name ?? "this workspace";
   const hasLog = boot.logTail.trim().length > 0;
+  const incompatible = boot.kind === "incompatible_workspace";
 
   return (
     <div
@@ -64,7 +65,9 @@ export function NodeFailed() {
         }}
       >
         <div style={{ font: `600 13px ${font.sans}`, color: color.danger, marginBottom: 6 }}>
-          The node for “{name}” failed to start
+          {incompatible
+            ? `Workspace update required for “${name}”`
+            : `The node for “${name}” failed to start`}
         </div>
         <div
           style={{
@@ -76,16 +79,29 @@ export function NodeFailed() {
             marginBottom: 14,
           }}
         >
-          {boot.reason}
+          {incompatible
+            ? "This workspace was created with an incompatible state schema. Its data has not been changed. Archive the workspace directory before creating a fresh workspace; keep the existing workspace, node identity, and Ducktape account key so they can be recovered or exported later."
+            : boot.reason}
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={() => actions.retryConnect()} style={primaryBtn}>
-            Retry
-          </button>
-          <button onClick={() => actions.newWorkspace()} style={ghostBtn}>
-            Choose another workspace
-          </button>
+          {incompatible ? (
+            // Both of the ordinary buttons land on onboarding, where creating
+            // and picking a workspace live side by side. Offering them as two
+            // buttons here would promise two destinations and deliver one.
+            <button onClick={() => actions.newWorkspace()} style={primaryBtn}>
+              Create fresh workspace
+            </button>
+          ) : (
+            <>
+              <button onClick={() => actions.retryConnect()} style={primaryBtn}>
+                Retry
+              </button>
+              <button onClick={() => actions.newWorkspace()} style={ghostBtn}>
+                Choose another workspace
+              </button>
+            </>
+          )}
           {hasLog && (
             <button onClick={() => setShowLog((v) => !v)} style={ghostBtn}>
               {showLog ? "Hide" : "Open"} daemon.log

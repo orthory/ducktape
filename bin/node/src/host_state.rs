@@ -38,7 +38,22 @@ use valset::Valset;
 use vaults::Vaults;
 use wasm_host::WasmModule;
 
+use crate::constants::current_state_schema_fingerprint;
 use crate::util::hex;
+
+pub(super) fn preflight_recovery_schema(manifest: &Manifest) -> Result<(), String> {
+    manifest
+        .preflight_state_schema(current_state_schema_fingerprint())
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn preflight_sync_schema(manifest: &statesync::Manifest) -> Result<(), String> {
+    recovery::check_state_schema(
+        Some(manifest.state_schema),
+        current_state_schema_fingerprint(),
+    )
+    .map_err(|error| error.to_string())
+}
 
 /// Consensus-visible network names shared by genesis, restore, and state sync.
 #[derive(Clone, Copy)]
@@ -326,6 +341,10 @@ pub(super) async fn restore_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
+    // Must precede every module/storage constructor below. A clean-break
+    // mismatch is classification, not a failed install attempt, and the
+    // archived workspace must remain byte-for-byte untouched.
+    preflight_recovery_schema(manifest)?;
     let kv = Kv::init(context.child("kv"), "kv").await;
     let pages = Pages::init(context.child("pages"), "pages")
         .await
@@ -594,6 +613,9 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     substrates: SyncSubstrates<'_>,
     attempt: usize,
 ) -> Result<Host, String> {
+    // Refuse before creating scratch/canonical stores. A peer can only offer
+    // state for the exact binary schema this joiner understands.
+    preflight_sync_schema(manifest)?;
     let SyncSubstrates {
         forge_repo,
         duckfs_dir,
@@ -942,7 +964,7 @@ mod tests {
     use commonware_runtime::Runner as _;
 
     use super::*;
-    use crate::constants::MODULE_IDS;
+    use crate::constants::{MODULE_IDS, MODULE_STATE_SCHEMAS};
 
     /// the registry ↔ `MODULE_IDS` parity pin. [`ProductionModules`] already
     /// forces genesis, restore, and state sync onto one module set at compile
@@ -975,6 +997,84 @@ mod tests {
             let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
             want.sort_unstable();
             assert_eq!(got, want);
+            let declared: Vec<(String, u32)> = MODULE_STATE_SCHEMAS
+                .iter()
+                .map(|(id, revision)| ((*id).to_string(), *revision))
+                .collect();
+            assert_eq!(host.state_schema(), declared);
+            assert_eq!(
+                host.state_schema_fingerprint(),
+                current_state_schema_fingerprint()
+            );
+        });
+    }
+
+    #[test]
+    fn incompatible_schema_refuses_before_opening_or_installing_workspace_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_forge = dir.path().join("source-forge");
+        let source_duckfs = dir.path().join("source-duckfs");
+        let workspace = dir.path().join("preserved-workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let sentinel = workspace.join("identity.key");
+        std::fs::write(&sentinel, b"preserve-me").expect("sentinel");
+        let target_forge = workspace.join("forge-repo");
+        let target_duckfs = workspace.join("duckfs");
+        let cfg = commonware_runtime::tokio::Config::default()
+            .with_storage_directory(dir.path().join("runtime"));
+        let executor = commonware_runtime::tokio::Runner::new(cfg);
+        executor.start(|context| async move {
+            let host = genesis_host(
+                &context,
+                &source_forge,
+                &source_duckfs,
+                &[],
+                NetworkBindings {
+                    invite: b"schema-preflight-test",
+                    identity_chain_id: "schema-preflight-test",
+                },
+                blobstore::BlobHandle::default(),
+            )
+            .await;
+            let mut manifest = Manifest::capture(
+                &host,
+                None,
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                None,
+                0,
+                1,
+            )
+            .expect("capture");
+            manifest.state_schema = Some([0xFF; 32]);
+
+            let error = match restore_host(
+                &context,
+                &target_forge,
+                &target_duckfs,
+                &manifest,
+                NetworkBindings {
+                    invite: b"schema-preflight-test",
+                    identity_chain_id: "schema-preflight-test",
+                },
+                blobstore::BlobHandle::default(),
+            )
+            .await
+            {
+                Ok(_) => panic!("mismatch must precede module install"),
+                Err(error) => error,
+            };
+            assert!(error.contains(recovery::STATE_SCHEMA_INCOMPATIBLE_MARKER));
+            assert_eq!(
+                std::fs::read(&sentinel).expect("sentinel survives"),
+                b"preserve-me"
+            );
+            assert!(!target_forge.exists(), "Forge substrate was never opened");
+            assert!(!target_duckfs.exists(), "DuckFS substrate was never opened");
         });
     }
 }

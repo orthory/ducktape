@@ -4,6 +4,7 @@
 // thread panel).
 
 import type { AgentRecord } from "../../domain/agent-client";
+import type { BootErrorKind } from "../../domain/boot-error";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type { RunLease } from "../../domain/dispatch-client";
 import type {
@@ -104,6 +105,7 @@ export interface TagFilter {
  *  failure. Distinct from `error` (transient, dismissible op failures) and from
  *  a joiner's `onboardingPhase: fatal` (shown in the waiting room). */
 export interface BootError {
+  kind: BootErrorKind;
   workspaceId: string | null;
   reason: string;
   logPath: string | null;

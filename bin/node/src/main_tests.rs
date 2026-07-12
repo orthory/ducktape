@@ -69,6 +69,7 @@ fn test_manifest(
         current_version: host::BASELINE_VERSION,
         pending_upgrade: None,
         required_min_version: host::BASELINE_VERSION,
+        state_schema: crate::constants::current_state_schema_fingerprint(),
         entries: vec![],
     }
 }
@@ -595,6 +596,7 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
             required_min_version: host::BASELINE_VERSION,
+            state_schema: crate::constants::current_state_schema_fingerprint(),
             entries: vec![],
         };
 

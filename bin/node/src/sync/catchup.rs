@@ -276,7 +276,7 @@ pub(crate) struct PostRebootCatchup {
 pub(crate) enum PostRebootCatchupError {
     Retry(String),
     RangePruned {
-        target: statesync::Manifest,
+        target: Box<statesync::Manifest>,
         requested_after: u64,
         retained_from: u64,
     },
@@ -338,7 +338,7 @@ where
                 retained_from,
             }) => {
                 return Err(PostRebootCatchupError::RangePruned {
-                    target: tip,
+                    target: Box::new(tip),
                     requested_after,
                     retained_from,
                 });

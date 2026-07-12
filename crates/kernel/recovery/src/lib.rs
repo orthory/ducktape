@@ -89,6 +89,53 @@ use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_batch, decode_frame};
 use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
+/// Stable machine-readable marker consumed by the native shell when a node
+/// refuses a clean-break-incompatible workspace.
+pub const STATE_SCHEMA_INCOMPATIBLE_MARKER: &str = "DUCKTAPE_STATE_SCHEMA_INCOMPATIBLE";
+
+/// A checkpoint was produced by a different canonical module-state schema.
+/// This is not corruption and is never repaired in place: changing snapshot
+/// bytes would rewrite module roots, the app hash, and sealed history.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{STATE_SCHEMA_INCOMPATIBLE_MARKER}: workspace state schema {found} is incompatible with this binary ({expected}); workspace data was not modified. Archive this workspace and create a fresh workspace. Ducktape identity and account keys are stored outside workspace state and must be preserved."
+)]
+pub struct IncompatibleStateSchema {
+    expected: FingerprintDisplay,
+    found: FingerprintDisplay,
+}
+
+/// Compare a persisted schema fingerprint with the binary's production
+/// schema. `None` names the exact legacy manifest format that predates this
+/// fence.
+pub fn check_state_schema(
+    found: Option<[u8; 32]>,
+    expected: [u8; 32],
+) -> Result<(), IncompatibleStateSchema> {
+    if found == Some(expected) {
+        return Ok(());
+    }
+    Err(IncompatibleStateSchema {
+        expected: FingerprintDisplay(Some(expected)),
+        found: FingerprintDisplay(found),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FingerprintDisplay(Option<[u8; 32]>);
+
+impl std::fmt::Display for FingerprintDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(bytes) = self.0 else {
+            return f.write_str("legacy/unversioned");
+        };
+        for byte in bytes {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// runtime bounds every store here needs (same alias the storage crate uses:
 /// `Storage + Clock + Metrics`).
 pub use commonware_storage::Context;
@@ -458,6 +505,10 @@ pub struct Manifest {
     /// `current_version`). the boot preflight compares the local build's
     /// `MAX_PROTOCOL_VERSION` against this and refuses EARLY when it is lower.
     pub required_min_version: u32,
+    /// Fingerprint of the exact ordered module/state-schema set that produced
+    /// this checkpoint. `None` decodes only legacy manifests written before
+    /// the clean-break fence existed; preflight rejects them actionably.
+    pub state_schema: Option<[u8; 32]>,
 }
 
 impl Manifest {
@@ -501,6 +552,9 @@ impl Manifest {
         }
         put_u32(&mut out, self.required_min_version);
         put_keys(&mut out, &self.residents);
+        if let Some(fingerprint) = self.state_schema {
+            out.extend_from_slice(&fingerprint);
+        }
         out
     }
 
@@ -551,6 +605,18 @@ impl Manifest {
         };
         let required_min_version = c.u32()?;
         let residents = get_keys(&mut c)?;
+        // The exact EOF after `residents` is the pre-schema-manifest format.
+        // Preserve that distinction so boot reports an incompatible workspace,
+        // not damaged/truncated storage. A partial new trailer is corruption.
+        let state_schema = if c.at == c.buf.len() {
+            None
+        } else {
+            Some(
+                c.take(32)?
+                    .try_into()
+                    .expect("state schema fingerprint is 32 bytes"),
+            )
+        };
         c.done()?;
         Ok(Self {
             height,
@@ -567,6 +633,7 @@ impl Manifest {
             current_version,
             pending_upgrade,
             required_min_version,
+            state_schema,
         })
     }
 
@@ -645,6 +712,7 @@ impl Manifest {
             current_version,
             pending_upgrade,
             required_min_version,
+            state_schema: Some(host.state_schema_fingerprint()),
         })
     }
 
@@ -655,6 +723,15 @@ impl Manifest {
     /// it (replica park, sync-only boot, validator boot).
     pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
         sdk::check_required_version(self.required_min_version, max_supported)
+    }
+
+    /// Clean-break state-schema preflight. Call this before opening or
+    /// installing any module substrate.
+    pub fn preflight_state_schema(
+        &self,
+        expected: [u8; 32],
+    ) -> Result<(), IncompatibleStateSchema> {
+        check_state_schema(self.state_schema, expected)
     }
 }
 
@@ -1966,6 +2043,7 @@ mod tests {
             current_version: 0,
             pending_upgrade: None,
             required_min_version: 0,
+            state_schema: Some([0xAB; 32]),
         }
     }
 
@@ -1990,6 +2068,32 @@ mod tests {
             ..sample_manifest()
         };
         assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
+    }
+
+    #[test]
+    fn legacy_manifest_decodes_for_actionable_schema_preflight() {
+        let current = sample_manifest();
+        let mut legacy = current.clone();
+        legacy.state_schema = None;
+        let decoded = Manifest::decode(&legacy.encode()).expect("legacy shape is classifiable");
+        assert_eq!(decoded.state_schema, None);
+
+        let error = decoded
+            .preflight_state_schema([0xAB; 32])
+            .expect_err("legacy schema must clean-break");
+        let message = error.to_string();
+        assert!(message.contains(STATE_SCHEMA_INCOMPATIBLE_MARKER));
+        assert!(message.contains("legacy/unversioned"));
+        assert!(message.contains("workspace data was not modified"));
+    }
+
+    #[test]
+    fn schema_revision_changes_the_preflight_identity() {
+        let revision_one = host::state_schema_fingerprint([("runs", 1)]);
+        let revision_two = host::state_schema_fingerprint([("runs", 2)]);
+        assert_ne!(revision_one, revision_two);
+        assert!(check_state_schema(Some(revision_two), revision_two).is_ok());
+        assert!(check_state_schema(Some(revision_one), revision_two).is_err());
     }
 
     #[test]

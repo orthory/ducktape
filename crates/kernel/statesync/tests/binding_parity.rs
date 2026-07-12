@@ -128,6 +128,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             current_version: 1,
             pending_upgrade: None,
             required_min_version: 1,
+            state_schema: [0xAB; 32],
             entries: vec![ManifestEntry {
                 module_id: "kv".into(),
                 root: StateRoot([3u8; 32]),
