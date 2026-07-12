@@ -4581,12 +4581,15 @@ name = "host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "capability",
  "commonware-cryptography",
  "commonware-runtime",
  "directory",
  "dispatch",
+ "duckdns",
  "futures",
  "greeter",
+ "identity",
  "inbox",
  "jobs",
  "kv",
@@ -4596,6 +4599,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "statesync",
+ "tagging",
  "tasks",
  "upgrade",
  "valset",

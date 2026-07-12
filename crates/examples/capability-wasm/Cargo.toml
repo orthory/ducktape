@@ -1,0 +1,29 @@
+# The wasm port of the `capability` module: compiles the NATIVE capability
+# crate to wasm32 and adapts it to the ducktape:module world through
+# guest-adapter — the module's logic stays single-sourced in
+# `crates/system/capability`. Standalone workspace: guest crates build to
+# `wasm32-unknown-unknown` and are componentized by the module build target,
+# never by the host workspace.
+[package]
+name = "capability-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+capability = { path = "../../system/capability" }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]
+
+# valset -> commonware-cryptography enables getrandom's "js" backend on wasm32,
+# which bakes unstrippable wasm-bindgen imports into the cdylib and breaks
+# componentization. no consensus path ever calls getrandom (modules are
+# deterministic by contract), so the guest links a vendored stub whose only
+# backend is a deterministic refusal — see getrandom-stub/Cargo.toml.
+[patch.crates-io]
+getrandom = { path = "getrandom-stub" }

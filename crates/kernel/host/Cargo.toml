@@ -41,6 +41,10 @@ vaults = { workspace = true }
 jobs = { workspace = true }
 inbox = { workspace = true }
 tasks = { workspace = true }
+tagging = { workspace = true }
+capability = { workspace = true }
+duckdns = { workspace = true }
+identity = { workspace = true }
 greeter = { workspace = true }
 # the deterministic-activation drain-injection test stands the real upgrade +
 # valset modules on the host and drives a block across an activation boundary.

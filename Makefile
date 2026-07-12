@@ -239,6 +239,27 @@ wasm-modules:
 	cp crates/examples/tasks-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tasks.component.wasm
 
+	cd crates/examples/tagging-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/tagging-wasm/target/wasm32-unknown-unknown/release/tagging_wasm.wasm \
+	  -o crates/examples/tagging-wasm/component.wasm
+	cp crates/examples/tagging-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/tagging.component.wasm
+
+	cd crates/examples/capability-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/capability-wasm/target/wasm32-unknown-unknown/release/capability_wasm.wasm \
+	  -o crates/examples/capability-wasm/component.wasm
+	cp crates/examples/capability-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/capability.component.wasm
+
+	cd crates/examples/duckdns-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/duckdns-wasm/target/wasm32-unknown-unknown/release/duckdns_wasm.wasm \
+	  -o crates/examples/duckdns-wasm/component.wasm
+	cp crates/examples/duckdns-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -258,6 +279,12 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/inbox.component.wasm
 	cmp crates/examples/tasks-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tasks.component.wasm
+	cmp crates/examples/tagging-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/tagging.component.wasm
+	cmp crates/examples/capability-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/capability.component.wasm
+	cmp crates/examples/duckdns-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

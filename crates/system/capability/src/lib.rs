@@ -18,6 +18,20 @@
 //! announce is what lets dispatch route work to it. without a valset (the
 //! single-node daemon) any external key may self-announce.
 //!
+//! ## capability classes
+//!
+//! the registry additionally routes capability CLASSES — namespace tokens
+//! (`agent`, `ai`, ...) a MODULE claims via [`CapabilityMsg::ClaimClass`].
+//! the wire form of a classed capability is `<class>:<rest>` and dispatch
+//! addresses classed work as `<node_id>/<class>:<rest>` (see
+//! [`parse_classed_address`]); the class map (class -> claimant module) is
+//! the primary router for that space. the claimant is the verified MODULE
+//! origin — a class is claimed by the module that serves it, so External and
+//! System origins reject. first claim wins deterministically; a re-claim by
+//! the owner is an idempotent no-op. there is deliberately NO unclaim op:
+//! dropping a claim would dangle every `<class>:` route already minted
+//! against it, so removal waits for an explicit, migration-shaped handoff op.
+//!
 //! state model mirrors valset's host-lent staging seam: `execute` STAGES into
 //! a `pending` overlay (committed state untouched); `query` reads
 //! pending-over-committed (read-your-writes); `commit_block` merges pending
@@ -43,8 +57,8 @@ use sdk::codec;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
-    ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
-    encode_query as valset_encode_query,
+    decode_reply as valset_decode_reply, encode_query as valset_encode_query, ValsetQuery,
+    ValsetReply,
 };
 
 /// most tags a single node may announce. a bound, not a schema: it exists so
@@ -64,6 +78,14 @@ pub struct CapabilityRegistry {
     /// replace, an EMPTY set stages a removal. read ahead of `announced`
     /// (read-your-writes), merged into committed state only on `commit_block`.
     pending: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    /// committed class claims: class -> the module that serves it. first
+    /// claim wins and claims are never removed (no unclaim op — see the
+    /// module doc), so this map only grows.
+    class_claims: BTreeMap<String, ModuleId>,
+    /// per-block staged class claims — an insert-only overlay read ahead of
+    /// `class_claims` (read-your-writes: a rival claim in the same block sees
+    /// the earlier stage), merged on `commit_block`, dropped on `abort_block`.
+    pending_class_claims: BTreeMap<String, ModuleId>,
 }
 
 impl CapabilityRegistry {
@@ -73,6 +95,8 @@ impl CapabilityRegistry {
             valset_id,
             announced: BTreeMap::new(),
             pending: BTreeMap::new(),
+            class_claims: BTreeMap::new(),
+            pending_class_claims: BTreeMap::new(),
         }
     }
 
@@ -144,23 +168,52 @@ impl CapabilityRegistry {
         map
     }
 
+    /// the committed class map with this block's staged claims applied —
+    /// read-your-writes; claims are insert-only, so the overlay never removes.
+    fn effective_classes(&self) -> BTreeMap<String, ModuleId> {
+        let mut map = self.class_claims.clone();
+        for (class, module) in &self.pending_class_claims {
+            map.insert(class.clone(), module.clone());
+        }
+        map
+    }
+
+    /// the module owning `class` in the pending-over-committed view — the
+    /// first-claim-wins check reads THIS, so a claim staged earlier in the
+    /// block already blocks a rival in the same block.
+    fn effective_class_owner(&self, class: &str) -> Option<&ModuleId> {
+        self.pending_class_claims
+            .get(class)
+            .or_else(|| self.class_claims.get(class))
+    }
+
     // ---- state-sync ---------------------------------------------------------
     // ship the committed registry as its root preimage; adopt a peer's bytes
     // only after re-deriving the root consensus expects — the root, not the
     // peer, is the trust anchor.
 
     /// canonical bytes of the COMMITTED registry — exactly the byte stream
-    /// `root()` hashes: node count u64-le, then per sorted node key its len
-    /// u64-le + key bytes + tag count u64-le, then per sorted tag its len
-    /// u64-le + utf-8 bytes. for a non-empty registry
-    /// `sha256(snapshot()) == root()`; an empty registry snapshots to a lone
-    /// zero count (whose root is still `ZERO`, unhashed). pending is
-    /// deliberately excluded — a snapshot ships what consensus committed to.
+    /// `root()` hashes, two count-prefixed sections back to back:
+    ///
+    /// 1. announcements — node count u64-le, then per sorted node key its len
+    ///    u64-le + key bytes + tag count u64-le, then per sorted tag its len
+    ///    u64-le + utf-8 bytes;
+    /// 2. class claims — class count u64-le, then per sorted class its
+    ///    len-prefixed utf-8 name + the claimant module id's len-prefixed
+    ///    utf-8 bytes. an empty class map encodes as a lone zero count.
+    ///
+    /// for a non-empty registry `sha256(snapshot()) == root()`; an empty
+    /// registry snapshots to two zero counts (whose root is still `ZERO`,
+    /// unhashed). pending is deliberately excluded — a snapshot ships what
+    /// consensus committed to.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::snapshot_of(&self.announced)
+        Self::snapshot_of(&self.announced, &self.class_claims)
     }
 
-    fn snapshot_of(map: &BTreeMap<Vec<u8>, BTreeSet<String>>) -> Vec<u8> {
+    fn snapshot_of(
+        map: &BTreeMap<Vec<u8>, BTreeSet<String>>,
+        classes: &BTreeMap<String, ModuleId>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(map.len() as u64).to_le_bytes());
         for (key, tags) in map {
@@ -169,6 +222,11 @@ impl CapabilityRegistry {
             for tag in tags {
                 codec::push_str(&mut out, tag);
             }
+        }
+        out.extend_from_slice(&(classes.len() as u64).to_le_bytes());
+        for (class, module) in classes {
+            codec::push_str(&mut out, class);
+            codec::push_str(&mut out, module);
         }
         out
     }
@@ -180,26 +238,37 @@ impl CapabilityRegistry {
     /// before the call. success clears pending — staged changes belong to the
     /// state being replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let decoded = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&decoded);
+        let (announced, class_claims) = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&announced, &class_claims);
         if root != expected {
             return Err(Error::Module(format!(
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
             )));
         }
-        self.announced = decoded;
+        self.announced = announced;
+        self.class_claims = class_claims;
         self.pending.clear();
+        self.pending_class_claims.clear();
         Ok(())
     }
 
     /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves
     /// them). every count and length is checked against the remaining buffer
     /// BEFORE any allocation, truncation and trailing bytes both reject, node
-    /// keys and tags must arrive strictly increasing, and a node with zero
-    /// tags rejects (empty means absent, so it has no encoding) — a given
-    /// registry has exactly one valid byte stream, so a peer cannot mint
-    /// alternative encodings for one state.
-    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, BTreeSet<String>>, Error> {
+    /// keys, tags, and class names must arrive strictly increasing, and a
+    /// node with zero tags rejects (empty means absent, so it has no
+    /// encoding) — a given registry has exactly one valid byte stream, so a
+    /// peer cannot mint alternative encodings for one state.
+    #[allow(clippy::type_complexity)]
+    fn decode_snapshot(
+        bytes: &[u8],
+    ) -> Result<
+        (
+            BTreeMap<Vec<u8>, BTreeSet<String>>,
+            BTreeMap<String, ModuleId>,
+        ),
+        Error,
+    > {
         let mut cur = codec::Cursor::new(bytes);
         let count = cur.u64("snapshot node count")?;
         // each node entry costs at least its 8-byte key-length prefix plus an
@@ -241,18 +310,41 @@ impl CapabilityRegistry {
             }
             map.insert(key.to_vec(), tags);
         }
+
+        let class_count = cur.u64("snapshot class count")?;
+        // each class entry costs at least its two 8-byte length prefixes.
+        cur.bound(class_count, 16, "snapshot class")?;
+        let mut classes = BTreeMap::new();
+        let mut prev_class: Option<&[u8]> = None;
+        for _ in 0..class_count {
+            let class = cur.bytes("snapshot class name")?;
+            if prev_class.is_some_and(|p| p >= class) {
+                return Err(Error::Module(
+                    "snapshot classes must be strictly increasing".into(),
+                ));
+            }
+            prev_class = Some(class);
+            let class = std::str::from_utf8(class)
+                .map_err(|e| Error::Module(format!("snapshot class name is not utf-8: {e}")))?;
+            let module = cur.string("snapshot class claimant")?;
+            classes.insert(class.to_string(), module);
+        }
         cur.finish("snapshot")?;
-        Ok(map)
+        Ok((map, classes))
     }
 
-    /// the state-based commitment for `map`: `ZERO` when empty, else sha256
-    /// over exactly the bytes `snapshot` emits. shared by `root()` (committed
-    /// state) and `install` (a decoded candidate), so the two can never drift.
-    fn root_of(map: &BTreeMap<Vec<u8>, BTreeSet<String>>) -> StateRoot {
-        if map.is_empty() {
+    /// the state-based commitment for the registry: `ZERO` when BOTH sections
+    /// are empty, else sha256 over exactly the bytes `snapshot` emits. shared
+    /// by `root()` (committed state) and `install` (a decoded candidate), so
+    /// the two can never drift.
+    fn root_of(
+        map: &BTreeMap<Vec<u8>, BTreeSet<String>>,
+        classes: &BTreeMap<String, ModuleId>,
+    ) -> StateRoot {
+        if map.is_empty() && classes.is_empty() {
             return StateRoot::ZERO;
         }
-        StateRoot(Sha256::digest(Self::snapshot_of(map)).into())
+        StateRoot(Sha256::digest(Self::snapshot_of(map, classes)).into())
     }
 }
 
@@ -263,10 +355,11 @@ impl Module for CapabilityRegistry {
     }
 
     /// state-based commitment over the COMMITTED registry: a length-prefixed
-    /// sha256 over the sorted node -> tags map. order-independent (BTreeMap /
-    /// BTreeSet) and idempotent. an empty registry reports `ZERO`.
+    /// sha256 over the sorted node -> tags map plus the sorted class -> module
+    /// map. order-independent (BTreeMap / BTreeSet) and idempotent. an empty
+    /// registry reports `ZERO`.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.announced)
+        Self::root_of(&self.announced, &self.class_claims)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -274,75 +367,120 @@ impl Module for CapabilityRegistry {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // identity comes from the verified submit origin, never the payload —
-        // a node can only announce for itself, which keeps the registry
-        // truthful by construction. module/system origins have no host of
-        // their own to speak for, and an empty key is a malformed origin
-        // (the same reject dispatch applies), never a registry entry.
-        let node = match &ctx.env().origin {
-            sdk::Origin::External(key) if key.is_empty() => {
-                return Err(Error::Module("external origin key is empty".into()));
-            }
-            sdk::Origin::External(key) => key.clone(),
-            other => {
-                return Err(Error::Module(format!(
-                    "capability announcements require an external submitter, got {other:?}"
-                )));
-            }
-        };
-        if let Some(valset_id) = self.valset_id.clone() {
-            // member-gated like identity's BindNode: validators UNION
-            // residents populate the registry, so lookups resolve to known
-            // peers — including a joined node that has not been promoted yet.
-            if !self.members(ctx, &valset_id).await?.contains(&node) {
-                return Err(Error::Module(
-                    "capability announcer holds no current standing (validator or resident)".into(),
-                ));
-            }
-        }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             CapabilityMsg::Announce { capabilities } => {
+                // identity comes from the verified submit origin, never the
+                // payload — a node can only announce for itself, which keeps
+                // the registry truthful by construction. module/system
+                // origins have no host of their own to speak for, and an
+                // empty key is a malformed origin (the same reject dispatch
+                // applies), never a registry entry.
+                let node = match &ctx.env().origin {
+                    sdk::Origin::External(key) if key.is_empty() => {
+                        return Err(Error::Module("external origin key is empty".into()));
+                    }
+                    sdk::Origin::External(key) => key.clone(),
+                    other => {
+                        return Err(Error::Module(format!(
+                            "capability announcements require an external submitter, got {other:?}"
+                        )));
+                    }
+                };
+                if let Some(valset_id) = self.valset_id.clone() {
+                    // member-gated like identity's BindNode: validators UNION
+                    // residents populate the registry, so lookups resolve to
+                    // known peers — including a joined node that has not been
+                    // promoted yet.
+                    if !self.members(ctx, &valset_id).await?.contains(&node) {
+                        return Err(Error::Module(
+                            "capability announcer holds no current standing (validator or resident)"
+                                .into(),
+                        ));
+                    }
+                }
                 let tags = Self::validate_tags(capabilities)?;
                 // declarative replace: the last announcement staged in a block
                 // wins, and an empty set stages a removal.
                 self.pending.insert(node, tags);
+            }
+            CapabilityMsg::ClaimClass { class } => {
+                // a class is claimed by the module that serves it: the
+                // claimant is the verified MODULE origin, never payload data.
+                // external submitters and the system have no module to route
+                // classed work to, so both reject.
+                let module = match &ctx.env().origin {
+                    sdk::Origin::Module(id) => id.clone(),
+                    other => {
+                        return Err(Error::Module(format!(
+                            "a class is claimed by the module that serves it \
+                             (module origin required), got {other:?}"
+                        )));
+                    }
+                };
+                validate_class(&class).map_err(Error::Module)?;
+                // first claim wins, read against the pending-over-committed
+                // view so a claim staged earlier in this block already binds.
+                match self.effective_class_owner(&class) {
+                    Some(owner) if *owner != module => {
+                        return Err(Error::Module(format!(
+                            "class {class:?} is already claimed by module {owner:?} \
+                             (first claim wins)"
+                        )));
+                    }
+                    // a re-claim by the owning module is an idempotent no-op:
+                    // nothing is staged, so the root cannot move.
+                    Some(_) => {}
+                    None => {
+                        self.pending_class_claims.insert(class, module);
+                    }
+                }
             }
         }
         Ok(())
     }
 
     /// read projection — the committed registry plus this block's staged
-    /// replacements.
+    /// replacements and claims.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let view = self.effective();
         Ok(match decode_query(req).map_err(Error::Module)? {
             CapabilityQuery::Providers { capability } => {
-                let providers = view
-                    .iter()
+                let providers = self
+                    .effective()
+                    .into_iter()
                     .filter(|(_, tags)| tags.contains(&capability))
-                    .map(|(key, _)| key.clone())
+                    .map(|(key, _)| key)
                     .collect();
                 encode_reply(&CapabilityReply::Providers(providers))
             }
             CapabilityQuery::Node { node } => {
-                let tags = view
+                let tags = self
+                    .effective()
                     .get(&node)
                     .map(|t| t.iter().cloned().collect())
                     .unwrap_or_default();
                 encode_reply(&CapabilityReply::Node(tags))
             }
             CapabilityQuery::All => {
-                let all = view
+                let all = self
+                    .effective()
                     .into_iter()
                     .map(|(key, tags)| (key, tags.into_iter().collect()))
                     .collect();
                 encode_reply(&CapabilityReply::All(all))
             }
+            CapabilityQuery::ResolveClass { class } => {
+                let owner = self.effective_class_owner(&class).cloned();
+                encode_reply(&CapabilityReply::ClassOwner(owner))
+            }
+            CapabilityQuery::Classes => {
+                let classes = self.effective_classes().into_iter().collect();
+                encode_reply(&CapabilityReply::Classes(classes))
+            }
         })
     }
 
-    /// merge the block's staged replacements into committed state — `root()`
-    /// now reflects them. no-op if nothing was staged.
+    /// merge the block's staged replacements and claims into committed state
+    /// — `root()` now reflects them. no-op if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
         for (key, tags) in std::mem::take(&mut self.pending) {
             if tags.is_empty() {
@@ -351,13 +489,15 @@ impl Module for CapabilityRegistry {
                 self.announced.insert(key, tags);
             }
         }
+        self.class_claims.append(&mut self.pending_class_claims);
         Ok(())
     }
 
-    /// discard the block's staged replacements — committed state (and
-    /// `root()`) is unchanged, so a failed block leaves no trace.
+    /// discard the block's staged replacements and claims — committed state
+    /// (and `root()`) is unchanged, so a failed block leaves no trace.
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();
+        self.pending_class_claims.clear();
         Ok(())
     }
 }
@@ -365,7 +505,7 @@ impl Module for CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MAX_TAG_LEN, encode_msg, encode_query};
+    use crate::{encode_msg, encode_query, MAX_CLASS_LEN, MAX_TAG_LEN};
     use valset::encode_reply as valset_encode_reply;
 
     /// a minimal Ctx: origin-configurable, and (optionally) answers BOTH the
@@ -778,7 +918,7 @@ mod tests {
 
         let mut dst = ungated();
         let before = dst.root();
-        // truncation: the final tag byte is missing.
+        // truncation: the final byte (of the trailing class count) is missing.
         assert!(dst.install(&bytes[..bytes.len() - 1], src_root).is_err());
         // trailing garbage: one byte past a well-formed stream.
         let mut trailing = bytes.clone();
@@ -805,12 +945,238 @@ mod tests {
         let bytes = src.snapshot();
         assert_eq!(
             bytes,
-            0u64.to_le_bytes().to_vec(),
-            "an empty registry is a lone zero count"
+            [0u64.to_le_bytes(), 0u64.to_le_bytes()].concat(),
+            "an empty registry is two zero counts (announcements, classes)"
         );
 
         let mut dst = ungated();
         dst.install(&bytes, StateRoot::ZERO).unwrap();
         assert_eq!(dst.root(), StateRoot::ZERO);
+    }
+
+    // ---- capability classes -------------------------------------------------
+
+    fn claim(class: &str) -> Msg {
+        Msg {
+            target: "capability".into(),
+            payload: encode_msg(&CapabilityMsg::ClaimClass {
+                class: class.into(),
+            }),
+        }
+    }
+    fn module_ctx(id: &str) -> TestCtx {
+        TestCtx::with_origin(sdk::Origin::Module(id.into()))
+    }
+    fn class_owner(c: &CapabilityRegistry, class: &str) -> Option<ModuleId> {
+        let reply =
+            futures::executor::block_on(c.query(&encode_query(&CapabilityQuery::ResolveClass {
+                class: class.into(),
+            })))
+            .unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            CapabilityReply::ClassOwner(owner) => owner,
+            other => panic!("expected ClassOwner reply, got {other:?}"),
+        }
+    }
+    fn classes(c: &CapabilityRegistry) -> Vec<(String, ModuleId)> {
+        let reply =
+            futures::executor::block_on(c.query(&encode_query(&CapabilityQuery::Classes))).unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            CapabilityReply::Classes(classes) => classes,
+            other => panic!("expected Classes reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_class_stages_then_commits_and_moves_root() {
+        let mut c = ungated();
+        assert_eq!(class_owner(&c, "agent"), None);
+
+        futures::executor::block_on(c.execute(&mut module_ctx("dispatch"), &claim("agent")))
+            .unwrap();
+        // staged, not committed: root still ZERO, but read-your-writes sees it.
+        assert_eq!(c.root(), StateRoot::ZERO, "root reflects committed only");
+        assert_eq!(class_owner(&c, "agent"), Some("dispatch".into()));
+
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_ne!(c.root(), StateRoot::ZERO, "a committed claim moves root");
+        assert_eq!(class_owner(&c, "agent"), Some("dispatch".into()));
+
+        // a second class from another module; Classes enumerates both, sorted.
+        futures::executor::block_on(c.execute(&mut module_ctx("saga"), &claim("ai"))).unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(
+            classes(&c),
+            vec![
+                ("agent".to_string(), "dispatch".to_string()),
+                ("ai".to_string(), "saga".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_claim_wins_reclaim_is_idempotent_rival_rejects() {
+        let mut c = ungated();
+        futures::executor::block_on(c.execute(&mut module_ctx("dispatch"), &claim("agent")))
+            .unwrap();
+
+        // a rival claim in the SAME block reads the stage (read-your-writes)
+        // and rejects — first claim wins at stage time, not commit time.
+        let err = futures::executor::block_on(c.execute(&mut module_ctx("saga"), &claim("agent")))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("already claimed")),
+            "got {err:?}"
+        );
+
+        futures::executor::block_on(c.commit_block()).unwrap();
+        let committed = c.root();
+
+        // a rival claim on the COMMITTED class rejects identically...
+        let err = futures::executor::block_on(c.execute(&mut module_ctx("saga"), &claim("agent")))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("already claimed")),
+            "got {err:?}"
+        );
+        // ...while a re-claim by the OWNER is an idempotent no-op.
+        futures::executor::block_on(c.execute(&mut module_ctx("dispatch"), &claim("agent")))
+            .unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(c.root(), committed, "an idempotent re-claim holds the root");
+        assert_eq!(class_owner(&c, "agent"), Some("dispatch".into()));
+    }
+
+    #[test]
+    fn claim_class_rejects_external_and_system_origins() {
+        let mut c = ungated();
+        for origin in [
+            sdk::Origin::External(vec![1u8; 32]),
+            sdk::Origin::External(Vec::new()),
+            sdk::Origin::System,
+        ] {
+            let mut ctx = TestCtx::with_origin(origin);
+            let err =
+                futures::executor::block_on(c.execute(&mut ctx, &claim("agent"))).unwrap_err();
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("module that serves it")),
+                "got {err:?}"
+            );
+        }
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(c.root(), StateRoot::ZERO, "nothing was staged");
+    }
+
+    #[test]
+    fn malformed_classes_are_rejected() {
+        let mut c = ungated();
+        let too_long = "c".repeat(MAX_CLASS_LEN + 1);
+        for bad in [
+            "",
+            too_long.as_str(),
+            "Agent",
+            "ag:ent",
+            "ag/ent",
+            "ag.ent",
+            "ag_ent",
+        ] {
+            let err =
+                futures::executor::block_on(c.execute(&mut module_ctx("dispatch"), &claim(bad)))
+                    .unwrap_err();
+            assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
+        }
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(c.root(), StateRoot::ZERO, "rejected claims staged nothing");
+    }
+
+    #[test]
+    fn abort_drops_staged_claims() {
+        let mut c = ungated();
+        futures::executor::block_on(c.execute(&mut module_ctx("dispatch"), &claim("agent")))
+            .unwrap();
+        futures::executor::block_on(c.abort_block()).unwrap();
+        assert_eq!(class_owner(&c, "agent"), None, "the stage is gone");
+        assert_eq!(c.root(), StateRoot::ZERO, "root unchanged after abort");
+
+        // the class is claimable again — the aborted claim never bound it.
+        futures::executor::block_on(c.execute(&mut module_ctx("saga"), &claim("agent"))).unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(class_owner(&c, "agent"), Some("saga".into()));
+    }
+
+    #[test]
+    fn class_snapshot_round_trip_reconstructs_root_claims_and_announcements() {
+        let mut src = ungated();
+        let node = vec![30u8; 32];
+        futures::executor::block_on(async {
+            src.execute(&mut TestCtx::external(&node), &announce(&["codex"]))
+                .await
+                .unwrap();
+            src.execute(&mut module_ctx("dispatch"), &claim("agent"))
+                .await
+                .unwrap();
+            src.execute(&mut module_ctx("saga"), &claim("ai"))
+                .await
+                .unwrap();
+            src.commit_block().await.unwrap();
+        });
+        let src_root = src.root();
+
+        // the snapshot IS the root preimage, classes included.
+        let bytes = src.snapshot();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(StateRoot(digest), src_root, "sha256(snapshot()) == root()");
+
+        // install must adopt BOTH sections and drop a stale staged claim.
+        let mut dst = ungated();
+        futures::executor::block_on(dst.execute(&mut module_ctx("other"), &claim("stale")))
+            .unwrap();
+        dst.install(&bytes, src_root).unwrap();
+        assert_eq!(dst.root(), src_root);
+        assert_eq!(node_tags(&dst, &node), vec!["codex"]);
+        assert_eq!(classes(&dst), classes(&src));
+        assert_eq!(class_owner(&dst, "stale"), None, "stale stage dropped");
+    }
+
+    #[test]
+    fn class_only_state_has_a_nonzero_root_and_round_trips() {
+        // classes alone (no announcements) must be committed to by the root —
+        // an empty node section with claims is NOT the ZERO sentinel.
+        let mut src = ungated();
+        futures::executor::block_on(src.execute(&mut module_ctx("dispatch"), &claim("agent")))
+            .unwrap();
+        futures::executor::block_on(src.commit_block()).unwrap();
+        assert_ne!(src.root(), StateRoot::ZERO);
+
+        let mut dst = ungated();
+        dst.install(&src.snapshot(), src.root()).unwrap();
+        assert_eq!(dst.root(), src.root());
+        assert_eq!(class_owner(&dst, "agent"), Some("dispatch".into()));
+    }
+
+    #[test]
+    fn unsorted_or_duplicate_class_sections_are_rejected() {
+        // hand-build a snapshot whose class section violates the strict
+        // ordering: 0 nodes, then "b" before "a" (and the duplicate case) —
+        // a peer cannot mint alternative encodings for one state.
+        let build = |names: [&str; 2]| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0u64.to_le_bytes()); // node count
+            bytes.extend_from_slice(&2u64.to_le_bytes()); // class count
+            for name in names {
+                codec::push_str(&mut bytes, name);
+                codec::push_str(&mut bytes, "dispatch");
+            }
+            bytes
+        };
+        let mut dst = ungated();
+        for bad in [build(["b", "a"]), build(["a", "a"])] {
+            let err = dst.install(&bad, StateRoot::ZERO).unwrap_err();
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("strictly increasing")),
+                "got {err:?}"
+            );
+        }
+        assert_eq!(dst.root(), StateRoot::ZERO, "failed installs left no trace");
     }
 }

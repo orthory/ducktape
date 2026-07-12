@@ -6,12 +6,10 @@
 
 use agent::AgentModule;
 use automations::Automations;
-use capability::CapabilityRegistry;
 use chat::Chat;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use dispatch::DispatchModule;
-use duckdns::DuckDns;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
@@ -28,7 +26,6 @@ use saga::{LeasePolicy, SagaModule};
 use sha2::Digest as _;
 use sdk::StateRoot;
 use statesync::{fetch_snapshot, qmdb::{QmdbStore, RemoteQmdbResolver}};
-use tagging::TaggingModule;
 use upgrade::Upgrade;
 use valset::Valset;
 use wasm_host::WasmModule;
@@ -123,6 +120,22 @@ const TASKS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/examples/tasks-wasm/component.wasm");
 const TASKS_MODULE_ID: &str = "tasks";
 
+/// tagging / capability / duckdns — adapter-ported tenants whose ops resolve
+/// SIBLING READS (valset standing, identity bindings, content-module roots)
+/// through the runtime's memoized replay. upgrade deliberately stays NATIVE:
+/// its Advance decides over frozen end-of-block committed state, a surface the
+/// wit world's staged-over-committed reads cannot represent (kernel
+/// coordinators — valset, modreg, upgrade — gate the machinery itself).
+const TAGGING_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/tagging-wasm/component.wasm");
+const TAGGING_MODULE_ID: &str = "tagging";
+const CAPABILITY_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/capability-wasm/component.wasm");
+const CAPABILITY_MODULE_ID: &str = "capability";
+const DUCKDNS_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/duckdns-wasm/component.wasm");
+const DUCKDNS_MODULE_ID: &str = "duckdns";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -152,6 +165,18 @@ fn seeded_modreg() -> Modreg {
     modreg.seed(
         TASKS_MODULE_ID,
         sha2::Sha256::digest(TASKS_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        TAGGING_MODULE_ID,
+        sha2::Sha256::digest(TAGGING_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        CAPABILITY_MODULE_ID,
+        sha2::Sha256::digest(CAPABILITY_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        DUCKDNS_MODULE_ID,
+        sha2::Sha256::digest(DUCKDNS_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -202,6 +227,26 @@ fn genesis_tasks_wasm() -> WasmModule {
         .with_state_schema_revision(2)
 }
 
+/// tagging / capability / duckdns at their GENESIS code (adapter-ported,
+/// revision 2 — see [`genesis_vaults_wasm`]).
+fn genesis_tagging_wasm() -> WasmModule {
+    WasmModule::from_bytes(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT)
+        .expect("embedded tagging component loads")
+        .with_state_schema_revision(2)
+}
+
+fn genesis_capability_wasm() -> WasmModule {
+    WasmModule::from_bytes(CAPABILITY_MODULE_ID, CAPABILITY_WASM_COMPONENT)
+        .expect("embedded capability component loads")
+        .with_state_schema_revision(2)
+}
+
+fn genesis_duckdns_wasm() -> WasmModule {
+    WasmModule::from_bytes(DUCKDNS_MODULE_ID, DUCKDNS_WASM_COMPONENT)
+        .expect("embedded duckdns component loads")
+        .with_state_schema_revision(2)
+}
+
 pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
     std::sync::Arc::new(move |ctx, line| {
         let Some(run_key) = ctx.run_key.as_deref() else {
@@ -231,13 +276,13 @@ struct ProductionModules {
     modreg: Modreg,
     hello_wasm: WasmModule,
     saga: SagaModule,
-    capability: CapabilityRegistry,
+    capability: WasmModule,
     dispatch: DispatchModule,
-    tagging: TaggingModule,
+    tagging: WasmModule,
     tasks: WasmModule,
     vaults: WasmModule,
     identity: Identity,
-    duckdns: DuckDns,
+    duckdns: WasmModule,
     gateway: Gateway,
     inbox: WasmModule,
     files: Files,
@@ -309,6 +354,9 @@ pub(super) async fn genesis_host(
     blobs.put_chunk(JOBS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(INBOX_WASM_COMPONENT.to_vec());
     blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(TAGGING_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(CAPABILITY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(DUCKDNS_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -353,13 +401,13 @@ pub(super) async fn genesis_host(
         // "claude", ...): member-gated self-announcements, so every node holds
         // an identical view of who can run what. its genesis contribution is an
         // empty registry (ZERO root) until nodes announce.
-        capability: CapabilityRegistry::new("capability", Some("valset".into())),
+        capability: genesis_capability_wasm(),
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
         dispatch: DispatchModule::new("dispatch", "saga"),
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
-        tagging: TaggingModule::new("tagging").with_direct_owner("runs"),
+        tagging: genesis_tagging_wasm(),
         tasks: genesis_tasks_wasm(),
         // the first ADAPTER-ported wasm tenant: the native vaults logic
         // compiled to wasm, whole-state persisted per dispatch (see
@@ -373,7 +421,7 @@ pub(super) async fn genesis_host(
             Some("valset".into()),
             bindings.identity_chain_id.to_string(),
         ),
-        duckdns: DuckDns::new("duckdns", "identity", Some("valset".into())),
+        duckdns: genesis_duckdns_wasm(),
         // Identity-signed, monotonic gateway routes. DuckDNS owns optional
         // human names, Files owns DuckFS bytes, and loopback ports stay local.
         gateway: Gateway::new(
@@ -501,8 +549,8 @@ pub(super) async fn restore_host(
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
-    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
-    let (bytes, root) = snapshot_of("capability")?;
+    let mut capability = genesis_capability_wasm();
+    let (bytes, root) = snapshot_of(CAPABILITY_MODULE_ID)?;
     capability
         .install(bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
@@ -513,8 +561,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
-    let mut tagging = TaggingModule::new("tagging").with_direct_owner("runs");
-    let (bytes, root) = snapshot_of("tagging")?;
+    let mut tagging = genesis_tagging_wasm();
+    let (bytes, root) = snapshot_of(TAGGING_MODULE_ID)?;
     tagging
         .install(bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;
@@ -545,8 +593,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
 
-    let mut duckdns = DuckDns::new("duckdns", "identity", Some("valset".into()));
-    let (bytes, root) = snapshot_of("duckdns")?;
+    let mut duckdns = genesis_duckdns_wasm();
+    let (bytes, root) = snapshot_of(DUCKDNS_MODULE_ID)?;
     duckdns
         .install(bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;
@@ -835,8 +883,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("capability").await?;
-    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    let (bytes, root) = snapshot_of(CAPABILITY_MODULE_ID).await?;
+    let mut capability = genesis_capability_wasm();
     capability
         .install(&bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
@@ -847,8 +895,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("tagging").await?;
-    let mut tagging = TaggingModule::new("tagging").with_direct_owner("runs");
+    let (bytes, root) = snapshot_of(TAGGING_MODULE_ID).await?;
+    let mut tagging = genesis_tagging_wasm();
     tagging
         .install(&bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;
@@ -906,8 +954,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("duckdns").await?;
-    let mut duckdns = DuckDns::new("duckdns", "identity", Some("valset".into()));
+    let (bytes, root) = snapshot_of(DUCKDNS_MODULE_ID).await?;
+    let mut duckdns = genesis_duckdns_wasm();
     duckdns
         .install(&bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;
