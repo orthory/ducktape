@@ -101,7 +101,6 @@ case "$(uname -s)" in
       install -m 755 "$target_dir/debug/$file" "$FLEET_ARTIFACT_DIR/bin/$file"
     done
     cp -a "$target_dir/debug/locales" "$FLEET_ARTIFACT_DIR/bin/"
-    artifact_env='{ "LD_LIBRARY_PATH": "." }'
     ;;
 esac
 
