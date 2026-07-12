@@ -610,6 +610,19 @@ fn readable_agent_slug(input: &str, max_bytes: usize) -> String {
 /// (spaces, `@`, `/`, 200 bytes). Those still need a valid, bounded, unique
 /// local part, so they keep the old derivation: a readable slug plus a suffix
 /// hashing the COMPLETE committed id, before any lossy normalization.
+///
+/// THE TWO BRANCHES MUST NOT COLLIDE, and a hash suffix alone does not buy that.
+/// The legacy derivation is lossy and its output lands back in the label
+/// alphabet: legacy id `"qa luna"` derives `qa-luna-<32 hex>`, which is itself a
+/// perfectly legal DNS label — so a NEW agent could register exactly that id and
+/// the verbatim branch would hand it the legacy agent's address. Both halves are
+/// public (the id is registry state, sha256 is sha256), so that is a cheap
+/// impersonation, not a birthday accident. The `.` separator makes the branches
+/// DISJOINT BY CONSTRUCTION instead of merely unlikely to meet: a dot is legal
+/// between the atoms of an RFC 5321 dot-string but can never occur in a DNS
+/// label, so no verbatim local part can ever equal a derived one.
+/// (`readable_agent_slug` trims `.`/`_`/`-` off both ends and falls back to
+/// `agent`, so the result never has a leading, trailing, or doubled dot.)
 fn attribution_email_local_part(input: &str) -> String {
     const HASH_BYTES: usize = 16;
     const HASH_HEX_BYTES: usize = HASH_BYTES * 2;
@@ -624,7 +637,7 @@ fn attribution_email_local_part(input: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("{slug}-{hash}")
+    format!("{slug}.{hash}")
 }
 
 fn head_message(run_dir: &Path, pinned_commit: &str) -> Result<Option<String>, String> {

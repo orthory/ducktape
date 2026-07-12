@@ -1859,13 +1859,63 @@ mod tests {
             let admitted = validate_agent_id(id).is_ok();
             assert_eq!(
                 admitted,
-                duckdns::validate_handle(id).is_ok(),
-                "agent and duckdns disagree on {id:?}"
+                duckdns::validate_handle_shape(id).is_ok(),
+                "agent and duckdns disagree on the SHAPE of {id:?}"
             );
         }
+        // duckdns's reserved ROOT labels are its ADMISSION policy, not part of
+        // the shape — an agent id is not a `.duck` handle, so an agent may be
+        // called `net` or `agents`.
         for label in duckdns::RESERVED_ROOT_LABELS {
             assert!(validate_agent_id(label).is_ok(), "{label}");
+            assert!(duckdns::validate_handle_shape(label).is_ok(), "{label}");
             assert!(duckdns::validate_handle(label).is_err(), "{label}");
         }
+    }
+
+    /// THE TRAP THE DUCKDNS SIDE FELL INTO, PINNED SHUT HERE. `validate_agent_id`
+    /// is an ADMISSION rule and must never reach `decode_committed`: agents
+    /// registered before the rule existed hold ids it rejects (`"qa luna"`), and
+    /// their bytes are in every committed snapshot. If decode enforced the rule,
+    /// a node on the new binary could not install agent state (no state sync) and
+    /// could not restore its own recovery checkpoint — a permanent brick with no
+    /// migration path. A legacy agent DECODES. It simply cannot be re-registered.
+    #[test]
+    fn a_snapshot_holding_a_legacy_non_label_agent_id_still_installs() {
+        // forge the bytes an old binary committed: register a same-length label
+        // id and swap it in the canonical encoding (every length prefix stays
+        // valid). `register` uppercases the display name, so the id is the only
+        // occurrence of this window.
+        const LEGACY: &str = "qa luna";
+        const STAND_IN: &str = "qa-luna";
+        assert_eq!(LEGACY.len(), STAND_IN.len());
+        assert!(
+            validate_agent_id(LEGACY).is_err(),
+            "no live Register could ever admit it"
+        );
+
+        let mut old = module();
+        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+        exec(&mut old, &mut ctx, &admin(&register(STAND_IN, &[]))).unwrap();
+        commit(&mut old);
+
+        let mut bytes = old.snapshot();
+        let at = bytes
+            .windows(STAND_IN.len())
+            .position(|w| w == STAND_IN.as_bytes())
+            .expect("the stand-in id is in the canonical bytes");
+        bytes[at..at + LEGACY.len()].copy_from_slice(LEGACY.as_bytes());
+        let root = StateRoot(Sha256::digest(&bytes).into());
+
+        let mut joiner = module();
+        joiner
+            .install(&bytes, root)
+            .expect("a legacy non-label agent id must still DECODE");
+        assert_eq!(joiner.root(), root);
+        assert_eq!(joiner.snapshot(), bytes, "and re-encode identically");
+        assert!(
+            get_agent(&joiner, LEGACY).is_some(),
+            "the legacy agent is intact and keeps working"
+        );
     }
 }

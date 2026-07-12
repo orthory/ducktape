@@ -159,6 +159,35 @@ fn resident_can_register_but_outsider_and_unbound_node_cannot() {
     );
 }
 
+/// a SetHandle for a reserved root label is refused at ADMISSION — the op never
+/// commits, so `agents.duck` can never be owned by an account. (What a snapshot
+/// already holding one does is `registry.rs`'s
+/// `a_snapshot_holding_a_newly_reserved_handle_still_installs_and_is_inert`: it
+/// decodes, and stays inert.)
+#[test]
+fn a_reserved_root_label_never_admits() {
+    let resident = node(1);
+    let mut ctx = TestCtx::new(resident.clone());
+    ctx.residents.push(resident.clone());
+    ctx.bind(resident, b"account-a");
+    let mut module = DuckDns::new("duckdns", "identity", Some("valset".into()));
+
+    for label in duckdns::RESERVED_ROOT_LABELS {
+        let err = execute(
+            &mut module,
+            &mut ctx,
+            DuckDnsMsg::SetHandle {
+                handle: Some((*label).into()),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("reserved"), "{label}: {err}");
+    }
+    block_on(module.commit_block()).unwrap();
+    assert_eq!(resolve(&module, "orthory"), DuckDnsReply::Resolved(None));
+}
+
 #[test]
 fn account_name_resolves_only_account_id_and_unregisters_cleanly() {
     let first = node(1);

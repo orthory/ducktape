@@ -624,16 +624,55 @@ fn attribution_addresses_hash_the_complete_id_after_a_readable_slug() {
     for (id, local) in ids.iter().zip(&locals) {
         assert!(agent::validate_agent_id(id).is_err(), "{id}");
         assert!(
-            local.to_ascii_lowercase().starts_with("qa-luna-"),
+            local.to_ascii_lowercase().starts_with("qa-luna."),
             "{local}"
         );
         assert!(local.len() <= MAX_AGENT_ID_BYTES, "{local}");
-        assert!(local.contains('-') && local != *id, "{local}");
+        assert!(local != *id, "{local}");
     }
     assert_ne!(locals[0], locals[1]);
     assert_ne!(locals[0], locals[2]);
     assert_ne!(locals[1], locals[2]);
     assert_eq!(locals[0], attribution_email_local_part(ids[0]));
+}
+
+/// THE ADDRESS IS AN IDENTITY — the verbatim and derived branches must not be
+/// able to name the same mailbox. A hash suffix alone did NOT give that: the
+/// derivation is lossy and used to land back in the label alphabet, so legacy
+/// `"qa luna"` derived `qa-luna-<32 hex>` — itself a legal DNS label. A new agent
+/// could register exactly that id, take the verbatim branch, and author commits
+/// as the legacy agent. Both inputs are public (registry state + sha256), so it
+/// was a cheap impersonation, not a birthday collision.
+///
+/// The `.` separator makes the two branches DISJOINT BY CONSTRUCTION: every
+/// derived local part contains a dot, and no id consensus admits ever can.
+#[test]
+fn a_derived_local_part_can_never_be_claimed_by_a_new_agent_id() {
+    let overlong = "x".repeat(200);
+    for legacy in [
+        "qa luna",
+        "qa/luna",
+        "QA-Luna",
+        "agent id",
+        "",
+        "\u{1f}",
+        overlong.as_str(),
+    ] {
+        assert!(agent::validate_agent_id(legacy).is_err(), "{legacy}");
+        let derived = attribution_email_local_part(legacy);
+        assert!(derived.contains('.'), "no dot to disjoin it: {derived}");
+        assert!(
+            agent::validate_agent_id(&derived).is_err(),
+            "a NEW agent could register {derived:?} and inherit {legacy:?}'s address"
+        );
+        assert!(derived.len() <= MAX_AGENT_ID_BYTES, "{derived}");
+        // and no leading/trailing/doubled dot — still a legal RFC 5321 dot-string.
+        assert!(!derived.starts_with('.') && !derived.ends_with('.') && !derived.contains(".."));
+    }
+    // the pre-fix collision, pinned: this is what `"qa luna"` used to derive.
+    let old_form = "qa-luna-4a052e65e069b9f7339f8795b7a7dbae";
+    assert!(agent::validate_agent_id(old_form).is_ok(), "it IS a label");
+    assert_ne!(attribution_email_local_part("qa luna"), old_form);
 }
 
 #[test]

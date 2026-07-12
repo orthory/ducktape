@@ -200,7 +200,11 @@ export function AgentDetail({
               gap: 8,
             }}
           >
-            <InfoRow label="address" value={agentAddress(agent.agent_id)} />
+            {/* a legacy agent has no label-shaped id, so no address it can be
+                reached at — see `agentAddress`. show none, never a false one. */}
+            {agentAddress(agent.agent_id) && (
+              <InfoRow label="address" value={agentAddress(agent.agent_id)} />
+            )}
             <InfoRow label="owner" value={ownerText(agent.owner)} />
             <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
