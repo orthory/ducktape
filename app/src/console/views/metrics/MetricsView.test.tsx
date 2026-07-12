@@ -30,6 +30,43 @@ const withData: NodeMetrics = {
     { module: "chat", origin: "module", count: 2 },
     { module: "tagging", origin: "module", count: 3 },
   ],
+  planes: [],
+};
+
+const withPlanes: NodeMetrics = {
+  ...withData,
+  planes: [
+    {
+      service: "voice",
+      owner: "chat",
+      ageSeconds: 90,
+      halted: false,
+      bytesTxDatagram: 640000,
+      bytesRxDatagram: 320000,
+      bytesTxStream: 0,
+      bytesRxStream: 0,
+      datagramsTx: 4000,
+      datagramsRx: 2000,
+      streamsOpened: 0,
+      streamsAccepted: 0,
+      drops: { shed: 5, rogue_datagrams: 2 },
+    },
+    {
+      service: "gateway",
+      owner: "gateway",
+      ageSeconds: 3725,
+      halted: true,
+      bytesTxDatagram: 0,
+      bytesRxDatagram: 0,
+      bytesTxStream: 150000,
+      bytesRxStream: 98000,
+      datagramsTx: 0,
+      datagramsRx: 0,
+      streamsOpened: 12,
+      streamsAccepted: 7,
+      drops: {},
+    },
+  ],
 };
 
 const renderMetrics = (
@@ -92,5 +129,26 @@ describe("MetricsView charts", () => {
     // none of the empty-state copy is showing.
     expect(screen.queryByText(/isn't reporting block metrics/)).toBeNull();
     expect(screen.queryByText(/Not connected/)).toBeNull();
+
+    // no open planes: the Data planes panel says so honestly.
+    expect(screen.getByText("Data planes")).toBeInTheDocument();
+    expect(screen.getByText(/No open data planes/)).toBeInTheDocument();
+  });
+
+  it("lists every open data plane with its creator and drop accounting", async () => {
+    renderMetrics(() => Promise.resolve(withPlanes));
+
+    await waitFor(() => expect(screen.getByText("2 open")).toBeInTheDocument());
+    // both planes, attributed to their creating module, with age.
+    expect(screen.getByText("voice")).toBeInTheDocument();
+    expect(screen.getByText("by chat · open 1m 30s")).toBeInTheDocument();
+    expect(screen.getByText("by gateway · open 1h 2m")).toBeInTheDocument();
+    // cumulative totals and drop counts per plane.
+    expect(screen.getByText("960 kB total")).toBeInTheDocument(); // voice tx+rx
+    expect(screen.getByText("248 kB total")).toBeInTheDocument(); // gateway tx+rx
+    expect(screen.getByText("7 dropped")).toBeInTheDocument();
+    // the gateway plane's pumps stopped: badged.
+    expect(screen.getByText("HALTED")).toBeInTheDocument();
+    expect(screen.queryByText(/No open data planes/)).toBeNull();
   });
 });
