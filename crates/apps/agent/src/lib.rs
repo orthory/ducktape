@@ -1739,7 +1739,10 @@ mod tests {
             ..Default::default()
         });
         assert!(rec.permits(&CapRequest::ForgeRead("r")));
-        assert!(!rec.permits(&CapRequest::ForgePush("r")), "read is not push");
+        assert!(
+            !rec.permits(&CapRequest::ForgePush("r")),
+            "read is not push"
+        );
         assert!(rec.permits(&CapRequest::DuckfsRead("src")));
         assert!(rec.permits(&CapRequest::DuckfsRead("src/lib.rs")));
         assert!(
@@ -1764,6 +1767,59 @@ mod tests {
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::SpawnSubagent));
         assert!(!empty.permits(&CapRequest::ForgeRead("r")));
+    }
+
+    /// the library grant is an ORDINARY duckfs read cap — no special namespace,
+    /// no second rule. the host assembler asks this question before it tells an
+    /// agent the shared library exists, and the MCP tool plane gates the actual
+    /// grep/read on `permits(DuckfsRead(..))`: the two must be the SAME rule, or
+    /// the run's context document promises a door the tool plane then slams.
+    #[test]
+    fn library_readable_is_the_duckfs_read_cap_the_tool_plane_enforces() {
+        let ungranted = record_with_caps(ResourceCaps::default());
+        assert!(
+            !ungranted.library_readable(),
+            "the empty default denies everything, the library included"
+        );
+
+        let granted = record_with_caps(ResourceCaps {
+            duckfs_read: vec![SKILL_LIBRARY_PREFIX.into()],
+            ..Default::default()
+        });
+        assert!(granted.library_readable());
+        // the grant the assembler reports is the grant the tool plane honors: the
+        // agent is told to grep the library and read a skill under it, and BOTH
+        // of those calls gate on the very same request.
+        assert!(granted.permits(&CapRequest::DuckfsRead(SKILL_LIBRARY_PREFIX)));
+        assert!(granted.permits(&CapRequest::DuckfsRead(&format!(
+            "{SKILL_LIBRARY_PREFIX}/release/SKILL.md"
+        ))));
+
+        // a wider prefix contains the library (prefix containment, not equality).
+        assert!(
+            record_with_caps(ResourceCaps {
+                duckfs_read: vec!["/shared".into()],
+                ..Default::default()
+            })
+            .library_readable()
+        );
+        // a sibling that merely shares the text does not.
+        assert!(
+            !record_with_caps(ResourceCaps {
+                duckfs_read: vec![format!("{SKILL_LIBRARY_PREFIX}-drafts")],
+                ..Default::default()
+            })
+            .library_readable()
+        );
+        // a grant of ONE library skill is not a grant of the library: the agent
+        // could not grep it, so it is not told it can.
+        assert!(
+            !record_with_caps(ResourceCaps {
+                duckfs_read: vec![format!("{SKILL_LIBRARY_PREFIX}/release")],
+                ..Default::default()
+            })
+            .library_readable()
+        );
     }
 
     /// the pages_write matcher is exact-or-`"*"` — page ids are opaque, so a

@@ -316,9 +316,12 @@ pub(super) async fn provision(
     // git cannot see them at all.
     let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
         // nothing to mount — but the document still ships (see the duckfs lane):
-        // the tool-plane instruction and the shared-library pointer are ambient,
-        // not curated.
-        (None, Some(assemble_context_doc(&[])?))
+        // the tool-plane instruction is ambient, and the library pointer rides
+        // the agent's own read cap. neither is curated.
+        (
+            None,
+            Some(assemble_context_doc(&[], spec.library_readable)?),
+        )
     } else {
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
@@ -327,15 +330,18 @@ pub(super) async fn provision(
         // the handle outlives the mounts: the session bind below rides the same
         // actor lane.
         let mount_handle = handle.clone();
+        // the committed library grant (consensus said it; the assembler obeys).
+        let library_readable = spec.library_readable;
         // the same step assembles the run's SOUL from the mounts it just
         // materialized — the only place holding both the curation and the bodies.
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
-                // W5: a failed provision removes ALL its own debris. the mount
-                // helper dropped its partial ro tree; the worktree — and its
-                // metadata in the shared repo — goes here.
-                cleanup_blocking(&repo_dir, &run_dir);
-            })
+            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
+                .inspect_err(|_| {
+                    // W5: a failed provision removes ALL its own debris. the mount
+                    // helper dropped its partial ro tree; the worktree — and its
+                    // metadata in the shared repo — goes here.
+                    cleanup_blocking(&repo_dir, &run_dir);
+                })
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
@@ -459,6 +465,8 @@ impl ForgeWorkspace {
             agent_display_name: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
+            // receipts never assemble a document, so the grant is moot here.
+            library_readable: false,
         }
     }
 

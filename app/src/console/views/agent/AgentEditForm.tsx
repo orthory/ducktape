@@ -11,6 +11,7 @@ import { accentVar, color, font, radius } from "../../theme/tokens";
 import {
   ACTION_HINT,
   ACTION_LABEL,
+  CapCheckbox,
   FieldLabel,
   inputStyle,
   monoInputStyle,
@@ -21,6 +22,7 @@ import {
   statusTone,
 } from "./parts";
 import { RunsOnPicker } from "./RunsOnPicker";
+import { canReadLibrary, withLibraryRead } from "./skill-library";
 import { cleanSkills } from "./skills";
 import { SkillsField } from "./SkillsField";
 
@@ -49,6 +51,10 @@ export function AgentEditForm({
   const [pagesWrite, setPagesWrite] = useState(
     (agent.caps?.pages_write ?? []).join(" "),
   );
+  // Seeded from the record: an agent registered without the grant gains it here
+  // (and one that has it can lose it) — the caps are what the tool plane
+  // enforces and what the run's context document is assembled against.
+  const [libraryRead, setLibraryRead] = useState(canReadLibrary(agent.caps));
 
   const toggle = (name: string) =>
     setAllowedActions((prev) =>
@@ -62,9 +68,13 @@ export function AgentEditForm({
       displayName: displayName.trim(),
       capability: capability.trim(),
       allowedActions,
-      // caps REPLACE wholesale on update: send the record's current caps
-      // with only pages_write swapped so the other grants survive.
-      caps: { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
+      // caps REPLACE wholesale on update: send the record's current caps with
+      // only the two fields this form owns swapped, so every other grant
+      // survives the edit.
+      caps: withLibraryRead(
+        { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
+        libraryRead,
+      ),
       skills: cleanSkills(skills),
     });
     onClose();
@@ -164,6 +174,14 @@ export function AgentEditForm({
               </label>
             );
           })}
+        </div>
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+          <CapCheckbox
+            id="agent-edit-library-read"
+            label="Can search the global skill library"
+            checked={libraryRead}
+            onChange={setLibraryRead}
+          />
         </div>
         <div>
           <FieldLabel htmlFor="agent-edit-pages-write">Page write access</FieldLabel>

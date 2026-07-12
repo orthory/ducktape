@@ -54,6 +54,20 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// told about and which costs a run nothing until it reads one.
 pub const MAX_SKILLS_PER_AGENT: usize = 64;
 
+/// the duckfs directory the GLOBAL SKILL LIBRARY lives under, one subdirectory
+/// per skill (`<name>/SKILL.md`). a CONVENTION, not a consensus-enforced
+/// namespace: the library is ordinary duckfs state, and an agent reaches it
+/// through the same `duckfs_read` cap as any other path
+/// ([`AgentRecord::library_readable`]).
+///
+/// it lives HERE, beside the caps that gate it, because three surfaces have to
+/// agree on one string: the cap the app grants, the check the run assembler
+/// makes before telling an agent the library exists, and the prefix the MCP
+/// tool plane is asked to read. NO trailing slash — a cap entry is a path
+/// prefix, and `permits` grants children by `"{prefix}/"`, so a trailing slash
+/// would grant the directory and none of its contents.
+pub const SKILL_LIBRARY_PREFIX: &str = "/shared/skills";
+
 /// hard cap on the serialized CHAT blocks a response's `reply_blocks` map to.
 /// deliberately well under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is
 /// emitted as a chat post inside the delivery block, and a post that chat
@@ -313,6 +327,20 @@ impl AgentRecord {
             CapRequest::PagesWrite(p) => has(&c.pages_write, "*") || has(&c.pages_write, p),
             CapRequest::SpawnSubagent => c.subagent_budget > 0,
         }
+    }
+
+    /// whether this agent may READ the global skill library
+    /// ([`SKILL_LIBRARY_PREFIX`]) — the one question the host-side run assembler
+    /// asks before telling the agent the library is there.
+    ///
+    /// deliberately [`Self::permits`] and nothing else: the assembled document
+    /// tells the agent to call the MCP tool plane's `ducktape_files_grep` /
+    /// `ducktape_files_read`, and those tools gate on exactly this call. a
+    /// second, hand-rolled prefix rule here could drift from the one that
+    /// enforces — and the drift would show up as a document that promises a door
+    /// the tool plane then refuses to open.
+    pub fn library_readable(&self) -> bool {
+        self.permits(&CapRequest::DuckfsRead(SKILL_LIBRARY_PREFIX))
     }
 }
 

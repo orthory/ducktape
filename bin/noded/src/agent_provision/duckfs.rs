@@ -76,22 +76,31 @@ pub(super) async fn provision(
     // that holds both the curation and the materialized bodies).
     let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
         // nothing to mount — but the document still ships. the tool-plane
-        // instruction and the shared-library pointer are facts about the world
-        // the run wakes up in, not part of the agent's curation: a skill-less
-        // agent that is never told the MCP plane exists is a blind one.
-        (None, Some(assemble_context_doc(&[])?))
+        // instruction is a fact about the world the run wakes up in, not part of
+        // the agent's curation: a skill-less agent that is never told the MCP
+        // plane exists is a blind one. the library pointer rides the agent's own
+        // read cap (`library_readable`), so a skill-less agent WITH the grant is
+        // told where to find skills, and one without it is told nothing it could
+        // not act on.
+        (
+            None,
+            Some(assemble_context_doc(&[], spec.library_readable)?),
+        )
     } else {
         let mount_handle = handle.clone();
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let checkout_rw = dir.clone();
+        // the committed library grant (consensus said it; the assembler obeys).
+        let library_readable = spec.library_readable;
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
-                // W5 again: the run never gets a workspace handle on a
-                // failed provision, so the already-materialized rw checkout
-                // goes too (the mount helper removed its own partial tree).
-                let _ = std::fs::remove_dir_all(&checkout_rw);
-            })
+            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
+                .inspect_err(|_| {
+                    // W5 again: the run never gets a workspace handle on a
+                    // failed provision, so the already-materialized rw checkout
+                    // goes too (the mount helper removed its own partial tree).
+                    let _ = std::fs::remove_dir_all(&checkout_rw);
+                })
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
@@ -144,6 +153,8 @@ impl NodedWorkspace {
             agent_display_name: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
+            // receipts never assemble a document, so the grant is moot here.
+            library_readable: false,
         }
     }
 }

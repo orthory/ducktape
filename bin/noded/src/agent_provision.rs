@@ -304,6 +304,7 @@ fn checkout_ro_mounts(
     handle: &NodeHandle,
     ro_root: &Path,
     mounts: &[RoMount],
+    library_readable: bool,
 ) -> Result<String, String> {
     let api = ActorNodeApi::new(handle.clone());
     mounts
@@ -320,7 +321,7 @@ fn checkout_ro_mounts(
             read_skill_doc(ro_root, m)
         })
         .collect::<Result<Vec<_>, _>>()
-        .and_then(|docs| assemble_context_doc(&docs))
+        .and_then(|docs| assemble_context_doc(&docs, library_readable))
         .inspect_err(|_| {
             let _ = std::fs::remove_dir_all(ro_root);
         })

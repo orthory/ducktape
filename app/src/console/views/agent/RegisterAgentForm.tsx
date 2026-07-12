@@ -15,6 +15,7 @@ import {
   ACTION_HINT,
   ACTION_LABEL,
   AgentAvatar,
+  CapCheckbox,
   FieldLabel,
   GroupCard,
   inputStyle,
@@ -28,6 +29,7 @@ import {
   StatusPill,
 } from "./parts";
 import { RunsOnPicker } from "./RunsOnPicker";
+import { withLibraryRead } from "./skill-library";
 import { cleanSkills } from "./skills";
 import { SkillsField } from "./SkillsField";
 
@@ -56,6 +58,10 @@ export function RegisterAgentForm({
   const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
   // The pages_write cap field: page ids (or "*") the agent may write.
   const [pagesWrite, setPagesWrite] = useState("");
+  // The library read grant, ON by default: without it the run's assembled
+  // context never even mentions the shared library, so a new agent would be the
+  // only one in the network that cannot look a skill up.
+  const [libraryRead, setLibraryRead] = useState(true);
   // The id is derived from the name by default; this reveals the override.
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -76,12 +82,18 @@ export function RegisterAgentForm({
     if (!ready) return;
     const pages = parsePagesWrite(pagesWrite);
     const curated = cleanSkills(skills);
+    // One caps record, built from both fields: the library grant is an ordinary
+    // duckfs_read prefix, not a flag of its own.
+    const caps: ResourceCaps = withLibraryRead(
+      pages.length ? { pages_write: pages } : {},
+      libraryRead,
+    );
     onRegister({
       displayName: displayName.trim(),
       agentId,
       capability: capability.trim(),
       allowedActions,
-      ...(pages.length ? { caps: { pages_write: pages } } : {}),
+      ...(Object.keys(caps).length ? { caps } : {}),
       ...(curated.length ? { skills: curated } : {}),
     });
     setDisplayName("");
@@ -90,6 +102,7 @@ export function RegisterAgentForm({
     setSkills([]);
     setAllowedActions(["chat.post"]);
     setPagesWrite("");
+    setLibraryRead(true);
     setShowAdvanced(false);
     onDone?.();
   };
@@ -209,6 +222,14 @@ export function RegisterAgentForm({
                   </label>
                 );
               })}
+            </div>
+            <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+              <CapCheckbox
+                id="agent-library-read"
+                label="Can search the global skill library"
+                checked={libraryRead}
+                onChange={setLibraryRead}
+              />
             </div>
             <div>
               <FieldLabel htmlFor="agent-pages-write">Page write access</FieldLabel>

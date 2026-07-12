@@ -206,6 +206,7 @@ fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
             source_snapshot: None,
         },
         ro_mounts: mounts,
+        library_readable: false,
     }
 }
 

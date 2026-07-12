@@ -5,12 +5,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  canReadLibrary,
   filterLibrary,
   inLibrary,
   LIBRARY_ROOT,
   libraryPrefix,
   librarySkill,
   parseSkillMeta,
+  withLibraryRead,
   type LibrarySkill,
 } from "./skill-library";
 
@@ -127,5 +129,51 @@ describe("filterLibrary", () => {
 
   it("does not crash on a description-less row", () => {
     expect(filterLibrary(skills, "qa").map((skill) => skill.name)).toEqual(["qa"]);
+  });
+});
+
+// The grant that makes the library REACHABLE. It is a plain duckfs_read cap —
+// the same one the MCP tool plane gates a real grep/read on, and the same one
+// the node's assembler asks before it tells an agent the library is there. These
+// mirror `AgentRecord::library_readable` (crates/apps/agent): if that rule ever
+// moves, these are the tests that should fail.
+describe("canReadLibrary", () => {
+  it("denies by default — an empty caps record grants nothing", () => {
+    expect(canReadLibrary(undefined)).toBe(false);
+    expect(canReadLibrary({})).toBe(false);
+    expect(canReadLibrary({ duckfs_read: [] })).toBe(false);
+  });
+
+  it("reads the grant off duckfs_read, by prefix containment", () => {
+    expect(canReadLibrary({ duckfs_read: [LIBRARY_ROOT] })).toBe(true);
+    // an ancestor prefix contains the library…
+    expect(canReadLibrary({ duckfs_read: ["/shared"] })).toBe(true);
+    // …a sibling that merely shares the text does not…
+    expect(canReadLibrary({ duckfs_read: [`${LIBRARY_ROOT}-drafts`] })).toBe(false);
+    // …and one skill inside it is not the library (the agent could not grep it).
+    expect(canReadLibrary({ duckfs_read: [`${LIBRARY_ROOT}/release`] })).toBe(false);
+    expect(canReadLibrary({ duckfs_read: ["/shared/agent-workspaces/bot"] })).toBe(false);
+  });
+});
+
+describe("withLibraryRead", () => {
+  it("adds and removes the grant, leaving every other cap alone", () => {
+    expect(withLibraryRead({ pages_write: ["*"] }, true)).toEqual({
+      pages_write: ["*"],
+      duckfs_read: [LIBRARY_ROOT],
+    });
+    expect(
+      withLibraryRead({ duckfs_read: ["/shared/data", LIBRARY_ROOT], tools: ["bash"] }, false),
+    ).toEqual({ duckfs_read: ["/shared/data"], tools: ["bash"] });
+  });
+
+  it("never double-grants, and leaves no empty list behind", () => {
+    expect(withLibraryRead({ duckfs_read: [LIBRARY_ROOT] }, true)).toEqual({
+      duckfs_read: [LIBRARY_ROOT],
+    });
+    // ungranted with nothing else to read: the key goes, so a caps-less agent
+    // stays caps-less on the wire.
+    expect(withLibraryRead({ duckfs_read: [LIBRARY_ROOT] }, false)).toEqual({});
+    expect(withLibraryRead(undefined, false)).toEqual({});
   });
 });

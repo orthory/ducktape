@@ -302,13 +302,63 @@ describe("AgentView", () => {
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     // Exact match: an agent with no curated skills sends no skills key at all
-    // (and never a prompt).
+    // (and never a prompt). It DOES send the library read cap: that grant is on
+    // by default, and it is what earns the run's assembled context the paragraph
+    // telling the agent the shared library exists.
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      allowedActions: ["chat.post"],
+      caps: { duckfs_read: ["/shared/skills"] },
+    });
+  });
+
+  it("grants the skill library by default, and lets the operator withhold it", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The affordance is a plain checkbox, ON out of the box.
+    const grant = screen.getByLabelText(/search the global skill library/i);
+    expect((grant as HTMLInputElement).checked).toBe(true);
+
+    // Unticked, the agent registers with NO duckfs_read grant — and the node's
+    // assembler, asking the same caps, then never tells it the library is there.
+    fireEvent.click(grant);
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith({
       displayName: "Triage Agent",
       agentId: "triage-agent",
       capability: "beta",
       allowedActions: ["chat.post"],
     });
+  });
+
+  it("an agent registered without the library grant can be given it by editing", () => {
+    const { spies } = renderAgents();
+
+    // `summarizer` (the fixture) carries no duckfs_read cap at all.
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    fireEvent.click(within(detail).getByRole("button", { name: /^edit$/i }));
+    const grant = screen.getByLabelText(/search the global skill library/i);
+    expect((grant as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(grant);
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    // caps REPLACE wholesale, so the save carries the library grant alongside
+    // every other cap the record already held.
+    expect(spies.updateAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "summarizer",
+        caps: { pages_write: [], duckfs_read: ["/shared/skills"] },
+      }),
+    );
   });
 
   it("curates skills: the persona is always-loaded, the rest on demand", () => {
@@ -505,6 +555,7 @@ describe("AgentView", () => {
       agentId: "triage-agent",
       capability: "beta",
       allowedActions: ["chat.post"],
+      caps: { duckfs_read: ["/shared/skills"] },
       skills: [
         { name: "release", source_prefix: "/shared/skills/release", load: "on_demand" },
         {

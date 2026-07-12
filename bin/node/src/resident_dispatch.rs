@@ -409,7 +409,6 @@ format = "text"
                 payload: serde_json::json!({
                     "ducktape_run": 3,
                     "agent_id": "bot",
-                    "prompt_hash": null,
                     "thread_key": null,
                     "instructions": "GENERIC",
                     "contract": "CONTRACT",

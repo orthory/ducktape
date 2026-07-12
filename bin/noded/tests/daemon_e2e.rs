@@ -543,7 +543,6 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
 
-    let prompt_hash = vec![7u8; 32];
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
@@ -551,7 +550,6 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
                 "capability": "echo-model",
-                "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }
         }),
@@ -1309,31 +1307,9 @@ fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, Str
     ]
 }
 
-/// upload `prompt` through the node-local blob lane and return its digest
-/// bytes — the pin `register_agent` commits. the run envelope carries this
-/// pin and the host REFUSES to run an agent whose prompt blob is not in the
-/// store (never a silent fallback to the generic instructions), so arming an
-/// agent uploads its prompt first — exactly what the app's save-agent flow
-/// does.
-fn put_prompt_blob(daemon: &Daemon, prompt: &str) -> Vec<u8> {
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", prompt.as_bytes());
-    assert_eq!(
-        code,
-        200,
-        "prompt blob upload failed: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let reply: serde_json::Value = serde_json::from_slice(&body).expect("blob reply json");
-    let digest = reply["digest"].as_str().expect("digest hex");
-    assert_eq!(digest.len(), 64, "sha256 hex digest: {digest}");
-    (0..digest.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&digest[i..i + 2], 16).expect("hex digest"))
-        .collect()
-}
-
-/// channel + uploaded prompt blob + registered agent + mention watch: the
-/// client-side trigger stack for one agent run in `channel`.
+/// channel + registered agent + mention watch: the client-side trigger stack
+/// for one agent run in `channel`. no prompt blob — an agent is its curated
+/// skills, and one that curates none still runs (it simply has no persona).
 fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
     let (code, block) = daemon.submit(
         "chat",
@@ -1343,10 +1319,6 @@ fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
         Some("owner"),
     );
     assert_eq!(code, 200, "create channel failed: {block}");
-    let prompt_hash = put_prompt_blob(
-        daemon,
-        &format!("You are {agent_id}, a daemon e2e test agent."),
-    );
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
@@ -1354,7 +1326,6 @@ fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
                 "agent_id": agent_id,
                 "display_name": agent_id,
                 "capability": tag,
-                "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }
         }),

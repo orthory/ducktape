@@ -317,6 +317,8 @@ async fn execute(
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
+        // the committed library grant, straight through to the assembler.
+        library_readable: plan.library_readable,
     };
     // (a)+(b) materialize OUTSIDE storage — bounded: a stalled actor lane
     // fails this attempt instead of pinning a pool permit to the saga

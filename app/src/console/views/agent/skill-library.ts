@@ -8,6 +8,7 @@
 // Pure functions only — SkillLibraryPicker does the duckfs reads through the
 // ordinary files-client.
 
+import type { ResourceCaps } from "../../../domain/agent-client";
 import { basename } from "../../../domain/files-client";
 import { slug } from "./parts";
 
@@ -17,6 +18,34 @@ export const LIBRARY_ROOT = "/shared/skills";
 
 /** Whether a curated prefix points into the shared pool. */
 export const inLibrary = (prefix: string): boolean => prefix.startsWith(`${LIBRARY_ROOT}/`);
+
+/** Whether these caps let the agent SEARCH the library — an ordinary
+ *  `duckfs_read` grant, mirroring the node's `AgentRecord::library_readable`
+ *  (`permits(DuckfsRead(LIBRARY_ROOT))`): a prefix grants itself and its
+ *  children, never a sibling that merely shares the text. The run assembler asks
+ *  the same question before it tells an agent the library is there, so an agent
+ *  without this grant is never pointed at a door the MCP tool plane would slam.
+ *
+ *  ponytail: the containment rule is two lines, so it is inlined rather than
+ *  imported from a shared module — but it is the SAME rule; if the node's ever
+ *  grows a case (globs, denials), this is the mirror to update. */
+export const canReadLibrary = (caps?: ResourceCaps): boolean =>
+  (caps?.duckfs_read ?? []).some(
+    (prefix) => prefix === LIBRARY_ROOT || LIBRARY_ROOT.startsWith(`${prefix}/`),
+  );
+
+/** The caps record with the library read grant added or removed, everything else
+ *  untouched — caps REPLACE wholesale on update, so an edit must carry the rest
+ *  of the grant through. */
+export const withLibraryRead = (caps: ResourceCaps | undefined, granted: boolean): ResourceCaps => {
+  const rest = (caps?.duckfs_read ?? []).filter((prefix) => prefix !== LIBRARY_ROOT);
+  const duckfs_read = granted ? [...rest, LIBRARY_ROOT] : rest;
+  const next: ResourceCaps = { ...caps, duckfs_read };
+  // An empty list is the wire's absent key (the node canonicalizes anyway); keep
+  // the shape lean so a caps-less agent stays caps-less.
+  if (duckfs_read.length === 0) delete next.duckfs_read;
+  return next;
+};
 
 /** The prefix a newly published skill takes: one slug segment under the root. */
 export const libraryPrefix = (name: string): string => `${LIBRARY_ROOT}/${slug(name)}`;

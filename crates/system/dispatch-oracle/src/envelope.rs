@@ -70,6 +70,14 @@ struct WireEnvelope {
     context: Option<String>,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
+    /// the committed `duckfs_read` verdict on the global skill library: the
+    /// composer asks the agent's record (`agent::AgentRecord::library_readable`)
+    /// and states the answer here, because the host has no consensus registry to
+    /// ask. defaulted `false` — an envelope that never stated the grant cannot
+    /// have earned it, and the paragraph it gates would only send the agent at a
+    /// door the tool plane refuses.
+    #[serde(default)]
+    library_readable: bool,
     result_contract: Option<WireResultContract>,
 }
 
@@ -161,6 +169,7 @@ pub async fn prepare(input: &str) -> Result<Prepared, String> {
         envelope.skills,
         envelope.result_contract,
         agent_display_name,
+        envelope.library_readable,
     )?;
     // reading order: system instructions → item context (forge runs only: what
     // this run is working ON) → output contract → conversation. every section is
@@ -214,6 +223,7 @@ fn accept_portable_envelope(
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
     agent_display_name: String,
+    library_readable: bool,
 ) -> Result<PortablePlan, String> {
     let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
@@ -244,6 +254,9 @@ fn accept_portable_envelope(
     ctx.portable = true;
     Ok(PortablePlan {
         source,
+        // consensus decided this (the agent's duckfs_read caps); the host only
+        // obeys — exactly like a skill's load mode.
+        library_readable,
         // the id CONSENSUS knows this run by — carried through to the
         // provisioner, which is the only thing that can name the run back to
         // `runs`. absent on a pre-field envelope: no session, never a failure.
@@ -510,6 +523,28 @@ mod tests {
             modes,
             vec![("persona", true), ("release", false), ("legacy", false)],
             "curation order survives verbatim, and a mode-less skill is on-demand"
+        );
+    }
+
+    /// the library grant crosses the wall as plain data: consensus decided it
+    /// (the agent's `duckfs_read` caps), and the plan carries it to the
+    /// assembler, which is what decides whether the run is ever TOLD the shared
+    /// library exists. an envelope that never stated it defaults to DENIED —
+    /// advertising a door the tool plane would refuse is the one outcome this
+    /// field exists to prevent.
+    #[tokio::test]
+    async fn the_library_read_grant_rides_the_envelope_into_the_plan() {
+        let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        v["library_readable"] = serde_json::json!(true);
+        let Prepared { workspace, .. } = prepare(&v.to_string()).await.unwrap();
+        assert!(workspace.library_readable);
+
+        // the composer's own default (an agent with no grant) and a pre-field
+        // envelope are the same wire: no key.
+        let Prepared { workspace, .. } = prepare(&envelope_json()).await.unwrap();
+        assert!(
+            !workspace.library_readable,
+            "an unstated grant is no grant: the run is never pointed at the library"
         );
     }
 

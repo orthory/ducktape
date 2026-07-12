@@ -250,31 +250,13 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
         matches!(chat::decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
     });
 
-    // arm the agent the way the app does: the prompt blob uploads FIRST —
-    // the run envelope carries its pin and the host REFUSES to run an agent
-    // whose registered prompt it cannot resolve (never a silent fallback to
-    // the generic instructions) — then RegisterAgent commits the digest.
-    // the blob lane takes the raw request body; the harness helper is
-    // json-bodied, so the blob is the JSON-encoded string — opaque bytes as
-    // far as this test cares (the provider script's answer is fixed).
-    //
-    // uploaded to the FOUNDER ONLY: blob bytes are node-local (the pin
-    // replicates through consensus, the bytes do not), and the RESIDENT is
-    // the executor here — so its run can only resolve the prompt through
-    // the mesh fetch-on-miss lane (#298), which this leg now exercises end
-    // to end.
-    let prompt = serde_json::json!("You are quacker, a resident e2e test agent.");
-    let (blob_code, blob_reply) = common::http_request(
-        cluster.http_ports[0],
-        "POST",
-        "/v1/files/blob",
-        Some(&prompt),
-    );
-    assert_eq!(blob_code, 200, "prompt blob upload failed: {blob_reply}");
-    let prompt_hash = common::unhex(
-        blob_reply["digest"].as_str().expect("blob reply carries a digest"),
-    );
-    assert_eq!(prompt_hash.len(), 32, "sha256 digest bytes");
+    // arm the agent the way the app does — and note what is NO LONGER here: the
+    // prompt blob. an agent's persona used to be blob bytes staged on ONE node,
+    // which a run leasing anywhere else had to fetch across the mesh (#298); it
+    // is a curated duckfs skill now, so consensus replicates it and the executor
+    // materializes it locally. this agent curates none, which is a legitimate
+    // agent: it still gets the ambient context document, and this leg is about
+    // WHERE the run executes, not what the model was told.
     cluster.submit(
         0,
         "agent",
@@ -282,7 +264,6 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
             agent_id: "quacker".into(),
             display_name: "quacker".into(),
             capability: provider.tag.clone(),
-            prompt_hash,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
             recipe_hash: None,
             caps: None,

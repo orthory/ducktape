@@ -91,6 +91,16 @@ struct RunEnvelope<'a> {
     context: Option<String>,
     workspace: WorkspaceSource,
     skills: Vec<SkillEnvelope>,
+    /// whether this agent's committed `duckfs_read` caps cover the global skill
+    /// library (`agent::SKILL_LIBRARY_PREFIX`). the HOST cannot work this out —
+    /// it has no registry to ask — so the composer states it, and the assembler
+    /// emits the library paragraph only when it is true.
+    ///
+    /// a fact ABOUT the caps, never a widening of them: the answer comes from
+    /// `AgentRecord::library_readable`, which is `permits(DuckfsRead(..))` — the
+    /// same call the MCP tool plane gates the real read on. so the document can
+    /// only advertise a door that will actually open.
+    library_readable: bool,
     result_contract: ResultContractEnvelope,
 }
 
@@ -232,6 +242,7 @@ fn envelope(
         context: portable.context,
         workspace: portable.workspace,
         skills: portable.skills,
+        library_readable: agent.library_readable(),
         result_contract: ResultContractEnvelope {
             ducktape_runner_result: RUNNER_RESULT_VERSION,
             sink: portable.sink,
@@ -558,6 +569,57 @@ mod tests {
         assert_eq!(
             skills[1]["always"], false,
             "an on-demand skill is indexed, not inlined"
+        );
+    }
+
+    /// the library grant the host assembles on is READ OFF THE CAPS, never
+    /// assumed: an agent whose `duckfs_read` covers the library prefix composes
+    /// `library_readable: true` and is told the library exists; one without the
+    /// grant composes `false` and is never pointed at a door the MCP tool plane
+    /// would refuse it (the caps ARE that refusal — same `permits` call).
+    #[test]
+    fn the_envelope_states_the_agents_library_read_grant() {
+        let compose = |caps: agent::ResourceCaps| {
+            let mut agent = agent_with_skills(Vec::new());
+            agent.caps = caps;
+            let payload = render_payload(
+                "runs",
+                &agent,
+                &run_id("general", 1),
+                "general",
+                1,
+                None,
+                &[],
+                PortableInputs {
+                    workspace: duckfs_workspace(&agent, None),
+                    skills: Vec::new(),
+                    sink: WireSink::Chain,
+                    context: None,
+                },
+            );
+            parse(&payload)["library_readable"].clone()
+        };
+
+        assert_eq!(
+            compose(agent::ResourceCaps::default()),
+            Value::Bool(false),
+            "the empty default grants nothing, so the agent hears nothing about the library"
+        );
+        assert_eq!(
+            compose(agent::ResourceCaps {
+                duckfs_read: vec![agent::SKILL_LIBRARY_PREFIX.into()],
+                ..Default::default()
+            }),
+            Value::Bool(true),
+            "the grant the app pre-fills is the grant the assembler acts on"
+        );
+        assert_eq!(
+            compose(agent::ResourceCaps {
+                duckfs_read: vec!["/shared/agent-workspaces/bot".into()],
+                ..Default::default()
+            }),
+            Value::Bool(false),
+            "an unrelated read grant is not a library grant"
         );
     }
 
