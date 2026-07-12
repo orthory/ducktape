@@ -265,6 +265,45 @@ fn contains_reserved_separator(value: &str) -> bool {
     value.contains(RESERVED_ID_SEPARATOR)
 }
 
+/// the longest agent id consensus admits — one DNS label (RFC 1035), which is
+/// also what an RFC 5321 local part (64 bytes) holds verbatim.
+pub const MAX_AGENT_ID_LEN: usize = 63;
+
+/// an agent id must be a legal DNS label: lowercase ASCII `[a-z0-9-]`, 1..=63
+/// bytes, no leading/trailing hyphen. the id IS the agent's address — forge
+/// attributes its commits to `<agent_id>@agents.duck` (`agents` is reserved in
+/// duckdns, see `RESERVED_ROOT_LABELS`), so an id that is not a label cannot
+/// round-trip. deliberately a COPY of duckdns's `validate_handle` shape rule
+/// rather than a call into it: two consensus modules must not share an
+/// admission rule that either could silently move (duckdns's reserved-label
+/// list is its own business — an agent may be called `net`). the tests pin the
+/// two rules to the same shape.
+pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
+    if agent_id.is_empty() {
+        return Err("agent_id must not be empty".into());
+    }
+    if agent_id.len() > MAX_AGENT_ID_LEN {
+        return Err(format!(
+            "agent_id exceeds {MAX_AGENT_ID_LEN} bytes: {} bytes",
+            agent_id.len()
+        ));
+    }
+    if agent_id.starts_with('-') || agent_id.ends_with('-') {
+        return Err(format!(
+            "agent_id must not start or end with a hyphen: {agent_id:?}"
+        ));
+    }
+    if !agent_id
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(format!(
+            "agent_id must be a DNS label (lowercase [a-z0-9-]): {agent_id:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// decode a canonical string SET, enforcing strictly-ascending order so a
 /// non-canonical (unsorted / duplicated) snapshot is rejected — the same
 /// discipline `allowed_actions` uses. part of the runtime-identity tail.
@@ -651,12 +690,9 @@ impl AgentModule {
                 skills,
             } => {
                 let owner = Self::admin_origin(&ctx.env().origin)?;
-                Self::validate_non_empty("agent_id", &agent_id)?;
-                if contains_reserved_separator(&agent_id) {
-                    return Err(Error::Module(
-                        "agent_id must not contain the reserved unit separator".into(),
-                    ));
-                }
+                // the label rule subsumes the old non-empty + reserved-separator
+                // checks (\x1f is not in [a-z0-9-]) — see `validate_agent_id`.
+                validate_agent_id(&agent_id).map_err(Error::Module)?;
                 Self::validate_non_empty("display_name", &display_name)?;
                 validate_tag(&capability).map_err(Error::Module)?;
                 Self::validate_prompt_hash(&prompt_hash)?;
@@ -1789,5 +1825,47 @@ mod tests {
             serde_json::json!("vault://k"),
             "secrets are opaque refs only"
         );
+    }
+
+    /// the id rule is a deliberate COPY of duckdns's handle shape rule (an
+    /// agent id must be a DNS label because it IS the local part of
+    /// `<id>@agents.duck`). pin the two together so tightening either one
+    /// alone goes red. the ONE intended divergence: duckdns also rejects its
+    /// reserved ROOT labels — an agent id is not a `.duck` handle, so an agent
+    /// may be called `net` or `agents`.
+    #[test]
+    fn agent_id_shape_matches_the_duckdns_label_rule() {
+        let too_long = "x".repeat(MAX_AGENT_ID_LEN + 1);
+        let longest = "x".repeat(MAX_AGENT_ID_LEN);
+        let cases = [
+            "quackbot",
+            "a",
+            "9",
+            "qa-luna",
+            "a--b",
+            "",
+            "-lead",
+            "trail-",
+            "UPPER",
+            "under_score",
+            "dot.ted",
+            "spa ce",
+            "bad\u{1f}id",
+            "quack/bot@example",
+            too_long.as_str(),
+            longest.as_str(),
+        ];
+        for id in cases {
+            let admitted = validate_agent_id(id).is_ok();
+            assert_eq!(
+                admitted,
+                duckdns::validate_handle(id).is_ok(),
+                "agent and duckdns disagree on {id:?}"
+            );
+        }
+        for label in duckdns::RESERVED_ROOT_LABELS {
+            assert!(validate_agent_id(label).is_ok(), "{label}");
+            assert!(duckdns::validate_handle(label).is_err(), "{label}");
+        }
     }
 }

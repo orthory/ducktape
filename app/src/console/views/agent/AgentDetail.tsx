@@ -5,6 +5,7 @@
 import { useState } from "react";
 
 import type { AgentRecord } from "../../../domain/agent-client";
+import { agentAddress } from "../../../domain/agent-client";
 import { Icon } from "../../components/Icon";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { AgentEditForm } from "./AgentEditForm";
@@ -199,6 +200,7 @@ export function AgentDetail({
               gap: 8,
             }}
           >
+            <InfoRow label="address" value={agentAddress(agent.agent_id)} />
             <InfoRow label="owner" value={ownerText(agent.owner)} />
             <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />

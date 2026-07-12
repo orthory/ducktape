@@ -11,8 +11,15 @@ pub const DUCKDNS_ZONE: &str = "duck";
 /// Structural labels reserved directly below `.duck`. `net` is the duck
 /// browser's inert internal namespace (`net.duck` pages render inline and
 /// must never resolve to an account) — a registrable "net" handle would
-/// collide with it.
-pub const RESERVED_ROOT_LABELS: &[&str] = &["net"];
+/// collide with it. `agents` is the synthetic domain of agent attribution
+/// idents (`<agent_id>@agents.duck`, see the forge lane): a registrable
+/// "agents" handle would let one account own every agent address AND every
+/// `<route>.agents.duck` browse.
+///
+/// This is THE reserved set — every other copy mirrors it: the app's
+/// `RESERVED_ROOT_LABELS` (`app/src/domain/duckdns-client.ts`, pinned to this
+/// literal by `duckdns-client.test.ts`) and `ops/demo-gateway.mjs`.
+pub const RESERVED_ROOT_LABELS: &[&str] = &["net", "agents"];
 pub const MAX_LABEL_LEN: usize = 63;
 pub const MAX_QUERY_LIMIT: u64 = 256;
 

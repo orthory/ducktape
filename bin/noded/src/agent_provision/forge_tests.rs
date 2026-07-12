@@ -601,13 +601,34 @@ fn commit_message_normalization_strips_supplied_identity_trailers_and_owns_attri
     assert!(!message.contains('\r'));
 }
 
+/// every id consensus admits today is a DNS label, and a label IS the address:
+/// `quackbot` → `quackbot@agents.duck`, resolvable straight back to the
+/// registry key.
+#[test]
+fn attribution_addresses_round_trip_a_label_shaped_agent_id() {
+    let longest = "x".repeat(63);
+    for id in [AGENT, "qa-luna", "a", longest.as_str()] {
+        assert!(agent::validate_agent_id(id).is_ok(), "{id}");
+        let local = attribution_email_local_part(id);
+        assert_eq!(local, id);
+        assert!(local.len() <= MAX_AGENT_ID_BYTES, "{local}");
+    }
+}
+
+/// LEGACY: ids registered before the label rule are not addresses — they still
+/// get a bounded, unique, readable local part off the complete committed id.
 #[test]
 fn attribution_addresses_hash_the_complete_id_after_a_readable_slug() {
-    let ids = ["qa/luna", "qa luna", "qa@luna"];
+    let ids = ["qa/luna", "qa luna", "qa@luna", "QA-Luna"];
     let locals = ids.map(attribution_email_local_part);
-    for local in &locals {
-        assert!(local.starts_with("qa-luna-"), "{local}");
+    for (id, local) in ids.iter().zip(&locals) {
+        assert!(agent::validate_agent_id(id).is_err(), "{id}");
+        assert!(
+            local.to_ascii_lowercase().starts_with("qa-luna-"),
+            "{local}"
+        );
         assert!(local.len() <= MAX_AGENT_ID_BYTES, "{local}");
+        assert!(local.contains('-') && local != *id, "{local}");
     }
     assert_ne!(locals[0], locals[1]);
     assert_ne!(locals[0], locals[2]);

@@ -65,6 +65,13 @@ export interface AgentRecord {
 
 const TARGET = "agent";
 
+/** The agent's address. `agent_id` is a DNS label by consensus rule, so it is
+ *  the local part verbatim — the same ident forge attributes every agent commit
+ *  to (`bin/noded/src/agent_provision/forge.rs`). `agents` is a RESERVED root
+ *  label in duckdns: no account can register the handle and inherit these
+ *  addresses. */
+export const agentAddress = (agentId: string): string => `${agentId}@agents.duck`;
+
 /** Every action name an agent can be granted (KNOWN_ACTIONS). A RegisterAgent /
  *  UpdateAgent rejects an `allowed_actions` entry outside this set.
  *

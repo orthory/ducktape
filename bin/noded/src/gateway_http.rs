@@ -296,7 +296,8 @@ pub(crate) async fn gateway_browser_base(
 /// Resolve a `duck://` authority (`<label>.<handle>.duck` or `<handle>.duck`)
 /// to the account it names and the route label beneath it. Node-local: one
 /// DuckDNS resolve, no session state and no round-trip to the publisher.
-/// `net.duck` and any `<x>.net.duck` are reserved and carry no gateway route.
+/// A reserved root label (`duckdns::RESERVED_ROOT_LABELS`: `net.duck`,
+/// `agents.duck`, and any `<x>.<reserved>.duck`) carries no gateway route.
 async fn resolve_duck_authority(
     handle: &NodeHandle,
     authority: &str,
@@ -318,10 +319,10 @@ async fn resolve_duck_authority(
     } else {
         (None, labels[0])
     };
-    if alias == "net" {
-        return Err(GatewayFailure::NotFound(
-            "net.duck is reserved and has no gateway route".into(),
-        ));
+    if duckdns::RESERVED_ROOT_LABELS.contains(&alias) {
+        return Err(GatewayFailure::NotFound(format!(
+            "{alias}.duck is reserved and has no gateway route"
+        )));
     }
     duckdns::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
     let name = match label {

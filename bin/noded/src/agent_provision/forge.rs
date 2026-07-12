@@ -49,9 +49,11 @@ use crate::NodeHandle;
 const NODE_COMMITTER_EMAIL: &str = "node@ducktape.local";
 /// the synthetic domain for agent authorship and attribution. DELIBERATELY in
 /// the network's own `.duck` namespace (duckdns), not a registerable TLD: no
-/// one can ever own it, so no GitHub account can ever verify these addresses
-/// and claim mirrored agent commits. The address is inert metadata —
-/// provenance lives in consensus receipts, never in Git idents.
+/// GitHub account can ever verify these addresses and claim mirrored agent
+/// commits. What makes it unownable is that `agents` is a RESERVED root label
+/// (`duckdns::RESERVED_ROOT_LABELS`) — consensus rejects it as a handle, so no
+/// account can register `agents.duck` and inherit these idents. The address is
+/// inert metadata — provenance lives in consensus receipts, never in Git idents.
 const AGENT_EMAIL_DOMAIN: &str = "agents.duck";
 /// the complete normalized commit message, canonical trailer included.
 const MAX_COMMIT_MESSAGE_BYTES: usize = 4 * 1024;
@@ -599,14 +601,23 @@ fn readable_agent_slug(input: &str, max_bytes: usize) -> String {
     }
 }
 
-/// RFC 5321 bounds the local part at 64 bytes. Keep a readable prefix while
-/// deriving the collision-resistant suffix from the complete committed id,
-/// before any lossy normalization.
+/// The agent's address. Consensus admits only DNS-label agent ids
+/// (`agent::validate_agent_id`), and a label fits an RFC 5321 local part
+/// verbatim — so `quackbot` attributes to `quackbot@agents.duck` and the
+/// address round-trips back to the registry key.
+///
+/// LEGACY FALLBACK: agents registered before that rule may carry any id
+/// (spaces, `@`, `/`, 200 bytes). Those still need a valid, bounded, unique
+/// local part, so they keep the old derivation: a readable slug plus a suffix
+/// hashing the COMPLETE committed id, before any lossy normalization.
 fn attribution_email_local_part(input: &str) -> String {
     const HASH_BYTES: usize = 16;
     const HASH_HEX_BYTES: usize = HASH_BYTES * 2;
     const SLUG_BYTES: usize = MAX_AGENT_ID_BYTES - HASH_HEX_BYTES - 1;
 
+    if agent::validate_agent_id(input).is_ok() {
+        return input.to_owned();
+    }
     let slug = readable_agent_slug(input, SLUG_BYTES);
     let digest = Sha256::digest(input.as_bytes());
     let hash = digest[..HASH_BYTES]

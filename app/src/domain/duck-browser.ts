@@ -95,8 +95,8 @@ export const parseDuckAddress = (input: string): DuckAddress => {
   }
   if (labels[labels.length - 1] !== "duck") throw new Error("Address must end in .duck.");
   const isNetwork = hostname === "net.duck";
-  if (labels.length === 3 && labels[1] === "net") {
-    throw new Error("net.duck is reserved and has no account subdomains.");
+  if (labels.length === 3 && duckdns.RESERVED_ROOT_LABELS.has(labels[1])) {
+    throw new Error(`${labels[1]}.duck is reserved and has no account subdomains.`);
   }
   const handle = labels.length === 3 ? labels[1] : labels[0];
   const name = gateway.routeName(labels.length === 3 ? labels[0] : null);
