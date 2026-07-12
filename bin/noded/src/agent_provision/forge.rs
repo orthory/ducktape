@@ -47,8 +47,12 @@ use crate::NodeHandle;
 /// every run commit's committer email — the committer NAME is the node's
 /// stable identity (D2: author is the agent, committer is the executing node).
 const NODE_COMMITTER_EMAIL: &str = "node@ducktape.local";
-/// the public synthetic domain used for agent authorship and attribution.
-const AGENT_EMAIL_DOMAIN: &str = "agents.ducktape.network";
+/// the synthetic domain for agent authorship and attribution. DELIBERATELY in
+/// the network's own `.duck` namespace (duckdns), not a registerable TLD: no
+/// one can ever own it, so no GitHub account can ever verify these addresses
+/// and claim mirrored agent commits. The address is inert metadata —
+/// provenance lives in consensus receipts, never in Git idents.
+const AGENT_EMAIL_DOMAIN: &str = "agents.duck";
 /// the complete normalized commit message, canonical trailer included.
 const MAX_COMMIT_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 128;
