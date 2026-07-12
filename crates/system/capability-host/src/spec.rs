@@ -138,6 +138,38 @@ pub struct CapabilitySpec {
     /// holding the credential, and the fresh executor config home that forces
     /// the CLI through it (see [`IsolationSpec`]).
     pub isolation: IsolationSpec,
+    /// optional `[context]` — where THIS CLI auto-loads ambient instructions
+    /// from, so the run's assembled context document (the agent's soul) can be
+    /// delivered by the executor's own convention (see [`ContextLocation`]).
+    /// absent = the doc rides the stdin prompt instead; a raw provider needs no
+    /// convention.
+    pub context: Option<ContextLocation>,
+}
+
+/// where an executor auto-loads its ambient instructions from — a CLOSED set of
+/// location KINDS, like [`OutputFormat`] and [`WorkspaceMode`], never a raw path:
+/// a spec that could name any path could aim a host-written file anywhere on the
+/// box, and there would be nothing left to validate. the file component is a
+/// plain name; the DIRECTORY is the host's to choose, per kind.
+///
+/// both kinds sit OUTSIDE the commit scan, which is what makes the delivery safe:
+/// the config home lives under the reserved run-runtime dir the provisioner
+/// deletes before scanning, and the workspace parent is beside the checkout,
+/// which `commit` only scans UNDER. so the soul never lands in an agent's
+/// snapshot or PR — and it never overwrites a repository's own instructions
+/// file, which stays inside the checkout and layers on top of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextLocation {
+    /// `"config-home:<file>"` → `<the run's fresh config home>/<file>`. requires
+    /// the spec to also declare `[isolation] config_home_env` (a hard load error
+    /// otherwise): without it there IS no fresh config home, so the path would
+    /// name a directory that never exists and the CLI would run unsouled.
+    ConfigHome(String),
+    /// `"workspace-parent:<file>"` → `<parent of the run's checkout>/<file>`.
+    /// the parent, not the checkout: a CLI that merges parent-directory
+    /// instructions with project ones then layers the repo's own file ON TOP of
+    /// the soul instead of having it overwritten.
+    WorkspaceParent(String),
 }
 
 /// how an executor authenticates WITHOUT its credential entering the child.
@@ -208,6 +240,9 @@ struct RawSpec {
     /// executor config home.
     #[serde(default)]
     isolation: Option<RawIsolation>,
+    /// optional `[context]` — the executor's native ambient-instructions file.
+    #[serde(default)]
+    context: Option<RawContext>,
     /// optional `[tools]` — argv injected into EVERY argv this file produces
     /// (see [`inject_tool_args`]).
     #[serde(default)]
@@ -293,6 +328,61 @@ fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationS
         config_home_env: raw.config_home_env,
         broker,
     })
+}
+
+/// the on-disk `[context]` shape — a dumb serde mirror; unknown fields fail
+/// loud like everywhere else in the spec format.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContext {
+    path: String,
+}
+
+/// validate `[context] path` into the closed [`ContextLocation`] set. the string
+/// is `<kind>:<file>` and BOTH halves are checked: an unknown kind is a load
+/// error (never a silently undelivered soul), and the file half must be a plain
+/// name — a `/` or a `..` would let a spec steer a host-written file out of the
+/// directory the kind picked, which is the whole traversal surface this closed
+/// set exists to not have.
+///
+/// `config-home:` additionally REQUIRES `[isolation] config_home_env`: the kind
+/// resolves against the fresh config home, and a spec that never asks for one
+/// names a directory that will not exist. failing at LOAD (not at the first run)
+/// is the point — an unsouled agent is a silently different agent.
+fn parse_context(
+    raw: Option<RawContext>,
+    isolation: &IsolationSpec,
+    origin: &str,
+) -> Result<Option<ContextLocation>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let Some((kind, file)) = raw.path.split_once(':') else {
+        return Err(format!(
+            "{origin}: context.path {:?} must be \"<kind>:<file>\" \
+             (want config-home:<file> | workspace-parent:<file>)",
+            raw.path
+        ));
+    };
+    if file.is_empty() || file.contains('/') || file == "." || file == ".." {
+        return Err(format!(
+            "{origin}: context.path {:?}: the file component must be a plain file \
+             name (no \"/\", no \"..\") — the directory is the kind's to choose",
+            raw.path
+        ));
+    }
+    match kind {
+        "config-home" if isolation.config_home_env.is_none() => Err(format!(
+            "{origin}: context.path {:?} resolves against the run's fresh config \
+             home, but this spec declares no [isolation] config_home_env — there \
+             would be no such directory and the executor would run with no context",
+            raw.path
+        )),
+        "config-home" => Ok(Some(ContextLocation::ConfigHome(file.to_string()))),
+        "workspace-parent" => Ok(Some(ContextLocation::WorkspaceParent(file.to_string()))),
+        other => Err(format!(
+            "{origin}: context.path kind {other:?} is not a known location \
+             (want config-home | workspace-parent)"
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -479,6 +569,9 @@ impl CapabilitySpec {
             .transpose()?
             .unwrap_or_default();
         let isolation = parse_isolation(raw.isolation, origin)?;
+        // AFTER isolation: `config-home:` is only meaningful when the spec asked
+        // for a fresh config home, so the check needs the parsed block.
+        let context = parse_context(raw.context, &isolation, origin)?;
         // THE credential invariant. a broker exists so the operator's credential
         // never enters the child; rw_dirs exist to mount that credential INTO the
         // child. a spec with both would authenticate through whichever the CLI
@@ -505,6 +598,7 @@ impl CapabilitySpec {
                 session,
                 rw_dirs,
                 isolation,
+                context,
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),
@@ -830,6 +924,69 @@ resume_args_append = ["--resume", "{{session_id}}"]
             spec_toml("ok")
         );
         assert!(CapabilitySpec::parse(&config_home_and_dirs, "t").is_ok());
+    }
+
+    #[test]
+    fn context_parses_into_the_closed_location_set() {
+        // absent [context] = the doc rides the stdin prompt (the raw-provider door).
+        let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
+        assert_eq!(plain.context, None);
+
+        let parent = format!(
+            "{}\n[context]\npath = \"workspace-parent:CLAUDE.md\"\n",
+            spec_toml("ok")
+        );
+        assert_eq!(
+            CapabilitySpec::parse(&parent, "t").unwrap().context,
+            Some(ContextLocation::WorkspaceParent("CLAUDE.md".into()))
+        );
+
+        // `config-home:` needs the fresh config home to exist at all.
+        let home = format!(
+            "{}\n[isolation]\nconfig_home_env = \"CLI_HOME\"\n\n[context]\npath = \"config-home:AGENTS.md\"\n",
+            spec_toml("ok")
+        );
+        assert_eq!(
+            CapabilitySpec::parse(&home, "t").unwrap().context,
+            Some(ContextLocation::ConfigHome("AGENTS.md".into()))
+        );
+    }
+
+    #[test]
+    fn context_rejects_unknown_kinds_traversal_and_a_config_home_that_does_not_exist() {
+        let base = spec_toml("ok");
+        for (path, expect) in [
+            // a raw path is not a location: the kind is what picks the directory.
+            ("/etc/cron.d/soul", "<kind>:<file>"),
+            ("/etc:passwd", "not a known location"),
+            ("home:AGENTS.md", "not a known location"),
+            ("AGENTS.md", "<kind>:<file>"),
+            // the file half is a plain NAME — the traversal surface the closed
+            // set exists to not have.
+            ("workspace-parent:../../.bashrc", "plain file"),
+            ("workspace-parent:sub/dir/CLAUDE.md", "plain file"),
+            ("workspace-parent:..", "plain file"),
+            ("workspace-parent:", "plain file"),
+        ] {
+            let toml = format!("{base}\n[context]\npath = \"{path}\"\n");
+            let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
+            assert!(
+                err.contains(expect),
+                "wanted {expect:?} for {path:?}: {err:?}"
+            );
+        }
+
+        // config-home: without [isolation] config_home_env names a directory
+        // that will never exist — a LOAD error, because at run time it would be
+        // a silently unsouled agent that still answers.
+        let orphan = format!("{base}\n[context]\npath = \"config-home:AGENTS.md\"\n");
+        let err = CapabilitySpec::parse(&orphan, "t").unwrap_err();
+        assert!(err.contains("config_home_env"), "got {err:?}");
+
+        // and an unknown field under [context] fails loud like everywhere else.
+        let typo = format!("{base}\n[context]\npaths = \"workspace-parent:X.md\"\n");
+        let err = CapabilitySpec::parse(&typo, "t").unwrap_err();
+        assert!(err.contains("not a valid spec"), "got {err:?}");
     }
 
     #[test]
