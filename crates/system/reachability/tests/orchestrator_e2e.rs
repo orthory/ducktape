@@ -513,6 +513,24 @@ async fn single_member_mesh_and_stranger_traffic_are_inert() {
         .await;
 }
 
+/// Establishment is asynchronous now (`bind` returns before discovery), so
+/// tests that need a live registration wait, bounded, for `Ready` first.
+async fn established(resolver: &reachability::NatResolver) -> std::net::SocketAddr {
+    let mut status = resolver.status().expect("resolver has coordinators");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let reachability::RendezvousStatus::Ready { reflexive } =
+                *status.borrow_and_update()
+            {
+                return reflexive;
+            }
+            status.changed().await.expect("establish task alive");
+        }
+    })
+    .await
+    .expect("rendezvous must establish against a live coordinator")
+}
+
 /// The production resolver against a REAL coordinator + two real UDP
 /// clients on loopback: register, lookup, simultaneous-open punch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -532,6 +550,8 @@ async fn nat_resolver_punches_over_loopback() {
     let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr], None)
         .await
         .unwrap();
+    established(&a).await;
+    established(&b).await;
     assert!(a.reflexive().is_some(), "bind discovered the reflexive");
 
     let dummy: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
@@ -568,9 +588,8 @@ async fn resolver_datagram_roundtrip_over_loopback() {
         client,
         reachability::RENDEZVOUS_KEEPALIVE,
         Some(sink_tx),
-    )
-    .await
-    .unwrap();
+    );
+    established(&resolver).await;
 
     let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let peer_addr = peer.local_addr().unwrap();
@@ -642,6 +661,7 @@ async fn private_coordinator_admits_authenticated_bind() {
         reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
             .await
             .expect("a genesis member's authenticated bind is admitted");
+    established(&m).await;
     assert!(
         m.reflexive().is_some(),
         "the member discovered its reflexive through the private coordinator"
@@ -657,6 +677,7 @@ async fn private_coordinator_admits_authenticated_bind() {
     )
     .await
     .expect("a capped joiner's authenticated bind is admitted");
+    established(&j).await;
     assert!(
         j.reflexive().is_some(),
         "the capped joiner discovered its reflexive through the private coordinator"
@@ -664,12 +685,14 @@ async fn private_coordinator_admits_authenticated_bind() {
 }
 
 /// A resolver with NO cap and a NON-genesis key is REFUSED by a private
-/// coordinator at the very first authenticated request: its `BindRequest`
-/// (valid PoP, but neither a genesis member nor cap-bearing) is silently
-/// dropped by the admission gate, so `NatResolver::bind` never discovers a
-/// reflexive and fails. A member with a cap, against the same coordinator,
-/// binds fine — proving it is the missing credential, not the transport,
-/// that denies the outsider.
+/// coordinator: its `BindRequest` (valid PoP, but neither a genesis member
+/// nor cap-bearing) is silently dropped by the admission gate. Denial is
+/// deliberately indistinguishable from a dark network on the wire (the gate
+/// drops, never answers), so with background establishment the refusal shows
+/// up as NEVER-READY: the resolver keeps retrying and no reflexive ever
+/// lands. A member against the same coordinator establishes promptly —
+/// proving it is the missing credential, not the transport, that denies the
+/// outsider.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_coordinator_denies_uncredentialed_bind() {
     let g = PrivateKey::from_seed(600);
@@ -685,28 +708,33 @@ async fn private_coordinator_denies_uncredentialed_bind() {
 
     // the outsider authenticates (valid PoP) but carries no cap and is not a
     // genesis member: every request, BindRequest included, is dropped by the
-    // admission gate, so bind cannot discover a reflexive.
+    // admission gate, so establishment can never discover a reflexive.
     let outsider_key = node_key_of(&outsider.public_key());
     let denied = reachability::NatResolver::bind(
         outsider_key,
         vec![coord_addr],
         Some((outsider.clone(), None)),
     )
-    .await;
-    assert!(
-        denied.is_err(),
-        "an uncredentialed (non-genesis, uncapped) node's bind is refused, got Ok"
-    );
+    .await
+    .expect("the local socket binds; admission shows up as never-Ready");
 
-    // control: a credentialed member binds against the same coordinator.
+    // control: a credentialed member establishes against the SAME coordinator
+    // while the outsider is still being refused — the transport works.
     let member_key = node_key_of(&member.public_key());
     let ok =
         reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
-            .await;
-    assert!(
-        ok.is_ok(),
-        "a genesis member binds against the same coordinator: {:?}",
-        ok.err()
+            .await
+            .expect("a genesis member's socket binds");
+    established(&ok).await;
+
+    // one full discovery attempt (3s) has certainly concluded by now — the
+    // member above establishes in milliseconds on loopback; give the outsider
+    // a further beat and hold that it never became Ready.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        denied.reflexive(),
+        None,
+        "an uncredentialed (non-genesis, uncapped) node must never establish rendezvous"
     );
 }
 
@@ -744,6 +772,8 @@ async fn private_coordinator_cross_peer_punch() {
         reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
             .await
             .expect("B's authenticated bind is admitted");
+    established(&a).await;
+    established(&b).await;
     assert!(a.reflexive().is_some() && b.reflexive().is_some());
 
     // Cross-peer resolve on both sides: A looks up B's key, B looks up A's.

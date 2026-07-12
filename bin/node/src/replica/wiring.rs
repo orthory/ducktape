@@ -275,36 +275,64 @@ pub(super) async fn wire(
                     let token_nonce = token.nonce.to_vec();
                     let reach = reach.clone();
                     let race_label = label.clone();
+                    // an exhausted race is honest-terminal ONLY for a fresh
+                    // join (no checkpoint): a bad invite must exit loudly,
+                    // never spin silently. a RESTART with standing (the
+                    // checkpoint exists) is a different animal — its paths
+                    // are known-good and merely dark (machine woke before
+                    // its network, coordinator briefly down), so dying at
+                    // 90s turns every offline boot into a dead node the
+                    // operator must resurrect by hand. it re-races forever,
+                    // loudly, instead.
+                    let restart_with_standing = manifest.is_some();
                     context.child("first_contact").spawn(move |_ctx| async move {
-                        let outcome = first_contact_join::drive_first_contact(
-                            reach,
-                            candidates,
-                            intro,
-                            token_nonce,
-                            race_label.clone(),
-                            std::time::Duration::from_secs(90),
-                        )
-                        .await;
-                        match outcome {
-                            first_contact_join::FirstContactOutcome::Installed {
-                                key,
-                                via,
-                            } => println!(
-                                "[node {race_label}] invite: first contact via {via} to \
-                                 {} — join rides the overlay",
-                                hex_bytes(&key.as_ref()[..4])
-                            ),
-                            first_contact_join::FirstContactOutcome::Terminal {
-                                tried,
-                                reason,
-                            } => {
-                                eprintln!(
-                                    "[node {race_label}] FATAL: first contact failed \
-                                     across all {tried} offered path(s) — {reason}. ask \
-                                     the inviter for a fresh invite once the mesh is \
-                                     reachable."
-                                );
-                                std::process::exit(3);
+                        let mut round = 0u32;
+                        loop {
+                            round += 1;
+                            let outcome = first_contact_join::drive_first_contact(
+                                reach.clone(),
+                                candidates.clone(),
+                                intro.clone(),
+                                token_nonce.clone(),
+                                race_label.clone(),
+                                std::time::Duration::from_secs(90),
+                            )
+                            .await;
+                            match outcome {
+                                first_contact_join::FirstContactOutcome::Installed {
+                                    key,
+                                    via,
+                                } => {
+                                    println!(
+                                        "[node {race_label}] invite: first contact via \
+                                         {via} to {} — join rides the overlay",
+                                        hex_bytes(&key.as_ref()[..4])
+                                    );
+                                    return;
+                                }
+                                first_contact_join::FirstContactOutcome::Terminal {
+                                    tried,
+                                    reason,
+                                } => {
+                                    if !restart_with_standing {
+                                        eprintln!(
+                                            "[node {race_label}] FATAL: first contact \
+                                             failed across all {tried} offered path(s) — \
+                                             {reason}. ask the inviter for a fresh invite \
+                                             once the mesh is reachable."
+                                        );
+                                        std::process::exit(3);
+                                    }
+                                    eprintln!(
+                                        "[node {race_label}] first contact round {round} \
+                                         failed across all {tried} offered path(s) — \
+                                         {reason}; this node holds a synced checkpoint, \
+                                         so it keeps retrying (next round in 30s) instead \
+                                         of exiting"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(30))
+                                        .await;
+                                }
                             }
                         }
                     });

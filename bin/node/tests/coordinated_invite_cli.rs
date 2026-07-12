@@ -385,6 +385,130 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
     );
 }
 
+/// The field failure this branch fixes, end to end through the REAL binary: a
+/// node boots while its coordinator is DARK (machine woke before its network,
+/// coordinator restarting) and the coordinator only comes up LATER. The plane
+/// must self-heal — retry in the background and register the moment the
+/// coordinator answers — instead of degrading to pass-through for the life of
+/// the process (the old behavior: one missed 3s window at boot meant no
+/// rendezvous, no punch, no tunnels until an operator restarted the node by
+/// hand).
+#[test]
+fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let founder = dir.path().join("founder");
+
+    // reserve a UDP port for the coordinator, then leave it dark for boot.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp port probe");
+    let coord_addr = probe.local_addr().expect("probe addr");
+    drop(probe);
+
+    // distinct listen/http/rpc ports AND a distinct wireguard UDP port: this
+    // test binary runs its tests in parallel, and two spawned nodes on
+    // init's defaults (p2p listen, wireguard 0.0.0.0:51820) collide.
+    let ports = alloc_ports(3);
+    let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
+    let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
+    drop(wg_probe);
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args([
+            "init",
+            "--name",
+            "coordinator-heal",
+            "--dir",
+            founder.to_str().expect("utf-8 founder dir"),
+            "--wireguard-effect",
+            "socket",
+            "--wireguard-listen",
+            &format!("127.0.0.1:{wg_port}"),
+            "--primary-coordinator",
+            &coord_addr.to_string(),
+            "--listen",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--advertised",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--http",
+            &format!("127.0.0.1:{}", ports[1]),
+            "--rpc",
+            &format!("127.0.0.1:{}", ports[2]),
+        ])
+        .output()
+        .expect("run init");
+    assert!(
+        init.status.success(),
+        "init failed:\n{}",
+        command_output(&init)
+    );
+
+    let log_path = dir.path().join("founder-heal.log");
+    let out = std::fs::File::create(&log_path).expect("create node log");
+    let err = out.try_clone().expect("clone node log handle");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .arg("--config")
+        .arg(founder.join("node.toml"))
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .expect("spawn ducktape-node");
+
+    let wait_for = |marker: &str, budget: Duration| -> (bool, String) {
+        let deadline = Instant::now() + budget;
+        loop {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.contains(marker) {
+                return (true, log);
+            }
+            if Instant::now() >= deadline {
+                return (false, log);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // act 1 — dark: the plane reports the outage and keeps the node up.
+    let (saw_unavailable, log) = wait_for("coordinator rendezvous unavailable", Duration::from_secs(25));
+    let still_running = child.try_wait().expect("poll node").is_none();
+    if !saw_unavailable || !still_running {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "the node must stay up and report the dark coordinator (running: \
+             {still_running}):\n{log}"
+        );
+    }
+    assert!(
+        !log.contains("coordinator-observed reflexive"),
+        "nothing answered yet — no reflexive can exist:\n{log}"
+    );
+
+    // act 2 — the coordinator comes up on the same address...
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("coordinator runtime");
+    let _coordinator = rt.spawn(async move {
+        let sock = tokio::net::UdpSocket::bind(coord_addr)
+            .await
+            .expect("bind the late coordinator");
+        nat_traversal::run_coordinator(
+            sock,
+            nat_traversal::AuthPolicy::Open { require_pop: false },
+        )
+        .await;
+    });
+
+    // ...and the running node registers on its own: establishment retries at
+    // 3s doubling to 30s, so one full backoff cycle bounds the wait.
+    let (healed, log) = wait_for("coordinator-observed reflexive", Duration::from_secs(45));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        healed,
+        "the plane must establish rendezvous once the coordinator answers — \
+         without a process restart:\n{log}"
+    );
+}
+
 /// Regression: an UNREACHABLE ambient coordinator must NOT take down the whole
 /// reachability plane. A socket-mode node whose only coordinator is a blackhole
 /// used to hard-fail at plane bring-up ("plane not started"), which then made
