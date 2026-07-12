@@ -53,6 +53,7 @@ use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
 use tracing_subscriber::prelude::*;
+use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
@@ -227,8 +228,7 @@ fn run_node(
         // automations bridging chat events into chat/tasks/inbox follow-ups,
         // jobs for deferred work, pages + forge for the substrate-backed
         // stores, and files (duckfs) for the content plane.
-        let chat = Chat::init(context.child("chat"), "chat")
-            .await
+        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         // the task plane: recipe manifests + capability dispatch with
@@ -263,8 +263,7 @@ fn run_node(
         // the pages effects lane (pages.comment / pages.set_checked) writes
         // to; unwired, both degrade to breadcrumbs.
         .with_pages_module("pages");
-        let pages = Pages::init(context.child("pages"), "pages")
-            .await
+        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
             .with_tagging("tagging");
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the

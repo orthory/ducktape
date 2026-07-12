@@ -999,6 +999,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "tasks",
 ]
 
@@ -1668,12 +1669,7 @@ name = "chat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-parallel",
  "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
  "data-plane",
  "host",
  "indexer",
@@ -1681,6 +1677,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "sha2",
  "statesync",
  "tagging",
  "tempfile",
@@ -2223,6 +2220,7 @@ dependencies = [
  "node",
  "rand_core 0.6.4",
  "sdk",
+ "statesync",
 ]
 
 [[package]]
@@ -4595,6 +4593,7 @@ dependencies = [
  "sdk",
  "serde_json",
  "sha2",
+ "statesync",
  "upgrade",
  "valset",
  "wasm-host",
@@ -5354,16 +5353,12 @@ name = "kv"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-parallel",
  "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
  "host",
  "sdk",
  "serde",
  "serde_json",
+ "sha2",
  "statesync",
 ]
 
@@ -5374,7 +5369,6 @@ dependencies = [
  "alloy-primitives",
  "async-trait",
  "commonware-runtime",
- "commonware-storage",
  "futures",
  "hex",
  "host",
@@ -5386,6 +5380,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "tempfile",
  "valset",
  "zeroize",
@@ -5945,6 +5940,7 @@ dependencies = [
  "kv",
  "saga",
  "sdk",
+ "statesync",
  "thiserror 2.0.18",
 ]
 
@@ -6067,6 +6063,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "tagging",
  "tasks",
  "tempfile",
@@ -6673,17 +6670,13 @@ name = "pages"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-parallel",
  "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
  "host",
  "indexer",
  "sdk",
  "serde",
  "serde_json",
+ "sha2",
  "statesync",
  "tagging",
  "tempfile",
@@ -8198,6 +8191,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "tagging",
  "tasks",
 ]
@@ -8888,6 +8882,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "statesync",
  "tagging",
  "tasks",
  "tempfile",

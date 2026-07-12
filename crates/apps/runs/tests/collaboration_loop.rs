@@ -17,6 +17,7 @@
 //! claimed and dispatched in the submit cascade, and the delivery block
 //! finalizes the board item with the validated response.
 
+use statesync::qmdb::QmdbStore;
 use agent::AgentModule;
 use agent::{
     ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentMsg,
@@ -240,7 +241,7 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
 }
 
 async fn genesis(context: deterministic::Context) -> Host {
-    let chat = Chat::init(context, "chat").await.with_tagging("tagging");
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context, "chat").await)).with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
         Box::new(TaggingModule::new("tagging")),

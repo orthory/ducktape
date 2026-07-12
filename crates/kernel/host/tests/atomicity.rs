@@ -17,6 +17,7 @@ use directory::{
 };
 use host::Host;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, StateRoot};
+use statesync::qmdb::QmdbStore;
 
 const DIR: &str = "directory";
 const KV: &str = "kv";
@@ -83,7 +84,7 @@ impl Module for Fanout {
 #[test]
 fn failed_block_rolls_back_every_module() {
     deterministic::Runner::default().start(|context| async move {
-        let kv = kv::Kv::init(context, KV).await;
+        let kv = kv::Kv::new(KV, Box::new(QmdbStore::init(context, KV).await));
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(Directory::new(DIR)),
@@ -197,7 +198,7 @@ fn budget_exceeded_also_rolls_back() {
 #[test]
 fn successful_multi_write_block_commits_all_together() {
     deterministic::Runner::default().start(|context| async move {
-        let kv = kv::Kv::init(context, KV).await;
+        let kv = kv::Kv::new(KV, Box::new(QmdbStore::init(context, KV).await));
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(Directory::new(DIR)),
@@ -352,7 +353,7 @@ impl Module for KvRywProbe {
 #[test]
 fn read_your_writes_against_qmdb_within_a_block() {
     deterministic::Runner::default().start(|context| async move {
-        let kv = kv::Kv::init(context, KV).await;
+        let kv = kv::Kv::new(KV, Box::new(QmdbStore::init(context, KV).await));
         let mut host = Host::genesis(vec![Box::new(kv), Box::new(KvRywProbe)]).expect("genesis");
 
         let kv0 = host.module_root(KV).unwrap();

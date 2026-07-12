@@ -1,20 +1,26 @@
 //! qmdb-backed chat module: block-based channels, threads, edits, tombstones,
 //! reactions, membership, and hook notifications.
 //!
-//! the module stores one logical record per entity in one commonware qmdb:
-//! a channel index (enumeration only — hashed qmdb keys cannot be listed; its
+//! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
+//! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
+//! to [`Chat::new`], so this crate never names a storage crate. the module
+//! stores one logical record per entity in that store:
+//! a channel index (enumeration only — hashed store keys cannot be listed; its
 //! 1 MiB codec bound is accepted debt), per-channel records, one record per
 //! message head, immutable per-edit revision records, per-emoji reaction sets,
 //! message-id pointers for global dedup, membership records, and small
 //! per-thread / per-message index records that stand in for range scans.
-//! qmdb keys are hashed, so pagination is computed-key point lookups driven by
+//! store keys are hashed, so pagination is computed-key point lookups driven by
 //! the channel's `head_seq` counter — never derived from a stored list.
 //!
 //! authorship is derived from `ctx.env().origin` on every write; payloads
 //! carry no author field. an empty external origin (the pre-consensus default)
 //! is rejected. like `document` and `kv`, writes are staged in memory during a
-//! block and flushed to qmdb in one batch at `commit_block`; the module root is
-//! the real qmdb root and the joiner path is commonware storage sync.
+//! block and flushed to the store in one batch at `commit_block`; the module
+//! root IS the store's merkle root. sync belongs to the store, not this
+//! module: a joiner rebuilds the concrete store from a peer
+//! (`QmdbStore::sync_from`) and wraps a fresh `Chat` around it — this module
+//! only forwards the trait's serve surface.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -37,47 +43,21 @@ pub mod video;
 pub mod call_wire;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
 
-use commonware_codec::RangeCfg;
-use commonware_cryptography::{Hasher, Sha256};
-use commonware_parallel::Sequential;
-use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
-use commonware_storage::{
-    Context, journal, mmr,
-    qmdb::{
-        any::{VariableConfig, unordered::variable::Db},
-        sync::{self, DbResolver, Target, engine::Config as SyncConfig},
-    },
-    translator::TwoCap,
-};
-use commonware_utils::range::NonEmptyRange;
 use sdk::{
-    Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    StateSyncHandle,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::Digest as _;
 use tagging::{TagEvent, TaggingMsg};
-
-/// the qmdb key: a fixed-width digest of a logical chat record key.
-type ChatKey = <Sha256 as Hasher>::Digest;
-
-/// one variable-value qmdb stores all chat records.
-pub type ChatDb<E> = Db<mmr::Family, E, ChatKey, Vec<u8>, Sha256, TwoCap, Sequential>;
-
-/// shared by fresh open and state-sync reconstruction so storage layout cannot
-/// drift between source and joiner.
-type ChatConfig = VariableConfig<TwoCap, ((), (RangeCfg<usize>, ())), Sequential>;
-
-/// a storage-sync target: qmdb root plus the active operation range.
-pub type ChatTarget = Target<mmr::Family, ChatKey>;
 
 const CHANNEL_INDEX_KEY: &[u8] = b"channel-index";
 
-fn hash_key(key: &[u8]) -> ChatKey {
-    let mut h = Sha256::new();
-    h.update(key);
-    h.finalize()
+/// hash a logical record key to its fixed-width store key. deterministic, so
+/// every validator maps a given logical key to the same store slot.
+fn hash_key(key: &[u8]) -> [u8; 32] {
+    sha2::Sha256::digest(key).into()
 }
 
 /// single-component key: prefix + 0 + id. safe because every prefix is a fixed
@@ -230,38 +210,6 @@ fn clamp_limit(limit: u64) -> u64 {
     limit.min(MAX_QUERY_LIMIT)
 }
 
-fn chat_config<E>(context: &E, id: &str) -> ChatConfig
-where
-    E: Context + BufferPooler,
-{
-    let page_cache = CacheRef::from_pooler(
-        context,
-        NonZeroU16::new(128).unwrap(),
-        NonZeroUsize::new(64).unwrap(),
-    );
-    let codec_config = ((), (RangeCfg::from(0..=1 << 20), ()));
-
-    VariableConfig {
-        merkle_config: mmr::full::Config {
-            journal_partition: format!("{id}-merkle-journal"),
-            metadata_partition: format!("{id}-merkle-meta"),
-            items_per_blob: NonZeroU64::new(64).unwrap(),
-            write_buffer: NonZeroUsize::new(1024).unwrap(),
-            strategy: Sequential,
-            page_cache: page_cache.clone(),
-        },
-        journal_config: journal::contiguous::variable::Config {
-            partition: format!("{id}-log"),
-            items_per_section: NonZeroU64::new(64).unwrap(),
-            write_buffer: NonZeroUsize::new(1024).unwrap(),
-            compression: None,
-            codec_config,
-            page_cache,
-        },
-        translator: TwoCap,
-    }
-}
-
 /// what a successful post staged — the inputs of the hook notifications.
 struct Posted {
     seq: u64,
@@ -270,12 +218,11 @@ struct Posted {
 }
 
 /// storage-backed chat module.
-pub struct Chat<E>
-where
-    E: Context + BufferPooler,
-{
+pub struct Chat {
     id: ModuleId,
-    db: ChatDb<E>,
+    /// the host-injected authenticated store: it owns durability, the merkle
+    /// commitment, and the byte-level sync serve surface.
+    store: Box<dyn MerkleStore>,
     /// logical-key -> staged write for the current block; `None` = delete.
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// the tagging plane every post is reported to (one `TagEvent` follow-up
@@ -285,20 +232,13 @@ where
     tagging: Option<ModuleId>,
 }
 
-impl<E> Chat<E>
-where
-    E: Context + BufferPooler,
-{
-    /// open or recover the store on `context` under module identity `id`.
-    pub async fn init(context: E, id: impl Into<ModuleId>) -> Self {
-        let id = id.into();
-        let cfg = chat_config(&context, &id);
-        let db = ChatDb::<E>::init(context, cfg)
-            .await
-            .expect("qmdb init failed");
+impl Chat {
+    /// wrap the host-constructed store under module identity `id`. sync — the
+    /// store arrives already opened (or already synced to a verified root).
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
-            id,
-            db,
+            id: id.into(),
+            store,
             pending: BTreeMap::new(),
             tagging: None,
         }
@@ -321,10 +261,7 @@ where
         if let Some(value) = self.pending.get(key) {
             return Ok(value.clone());
         }
-        self.db
-            .get(&hash_key(key))
-            .await
-            .map_err(|e| Error::Module(format!("qmdb get failed: {e}")))
+        self.store.get(&hash_key(key)).await
     }
 
     async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
@@ -1122,74 +1059,18 @@ where
             .unwrap_or_default();
         Ok(index.into_iter().collect())
     }
-
-    // ---- state-sync ---------------------------------------------------------
-    // the joiner pulls a proven qmdb operation range rather than replaying
-    // exported records. the target root is the trust anchor.
-
-    pub async fn sync_target(&self) -> ChatTarget {
-        let end = self.db.bounds().await.end;
-        let start = self.db.sync_boundary();
-        Target {
-            root: self.db.root(),
-            range: NonEmptyRange::new(start..end)
-                .expect("a committed store has a non-empty op range"),
-        }
-    }
-
-    pub fn into_resolver(self) -> Arc<ChatDb<E>> {
-        Arc::new(self.db)
-    }
-
-    pub async fn sync_from<R>(
-        context: E,
-        id: impl Into<ModuleId>,
-        target: ChatTarget,
-        resolver: R,
-    ) -> Result<Self, String>
-    where
-        R: DbResolver<ChatDb<E>>,
-    {
-        let id = id.into();
-        let db_config = chat_config(&context, &id);
-        let config = SyncConfig {
-            context,
-            resolver,
-            target,
-            max_outstanding_requests: 1,
-            fetch_batch_size: NonZeroU64::new(64).unwrap(),
-            apply_batch_size: 1024,
-            db_config,
-            update_rx: None,
-            finish_rx: None,
-            reached_target_tx: None,
-            max_retained_roots: 8,
-        };
-        // a sync failure (transport blip, dropped source) is the caller's
-        // retry loop to own — never a process kill.
-        let db = sync::sync(config)
-            .await
-            .map_err(|e| format!("qmdb sync: {e:?}"))?;
-        Ok(Self {
-            id,
-            db,
-            pending: BTreeMap::new(),
-            tagging: None,
-        })
-    }
 }
 
 #[async_trait::async_trait(?Send)]
-impl<E> Module for Chat<E>
-where
-    E: Context + BufferPooler,
-{
+impl Module for Chat {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
 
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        StateRoot(self.db.root().0)
+        self.store.root()
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -1203,11 +1084,11 @@ where
     /// (historical proof-carrying op ranges) from committed state. read-only;
     /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        statesync::qmdb::serve_bytes(&self.db, req).await
+        self.store.serve_sync(req).await
     }
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
-        statesync::qmdb::resolver_sync_target(&self.db).await
+        self.store.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -1390,24 +1271,20 @@ where
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged. BTreeMap iteration keeps the
+    /// write order deterministic across validators, and a staged `None` ships
+    /// as a delete of the hashed key.
     async fn commit_block(&mut self) -> Result<(), Error> {
         if self.pending.is_empty() {
             return Ok(());
         }
-
-        let mut batch = self.db.new_batch();
-        for (key, value) in &self.pending {
-            batch = batch.write(hash_key(key), value.clone());
-        }
-        let batch = batch
-            .merkleize(&self.db, None::<Vec<u8>>)
-            .await
-            .expect("merkleize failed");
-        self.db
-            .apply_batch(batch)
-            .await
-            .expect("apply_batch failed");
-        self.db.commit().await.expect("commit failed");
+        let writes = self
+            .pending
+            .iter()
+            .map(|(key, value)| (hash_key(key), value.clone()))
+            .collect();
+        self.store.commit_batch(writes).await?;
         self.pending.clear();
         Ok(())
     }

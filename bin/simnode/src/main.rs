@@ -87,6 +87,7 @@ use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
+use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
@@ -371,8 +372,7 @@ fn run_sim(
     executor.start(|context| async move {
         // genesis: noded's exact module set (keep in sync with MODULE_IDS) so
         // app queries and status roots behave like a real daemon's.
-        let chat = Chat::init(context.child("chat"), "chat")
-            .await
+        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
@@ -398,8 +398,7 @@ fn run_sim(
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
         .with_pages_module("pages");
-        let pages = Pages::init(context.child("pages"), "pages")
-            .await
+        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
             .with_tagging("tagging");
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")

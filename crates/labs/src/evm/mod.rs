@@ -9,8 +9,6 @@ pub use interface::*;
 
 pub mod index;
 
-use commonware_runtime::BufferPooler;
-use commonware_storage::Context as StorageContext;
 use kv::Kv;
 use revm::{
     Context as RevmContext, ExecuteCommitEvm, MainBuilder, MainContext,
@@ -21,7 +19,7 @@ use revm::{
     state::AccountInfo,
 };
 use sdk::{
-    Ctx, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
     StateSyncHandle,
 };
 use serde::{Deserialize, Serialize};
@@ -46,29 +44,25 @@ struct SnapshotSlot {
     value: [u8; 32],
 }
 
-pub struct EvmModule<E>
-where
-    E: StorageContext + BufferPooler,
-{
+pub struct EvmModule {
     id: ModuleId,
-    store: Kv<E>,
+    store: Kv,
     committed: InMemoryDB,
     pending: Option<InMemoryDB>,
 }
 
-impl<E> EvmModule<E>
-where
-    E: StorageContext + BufferPooler,
-{
-    pub async fn init(context: E, id: impl Into<ModuleId>) -> Result<Self, Error> {
+impl EvmModule {
+    /// Wrap the host-injected merkle store (the host constructs the concrete
+    /// qmdb store and hands it in as `Box<dyn MerkleStore>`).
+    pub async fn init(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Result<Self, Error> {
         let id = id.into();
-        let store = Kv::init(context, id.clone()).await;
+        let store = Kv::new(id.clone(), store);
         Self::from_store(id, store).await
     }
 
     /// Rehydrate the EVM adapter around an already verified QMDB store. State
-    /// sync uses this after [`Kv::sync_from`] reconstructs the module root.
-    pub async fn from_store(id: impl Into<ModuleId>, store: Kv<E>) -> Result<Self, Error> {
+    /// sync uses this after `QmdbStore::sync_from` reconstructs the module root.
+    pub async fn from_store(id: impl Into<ModuleId>, store: Kv) -> Result<Self, Error> {
         let id = id.into();
         let committed = match store.get(STATE_KEY).await {
             Some(bytes) => decode_snapshot(&bytes)?,
@@ -170,10 +164,7 @@ where
 }
 
 #[async_trait::async_trait(?Send)]
-impl<E> Module for EvmModule<E>
-where
-    E: StorageContext + BufferPooler,
-{
+impl Module for EvmModule {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
@@ -437,6 +428,7 @@ fn word_bytes(word: &B256) -> [u8; 32] {
 mod tests {
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     use host::{BlockContext, Host};
+    use statesync::qmdb::QmdbStore;
 
     use super::*;
 
@@ -465,7 +457,8 @@ mod tests {
     #[test]
     fn deploys_and_persists_contract_storage_in_qmdb() {
         deterministic::Runner::default().start(|context| async move {
-            let evm = EvmModule::init(context.child("evm"), "evm").await.unwrap();
+            let store = QmdbStore::init(context.child("evm"), "evm").await;
+            let evm = EvmModule::init("evm", Box::new(store)).await.unwrap();
             let mut host = Host::genesis(vec![Box::new(evm)]).unwrap();
             let root_before = host.module_root("evm").unwrap();
 
@@ -538,7 +531,8 @@ mod tests {
 
             let committed_root = host.module_root("evm").unwrap();
             drop(host);
-            let reopened = EvmModule::init(context.child("evm"), "evm").await.unwrap();
+            let store = QmdbStore::init(context.child("evm"), "evm").await;
+            let reopened = EvmModule::init("evm", Box::new(store)).await.unwrap();
             assert_eq!(reopened.root(), committed_root);
             let reopened = Host::genesis(vec![Box::new(reopened)]).unwrap();
             let reply = reopened

@@ -1,9 +1,6 @@
-use super::{Block, BlockKind, BufferPooler, Context, PageError, PageMsg, Pages, to_page_err};
+use super::{Block, BlockKind, PageError, PageMsg, Pages, to_page_err};
 
-impl<E> Pages<E>
-where
-    E: Context + BufferPooler,
-{
+impl Pages {
     pub(super) async fn apply_page_op(&mut self, msg: PageMsg) -> Result<(), PageError> {
         match msg {
             PageMsg::CreatePage {

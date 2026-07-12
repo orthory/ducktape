@@ -1,4 +1,4 @@
-use super::{Block, BlockKind, BufferPooler, Context, PageError, PageMsg, Pages, to_page_err};
+use super::{Block, BlockKind, PageError, PageMsg, Pages, to_page_err};
 
 /// resolve an `after` sibling anchor to the insert index within `children`:
 /// `None` -> first child (0); `Some(id)` -> one past the anchor's position,
@@ -14,10 +14,7 @@ fn idx_after(children: &[String], after: &Option<String>) -> Result<usize, PageE
     }
 }
 
-impl<E> Pages<E>
-where
-    E: Context + BufferPooler,
-{
+impl Pages {
     pub(super) async fn apply_block_op(&mut self, msg: PageMsg) -> Result<(), PageError> {
         match msg {
             PageMsg::InsertBlock {

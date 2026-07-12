@@ -8,18 +8,16 @@ sdk = { workspace = true }
 tagging = { workspace = true }
 serde = { workspace = true }
 indexer = { workspace = true }
-# kernel state-sync platform surface: the shared qmdb serve/wire helpers.
-statesync = { workspace = true }
 async-trait = "0.1"
 serde_json = "1"
-commonware-storage = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-cryptography = { workspace = true }
-commonware-parallel = "2026.5.0"
-commonware-codec = "2026.5.0"
-commonware-utils = { workspace = true }
+# the logical-key -> store-key hash (sha256); the store itself is injected.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+# the tests drive the module the way a host does: construct the concrete
+# QmdbStore and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }

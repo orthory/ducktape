@@ -27,7 +27,7 @@ fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageM
 #[test]
 fn add_comment_reports_structured_agent_mentions_to_tagging() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await.with_tagging("tagging");
+        let mut p = pages_on!(context, "pages").with_tagging("tagging");
         let mut op = add("t1", "c1", "page-1", "@qa-luna please review");
         let PageMsg::AddComment { mentions, .. } = &mut op else {
             unreachable!()
@@ -60,7 +60,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
 #[test]
 fn add_comment_rejects_over_length_ids_before_staging() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         let long_thread = "t".repeat(MAX_THREAD_ID_BYTES + 1);
         apply_err_as(
             &mut p,
@@ -103,7 +103,7 @@ fn add_comment_rejects_over_length_ids_before_staging() {
 #[test]
 fn add_comment_rejects_escaping_char_ids() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         for (t, c, tg) in [
             ("th\u{1}read", "m1", "b1"), // control char in thread_id
             ("t1", "com\"ment", "b1"),   // quote in comment_id
@@ -161,7 +161,7 @@ fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
 #[test]
 fn as_agent_refines_a_module_origin_into_an_agent_author() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit_as(
             &mut p,
             &add_as_agent("t1", "m1", "b1", "bot"),
@@ -181,7 +181,7 @@ fn as_agent_refines_a_module_origin_into_an_agent_author() {
 #[test]
 fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_err_as(
             &mut p,
             &add_as_agent("t1", "m1", "b1", "bot"),
@@ -202,7 +202,7 @@ fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
 #[test]
 fn get_comment_serves_the_record_tombstones_included() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         assert_eq!(query_comment(&p, "m1").await, None, "absent id is None");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
         assert!(query_comment(&p, "m1").await.is_some());
@@ -225,7 +225,7 @@ fn get_comment_serves_the_record_tombstones_included() {
 #[test]
 fn comment_add_opens_then_appends_and_batches_by_target() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
         apply_commit_as(&mut p, &add("t1", "m2", "b1", "second"), user("bob")).await;
         apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
@@ -259,7 +259,7 @@ fn comment_add_opens_then_appends_and_batches_by_target() {
 #[test]
 fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
         apply_err_as(
             &mut p,
@@ -288,7 +288,7 @@ fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
 #[test]
 fn comment_edit_and_delete_are_author_only() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
         apply_err_as(
             &mut p,
@@ -327,7 +327,7 @@ fn comment_edit_and_delete_are_author_only() {
 #[test]
 fn comment_deleting_last_live_removes_the_thread() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
         apply_commit_as(&mut p, &add("t1", "m2", "b1", "b"), user("alice")).await;
         apply_commit_as(
@@ -362,7 +362,7 @@ fn comment_deleting_last_live_removes_the_thread() {
 #[test]
 fn comment_resolve_toggles_and_records_resolver() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
         apply_commit_as(
             &mut p,
@@ -405,7 +405,7 @@ fn comment_resolve_toggles_and_records_resolver() {
 #[test]
 fn comment_caps_and_reserved_ids_reject() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         let huge = "x".repeat(MAX_COMMENT_TEXT_BYTES + 1);
         apply_err_as(
             &mut p,
@@ -438,7 +438,7 @@ fn comment_caps_and_reserved_ids_reject() {
 #[test]
 fn comments_and_blocks_coexist_and_move_the_root() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         let before = p.root();
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "note on b1"), user("alice")).await;
@@ -457,7 +457,7 @@ fn comments_and_blocks_coexist_and_move_the_root() {
 #[test]
 fn deleting_a_block_purges_its_comment_threads() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
         apply_commit_as(&mut p, &add("t2", "m2", "p1", "on the page"), user("alice")).await;

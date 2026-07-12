@@ -25,6 +25,8 @@ dispatch = { workspace = true }
 modreg = { workspace = true }
 
 [dev-dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 # the live-code-update proof stands a real wasm module on the host and swaps its
 # component across a code-registry activation boundary (modreg is a normal dep).
 wasm-host = { workspace = true }

@@ -11,6 +11,7 @@ use greeter::Greeter;
 use host::Host;
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 use wasm_host::WasmModule;
+use statesync::qmdb::QmdbStore;
 
 /// GENERATED artifact — built from `crates/examples/directory-wasm` by the
 /// module build target; committed so this proof is self-contained.
@@ -58,7 +59,7 @@ fn greeter_composes_with_a_wasm_directory() {
 
 fn greet_through(directory: impl Fn() -> Box<dyn Module> + Send + 'static) {
     deterministic::Runner::default().start(|context| async move {
-        let kv = kv::Kv::init(context, "kv").await;
+        let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context, "kv").await));
         let mut host = Host::genesis(vec![
             Box::new(kv),
             directory(),

@@ -348,6 +348,37 @@ pub trait Ctx {
     fn emit_event(&mut self, ev: Event);
 }
 
+/// the deterministic merkle-KV storage surface a disk-backed module touches —
+/// the HOST constructs the concrete store (qmdb today) and INJECTS this handle,
+/// so the module is pure logic over it and never names a storage crate. keys
+/// are the module's own 32-byte digests (the module owns its logical→digest
+/// hashing and its staged overlay); the handle owns durability, the merkle
+/// commitment, and the byte-level sync serve surface.
+#[async_trait::async_trait(?Send)]
+pub trait MerkleStore {
+    /// read one hashed key from COMMITTED state.
+    async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
+
+    /// apply + durably commit ONE batch of hashed-key writes (`None` = delete)
+    /// at a block boundary. after this returns, [`MerkleStore::root`] reflects
+    /// the batch.
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), Error>;
+
+    /// the merkle root over committed state — the module's `root()` verbatim.
+    fn root(&self) -> StateRoot;
+
+    /// the committed resolver sync target (root + op-log bounds) behind
+    /// [`StateSyncHandle::ResolverBacked`].
+    async fn sync_target(&self) -> Result<ResolverSyncTarget, Error>;
+
+    /// serve one byte-level state-sync request against committed state (the
+    /// qmdb sync wire; request/response bytes are handle-defined).
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error>;
+}
+
 /// the host-facing surface of a feature module: identity, authenticated root, the
 /// async dispatch entry point, and a read-only query projection.
 ///

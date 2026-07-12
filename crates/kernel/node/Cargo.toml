@@ -22,6 +22,8 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 
 [dev-dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 # tests stand hosts over in-memory directory modules and drive the async seams
 # on a plain futures executor.
 directory = { workspace = true }

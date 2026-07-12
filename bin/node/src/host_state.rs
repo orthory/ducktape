@@ -29,7 +29,7 @@ use runs::RunsModule;
 use saga::{LeasePolicy, SagaModule};
 use sha2::Digest as _;
 use sdk::StateRoot;
-use statesync::{fetch_snapshot, qmdb::RemoteQmdbResolver};
+use statesync::{fetch_snapshot, qmdb::{QmdbStore, RemoteQmdbResolver}};
 use tagging::TaggingModule;
 use tasks::Tasks;
 use upgrade::Upgrade;
@@ -155,9 +155,9 @@ pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_
 /// until it builds one. `constants::MODULE_IDS` mirrors this set for the
 /// status surfaces; the parity test below pins the two together.
 struct ProductionModules {
-    kv: Kv<commonware_runtime::tokio::Context>,
-    pages: Pages<commonware_runtime::tokio::Context>,
-    chat: Chat<commonware_runtime::tokio::Context>,
+    kv: Kv,
+    pages: Pages,
+    chat: Chat,
     forge: Forge,
     valset: Valset,
     governance: Governance,
@@ -230,12 +230,10 @@ pub(super) async fn genesis_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Host {
-    let kv = Kv::init(context.child("kv"), "kv").await;
-    let pages = Pages::init(context.child("pages"), "pages")
-        .await
+    let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
         .with_tagging("tagging");
-    let chat = Chat::init(context.child("chat"), "chat")
-        .await
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
         .with_tagging("tagging");
     // seed the blob plane with the genesis components, so this node can serve
     // (and re-fetch) every wasm tenant's initial code by content hash.
@@ -369,12 +367,10 @@ pub(super) async fn restore_host(
     // mismatch is classification, not a failed install attempt, and the
     // archived workspace must remain byte-for-byte untouched.
     preflight_recovery_schema(manifest)?;
-    let kv = Kv::init(context.child("kv"), "kv").await;
-    let pages = Pages::init(context.child("pages"), "pages")
-        .await
+    let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
         .with_tagging("tagging");
-    let chat = Chat::init(context.child("chat"), "chat")
-        .await
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
         .with_tagging("tagging");
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -687,31 +683,46 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     };
 
     let (target, resolver) = fetch_target("kv").await?;
-    let kv = Kv::sync_from(
-        scratch_context.child(child_label("kv")),
+    let kv = Kv::new(
         "kv",
-        target,
-        resolver,
-    )
-    .await?;
+        Box::new(
+            QmdbStore::sync_from(
+                scratch_context.child(child_label("kv")),
+                "kv",
+                target,
+                resolver,
+            )
+            .await?,
+        ),
+    );
 
     let (target, resolver) = fetch_target("pages").await?;
-    let pages = Pages::sync_from(
-        scratch_context.child(child_label("pages")),
+    let pages = Pages::new(
         "pages",
-        target,
-        resolver,
-    )
-    .await?;
+        Box::new(
+            QmdbStore::sync_from(
+                scratch_context.child(child_label("pages")),
+                "pages",
+                target,
+                resolver,
+            )
+            .await?,
+        ),
+    );
 
     let (target, resolver) = fetch_target("chat").await?;
-    let chat = Chat::sync_from(
-        scratch_context.child(child_label("chat")),
+    let chat = Chat::new(
         "chat",
-        target,
-        resolver,
+        Box::new(
+            QmdbStore::sync_from(
+                scratch_context.child(child_label("chat")),
+                "chat",
+                target,
+                resolver,
+            )
+            .await?,
+        ),
     )
-    .await?
     .with_tagging("tagging");
 
 

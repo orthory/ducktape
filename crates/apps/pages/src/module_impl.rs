@@ -1,8 +1,8 @@
 use super::{
-    AuthorRef, BlockKind, BufferPooler, Context, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId,
-    Msg, PAGE_INDEX_KEY, PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget,
-    StateRoot, StateSyncHandle, TagEvent, TaggingMsg, TargetThreads, decode_msg, decode_query,
-    encode_reply, hash_key,
+    AuthorRef, BlockKind, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId, Msg, PAGE_INDEX_KEY,
+    PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget, StateRoot,
+    StateSyncHandle, TagEvent, TaggingMsg, TargetThreads, decode_msg, decode_query, encode_reply,
+    hash_key,
 };
 
 fn tag_author(author: &AuthorRef) -> tagging::Author {
@@ -28,17 +28,14 @@ fn tag_ref(author: &AuthorRef) -> Option<tagging::EntityRef> {
 }
 
 #[async_trait::async_trait(?Send)]
-impl<E> Module for Pages<E>
-where
-    E: Context + BufferPooler,
-{
+impl Module for Pages {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
 
-    /// the REAL qmdb merkle root over all blocks, as a 32-byte state root.
+    /// the store's REAL merkle root over all blocks, as a 32-byte state root.
     fn root(&self) -> StateRoot {
-        StateRoot(self.db.root().0)
+        self.store.root()
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -51,15 +48,15 @@ where
     /// the network state-sync serve lane: answers the shared qmdb wire
     /// requests from committed state. read-only.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        statesync::qmdb::serve_bytes(&self.db, req).await
+        self.store.serve_sync(req).await
     }
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
-        statesync::qmdb::resolver_sync_target(&self.db).await
+        self.store.sync_target().await
     }
 
     /// decode a [`crate::PageMsg`] and apply it to the staged overlay. the only
-    /// `.await` is on own qmdb state — deterministic, so replay-safe.
+    /// `.await` is on own store state — deterministic, so replay-safe.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let m = decode_msg(&msg.payload).map_err(Error::Module)?;
         let tagged_comment = match &m {
@@ -110,7 +107,7 @@ where
         Ok(())
     }
 
-    /// real async read of own qmdb state, serving STAGED-over-committed via
+    /// real async read of own store state, serving STAGED-over-committed via
     /// the overlay, so reads within a block observe this block's writes. the
     /// reserved sentinel reads as absence (it is not a block).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
@@ -186,31 +183,25 @@ where
         }
     }
 
-    /// publish the block-height's staged records in ONE qmdb batch: writes AND
-    /// deletes (`batch.write(key, None)` drops a key). no-op (and no root
-    /// movement) if nothing was staged.
+    /// publish the block-height's staged records in ONE store batch: writes
+    /// AND deletes (a `None` value drops a key). no-op (and no root movement)
+    /// if nothing was staged. BTreeMap iteration keeps the write order
+    /// deterministic across validators.
     async fn commit_block(&mut self) -> Result<(), Error> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let mut batch = self.db.new_batch();
-        for (key, value) in &self.pending {
-            batch = batch.write(hash_key(key), value.clone());
-        }
-        let batch = batch
-            .merkleize(&self.db, None::<Vec<u8>>)
-            .await
-            .expect("merkleize failed");
-        self.db
-            .apply_batch(batch)
-            .await
-            .expect("apply_batch failed");
-        self.db.commit().await.expect("commit failed");
+        let writes = self
+            .pending
+            .iter()
+            .map(|(key, value)| (hash_key(key), value.clone()))
+            .collect();
+        self.store.commit_batch(writes).await?;
         self.pending.clear();
         Ok(())
     }
 
-    /// discard the staged records — nothing reached qmdb, so `root()` is
+    /// discard the staged records — nothing reached the store, so `root()` is
     /// unchanged.
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();

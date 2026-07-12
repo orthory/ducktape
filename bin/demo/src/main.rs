@@ -7,6 +7,7 @@
 //!
 //! run: `cargo run -p demo`
 
+use statesync::qmdb::QmdbStore;
 use agent::AgentModule;
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
@@ -70,14 +71,13 @@ fn main() {
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
-        let kv = kv::Kv::init(context.child("kv"), "kv").await;
+        let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
         let forge = Forge::init("forge", forge_repo.clone())
             .expect("forge init")
             .with_chat("chat");
-        let chat = Chat::init(context.child("chat"), "chat")
-            .await
+        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");

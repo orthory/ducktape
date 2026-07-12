@@ -20,11 +20,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-storage = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
+# the tests drive the EVM module the way a host does: construct the concrete
+# QmdbStore on the deterministic runtime and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
 tempfile = { workspace = true }
 futures = "0.3"
 hex = "0.4"

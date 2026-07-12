@@ -48,6 +48,7 @@ use tasks::Tasks;
 use super::plane_tests::{committed_block, files_reply};
 use super::*;
 use crate::NodeCommand;
+use statesync::qmdb::QmdbStore;
 
 /// the agent under test, and the node that will claim its run's lease. the node
 /// key IS the pool's identity — the same bytes `runs` checks the bind's origin
@@ -123,8 +124,7 @@ fn alice() -> Origin {
 /// the genesis set the collaboration loop runs on — chat + the tagging plane +
 /// the dispatch plane + the registry + runs.
 async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
-    let chat = Chat::init(context.child("chat"), "chat")
-        .await
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
         .with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
