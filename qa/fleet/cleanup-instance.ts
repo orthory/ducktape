@@ -5,20 +5,19 @@ const home = required('FLEET_HOME')
 const id = required('FLEET_INSTANCE_ID')
 const workspace = join(home, '.ducktape', 'workspaces', id)
 const pidfile = join(workspace, 'node.pid')
+const configPath = join(workspace, 'node.toml')
 
 let pid: number
 try { pid = Number((await readFile(pidfile, 'utf8')).trim()) } catch { process.exit(0) }
 if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('workspace node pidfile is invalid')
 
 const expectedExecutable = await realpath(join(required('FLEET_ARTIFACT_DIR'), 'bin', 'ducktape-node'))
-const config = await realpath(join(workspace, 'node.toml'))
+const config = await realpath(configPath)
 const owned = await identity(pid)
 if (!owned) { await rm(pidfile, { force: true }); process.exit(0) }
 if (owned.pgid !== pid) throw new Error('workspace node is not the leader of its process group')
-const executable = await realpath(`/proc/${pid}/exe`)
-const argv = (await readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0').filter(Boolean)
-const configIndex = argv.indexOf('--config')
-if (executable !== expectedExecutable || configIndex < 0 || !argv[configIndex + 1] || await realpath(argv[configIndex + 1]!) !== config) {
+const executable = await processExecutable(pid)
+if (executable !== expectedExecutable || !await processUsesConfig(pid, [configPath, config])) {
   throw new Error('workspace node pidfile does not identify this Fleet instance')
 }
 
@@ -51,11 +50,38 @@ function required(name: string): string {
 }
 
 async function identity(target: number): Promise<{ pgid: number; startTime: string } | undefined> {
-  try {
+  if (process.platform === 'linux') try {
     const stat = await readFile(`/proc/${target}/stat`, 'utf8')
     const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
     return { pgid: Number(fields[2]), startTime: fields[19]! }
   } catch { return undefined }
+  const result = Bun.spawnSync(['ps', '-p', String(target), '-o', 'pgid=', '-o', 'lstart='])
+  if (result.exitCode !== 0) return undefined
+  const match = result.stdout.toString().trim().match(/^(\d+)\s+(.+)$/)
+  return match ? { pgid: Number(match[1]), startTime: match[2]! } : undefined
+}
+
+async function processExecutable(target: number): Promise<string | undefined> {
+  if (process.platform === 'linux') {
+    try { return await realpath(`/proc/${target}/exe`) } catch { return undefined }
+  }
+  const result = Bun.spawnSync(['lsof', '-a', '-p', String(target), '-d', 'txt', '-Fn'])
+  if (result.exitCode !== 0) return undefined
+  const path = result.stdout.toString().split('\n').find((line) => line.startsWith('n'))?.slice(1)
+  if (!path) return undefined
+  try { return await realpath(path) } catch { return undefined }
+}
+
+async function processUsesConfig(target: number, expected: string[]): Promise<boolean> {
+  if (process.platform === 'linux') {
+    const argv = (await readFile(`/proc/${target}/cmdline`, 'utf8')).split('\0').filter(Boolean)
+    const index = argv.indexOf('--config')
+    return index >= 0 && Boolean(argv[index + 1]) && expected.includes(await realpath(argv[index + 1]!))
+  }
+  const result = Bun.spawnSync(['ps', '-ww', '-p', String(target), '-o', 'command='])
+  if (result.exitCode !== 0) return false
+  const command = result.stdout.toString().trim()
+  return expected.some((path) => command.includes(`--config ${path}`) || command.includes(`--config=${path}`))
 }
 
 async function sameProcess(target: number, startTime: string): Promise<boolean> {
@@ -63,6 +89,11 @@ async function sameProcess(target: number, startTime: string): Promise<boolean> 
 }
 
 function groupAlive(pgid: number): boolean {
+  if (process.platform !== 'linux') {
+    const result = Bun.spawnSync(['ps', '-axo', 'pgid='])
+    if (result.exitCode !== 0) throw new Error(`could not inspect process groups: ${result.stderr}`)
+    return result.stdout.toString().split('\n').some((line) => Number(line.trim()) === pgid)
+  }
   try { process.kill(-pgid, 0); return true } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
     throw error

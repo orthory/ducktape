@@ -19,20 +19,30 @@ test('Fleet config is CEF-only and points at owned hooks', async () => {
     runtimes: { default: 'cef', cef: { build: ['bash', 'qa/fleet/build-cef.sh'] } }
   })
   expect(Bun.spawnSync(['bash', '-n', join(root, 'qa/fleet/build-cef.sh')]).exitCode).toBe(0)
-  expect(await Bun.file(join(root, 'qa/fleet/build-cef.sh')).text()).toContain('VITE_TAURI_AGENT=1')
-  expect(await Bun.file(join(root, 'qa/fleet/build-cef.sh')).text()).toContain('tauri-agent-artifact/v1')
+  const buildHook = await Bun.file(join(root, 'qa/fleet/build-cef.sh')).text()
+  expect(buildHook).toContain('VITE_TAURI_AGENT=1')
+  expect(buildHook).toContain('tauri-agent-artifact/v1')
+  expect(buildHook).toContain('Darwin)')
+  expect(buildHook).toContain('Chromium Embedded Framework.framework')
+  expect(buildHook).toContain('artifact_env=\'{ "LD_LIBRARY_PATH": "." }\'')
   expect(await Bun.file(join(root, 'app/src/main.tsx')).text()).toContain(
     'import.meta.env.VITE_TAURI_AGENT === "1"'
   )
-  const smoke = await Bun.file(join(root, '.tauri-agent/suites/cef-smoke.json')).json()
-  expect(smoke).toMatchObject({
-    protocol: 'tauri-agent-suite/v1', id: 'cef-smoke', runtime: 'cef',
-    budget: { steps: 3, seconds: 30, tokens: 1000, repetitions: 2 }
-  })
-  expect(smoke.pass).toEqual([{ expect: { role: 'button', name: 'Create account', present: true } }])
+  const smoke = await Bun.file(join(root, '.tauri-agent/suites/cef-smoke.toon')).text()
+  for (const expected of [
+    'protocol: tauri-agent-suite/v1',
+    'id: cef-smoke',
+    'runtime: cef',
+    'role: button',
+    'name: Create account',
+    'steps: 3',
+    'seconds: 30',
+    'tokens: 1000',
+    'repetitions: 2'
+  ]) expect(smoke).toContain(expected)
 })
 
-test('cleanup hook terminates only the recorded instance node group', async () => {
+test('cleanup hook terminates only the recorded instance node group on this platform', async () => {
   const scratch = await mkdtemp(join(tmpdir(), 'ducktape-fleet-cleanup-'))
   const artifact = join(scratch, 'artifact')
   const home = join(scratch, 'home')

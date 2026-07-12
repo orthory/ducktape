@@ -23,12 +23,46 @@ install -m 755 "$target_dir/debug/ducktape-node" "$root/app/src-tauri/binaries/d
 install -d -m 700 "$FLEET_ARTIFACT_DIR/bin"
 install -m 755 "$target_dir/debug/ducktape-desktop" "$FLEET_ARTIFACT_DIR/bin/ducktape"
 install -m 755 "$target_dir/debug/ducktape-node" "$FLEET_ARTIFACT_DIR/bin/ducktape-node"
-for file in libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
-  chrome-sandbox chrome_100_percent.pak chrome_200_percent.pak icudtl.dat \
-  resources.pak v8_context_snapshot.bin vk_swiftshader_icd.json; do
-  install -m 755 "$target_dir/debug/$file" "$FLEET_ARTIFACT_DIR/bin/$file"
-done
-cp -a "$target_dir/debug/locales" "$FLEET_ARTIFACT_DIR/bin/"
+
+artifact_env='{}'
+case "$(uname -s)" in
+  Darwin)
+    cef_version="$(cd "$root" && cargo metadata --format-version 1 | bun -e '
+      const metadata = await Bun.stdin.json()
+      const pkg = metadata.packages.find((candidate) => candidate.name === "cef")
+      if (!pkg) throw new Error("cargo metadata contains no cef package")
+      const version = pkg.version.split("+")[1]
+      if (!version) throw new Error(`cef package version has no distribution suffix: ${pkg.version}`)
+      console.log(version)
+    ')"
+    case "$(uname -m)" in
+      arm64) cef_arch=aarch64 ;;
+      x86_64) cef_arch=x86_64 ;;
+      *) echo "unsupported macOS CEF architecture: $(uname -m)" >&2; exit 71 ;;
+    esac
+    framework="$CEF_PATH/Chromium Embedded Framework.framework"
+    if [ ! -f "$framework/Chromium Embedded Framework" ]; then
+      framework="$CEF_PATH/$cef_version/cef_macos_$cef_arch/Chromium Embedded Framework.framework"
+    fi
+    [ -f "$framework/Chromium Embedded Framework" ] || {
+      echo "CEF framework not found for macOS $cef_arch at $framework" >&2
+      exit 71
+    }
+    install -d -m 700 "$FLEET_ARTIFACT_DIR/Frameworks"
+    cp -a "$framework" "$FLEET_ARTIFACT_DIR/Frameworks/"
+    ;;
+  *)
+    for file in libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
+      chrome-sandbox chrome_100_percent.pak chrome_200_percent.pak icudtl.dat \
+      resources.pak v8_context_snapshot.bin vk_swiftshader_icd.json; do
+      install -m 755 "$target_dir/debug/$file" "$FLEET_ARTIFACT_DIR/bin/$file"
+    done
+    cp -a "$target_dir/debug/locales" "$FLEET_ARTIFACT_DIR/bin/"
+    artifact_env='{ "LD_LIBRARY_PATH": "." }'
+    ;;
+esac
+
+export FLEET_ARTIFACT_ENV="$artifact_env"
 
 bun -e '
   await Bun.write(process.env.FLEET_ARTIFACT_MANIFEST, JSON.stringify({
@@ -36,6 +70,6 @@ bun -e '
     executable: "bin/ducktape",
     args: ["--no-sandbox", "--single-process", "--in-process-gpu"],
     cwd: "bin",
-    env: { CEF_PATH: process.env.CEF_PATH, LD_LIBRARY_PATH: "." }
+    env: JSON.parse(process.env.FLEET_ARTIFACT_ENV)
   }) + "\n")
 '
