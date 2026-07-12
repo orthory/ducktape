@@ -67,8 +67,11 @@ import {
   channelIdOf,
   clearPendingDisplayName,
   clearRemoteUrl,
+  docTabsScope,
+  loadDocTabs,
   loadPendingDisplayName,
   removeTab,
+  resetNodeProjection,
   saveAccent,
   saveTheme,
   saveDocTabs,
@@ -524,6 +527,7 @@ export function createActions({
   const patch = (p: Partial<ConsoleState>) => dispatch({ type: "patch", patch: p });
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
+  const isCurrentNode = (live: NodeTransport): boolean => getNode() === live;
 
   /** The live transport + active workspace the account writes sign against.
    *  Throws when disconnected — callers wrap it in a promise chain, so the
@@ -544,6 +548,16 @@ export function createActions({
   // The tag filter's own token, same discipline: setTagFilter/clearTagFilter
   // (and a channel switch) bump it so a stale tagSearch can't land.
   let tagToken = 0;
+
+  /** Clear every node-owned slice and supersede query fan-outs that use local
+   * tokens rather than the provider's transport-bound hydration guard. */
+  const resetForNodeChange = (): Partial<ConsoleState> => {
+    searchToken += 1;
+    tagToken += 1;
+    return resetNodeProjection();
+  };
+  const currentDocTabsScope = (): string =>
+    docTabsScope(getState().workspace?.id ?? null, getState().nodeUrl);
 
   // The live call session (the browser audio graph + camera + ws), or null when
   // not in a huddle. Ephemeral and per-client — it lives here, not in state;
@@ -813,7 +827,7 @@ export function createActions({
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
   ) => {
     const live = getNode();
-    if (!live) return Promise.resolve();
+    if (!live) return Promise.resolve(false);
     const startedAt = Date.now();
     update((prev) => ({
       ...(preconfirm ? preconfirm(prev) : {}),
@@ -822,13 +836,15 @@ export function createActions({
     return Promise.resolve()
       .then(() => submit(live))
       .then((result) => {
+        if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: finalizeOp(prev.ops, key, receiptOf(result)) }));
-        return refresh();
+        return refresh().then(() => true);
       })
       .catch((err) => {
+        if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
         fail(err);
-        return refresh();
+        return refresh().then(() => true);
       });
   };
 
@@ -849,18 +865,24 @@ export function createActions({
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
-      .then((messages) => patch({ messages }))
-      .catch(fail);
+      .then((messages) =>
+        update((prev) =>
+          isCurrentNode(live) && prev.activeChannel === channelId ? { messages } : {},
+        ),
+      )
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // A first agent mention in an UNWATCHED channel creates the runs watch the
   // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
   // the post — otherwise the mention commits with nothing routing it to the
   // agent. An existing watch of ANY policy is respected, never overwritten.
-  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<unknown> => {
-    if (!hasAgentMention(blocks)) return Promise.resolve();
+  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<boolean> => {
+    if (!hasAgentMention(blocks)) return Promise.resolve(true);
     if (getState().watches.some((watch) => watch.channel_id === channelId))
-      return Promise.resolve();
+      return Promise.resolve(true);
     return submitTracked(
       opKey.watch(channelId),
       (live) =>
@@ -891,31 +913,33 @@ export function createActions({
     channelId: string,
     body: string,
     thread: number | null,
-  ): Promise<unknown> => {
+  ): Promise<boolean> => {
     const messageId = crypto.randomUUID();
     const blocks = parseMessageInput(body, mentionResolver());
     const author = getState().author;
-    return ensureMentionWatch(channelId, blocks).then(() =>
-      submitTracked(
-        opKey.message(channelId, messageId),
-        (live) =>
-          chatClient.postMessage(live, {
-            channelId,
-            messageId,
-            blocks,
-            origin: author,
-            ...(thread !== null ? { thread } : {}),
-          }),
-        (prev) =>
-          optimistic.postedMessage(prev, {
-            channelId,
-            messageId,
-            blocks,
-            authorBytes: selfAuthorBytes(prev.status, prev.author),
-            at: Date.now(),
-            thread,
-          }),
-      ),
+    return ensureMentionWatch(channelId, blocks).then((current) =>
+      current
+        ? submitTracked(
+            opKey.message(channelId, messageId),
+            (live) =>
+              chatClient.postMessage(live, {
+                channelId,
+                messageId,
+                blocks,
+                origin: author,
+                ...(thread !== null ? { thread } : {}),
+              }),
+            (prev) =>
+              optimistic.postedMessage(prev, {
+                channelId,
+                messageId,
+                blocks,
+                authorBytes: selfAuthorBytes(prev.status, prev.author),
+                at: Date.now(),
+                thread,
+              }),
+          )
+        : false,
     );
   };
 
@@ -931,19 +955,28 @@ export function createActions({
     return chatClient
       .thread(live, { channelId, rootSeq: root.seq })
       .then((activeThread) =>
-        update((prev) => (prev.activeThread?.root.seq === root.seq ? { activeThread } : {})),
+        update((prev) =>
+          isCurrentNode(live) && prev.activeThread?.root.seq === root.seq
+            ? { activeThread }
+            : {},
+        ),
       )
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // load the comment threads for the open page (the page id + every visible
   // block id) in one batch; refreshed on open and after any comment op.
-  const loadPageThreads = (blocksOverride?: PageBlock[]): Promise<void> => {
+  const loadPageThreads = (
+    blocksOverride?: PageBlock[],
+    source?: { live: NodeTransport; page: string },
+  ): Promise<void> => {
     // `blocks` is passed by callers that JUST fetched the tree, because
     // getState().activePageBlocks lags a dispatch (stateRef updates on render);
     // reading it here would ship only the page target and miss every block.
-    const live = getNode();
-    const page = getState().activePage;
+    const live = source?.live ?? getNode();
+    const page = source?.page ?? getState().activePage;
     if (!live || !page) {
       patch({ pageThreads: [] });
       return Promise.resolve();
@@ -960,8 +993,16 @@ export function createActions({
     const batches: string[][] = [];
     for (let i = 0; i < targets.length; i += CHUNK) batches.push(targets.slice(i, i + CHUNK));
     return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
-      .then((results) => patch({ pageThreads: results.flat() }))
-      .catch(fail);
+      .then((results) =>
+        update((prev) =>
+          isCurrentNode(live) && prev.activePage === page
+            ? { pageThreads: results.flat() }
+            : {},
+        ),
+      )
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // load the active page's block tree + its comment threads (threads keyed off
@@ -973,10 +1014,15 @@ export function createActions({
     Promise.resolve()
       .then(() => pagesClient.getPage(live, pageId))
       .then((blocks) => {
-        patch({ activePageBlocks: blocks ?? [] });
-        return loadPageThreads(blocks ?? []);
+        if (!isCurrentNode(live)) return;
+        update((prev) =>
+          prev.activePage === pageId ? { activePageBlocks: blocks ?? [] } : {},
+        );
+        return loadPageThreads(blocks ?? [], { live, page: pageId });
       })
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // the single entry point into a page: make it active (opening a tab), then
@@ -986,7 +1032,7 @@ export function createActions({
     const live = getNode();
     if (!live || !pageId) return;
     const tabs = addTab(getState().openTabs, pageId);
-    saveDocTabs(tabs);
+    saveDocTabs(currentDocTabsScope(), tabs);
     patch({
       activePage: pageId,
       activePageBlocks: [],
@@ -1003,7 +1049,7 @@ export function createActions({
   // would re-stage the just-closed id.
   const closeTabLocal = (pageId: string) => {
     const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
-    saveDocTabs(tabs);
+    saveDocTabs(currentDocTabsScope(), tabs);
     if (active && active !== getState().activePage) {
       patch({ openTabs: tabs, activePage: active, activePageBlocks: [], pageThreads: [] });
       loadActivePage(active);
@@ -1036,9 +1082,13 @@ export function createActions({
     return forgeClient
       .listItems(live, repo)
       .then((items) =>
-        update((prev) => (prev.forgeRepo === repo ? { forgeItems: items } : {})),
+        update((prev) =>
+          isCurrentNode(live) && prev.forgeRepo === repo ? { forgeItems: items } : {},
+        ),
       )
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   const loadForgeBranches = (repo: string): Promise<void> => {
@@ -1048,9 +1098,13 @@ export function createActions({
     return forgeClient
       .listRefs(live, repo)
       .then((refs) =>
-        update((prev) => (prev.forgeRepo === repo ? { forgeBranches: refs } : {})),
+        update((prev) =>
+          isCurrentNode(live) && prev.forgeRepo === repo ? { forgeBranches: refs } : {},
+        ),
       )
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -1070,7 +1124,9 @@ export function createActions({
     // staleness this clear prevents.
     setNode(null);
     patch({
+      ...resetForNodeChange(),
       workspace: target,
+      openTabs: loadDocTabs(docTabsScope(target.id, null)),
       needsOnboarding: false,
       onboardingBusy: false,
       // a force-forget/delete offer is scoped to the workspace it was raised
@@ -1084,11 +1140,6 @@ export function createActions({
       bootError: null,
       connectionDown: null,
       error: null,
-      // per-node observability belonging to the workspace we're leaving; the
-      // node effect re-hydrates blocks and re-follows the block stream once
-      // the new node is set below.
-      lastBlock: null,
-      blocks: [],
       // a non-member target parks first: seed the waiting-room phase NOW so
       // the console shell (still holding the previous workspace's residual
       // projections) can never flash during the async select/poll below.
@@ -1410,7 +1461,9 @@ export function createActions({
             postPolicy,
             at: Date.now(),
           }),
-      ).then(() => enterChannel(channelId));
+      ).then((current) => {
+        if (current) enterChannel(channelId);
+      });
     },
 
     sendMessage: (body) => {
@@ -1430,8 +1483,16 @@ export function createActions({
       if (!live || !channelId) return;
       Promise.resolve()
         .then(() => chatClient.thread(live, { channelId, rootSeq }))
-        .then((activeThread) => patch({ activeThread }))
-        .catch(fail);
+        .then((activeThread) =>
+          update((prev) =>
+            isCurrentNode(live) && prev.activeChannel === channelId
+              ? { activeThread }
+              : {},
+          ),
+        )
+        .catch((err) => {
+          if (isCurrentNode(live)) fail(err);
+        });
     },
 
     closeThread: () => patch({ activeThread: null }),
@@ -1445,7 +1506,9 @@ export function createActions({
       const channelId = getState().activeChannel;
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
-      void postToChannel(channelId, body, root.seq).then(() => resyncOpenThread());
+      void postToChannel(channelId, body, root.seq).then((current) => {
+        if (current) return resyncOpenThread();
+      });
     },
 
     editMessage: (seq, body) => {
@@ -1473,7 +1536,9 @@ export function createActions({
             origin: getState().author,
           }),
         (prev) => optimistic.editedMessage(prev, channelId, seq, blocks, Date.now()),
-      ).then(resyncOpenThread);
+      ).then((current) => {
+        if (current) return resyncOpenThread();
+      });
     },
 
     deleteMessage: (seq) => {
@@ -1484,7 +1549,9 @@ export function createActions({
         (live) =>
           chatClient.deleteMessage(live, { channelId, seq, origin: getState().author }),
         (prev) => optimistic.deletedMessage(prev, channelId, seq),
-      ).then(resyncOpenThread);
+      ).then((current) => {
+        if (current) return resyncOpenThread();
+      });
     },
 
     toggleReaction: (seq, emoji) => {
@@ -1516,7 +1583,8 @@ export function createActions({
             : chatClient.addReaction(live, { channelId, seq, emoji, origin }),
         (prev) =>
           optimistic.reactionToggled(prev, channelId, seq, emoji, selfBytes, Boolean(mine)),
-      ).then(() => {
+      ).then((current) => {
+        if (!current) return;
         const live = getNode();
         const root = getState().activeThread?.root;
         if (!live || !root) return;
@@ -1524,10 +1592,14 @@ export function createActions({
           .thread(live, { channelId, rootSeq: root.seq })
           .then((activeThread) =>
             update((prev) =>
-              prev.activeThread?.root.seq === root.seq ? { activeThread } : {},
+              isCurrentNode(live) && prev.activeThread?.root.seq === root.seq
+                ? { activeThread }
+                : {},
             ),
           )
-          .catch(fail);
+          .catch((err) => {
+            if (isCurrentNode(live)) fail(err);
+          });
       });
     },
 
@@ -1559,7 +1631,8 @@ export function createActions({
             authorBytes: selfAuthorBytes(prev.status, prev.author),
             at: Math.floor(Date.now() / 1000),
           }),
-      ).then(() => {
+      ).then((current) => {
+        if (!current) return;
         // consensus refused the join (members-only, roster full): the audio
         // session must not keep streaming into a huddle we are not in.
         const settled = getState();
@@ -1747,7 +1820,7 @@ export function createActions({
           body,
           origin: getState().author,
         }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     openForgePr: ({ repo, title, body, sourceBranch, targetBranch }) => {
@@ -1761,7 +1834,7 @@ export function createActions({
           targetBranch,
           origin: getState().author,
         }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     editForgeItem: ({ repo, number, title, body }) => {
@@ -1769,14 +1842,14 @@ export function createActions({
       if (!repo || (title === null && body === null)) return Promise.resolve();
       return submitTracked(opKey.forgeItem(repo, number), (live) =>
         forgeClient.editItem(live, { repo, number, title, body, origin: getState().author }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     setForgeItemState: ({ repo, number, open }) => {
       if (!repo) return Promise.resolve();
       return submitTracked(opKey.forgeItem(repo, number), (live) =>
         forgeClient.setItemState(live, { repo, number, open, origin: getState().author }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     mergeForgePr: ({ repo, number, prevTargetOid, expectedSourceOid, mergeOid, packDigest }) => {
@@ -1792,7 +1865,11 @@ export function createActions({
           origin: getState().author,
         }),
         // a merge moves the target branch head too — reload both slices.
-      ).then(() => Promise.all([loadForgeItems(repo), loadForgeBranches(repo)])).then(() => {});
+      ).then((current) =>
+        current
+          ? Promise.all([loadForgeItems(repo), loadForgeBranches(repo)]).then(() => {})
+          : undefined,
+      );
     },
 
     submitForgeReview: ({ repo, number, verdict, body, commitOid, comments }) => {
@@ -1807,7 +1884,7 @@ export function createActions({
           comments,
           origin: getState().author,
         }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     // ── Docs ──
@@ -1816,8 +1893,12 @@ export function createActions({
       if (!live) return;
       Promise.resolve()
         .then(() => pagesClient.listPages(live))
-        .then((pages) => patch({ pages }))
-        .catch(fail);
+        .then((pages) => {
+          if (isCurrentNode(live)) patch({ pages });
+        })
+        .catch((err) => {
+          if (isCurrentNode(live)) fail(err);
+        });
     },
 
     openPage: enterPage,
@@ -1832,7 +1913,9 @@ export function createActions({
         opKey.page(pageId),
         (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
         (prev) => optimistic.pageCreated(prev, { pageId, title: "", parent }),
-      ).then(() => enterPage(pageId));
+      ).then((current) => {
+        if (current) enterPage(pageId);
+      });
     },
 
     // kept for programmatic/test callers that pass a title.
@@ -1842,7 +1925,9 @@ export function createActions({
         opKey.page(pageId),
         (live) => pagesClient.createPage(live, { pageId, title: title.trim() }),
         (prev) => optimistic.pageCreated(prev, { pageId, title: title.trim() }),
-      ).then(() => enterPage(pageId));
+      ).then((current) => {
+        if (current) enterPage(pageId);
+      });
     },
 
     setPageParent: ({ pageId, parent }) => {
@@ -1854,9 +1939,19 @@ export function createActions({
     deletePage: (pageId) => {
       if (!pageId) return;
       submitTracked(opKey.page(pageId), (live) => pagesClient.deletePage(live, pageId))
-        .then(() => {
+        .then((current) => {
+          if (!current) return;
           const live = getNode();
-          if (live) pagesClient.listPages(live).then((pages) => patch({ pages })).catch(fail);
+          if (live) {
+            pagesClient
+              .listPages(live)
+              .then((pages) => {
+                if (isCurrentNode(live)) patch({ pages });
+              })
+              .catch((err) => {
+                if (isCurrentNode(live)) fail(err);
+              });
+          }
         })
         .catch(fail);
       // close its tab immediately (optimistic UX).
@@ -1882,7 +1977,9 @@ export function createActions({
           text: clean,
           mentions,
         }),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     editComment: ({ commentId, text }) => {
@@ -1890,19 +1987,25 @@ export function createActions({
       if (!clean) return;
       submitTracked(opKey.comment(commentId), (live) =>
         pagesClient.editComment(live, { commentId, text: clean }),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     deleteComment: (commentId) => {
       submitTracked(opKey.comment(commentId), (live) =>
         pagesClient.deleteComment(live, commentId),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     resolveThread: ({ threadId, resolved }) => {
       submitTracked(opKey.commentThread(threadId), (live) =>
         pagesClient.resolveThread(live, { threadId, resolved }),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
@@ -2202,11 +2305,11 @@ export function createActions({
           ]),
         )
         .then(([chat, docs]) => {
-          if (token !== searchToken) return; // a newer query superseded this one
+          if (!isCurrentNode(live) || token !== searchToken) return;
           patch({ search: { query, chat, docs }, searchPending: false });
         })
         .catch((err) => {
-          if (token !== searchToken) return;
+          if (!isCurrentNode(live) || token !== searchToken) return;
           patch({ searchPending: false });
           fail(err);
         });
@@ -2233,11 +2336,11 @@ export function createActions({
       chatClient
         .tagSearch(live, { tag: clean, channelId: channelId ?? undefined, limit: 100 })
         .then((hits) => {
-          if (token !== tagToken) return; // superseded by a newer filter/clear
+          if (!isCurrentNode(live) || token !== tagToken) return;
           patch({ tagHits: hits, tagHitsPending: false });
         })
         .catch((err) => {
-          if (token !== tagToken) return;
+          if (!isCurrentNode(live) || token !== tagToken) return;
           patch({ tagHitsPending: false });
           fail(err);
         });
@@ -2256,7 +2359,11 @@ export function createActions({
         .tags(live, { channelId, limit: 20 })
         .then((rows) => {
           // only land on the channel the load was asked for.
-          if (getState().activeChannel === channelId) patch({ channelTags: rows });
+          update((prev) =>
+            isCurrentNode(live) && prev.activeChannel === channelId
+              ? { channelTags: rows }
+              : {},
+          );
         })
         // best-effort: an older node without the index tier 404s the view.
         .catch(() => {});
@@ -2340,29 +2447,8 @@ export function createActions({
       // progressing one just re-runs the idempotent connect).
       if (target.id === getState().workspace?.id && target.member) return;
       const enter = (): void => {
-        // drop the old node + its projections so the switch shows no stale state.
-        setNode(null);
-        patch({
-          connected: false,
-          status: null,
-          channels: [],
-          messages: [],
-          activeChannel: null,
-          activeThread: null,
-          authorNames: {},
-          nodeUsers: {},
-          accountKeys: {},
-          accountHandles: {},
-          pages: [],
-          activePage: null,
-          activePageBlocks: [],
-          agents: [],
-          watches: [],
-          pendingRuns: [],
-          files: [],
-          ops: {},
-          onboardingPhase: null,
-        });
+        // connectActive synchronously drops the old transport and clears the
+        // complete node projection before its first async workspace call.
         connectActive(target).catch(fail);
       };
       if (target.member) {
@@ -2405,34 +2491,9 @@ export function createActions({
       // (mirrors selectWorkspace's reset).
       setNode(null);
       patch({
+        ...resetForNodeChange(),
         workspace: null,
-        connected: false,
-        status: null,
-        // per-node observability: the live chain tip and the node's own
-        // durable block history. clear them on a node switch so the new
-        // node's explorer never shows the previous node's rows.
-        lastBlock: null,
-        blocks: [],
-        channels: [],
-        messages: [],
-        activeChannel: null,
-        activeThread: null,
-        authorNames: {},
-        nodeUsers: {},
-        accountKeys: {},
-        accountHandles: {},
-        members: [],
-        proposals: [],
-        governanceShares: { active: false, allocations: [], total: 0 },
-        forgeHead: null,
-        pages: [],
-        activePage: null,
-        activePageBlocks: [],
-        agents: [],
-        watches: [],
-        pendingRuns: [],
-        files: [],
-        ops: {},
+        openTabs: loadDocTabs(docTabsScope(null, url)),
         onboardingPhase: null,
         onboardingBusy: false,
         inviteBlob: null,
@@ -2523,23 +2584,7 @@ export function createActions({
           // selectWorkspace's reset), then repoint the switcher.
           setNode(null);
           patch({
-            connected: false,
-            status: null,
-            channels: [],
-            messages: [],
-            activeChannel: null,
-            activeThread: null,
-            authorNames: {},
-            nodeUsers: {},
-            accountKeys: {},
-            accountHandles: {},
-            pages: [],
-            activePage: null,
-            activePageBlocks: [],
-            agents: [],
-            watches: [],
-            pendingRuns: [],
-            ops: {},
+            ...resetForNodeChange(),
             onboardingPhase: null,
             inviteBlob: null,
           });
@@ -2591,23 +2636,7 @@ export function createActions({
           // (mirrors forgetWorkspace), then repoint or fall back to the gate.
           setNode(null);
           patch({
-            connected: false,
-            status: null,
-            channels: [],
-            messages: [],
-            activeChannel: null,
-            activeThread: null,
-            authorNames: {},
-            nodeUsers: {},
-            accountKeys: {},
-            accountHandles: {},
-            pages: [],
-            activePage: null,
-            activePageBlocks: [],
-            agents: [],
-            watches: [],
-            pendingRuns: [],
-            ops: {},
+            ...resetForNodeChange(),
             onboardingPhase: null,
             inviteBlob: null,
           });
