@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -23,7 +23,10 @@ test('Fleet config is CEF-only and points at owned hooks', async () => {
   expect(buildHook).toContain('VITE_TAURI_AGENT=1')
   expect(buildHook).toContain('tauri-agent-artifact/v1')
   expect(buildHook).toContain('Darwin)')
-  expect(buildHook).toContain('Chromium Embedded Framework.framework')
+  expect(buildHook).toContain('--bundles app')
+  expect(buildHook).toContain('check-macos-cef-bundle.sh')
+  expect(buildHook).toContain('app/Ducktape.app/Contents/MacOS/ducktape-desktop')
+  expect(buildHook).toContain("artifact_cwd='app/Ducktape.app/Contents/MacOS'")
   expect(buildHook).toContain('artifact_env=\'{ "LD_LIBRARY_PATH": "." }\'')
   expect(await Bun.file(join(root, 'app/src/main.tsx')).text()).toContain(
     'import.meta.env.VITE_TAURI_AGENT === "1"'
@@ -49,13 +52,16 @@ test('cleanup hook terminates only the recorded instance node group on this plat
   const targetConfig = join(home, '.ducktape/workspaces/target/node.toml')
   const siblingConfig = join(home, '.ducktape/workspaces/sibling/node.toml')
   const node = join(artifact, 'bin/ducktape-node')
+  const bundledNode = join(artifact, 'app/Ducktape.app/Contents/MacOS/ducktape-node')
   await Promise.all([
     mkdir(join(artifact, 'bin'), { recursive: true }),
+    mkdir(join(artifact, 'app/Ducktape.app/Contents/MacOS'), { recursive: true }),
     mkdir(join(home, '.ducktape/workspaces/target'), { recursive: true }),
     mkdir(join(home, '.ducktape/workspaces/sibling'), { recursive: true })
   ])
-  await Promise.all([copyFile('/bin/bash', node), writeFile(targetConfig, ''), writeFile(siblingConfig, '')])
-  await chmod(node, 0o700)
+  await Promise.all([symlink('/bin/bash', bundledNode), writeFile(targetConfig, ''), writeFile(siblingConfig, '')])
+  await symlink('../app/Ducktape.app/Contents/MacOS/ducktape-node', node)
+  expect(await realpath(node)).toBe(await realpath(bundledNode))
   const start = (config: string) => {
     const launcher = Bun.spawnSync(['bun', '-e', `
       const [node, config] = Bun.argv.slice(1)
@@ -68,8 +74,17 @@ test('cleanup hook terminates only the recorded instance node group on this plat
   }
   const target = start(targetConfig)
   const sibling = start(siblingConfig)
+  const prefixed = start(`${targetConfig}.evil`)
   const kill = (pid: number) => { try { process.kill(-pid, 'SIGKILL') } catch { /* already stopped */ } }
   try {
+    await writeFile(join(home, '.ducktape/workspaces/target/node.pid'), String(prefixed))
+    const rejected = Bun.spawnSync(['bun', join(root, 'qa/fleet/cleanup-instance.ts')], {
+      cwd: root,
+      env: { ...process.env, FLEET_ARTIFACT_DIR: artifact, FLEET_HOME: home, FLEET_INSTANCE_ID: 'target' }
+    })
+    expect(rejected.exitCode).not.toBe(0)
+    expect(alive(prefixed)).toBe(true)
+
     await writeFile(join(home, '.ducktape/workspaces/target/node.pid'), String(target))
     const result = Bun.spawnSync(['bun', join(root, 'qa/fleet/cleanup-instance.ts')], {
       cwd: root,
@@ -78,6 +93,7 @@ test('cleanup hook terminates only the recorded instance node group on this plat
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(alive(target)).toBe(false)
     expect(alive(sibling)).toBe(true)
+    expect(alive(prefixed)).toBe(true)
     expect(await Bun.file(join(home, '.ducktape/workspaces/target/node.pid')).exists()).toBe(false)
     expect(Bun.spawnSync(['bun', join(root, 'qa/fleet/cleanup-instance.ts')], {
       cwd: root,
@@ -86,6 +102,7 @@ test('cleanup hook terminates only the recorded instance node group on this plat
   } finally {
     kill(target)
     kill(sibling)
+    kill(prefixed)
     await rm(scratch, { recursive: true, force: true })
   }
 })

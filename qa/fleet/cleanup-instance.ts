@@ -81,7 +81,10 @@ async function processUsesConfig(target: number, expected: string[]): Promise<bo
   const result = Bun.spawnSync(['ps', '-ww', '-p', String(target), '-o', 'command='])
   if (result.exitCode !== 0) return false
   const command = result.stdout.toString().trim()
-  return expected.some((path) => command.includes(`--config ${path}`) || command.includes(`--config=${path}`))
+  return expected.some((path) => {
+    const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`(?:^|\\s)--config(?:\\s+|=)${escaped}(?=\\s|$)`).test(command)
+  })
 }
 
 async function sameProcess(target: number, startTime: string): Promise<boolean> {
