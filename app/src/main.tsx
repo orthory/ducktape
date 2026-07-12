@@ -33,7 +33,17 @@ if (import.meta.env.DEV || import.meta.env.VITE_TAURI_AGENT === "1") {
       import("@byeongsu-hong/tauri-agent-plugin"),
       import("@tauri-apps/api/window"),
     ]);
-    new WebviewAgentInstrumentation({ windowLabel: getCurrentWindow().label }).install();
+    new WebviewAgentInstrumentation({
+      windowLabel: getCurrentWindow().label,
+      // State probes for deterministic QA suites (.tauri-agent/suites): the
+      // fleet runner's `state` pass conditions read these — DOM-derived, no
+      // store coupling. `expect`/`ipc` conditions can't observe the bell (an
+      // absent-element expect aborts the run; IPC capture is empty under CEF).
+      state: {
+        notifyDropdownOpen: () =>
+          document.querySelector('[aria-label="Recent notifications"]') !== null,
+      },
+    }).install();
   })().catch(() => {});
 }
 
