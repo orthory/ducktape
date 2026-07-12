@@ -1,14 +1,14 @@
 // Sidebar + the routed screen body, plus the error strip. Routing is the
-// registry lookup: state.screen is a module id or one of the shell-owned
-// screens ("settings", "account"). Cross-module search is not a route — it's
-// the ⌘K palette the shell overlays.
+// registry lookup: state.screen is a module id or the shell-owned "settings"
+// screen. The account Home is NOT a routed screen — it's a full-window layer
+// gated by state.atHome, one level up in DucktapeConsole. Cross-module search
+// is not a route either — it's the ⌘K palette the shell overlays.
 
 import { useEffect } from "react";
 
 import { moduleById } from "../modules/registry";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font } from "../theme/tokens";
-import { AccountView } from "../views/account/AccountView";
 import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
@@ -18,7 +18,6 @@ import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
 
 function resolveScreen(screen: string) {
   if (screen === "settings") return SettingsView;
-  if (screen === "account") return AccountView;
   return moduleById(screen)?.Screen ?? SettingsView;
 }
 

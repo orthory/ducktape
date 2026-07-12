@@ -13,6 +13,12 @@ import { keyHex } from "../../../domain/chat-client";
 import { enrollCancel, enrollPoll } from "../../../domain/enroll-client";
 import type { KeyKind, MemberKeyView } from "../../../domain/identity-client";
 import { shortKey } from "../../../domain/names";
+import {
+  touchidAvailable,
+  touchidDisable,
+  touchidEnroll,
+  touchidEnrolled,
+} from "../../../domain/touchid-client";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import type { PhoneEnrollment } from "../../store/account-ops";
@@ -22,6 +28,7 @@ import {
   errMessage,
   errorTextStyle,
   inputStyle,
+  PasswordForm,
   primaryButtonStyle,
   secondaryButtonStyle,
 } from "../onboarding/IdentityGateForms";
@@ -35,8 +42,8 @@ import {
   outlineButton,
   SectionLabel,
 } from "../settings/parts";
-import { encodeLinkChallenge } from "./link-device";
-import type { LinkChallenge } from "./link-device";
+import { encodeLinkChallenge } from "../account/link-device";
+import type { LinkChallenge } from "../account/link-device";
 import { CustodyPanel } from "./CustodyCard";
 
 /** Human label for a member key's scheme. */
@@ -269,7 +276,7 @@ function PhoneEnrollPanel({ onDone }: { onDone: () => void }) {
   );
 }
 
-export function DeviceKeysCard({
+export function DevicesCard({
   accountId,
   identity,
 }: {
@@ -281,8 +288,117 @@ export function DeviceKeysCard({
   const [pendingRemove, setPendingRemove] = useState<MemberKeyView | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
 
+  // Touch ID is machine-scoped (a Keychain item on THIS Mac), not part of the
+  // account's member keys — its own probe + enable/disable, gated on macOS
+  // availability. `touchidEnroll` needs the vault passphrase, so Enable opens a
+  // password confirm; a Touch-ID-created account is already enrolled at signup.
+  const [tidOk, setTidOk] = useState(false);
+  const [tidOn, setTidOn] = useState(false);
+  const [tidEnable, setTidEnable] = useState(false);
+  const [tidBusy, setTidBusy] = useState(false);
+  const [tidError, setTidError] = useState<string | null>(null);
+  const [tidConfirmDisable, setTidConfirmDisable] = useState(false);
+  useEffect(() => {
+    touchidAvailable().then(setTidOk).catch(() => setTidOk(false));
+    touchidEnrolled().then(setTidOn).catch(() => setTidOn(false));
+  }, []);
+
   const members = accountId ? (state.accountKeys[accountId] ?? []) : [];
   const devicePubkey = identity?.pubkey?.toLowerCase();
+
+  const touchidSection = tidOk ? (
+    <>
+      <SectionLabel>THIS DEVICE</SectionLabel>
+      <GroupCard>
+        <ControlRow
+          title="Touch ID"
+          desc={
+            tidOn
+              ? "Unlock your account on this Mac with Touch ID."
+              : "Unlock your account on this Mac with Touch ID instead of your password."
+          }
+          last={!tidEnable && !tidError}
+          control={
+            tidOn ? (
+              <HoverButton
+                ariaLabel="Disable Touch ID"
+                onClick={() => setTidConfirmDisable(true)}
+                hoverBg={color.dangerSoft}
+                style={{ ...outlineButton, color: color.red }}
+              >
+                Disable Touch ID
+              </HoverButton>
+            ) : tidEnable ? (
+              <HoverButton
+                ariaLabel="Cancel enable Touch ID"
+                onClick={() => {
+                  setTidEnable(false);
+                  setTidError(null);
+                }}
+                hoverBg={color.titlebar}
+                style={outlineButton}
+              >
+                Cancel
+              </HoverButton>
+            ) : (
+              <HoverButton
+                onClick={() => {
+                  setTidError(null);
+                  setTidEnable(true);
+                }}
+                hoverBg={color.titlebar}
+                style={outlineButton}
+              >
+                Enable Touch ID
+              </HoverButton>
+            )
+          }
+        />
+        {tidEnable && !tidOn && (
+          <CustodyPanel last={!tidError}>
+            <PasswordForm
+              mode="confirm"
+              busy={tidBusy}
+              error={tidError}
+              submitLabel={tidBusy ? "Enabling…" : "Enable Touch ID"}
+              onSubmit={(password) => {
+                setTidBusy(true);
+                setTidError(null);
+                touchidEnroll(password)
+                  .then(() => {
+                    setTidEnable(false);
+                    setTidOn(true);
+                  })
+                  .catch((err) => setTidError(errMessage(err)))
+                  .finally(() => setTidBusy(false));
+              }}
+            />
+          </CustodyPanel>
+        )}
+        {tidError && !tidEnable && (
+          <CustodyPanel last>
+            <span style={errorTextStyle}>{tidError}</span>
+          </CustodyPanel>
+        )}
+      </GroupCard>
+      {tidConfirmDisable && (
+        <ConfirmDialog
+          title="Disable Touch ID on this device?"
+          confirmLabel="Disable Touch ID"
+          onCancel={() => setTidConfirmDisable(false)}
+          onConfirm={() => {
+            setTidConfirmDisable(false);
+            touchidDisable()
+              .then(() => setTidOn(false))
+              .catch((err) => setTidError(errMessage(err)));
+          }}
+        >
+          Your account is unaffected — you&apos;ll unlock with your recovery
+          phrase or password instead. You can re-enable Touch ID here anytime.
+        </ConfirmDialog>
+      )}
+    </>
+  ) : null;
 
   if (!accountId) {
     // Unlinked device: offer the NEW-device half of the ceremony (needs a
@@ -312,12 +428,14 @@ export function DeviceKeysCard({
             </CustodyPanel>
           )}
         </GroupCard>
+        {touchidSection}
       </>
     );
   }
 
   return (
     <>
+      {touchidSection}
       <SectionLabel>DEVICES &amp; KEYS</SectionLabel>
       <GroupCard>
         {members.map((member) => {
