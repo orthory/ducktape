@@ -253,6 +253,7 @@ format = "text"
             dispatch_id: "d1".into(),
             capability: "alpha".into(),
             payload: b"the entire input".to_vec(),
+            demands: Default::default(),
         })
     }
 
@@ -356,6 +357,7 @@ format = "text"
             dispatch_id: "d1".into(),
             capability: "alpha".into(),
             payload: vec![0xff, 0xfe],
+            demands: Default::default(),
         });
         match gate(&providers, b"me", &effect_for(spec, Some(b"me"))) {
             Gated::Immediate(msg) => {

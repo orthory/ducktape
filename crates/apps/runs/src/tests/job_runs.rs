@@ -33,6 +33,7 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
         dispatch_id,
         recipe_id,
         payload,
+        ..
     } = &dispatches[0]
     else {
         panic!("expected a dispatch");

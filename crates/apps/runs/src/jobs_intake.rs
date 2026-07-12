@@ -119,6 +119,7 @@ impl RunsModule {
                 dispatch_id: dispatch_id.clone(),
                 recipe_id: recipe_id_for(agent_id),
                 payload,
+                demands: Default::default(),
             }),
         });
         self.pending_overlay.insert(

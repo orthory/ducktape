@@ -561,6 +561,7 @@ format = "text"
                 dispatch_id: "d1".into(),
                 capability: "alpha".into(),
                 payload: payload.to_vec(),
+                demands: Default::default(),
             }),
             deadline: None,
             assignee: assignee.map(|a| a.to_vec()),

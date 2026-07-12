@@ -111,6 +111,7 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
         dispatch_id,
         recipe_id,
         payload,
+        ..
     } = &dispatches[0]
     else {
         panic!("expected a dispatch");
