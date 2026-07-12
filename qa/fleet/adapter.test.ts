@@ -27,7 +27,10 @@ test('Fleet config is CEF-only and points at owned hooks', async () => {
   expect(buildHook).toContain('check-macos-cef-bundle.sh')
   expect(buildHook).toContain('app/Ducktape.app/Contents/MacOS/ducktape-desktop')
   expect(buildHook).toContain("artifact_cwd='app/Ducktape.app/Contents/MacOS'")
-  expect(buildHook).toContain('artifact_env=\'{ "LD_LIBRARY_PATH": "." }\'')
+  // The Linux artifact must need NO environment: the binary's $ORIGIN rpath
+  // (app/src-tauri/build.rs) resolves the CEF payload beside it, exactly as
+  // launcher-spawned installs do.
+  expect(buildHook).not.toContain('LD_LIBRARY_PATH')
   const qaSkill = await Bun.file(join(root, 'skills/qa/SKILL.md')).text()
   const upgradeSkill = await Bun.file(join(root, 'skills/upgrade/SKILL.md')).text()
   const opsReadme = await Bun.file(join(root, 'ops/README.md')).text()

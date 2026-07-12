@@ -19,6 +19,15 @@ fn main() {
             std::fs::write(&path, []).expect("write sidecar placeholder");
         }
     }
+    // Linux links libcef.so dynamically (CEF ships no static library), and app
+    // launchers spawn with a clean environment — no LD_LIBRARY_PATH to lean on.
+    // $ORIGIN makes the loader resolve libcef.so and the ANGLE/swiftshader libs
+    // from the executable's own directory, which is exactly where both the
+    // cargo target dir (cef-dll-sys copies them) and the staged install
+    // (ops/stage-linux-app.sh) place them.
+    if triple.contains("linux") {
+        println!("cargo::rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+    }
     // Register every application command with Tauri's ACL. Without an app
     // manifest, custom invoke-handler commands are globally allowed; that is
     // unsafe once executable gateway content has its own capability-free
