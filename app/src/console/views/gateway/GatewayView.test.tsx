@@ -34,6 +34,32 @@ describe("GatewayView route editor", () => {
     expect(screen.getByText(/address, reverse proxy, and signed access policy are saved together/)).toBeInTheDocument();
   });
 
+  it("keeps an invalid IME route label inside the editor instead of crashing", async () => {
+    const node = "22".repeat(32);
+    const account = "11".repeat(32);
+    renderGateway({
+      workspace: {
+        id: "test",
+        name: "Test",
+        chainId: "test",
+        pubkey: node,
+        founder: true,
+        member: true,
+        ports: { listen: 1, http: 2, rpc: 3 },
+      },
+      nodeUsers: { [node]: { accountId: account, name: "Alice" } },
+      accountHandles: { [account]: "alice" },
+    });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Route label" }), {
+      target: { value: "ㄷ" },
+    });
+
+    expect(await screen.findByText("Use lowercase letters, numbers, and hyphens.")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Route label" })).toHaveValue("ㄷ");
+    expect(screen.getByText("Gateway")).toBeInTheDocument();
+  });
+
   it("lists account routes and health-checks the selected route end to end", async () => {
     const node = "22".repeat(32);
     const account = "11".repeat(32);
