@@ -45,6 +45,7 @@ use crate::actor_api::ActorNodeApi;
 
 mod duckfs;
 mod forge;
+mod session;
 
 pub use forge::forge_push_base;
 
@@ -210,11 +211,24 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// registry by whoever holds this id; copying it into the env would mint a
 /// second, unversioned copy that drifts from the record it came from the moment
 /// the registry moves. the committed record is the one truth.
+///
+/// `DUCKTAPE_RUN_SESSION_KEY` + `DUCKTAPE_RUN_ID` are the WRITE half of the tool
+/// plane, and they appear together or not at all: the key signs the op, the run
+/// id says which session it belongs to, and neither is any use alone. absent =
+/// no session opened ([`session::open`]) = the read-only plane, which is the
+/// pre-session behaviour and never an error.
+///
+/// the key is the agent's PRIVATE half, in a process the agent can read. that is
+/// deliberate and safe: its whole authority is "what this agent may already do,
+/// for this run, until it settles" — consensus re-checks the grant on every
+/// action. the NODE key, which signs anything, must never be here (see
+/// [`session`]).
 fn run_env(
     dir: &Path,
     ro_dir: Option<&Path>,
     node_url: Option<&str>,
     spec: &WorkspaceSpec,
+    session: Option<&session::RunSession>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
@@ -228,6 +242,13 @@ fn run_env(
     }
     if let Some(agent) = &spec.agent_id {
         env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
+    }
+    if let Some(session) = session {
+        env.insert(
+            "DUCKTAPE_RUN_SESSION_KEY".into(),
+            session.private_hex.clone(),
+        );
+        env.insert("DUCKTAPE_RUN_ID".into(), spec.run_id.clone());
     }
     env
 }

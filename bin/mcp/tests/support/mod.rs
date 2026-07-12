@@ -128,6 +128,20 @@ impl Harness {
         cmd
     }
 
+    /// a `ducktape-mcp` subprocess carrying a SESSION — the write-capable shape
+    /// the provisioner produces once it has bound a key to a live run.
+    ///
+    /// the seed is hexed exactly as `agent_provision::session` hexes the real
+    /// one, so the server rebuilds the same signer from it. no run is bound in
+    /// this harness, which is the point: consensus must refuse the write, and it
+    /// must be consensus that does it.
+    pub fn mcp_with_session(&self, seed: [u8; 32], run_id: &str) -> Command {
+        let mut cmd = self.mcp();
+        cmd.env("DUCKTAPE_RUN_SESSION_KEY", hex(&seed))
+            .env("DUCKTAPE_RUN_ID", run_id);
+        cmd
+    }
+
     /// a `ducktape-mcp` subprocess with NO agent bound — the "started outside a
     /// provisioned run" shape.
     pub fn mcp_agentless(&self) -> Command {
@@ -294,10 +308,29 @@ impl Drop for Harness {
 
 /// the actor loop: one block per submit, queries answered inline.
 fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>) {
+    // `runs` is here so a WRITE from the tool server reaches the module that
+    // actually gates it. no run is ever dispatched in this harness — driving the
+    // full engagement loop needs chat + a deterministic runtime context, and
+    // `runs`'s own collaboration_loop e2e already does exactly that against a
+    // REAL lease. what this harness proves is the other half: that a signed
+    // AgentAction leaves the tool server, crosses the router, reaches `runs`, and
+    // is refused BY CONSENSUS rather than by anything in the binary under test.
     let mut host = Host::genesis(vec![
         Box::new(agent::AgentModule::new("agent", "saga", None)),
         Box::new(saga::SagaModule::new("saga")),
         Box::new(tasks::Tasks::new("tasks")),
+        Box::new(dispatch::DispatchModule::new("dispatch", "saga")),
+        Box::new(tagging::TaggingModule::new("tagging")),
+        Box::new(runs::RunsModule::new(
+            "runs",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            "agent",
+            Some("tasks".into()),
+            None,
+        )),
     ])
     .expect("genesis");
     let mut height: u64 = 0;
@@ -325,6 +358,37 @@ fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>) {
                                 app_hash: noded::hex_root(&out.app_hash),
                             })
                         }
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = reply.send(result);
+                }
+                // the signed-frame lane, FAITHFUL to both real binaries: the
+                // origin is the frame's verified signer, never a caller string.
+                // a stub that stamped a claimed origin here would reproduce the
+                // exact defect this lane closes — an e2e passing on attribution
+                // production cannot produce.
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    let result = match node::decode_frame(&frame) {
+                        Ok((origin, msg)) => {
+                            let next = height + 1;
+                            let ctx = BlockContext {
+                                protocol_version: 0,
+                                height: next,
+                                consensus_time: next,
+                                origin,
+                            };
+                            match host.submit_at(ctx, msg).await {
+                                Ok(out) => {
+                                    height = next;
+                                    Ok(BlockSummary {
+                                        height,
+                                        app_hash: noded::hex_root(&out.app_hash),
+                                    })
+                                }
+                                Err(err) => Err(err.to_string()),
+                            }
+                        }
+                        // a forged/tampered frame is a rejection, not a block.
                         Err(err) => Err(err.to_string()),
                     };
                     let _ = reply.send(result);
@@ -369,6 +433,12 @@ pub fn payload(result: &Value) -> Value {
     let (is_error, text) = content(result);
     assert!(!is_error, "expected a success, got a refusal: {text}");
     serde_json::from_str(&text).expect("a successful tool result carries json")
+}
+
+/// the session key's wire form: lowercase hex of the 32-byte seed, exactly as
+/// `agent_provision::session` writes it into the run's environment.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn free_port() -> u16 {

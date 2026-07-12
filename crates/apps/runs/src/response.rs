@@ -10,7 +10,7 @@ use super::{
     chat_encode_msg, chat_encode_query, decode_result_event, page_thread_id, reply_message_id,
     tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
 };
-use super::{RunOutcome, RunRecord, sink};
+use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
 // ---- response normalization ---------------------------------------------------------
 // the dispatch-plane oracle returns the model's RAW text (opinion-free, Text
@@ -217,6 +217,16 @@ pub(super) fn allows(agent: &AgentRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
 }
 
+/// whether an action belongs to the STRICT all-or-nothing lane's tasks arm —
+/// the only arm that needs a configured tasks module and the committed task
+/// ids, so a response without one never pays for either.
+fn is_task_action(action: &AgentAction) -> bool {
+    matches!(
+        action,
+        AgentAction::CreateTask { .. } | AgentAction::UpdateTaskStatus { .. }
+    )
+}
+
 impl RunsModule {
     // ---- the result intake (origin == dispatch) ------------------------------------
 
@@ -252,6 +262,13 @@ impl RunsModule {
             ..
         } = event;
         self.pending_overlay.insert(dispatch_id, None);
+        // a session may NEVER outlive its run. this is the only place a pending
+        // entry prunes — delivery, worker failure, timeout, and cancellation all
+        // arrive as the one `ResultEvent` (cancel routes through the dispatch
+        // plane, whose Err("cancelled") delivery lands right here) — so pruning
+        // the session beside it is the whole close-out. an agent's key stops
+        // being an authority in the same block its run stops existing.
+        self.pending_sessions.insert(run_id.clone(), None);
 
         match outcome {
             // THE single delivery path: decode the runner result and apply
@@ -332,7 +349,10 @@ impl RunsModule {
                 Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
             };
         }
-        let response = match self.validate_response(&*ctx, run_id, entry, response).await {
+        let response = match self
+            .validate_response(&*ctx, run_id, entry, Lane::Settle, response)
+            .await
+        {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
@@ -352,9 +372,10 @@ impl RunsModule {
         // the pages effects lane: applied here at the run boundary like every
         // other effect, but probe-guarded and cap-gated per action — a bad
         // pages action degrades to a breadcrumb, the run still delivers.
-        self.emit_pages_effects(ctx, run_id, entry, &response.actions)
+        self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &response.actions)
             .await;
-        self.emit_response(ctx, run_id, entry, response).await;
+        self.emit_response(ctx, run_id, entry, Lane::Settle, response)
+            .await;
         let pr_number = self
             .emit_sink(
                 ctx,
@@ -392,11 +413,19 @@ impl RunsModule {
     /// emitted follow-ups could make chat or tasks REJECT (which would abort
     /// the delivery block — the no-fail rule): a squatted reply message id, a
     /// full thread, a duplicate or unknown task id.
-    async fn validate_response(
+    ///
+    /// THE ONE definition of what an agent may do. the session lane
+    /// ([`super::sessions`]) validates each mid-run action by calling this with
+    /// a one-action response under [`Lane::Session`], so the tool plane can
+    /// never become a second, wider permission vocabulary: if these two ever
+    /// disagreed, the disagreement WOULD be the hole this design exists to
+    /// close.
+    pub(super) async fn validate_response(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
         entry: &PendingState,
+        lane: Lane,
         response: AgentResponse,
     ) -> Result<AgentResponse, String> {
         let agent = self
@@ -457,48 +486,81 @@ impl RunsModule {
             }
         }
 
-        // the strict all-or-nothing lane covers the TASK verbs only. the two
-        // pages actions are deliberately NOT validated here: they gate and
-        // validate at apply (`emit_pages_effects`), where a bad one degrades
+        // the strict all-or-nothing lane covers the CHAT-POST and TASK verbs.
+        // the two pages actions are deliberately NOT validated here: they gate
+        // and validate at apply (`emit_pages_effects`), where a bad one degrades
         // ALONE with a breadcrumb instead of failing the whole run.
-        let task_actions: Vec<&AgentAction> = response
-            .actions
-            .iter()
-            .filter(|action| !super::pages_effects::is_pages_action(action))
-            .collect();
-        if !task_actions.is_empty() {
-            let Some(tasks) = self.tasks.clone() else {
-                return Err("no tasks module is configured".into());
-            };
-            let existing = self.task_ids(ctx, &tasks).await?;
-            let mut created: BTreeSet<&str> = BTreeSet::new();
-            for action in task_actions {
-                let name = action.vocabulary_name();
-                if !allows(&agent, name) {
-                    return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
+        //
+        // only the tasks arm needs a tasks module and the committed task ids, so
+        // a response carrying none pays for neither.
+        let tasks = match response.actions.iter().any(is_task_action) {
+            true => Some(
+                self.tasks
+                    .clone()
+                    .ok_or_else(|| "no tasks module is configured".to_string())?,
+            ),
+            false => None,
+        };
+        let existing = match &tasks {
+            Some(tasks) => self.task_ids(ctx, tasks).await?,
+            None => BTreeSet::new(),
+        };
+        let mut created: BTreeSet<&str> = BTreeSet::new();
+        for (index, action) in response.actions.iter().enumerate() {
+            if super::pages_effects::is_pages_action(action) {
+                continue;
+            }
+            let name = action.vocabulary_name();
+            if !allows(&agent, name) {
+                return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
+            }
+            match action {
+                // an agent SPEAKING — its own channel, its own moment — as
+                // opposed to reply_blocks, which only answer where the agent was
+                // engaged. that is the wider power, so it rides its own grant
+                // (`chat.post_message`): holding `chat.post` must NEVER widen
+                // into it, or every already-registered agent would have been
+                // silently handed the wider one.
+                AgentAction::PostMessage {
+                    channel_id,
+                    text,
+                    thread,
+                } => {
+                    if text.trim().is_empty() {
+                        return Err("chat.post_message requires a non-empty text".into());
+                    }
+                    // the whole actions vec is already bounded by
+                    // MAX_ACTIONS_BYTES above, so the posted block cannot
+                    // approach chat's own MAX_MESSAGE_HEAD_BYTES.
+                    self.probe_channel_exists(ctx, channel_id).await?;
+                    self.probe_post_lands(
+                        ctx,
+                        channel_id,
+                        &post_message_id(run_id, &lane.slot(index)),
+                        *thread,
+                    )
+                    .await?;
                 }
-                match action {
-                    AgentAction::CreateTask { task_id, title } => {
-                        if task_id.is_empty() || title.is_empty() {
-                            return Err("task actions require a non-empty task_id and title".into());
-                        }
-                        // duplicates — committed or earlier in this very
-                        // response — would make tasks reject the follow-up.
-                        if existing.contains(task_id) || !created.insert(task_id) {
-                            return Err(format!("task already exists: {task_id}"));
-                        }
+                AgentAction::CreateTask { task_id, title } => {
+                    if task_id.is_empty() || title.is_empty() {
+                        return Err("task actions require a non-empty task_id and title".into());
                     }
-                    AgentAction::UpdateTaskStatus { task_id, status } => {
-                        if task_status(status).is_none() {
-                            return Err(format!("unknown task status: {status}"));
-                        }
-                        if !existing.contains(task_id) && !created.contains(task_id.as_str()) {
-                            return Err(format!("unknown task: {task_id}"));
-                        }
+                    // duplicates — committed or earlier in this very
+                    // response — would make tasks reject the follow-up.
+                    if existing.contains(task_id) || !created.insert(task_id) {
+                        return Err(format!("task already exists: {task_id}"));
                     }
-                    AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
-                        unreachable!("pages actions are filtered out above")
+                }
+                AgentAction::UpdateTaskStatus { task_id, status } => {
+                    if task_status(status).is_none() {
+                        return Err(format!("unknown task status: {status}"));
                     }
+                    if !existing.contains(task_id) && !created.contains(task_id.as_str()) {
+                        return Err(format!("unknown task: {task_id}"));
+                    }
+                }
+                AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
+                    unreachable!("pages actions are skipped above")
                 }
             }
         }
@@ -508,22 +570,48 @@ impl RunsModule {
 
     /// prove a reply under the run's message id could land in chat RIGHT NOW
     /// — the no-fail rule again: an emitted post must be valid by
-    /// construction, so anything chat would reject is probed first.
+    /// construction, so anything chat would reject is probed first. the run's
+    /// own channel is where its anchor came from, so only the post itself needs
+    /// probing.
     async fn probe_reply_postable(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
         entry: &PendingState,
     ) -> Result<(), String> {
-        // message ids are client-chosen, so anyone could squat the reply
-        // id before the result lands; chat would reject the duplicate and
-        // abort the block. fail the run instead.
-        let message_id = reply_message_id(run_id);
+        self.probe_post_lands(
+            ctx,
+            &entry.channel_id,
+            &reply_message_id(run_id),
+            entry.thread_root,
+        )
+        .await
+    }
+
+    /// THE chat-post probe, shared by the run's reply and by a
+    /// `chat.post_message` action: everything chat would REJECT about the post
+    /// we are about to emit, checked against committed state first — a squatted
+    /// message id (ids are client-chosen, so anyone can take one), a thread root
+    /// that does not exist, one that is itself a reply (chat forbids
+    /// subthreads), and a full thread.
+    ///
+    /// a `chat.post_message` additionally names its OWN channel (the reply's is
+    /// the run's), which is probed by the caller's `require_channel` peer below.
+    async fn probe_post_lands(
+        &self,
+        ctx: &dyn Ctx,
+        channel_id: &str,
+        message_id: &str,
+        thread: Option<u64>,
+    ) -> Result<(), String> {
+        if channel_id.is_empty() {
+            return Err("chat posts require a non-empty channel_id".into());
+        }
         let reply = ctx
             .query(
                 &self.chat,
                 &chat_encode_query(&ChatQuery::Message {
-                    message_id: message_id.clone(),
+                    message_id: message_id.to_string(),
                 }),
             )
             .await
@@ -535,13 +623,14 @@ impl RunsModule {
             }
             _ => return Err("unexpected chat reply for a message lookup".into()),
         }
-        // a threaded reply must still fit under chat's thread cap.
-        if let Some(root_seq) = entry.thread_root {
+        // a threaded post must anchor on a real ROOT and still fit under chat's
+        // thread cap.
+        if let Some(root_seq) = thread {
             let reply = ctx
                 .query(
                     &self.chat,
                     &chat_encode_query(&ChatQuery::MessagesRange {
-                        channel_id: entry.channel_id.clone(),
+                        channel_id: channel_id.to_string(),
                         from_seq: root_seq,
                         limit: 1,
                     }),
@@ -555,11 +644,13 @@ impl RunsModule {
                 .first()
                 .filter(|v| v.seq == root_seq)
                 .ok_or_else(|| format!("thread root does not exist: {root_seq}"))?;
-            if root.head.reply_count >= MAX_THREAD_REPLIES as u64 {
+            if root.head.thread.is_some() {
                 return Err(format!(
-                    "thread reply cap reached: {}/{root_seq}",
-                    entry.channel_id
+                    "thread replies cannot start subthreads: {channel_id}/{root_seq}"
                 ));
+            }
+            if root.head.reply_count >= MAX_THREAD_REPLIES as u64 {
+                return Err(format!("thread reply cap reached: {channel_id}/{root_seq}"));
             }
         }
         Ok(())
@@ -654,6 +745,27 @@ impl RunsModule {
                 as_agent: Some(entry.agent_id.clone()),
             }),
         })
+    }
+
+    /// prove a channel EXISTS before an agent speaks into it — chat rejects a
+    /// post to an unknown channel, and on the settle path that rejection would
+    /// abort the delivery block. (its post policy needs no probe: chat always
+    /// admits a module/agent author.)
+    async fn probe_channel_exists(&self, ctx: &dyn Ctx, channel_id: &str) -> Result<(), String> {
+        let reply = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Channel {
+                    channel_id: channel_id.to_string(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("chat channel lookup failed: {e}"))?;
+        match chat_decode_reply(&reply) {
+            Ok(ChatReply::Channel(Some(_))) => Ok(()),
+            Ok(ChatReply::Channel(None)) => Err(format!("unknown channel: {channel_id}")),
+            _ => Err("unexpected chat reply for a channel lookup".into()),
+        }
     }
 
     /// surface a failed CHAT run as a threaded reply authored by the agent —
@@ -751,13 +863,18 @@ impl RunsModule {
     }
 
     /// hand a VALIDATED response its follow-ups: the chat reply (authored as
-    /// the agent, threaded like its anchor) and the task writes — all drained
-    /// in this same delivery block (P2, P6).
-    async fn emit_response(
+    /// the agent, threaded like its anchor — or, for a run invoked from a page
+    /// comment, a reply IN that comment thread), the agent's own chat posts, and
+    /// the task writes — all drained in this same delivery block (P2, P6). every
+    /// one rides this MODULE's origin, which is what lets chat and pages refine
+    /// `as_agent` into `AuthorRef::Agent { module, agent_id }` — authorship no
+    /// external submitter can forge.
+    pub(super) async fn emit_response(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
+        lane: Lane,
         response: AgentResponse,
     ) {
         if !response.reply_blocks.is_empty() {
@@ -782,26 +899,44 @@ impl RunsModule {
                 });
             }
         }
-        for action in response.actions {
-            let payload = match action {
-                AgentAction::CreateTask { task_id, title } => {
-                    tasks_encode_msg(&TaskMsg::CreateTask { task_id, title })
-                }
-                AgentAction::UpdateTaskStatus { task_id, status } => {
-                    tasks_encode_msg(&TaskMsg::UpdateStatus {
+        for (index, action) in response.actions.into_iter().enumerate() {
+            let msg = match action {
+                AgentAction::PostMessage {
+                    channel_id,
+                    text,
+                    thread,
+                } => Msg {
+                    target: self.chat.clone(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id,
+                        message_id: post_message_id(run_id, &lane.slot(index)),
+                        blocks: vec![Block::paragraph(text)],
+                        thread,
+                        as_agent: Some(entry.agent_id.clone()),
+                    }),
+                },
+                AgentAction::CreateTask { task_id, title } => Msg {
+                    target: self.task_target(),
+                    payload: tasks_encode_msg(&TaskMsg::CreateTask { task_id, title }),
+                },
+                AgentAction::UpdateTaskStatus { task_id, status } => Msg {
+                    target: self.task_target(),
+                    payload: tasks_encode_msg(&TaskMsg::UpdateStatus {
                         task_id,
                         status: task_status(&status).expect("status was validated"),
-                    })
-                }
+                    }),
+                },
                 // pages actions were already applied by `emit_pages_effects`
                 // (its own lane: probes, cap gate, per-action degrade).
                 AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => continue,
             };
-            let target = self
-                .tasks
-                .clone()
-                .expect("task actions were validated against a configured tasks module");
-            ctx.emit_msg(Msg { target, payload });
+            ctx.emit_msg(msg);
         }
+    }
+
+    fn task_target(&self) -> super::ModuleId {
+        self.tasks
+            .clone()
+            .expect("task actions were validated against a configured tasks module")
     }
 }

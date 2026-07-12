@@ -117,10 +117,10 @@ mod envelope;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
-    ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery, AgentRecord, AgentReply,
-    AgentResponse, AgentStatus, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
-    RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
+    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED,
+    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery,
+    AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
+    MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
     decode_reply as agent_decode_reply, encode_query as agent_encode_query,
 };
 use chat::{
@@ -227,6 +227,45 @@ pub fn reply_message_id(run_id: &str) -> String {
     format!("agent/{run_id}")
 }
 
+/// which lane an agent action is being applied from — and therefore how its
+/// minted ids are NUMBERED. every id an action mints (a chat message id, a
+/// pages thread/comment id) is derived from `(run_id, slot)` and nothing else:
+/// no host randomness, no wall clock, so every replaying validator derives
+/// byte-identical ids (X2).
+///
+/// the two lanes must never SHARE a slot: the settle path numbers actions by
+/// their index in the delivered response, and the session lane by its committed
+/// action counter — both count from 0, so an `s` prefix keeps the session's id
+/// space disjoint. without it a mid-run write would squat exactly the id the
+/// final response's nth action mints, and that action would silently degrade
+/// (pages) on the id it was owed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Lane {
+    /// the settle path: the nth action of the run's delivered response.
+    Settle,
+    /// the session lane: the nth action of the run's open agent session.
+    Session(u32),
+}
+
+impl Lane {
+    /// the id salt of the action at `index` in this lane's action list.
+    fn slot(self, index: usize) -> String {
+        match self {
+            Lane::Settle => index.to_string(),
+            Lane::Session(actions) => format!("s{actions}"),
+        }
+    }
+}
+
+/// the chat message id of an agent's `chat.post_message` — distinct from
+/// [`reply_message_id`] (the run's ONE reply) and per-slot unique, so the id is
+/// free by construction unless a submitter squatted it (which the emit probe
+/// catches). the slot is the action's [`Lane`] slot: its index in the delivered
+/// response, or `s{n}` for the nth action of the run's session.
+pub fn post_message_id(run_id: &str, slot: &str) -> String {
+    format!("agent/{run_id}/post/{slot}")
+}
+
 /// the dispatch-plane recipe an agent's runs execute under — registered
 /// (module-owned) by the registry hook in the same block as the agent itself.
 pub(crate) fn recipe_id_for(agent_id: &str) -> String {
@@ -277,6 +316,10 @@ mod module_impl;
 // the run boundary — probe-guarded, cap-gated, per-action degrade.
 mod pages_effects;
 mod response;
+// the agent session lane: the mid-run write path — an ephemeral key bound to a
+// live run, and the actions it signs, validated against the SAME grant the
+// settle path validates.
+mod sessions;
 // the delivery sink (O1/O2): the forge PR sink applied at the result intake —
 // gates, duplicate-PR guard, and message-facet title/body derivation.
 mod sink;
@@ -373,12 +416,19 @@ pub struct RunsModule {
     /// in-flight correlation entries keyed by dispatch id — pruned on
     /// delivery; the dispatch module owns lifecycle and history.
     pending: BTreeMap<String, PendingState>,
+    /// the LIVE agent sessions keyed by run id — the ephemeral key each
+    /// executing node bound to its run, plus the budget it has spent. committed
+    /// state (in `root()`): the ACL every validator enforces mid-run, so it must
+    /// be the same on all of them. bounded by the pending runs — a session is
+    /// pruned in the same block as its run's entry and can never outlive it.
+    sessions: BTreeMap<String, AgentSession>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
     /// `commit_block`. a watch stages `None` for removal (unwatch); a pending
-    /// entry stages `None` for its prune.
+    /// entry stages `None` for its prune; a session stages `None` for its prune.
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
+    pending_sessions: BTreeMap<String, Option<AgentSession>>,
     /// the delivered-runs ring (last [`RUN_HISTORY_CAP`], oldest first —
     /// queries serve it reversed). DERIVED state: recorded at delivery,
     /// rebuilt by replay, never in `root()`/snapshot, empty after a
@@ -442,8 +492,10 @@ impl RunsModule {
             pages: None,
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
+            pending_sessions: BTreeMap::new(),
             history: VecDeque::new(),
             pending_history: Vec::new(),
         }
@@ -514,6 +566,13 @@ impl RunsModule {
         match self.pending_overlay.get(dispatch_id) {
             Some(staged) => staged.as_ref(),
             None => self.pending.get(dispatch_id),
+        }
+    }
+
+    fn session(&self, run_id: &str) -> Option<&AgentSession> {
+        match self.pending_sessions.get(run_id) {
+            Some(staged) => staged.as_ref(),
+            None => self.sessions.get(run_id),
         }
     }
 
@@ -588,7 +647,7 @@ impl RunsModule {
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
     pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.watches, &self.pending)
+        encode_committed(&self.watches, &self.pending, &self.sessions)
     }
 
     /// adopt a peer's snapshot as own committed state — but only after the
@@ -599,16 +658,18 @@ impl RunsModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (watches, pending) = decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&watches, &pending) != expected {
+        let (watches, pending, sessions) = decode_committed(bytes).map_err(Error::Module)?;
+        if committed_root(&watches, &pending, &sessions) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
             ));
         }
         self.watches = watches;
         self.pending = pending;
+        self.sessions = sessions;
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        self.pending_sessions.clear();
         // the ring is derived per-node state: a snapshot describes a block
         // boundary this node never executed, so its history starts empty.
         self.history.clear();

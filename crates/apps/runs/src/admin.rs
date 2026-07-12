@@ -181,6 +181,16 @@ impl RunsModule {
                 });
                 Ok(())
             }
+            // the session lane (see [`super::sessions`]). deliberately NOT under
+            // `admin_origin`: these two ops carry their own, STRICTER
+            // authorization — the run's committed lease-holder opens, and only
+            // the bound session key acts — and neither is a capability any
+            // "non-empty submitter" has.
+            RunsMsg::OpenAgentSession {
+                run_id,
+                session_key,
+            } => self.open_agent_session(ctx, run_id, session_key).await,
+            RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
         }
     }
 }

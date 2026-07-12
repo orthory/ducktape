@@ -16,9 +16,8 @@ use commonware_runtime::{Spawner, Supervisor};
 use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
-use noded::NodeCommand;
+use noded::{NodeCommand, ORACLE_ORIGIN};
 
-use crate::ORACLE_ORIGIN;
 
 fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
     Arc::new(move |ctx, line| {

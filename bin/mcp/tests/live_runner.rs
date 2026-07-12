@@ -1,13 +1,24 @@
 //! the FULL-STACK live proof: a real runner CLI, driving the real
-//! `ducktape-mcp` binary, against a real node, doing a real gated write that
-//! really lands in consensus.
+//! `ducktape-mcp` binary, against a real node — and consensus refusing the write
+//! it tries to make.
+//!
+//! the chain under test is the whole one: `claude` spawns the server from the
+//! capability spec's own argv, the model calls its tools, the server signs a
+//! `RunsMsg::AgentAction` frame with the run's session key, the frame crosses the
+//! real router into the real `runs` module — which says NO, because the key is
+//! bound to no live run. the agent HOLDS `tasks.create`; the grant is not what
+//! stops it. the session gate is. a task appearing on the chain here would mean
+//! that gate can be walked straight past.
+//!
+//! (the positive case — a bound session's write landing as `AuthorRef::Agent` —
+//! is proven in `runs`'s own collaboration_loop e2e, which is the only harness
+//! with a real dispatch and a real committed lease to bind against.)
 //!
 //! `#[ignore]` by design. it shells out to `claude`, which needs a logged-in
 //! CLI, network, and money — none of which belong in a gate that must be green
 //! on every machine. but the thing it proves is the one thing no other test in
 //! this crate can: that the capability spec's argv actually makes a RUNNER
-//! spawn our server and let the model call it. everything else here proves our
-//! binary speaks MCP correctly to a client we wrote ourselves.
+//! spawn our server and let the model call it.
 //!
 //! run it deliberately:
 //!
@@ -32,7 +43,7 @@ const MCP_CONFIG: &str = r#"{"mcpServers":{"ducktape":{"command":"ducktape-mcp"}
 
 #[test]
 #[ignore = "drives the real `claude` CLI: needs auth, network, and budget"]
-fn a_real_claude_run_writes_through_the_tool_plane_into_consensus() {
+fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     let h = Harness::start(&["tasks.create"]);
 
     // the binary under test must be resolvable by BARE NAME, exactly as the
@@ -52,6 +63,12 @@ fn a_real_claude_run_writes_through_the_tool_plane_into_consensus() {
     let prompt = "Use the ducktape MCP tools. First call ducktape_whoami. Then call \
                   ducktape_task_create with the title: live-proof. Then reply with the word \
                   DONE and nothing else.";
+    // a session key bound to no live run — this harness dispatches none. so the
+    // write MUST be refused, and refused by `runs` in consensus rather than by
+    // the tool server. that is the whole chain under test: a real runner spawns
+    // the real binary, which signs a real frame, which crosses the real router
+    // into the real module, which says no.
+    const SEED: [u8; 32] = [55u8; 32];
 
     let out = Command::new("claude")
         .args([
@@ -71,6 +88,8 @@ fn a_real_claude_run_writes_through_the_tool_plane_into_consensus() {
         .env("PATH", &path)
         .env("DUCKTAPE_NODE", h.node_url())
         .env("DUCKTAPE_RUN_AGENT", AGENT_ID)
+        .env("DUCKTAPE_RUN_SESSION_KEY", support::hex(&SEED))
+        .env("DUCKTAPE_RUN_ID", "no-such-saga:0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -89,18 +108,22 @@ fn a_real_claude_run_writes_through_the_tool_plane_into_consensus() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     eprintln!("claude said: {stdout}");
 
-    // the ONLY assertion that matters: ask the NODE what it holds. the model's
-    // prose is not evidence — a model will happily claim it called a tool it
-    // never reached (it did, repeatedly, while this was being built). consensus
-    // is the oracle.
+    // the model's prose is not evidence — a model will happily claim it called a
+    // tool it never reached (it did, repeatedly, while this was built). the node
+    // is the oracle, and it must hold NOTHING: the agent's session key is bound
+    // to no live run, so consensus refused the write even though the agent holds
+    // the tasks.create grant. a task appearing here would mean the write bypassed
+    // the session gate entirely — the exact defect this design closes.
     let reply = h.query("tasks", json!("list"));
-    let tasks = reply["tasks"].as_array().expect("a task list");
-    assert_eq!(
-        tasks.len(),
-        1,
-        "a real claude run, through the real spec argv, must have written exactly one task \
-         through the MCP tool plane — the node holds: {reply}"
+    assert!(
+        reply["tasks"].as_array().is_none_or(|t| t.is_empty()),
+        "a session bound to no run must not be able to write, however real the runner: {reply}"
     );
-    assert_eq!(tasks[0]["title"], "live-proof");
-    assert_eq!(tasks[0]["status"], "open");
+
+    // and the run must have actually REACHED the tools — otherwise this test
+    // would pass just as well against a server that never started.
+    assert!(
+        stdout.contains("DONE") || stdout.contains("whoami"),
+        "the model must have driven the tool plane: {stdout}"
+    );
 }

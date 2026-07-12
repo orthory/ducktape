@@ -44,8 +44,8 @@ use indexer::IndexStore;
 use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
-    payload_preview,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
+    hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
 use host::worker::MAX_WORKER_ROUNDS;
@@ -74,7 +74,6 @@ const MODULE_IDS: [&str; 16] = [
     "duckdns",
     "gateway",
 ];
-const ORACLE_ORIGIN: &[u8] = b"oracle";
 
 mod oracle_pool;
 
@@ -385,6 +384,38 @@ fn run_node(
                     )
                     .await;
                     let _ = reply.send(result); // caller may have hung up
+                }
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    // the frame lane is FAITHFUL to the real node here, and that
+                    // is the whole point of it: the origin is the frame's
+                    // VERIFIED signer, never the caller's claim. the frameless
+                    // arm above trusts a client string — a convention a local
+                    // daemon can afford — and `bin/node` discards that string
+                    // outright, so an embedded daemon that also stamped a claimed
+                    // origin HERE would let an e2e pass on attribution production
+                    // would never produce. it decodes exactly as the validator's
+                    // ordered drain does instead.
+                    let result = match node::decode_frame(&frame) {
+                        Ok((origin, msg)) => {
+                            submit_and_drain(
+                                &mut host,
+                                &workers,
+                                &mut height,
+                                &index,
+                                &op_blobs,
+                                &stream_hub,
+                                &metrics,
+                                origin,
+                                msg,
+                            )
+                            .await
+                        }
+                        // junk never reaches the store: the http gate already
+                        // refused it, and this is the second wall for any
+                        // embedder-side producer on the command lane.
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host

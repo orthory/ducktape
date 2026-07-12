@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::Signer as _;
 use dispatch_oracle::{RoMount, WorkspaceProvisioner as _, WorkspaceSource, WorkspaceSpec};
 use duckfs_client::chunk::{chunk_ids, file_object_id};
 use duckfs_core::{
@@ -60,38 +62,105 @@ pub(super) fn spawn_files_actor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(cmd) = rx.next().await {
-            let NodeCommand::Query { req, reply, .. } = cmd else {
-                // the mount lane only ever reads; a submit here is a bug.
-                panic!("the stand-in files actor got a non-query command");
-            };
-            let reply_bytes = match decode_query(&req).expect("a files query") {
-                FilesQuery::Refs {} => Ok(encode_reply(&FilesReply::Refs(RefsInfo {
-                    head: None,
-                    pins: BTreeMap::new(),
-                    window_len: 0,
-                }))),
-                FilesQuery::Find { prefix, .. } => Ok(encode_reply(&FilesReply::Find {
-                    entries: tree
-                        .iter()
-                        .filter(|(path, _)| path.starts_with(&prefix))
-                        .map(|(path, bytes)| file_entry(path, bytes))
-                        .collect(),
-                    next: None,
-                })),
-                FilesQuery::Read { path, .. } if !reject_reads => {
-                    let bytes = tree.get(&path).cloned().unwrap_or_default();
-                    Ok(encode_reply(&FilesReply::Read {
-                        b64: STANDARD.encode(&bytes),
-                        eof: true,
-                    }))
+            match cmd {
+                // the ONE write a provision makes: the agent session bind, which
+                // this actor is the assignee for and so commits. the refusing
+                // case is [`spawn_session_actor`].
+                NodeCommand::Submit { reply, .. } => {
+                    let _ = reply.send(Ok(committed_block()));
                 }
-                // the verbatim module contract string the engine's taxonomy keys on.
-                FilesQuery::Read { .. } => Err("files: chunk not available".to_string()),
-                other => panic!("the checkout asked for {other:?}"),
-            };
-            let _ = reply.send(reply_bytes);
+                NodeCommand::Query { req, reply, .. } => {
+                    let _ = reply.send(files_reply(&tree, reject_reads, &req));
+                }
+                // the mount lane otherwise only ever reads.
+                _ => panic!("the stand-in files actor got an unexpected command"),
+            }
         }
     })
+}
+
+/// every session bind this actor saw, in order — the ops the provisioner ACTUALLY
+/// submitted, so a test asserts against the wire and not against its own belief
+/// about it.
+pub(super) type SessionBinds = std::sync::Arc<std::sync::Mutex<Vec<runs::RunsMsg>>>;
+
+/// a stand-in actor for the SESSION lane: it records every op the provisioner
+/// submits and answers it with `bind` — `Ok` for the node that holds the run's
+/// lease, `Err(detail)` for one that does not (the module's own refusal string).
+/// files queries are answered over an empty tree, so the rw checkout materializes
+/// an empty dir and the provision reaches the session either way.
+fn spawn_session_actor(
+    mut rx: futures::channel::mpsc::Receiver<NodeCommand>,
+    bind: Result<(), &'static str>,
+) -> (tokio::task::JoinHandle<()>, SessionBinds) {
+    let binds: SessionBinds = Default::default();
+    let seen = binds.clone();
+    let actor = tokio::spawn(async move {
+        while let Some(cmd) = rx.next().await {
+            match cmd {
+                NodeCommand::Submit {
+                    target,
+                    payload,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(target, "runs", "the only op a provision submits");
+                    seen.lock()
+                        .unwrap()
+                        .push(runs::decode_msg(&payload).expect("a runs op"));
+                    let _ = reply.send(bind.map(|()| committed_block()).map_err(Into::into));
+                }
+                NodeCommand::Query { req, reply, .. } => {
+                    let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
+                }
+                _ => panic!("the stand-in session actor got an unexpected command"),
+            }
+        }
+    });
+    (actor, binds)
+}
+
+fn committed_block() -> crate::BlockSummary {
+    crate::BlockSummary {
+        height: 1,
+        app_hash: "ab".repeat(32),
+    }
+}
+
+/// answer one files query over `tree` — the read half both stand-ins share.
+///
+/// `reject_reads` fails every `read` AFTER the enumeration succeeded (see
+/// [`spawn_files_actor`]).
+fn files_reply(
+    tree: &BTreeMap<String, Vec<u8>>,
+    reject_reads: bool,
+    req: &[u8],
+) -> Result<Vec<u8>, String> {
+    match decode_query(req).expect("a files query") {
+        FilesQuery::Refs {} => Ok(encode_reply(&FilesReply::Refs(RefsInfo {
+            head: None,
+            pins: BTreeMap::new(),
+            window_len: 0,
+        }))),
+        FilesQuery::Find { prefix, .. } => Ok(encode_reply(&FilesReply::Find {
+            entries: tree
+                .iter()
+                .filter(|(path, _)| path.starts_with(&prefix))
+                .map(|(path, bytes)| file_entry(path, bytes))
+                .collect(),
+            next: None,
+        })),
+        FilesQuery::Read { path, .. } if !reject_reads => {
+            let bytes = tree.get(&path).cloned().unwrap_or_default();
+            Ok(encode_reply(&FilesReply::Read {
+                b64: STANDARD.encode(&bytes),
+                eof: true,
+            }))
+        }
+        // the verbatim module contract string the engine's taxonomy keys on.
+        FilesQuery::Read { .. } => Err("files: chunk not available".to_string()),
+        other => panic!("the checkout asked for {other:?}"),
+    }
 }
 
 /// one file entry, content-addressed EXACTLY as the module stores it — the
@@ -249,6 +318,115 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
     assert!(
         !ws.path_entries().is_empty(),
         "the bin dir is unconditional"
+    );
+    ws.cleanup().await;
+}
+
+// ---- the agent session key --------------------------------------------------
+
+#[tokio::test]
+async fn an_agent_run_gets_a_fresh_session_key_whose_public_half_is_what_was_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let (_actor, binds) = spawn_session_actor(rx, Ok(()));
+
+    let ws = NodedProvisioner::new(handle, tmp.path())
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("provision");
+    let env = ws.env();
+
+    // BOTH vars or neither: the key signs the op, the run id says which session
+    // it belongs to.
+    let key_hex = env
+        .get("DUCKTAPE_RUN_SESSION_KEY")
+        .expect("an agent run holds a session key");
+    assert_eq!(env.get("DUCKTAPE_RUN_ID").map(String::as_str), Some("s1:0"));
+    assert_eq!(key_hex.len(), 64, "32 bytes of lowercase hex");
+    let seed = duckfs_core::from_hex_32(key_hex).expect("the key is lowercase hex");
+
+    // THE invariant: what consensus was asked to bind is the PUBLIC half of the
+    // key the run holds — a bind of anything else would authorize a key nobody
+    // can sign with, and the agent's ops would be refused for the rest of the run.
+    let bound = match binds.lock().unwrap().as_slice() {
+        [
+            runs::RunsMsg::OpenAgentSession {
+                run_id,
+                session_key,
+            },
+        ] => {
+            assert_eq!(run_id, "s1:0");
+            session_key.clone()
+        }
+        other => panic!("expected exactly one session bind, got {other:?}"),
+    };
+    assert_eq!(bound.len(), runs::SESSION_KEY_LEN);
+    let public = commonware_cryptography::ed25519::PrivateKey::decode(seed.as_slice())
+        .expect("32 bytes decode")
+        .public_key();
+    assert_eq!(
+        bound,
+        public.as_ref().to_vec(),
+        "the bound key is the pair of the private key handed to the run"
+    );
+
+    // and the NODE key is nowhere near the run: only the session key, which can
+    // do exactly what this agent may already do, for this run, until it settles.
+    assert!(!env.contains_key("DUCKTAPE_NODE_KEY"));
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let (_actor, binds) = spawn_session_actor(rx, Ok(()));
+
+    let ws = NodedProvisioner::new(handle, tmp.path())
+        .provision(&duckfs_spec(None, Vec::new()))
+        .await
+        .expect("provision");
+
+    let env = ws.env();
+    assert!(!env.contains_key("DUCKTAPE_RUN_SESSION_KEY"));
+    assert!(!env.contains_key("DUCKTAPE_RUN_ID"));
+    assert!(
+        binds.lock().unwrap().is_empty(),
+        "a workspace nobody acts for asks consensus for nothing"
+    );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_refused_bind_degrades_to_a_read_only_plane_and_never_fails_the_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    // the shape of a node that is somehow not the run's committed lease-holder.
+    let (_actor, binds) = spawn_session_actor(rx, Err("runs: not the run's assignee"));
+
+    // the run STILL provisions: a session is an additive capability, and losing
+    // it must never cost the run its workspace (it can still return a response).
+    let ws = NodedProvisioner::new(handle, tmp.path())
+        .with_node_url(Some("http://127.0.0.1:8844".into()))
+        .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .expect("a refused session does not fail the provision");
+
+    let env = ws.env();
+    assert_eq!(binds.lock().unwrap().len(), 1, "the bind was attempted");
+    assert!(
+        !env.contains_key("DUCKTAPE_RUN_SESSION_KEY") && !env.contains_key("DUCKTAPE_RUN_ID"),
+        "no session, no key — the agent must not hold a key consensus refused"
+    );
+    // the READ half of the tool plane is untouched: this is exactly the
+    // pre-session behaviour, not a broken run.
+    assert_eq!(
+        env.get("DUCKTAPE_NODE").map(String::as_str),
+        Some("http://127.0.0.1:8844")
+    );
+    assert_eq!(
+        env.get("DUCKTAPE_RUN_AGENT").map(String::as_str),
+        Some("quackbot")
     );
     ws.cleanup().await;
 }

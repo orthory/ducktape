@@ -466,6 +466,17 @@ fn run_sim(
                     Some(NodeCommand::Submit { target, payload, origin, reply }) => {
                         sim.handle_submit(origin, Msg { target, payload }, reply).await;
                     }
+                    // the signed-frame lane needs an authorship the sim does not
+                    // have: it fabricates state for the UI, runs no agent (no
+                    // dispatch pool, no provisioner), and mints no session keys,
+                    // so nothing here could ever hold a key worth verifying. an
+                    // honest refusal beats a lane that pretends — the same call
+                    // /v1/call/ws makes where there is no mesh.
+                    Some(NodeCommand::SubmitFrame { reply, .. }) => {
+                        let _ = reply.send(Err(
+                            "the simulator serves no signed-frame lane — use /v1/submit".into(),
+                        ));
+                    }
                     Some(NodeCommand::Query { target, req, reply }) => {
                         let result = sim.host.query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);

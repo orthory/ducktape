@@ -429,3 +429,145 @@ fn a_fenced_job_response_still_yields_actions_only() {
     );
     assert_eq!(parsed.actions.len(), 1, "the fenced action is recovered");
 }
+
+// ---- chat.post_message on the settle path ------------------------------------
+
+#[test]
+fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
+    // the agent SPEAKING (its own channel, its own message) rather than
+    // ANSWERING where it was engaged — one more action in the strict lane, and
+    // one more chat post carrying `as_agent`.
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![AgentAction::PostMessage {
+                    channel_id: "general".into(),
+                    text: "progress: halfway".into(),
+                    thread: None,
+                }],
+            )),
+        ),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    let msgs = ctx.chat_msgs();
+    assert_eq!(msgs.len(), 2, "the run's reply AND the agent's own post");
+    assert_eq!(
+        msgs[1],
+        ChatMsg::PostMessage {
+            channel_id: "general".into(),
+            // the settle path numbers by the action's index in the response —
+            // disjoint from the session lane's `s`-prefixed slots.
+            message_id: post_message_id(&run_id, "0"),
+            blocks: vec![Block::paragraph("progress: halfway")],
+            thread: None,
+            as_agent: Some("bot".into()),
+        }
+    );
+    assert_ne!(
+        msgs[1], msgs[0],
+        "the post never squats the run's ONE reply id"
+    );
+}
+
+#[test]
+fn post_message_without_its_own_grant_fails_the_run() {
+    // THE ESCALATION GUARD, on the settle path: `chat.post` authorizes the
+    // reply and nothing more. an agent registered before this action existed
+    // must not have been silently handed the wider power.
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![AgentAction::PostMessage {
+                    channel_id: "general".into(),
+                    text: "sneaking in".into(),
+                    thread: None,
+                }],
+            )),
+        ),
+    )
+    .unwrap();
+
+    // the strict lane: an ungranted action fails the RUN (never the block).
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("not allowed to chat.post_message")),
+        "{:?}",
+        ctx.notes()
+    );
+    let posts = ctx.chat_msgs();
+    assert_eq!(posts.len(), 1, "only the failure reply: {posts:?}");
+    assert!(
+        matches!(
+            &posts[0],
+            ChatMsg::PostMessage { message_id, .. } if *message_id == reply_message_id(&run_id)
+        ),
+        "the agent's own post never existed — only the run's failure reply"
+    );
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+}
+
+#[test]
+fn a_post_message_effect_from_the_host_lane_decodes_and_threads() {
+    // the host-assembled effects facet is authoritative when non-empty (R1), so
+    // the new kind must decode there too — thread included.
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(
+                "done",
+                serde_json::json!({
+                    "effects": [{
+                        "kind": ACTION_CHAT_POST_MESSAGE,
+                        "channel_id": "general",
+                        "text": "threaded update",
+                        "thread": 1,
+                    }]
+                }),
+            )),
+        ),
+    )
+    .unwrap();
+
+    let msgs = ctx.chat_msgs();
+    assert_eq!(msgs.len(), 2);
+    assert!(
+        matches!(
+            &msgs[1],
+            ChatMsg::PostMessage { thread: Some(1), channel_id, .. } if channel_id == "general"
+        ),
+        "the effect's thread rides through: {:?}",
+        msgs[1]
+    );
+}
