@@ -2637,9 +2637,11 @@ where
     /// rendezvous-resolved path — and dropping it for `None` on an
     /// endpoint-less pair leaves BOTH sides unable to initiate, killing the
     /// live tunnel the join rode (and with it a fresh resident's only
-    /// statesync source, right as its standing lands). Same key + same
-    /// endpoint means the applied config is unchanged, so the device keeps
-    /// the tunnel's live sessions through the merge.
+    /// statesync source, right as its standing lands). The retained endpoint
+    /// is what carries the cutover: a reconfigure-in-place apply keeps the
+    /// tunnel's live sessions outright (same key + same endpoint = unchanged
+    /// config), and the epoch apply's full interface rebuild can re-initiate
+    /// immediately instead of deadlocking endpoint-less.
     fn merge_invite_layer(&mut self, merged: &mut BTreeMap<ValidatorIdentity, PeerTunnelConfig>) {
         self.invite_peers.retain(|id, invite| match merged.get_mut(id) {
             Some(entry) => {
