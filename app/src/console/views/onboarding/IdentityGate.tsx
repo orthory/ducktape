@@ -41,6 +41,12 @@ import {
   unlockIdentity,
 } from "../../../domain/user-identity-client";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
+import {
+  randomPassphrase,
+  touchidAvailable,
+  touchidEnroll,
+  touchidUnlock,
+} from "../../../domain/touchid-client";
 import { saveLinkPending, savePendingDisplayName } from "../../store/state";
 import { color, font } from "../../theme/tokens";
 import {
@@ -66,7 +72,13 @@ const ABSENT_TABS = [
   { id: "link", label: "Link device" },
 ] as const;
 
-type AbsentMode = (typeof ABSENT_TABS)[number]["id"];
+// The Touch ID entry sits next to Create, but only on a Mac with a usable
+// biometric authenticator — it's spliced into the Create/Touch-ID screens'
+// tab rail when `touchidAvailable()` resolves true, never shown elsewhere.
+const TOUCHID_TAB = { id: "touchid", label: "Use Touch ID" } as const;
+const CREATE_TABS_WITH_TOUCHID = [ABSENT_TABS[0], TOUCHID_TAB, ...ABSENT_TABS.slice(1)] as const;
+
+type AbsentMode = (typeof ABSENT_TABS)[number]["id"] | "touchid";
 
 // ── absent: create ──────────────────────────────────────────────────────
 
@@ -75,9 +87,12 @@ type CreateStep = "password" | "grid" | "confirm";
 function CreateFlow({
   onDone,
   onSwitchMode,
+  touchidAvailable = false,
 }: {
   onDone: () => void;
   onSwitchMode: (mode: AbsentMode) => void;
+  /** Splices the "Use Touch ID" tab into this screen's rail on a capable Mac. */
+  touchidAvailable?: boolean;
 }) {
   const [step, setStep] = useState<CreateStep>("password");
   const [name, setName] = useState("");
@@ -91,7 +106,11 @@ function CreateFlow({
         title="Create your account"
         subtitle="One account for all your devices and workspaces. Set a password to protect it on this device — your 24-word recovery phrase comes next."
       >
-        <ModeTabs tabs={ABSENT_TABS} mode="create" onSelect={onSwitchMode} />
+        <ModeTabs
+          tabs={touchidAvailable ? CREATE_TABS_WITH_TOUCHID : ABSENT_TABS}
+          mode="create"
+          onSelect={onSwitchMode}
+        />
         <input
           aria-label="Display name"
           value={name}
@@ -152,6 +171,108 @@ function CreateFlow({
           setBusy(true);
           setError(null);
           confirmMnemonic()
+            .then(onDone)
+            .catch((err) => setError(errMessage(err)))
+            .finally(() => setBusy(false));
+        }}
+      />
+    </GateCard>
+  );
+}
+
+// ── absent: create with Touch ID (macOS) ───────────────────────────────
+
+type TouchIdStep = "intro" | "grid" | "confirm";
+
+// Same ceremony as CreateFlow minus the human password: the vault is sealed
+// with a random 32-byte passphrase the user never sees (stashed in the
+// biometric Keychain after confirm), and the 24-word phrase is reframed as the
+// sole recovery path. Enroll runs AFTER confirm and is non-fatal — the account
+// already exists by then, so a failed enroll can never strand the user (they
+// can enable Touch ID later from Home).
+function TouchIdCreateFlow({
+  onDone,
+  onSwitchMode,
+}: {
+  onDone: () => void;
+  onSwitchMode: (mode: AbsentMode) => void;
+}) {
+  const [step, setStep] = useState<TouchIdStep>("intro");
+  const [name, setName] = useState("");
+  const [mnemonic, setMnemonic] = useState("");
+  const [pass] = useState(randomPassphrase); // generated once, stable for this flow
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (step === "intro") {
+    return (
+      <GateCard
+        title="Use Touch ID"
+        subtitle="Unlock this Mac with Touch ID — no password to remember. You'll still get a 24-word recovery phrase: it's the only other way back into your account, so save it."
+      >
+        <ModeTabs tabs={CREATE_TABS_WITH_TOUCHID} mode="touchid" onSelect={onSwitchMode} />
+        <input
+          aria-label="Display name"
+          value={name}
+          placeholder="Your name (optional)"
+          onChange={(event) => setName(event.target.value)}
+          style={inputStyle}
+        />
+        <button
+          disabled={busy}
+          style={primaryButtonStyle(busy)}
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            createIdentity(pass)
+              .then((created) => {
+                const trimmed = name.trim();
+                if (trimmed) savePendingDisplayName(trimmed);
+                setMnemonic(created.mnemonic);
+                setStep("grid");
+              })
+              .catch((err) => setError(errMessage(err)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          {busy ? "Creating…" : "Continue with Touch ID"}
+        </button>
+        {error && <span style={errorTextStyle}>{error}</span>}
+      </GateCard>
+    );
+  }
+
+  if (step === "grid") {
+    return (
+      <GateCard
+        title="Save your recovery phrase"
+        subtitle="These 24 words are the ONLY way back into your account if you lose this Mac. Write them down in order; they're shown only once."
+      >
+        <MnemonicGrid
+          mnemonic={mnemonic}
+          onContinue={() => setStep("confirm")}
+          continueLabel="I've saved it — continue"
+        />
+      </GateCard>
+    );
+  }
+
+  return (
+    <GateCard
+      title="Confirm your recovery phrase"
+      subtitle="Enter the requested words to prove you saved them."
+    >
+      <ConfirmWords
+        mnemonic={mnemonic}
+        busy={busy}
+        error={error}
+        onConfirmed={() => {
+          setBusy(true);
+          setError(null);
+          confirmMnemonic()
+            // Enroll AFTER confirm; a failed enroll is swallowed on purpose —
+            // the account + phrase already work, Touch ID can be enabled later.
+            .then(() => touchidEnroll(pass).catch(() => undefined))
             .then(onDone)
             .catch((err) => setError(errMessage(err)))
             .finally(() => setBusy(false));
@@ -291,7 +412,13 @@ function LinkFlow({
 
 function AbsentScreen({ onDone }: { onDone: () => void }) {
   const [mode, setMode] = useState<AbsentMode>("create");
-  if (mode === "create") return <CreateFlow onDone={onDone} onSwitchMode={setMode} />;
+  const [touchid, setTouchid] = useState(false);
+  useEffect(() => {
+    touchidAvailable().then(setTouchid, () => setTouchid(false));
+  }, []);
+  if (mode === "touchid") return <TouchIdCreateFlow onDone={onDone} onSwitchMode={setMode} />;
+  if (mode === "create")
+    return <CreateFlow onDone={onDone} onSwitchMode={setMode} touchidAvailable={touchid} />;
   if (mode === "restore") return <RestoreFlow onDone={onDone} onSwitchMode={setMode} />;
   return <LinkFlow onDone={onDone} onSwitchMode={setMode} />;
 }
@@ -389,12 +516,40 @@ function PlaintextScreen({ onDone, onDismiss }: { onDone: () => void; onDismiss:
 function LockedScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [touchid, setTouchid] = useState(false);
+  useEffect(() => {
+    touchidAvailable().then(setTouchid, () => setTouchid(false));
+  }, []);
+
+  // The biometric Keychain read prompts Touch ID; on a device whose biometrics
+  // were invalidated the shim returns the "touchid-unavailable" sentinel, which
+  // we translate into "use your recovery phrase" rather than a raw error.
+  const runTouchId = () => {
+    setBusy(true);
+    setError(null);
+    touchidUnlock()
+      .then(onDone)
+      .catch((err) => {
+        const msg = errMessage(err);
+        setError(
+          msg.includes("touchid-unavailable")
+            ? "Touch ID is unavailable — unlock with your recovery phrase (Restore) instead."
+            : msg,
+        );
+      })
+      .finally(() => setBusy(false));
+  };
 
   return (
     <GateCard
       title="Unlock your account"
       subtitle="Enter your password to unlock your account on this device for this session."
     >
+      {touchid && (
+        <button disabled={busy} style={primaryButtonStyle(busy)} onClick={runTouchId}>
+          {busy ? "Unlocking…" : "Unlock with Touch ID"}
+        </button>
+      )}
       <PasswordForm
         mode="confirm"
         busy={busy}

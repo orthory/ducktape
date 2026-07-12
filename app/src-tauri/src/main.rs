@@ -24,6 +24,7 @@ mod menu;
 mod notify;
 mod permissions;
 mod rt;
+mod touchid;
 mod tray;
 mod user_identity;
 mod workspaces;
@@ -151,6 +152,11 @@ fn main() {
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,
+            touchid::touchid_available,
+            touchid::touchid_enroll,
+            touchid::touchid_enrolled,
+            touchid::touchid_unlock,
+            touchid::touchid_disable,
             enroll::enroll_start,
             enroll::enroll_poll,
             enroll::enroll_cancel,

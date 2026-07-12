@@ -603,7 +603,13 @@ export function DucktapeProvider({
           return;
         }
         if (!active) {
-          dispatch({ type: "patch", patch: { needsOnboarding: true } });
+          // First run (no workspaces at all) → the onboarding gate. Workspaces
+          // registered but none active → the account-centric Home layer, not a
+          // re-onboard. Either way the shell stays hidden until one is entered.
+          dispatch({
+            type: "patch",
+            patch: all.length > 0 ? { atHome: true } : { needsOnboarding: true },
+          });
           return;
         }
         return actions.connectActive(active);
