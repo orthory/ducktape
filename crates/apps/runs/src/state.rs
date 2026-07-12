@@ -1,6 +1,6 @@
 use super::{
-    BTreeMap, Digest, Error, PendingState, RUN_KEY_SEPARATOR, SagaOrigin, Sha256, StateRoot,
-    TurnPolicy, dispatch_id_for,
+    AgentSession, BTreeMap, Digest, Error, MAX_ACTIONS_PER_SESSION, PendingState,
+    RUN_KEY_SEPARATOR, SESSION_KEY_LEN, SagaOrigin, Sha256, StateRoot, TurnPolicy, dispatch_id_for,
 };
 
 // ---- canonical encoding -------------------------------------------------------
@@ -53,6 +53,7 @@ fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
 pub(super) fn encode_committed(
     watches: &BTreeMap<String, TurnPolicy>,
     pending: &BTreeMap<String, PendingState>,
+    sessions: &BTreeMap<String, AgentSession>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -83,6 +84,19 @@ pub(super) fn encode_committed(
         out.extend_from_slice(&p.created_at.to_le_bytes());
     }
 
+    // the live agent sessions, keyed by run id. the action counter is the
+    // spent budget AND the deterministic id salt, so it is committed like
+    // every other field — a validator that replayed a different count would
+    // mint different ids.
+    out.extend_from_slice(&(sessions.len() as u64).to_le_bytes());
+    for (run_id, s) in sessions {
+        put_bytes(&mut out, run_id.as_bytes());
+        put_bytes(&mut out, s.agent_id.as_bytes());
+        put_bytes(&mut out, &s.session_key);
+        out.extend_from_slice(&s.opened_at.to_le_bytes());
+        out.extend_from_slice(&u64::from(s.actions).to_le_bytes());
+    }
+
     out
 }
 
@@ -92,8 +106,9 @@ pub(super) fn encode_committed(
 pub(super) fn committed_root(
     watches: &BTreeMap<String, TurnPolicy>,
     pending: &BTreeMap<String, PendingState>,
+    sessions: &BTreeMap<String, AgentSession>,
 ) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(watches, pending)).into())
+    StateRoot(Sha256::digest(encode_committed(watches, pending, sessions)).into())
 }
 
 // ---- canonical decoding (UNTRUSTED input) ---------------------------------
@@ -234,14 +249,47 @@ fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), S
     Ok(())
 }
 
-type Committed = (BTreeMap<String, TurnPolicy>, BTreeMap<String, PendingState>);
+/// a decoded session must be one a live module could have staged: the key IS
+/// the run id, the key length is the one this module admits, and the counter is
+/// within the budget the action lane enforces. `pending` is the run's own
+/// existence check — a session may never outlive its run, so a snapshot whose
+/// session names no in-flight run is not one any honest node could produce.
+fn validate_decoded_session(
+    pending: &BTreeMap<String, PendingState>,
+    s: &AgentSession,
+) -> Result<(), String> {
+    if s.session_key.len() != SESSION_KEY_LEN {
+        return Err("snapshot session key is not a 32-byte ed25519 key".into());
+    }
+    if contains_run_separator(&s.agent_id) {
+        return Err("snapshot session agent_id contains reserved unit separator".into());
+    }
+    if s.actions > MAX_ACTIONS_PER_SESSION {
+        return Err("snapshot session has spent more than its action budget".into());
+    }
+    let entry = pending
+        .get(&dispatch_id_for(&s.run_id))
+        .ok_or_else(|| "snapshot session names no in-flight run".to_string())?;
+    if entry.agent_id != s.agent_id {
+        return Err("snapshot session agent does not match its run".into());
+    }
+    Ok(())
+}
+
+type Committed = (
+    BTreeMap<String, TurnPolicy>,
+    BTreeMap<String, PendingState>,
+    BTreeMap<String, AgentSession>,
+);
 
 pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: a watch costs its id prefix and a policy
     // discriminant; a pending entry its three length prefixes, anchor, two
-    // option tags, claim height, origin discriminant, and created_at.
+    // option tags, claim height, origin discriminant, and created_at; a session
+    // its three length prefixes, opened_at, and the action counter.
     const MIN_WATCH_BYTES: u64 = 8 + 1;
     const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
+    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8;
 
     let mut watches: BTreeMap<String, TurnPolicy> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_WATCH_BYTES, "watch")?;
@@ -286,8 +334,28 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         insert_ascending(&mut pending, dispatch_id, entry)?;
     }
 
+    let mut sessions: BTreeMap<String, AgentSession> = BTreeMap::new();
+    let count = take_count(&mut buf, MIN_SESSION_BYTES, "session")?;
+    for _ in 0..count {
+        let run_id = take_lp_string(&mut buf)?;
+        let agent_id = take_lp_string(&mut buf)?;
+        let session_key = take_lp_bytes(&mut buf)?;
+        let opened_at = take_u64(&mut buf)?;
+        let actions = u32::try_from(take_u64(&mut buf)?)
+            .map_err(|_| "snapshot session action count exceeds u32".to_string())?;
+        let session = AgentSession {
+            run_id: run_id.clone(),
+            agent_id,
+            session_key,
+            opened_at,
+            actions,
+        };
+        validate_decoded_session(&pending, &session)?;
+        insert_ascending(&mut sessions, run_id, session)?;
+    }
+
     if !buf.is_empty() {
         return Err("snapshot has trailing bytes".into());
     }
-    Ok((watches, pending))
+    Ok((watches, pending, sessions))
 }

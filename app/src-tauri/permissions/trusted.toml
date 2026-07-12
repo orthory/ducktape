@@ -15,6 +15,7 @@ commands.allow = [
   "gateway_inline_place",
   "gateway_inline_close",
   "gateway_inline_hide_all",
+  "duck_set_gateway_base",
   "workspace_create",
   "workspace_join",
   "workspace_invite_blob",
@@ -62,4 +63,5 @@ commands.allow = [
   "huddle_pop_in",
   "notify_configure",
   "notify_mark_seen",
+  "notify_recent",
 ]

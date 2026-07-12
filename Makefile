@@ -74,7 +74,8 @@ demo-clear:
 
 ## dogfood: host ducktape's own source in the local dev node's forge module.
 ## registers a static `ducktape-dev` git remote at the node's forge endpoint and
-## pushes `main` (needs a running dev node — `make dev`). see ops/dogfood-forge.sh.
+## fetches + pushes canonical `origin/dev` to Forge `main`, then verifies the
+## exact ref (needs a running dev node — `make dev`). see ops/dogfood-forge.sh.
 dogfood-forge:
 	@bash ops/dogfood-forge.sh
 

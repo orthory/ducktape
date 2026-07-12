@@ -22,7 +22,9 @@
 //! - [`Principal::Gateway`] — executable content from a `.duck` site, in a
 //!   capability-free webview. It may ASK for the huddle-class devices
 //!   ([`GATEWAY_PROMPTABLE`]); only the user, through the native consent
-//!   window, can grant them. Everything else is denied outright.
+//!   window, can grant them. It is granted the protocol-required capabilities
+//!   in [`GATEWAY_AUTO_GRANTED`] without asking. Everything else is denied
+//!   outright.
 //! - [`Principal::Untrusted`] — an unknown webview label, or a bundled window
 //!   showing an origin it has no business showing. Denied.
 //!
@@ -68,6 +70,25 @@ const GATEWAY_PROMPTABLE: &[PermissionKind] = &[
     PermissionKind::Camera,
     PermissionKind::ScreenCapture,
 ];
+
+/// What publisher content is granted WITHOUT asking, because the protocol
+/// cannot work otherwise.
+///
+/// The WebSocket side door (spec D6) is loopback by construction: a `duck://`
+/// page cannot open a socket on its own scheme, so it fetches a single-use
+/// token and opens `ws://127.0.0.1:<gateway-port>`. Chromium gates any
+/// loopback connection behind the local-network permission, so denying it here
+/// would deny the protocol's only realtime lane — no prompt would make sense
+/// either, since the user did not ask for a "local network" feature, they
+/// opened a `.duck` app.
+///
+/// This is not a hole: the reachable surface is not "loopback", it is exactly
+/// what the node's minted CSP allows. `connect-src` is pinned to the page's own
+/// duck origin plus the node's own gateway port, and `content-security-policy`
+/// is NOT in the proxy's allowed response headers — a publisher cannot widen
+/// it. The door itself still demands a single-use, TTL'd, same-origin-minted
+/// token that resolves to the caller's signed route.
+const GATEWAY_AUTO_GRANTED: &[PermissionKind] = &[PermissionKind::LocalNetwork];
 
 const GATEWAY_PREFIX: &str = "gateway-";
 const PROMPT_LABEL: &str = "permission-prompt";
@@ -185,6 +206,15 @@ fn decide(request: &PermissionRequest) -> Decision {
                 .collect(),
         ),
         Principal::Gateway { site } => {
+            // Protocol-required capabilities are granted outright, with no
+            // prompt and no stored grant (see `GATEWAY_AUTO_GRANTED`).
+            if request
+                .kinds
+                .iter()
+                .all(|kind| GATEWAY_AUTO_GRANTED.contains(kind))
+            {
+                return Decision::Allow;
+            }
             // CEF grants a request whole or not at all, so a request mixing a
             // promptable device with something publisher content may never have
             // is denied outright — there is no subset left to ask about.
@@ -622,7 +652,6 @@ mod tests {
         );
 
         for forbidden in [
-            PermissionKind::LocalNetwork,
             PermissionKind::Geolocation,
             PermissionKind::ClipboardRead,
             PermissionKind::Notifications,
@@ -650,6 +679,35 @@ mod tests {
             "a request mixing a device with a forbidden permission cannot be split"
         );
         forget_webview("gateway-abc");
+    }
+
+    #[test]
+    fn the_websocket_side_door_gets_local_network_without_asking() {
+        note_gateway_site("gateway-door", "board.demo.duck");
+        // The page opens ws://127.0.0.1:<gateway-port>; Chromium gates loopback
+        // behind this permission. Denying it (or prompting for it) would break
+        // the protocol's only realtime lane.
+        assert_eq!(
+            decide(&request(
+                "gateway-door",
+                "http://door.localhost:49152",
+                vec![PermissionKind::LocalNetwork]
+            )),
+            Decision::Allow,
+            "the D6 WebSocket door is loopback by construction"
+        );
+        // It is protocol-required, not a device: it must not drag a promptable
+        // device through with it.
+        assert_eq!(
+            decide(&request(
+                "gateway-door",
+                "http://door.localhost:49152",
+                vec![PermissionKind::LocalNetwork, PermissionKind::Camera]
+            )),
+            Decision::Deny(DenyReason::PolicyDenied),
+            "a mixed request is still whole-or-nothing"
+        );
+        forget_webview("gateway-door");
     }
 
     #[test]

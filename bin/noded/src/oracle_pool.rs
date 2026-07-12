@@ -16,9 +16,8 @@ use commonware_runtime::{Spawner, Supervisor};
 use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
-use noded::NodeCommand;
+use noded::{NodeCommand, ORACLE_ORIGIN};
 
-use crate::ORACLE_ORIGIN;
 
 fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
     Arc::new(move |ctx, line| {
@@ -42,7 +41,10 @@ fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::Outpu
 /// daemon's storage dir (host-local, never consensus). `storage` keys the
 /// portable run-workspace root's per-node salt and its D7 boot validation.
 /// `forge_push_base` is the loopback smart-HTTP base agent-run branch pushes
-/// dial (derived from the daemon's OWN listen address by the caller).
+/// dial, and `node_http_base` the bare base a run's tool plane dials back
+/// (`DUCKTAPE_NODE`) — both derived from the daemon's OWN listen address by the
+/// caller.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
@@ -51,6 +53,7 @@ pub(crate) fn oracle_workers<C>(
     agent_dirs: capability_host::AgentDirs,
     storage: &std::path::Path,
     forge_push_base: Option<String>,
+    node_http_base: Option<String>,
 ) -> Vec<Box<dyn host::worker::Worker>>
 where
     C: Spawner + Supervisor + 'static,
@@ -135,7 +138,12 @@ where
         // (NodeStatus reports an empty public_key), and DEFAULT_ORIGIN is the
         // same identity its http push lane already submits under (D2: the
         // author is the agent, the committer the executing node).
-        .with_forge(forge_push_base, noded::DEFAULT_ORIGIN),
+        .with_forge(forge_push_base, noded::DEFAULT_ORIGIN)
+        // the agent tool plane: every run's child gets this daemon's http base
+        // as DUCKTAPE_NODE and the running binary's dir on PATH, so the MCP
+        // server the runner CLI spawns (outside the agent's sandbox) finds both
+        // `ducktape-mcp` and the node it acts against.
+        .with_node_url(node_http_base),
     );
 
     vec![Box::new(

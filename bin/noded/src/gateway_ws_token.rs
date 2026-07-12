@@ -76,7 +76,15 @@ impl WsTokenStore {
     pub fn consume(&self, token: &str, origin: &str) -> Option<WsGrant> {
         let mut entries = self.entries.lock().expect("ws token store poisoned");
         let entry = entries.remove(token)?;
-        if entry.expires_at <= Instant::now() || entry.origin != origin {
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        // CEF serializes a custom-scheme page's origin as the literal "null"
+        // on WebSocket handshakes, so the exact pin cannot hold for the very
+        // browser this door serves. Accept that serialization: the mint is
+        // already same-origin-gated at the trusted duck:// scheme handler, and
+        // single-use + TTL + token secrecy remain the transport defense.
+        if entry.origin != origin && origin != "null" {
             return None;
         }
         Some(WsGrant {

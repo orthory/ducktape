@@ -41,6 +41,14 @@ source revision → cached CEF debug artifact → isolated instance(s) → run(s
   executable, config path, and start identity before stopping the detached node
   group. Fleet owns HOME, XDG/data/display/port isolation and its desktop,
   VNC, and X process groups.
+- **Stop the instance before deleting its worktree.** `cleanupInstance` is a
+  path *inside* the worktree, while the workspace, pidfile, and detached node
+  live outside it under `FLEET_HOME` — so removing the worktree first destroys
+  the only thing that could stop the node, and it survives forever, unreachable
+  by `fleet down`. `ops/worktree-clean.sh` does the sequence in the right order
+  (dry-run by default, `--yes` to act): it reaps orphaned instances, then
+  removes worktrees whose branch is fully merged into `origin/dev`, and refuses
+  any that is dirty or carries an unmerged commit.
 - Ducktape's desktop is CEF-only on `dev`; the suite declares `runtime: cef`.
 - The dashboard and VNC server bind to loopback unless an operator explicitly
   chooses another dashboard host. Use an SSH/Tailscale tunnel for remote viewing.

@@ -61,6 +61,15 @@ base64 = { workspace = true }
 # forge attribution emails include a bounded sha256-derived suffix so distinct
 # committed agent ids cannot collapse onto the same synthetic address.
 sha2 = { workspace = true }
+# the op-frame codec. `/v1/submit/frame` VERIFIES an already-signed frame before
+# it reaches any actor, and the embedded daemon takes the op's origin from that
+# verification — never from a caller-supplied string. same codec every validator
+# runs, so one definition of "who signed this op".
+node = { workspace = true }
+# the per-run agent session keypair: minted with the SAME ed25519 types
+# `node::encode_frame` signs with (no second crypto stack, no hand-rolled key).
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
 
 commonware-runtime = { workspace = true }
 

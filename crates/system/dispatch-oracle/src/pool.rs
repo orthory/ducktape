@@ -293,6 +293,10 @@ async fn execute(
     let sink = plan.sink;
     let spec = WorkspaceSpec {
         run_id: format!("{}:{}", job.saga_id, job.attempt),
+        // the CONSENSUS id, straight from the envelope — the only id that
+        // resolves the run back in `runs`. it is deliberately NOT derived from
+        // the saga id above: that one exists to key the on-disk workspace dir.
+        consensus_run_id: plan.consensus_run_id,
         agent_id: ctx.agent_id.clone(),
         agent_display_name: Some(plan.agent_display_name),
         // the tagged source (duckfs subtree or forge repo@commit) crosses to

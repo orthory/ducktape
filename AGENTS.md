@@ -27,6 +27,30 @@
 - After the worktree change is implemented and verified, submit it as a PR
   against `dev`. Do not treat local completion as done when the requested flow
   is delivery.
+
+## Worktree Cleanup (a merged worktree is garbage — remove it)
+
+- **A worktree's life ends when its PR merges.** Once merged, remove the
+  worktree and delete its branch. Leaving it costs ~20 GB of Cargo target each
+  and nothing else; twelve of them once ate 250 GB and had to be swept by hand.
+- **Stop the QA fleet BEFORE removing the worktree — this order is not optional.**
+  `.tauri-agent/fleet.json` points `cleanupInstance` at
+  `qa/fleet/cleanup-instance.ts`, a path *inside the worktree*, while the
+  instance's workspace, pidfile and detached `ducktape-node` live *outside* it
+  under `FLEET_HOME`. Delete the worktree first and you delete the only thing
+  that could ever stop its node: it then runs forever, unreachable by
+  `fleet down`. That is not hypothetical — a node was found still up 40 hours
+  after its worktree was gone, beside 9.2 GB of instance homes whose worktrees
+  no longer existed. So: `"$FLEET" down <instance-id>`, *then* remove the tree.
+- **`ops/worktree-clean.sh` does the whole sequence safely.** Dry-run by
+  default; `--yes` to act. It reaps orphaned fleet instances (killing only a pid
+  it has verified is that workspace's own `ducktape-node`, by exe and
+  `--config` — never `pkill -f`), then removes worktrees whose branch is fully
+  merged into `origin/dev`. It REFUSES a worktree that is dirty or carries a
+  commit not in `dev`; unmerged work is never its to throw away.
+- Never stop desktop/QA processes with `pkill -f` — a pattern match will
+  cheerfully kill an editor, a grep, or this script. Find them by process cwd or
+  let Fleet's own teardown do it.
 - Review the PR from a clean context before merging: re-read the diff against
   `dev`, check for scope creep and missing verification, and address actionable
   feedback before deciding mergeability.

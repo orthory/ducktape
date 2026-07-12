@@ -642,6 +642,30 @@ pub(super) async fn park(
                                     }
                                 }
                             }
+                            // an ALREADY-SIGNED frame (an agent's session key,
+                            // not this node's): relayed VERBATIM — the resident
+                            // is the courier, never the author, so it neither
+                            // re-signs nor spends its own seq. the custodian
+                            // validator verifies the signature before it pins,
+                            // exactly as it does for a frame the resident signed
+                            // itself. same standing rule as above: no standing,
+                            // no boundary, no relay.
+                            noded::NodeCommand::SubmitFrame { frame, reply } => {
+                                if !resident_standing || serving.is_none() {
+                                    let _ =
+                                        reply.send(Err(not_serving(resident_standing)));
+                                } else {
+                                    match resident_relay.submit_frame(
+                                        frame,
+                                        &announce_targets,
+                                        &mut relay_tx,
+                                        relay_runtime::ResidentHold::Http(reply),
+                                    ) {
+                                        Ok(_) => {}
+                                        Err((hold, e)) => hold.fail(e),
+                                    }
+                                }
+                            }
                             noded::NodeCommand::Query { target, req, reply } => {
                                 let result = match &serving {
                                     Some((_, node_r)) => node_r

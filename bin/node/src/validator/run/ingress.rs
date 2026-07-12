@@ -395,19 +395,66 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    pub(super) async fn on_http(&mut self, cmd: noded::NodeCommand) {
+    /// take custody of an already-framed op on THIS validator: fan a forge pack
+    /// out to the peers that need it, then pin + propose the frame and hold the
+    /// caller's reply against the frame id until the drain answers it.
+    ///
+    /// the frame arrives SIGNED and is submitted verbatim — nothing here looks
+    /// at, replaces, or re-derives its origin. that is what makes it usable by
+    /// both callers: the frameless lane, whose frame this node just signed with
+    /// its own key, and the signed-frame lane, whose frame some OTHER key signed
+    /// (an agent's per-run session key). a re-sign here would silently convert
+    /// the second into the first — the exact defect the frame lane closes.
+    async fn submit_local_frame(
+        &mut self,
+        frame: Vec<u8>,
+        reply: futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
+    ) {
         let Self {
-            context,
             node,
             relay_tx,
-            next_seq,
             signer,
-            status_public_key,
             pending_submits,
             validator_relay,
             ..
         } = self;
 
+        let peers: Vec<ed25519::PublicKey> = if relay::required_blob_digest(&frame).is_some() {
+            read_valset_members(node.host())
+                .await
+                .iter()
+                .filter_map(|raw| ed25519::PublicKey::decode(raw.as_slice()).ok())
+                .filter(|key| key != &signer.public_key())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        match validator_relay.prepare_local(frame, reply, peers, relay_tx) {
+            Ok(Some(relay_runtime::ValidatorAction::SubmitLocal {
+                frame_id,
+                frame,
+                reply,
+                deadline,
+            })) => match node.submit_frame(frame).await {
+                Ok(id) => {
+                    debug_assert_eq!(id, frame_id);
+                    pending_submits.insert(id, (reply, deadline));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                }
+            },
+            Ok(Some(relay_runtime::ValidatorAction::SubmitResident { .. })) => {
+                unreachable!("local preparation returns a local action")
+            }
+            Ok(None) => {}
+            Err((reply, detail)) => {
+                let _ = reply.send(Err(detail));
+            }
+        }
+    }
+
+    pub(super) async fn on_http(&mut self, cmd: noded::NodeCommand) {
         match cmd {
             // `origin` is the caller's CLAIMED submitter identity —
             // meaningful on the embedded daemon, but this lane signs
@@ -415,53 +462,32 @@ impl ValidatorRuntime<'_> {
             // (authenticated authorship that governance relies on).
             // a claimed origin cannot ride a signed frame without
             // making authorship forgeable, so it is ignored here;
-            // display names resolve via the name registry instead.
+            // display names resolve via the name registry instead. a
+            // caller that needs to be its OWN author signs a frame and
+            // takes the SubmitFrame arm below.
             noded::NodeCommand::Submit {
                 target,
                 payload,
                 origin: _,
                 reply,
             } => {
-                let seq = *next_seq;
-                *next_seq += 1;
-                let frame = node::encode_frame(signer, seq, &Msg { target, payload });
-                let peers: Vec<ed25519::PublicKey> =
-                    if relay::required_blob_digest(&frame).is_some() {
-                        read_valset_members(node.host())
-                            .await
-                            .iter()
-                            .filter_map(|raw| ed25519::PublicKey::decode(raw.as_slice()).ok())
-                            .filter(|key| key != &signer.public_key())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                match validator_relay.prepare_local(frame, reply, peers, relay_tx) {
-                    Ok(Some(relay_runtime::ValidatorAction::SubmitLocal {
-                        frame_id,
-                        frame,
-                        reply,
-                        deadline,
-                    })) => match node.submit_frame(frame).await {
-                        Ok(id) => {
-                            debug_assert_eq!(id, frame_id);
-                            pending_submits.insert(id, (reply, deadline));
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(format!("submit failed: {e}")));
-                        }
-                    },
-                    Ok(Some(relay_runtime::ValidatorAction::SubmitResident { .. })) => {
-                        unreachable!("local preparation returns a local action")
-                    }
-                    Ok(None) => {}
-                    Err((reply, detail)) => {
-                        let _ = reply.send(Err(detail));
-                    }
-                }
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload });
+                self.submit_local_frame(frame, reply).await;
+            }
+            // an ALREADY-SIGNED frame: submitted VERBATIM, never re-signed and
+            // never re-originated. `OrderedNode::submit_frame` verifies the
+            // signature before anything is pinned, so a forged or tampered frame
+            // is a rejection here, not junk in the store — and the origin the
+            // block carries is the frame's own proven signer, which is the only
+            // authorship a module can trust.
+            noded::NodeCommand::SubmitFrame { frame, reply } => {
+                self.submit_local_frame(frame, reply).await;
             }
             noded::NodeCommand::Query { target, req, reply } => {
-                let result = node
+                let result = self
+                    .node
                     .host()
                     .query(&target, &req)
                     .await
@@ -473,7 +499,8 @@ impl ValidatorRuntime<'_> {
                     .iter()
                     .map(|m| noded::ModuleStatus {
                         id: (*m).into(),
-                        root: node
+                        root: self
+                            .node
                             .host()
                             .module_root(m)
                             .map(|r| hex(&r))
@@ -483,16 +510,16 @@ impl ValidatorRuntime<'_> {
                     .collect();
                 let _ = reply.send(noded::NodeStatus {
                     version: env!("CARGO_PKG_VERSION").into(),
-                    app_hash: hex(&node.app_hash()),
-                    height: node.finalized().map(|f| f.height).unwrap_or(0),
+                    app_hash: hex(&self.node.app_hash()),
+                    height: self.node.finalized().map(|f| f.height).unwrap_or(0),
                     modules,
-                    public_key: status_public_key.clone(),
+                    public_key: self.status_public_key.clone(),
                 });
             }
             noded::NodeCommand::Metrics { reply } => {
                 // one registry: commonware's runtime series plus the
                 // `ducktape_*` block series the drain loop records.
-                let _ = reply.send(context.encode());
+                let _ = reply.send(self.context.encode());
             }
         }
     }

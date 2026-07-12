@@ -326,6 +326,10 @@ fn actor_gone() -> Response {
 pub fn router(handle: NodeHandle) -> Router {
     Router::new()
         .route("/v1/submit", post(submit))
+        // the AUTHENTICATED submit lane: raw signed frame bytes in, the same
+        // receipt out. distinct from `/v1/submit` above, whose `origin` is a
+        // caller-supplied string.
+        .route("/v1/submit/frame", post(submit_frame))
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
         .route("/v1/blocks", get(blocks))
@@ -422,6 +426,16 @@ pub fn router(handle: NodeHandle) -> Router {
 /// the fallback submitter identity when a client sends no `origin`.
 pub const DEFAULT_ORIGIN: &str = "noded";
 
+/// the EMBEDDED daemon's executing identity: the origin its dispatch pool
+/// claims a run under, so an Accept claim records THIS key as the run's
+/// assignee and every op the daemon submits on the run's behalf (the oracle
+/// result, the agent session it opens) matches the lease-holder consensus
+/// committed. the real node has a keypair for this and signs; the embedded
+/// daemon has only its trusted-client origin string, so it must be ONE string
+/// — the binary's actor loop, its oracle pool, and the provisioner all name it
+/// here rather than each inventing a spelling.
+pub const ORACLE_ORIGIN: &[u8] = b"oracle";
+
 async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
     let payload = serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
     // empty string falls back too — chat rejects empty external authors
@@ -447,6 +461,66 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
             // stage the op's bytes only AFTER the commit so a rejected op leaves
             // nothing behind. put_chunk keys by sha256, so the digest IS the
             // op's content address (fetchable via /v1/files/blob/{op_hash}).
+            let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
+            Json(SubmitReceipt {
+                height: block.height,
+                app_hash: block.app_hash,
+                op_hash,
+            })
+            .into_response()
+        }
+        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Err(_) => actor_gone(),
+    }
+}
+
+/// POST /v1/submit/frame — an ALREADY-SIGNED op frame (`application/octet-stream`,
+/// the exact bytes [`node::encode_frame`] produced), answered with the same
+/// [`SubmitReceipt`] `/v1/submit` returns.
+///
+/// this lane exists because `/v1/submit`'s `origin` is a caller-supplied STRING:
+/// the embedded daemon honours it, `bin/node` throws it away and signs with its
+/// own node key, so nothing submitted there can carry authorship consensus is
+/// able to check. a frame can — its origin IS its verified signer, bound to
+/// `(seq, target, payload)` under `FRAME_NS`, which every honest validator
+/// re-verifies identically. that is what lets an agent's ephemeral session key
+/// act for itself instead of borrowing the node's identity.
+///
+/// the signature is verified HERE, before the frame reaches any actor: a frame
+/// that does not parse, or whose signature does not bind, is a 400 carrying the
+/// codec's verbatim reason and never enters a store or an orderer. the actors
+/// verify again where it matters (the validator's `submit_frame` re-checks
+/// before it pins) — this is the cheap gate, not the only one.
+async fn submit_frame(
+    State(handle): State<NodeHandle>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let frame = match body {
+        Ok(bytes) => bytes,
+        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    };
+    let payload = match node::decode_frame(&frame) {
+        // the origin is DELIBERATELY dropped here: the http layer never tells an
+        // actor who signed — the actor re-derives that from the bytes (or, on
+        // the validator, `submit_frame` does). one authority on authorship.
+        Ok((_origin, msg)) => msg.payload,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, &err.to_string()),
+    };
+    let (reply, rx) = oneshot::channel();
+    if let Err(resp) = handle
+        .send(NodeCommand::SubmitFrame {
+            frame: frame.to_vec(),
+            reply,
+        })
+        .await
+    {
+        return resp;
+    }
+    match rx.await {
+        Ok(Ok(block)) => {
+            // the receipt's op_hash addresses the op PAYLOAD — the module's own
+            // bytes, exactly as the frameless lane stages them. the frame
+            // envelope is transport (signature, seq), not content.
             let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
             Json(SubmitReceipt {
                 height: block.height,
