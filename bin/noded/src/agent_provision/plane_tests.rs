@@ -1,0 +1,254 @@
+//! the agent TOOL PLANE both lanes hand every run: the node base its tools
+//! dial (`DUCKTAPE_NODE`), the identity they act under (`DUCKTAPE_RUN_AGENT`),
+//! and the bin dir on PATH where `ducktape-mcp` is found.
+//!
+//! the duckfs-lane cases here run the REAL `checkout_with` engine against a
+//! stand-in files actor on the `NodeCommand` lane ([`spawn_files_actor`], which
+//! the forge-lane W6 tests share) — the mount bracket is exercised for real,
+//! without booting a node.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use dispatch_oracle::{RoMount, WorkspaceProvisioner as _, WorkspaceSource, WorkspaceSpec};
+use duckfs_client::chunk::{chunk_ids, file_object_id};
+use duckfs_core::{
+    EntryInfo, EntryKindWire, FilesQuery, FilesReply, RefsInfo, decode_query, encode_reply,
+};
+use futures::StreamExt as _;
+
+use super::*;
+use crate::NodeCommand;
+
+/// the skill subtree every W6 test mounts, and the file it must materialize.
+pub(super) const SKILL_PREFIX: &str = "/shared/skills/qa";
+pub(super) const SKILL_FILE: &str = "SKILL.md";
+pub(super) const SKILL_BODY: &str = "always quack twice\n";
+
+/// the in-memory duckfs the stand-in actor serves: one skill subtree.
+pub(super) fn skill_tree() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([(
+        format!("{SKILL_PREFIX}/{SKILL_FILE}"),
+        SKILL_BODY.as_bytes().to_vec(),
+    )])
+}
+
+/// the W6 mount every skill test pins (`<ro-root>/qa` ⇐ the skill subtree).
+pub(super) fn skill_mount() -> RoMount {
+    RoMount {
+        source_prefix: SKILL_PREFIX.into(),
+        source_snapshot: None,
+        mount_subpath: "qa".into(),
+    }
+}
+
+/// a stand-in files actor on the `NodeCommand` lane: answers the three queries
+/// a checkout makes (`refs` / `find` / `read`) over one in-memory tree, so the
+/// REAL engine production runs (`checkout_with` through `ActorNodeApi`) drives
+/// the mount bracket without a booted node.
+///
+/// `reject_reads` fails every `read` AFTER the enumeration succeeded — the
+/// shape of a mid-checkout failure (a transport drop, an unavailable chunk):
+/// the mount dirs are already on disk when the error fires, so the W5 unwind
+/// has real debris to remove.
+pub(super) fn spawn_files_actor(
+    mut rx: futures::channel::mpsc::Receiver<NodeCommand>,
+    tree: BTreeMap<String, Vec<u8>>,
+    reject_reads: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.next().await {
+            let NodeCommand::Query { req, reply, .. } = cmd else {
+                // the mount lane only ever reads; a submit here is a bug.
+                panic!("the stand-in files actor got a non-query command");
+            };
+            let reply_bytes = match decode_query(&req).expect("a files query") {
+                FilesQuery::Refs {} => Ok(encode_reply(&FilesReply::Refs(RefsInfo {
+                    head: None,
+                    pins: BTreeMap::new(),
+                    window_len: 0,
+                }))),
+                FilesQuery::Find { prefix, .. } => Ok(encode_reply(&FilesReply::Find {
+                    entries: tree
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(&prefix))
+                        .map(|(path, bytes)| file_entry(path, bytes))
+                        .collect(),
+                    next: None,
+                })),
+                FilesQuery::Read { path, .. } if !reject_reads => {
+                    let bytes = tree.get(&path).cloned().unwrap_or_default();
+                    Ok(encode_reply(&FilesReply::Read {
+                        b64: STANDARD.encode(&bytes),
+                        eof: true,
+                    }))
+                }
+                // the verbatim module contract string the engine's taxonomy keys on.
+                FilesQuery::Read { .. } => Err("files: chunk not available".to_string()),
+                other => panic!("the checkout asked for {other:?}"),
+            };
+            let _ = reply.send(reply_bytes);
+        }
+    })
+}
+
+/// one file entry, content-addressed EXACTLY as the module stores it — the
+/// checkout re-derives this id over the bytes it assembled and refuses a
+/// mismatch, so a sloppy stand-in would fail the verify, not the test.
+fn file_entry(path: &str, bytes: &[u8]) -> EntryInfo {
+    let meta = BTreeMap::new();
+    let size = bytes.len() as u64;
+    EntryInfo {
+        path: path.into(),
+        kind: EntryKindWire::File,
+        size,
+        exec: false,
+        object: duckfs_core::to_hex(&file_object_id(size, &chunk_ids(bytes), &meta)),
+        meta,
+    }
+}
+
+/// a duckfs-source spec: the agent's own workspace prefix (empty in the
+/// stand-in tree — the rw checkout materializes nothing) plus the skill mounts.
+fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
+    WorkspaceSpec {
+        run_id: "s1:0".into(),
+        agent_id: agent.map(Into::into),
+        source: WorkspaceSource::Duckfs {
+            source_prefix: "/shared/agent-workspaces/quackbot".into(),
+            source_snapshot: None,
+        },
+        ro_mounts: mounts,
+    }
+}
+
+// ---- the node base -------------------------------------------------------
+
+#[test]
+fn the_node_base_is_the_bare_http_root_the_forge_lane_hangs_off() {
+    // a wildcard bind must become a CONNECTABLE loopback in the SAME family (a
+    // bindv6only [::] listener refuses 127.0.0.1) — a run dials this back.
+    assert_eq!(
+        node_http_base(Some("0.0.0.0:8844")).as_deref(),
+        Some("http://127.0.0.1:8844")
+    );
+    assert_eq!(
+        node_http_base(Some("[::]:9001")).as_deref(),
+        Some("http://[::1]:9001")
+    );
+    // an explicit host passes through untouched (the operator chose it).
+    assert_eq!(
+        node_http_base(Some("10.0.0.5:8844")).as_deref(),
+        Some("http://10.0.0.5:8844")
+    );
+    assert_eq!(
+        node_http_base(Some("localhost:8844")).as_deref(),
+        Some("http://localhost:8844")
+    );
+    // no http surface ⇒ nothing to dial ⇒ nothing to hand the run.
+    assert_eq!(node_http_base(None), None);
+
+    // DUCKTAPE_NODE is the node ROOT: the /forge mount is the FORGE lane's
+    // suffix on top of it, and must never leak into the tool plane's base.
+    let base = node_http_base(Some("0.0.0.0:8844")).unwrap();
+    assert!(
+        !base.contains("/forge"),
+        "the node base carries no suffix: {base}"
+    );
+    assert_eq!(
+        forge_push_base(Some("0.0.0.0:8844")).unwrap(),
+        format!("{base}/forge"),
+        "one derivation, two bases — the push lane is the node base plus /forge"
+    );
+}
+
+// ---- what a run actually gets ---------------------------------------------
+
+#[tokio::test]
+async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let _actor = spawn_files_actor(rx, skill_tree(), false);
+    let prov = NodedProvisioner::new(handle, tmp.path())
+        .with_node_url(Some("http://127.0.0.1:8844".into()));
+
+    let ws = prov
+        .provision(&duckfs_spec(Some("quackbot"), vec![skill_mount()]))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let env = ws.env();
+
+    // the tool plane's two halves: WHERE the node is …
+    assert_eq!(
+        env.get("DUCKTAPE_NODE").map(String::as_str),
+        Some("http://127.0.0.1:8844")
+    );
+    // … and WHO the run acts for. the grant (owner/allowed_actions/caps) is
+    // deliberately NOT here: it is read back from the committed registry by
+    // this id, so it can never drift from the record.
+    assert_eq!(
+        env.get("DUCKTAPE_RUN_AGENT").map(String::as_str),
+        Some("quackbot")
+    );
+    assert!(!env.contains_key("DUCKTAPE_RUN_OWNER"));
+    assert!(!env.contains_key("DUCKTAPE_RUN_ALLOWED_ACTIONS"));
+    // the workspace + skill roots (the skill tree is the -ro SIBLING).
+    assert_eq!(
+        env.get("DUCKTAPE_RUN_WORKSPACE").map(String::as_str),
+        Some(dir.display().to_string().as_str())
+    );
+    let ro = PathBuf::from(env.get("DUCKTAPE_RUN_SKILLS").expect("skills root"));
+    assert_eq!(ro, PathBuf::from(format!("{}-ro", dir.display())));
+    assert_eq!(
+        std::fs::read_to_string(ro.join("qa").join(SKILL_FILE)).unwrap(),
+        SKILL_BODY
+    );
+
+    // PATH: the dir holding the RUNNING binary — `ducktape-mcp` ships beside
+    // it, and the runner CLI resolves the server by bare command name.
+    let exe_dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert_eq!(ws.path_entries(), vec![exe_dir]);
+
+    ws.cleanup().await;
+    assert!(
+        !dir.exists() && !ro.exists(),
+        "W5: both trees are the run's debris"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guessing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let _actor = spawn_files_actor(rx, skill_tree(), false);
+    // no with_node_url (a node serving no http surface) and no agent_id.
+    let ws = NodedProvisioner::new(handle, tmp.path())
+        .provision(&duckfs_spec(None, Vec::new()))
+        .await
+        .expect("provision");
+
+    let env = ws.env();
+    assert!(
+        !env.contains_key("DUCKTAPE_NODE"),
+        "a guessed base is worse than an absent one"
+    );
+    assert!(!env.contains_key("DUCKTAPE_RUN_AGENT"));
+    assert!(
+        !env.contains_key("DUCKTAPE_RUN_SKILLS"),
+        "no mounts, no root"
+    );
+    // the run still runs — only the tool plane is missing, never the workspace.
+    assert!(env.contains_key("DUCKTAPE_RUN_WORKSPACE"));
+    assert!(
+        !ws.path_entries().is_empty(),
+        "the bin dir is unconditional"
+    );
+    ws.cleanup().await;
+}

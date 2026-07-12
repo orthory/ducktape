@@ -75,6 +75,7 @@ members = [
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
+    "bin/mcp",
     # app — the desktop shell of the react client (web twin ships from app/)
     "app/src-tauri",
 ]

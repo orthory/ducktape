@@ -92,6 +92,37 @@ resume_args = [
     "-",
 ]
 
+[tools]
+# Wires the Ducktape MCP server into every argv this file produces — the base
+# tag, every [[variants]] tag, and the resume argv — spliced in at load time
+# IMMEDIATELY AFTER args[0] (the `exec` subcommand). Not appended: codex's
+# trailing bare "-" (prompt from stdin) must stay LAST.
+#
+# `ducktape-mcp` is resolved from the RUN's PATH — the provisioner puts its
+# directory there — so this spec names no absolute path and stays portable
+# across hosts. The values carry embedded double quotes because codex parses
+# a -c override as TOML; argv goes straight to exec, no shell ever sees it.
+#
+# default_tools_approval_mode="approve" is LOAD-BEARING, and its name reads
+# backwards. `codex exec` is non-interactive: there is no human to answer an
+# approval prompt, so any MCP tool call that WANTS one is auto-cancelled
+# ("user cancelled MCP tool call") and the agent silently loses its whole tool
+# plane. Of the four modes (auto / prompt / writes / approve) only `approve`
+# means "these tools are already approved — do not ask"; the other three ask,
+# and asking is a denial here. Verified against codex-cli 0.144.1 by running
+# the real argv: with `approve` the call completes and returns the server's
+# payload, and the run's `--sandbox workspace-write` is STILL enforced (a
+# direct `curl` to the node from the agent's shell fails with exit 7 in the
+# same run). That is the whole reason the tool plane is an MCP server the
+# RUNNER spawns rather than a CLI on the agent's PATH: the sandbox has no
+# network, and this is the only door through it.
+args = [
+    "-c",
+    'mcp_servers.ducktape.command="ducktape-mcp"',
+    "-c",
+    'mcp_servers.ducktape.default_tools_approval_mode="approve"',
+]
+
 # ---- curated model/effort matrix -------------------------------------------
 # The models the codex CLI itself lists (0.144.1): the gpt-5.6 family plus
 # gpt-5.5. Each model carries only the efforts that model actually supports —

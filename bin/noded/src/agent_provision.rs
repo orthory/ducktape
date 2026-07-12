@@ -18,24 +18,39 @@
 //! forge repo base are all reachable, the reachability wall dispatch-oracle
 //! cannot cross.
 //!
+//! whichever lane materializes it, every run is handed the same TOOL PLANE
+//! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
+//! `PATH` (where `ducktape-mcp` ships), the node's http base as `DUCKTAPE_NODE`,
+//! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
+//! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
+//! and know who it acts for; the GRANT itself is never in the env (see
+//! [`run_env`]).
+//!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
 //! a root VALIDATED at boot to be OUTSIDE `<storage>` — so a `..` from a
 //! checkout can NOT reach `user.key`, the node keys, qmdb, the blobstore, or
 //! forge's git substrate. the managed `/v1/fs/workspaces` root stays under
 //! `<storage>`; this is a distinct, relocated root for live agent runs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, RoMount, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
 };
+use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 
 use crate::NodeHandle;
+use crate::actor_api::ActorNodeApi;
 
 mod duckfs;
 mod forge;
 
 pub use forge::forge_push_base;
+
+#[cfg(test)]
+#[path = "agent_provision/plane_tests.rs"]
+mod plane_tests;
 
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
@@ -142,6 +157,123 @@ fn mount_dir_name(subpath: &str) -> Result<(), String> {
     }
 }
 
+/// this node's OWN http base — `http://<host>:<port>`, derived from its listen
+/// address, with a wildcard bind rewritten to the SAME family's loopback
+/// (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]` — a bindv6only `[::]` listener
+/// refuses v4 loopback dials). the base must be a CONNECTABLE host: a run's
+/// tool plane dials it back (`DUCKTAPE_NODE`), and the forge lane pushes to it
+/// ([`forge_push_base`] is exactly this base plus `/forge`). `None` in = no
+/// http surface = nothing to dial.
+pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
+    let listen = http_listen?;
+    let base = match listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let loopback = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+            format!("{loopback}:{}", addr.port())
+        }
+        Ok(addr) => addr.to_string(),
+        // not a socket address (hostname:port) — trust the operator's string.
+        Err(_) => listen.to_string(),
+    };
+    Some(format!("http://{base}"))
+}
+
+/// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
+/// binary. `ducktape-mcp` ships beside `noded`/`node`, and the runner CLI
+/// (codex/claude) spawns the MCP server by BARE command name from OUTSIDE the
+/// agent's sandbox — so putting this one dir on the child's PATH is the whole
+/// of how `ducktape-mcp` resolves.
+///
+/// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
+/// degrades to NO entry rather than failing the run: the agent still runs,
+/// just without the tool plane. never the other way round.
+fn tool_path_entries() -> Vec<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .into_iter()
+        .collect()
+}
+
+/// the run child's environment, shared by both lanes: where its writable tree
+/// is, where its W6 skill trees are, which node its tools dial, and which agent
+/// it is acting for.
+///
+/// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape-fs` reads — one
+/// name for "the node this process talks to", so every Ducktape tool a run
+/// spawns (the `ducktape-mcp` server the runner CLI starts, outside the agent's
+/// sandbox, included) finds the node without a second convention. a node with
+/// no http surface has nothing to name, so the var is simply absent.
+///
+/// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the grant —
+/// owner, allowed_actions, ResourceCaps — is read back from the COMMITTED agent
+/// registry by whoever holds this id; copying it into the env would mint a
+/// second, unversioned copy that drifts from the record it came from the moment
+/// the registry moves. the committed record is the one truth.
+fn run_env(
+    dir: &Path,
+    ro_dir: Option<&Path>,
+    node_url: Option<&str>,
+    spec: &WorkspaceSpec,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
+    if let Some(ro) = ro_dir {
+        // the consumer hook: skill trees live under this root, one dir per
+        // mount name.
+        env.insert("DUCKTAPE_RUN_SKILLS".into(), ro.display().to_string());
+    }
+    if let Some(url) = node_url {
+        env.insert("DUCKTAPE_NODE".into(), url.to_string());
+    }
+    if let Some(agent) = &spec.agent_id {
+        env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
+    }
+    env
+}
+
+/// materialize the run's W6 skill mounts under `ro_root` — one duckfs checkout
+/// per mount at `<ro_root>/<name>`. the ONE implementation both lanes call.
+///
+/// the ro root is a SUFFIXED SIBLING of the run's writable tree (`<slug>-ro`),
+/// never a child of it: the duckfs lane's `commit` scans only under the rw dir
+/// and the forge lane's `git add -A` only sees its own worktree, so a skill
+/// tree beside them can never leak into an output snapshot or ride a pushed
+/// branch. mount names arrive PRE-VALIDATED ([`mount_dir_name`] + dedup) from
+/// [`NodedProvisioner::provision`].
+///
+/// SYNC on purpose: the engine is blocking std::fs + `block_on` of the actor,
+/// so every caller runs this on `spawn_blocking` — NEVER an async worker.
+///
+/// W5 on the error path: a checkout can fail PARTWAY (transport mid-read,
+/// verify mismatch) after materializing some of the tree, and a failed
+/// provision hands the run no workspace to clean up — so this removes its OWN
+/// debris (the whole ro root) before returning. the caller unwinds the rw tree
+/// it already materialized.
+fn checkout_ro_mounts(
+    handle: &NodeHandle,
+    ro_root: &Path,
+    mounts: &[RoMount],
+) -> Result<(), String> {
+    let api = ActorNodeApi::new(handle.clone());
+    mounts
+        .iter()
+        .try_for_each(|m| {
+            checkout_with(
+                &api,
+                &ro_root.join(&m.mount_subpath),
+                &m.source_prefix,
+                m.source_snapshot.as_deref(),
+                &CheckoutOptions::default(),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(ro_root);
+        })
+}
+
 /// the real provisioner: mints per-run workspaces under `root`, driving the
 /// duckfs engine over `handle`'s actor lane and (when [`Self::with_forge`]
 /// configured a usable lane) the forge worktree engine over host `git`.
@@ -152,6 +284,10 @@ pub struct NodedProvisioner {
     /// `Err(reason)` — decided ONCE at construction, permanent and loud —
     /// when it can't. the duckfs lane is unaffected either way.
     forge: Result<forge::ForgeLane, String>,
+    /// this node's http base, handed to every run as `DUCKTAPE_NODE` so its
+    /// tool plane can dial back. `None` = no http surface = the var is unset
+    /// (see [`Self::with_node_url`]).
+    node_url: Option<String>,
 }
 
 impl NodedProvisioner {
@@ -162,7 +298,18 @@ impl NodedProvisioner {
             forge: Err("this provisioner was built without a forge lane \
                         (with_forge was never called)"
                 .into()),
+            node_url: None,
         }
+    }
+
+    /// bind the agent tool plane to this node: `node_url` is the base every run
+    /// dials as `DUCKTAPE_NODE` ([`node_http_base`] derives it from the node's
+    /// http listen address). `None` — a node serving no http surface — leaves
+    /// the var unset: there is nothing for a run's tools to talk to, and a
+    /// guessed URL would be worse than an absent one.
+    pub fn with_node_url(mut self, node_url: Option<String>) -> Self {
+        self.node_url = node_url;
+        self
     }
 
     /// configure the forge worktree lane: `push_base` is the loopback
@@ -220,6 +367,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 ));
             }
         }
+        let ro_root = self.root.join(format!("{slug}-ro"));
         match &spec.source {
             WorkspaceSource::Duckfs {
                 source_prefix,
@@ -228,15 +376,26 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 duckfs::provision(
                     self.handle.clone(),
                     run_dir,
-                    self.root.join(format!("{slug}-ro")),
+                    ro_root,
                     source_prefix.clone(),
                     source_snapshot.clone(),
+                    self.node_url.clone(),
                     spec,
                 )
                 .await
             }
             WorkspaceSource::Forge { repo, .. } => match &self.forge {
-                Ok(lane) => forge::provision(lane, run_dir, spec).await,
+                Ok(lane) => {
+                    forge::provision(
+                        lane,
+                        self.handle.clone(),
+                        run_dir,
+                        ro_root,
+                        self.node_url.clone(),
+                        spec,
+                    )
+                    .await
+                }
                 // a loud attempt failure BEFORE any on-disk debris — the saga
                 // settles the attempt (liveness is its job, not ours).
                 Err(reason) => Err(format!(

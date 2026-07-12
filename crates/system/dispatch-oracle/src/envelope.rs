@@ -6,7 +6,8 @@
 //! thread-continuity key, generic fallback instructions, the strict output
 //! contract, and the rendered conversation. the host resolves the pin to the
 //! real prompt bytes through an injected [`BlobResolver`] and assembles
-//! `<prompt-or-instructions>\n\n<contract>\n\n<conversation>` — so agents
+//! `<prompt-or-instructions>\n\n[<runtime>\n\n][<context>\n\n]<contract>\n\n<conversation>`
+//! (the bracketed sections ride only when the envelope carries them) — so agents
 //! finally run on their REGISTERED prompt, while consensus stays
 //! deterministic (it committed the hash, and the blob is content-addressed,
 //! so the exact bytes stay verifiable).
@@ -65,6 +66,12 @@ struct WireEnvelope {
     /// input between the instructions and the contract; None-case assembly
     /// stays byte-identical.
     context: Option<String>,
+    /// the deterministic runtime section: the ducktape tool plane plus the
+    /// run's skill mounts, composed in consensus. `Option` because it is an
+    /// ADDITIVE v3 field — an envelope composed before it existed carries no
+    /// key and must still run (it simply assembles without the section, exactly
+    /// as this worker did before).
+    runtime: Option<String>,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
@@ -179,21 +186,24 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
         envelope.skills,
         envelope.result_contract,
     )?;
-    // reading order (coordinator-decided M1 follow-up): system instructions →
-    // item context (forge runs only) → output contract → conversation. the
-    // context section is byte-exact from the envelope field, joined with the
-    // same "\n\n" delimiter as every other section; a context-less envelope
-    // assembles byte-identically to the pre-context worker.
-    let input = match &envelope.context {
-        Some(context) => format!(
-            "{prompt}\n\n{context}\n\n{}\n\n{}",
-            envelope.contract, envelope.conversation
-        ),
-        None => format!(
-            "{prompt}\n\n{}\n\n{}",
-            envelope.contract, envelope.conversation
-        ),
-    };
+    // reading order: system instructions → runtime (the tool plane and the
+    // run's skill mounts: what this session CAN do) → item context (forge runs
+    // only: what it is working ON) → output contract → conversation. every
+    // section is byte-exact from its envelope field, joined with the same
+    // "\n\n" delimiter; an OPTIONAL section that is absent contributes no
+    // delimiter either, so an envelope missing one assembles byte-identically
+    // to the worker that predates it.
+    let input = [
+        Some(prompt.as_str()),
+        envelope.runtime.as_deref(),
+        envelope.context.as_deref(),
+        Some(envelope.contract.as_str()),
+        Some(envelope.conversation.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
     Ok(Prepared {
         input,
         ctx,
@@ -605,6 +615,41 @@ mod tests {
         // context-less envelope assembles exactly the pre-context bytes.
         let Prepared { input, .. } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+    }
+
+    #[tokio::test]
+    async fn the_runtime_section_reaches_the_provider_input_ahead_of_the_item_context() {
+        // the runtime section (the ducktape tool plane + the run's skill
+        // mounts) is what the session CAN do; the item context is what it works
+        // ON. capabilities read first: instructions → runtime → context →
+        // contract → conversation.
+        let mut with_runtime: serde_json::Value =
+            serde_json::from_str(&forge_envelope_json()).unwrap();
+        with_runtime["runtime"] = serde_json::json!(
+            "A Ducktape MCP tool server named \"ducktape\" is available in this session."
+        );
+        let Prepared { input, .. } = prepare(&with_runtime.to_string(), None).await.unwrap();
+        assert_eq!(
+            input,
+            "GENERIC\n\nA Ducktape MCP tool server named \"ducktape\" is available in this \
+             session.\n\nForge item context — you are working this item as a session.\n\
+             repo: app\nitem: issue #7 (open)\n\nCONTRACT\n\nCONVERSATION"
+        );
+
+        // it is an ADDITIVE field: an envelope composed before the section
+        // existed carries no key and assembles byte-identically to what this
+        // worker produced then — no stray delimiter, no missing section.
+        let Prepared { input, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+
+        // and a runtime-only (non-forge) envelope carries it alone.
+        let mut duckfs_with_runtime: serde_json::Value =
+            serde_json::from_str(&envelope_json(None)).unwrap();
+        duckfs_with_runtime["runtime"] = serde_json::json!("TOOL PLANE");
+        let Prepared { input, .. } = prepare(&duckfs_with_runtime.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(input, "GENERIC\n\nTOOL PLANE\n\nCONTRACT\n\nCONVERSATION");
     }
 
     #[tokio::test]
