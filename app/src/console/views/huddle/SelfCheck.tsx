@@ -111,7 +111,8 @@ export function SelfCheck({
     aspectRatio: "16 / 9",
     borderRadius: radius.md,
     overflow: "hidden",
-    background: color.dark,
+    // video letterbox → scrim, not the inverting `color.dark` (see CallTiles).
+    background: color.scrim,
     border: `2px solid ${speaking ? color.green : "transparent"}`,
     boxSizing: "border-box",
     display: "flex",
@@ -158,8 +159,9 @@ export function SelfCheck({
               bottom: 8,
               padding: "2px 8px",
               borderRadius: 999,
-              background: "rgba(38,37,31,.62)",
-              color: color.onDark,
+              // always-dark chip over video → always-light text (see CallTiles).
+              background: color.scrimSoft,
+              color: color.onScrim,
               font: `600 11px ${font.sans}`,
             }}
           >
