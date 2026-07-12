@@ -54,6 +54,14 @@ pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u
 #[derive(Deserialize)]
 struct WireEnvelope {
     agent_id: String,
+    /// the run's CONSENSUS id — what `runs` resolves the run by (the id its
+    /// pending map is keyed on, and the one its agent session lane binds). the
+    /// host has no way to derive it: the pool's own `WorkspaceSpec.run_id` is
+    /// `{saga_id}:{attempt}`, a host-local workspace-dir key that names no run
+    /// in consensus. `Option` because it is an ADDITIVE field — an envelope
+    /// composed before it existed carries no key, and such a run must still
+    /// execute (it simply opens no session: the read-only tool plane).
+    run_id: Option<String>,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
     /// carries none (the generic `instructions` apply).
     prompt_hash: Option<String>,
@@ -182,6 +190,7 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
     };
     let workspace = accept_portable_envelope(
         &mut ctx,
+        envelope.run_id,
         envelope.workspace,
         envelope.skills,
         envelope.result_contract,
@@ -228,6 +237,7 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
 /// `capability-host::workdir_for`).
 fn accept_portable_envelope(
     ctx: &mut RunContext,
+    consensus_run_id: Option<String>,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
@@ -261,6 +271,10 @@ fn accept_portable_envelope(
     ctx.portable = true;
     Ok(PortablePlan {
         source,
+        // the id CONSENSUS knows this run by — carried through to the
+        // provisioner, which is the only thing that can name the run back to
+        // `runs`. absent on a pre-field envelope: no session, never a failure.
+        consensus_run_id,
         // the requested sink rides the plan so the pool can echo it on the
         // assembled RunnerResult; Chain (the default) when the key is absent.
         sink: result_contract.sink,
@@ -301,12 +315,17 @@ mod tests {
         })
     }
 
+    /// the CONSENSUS run id the composer stamps — see
+    /// [`crate::provision::WorkspaceSpec::consensus_run_id`].
+    const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}7\u{1f}bot";
+
     /// a duckfs-sourced v3 envelope — the byte shape the runs composer emits
     /// for every non-forge run.
     fn envelope_json(prompt_hash: Option<&str>) -> String {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "run_id": CONSENSUS_RUN_ID,
             "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
@@ -331,6 +350,7 @@ mod tests {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
             "prompt_hash": null,
             "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
@@ -532,6 +552,31 @@ mod tests {
             workspace.skills[0].source_snapshot.as_deref(),
             Some("bb".repeat(32).as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn the_plan_carries_the_consensus_run_id_and_tolerates_its_absence() {
+        // the id `runs` resolves the run by. it MUST survive the decode: the
+        // pool has no other way to name the run — its own spec id is
+        // `{saga_id}:{attempt}`, which resolves nothing in consensus — so a
+        // dropped id here silently kills every mid-run write the run makes.
+        let Prepared { workspace, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(
+            workspace.consensus_run_id.as_deref(),
+            Some(CONSENSUS_RUN_ID),
+            "the run id crosses the envelope verbatim, separators and all"
+        );
+
+        // ADDITIVE: an envelope composed before the field existed still runs —
+        // it simply names no run, so the provisioner opens no session (the
+        // read-only tool plane) rather than binding to a run that isn't there.
+        let mut legacy: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        legacy.as_object_mut().unwrap().remove("run_id");
+        let Prepared {
+            input, workspace, ..
+        } = prepare(&legacy.to_string(), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(workspace.consensus_run_id, None);
     }
 
     #[tokio::test]

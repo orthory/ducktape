@@ -95,7 +95,8 @@ impl RunsModule {
                 return Ok(());
             }
         };
-        let payload = envelope::render_job_payload(&agent, &job_id, &spec, portable).into_bytes();
+        let payload =
+            envelope::render_job_payload(&agent, &run_id, &job_id, &spec, portable).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             self.note(
                 ctx,

@@ -93,14 +93,6 @@ pub fn arg_str(args: &Value, name: &str) -> Result<String> {
         })
 }
 
-/// an optional string argument.
-pub fn opt_str(args: &Value, name: &str) -> Option<String> {
-    args.get(name)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 /// an optional integer argument.
 pub fn opt_u64(args: &Value, name: &str) -> Option<u64> {
     args.get(name).and_then(Value::as_u64)

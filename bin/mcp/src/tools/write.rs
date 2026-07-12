@@ -1,62 +1,56 @@
-//! the write plane: the same five things an agent could already do — now
-//! available WHILE it works, not only in the JSON it returns at the end.
+//! the write plane: the things an agent may do — now provable, and enforced
+//! where it counts.
 //!
-//! ## one vocabulary, not two
+//! ## every write is one signed action
 //!
-//! every tool here maps to exactly one `agent::KNOWN_ACTIONS` name, and is
-//! gated on it through `Run::authorize`. that is deliberate and load-bearing:
-//! the tool plane must not become a second, wider definition of what an agent
-//! may do. an owner grants `chat.post` once, and it governs both the response
-//! contract's `actions` and this plane's `ducktape_chat_post`. a tool with no
-//! action behind it would be a permission nobody could refuse.
+//! each tool here builds exactly one `agent::AgentAction`, hands it to
+//! [`Run::act`], and reports what came back. `act` signs a
+//! `RunsMsg::AgentAction` with this run's session key and submits it as an op
+//! frame; the runs module then decides, ON EVERY VALIDATOR, whether the agent
+//! was allowed to do it.
 //!
-//! ## how it differs from the response path, and why that is written down
+//! there is deliberately NO permission check in this file. the gate lives in
+//! consensus, in `runs`, reusing the same validator the response path uses —
+//! one definition of "what an agent may do", checked in one place. a courtesy
+//! pre-check here would be a second implementation of that rule, and the two
+//! would eventually disagree. when they disagreed, the one that mattered would
+//! be the other one.
 //!
-//! the runs module validates a response's actions IN CONSENSUS and emits them
-//! as module-origin effects, which is how they carry `AuthorRef::Agent`
-//! attribution. this plane cannot: it is a host-side process, and only a module
-//! may refine an origin into an agent author (chat and pages both reject
-//! `as_agent` from an external submitter — by design). so a write from here
-//! lands under the agent's OWNER, exactly as if the owner had done it in the
-//! app, and the gate that authorized it ran here rather than on-chain.
+//! ## what the session key buys
 //!
-//! see `identity`'s module doc for the full ceiling and its upgrade path. the
-//! short version: this opens no hole that the ambient `/v1/submit` route did
-//! not already have open, and under codex's network-less sandbox it is a real
-//! boundary.
+//! a frame's origin is its VERIFIED public key. so an `AgentAction` op is proof
+//! that this agent's run made it: consensus can (and does) check that the origin
+//! is the session key bound to this run, that the run is still in flight, and
+//! that the action fits the agent's committed grant. the write then lands as a
+//! MODULE-origin effect, which is what earns it `AuthorRef::Agent` attribution —
+//! chat and pages only accept `as_agent` from a module.
 //!
-//! ## ids
+//! none of that is available on the frameless lane, where the caller's origin is
+//! discarded and the op is re-signed by the node (see `node`'s module doc). that
+//! is why this file has no `submit` calls in it at all.
 //!
-//! chat messages, tasks, pages threads and pages comments are all
-//! CLIENT-minted. `Run::mint` produces them. a squatted id is refused by the
-//! module and the refusal reaches the model verbatim.
+//! ## the action vocabulary is the grant vocabulary
+//!
+//! the tools map one-for-one onto `agent::KNOWN_ACTIONS`. the tool plane must
+//! never become a second, wider set of powers than the one an owner can read off
+//! the agent's record and reason about.
 
 use serde_json::{Value, json};
 
-use agent::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
-    ACTION_TASKS_UPDATE_STATUS, CapRequest,
-};
-use chat::{Block, ChatMsg};
-use pages::{PageMsg, PageQuery};
-use tasks::{TaskMsg, TaskStatus};
+use agent::AgentAction;
+use tasks::TaskStatus;
 
-use super::{Tool, arg_bool, arg_str, opt_str, opt_u64, schema};
+use super::{Tool, arg_bool, arg_str, opt_u64, schema};
 use crate::identity::Run;
 use crate::node::{NodeError, Result};
-
-const TARGET_CHAT: &str = "chat";
-const TARGET_TASKS: &str = "tasks";
-const TARGET_PAGES: &str = "pages";
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "ducktape_chat_post",
             description: "Post a message to a chat channel. Use this to report progress or ask a \
-                          question while you work — you do not have to wait for your final \
-                          answer. Requires the chat.post action. The message is attributed to \
-                          your owner.",
+                          question while you work — you do not have to save everything for your \
+                          final answer. Requires the chat.post_message action.",
             schema: || {
                 schema(&[
                     ("channel_id", "string", true, "The channel to post in."),
@@ -84,12 +78,7 @@ pub(super) fn tools() -> Vec<Tool> {
             schema: || {
                 schema(&[
                     ("task_id", "string", true, "The task to move."),
-                    (
-                        "status",
-                        "string",
-                        true,
-                        "One of: open, in_progress, done.",
-                    ),
+                    ("status", "string", true, "One of: open, in_progress, done."),
                 ])
             },
             handler: task_status,
@@ -128,107 +117,51 @@ pub(super) fn tools() -> Vec<Tool> {
 }
 
 fn chat_post(run: &Run, args: &Value) -> Result<Value> {
-    let record = run.record()?;
-    let origin = run.authorize(&record, ACTION_CHAT_POST, &[])?;
-    let msg = ChatMsg::PostMessage {
+    run.act(AgentAction::PostMessage {
         channel_id: arg_str(args, "channel_id")?,
-        message_id: run.mint("message"),
-        blocks: vec![Block::paragraph(arg_str(args, "text")?)],
+        text: arg_str(args, "text")?,
         thread: opt_u64(args, "thread"),
-        // an external submitter setting `as_agent` is REJECTED by chat: only a
-        // module origin may refine itself into an agent author. the post is the
-        // owner's, and honestly labelled as such.
-        as_agent: None,
-    };
-    submit(run, TARGET_CHAT, &msg, &origin)
+    })
 }
 
 fn task_create(run: &Run, args: &Value) -> Result<Value> {
-    let record = run.record()?;
-    let origin = run.authorize(&record, ACTION_TASKS_CREATE, &[])?;
+    // the task id is the ONE id the agent supplies: `AgentAction::CreateTask`
+    // carries it in the payload (the response path has the model invent it), so
+    // unlike the pages/chat ids — which runs derives deterministically in
+    // consensus — this one is minted host-side and rides the committed op as
+    // plain data. every validator sees the same bytes, so determinism holds.
     let task_id = run.mint("task");
-    let msg = TaskMsg::CreateTask {
+    run.act(AgentAction::CreateTask {
         task_id: task_id.clone(),
         title: arg_str(args, "title")?,
-    };
-    submit(run, TARGET_TASKS, &msg, &origin)?;
-    // the minted id is the only thing the agent cannot derive itself, and it is
-    // what every follow-up (ducktape_task_status) needs — so hand it back
-    // rather than making the agent re-list the tasks to find what it just made.
+    })?;
+    // hand the id back: it is the only thing the agent cannot derive itself, and
+    // ducktape_task_status needs it.
     Ok(json!({"task_id": task_id}))
 }
 
 fn task_status(run: &Run, args: &Value) -> Result<Value> {
-    let record = run.record()?;
-    let origin = run.authorize(&record, ACTION_TASKS_UPDATE_STATUS, &[])?;
-    let msg = TaskMsg::UpdateStatus {
+    let status = task_status_of(&arg_str(args, "status")?)?;
+    run.act(AgentAction::UpdateTaskStatus {
         task_id: arg_str(args, "task_id")?,
-        status: task_status_of(&arg_str(args, "status")?)?,
-    };
-    submit(run, TARGET_TASKS, &msg, &origin)
+        // the wire name of a `tasks::TaskStatus` — parsed here purely so a
+        // near-miss ("Done") is answered with the three real names instead of
+        // burning a consensus round-trip to be told the same thing.
+        status: status_wire_name(status).to_string(),
+    })
 }
 
 fn page_comment(run: &Run, args: &Value) -> Result<Value> {
-    let record = run.record()?;
-    let target = arg_str(args, "target")?;
-    // the cap is PAGE-scoped but the target may be a block, so the owning page
-    // must be resolved BEFORE the gate can be applied — the same resolution the
-    // runs module's pages lane does, for the same reason. a page root is itself
-    // a block that names itself as its page, so one lookup covers both shapes.
-    let page = owning_page(run, &target)?;
-    let origin = run.authorize(
-        &record,
-        ACTION_PAGES_COMMENT,
-        &[CapRequest::PagesWrite(&page)],
-    )?;
-    let msg = PageMsg::AddComment {
-        thread_id: run.mint("thread"),
-        comment_id: run.mint("comment"),
-        target,
-        text: arg_str(args, "text")?,
-        // as with chat: an external origin may not claim an agent author.
-        as_agent: None,
-    };
-    submit(run, TARGET_PAGES, &msg, &origin)
+    run.act(AgentAction::AddPageComment {
+        target: arg_str(args, "target")?,
+        body: arg_str(args, "text")?,
+    })
 }
 
 fn page_check(run: &Run, args: &Value) -> Result<Value> {
-    let record = run.record()?;
-    let block_id = arg_str(args, "block_id")?;
-    let page = owning_page(run, &block_id)?;
-    let origin = run.authorize(
-        &record,
-        ACTION_PAGES_SET_CHECKED,
-        &[CapRequest::PagesWrite(&page)],
-    )?;
-    let msg = PageMsg::SetChecked {
-        block_id,
+    run.act(AgentAction::SetPageChecked {
+        block: arg_str(args, "block_id")?,
         checked: arg_bool(args, "checked")?,
-    };
-    submit(run, TARGET_PAGES, &msg, &origin)
-}
-
-/// which page a target (a page id or a block id) belongs to — the page-scoped
-/// `pages_write` cap needs the page, and the agent only ever has the block.
-fn owning_page(run: &Run, target: &str) -> Result<String> {
-    let query = PageQuery::GetBlock {
-        block_id: target.to_string(),
-    };
-    let reply = run.node.query(
-        TARGET_PAGES,
-        serde_json::to_value(&query)
-            .map_err(|e| NodeError::Transport(format!("could not encode the query: {e}")))?,
-    )?;
-    let block = reply.get("block").unwrap_or(&Value::Null);
-    if block.is_null() {
-        return Err(NodeError::Rejected(format!(
-            "no page or block {target:?} exists"
-        )));
-    }
-    opt_str(block, "page").ok_or_else(|| {
-        NodeError::Transport(format!(
-            "pages returned a block with no owning page: {block}"
-        ))
     })
 }
 
@@ -243,40 +176,19 @@ fn task_status_of(status: &str) -> Result<TaskStatus> {
     }
 }
 
-/// the one submit funnel. `origin` can only have come from `Run::authorize`,
-/// so there is no path to this function that skipped the gate.
-fn submit<M: serde::Serialize>(run: &Run, target: &str, msg: &M, origin: &str) -> Result<Value> {
-    let payload = serde_json::to_value(msg)
-        .map_err(|e| NodeError::Transport(format!("could not encode the op: {e}")))?;
-    run.node.submit(target, payload, origin)
+/// the wire name `tasks::TaskStatus` serializes to — the string
+/// `AgentAction::UpdateTaskStatus` carries.
+fn status_wire_name(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "open",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Done => "done",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ops_encode_to_the_modules_own_wire_shapes() {
-        let post = serde_json::to_value(ChatMsg::PostMessage {
-            channel_id: "c".into(),
-            message_id: "m".into(),
-            blocks: vec![Block::paragraph("hi")],
-            thread: None,
-            as_agent: None,
-        })
-        .unwrap();
-        assert_eq!(post["post_message"]["channel_id"], "c");
-        // the agent NEVER claims agent authorship on an external submit — chat
-        // would reject it, and the run would lose a write it thought it made.
-        assert!(post["post_message"]["as_agent"].is_null());
-
-        let create = serde_json::to_value(TaskMsg::CreateTask {
-            task_id: "t".into(),
-            title: "title".into(),
-        })
-        .unwrap();
-        assert_eq!(create, json!({"create_task": {"task_id": "t", "title": "title"}}));
-    }
 
     #[test]
     fn task_status_parses_exactly_the_three_wire_names() {
@@ -291,17 +203,57 @@ mod tests {
     }
 
     #[test]
+    fn the_status_wire_names_round_trip_through_the_action() {
+        // the action carries the status as a STRING, and tasks decodes it back
+        // into its own enum. if these two names ever drift, an agent's
+        // "done" silently becomes a rejected op — so pin the round trip.
+        for (name, status) in [
+            ("open", TaskStatus::Open),
+            ("in_progress", TaskStatus::InProgress),
+            ("done", TaskStatus::Done),
+        ] {
+            assert_eq!(status_wire_name(task_status_of(name).unwrap()), name);
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                Value::String(name.into()),
+                "the tasks module's own wire name must match"
+            );
+        }
+    }
+
+    #[test]
     fn every_write_tool_maps_to_a_known_action() {
-        // the invariant this whole file rests on: the tool plane is not a
-        // second, wider permission vocabulary. every write is gated on a name
-        // the agent registry already knows and an owner can already grant.
+        // the invariant the whole plane rests on: the tools are not a second,
+        // wider permission vocabulary than the one an owner grants and consensus
+        // enforces. every KNOWN_ACTION that an agent can *invoke* has a tool, and
+        // every tool names its action so a denied agent can say what it lacks.
+        //
+        // chat.post is the exception and belongs to no tool: it authorizes the
+        // run's REPLY BLOCKS (its final answer), which the runs module posts —
+        // not anything an agent calls mid-run. chat.post_message is the tool-side
+        // power, and it is deliberately a different grant.
         let described: Vec<&str> = tools().iter().map(|t| t.description).collect();
         for action in agent::KNOWN_ACTIONS {
+            if action == agent::ACTION_CHAT_POST {
+                continue;
+            }
             assert!(
                 described.iter().any(|d| d.contains(action)),
                 "no write tool is gated on the {action} action — either the tool is missing or \
                  the plane has drifted from KNOWN_ACTIONS"
             );
         }
+    }
+
+    #[test]
+    fn chat_post_requires_the_wider_grant_not_the_reply_grant() {
+        // the escalation guard, asserted at the tool surface: holding chat.post
+        // ("you may answer me") must NOT be what unlocks posting into arbitrary
+        // channels. that is chat.post_message, and an owner has to grant it.
+        let chat = tools()
+            .into_iter()
+            .find(|t| t.name == "ducktape_chat_post")
+            .expect("the chat tool");
+        assert!(chat.description.contains(agent::ACTION_CHAT_POST_MESSAGE));
     }
 }

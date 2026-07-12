@@ -270,8 +270,11 @@ pub(super) async fn provision(
         let checkout_ro = ro_root.clone();
         let repo_dir = workspace_args.repo_dir.clone();
         let run_dir = workspace_args.run_dir.clone();
+        // the handle outlives the mounts: the session bind below rides the same
+        // actor lane.
+        let mount_handle = handle.clone();
         tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&handle, &checkout_ro, &mounts).inspect_err(|_| {
+            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
                 // W5: a failed provision removes ALL its own debris. the mount
                 // helper dropped its partial ro tree; the worktree — and its
                 // metadata in the shared repo — goes here.
@@ -283,11 +286,16 @@ pub(super) async fn provision(
         Some(ro_root)
     };
 
+    // the worktree EXISTS now, so ask consensus to bind the run's agent session
+    // — never before: a bind for a run that failed to materialize would spend an
+    // op on a run that never starts.
+    let session = super::session::open(&handle, spec).await;
     let env = super::run_env(
         &workspace_args.run_dir,
         ro_dir.as_deref(),
         node_url.as_deref(),
         spec,
+        session.as_ref(),
     );
     Ok(Box::new(ForgeWorkspace {
         repo_dir: workspace_args.repo_dir,
@@ -384,6 +392,7 @@ impl ForgeWorkspace {
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
+            consensus_run_id: None,
             agent_id: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),

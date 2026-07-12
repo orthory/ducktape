@@ -32,6 +32,17 @@ pub enum NodeCommand {
         origin: Vec<u8>,
         reply: oneshot::Sender<Result<BlockSummary, String>>,
     },
+    /// take custody of an ALREADY-SIGNED op frame (`POST /v1/submit/frame`).
+    /// carries the RAW frame bytes: the origin rides INSIDE them as the
+    /// signature's verified signer, so no lane consults a caller string and no
+    /// lane may re-sign — a validator that re-framed this with its own node key
+    /// would destroy the exact authorship the lane exists to carry (an agent's
+    /// session key). the bytes are verified before they reach any actor, and
+    /// every actor verifies again where it must.
+    SubmitFrame {
+        frame: Vec<u8>,
+        reply: oneshot::Sender<Result<BlockSummary, String>>,
+    },
     Query {
         target: String,
         req: Vec<u8>,

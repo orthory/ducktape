@@ -27,9 +27,20 @@ chat = { workspace = true }
 tasks = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
-# `AgentRecord.owner` is a `SagaOrigin` — the type the submit origin is derived
-# from, and the one place a module-owned agent is refused rather than forged.
+# `AgentRecord.owner` is a `SagaOrigin` — read back for `ducktape_whoami`.
 saga = { workspace = true }
+# the session lane: every WRITE is a `RunsMsg::AgentAction` op, signed by this
+# run's session key and validated in CONSENSUS against the agent's committed
+# grant. the runs module — not this binary — is the gate.
+runs = { workspace = true }
+sdk = { workspace = true }
+# `encode_frame`: an op frame's origin IS its verified public key, so a signed
+# AgentAction proves which run it came from. this is the whole reason the write
+# plane is trustworthy — the frameless `/v1/submit` origin string is DISCARDED
+# by the real node.
+node = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,7 +57,13 @@ base64 = { workspace = true }
 # same shape as bin/fs's cli_e2e.
 noded = { path = "../noded" }
 host = { workspace = true }
-sdk = { workspace = true }
+# the stand-in actor answers the signed-frame lane exactly as both real binaries
+# do — decode + VERIFY, and the verified signer becomes the block's origin.
+node = { workspace = true }
+# the e2e drives the session lane end to end, so it needs the modules the lane
+# touches (runs + its collaborators) and the dispatch plane the run rides.
+dispatch = { workspace = true }
+tagging = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 futures = "0.3"
 tempfile = { workspace = true }

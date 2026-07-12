@@ -23,6 +23,7 @@ use support::{AGENT_ID, Harness, OWNER, content, payload};
 /// every action the registry knows — the "fully trusted agent" grant.
 const ALL_ACTIONS: &[&str] = &[
     "chat.post",
+    "chat.post_message",
     "tasks.create",
     "tasks.update_status",
     "pages.comment",
@@ -43,97 +44,112 @@ fn whoami_reports_the_committed_grant() {
     assert_eq!(who["owner"], json!({"external": OWNER.as_bytes()}));
 }
 
-#[test]
-fn a_granted_write_lands_on_chain_attributed_to_the_owner() {
-    let h = Harness::start(&["tasks.create"]);
-
-    let created = payload(&h.call(
-        h.mcp(),
-        "ducktape_task_create",
-        json!({"title": "ship the tool plane"}),
-    ));
-    let task_id = created["task_id"].as_str().expect("the minted id comes back");
-
-    // the oracle: ask the NODE what it holds, not the server that told us it
-    // wrote. a tool that lied about writing would pass every assertion that
-    // only read its own reply.
-    let reply = h.query("tasks", json!("list"));
-    let tasks = reply["tasks"].as_array().expect("a task list");
-    assert_eq!(tasks.len(), 1, "exactly the one task we created: {reply}");
-    assert_eq!(tasks[0]["id"], task_id);
-    assert_eq!(tasks[0]["title"], "ship the tool plane");
-    assert_eq!(tasks[0]["status"], "open");
-}
+/// a session key bound to nothing — no run in this harness was ever dispatched.
+/// consensus must therefore refuse every action it signs, and the refusal must
+/// come from `runs`, not from the binary under test.
+const SEED: [u8; 32] = [77u8; 32];
+const UNBOUND_RUN: &str = "no-such-saga:0";
 
 #[test]
-fn a_denied_write_never_reaches_the_chain() {
-    // the agent may create tasks but NOT move them.
+fn a_write_is_refused_by_consensus_not_by_the_tool_server() {
+    // the agent holds tasks.create — so if anything refuses this, it is NOT the
+    // grant. it is `runs`, in consensus, observing that the session key signing
+    // the op is bound to no live run. that is the whole architecture in one
+    // assertion: the tool server no longer decides.
     let h = Harness::start(&["tasks.create"]);
-
-    let created = payload(&h.call(
-        h.mcp(),
-        "ducktape_task_create",
-        json!({"title": "stays open"}),
-    ));
-    let task_id = created["task_id"].as_str().unwrap().to_string();
 
     let refused = h.call(
-        h.mcp(),
-        "ducktape_task_status",
-        json!({"task_id": task_id, "status": "done"}),
+        h.mcp_with_session(SEED, UNBOUND_RUN),
+        "ducktape_task_create",
+        json!({"title": "should never land"}),
     );
     let (is_error, text) = content(&refused);
-    assert!(is_error, "the denied write must refuse: {text}");
-    // the refusal names the exact grant the owner would have to widen — an
-    // agent that cannot say WHICH permission it lacks is useless to its owner.
+    assert!(is_error, "an action for an unbound run must refuse: {text}");
+    // `runs`'s own words, reaching the model verbatim through the frame lane.
     assert!(
-        text.contains("tasks.update_status"),
-        "the refusal must name the missing action: {text}"
+        text.contains("agent session") || text.contains("not in flight"),
+        "the refusal must be the runs module's, about the session: {text}"
     );
 
-    // the assertion that actually proves the gate: the chain is unmoved. a gate
-    // that refused in words but submitted anyway would pass the check above.
+    // and the chain is unmoved. a gate that refused in words but wrote anyway
+    // would pass the check above.
     let reply = h.query("tasks", json!("list"));
-    assert_eq!(
-        reply["tasks"][0]["status"], "open",
-        "a denied write must not have touched consensus: {reply}"
+    assert!(
+        reply["tasks"].as_array().is_none_or(|t| t.is_empty()),
+        "nothing may have been written: {reply}"
     );
 }
 
 #[test]
-fn the_gate_follows_the_committed_grant_when_it_narrows_mid_run() {
+fn a_write_without_a_session_never_reaches_the_wire_at_all() {
+    // no session key: the server has no credential to prove the write came from
+    // this agent, so it refuses locally rather than falling back to a lane that
+    // would file the write under the executing node's identity. that fallback IS
+    // the defect this whole design removes, so its absence is asserted.
+    let h = Harness::start(&["tasks.create"]);
+
+    let refused = h.call(h.mcp(), "ducktape_task_create", json!({"title": "nope"}));
+    let (is_error, text) = content(&refused);
+    assert!(is_error, "a session-less write must refuse: {text}");
+    assert!(
+        text.contains("session"),
+        "the refusal must say the run holds no session: {text}"
+    );
+}
+
+#[test]
+fn the_reported_grant_is_the_committed_one_even_as_it_narrows() {
+    // whoami reads the registry per call, so an owner narrowing the agent
+    // mid-run is visible immediately. (the ENFORCEMENT of that grant now lives
+    // in consensus — see runs' own tests; what the tool server still owes the
+    // model is an honest answer about what it currently holds.)
     let h = Harness::start(ALL_ACTIONS);
+    let before = payload(&h.call(h.mcp(), "ducktape_whoami", json!({})));
+    assert!(
+        before["allowed_actions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tasks.create"))
+    );
 
-    // with the full grant, the write lands.
-    let created = payload(&h.call(h.mcp(), "ducktape_task_create", json!({"title": "first"})));
-    assert!(created["task_id"].is_string());
-
-    // the owner narrows the agent on-chain, mid-run — revoking tasks.create.
     h.submit(
         "agent",
-        json!({
-            "update_agent": {
-                "agent_id": AGENT_ID,
-                "allowed_actions": ["chat.post"],
-            }
-        }),
+        json!({"update_agent": {"agent_id": AGENT_ID, "allowed_actions": ["chat.post"]}}),
         OWNER,
     );
 
-    // the very next call must refuse. a grant cached at startup would happily
-    // keep honouring a permission consensus has already taken away — which is
-    // exactly why `Run::record` re-reads the registry per call.
-    let refused = h.call(h.mcp(), "ducktape_task_create", json!({"title": "second"}));
-    let (is_error, text) = content(&refused);
-    assert!(is_error, "the revoked action must now refuse: {text}");
-    assert!(text.contains("tasks.create"), "{text}");
-
-    let reply = h.query("tasks", json!("list"));
+    let after = payload(&h.call(h.mcp(), "ducktape_whoami", json!({})));
     assert_eq!(
-        reply["tasks"].as_array().unwrap().len(),
-        1,
-        "the second task must not exist: {reply}"
+        after["allowed_actions"],
+        json!(["chat.post"]),
+        "a cached grant would still be reporting the revoked one"
     );
+}
+
+#[test]
+fn one_session_carries_many_calls_and_never_answers_the_notification() {
+    let h = Harness::start(&["tasks.create"]);
+    h.submit(
+        "tasks",
+        json!({"create_task": {"task_id": "seeded", "title": "from the test"}}),
+        OWNER,
+    );
+
+    // the framing test: a real runner opens ONE stdio session, sends the
+    // `initialized` notification, then makes call after call down the same pipe.
+    // an answered notification would shift every id, and `session` asserts the
+    // count.
+    let results = h.session(
+        h.mcp(),
+        &[
+            json!({"name": "ducktape_whoami", "arguments": {}}),
+            json!({"name": "ducktape_tasks", "arguments": {}}),
+            json!({"name": "ducktape_chat_channels", "arguments": {}}),
+        ],
+    );
+    assert_eq!(results.len(), 3);
+    assert_eq!(payload(&results[0])["agent_id"], AGENT_ID);
+    assert_eq!(payload(&results[1])["tasks"][0]["id"], "seeded");
 }
 
 #[test]
@@ -203,36 +219,34 @@ fn a_run_with_no_agent_can_read_but_never_write() {
 }
 
 #[test]
-fn a_module_rejection_reaches_the_model_verbatim() {
+fn a_refusal_reaches_the_model_verbatim() {
     let h = Harness::start(&["tasks.update_status"]);
 
-    // moving a task that does not exist: the module refuses, and its own words
-    // must reach the model rather than a reworded guess at them — an agent can
-    // only correct a mistake it can read.
+    // whatever refuses — the tool server for a missing credential, or `runs` for
+    // an unbound session — its OWN words must reach the model rather than a
+    // reworded guess at them. an agent can only correct a mistake it can read.
     let refused = h.call(
-        h.mcp(),
+        h.mcp_with_session(SEED, UNBOUND_RUN),
         "ducktape_task_status",
         json!({"task_id": "no-such-task", "status": "done"}),
     );
     let (is_error, text) = content(&refused);
-    assert!(is_error, "a module rejection must surface as a refusal");
+    assert!(is_error, "the refusal must surface as one");
     assert!(
         text.contains("Ducktape refused the request"),
-        "the module's rejection must reach the model: {text}"
+        "the refusal must reach the model verbatim: {text}"
     );
 }
 
 #[test]
 fn a_bad_status_name_is_refused_before_it_reaches_the_node() {
     let h = Harness::start(&["tasks.update_status"]);
-    h.submit(
-        "tasks",
-        json!({"create_task": {"task_id": "t1", "title": "t"}}),
-        OWNER,
-    );
 
+    // the ONE thing still checked locally: a status that is not one of the three
+    // wire names. not a permission decision — a spelling one — so answering it
+    // here costs the agent a consensus round-trip it would only lose anyway.
     let refused = h.call(
-        h.mcp(),
+        h.mcp_with_session(SEED, UNBOUND_RUN),
         "ducktape_task_status",
         json!({"task_id": "t1", "status": "Done"}),
     );
@@ -242,44 +256,6 @@ fn a_bad_status_name_is_refused_before_it_reaches_the_node() {
         text.contains("open, in_progress, or done"),
         "a near-miss status must be told the three real names: {text}"
     );
-
-    let reply = h.query("tasks", json!("list"));
-    assert_eq!(reply["tasks"][0]["status"], "open", "nothing moved");
-}
-
-#[test]
-fn one_session_carries_many_calls_and_never_answers_the_notification() {
-    let h = Harness::start(&["tasks.create"]);
-
-    // the framing test: a real runner opens ONE stdio session, sends the
-    // `initialized` notification, and then makes call after call down the same
-    // pipe. an answered notification would shift every id and `session` asserts
-    // the count.
-    let results = h.session(
-        h.mcp(),
-        &[
-            json!({"name": "ducktape_whoami", "arguments": {}}),
-            json!({"name": "ducktape_task_create", "arguments": {"title": "one"}}),
-            json!({"name": "ducktape_task_create", "arguments": {"title": "two"}}),
-            json!({"name": "ducktape_tasks", "arguments": {}}),
-        ],
-    );
-    assert_eq!(results.len(), 4);
-    assert_eq!(payload(&results[0])["agent_id"], AGENT_ID);
-
-    let listed = payload(&results[3]);
-    let titles: Vec<&str> = listed["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["title"].as_str().unwrap())
-        .collect();
-    assert!(titles.contains(&"one") && titles.contains(&"two"), "{titles:?}");
-
-    // both writes landed, with distinct minted ids — the id minter must not
-    // collide within one process.
-    let reply = h.query("tasks", json!("list"));
-    assert_eq!(reply["tasks"].as_array().unwrap().len(), 2);
 }
 
 #[test]

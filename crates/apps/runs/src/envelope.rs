@@ -81,6 +81,15 @@ fn runtime_section(skills: &[SkillEnvelope]) -> String {
 struct RunEnvelope<'a> {
     ducktape_run: u32,
     agent_id: &'a str,
+    /// the run's CONSENSUS id — the key this module resolves a run by
+    /// (`dispatch_id_for(run_id)` is the pending map's key, and the agent
+    /// session lane binds on it). it rides the envelope because it is NOT
+    /// derivable host-side: the provisioner's own `WorkspaceSpec.run_id` is
+    /// `{saga_id}:{attempt}`, a host-local key for the on-disk workspace dir,
+    /// and hashing THAT resolves no run at all — every session bind and every
+    /// mid-run action named a run that never existed, and the whole write plane
+    /// degraded silently. the composer knows the id; the host must be TOLD it.
+    run_id: &'a str,
     /// lowercase hex of the agent's [`PROMPT_HASH_LEN`]-byte prompt pin, or
     /// null when the record carries none — the host resolves the prompt
     /// content by this digest and falls back to `instructions` on null.
@@ -218,8 +227,13 @@ pub(crate) fn resolve_skills(agent: &AgentRecord, head: &Option<String>) -> Vec<
 
 /// serialize one envelope — deterministic: fixed field order (see
 /// [`RunEnvelope`]) and serde_json's canonical string escaping.
+///
+/// `run_id` is passed in, never re-derived here: the callsite already minted it
+/// to key the dispatch, and one id minted in two places is exactly the drift
+/// this field exists to close.
 fn envelope(
     agent: &AgentRecord,
+    run_id: &str,
     thread_key: Option<String>,
     conversation: String,
     portable: PortableInputs,
@@ -227,6 +241,7 @@ fn envelope(
     serde_json::to_string(&RunEnvelope {
         ducktape_run: RUN_ENVELOPE_VERSION,
         agent_id: &agent.agent_id,
+        run_id,
         prompt_hash: prompt_hash_hex(agent),
         thread_key,
         instructions: DEFAULT_PROMPT,
@@ -254,9 +269,11 @@ fn prompt_hash_hex(agent: &AgentRecord) -> Option<String> {
 
 /// compose a chat run's payload: the envelope around the rendered transcript
 /// window ending at the anchor.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_payload(
     module_id: &str,
     agent: &AgentRecord,
+    run_id: &str,
     channel_id: &str,
     anchor_seq: u64,
     thread_root: Option<u64>,
@@ -266,6 +283,7 @@ pub(crate) fn render_payload(
     let thread_key = format!("{channel_id}#{}", thread_root.unwrap_or(anchor_seq));
     envelope(
         agent,
+        run_id,
         Some(thread_key),
         render_conversation(module_id, &agent.agent_id, transcript),
         portable,
@@ -276,12 +294,14 @@ pub(crate) fn render_payload(
 /// conversation is the job's coordinates plus its FULL submitted spec.
 pub(crate) fn render_job_payload(
     agent: &AgentRecord,
+    run_id: &str,
     job_id: &str,
     spec: &str,
     portable: PortableInputs,
 ) -> String {
     envelope(
         agent,
+        run_id,
         None,
         format!(
             "Job {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
@@ -295,6 +315,7 @@ pub(crate) fn render_job_payload(
 /// thread/ordinal coordinates explicit.
 pub(crate) fn render_page_comment_payload(
     agent: &AgentRecord,
+    run_id: &str,
     thread_id: &str,
     ordinal: u64,
     author: &str,
@@ -303,6 +324,7 @@ pub(crate) fn render_page_comment_payload(
 ) -> String {
     envelope(
         agent,
+        run_id,
         Some(format!("pages:{thread_id}")),
         format!(
             "Pages comment thread {thread_id}, comment {ordinal}. Reply to this comment thread.\n\n{author}: {text}"
@@ -426,6 +448,17 @@ mod tests {
         serde_json::from_str(payload).expect("the payload is a JSON envelope")
     }
 
+    /// the run ids the composer's REAL callsites mint — never a hand-written
+    /// string: the envelope's whole job is to carry the id the pending map is
+    /// keyed by, so a test that invents one would prove nothing.
+    fn run_id(channel: &str, anchor_seq: u64) -> String {
+        crate::run_id_for(channel, anchor_seq, "bot")
+    }
+
+    fn job_id(job: &str) -> String {
+        crate::job_run_id_for(job, "bot", 3)
+    }
+
     fn portable(snapshot: Option<&str>, skills: Vec<SkillEnvelope>) -> PortableInputs {
         PortableInputs {
             workspace: duckfs_workspace(
@@ -462,7 +495,16 @@ mod tests {
     fn a_chat_envelope_carries_the_prompt_pin_and_anchor_thread_key() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
-        let payload = render_payload("runs", &agent, "general", 1, None, &transcript, plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 1),
+            "general",
+            1,
+            None,
+            &transcript,
+            plain(),
+        );
         let v = parse(&payload);
 
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
@@ -481,13 +523,69 @@ mod tests {
 
         // field order is part of the committed bytes — assert the layout, not
         // just the values.
-        assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#));
+        assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#));
+    }
+
+    #[test]
+    fn every_envelope_names_the_run_the_pending_map_is_keyed_by() {
+        // the host cannot derive this id (its own run key is
+        // `{saga_id}:{attempt}`), so an envelope that omits it leaves the
+        // executing node unable to name its own run back to this module — the
+        // session bind and every mid-run action then address a run that does
+        // not exist. all three lanes must carry it.
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+
+        let chat = run_id("general", 1);
+        let v = parse(&render_payload(
+            "runs",
+            &agent,
+            &chat,
+            "general",
+            1,
+            None,
+            &[],
+            plain(),
+        ));
+        assert_eq!(v["run_id"], chat);
+        assert_eq!(
+            chat,
+            crate::run_id_for("general", 1, "bot"),
+            "the composed id IS the turn-claim key the dispatch is registered under"
+        );
+
+        let job = job_id("job-1");
+        let v = parse(&render_job_payload(&agent, &job, "job-1", "spec", plain()));
+        assert_eq!(
+            v["run_id"], job,
+            "job runs have no channel, but do have a run"
+        );
+
+        let page = crate::page_run_id_for("thread-1", 1, "bot");
+        let v = parse(&render_page_comment_payload(
+            &agent,
+            &page,
+            "thread-1",
+            1,
+            "user:aa",
+            "hi",
+            plain(),
+        ));
+        assert_eq!(v["run_id"], page);
     }
 
     #[test]
     fn an_agent_without_a_prompt_pin_composes_null() {
         let agent = agent_with_hash(Vec::new());
-        let payload = render_payload("runs", &agent, "general", 1, None, &[], plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 1),
+            "general",
+            1,
+            None,
+            &[],
+            plain(),
+        );
         let v = parse(&payload);
         assert!(v["prompt_hash"].is_null());
         assert_eq!(
@@ -501,7 +599,16 @@ mod tests {
     fn a_threaded_anchor_keys_by_its_thread_root() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
         let transcript = vec![message(3, AuthorRef::User(vec![1; 32]), "in thread")];
-        let payload = render_payload("runs", &agent, "general", 3, Some(1), &transcript, plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 3),
+            "general",
+            3,
+            Some(1),
+            &transcript,
+            plain(),
+        );
         assert_eq!(
             parse(&payload)["thread_key"],
             "general#1",
@@ -512,7 +619,13 @@ mod tests {
     #[test]
     fn a_job_envelope_has_no_thread_key_and_preserves_the_job_framing() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_job_payload(&agent, "job-1", "summarize this work item", plain());
+        let payload = render_job_payload(
+            &agent,
+            &job_id("job-1"),
+            "job-1",
+            "summarize this work item",
+            plain(),
+        );
         let v = parse(&payload);
         assert!(v["thread_key"].is_null(), "job runs have no channel");
         assert_eq!(v["agent_id"], "bot");
@@ -537,22 +650,58 @@ mod tests {
                 "earlier reply",
             ),
         ];
-        let a = render_payload("runs", &agent, "general", 2, None, &transcript, plain());
-        let b = render_payload("runs", &agent, "general", 2, None, &transcript, plain());
+        let a = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 2),
+            "general",
+            2,
+            None,
+            &transcript,
+            plain(),
+        );
+        let b = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 2),
+            "general",
+            2,
+            None,
+            &transcript,
+            plain(),
+        );
         assert_eq!(
             a.as_bytes(),
             b.as_bytes(),
             "composition is byte-deterministic"
         );
-        let j1 = render_job_payload(&agent, "job-1", "spec", plain());
-        let j2 = render_job_payload(&agent, "job-1", "spec", plain());
+        let j1 = render_job_payload(&agent, &job_id("job-1"), "job-1", "spec", plain());
+        let j2 = render_job_payload(&agent, &job_id("job-1"), "job-1", "spec", plain());
         assert_eq!(j1.as_bytes(), j2.as_bytes());
 
         // the runtime section is composed, not passed in — so it must be
         // byte-stable across composes of the same skill list too.
         let skilled = || portable(None, vec![skill("release"), skill("triage")]);
-        let s1 = render_payload("runs", &agent, "general", 2, None, &transcript, skilled());
-        let s2 = render_payload("runs", &agent, "general", 2, None, &transcript, skilled());
+        let s1 = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 2),
+            "general",
+            2,
+            None,
+            &transcript,
+            skilled(),
+        );
+        let s2 = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 2),
+            "general",
+            2,
+            None,
+            &transcript,
+            skilled(),
+        );
         assert_eq!(
             s1.as_bytes(),
             s2.as_bytes(),
@@ -582,7 +731,16 @@ mod tests {
                 "someone else",
             ),
         ];
-        let payload = render_payload("runs", &agent, "general", 3, None, &transcript, plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 3),
+            "general",
+            3,
+            None,
+            &transcript,
+            plain(),
+        );
         let conversation = parse(&payload)["conversation"]
             .as_str()
             .unwrap()
@@ -606,6 +764,7 @@ mod tests {
         let payload = render_payload(
             "runs",
             &agent,
+            &run_id("general", 1),
             "general",
             1,
             None,
@@ -615,13 +774,19 @@ mod tests {
 
         // field order is stable — the marker leads.
         assert!(
-            payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#),
+            payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#),
             "the marker leads with a stable field order: {payload}"
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 3);
-        assert_eq!(v["workspace"]["kind"], "duckfs", "the workspace source is tagged");
-        assert_eq!(v["workspace"]["source_prefix"], "/shared/agent-workspaces/bot");
+        assert_eq!(
+            v["workspace"]["kind"], "duckfs",
+            "the workspace source is tagged"
+        );
+        assert_eq!(
+            v["workspace"]["source_prefix"],
+            "/shared/agent-workspaces/bot"
+        );
         assert_eq!(v["workspace"]["source_snapshot"], "aa".repeat(32));
         // D7: the envelope carries SOURCE coords only — never a host mount path.
         assert!(
@@ -649,7 +814,16 @@ mod tests {
     fn no_head_states_a_null_pin_not_an_absent_key() {
         // an unresolved head is an EXPLICIT null pin decision, not a missing key.
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_payload("runs", &agent, "general", 1, None, &[], plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 1),
+            "general",
+            1,
+            None,
+            &[],
+            plain(),
+        );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 3);
         assert!(
@@ -657,7 +831,10 @@ mod tests {
             "an unresolved head composes source_snapshot: null"
         );
         assert!(
-            v["workspace"].as_object().unwrap().contains_key("source_snapshot"),
+            v["workspace"]
+                .as_object()
+                .unwrap()
+                .contains_key("source_snapshot"),
             "the pin decision is stated as null, not omitted"
         );
         assert_eq!(v["skills"].as_array().unwrap().len(), 0, "no skills is []");
@@ -674,6 +851,7 @@ mod tests {
         let payload = render_payload(
             "runs",
             &agent,
+            &run_id("general", 1),
             "general",
             1,
             None,
@@ -702,7 +880,16 @@ mod tests {
     #[test]
     fn a_skill_less_run_composes_the_tool_plane_but_no_skills_sentence() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_payload("runs", &agent, "general", 1, None, &[], plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 1),
+            "general",
+            1,
+            None,
+            &[],
+            plain(),
+        );
         let runtime = runtime_of(&payload);
         assert_eq!(
             runtime, TOOL_PLANE_INSTRUCTION,
@@ -718,7 +905,16 @@ mod tests {
         // is the worker's business — dispatch-oracle decodes by name and puts
         // runtime BEFORE context.)
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_payload("runs", &agent, "general", 1, None, &[], plain());
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 1),
+            "general",
+            1,
+            None,
+            &[],
+            plain(),
+        );
         let quoted = serde_json::to_string(TOOL_PLANE_INSTRUCTION).unwrap();
         assert!(
             payload.contains(&format!(
@@ -757,7 +953,16 @@ mod tests {
             },
             context: Some("Forge item context:\nrepo: app".into()),
         };
-        let payload = render_payload("runs", &agent, "forge:app:7", 1, None, &transcript, inputs);
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("forge:app:7", 1),
+            "forge:app:7",
+            1,
+            None,
+            &transcript,
+            inputs,
+        );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 3);
         assert_eq!(
@@ -816,8 +1021,30 @@ mod tests {
             },
             context: Some("ctx".into()),
         };
-        let a = render_payload("runs", &agent, "forge:app:9", 1, None, &transcript, inputs());
-        let b = render_payload("runs", &agent, "forge:app:9", 1, None, &transcript, inputs());
-        assert_eq!(a.as_bytes(), b.as_bytes(), "forge composition is byte-deterministic");
+        let a = render_payload(
+            "runs",
+            &agent,
+            &run_id("forge:app:9", 1),
+            "forge:app:9",
+            1,
+            None,
+            &transcript,
+            inputs(),
+        );
+        let b = render_payload(
+            "runs",
+            &agent,
+            &run_id("forge:app:9", 1),
+            "forge:app:9",
+            1,
+            None,
+            &transcript,
+            inputs(),
+        );
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "forge composition is byte-deterministic"
+        );
     }
 }

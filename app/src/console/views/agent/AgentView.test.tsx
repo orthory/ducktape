@@ -126,7 +126,10 @@ describe("AgentView", () => {
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
     expect(within(detail).getByText("summarizer")).toBeInTheDocument();
     expect(within(detail).getByText("Alpha")).toBeInTheDocument();
-    expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
+    // "chat.post" is the REPLY grant — it only lets an agent answer where it was
+    // engaged. Posting into arbitrary channels is the separate chat.post_message
+    // grant, so the two must never read as the same permission.
+    expect(within(detail).getByText("Reply in chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
 
     fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));

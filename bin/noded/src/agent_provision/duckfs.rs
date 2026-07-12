@@ -91,7 +91,17 @@ pub(super) async fn provision(
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
         Some(ro_root)
     };
-    let env = super::run_env(&dir, ro_dir.as_deref(), node_url.as_deref(), spec);
+    // the workspace EXISTS now, so ask consensus to bind the run's agent session
+    // — never before: a bind for a run that failed to materialize would spend an
+    // op on a run that never starts.
+    let session = super::session::open(&handle, spec).await;
+    let env = super::run_env(
+        &dir,
+        ro_dir.as_deref(),
+        node_url.as_deref(),
+        spec,
+        session.as_ref(),
+    );
     Ok(Box::new(NodedWorkspace {
         handle,
         dir,
@@ -115,10 +125,11 @@ struct NodedWorkspace {
 
 impl NodedWorkspace {
     /// a receipt-only spec: `commit`/`no_changes` read only the source coords,
-    /// so the run_id/tools/mount are irrelevant here.
+    /// so the run ids/tools/mount are irrelevant here.
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
+            consensus_run_id: None,
             agent_id: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),

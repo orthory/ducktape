@@ -197,6 +197,10 @@ impl RunsModule {
     /// clean skip for the no-fail engagement intake and a clean error for an
     /// explicit `RequestRun`.
     ///
+    /// `run_id` is the caller's — the SAME id it keyed the dispatch by. it
+    /// rides into the envelope so the executing host can name the run back to
+    /// this module (the session bind, and every mid-run action).
+    ///
     /// a `forge:<repo>:<n>` trigger channel selects the forge compose lane
     /// (M1): the item-session workspace source, the requested PR sink, and
     /// the injected item context — see [`super::forge_source`]. any other
@@ -205,6 +209,7 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         agent: &AgentRecord,
+        run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
@@ -234,6 +239,7 @@ impl RunsModule {
         let payload = envelope::render_payload(
             &self.id,
             agent,
+            run_id,
             channel_id,
             anchor_seq,
             thread_root,
@@ -254,11 +260,13 @@ impl RunsModule {
     }
 
     /// Prepare a run triggered by one Pages comment. `ordinal` is 1-based in
-    /// the thread and comes from Pages' same-block tag event.
+    /// the thread and comes from Pages' same-block tag event. `run_id` is the
+    /// caller's, exactly as in [`Self::prepare_dispatch`].
     pub(super) async fn prepare_page_dispatch(
         &self,
         ctx: &dyn Ctx,
         agent: &AgentRecord,
+        run_id: &str,
         thread_id: &str,
         ordinal: u64,
     ) -> Result<PreparedDispatch, String> {
@@ -311,6 +319,7 @@ impl RunsModule {
         portable.context = Some(inject::render_pages_section(&[(page_id, blocks)]));
         let payload = envelope::render_page_comment_payload(
             agent,
+            run_id,
             thread_id,
             ordinal,
             &author,
