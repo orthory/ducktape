@@ -34,6 +34,12 @@ wasm-host = { workspace = true }
 # runtime and drives it through the host.
 kv = { workspace = true }
 directory = { workspace = true }
+# the STORE-BACKED parity proofs drive the SAME op matrix through the native
+# pages/chat modules over QmdbStore and their wasm ports over
+# `WasmModule::with_store(QmdbStore)`, pinning IDENTICAL roots block-by-block
+# (root-continuous cutover — revision stays 1).
+pages = { workspace = true }
+chat = { workspace = true }
 # the adapter-port parity proof drives the SAME op matrix through the native
 # vaults module and its wasm port, asserting identical replies + the declared
 # state-schema break.

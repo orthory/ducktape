@@ -1,0 +1,30 @@
+# The wasm port of the `chat` module: compiles the NATIVE chat crate to
+# wasm32 and adapts it to the ducktape:module world through guest-adapter —
+# the module's logic stays single-sourced in `crates/apps/chat`. Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+# `default-features = false` drops the `native` feature's off-consensus
+# submodules (the derived index drags fluent31's unix IO; voice/video drag
+# tokio/opus/the data plane); the consensus state machine and sdk::Module
+# impl compile unconditionally, so the port loses nothing consensus-visible.
+#
+# STORE-BACKED port: unlike the whole-state (`load_state`/`save_state`)
+# tenants, this guest constructs the native module over `WitStore` — the
+# adapter's `sdk::MerkleStore` over the host `state-*` imports — so the REAL
+# qmdb store stays host-side (`WasmModule::with_store`) and the cutover is
+# root-continuous (state schema revision stays 1).
+[package]
+name = "chat-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+chat = { path = "../../apps/chat", default-features = false }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]

@@ -166,6 +166,12 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("agent", 1),
     ("automations", 1),
     ("capability", 2),
+    // 1 (UNCHANGED at the wasm cutover): chat/pages are STORE-BACKED ports —
+    // the wasm module wraps the SAME host-constructed qmdb store the native
+    // module drove (`WasmModule::with_store`), so root() is the same merkle
+    // root over the same committed op log, byte-for-byte. only the executor
+    // moved into wasm; the canonical state encoding never changed shape, so
+    // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
     ("chat", 1),
     ("directory", 1),
     ("dispatch", 1),
@@ -184,6 +190,7 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("jobs", 2),
     ("kv", 1),
     ("modreg", 1),
+    // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
     ("runs", 2),
     ("saga", 1),

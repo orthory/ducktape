@@ -19,6 +19,18 @@
 //!     answer memoized — every round re-treads the identical prefix, so the
 //!     replay converges in (distinct reads + 1) rounds, bounded by
 //!     [`MAX_SIBLING_READS`].
+//!
+//! COMMITTED state has two backings ([`StateBacking`]):
+//!   * `Map` — the original host-KV `BTreeMap`, whose root is sha256 over the
+//!     canonical encoding and whose sync surface is installable snapshot bytes.
+//!   * `Store` — a host-injected [`sdk::MerkleStore`] (qmdb in production, via
+//!     [`WasmModule::with_store`]): the root IS the store's merkle root and
+//!     sync is the store's resolver lane, so a native module already written
+//!     over `Box<dyn MerkleStore>` ports with a ROOT-CONTINUOUS cutover — the
+//!     same ops commit the same store ops and the app-hash never moves. store
+//!     reads are async, so `state-get` misses ride the SAME memoized-replay
+//!     machinery as sibling reads (bounded by [`MAX_STORE_READS`]); the staged
+//!     overlay and the commit/abort boundary are identical in both backings.
 
 use std::collections::BTreeMap;
 
@@ -27,19 +39,21 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
 
 use sdk::{
-    Ctx, Env as SdkEnv, Error as SdkError, Event, Module, ModuleId, Msg, Origin as SdkOrigin,
-    StateRoot, StateSyncHandle,
+    Ctx, Env as SdkEnv, Error as SdkError, Event, MerkleStore, Module, ModuleId, Msg,
+    Origin as SdkOrigin, ROOT_LEN, ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
 
 mod bindings {
     wasmtime::component::bindgen!({
         world: "module",
         path: "../module-guest/wit",
-        // the two sibling-read imports may TRAP: a read the per-dispatch memo
-        // cannot answer pauses the run (deterministically — same point on every
-        // validator), the async wrapper resolves it through the host `Ctx`, and
-        // the pure guest is replayed with the answer memoized. see `SiblingMemo`.
+        // these imports may TRAP: a read the per-dispatch memo cannot answer
+        // pauses the run (deterministically — same point on every validator),
+        // the async wrapper resolves it (sibling reads through the host `Ctx`,
+        // store-backed `state-get` through the injected store), and the pure
+        // guest is replayed with the answer memoized. see `SiblingMemo`.
         imports: {
+            "ducktape:module/host.state-get": trappable,
             "ducktape:module/host.module-root": trappable,
             "ducktape:module/host.query-module": trappable,
         },
@@ -60,10 +74,19 @@ pub const DEFAULT_FUEL: u64 = 2_000_000_000;
 /// that needs more is rejected identically on every validator.
 pub const MAX_SIBLING_READS: usize = 64;
 
-/// trap message for a sibling read the memo cannot answer yet. never surfaces to
+/// per-dispatch bound on DISTINCT committed-store reads (`state-get` misses in
+/// [`StateBacking::Store`] mode). own-state reads are far cheaper than sibling
+/// reads to answer but far more numerous (an op walks its own records), so they
+/// carry their own, larger budget. a protocol constant, like
+/// [`MAX_SIBLING_READS`]: an op that needs more is rejected identically on
+/// every validator. map-backed modules never pause on state reads, so this
+/// bound is store-mode-only.
+pub const MAX_STORE_READS: usize = 4096;
+
+/// trap message for a read the memo cannot answer yet. never surfaces to
 /// consensus: the execute/query drivers intercept the run (via
 /// [`HostData::pending`]) and replay with the answer resolved.
-const PENDING_READ_TRAP: &str = "pending sibling read (host resolves and replays)";
+const PENDING_READ_TRAP: &str = "pending host read (host resolves and replays)";
 
 // ============================================================================
 // per-dispatch host state — owned (no borrows), so `Store<T>` stays `'static`.
@@ -71,31 +94,59 @@ const PENDING_READ_TRAP: &str = "pending sibling read (host resolves and replays
 // after, mirroring the host's own remove-execute-reinsert dispatch trick.
 // ============================================================================
 
-/// one sibling read the guest attempted that the memo could not answer yet.
+/// one host read the guest attempted that the memo could not answer yet.
 enum PendingRead {
     Root(String),
     Query(String, Vec<u8>),
+    /// a committed-store `state-get` miss ([`StateBacking::Store`] mode only):
+    /// the driver resolves it against the injected [`MerkleStore`] — no ctx
+    /// needed, so even the ctx-less [`Module::query`] path replays these.
+    State(Vec<u8>),
 }
 
-/// resolved sibling-read answers, accumulated across the replay rounds of ONE
+/// resolved read answers, accumulated across the replay rounds of ONE
 /// dispatch/query. the guest is pure and its inputs are fixed for the whole
 /// dispatch, so each round re-treads the identical prefix; a memo hit returns
 /// exactly what the earlier round saw, and each round discovers at most one new
-/// read. answers are stable within a dispatch (nothing else runs in between).
+/// read. answers are stable within a dispatch (nothing else runs in between —
+/// the injected store only ever moves at `commit_block`, never mid-dispatch).
 #[derive(Default)]
 struct SiblingMemo {
     roots: BTreeMap<String, Option<Vec<u8>>>,
     queries: BTreeMap<(String, Vec<u8>), Result<Vec<u8>, WitError>>,
+    /// committed-store answers for store-backed modules. staged writes shadow
+    /// these at `state-get` (overlay first), so a stale entry is unreachable.
+    states: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl SiblingMemo {
+    /// DISTINCT sibling reads so far (the [`MAX_SIBLING_READS`] budget); the
+    /// store-read budget is tracked separately over `states`.
     fn len(&self) -> usize {
         self.roots.len() + self.queries.len()
     }
 
-    /// resolve one pending read against the host ctx and memoize the answer.
-    /// errors are answers too: a deterministic rejection (unknown module,
-    /// unsupported query, cycle) memoizes as the wit error the guest will see.
+    /// both replay budgets still hold — the loop guard every driver shares.
+    fn within_budgets(&self) -> bool {
+        self.len() <= MAX_SIBLING_READS && self.states.len() <= MAX_STORE_READS
+    }
+
+    /// the deterministic rejection for a blown replay budget.
+    fn budget_error(&self) -> SdkError {
+        if self.len() > MAX_SIBLING_READS {
+            SdkError::Module(format!(
+                "sibling-read budget exceeded ({MAX_SIBLING_READS})"
+            ))
+        } else {
+            SdkError::Module(format!("store-read budget exceeded ({MAX_STORE_READS})"))
+        }
+    }
+
+    /// resolve one pending SIBLING read against the host ctx and memoize the
+    /// answer. errors are answers too: a deterministic rejection (unknown
+    /// module, unsupported query, cycle) memoizes as the wit error the guest
+    /// will see. `State` reads never reach here — the drivers resolve them
+    /// against the injected store (they need no ctx).
     async fn resolve(&mut self, ctx: &dyn Ctx, read: PendingRead) {
         match read {
             PendingRead::Root(target) => {
@@ -105,6 +156,9 @@ impl SiblingMemo {
             PendingRead::Query(target, req) => {
                 let answer = ctx.query(&target, &req).await.map_err(to_wit_error);
                 self.queries.insert((target, req), answer);
+            }
+            PendingRead::State(_) => {
+                unreachable!("state reads resolve against the injected store, never the ctx")
             }
         }
     }
@@ -116,35 +170,43 @@ struct HostData {
     committed: BTreeMap<Vec<u8>, Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     memo: SiblingMemo,
-    /// set when the guest hits a sibling read the memo can't answer: the run is
-    /// paused (host trap) and the driver resolves + replays. always `None` when
-    /// a run finishes cleanly.
+    /// set when the guest hits a read the memo can't answer: the run is paused
+    /// (host trap) and the driver resolves + replays. always `None` when a run
+    /// finishes cleanly.
     pending: Option<PendingRead>,
-    /// a ctx-less run (plain [`Module::query`]) has no resolver: a memo miss
-    /// answers the pre-cutover stub surface (root `None`, query `unsupported`)
-    /// instead of pausing the run.
+    /// a ctx-less run (plain [`Module::query`]) has no SIBLING resolver: a memo
+    /// miss on module-root/query-module answers the pre-cutover stub surface
+    /// (root `None`, query `unsupported`) instead of pausing the run. state
+    /// reads are NOT sealed — the injected store is the module's own state and
+    /// is always resolvable, ctx or not.
     sealed: bool,
+    /// committed state lives in an injected [`MerkleStore`], not `committed`:
+    /// a `state-get` miss (staged, then memo) pauses the run for the driver to
+    /// resolve `store.get` and replay. `committed` stays empty in this mode.
+    store_backed: bool,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
-}
-
-impl HostData {
-    /// overlay-over-committed read: a staged `Some` is a set, staged `None` a
-    /// delete, absence falls through to committed.
-    fn effective_get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match self.staged.get(key) {
-            Some(overlay) => overlay.clone(),
-            None => self.committed.get(key).cloned(),
-        }
-    }
 }
 
 impl host::Host for HostData {
     fn get_env(&mut self) -> WitEnv {
         self.env.clone().expect("env is set before every dispatch")
     }
-    fn state_get(&mut self, key: Vec<u8>) -> Option<Vec<u8>> {
-        self.effective_get(&key)
+    /// overlay-over-committed read: a staged `Some` is a set, staged `None` a
+    /// delete, absence falls through to committed — the map directly, or the
+    /// injected store via memoized replay.
+    fn state_get(&mut self, key: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
+        if let Some(overlay) = self.staged.get(&key) {
+            return Ok(overlay.clone());
+        }
+        if !self.store_backed {
+            return Ok(self.committed.get(&key).cloned());
+        }
+        if let Some(answer) = self.memo.states.get(&key) {
+            return Ok(answer.clone());
+        }
+        self.pending = Some(PendingRead::State(key));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
     fn state_set(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.staged.insert(key, Some(value));
@@ -202,6 +264,25 @@ fn to_wit_error(e: SdkError) -> WitError {
 // the wasm module
 // ============================================================================
 
+/// where a wasm tenant's COMMITTED state lives. the staged overlay, the
+/// commit/abort boundary, and the whole dispatch machinery are identical in
+/// both modes — only the committed substrate (and therefore `root()` and the
+/// sync surface) differs.
+enum StateBacking {
+    /// the original host-KV map: root is sha256 over the canonical encoding,
+    /// sync is installable snapshot bytes ([`WasmModule::snapshot`] /
+    /// [`WasmModule::install`]).
+    Map {
+        committed: BTreeMap<Vec<u8>, Vec<u8>>,
+    },
+    /// a host-injected authenticated store (qmdb in production): root is the
+    /// store's merkle root, sync is the store's resolver lane. snapshot/install
+    /// do not apply — a joiner rebuilds the CONCRETE store (`sync_from`) and
+    /// wraps a fresh module around it, exactly like a native store-backed
+    /// module.
+    Store { store: Box<dyn MerkleStore> },
+}
+
 /// A wasm module: a `ducktape:module` component plus its host-owned
 /// authenticated state. Presented to the host as an ordinary [`sdk::Module`].
 pub struct WasmModule {
@@ -213,7 +294,7 @@ pub struct WasmModule {
     /// host reconciles against the registry's committed active hash. NOT part of
     /// `root()` (code is invisible to the app-hash); per-node realization only.
     code_hash: Vec<u8>,
-    committed: BTreeMap<Vec<u8>, Vec<u8>>,
+    backing: StateBacking,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     fuel: u64,
     /// the canonical committed-state revision this tenant declares (see
@@ -223,24 +304,70 @@ pub struct WasmModule {
 }
 
 impl WasmModule {
-    /// Load a module from component bytes with an empty state store.
-    pub fn from_bytes(id: impl Into<ModuleId>, component_bytes: &[u8]) -> Result<Self, SdkError> {
+    fn load(id: ModuleId, component_bytes: &[u8], backing: StateBacking) -> Result<Self, SdkError> {
         let engine = Engine::new(&deterministic_config()).map_err(module_err)?;
         let component = Component::from_binary(&engine, component_bytes).map_err(module_err)?;
         let mut linker = Linker::new(&engine);
         ModuleWorld::add_to_linker::<HostData, HasSelf<HostData>>(&mut linker, |d| d)
             .map_err(module_err)?;
         Ok(Self {
-            id: id.into(),
+            id,
             engine,
             linker,
             component,
             code_hash: sha256(component_bytes),
-            committed: BTreeMap::new(),
+            backing,
             staged: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
             state_schema_revision: 1,
         })
+    }
+
+    /// Load a module from component bytes with an empty host-KV state store.
+    pub fn from_bytes(id: impl Into<ModuleId>, component_bytes: &[u8]) -> Result<Self, SdkError> {
+        Self::load(
+            id.into(),
+            component_bytes,
+            StateBacking::Map {
+                committed: BTreeMap::new(),
+            },
+        )
+    }
+
+    /// Load a module from component bytes over a host-injected authenticated
+    /// store — committed state lives in `store` (already opened, or already
+    /// synced to a verified root), `root()` is the store's merkle root, and
+    /// sync is the store's resolver lane. this is the STORE-BACKED port shape:
+    /// a native module written over `Box<dyn MerkleStore>` compiles into the
+    /// guest and drives the very same store through the wit `state-*` imports,
+    /// so the cutover is root-continuous.
+    pub fn with_store(
+        id: impl Into<ModuleId>,
+        component_bytes: &[u8],
+        store: Box<dyn MerkleStore>,
+    ) -> Result<Self, SdkError> {
+        Self::load(id.into(), component_bytes, StateBacking::Store { store })
+    }
+
+    fn is_store_backed(&self) -> bool {
+        matches!(self.backing, StateBacking::Store { .. })
+    }
+
+    /// resolve one paused committed-store read: 32-byte digests are the only
+    /// key shape the store speaks (every store-backed module hashes its logical
+    /// keys before the wit boundary), so anything else is rejected — a
+    /// deterministic refusal, identical on every validator, never a fork.
+    async fn resolve_state_read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SdkError> {
+        let StateBacking::Store { store } = &self.backing else {
+            unreachable!("map-backed runs never pause on state reads");
+        };
+        let digest: &[u8; ROOT_LEN] = key.try_into().map_err(|_| {
+            SdkError::Module(format!(
+                "store-backed state keys must be {ROOT_LEN}-byte digests, got {}",
+                key.len()
+            ))
+        })?;
+        store.get(digest).await
     }
 
     /// declare a non-default canonical-state revision (the recovery/state-sync
@@ -279,23 +406,49 @@ impl WasmModule {
 
     /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
     /// this is what checkpoint capture ships (see [`Module::state_sync_handle`]).
+    /// map-backed only: a store-backed tenant has no byte snapshot (its sync
+    /// surface is the store's resolver lane), so asking for one is a host
+    /// wiring bug and panics loud.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.committed)
+        match &self.backing {
+            StateBacking::Map { committed } => Self::encode_state(committed),
+            StateBacking::Store { .. } => {
+                panic!("a store-backed wasm module has no byte snapshot — sync the store")
+            }
+        }
     }
 
     /// verify-then-adopt a peer/checkpoint snapshot: strict-decode, recompute
     /// the root, refuse on mismatch — committed state and stage untouched on any
     /// error. code is NOT part of the snapshot (the registry owns the code
     /// commitment; the host reconciles running code separately), so install
-    /// never touches the loaded component.
+    /// never touches the loaded component. map-backed only: a store-backed
+    /// tenant adopts state by rebuilding its CONCRETE store (`sync_from`) and
+    /// wrapping a fresh module around it, so install refuses.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), SdkError> {
+        let StateBacking::Map { committed } = &mut self.backing else {
+            return Err(SdkError::Module(
+                "a store-backed wasm module adopts state through its injected store, not install"
+                    .into(),
+            ));
+        };
         let decoded = decode_state(bytes)?;
         if Self::root_of(&decoded) != expected {
             return Err(SdkError::Module("snapshot root mismatch".into()));
         }
-        self.committed = decoded;
+        *committed = decoded;
         self.staged.clear();
         Ok(())
+    }
+
+    /// this round's copy of map-backed committed state. store-backed rounds
+    /// carry an EMPTY map — their committed reads pause and resolve through
+    /// the injected store instead.
+    fn committed_for_round(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        match &self.backing {
+            StateBacking::Map { committed } => committed.clone(),
+            StateBacking::Store { .. } => BTreeMap::new(),
+        }
     }
 
     /// one round of the guest's `query` export over LIVE state — the staged
@@ -303,7 +456,7 @@ impl WasmModule {
     /// query serves from its live struct (out of block the overlay is empty, so
     /// this is the committed projection). writes a guest attempts here land in
     /// the round's own copy and are dropped: read-only by construction. returns
-    /// the outcome plus the memo and any pending sibling read the round paused on.
+    /// the outcome plus the memo and any pending read the round paused on.
     fn query_round(
         &self,
         env: WitEnv,
@@ -313,11 +466,12 @@ impl WasmModule {
     ) -> (Result<Vec<u8>, SdkError>, SiblingMemo, Option<PendingRead>) {
         let data = HostData {
             env: Some(env),
-            committed: self.committed.clone(),
+            committed: self.committed_for_round(),
             staged: self.staged.clone(),
             memo,
             pending: None,
             sealed,
+            store_backed: self.is_store_backed(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
         };
@@ -471,8 +625,14 @@ impl Module for WasmModule {
         self.id.clone()
     }
 
+    /// map mode: sha256 over the canonical host-KV encoding. store mode: the
+    /// injected store's REAL merkle root, verbatim — the same value the native
+    /// module computed pre-cutover, so the app-hash is continuous.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.committed)
+        match &self.backing {
+            StateBacking::Map { committed } => Self::root_of(committed),
+            StateBacking::Store { store } => store.root(),
+        }
     }
 
     fn state_schema_revision(&self) -> u32 {
@@ -484,7 +644,34 @@ impl Module for WasmModule {
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, SdkError> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+        match &self.backing {
+            StateBacking::Map { .. } => Ok(StateSyncHandle::SnapshotBytes(self.snapshot())),
+            // verbatim what the native store-backed modules (pages, chat, kv)
+            // declared: sync rides the store's resolver lane, not byte
+            // snapshots.
+            StateBacking::Store { .. } => Ok(StateSyncHandle::ResolverBacked {
+                backend: "qmdb".into(),
+                detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
+            }),
+        }
+    }
+
+    /// the network state-sync serve lane of a store-backed tenant: answers the
+    /// shared qmdb wire requests from committed state, read-only. map-backed
+    /// tenants keep the default non-coverage (their sync surface is snapshot
+    /// bytes).
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
+        match &self.backing {
+            StateBacking::Map { .. } => Err(SdkError::SyncUnsupported),
+            StateBacking::Store { store } => store.serve_sync(req).await,
+        }
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, SdkError> {
+        match &self.backing {
+            StateBacking::Map { .. } => Err(SdkError::SyncUnsupported),
+            StateBacking::Store { store } => store.sync_target().await,
+        }
     }
 
     /// Replace the component code IN PLACE, keeping the host-owned state store.
@@ -507,15 +694,22 @@ impl Module for WasmModule {
         // replay could observe (e.g. double-apply) its own discarded effects.
         let staged0 = std::mem::take(&mut self.staged);
         let mut memo = SiblingMemo::default();
-        while memo.len() <= MAX_SIBLING_READS {
-            // move committed + memo into owned per-round data; staged is a copy.
+        while memo.within_budgets() {
+            // move map-backed committed + memo into owned per-round data;
+            // staged is a copy. store-backed rounds carry an empty map and
+            // resolve committed reads through the injected store instead.
+            let round_committed = match &mut self.backing {
+                StateBacking::Map { committed } => std::mem::take(committed),
+                StateBacking::Store { .. } => BTreeMap::new(),
+            };
             let data = HostData {
                 env: Some(env.clone()),
-                committed: std::mem::take(&mut self.committed),
+                committed: round_committed,
                 staged: staged0.clone(),
                 memo: std::mem::take(&mut memo),
                 pending: None,
                 sealed: false,
+                store_backed: self.is_store_backed(),
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
             };
@@ -533,12 +727,27 @@ impl Module for WasmModule {
             // reclaim state regardless of outcome (a trap leaves the moved-in
             // state in the store; take it back so the module is never left empty).
             let data = store.into_data();
-            self.committed = data.committed;
+            if let StateBacking::Map { committed } = &mut self.backing {
+                *committed = data.committed;
+            }
             memo = data.memo;
 
-            // a paused run: resolve the read through the host ctx and replay.
+            // a paused run: resolve the read (own store, or host ctx) and replay.
             if let Some(read) = data.pending {
-                memo.resolve(&*ctx, read).await;
+                match read {
+                    PendingRead::State(key) => match self.resolve_state_read(&key).await {
+                        Ok(answer) => {
+                            memo.states.insert(key, answer);
+                        }
+                        // a refused store read (bad key shape, store error) is
+                        // a deterministic rejection of the whole op.
+                        Err(e) => {
+                            self.staged = staged0;
+                            return Err(e);
+                        }
+                    },
+                    read => memo.resolve(&*ctx, read).await,
+                }
                 continue;
             }
 
@@ -568,15 +777,15 @@ impl Module for WasmModule {
             };
         }
         self.staged = staged0;
-        Err(SdkError::Module(format!(
-            "sibling-read budget exceeded ({MAX_SIBLING_READS})"
-        )))
+        Err(memo.budget_error())
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
-        // ctx-less direct read: no resolver, so sibling reads answer the sealed
-        // stub surface (root `None`, query `unsupported`). host-routed reads go
-        // through `query_with` instead, which resolves them for real.
+        // ctx-less direct read: no SIBLING resolver, so module-root/query-module
+        // answer the sealed stub surface (root `None`, query `unsupported`) —
+        // host-routed reads go through `query_with` instead, which resolves
+        // them for real. committed-STORE reads still replay (the injected store
+        // is this module's own state; no ctx needed).
         let env = WitEnv {
             height: 0,
             consensus_time: 0,
@@ -584,35 +793,80 @@ impl Module for WasmModule {
             me: self.id.clone(),
             origin: WitOrigin::System,
         };
-        let (outcome, _, _) = self.query_round(env, SiblingMemo::default(), true, req);
-        outcome
+        let mut memo = SiblingMemo::default();
+        while memo.within_budgets() {
+            let (outcome, returned, pending) = self.query_round(env.clone(), memo, true, req);
+            memo = returned;
+            match pending {
+                None => return outcome,
+                Some(PendingRead::State(key)) => {
+                    let answer = self.resolve_state_read(&key).await?;
+                    memo.states.insert(key, answer);
+                }
+                Some(_) => unreachable!("sealed runs never pause on sibling reads"),
+            }
+        }
+        Err(memo.budget_error())
     }
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, SdkError> {
         let mut memo = SiblingMemo::default();
-        while memo.len() <= MAX_SIBLING_READS {
+        while memo.within_budgets() {
             let (outcome, returned, pending) =
                 self.query_round(to_wit_env(ctx.env()), memo, false, req);
             memo = returned;
             match pending {
-                Some(read) => memo.resolve(ctx, read).await,
                 None => return outcome,
+                Some(PendingRead::State(key)) => {
+                    let answer = self.resolve_state_read(&key).await?;
+                    memo.states.insert(key, answer);
+                }
+                Some(read) => memo.resolve(ctx, read).await,
             }
         }
-        Err(SdkError::Module(format!(
-            "sibling-read budget exceeded ({MAX_SIBLING_READS})"
-        )))
+        Err(memo.budget_error())
     }
 
     async fn commit_block(&mut self) -> Result<(), SdkError> {
-        for (key, overlay) in std::mem::take(&mut self.staged) {
-            match overlay {
-                Some(value) => {
-                    self.committed.insert(key, value);
+        match &mut self.backing {
+            StateBacking::Map { committed } => {
+                for (key, overlay) in std::mem::take(&mut self.staged) {
+                    match overlay {
+                        Some(value) => {
+                            committed.insert(key, value);
+                        }
+                        None => {
+                            committed.remove(&key);
+                        }
+                    }
                 }
-                None => {
-                    self.committed.remove(&key);
+            }
+            StateBacking::Store { store } => {
+                // publish the whole block's staged writes in ONE store batch —
+                // exactly the native store-backed contract: no-op (and no root
+                // movement) when nothing staged, `None` ships as a delete. the
+                // staged map orders by hashed key while a native module orders
+                // by logical key, but the store's batch canonicalizes mutations
+                // by key before merkleizing, so the committed op log — and the
+                // root — is identical either way. keys were validated as
+                // digests when staged content arrived from the guest; a
+                // non-digest key here fails closed before any store touch.
+                if self.staged.is_empty() {
+                    return Ok(());
                 }
+                let mut writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)> =
+                    Vec::with_capacity(self.staged.len());
+                for (key, value) in &self.staged {
+                    let digest: [u8; ROOT_LEN] = key.as_slice().try_into().map_err(|_| {
+                        SdkError::Module(format!(
+                            "store-backed state keys must be {ROOT_LEN}-byte digests, got {}",
+                            key.len()
+                        ))
+                    })?;
+                    writes.push((digest, value.clone()));
+                }
+                store.commit_batch(writes).await?;
+                self.staged.clear();
             }
         }
         Ok(())

@@ -295,6 +295,20 @@ wasm-modules:
 	cp crates/examples/governance-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/governance.component.wasm
 
+	cd crates/examples/pages-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/pages-wasm/target/wasm32-unknown-unknown/release/pages_wasm.wasm \
+	  -o crates/examples/pages-wasm/component.wasm
+	cp crates/examples/pages-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/pages.component.wasm
+
+	cd crates/examples/chat-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/chat-wasm/target/wasm32-unknown-unknown/release/chat_wasm.wasm \
+	  -o crates/examples/chat-wasm/component.wasm
+	cp crates/examples/chat-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/chat.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -326,6 +340,10 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/gateway.component.wasm
 	cmp crates/examples/governance-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/governance.component.wasm
+	cmp crates/examples/pages-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/pages.component.wasm
+	cmp crates/examples/chat-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/chat.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

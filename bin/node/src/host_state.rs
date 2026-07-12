@@ -6,7 +6,6 @@
 
 use agent::AgentModule;
 use automations::Automations;
-use chat::Chat;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use dispatch::DispatchModule;
@@ -16,7 +15,6 @@ use forge::Forge;
 use host::Host;
 use kv::Kv;
 use modreg::Modreg;
-use pages::Pages;
 use recovery::Manifest;
 use runs::RunsModule;
 use saga::{LeasePolicy, SagaModule};
@@ -151,6 +149,22 @@ const GOVERNANCE_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/examples/governance-wasm/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
 
+/// pages / chat — the first STORE-BACKED wasm tenants: the native crates are
+/// pure logic over an injected `sdk::MerkleStore`, so the guests compile that
+/// SAME logic over the adapter's `WitStore` while the REAL qmdb store stays
+/// host-side (`WasmModule::with_store`). unlike the whole-state adapter
+/// ports there is no snapshot re-encoding: the module root IS the store's
+/// merkle root, byte-identical across the cutover (state schema revision
+/// STAYS 1 — see `constants::MODULE_STATE_SCHEMAS`), and pre-cutover
+/// workspaces reopen unchanged. NOTE the `.with_tagging("tagging")` wiring
+/// moved INTO the guests — the host builder chain drops it.
+const PAGES_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/pages-wasm/component.wasm");
+const PAGES_MODULE_ID: &str = "pages";
+const CHAT_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/chat-wasm/component.wasm");
+const CHAT_MODULE_ID: &str = "chat";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -204,6 +218,14 @@ fn seeded_modreg() -> Modreg {
     modreg.seed(
         GOVERNANCE_MODULE_ID,
         sha2::Sha256::digest(GOVERNANCE_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        PAGES_MODULE_ID,
+        sha2::Sha256::digest(PAGES_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        CHAT_MODULE_ID,
+        sha2::Sha256::digest(CHAT_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -272,6 +294,25 @@ fn genesis_duckdns_wasm() -> WasmModule {
     WasmModule::from_bytes(DUCKDNS_MODULE_ID, DUCKDNS_WASM_COMPONENT)
         .expect("embedded duckdns component loads")
         .with_state_schema_revision(2)
+}
+
+/// pages at its GENESIS code over the host-constructed store (a fresh/reopened
+/// `QmdbStore::init`, or a `QmdbStore::sync_from` at a verified root — all
+/// three lifecycles hand the store in the same way, exactly as they handed it
+/// to the native constructor). REVISION STAYS 1: the committed encoding is the
+/// store's own op log and the module root is its merkle root, byte-identical
+/// across the cutover (pinned by `wasm_pages_parity`), so no schema fence and
+/// no re-genesis.
+fn pages_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(PAGES_MODULE_ID, PAGES_WASM_COMPONENT, store)
+        .expect("embedded pages component loads")
+}
+
+/// chat at its GENESIS code over the host-constructed store (store-backed,
+/// revision stays 1 — see [`pages_wasm`]; pinned by `wasm_chat_parity`).
+fn chat_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(CHAT_MODULE_ID, CHAT_WASM_COMPONENT, store)
+        .expect("embedded chat component loads")
 }
 
 /// a wasm tenant at its GENESIS code with a host-installed GENESIS-CONFIG
@@ -355,8 +396,8 @@ pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_
 /// status surfaces; the parity test below pins the two together.
 struct ProductionModules {
     kv: Kv,
-    pages: Pages,
-    chat: Chat,
+    pages: WasmModule,
+    chat: WasmModule,
     forge: Forge,
     valset: Valset,
     governance: WasmModule,
@@ -430,10 +471,11 @@ pub(super) async fn genesis_host(
     blobs: blobstore::BlobHandle,
 ) -> Host {
     let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-    let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
-        .with_tagging("tagging");
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-        .with_tagging("tagging");
+    // pages/chat are STORE-BACKED wasm tenants: the host still constructs the
+    // concrete qmdb stores exactly as before — only the executor wrapped
+    // around them changed (and `.with_tagging` moved into the guests).
+    let pages = pages_wasm(Box::new(QmdbStore::init(context.child("pages"), "pages").await));
+    let chat = chat_wasm(Box::new(QmdbStore::init(context.child("chat"), "chat").await));
     // seed the blob plane with the genesis components, so this node can serve
     // (and re-fetch) every wasm tenant's initial code by content hash.
     blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
@@ -448,6 +490,8 @@ pub(super) async fn genesis_host(
     blobs.put_chunk(IDENTITY_WASM_COMPONENT.to_vec());
     blobs.put_chunk(GATEWAY_WASM_COMPONENT.to_vec());
     blobs.put_chunk(GOVERNANCE_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(PAGES_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(CHAT_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -572,10 +616,12 @@ pub(super) async fn restore_host(
     // archived workspace must remain byte-for-byte untouched.
     preflight_recovery_schema(manifest)?;
     let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-    let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
-        .with_tagging("tagging");
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-        .with_tagging("tagging");
+    // store-backed wasm tenants restore like the other qmdb modules: the
+    // stores reopen themselves at their committed positions and the wasm
+    // wrapper computes root() straight from them (no snapshot install — see
+    // [`pages_wasm`]).
+    let pages = pages_wasm(Box::new(QmdbStore::init(context.child("pages"), "pages").await));
+    let chat = chat_wasm(Box::new(QmdbStore::init(context.child("chat"), "chat").await));
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?
@@ -897,34 +943,31 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         ),
     );
 
+    // store-backed wasm tenants join like the other qmdb modules: rebuild the
+    // CONCRETE store at the manifest's pinned target (merkle-verified against
+    // the committed root), then wrap the wasm module around it — the same
+    // sync-then-inject lifecycle the native constructors had.
     let (target, resolver) = fetch_target("pages").await?;
-    let pages = Pages::new(
-        "pages",
-        Box::new(
-            QmdbStore::sync_from(
-                scratch_context.child(child_label("pages")),
-                "pages",
-                target,
-                resolver,
-            )
-            .await?,
-        ),
-    );
+    let pages = pages_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("pages")),
+            "pages",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
 
     let (target, resolver) = fetch_target("chat").await?;
-    let chat = Chat::new(
-        "chat",
-        Box::new(
-            QmdbStore::sync_from(
-                scratch_context.child(child_label("chat")),
-                "chat",
-                target,
-                resolver,
-            )
-            .await?,
-        ),
-    )
-    .with_tagging("tagging");
+    let chat = chat_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("chat")),
+            "chat",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
 
 
     // snapshot lane: chunked bytes from the captured boundary, install gated

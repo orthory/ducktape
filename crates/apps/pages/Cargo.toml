@@ -3,11 +3,22 @@ name = "pages"
 edition.workspace = true
 version.workspace = true
 
+# the consensus state machine, wire types, and sdk::Module impl always compile
+# (they are the surface the `pages-wasm` guest ports to wasm32). only the
+# node-local derived index rides the `native` feature: `indexer` drags
+# fluent31's unix-only IO, which cannot cross into a wasm guest — and the
+# index is a serving-binary materialized view, never consensus state.
+# `default-features = false` is therefore FULL consensus behavior, minus the
+# index module.
+[features]
+default = ["native"]
+native = ["dep:indexer"]
+
 [dependencies]
 sdk = { workspace = true }
 tagging = { workspace = true }
 serde = { workspace = true }
-indexer = { workspace = true }
+indexer = { workspace = true, optional = true }
 async-trait = "0.1"
 serde_json = "1"
 # the logical-key -> store-key hash (sha256); the store itself is injected.

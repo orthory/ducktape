@@ -54,7 +54,10 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the derived-tier materialized view; registered only by serving binaries.
+// the derived-tier materialized view; registered only by serving binaries —
+// native-only (indexer drags fluent31's unix IO), never consensus state, so
+// the wasm guest builds without it.
+#[cfg(feature = "native")]
 pub mod index;
 
 use std::collections::BTreeMap;

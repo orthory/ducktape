@@ -25,21 +25,30 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
+// everything below is OFF-consensus and native-only: none of it touches qmdb
+// or the app-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
+// cannot cross into the `chat-wasm` guest — so the consensus state machine
+// above compiles for wasm32 without them.
+//
 // the derived-tier materialized view; registered only by serving binaries.
+#[cfg(feature = "native")]
 pub mod index;
 // the real-time voice media engine (Opus over the data plane's datagram
 // class). Off-consensus: it touches no qmdb and no app-hash — the chat
 // module's consensus state (channels, membership) is what will drive its
 // admission and channel→flow derivation. Kept as a self-contained submodule.
+#[cfg(feature = "native")]
 pub mod voice;
 // the video call media wire (frame fragmentation/reassembly + call control)
 // over the data plane's Service::Video / Service::Voice flows. Off-consensus
 // like `voice`, for the same reason: consensus never carries media.
+#[cfg(feature = "native")]
 pub mod video;
 // the single-definition-site codec for the webview call socket
 // (`/v1/call/ws`) — audio + camera video framing shared by `noded` and the
 // app's TypeScript leg. See the module doc for the D1 (big-endian headers)
 // rule. Off-consensus, same reasoning as `voice`/`video`.
+#[cfg(feature = "native")]
 pub mod call_wire;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -9,6 +9,11 @@
 //!
 //! * [`WitCtx`] — an [`sdk::Ctx`] over the host imports, so the native
 //!   module's `execute(&mut dyn Ctx, ..)` runs unmodified inside the guest.
+//! * [`WitStore`] — an [`sdk::MerkleStore`] over the host `state-*` imports,
+//!   for STORE-BACKED ports (pages, chat): the native module's injected-store
+//!   reads and its `commit_block` batch become host-KV calls, the REAL store
+//!   stays host-side (`WasmModule::with_store`), and the cutover is
+//!   root-continuous.
 //! * [`block_on`] — the guest's executor. every await in a module resolves
 //!   immediately (the sdk contract: awaits are on deterministic resources, and
 //!   inside a guest they are all synchronous host calls underneath), so this
@@ -59,7 +64,9 @@ pub mod bindings {
 pub use bindings::ducktape::module::host;
 pub use bindings::{export_module, Guest};
 
-use sdk::{Ctx, Env, Error, Event, Msg, Origin, StateRoot, ROOT_LEN};
+use sdk::{
+    Ctx, Env, Error, Event, MerkleStore, Msg, Origin, ResolverSyncTarget, StateRoot, ROOT_LEN,
+};
 
 use std::future::Future;
 use std::pin::pin;
@@ -145,6 +152,81 @@ impl Ctx for WitCtx {
 
     fn emit_event(&mut self, ev: Event) {
         host::emit_event(&ev.source, &ev.payload);
+    }
+}
+
+// ============================================================================
+// WitStore — sdk::MerkleStore over the host state imports
+// ============================================================================
+
+/// the [`sdk::MerkleStore`] a STORE-BACKED ported module drives inside the
+/// guest: the host constructed the REAL store (qmdb) and holds it behind
+/// `WasmModule::with_store`; this unit type forwards the module's store calls
+/// to the wit `state-*` imports so the native crate's `Box<dyn MerkleStore>`
+/// constructor shape compiles into the guest unchanged.
+///
+/// * [`MerkleStore::get`] → `host::state_get` — which reads STAGED-over-
+///   committed, not committed alone. that is deliberately the module's
+///   expected view: a native store-backed module keeps ONE `pending` overlay
+///   alive across a whole block, so a later dispatch's `store.get` miss falls
+///   through to committed state while its earlier writes sit in `pending`.
+///   the guest's module is rebuilt per dispatch (its inner `pending` covers
+///   only the CURRENT dispatch), so the prior dispatches' writes live in the
+///   host's outer staged overlay instead — reading through that overlay is
+///   exactly the read-your-writes surface the native module had. within one
+///   dispatch the module's own `pending` shadows every key it wrote before
+///   `state_get` is ever consulted, so the overlay-read never reorders a
+///   single-dispatch view either.
+/// * [`MerkleStore::commit_batch`] → one `host::state_set`/`state_delete` per
+///   write. this is OUTER STAGING, not a durable commit: the guest flushes its
+///   inner per-dispatch overlay here each dispatch, and the host publishes the
+///   accumulated block batch into the real store at the true block boundary
+///   (or discards it on abort) — the same one-batch-per-block store commit the
+///   native module issued itself.
+/// * [`MerkleStore::root`] / [`sync_target`](MerkleStore::sync_target) /
+///   [`serve_sync`](MerkleStore::serve_sync) — UNREACHABLE IN A GUEST: the
+///   host owns the real store and serves `root()`, the resolver target, and
+///   the sync wire directly from it (`WasmModule::with_store` forwards the
+///   `Module` trait surface), so no dispatch/query path in the ported logic
+///   can legitimately reach these. they fail loud (a deterministic trap /
+///   error, identical on every validator) rather than fabricate an answer.
+pub struct WitStore;
+
+#[async_trait::async_trait(?Send)]
+impl MerkleStore for WitStore {
+    async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(host::state_get(key))
+    }
+
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), Error> {
+        for (key, value) in writes {
+            match value {
+                Some(value) => host::state_set(&key, &value),
+                None => host::state_delete(&key),
+            }
+        }
+        Ok(())
+    }
+
+    fn root(&self) -> StateRoot {
+        panic!(
+            "MerkleStore::root is unreachable in a guest — the host serves it from the real store"
+        )
+    }
+
+    async fn sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        Err(Error::Module(
+            "MerkleStore::sync_target is unreachable in a guest — host-served".into(),
+        ))
+    }
+
+    async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::Module(
+            "MerkleStore::serve_sync is unreachable in a guest — host-served".into(),
+        ))
     }
 }
 
