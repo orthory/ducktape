@@ -1,9 +1,11 @@
 //! resolution of both config shapes into the one runnable form
 //! (`Resolved`), plus the wireguard/advertised endpoint derivations.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use capability_host::SandboxBackend;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 
@@ -116,6 +118,46 @@ pub struct Resolved {
     /// joiner's lobby-reply task can persist a `coord.cap` delivered over its
     /// `JoinReply` via `save_coord_cap`.
     pub workspace: PathBuf,
+    /// how provider runs are spawned (`NodeToml::sandbox`). `Direct` (the
+    /// default) is the plain host spawn; `Podman` sandboxes every run AND
+    /// makes this node announce `sandbox_capacity`.
+    pub sandbox: SandboxBackend,
+    /// the numeric capacity a `Podman` node announces alongside its tags
+    /// (probed host totals, per-key overrides winning). EMPTY for a `Direct`
+    /// node — a direct spawn makes no capacity promise. This one value is both
+    /// the dispatch pool's ledger and the capability announce's resources.
+    pub sandbox_capacity: BTreeMap<String, u64>,
+}
+
+/// resolve the operator's sandbox choice into a spawn backend plus the numeric
+/// capacity a sandboxed node announces. absent/`"direct"` → `Direct` (no
+/// capacity — a direct spawn makes no promise); `"podman"` → `Podman` with the
+/// probed host totals, per-key overrides winning; `"tart"` is accepted and
+/// resolves to `Direct` for now (a sibling branch adds the real variant);
+/// anything else is a loud config error.
+fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
+    match raw.sandbox.as_deref() {
+        None | Some("direct") => Ok((SandboxBackend::Direct, BTreeMap::new())),
+        Some("podman") => {
+            let image = raw
+                .sandbox_image
+                .clone()
+                .unwrap_or_else(|| "docker.io/library/node:22-slim".into());
+            let mut capacity = crate::host_resources::probe();
+            if let Some(cores) = raw.sandbox_cores {
+                capacity.insert("cores".into(), cores);
+            }
+            if let Some(mem_gb) = raw.sandbox_mem_gb {
+                capacity.insert("mem_gb".into(), mem_gb);
+            }
+            Ok((SandboxBackend::Podman { image }, capacity))
+        }
+        // tart backend lands in a sibling branch; config value reserved.
+        Some("tart") => Ok((SandboxBackend::Direct, BTreeMap::new())),
+        Some(other) => Err(format!(
+            "sandbox: {other:?} is not \"direct\", \"podman\", or \"tart\""
+        )),
+    }
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -207,6 +249,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
         .transpose()?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
     // Existing workspaces predate `gateway_listen`. Any node already exposing
     // the app surface gets the safe loopback/ephemeral gateway automatically;
     // no registry or node.toml migration (and no stale port) is required.
@@ -240,7 +283,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
-        announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        announce_capabilities: raw.announce_capabilities.unwrap_or(false),
         coordination: descriptor.coordination(),
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
@@ -251,6 +294,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         workspace: base.to_path_buf(),
         primary_coordinator: raw.primary_coordinator,
         wireguard_advertised,
+        sandbox,
+        sandbox_capacity,
     })
 }
 
@@ -425,6 +470,9 @@ fn resolve_advertised(
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
+    // resolved before any field of `raw` is moved out below (it borrows the
+    // whole struct).
+    let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
     let id = raw
         .id
         .ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
@@ -529,13 +577,15 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         invite_wireguard: None,
         invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(false),
-        announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        announce_capabilities: raw.announce_capabilities.unwrap_or(false),
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
         coord_cap: None,
         primary_coordinator: raw.primary_coordinator,
         wireguard_advertised,
+        sandbox,
+        sandbox_capacity,
     })
 }
 
@@ -749,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn announce_capabilities_defaults_on_and_parses_off() {
+    fn announce_capabilities_defaults_off_and_parses_on() {
         let dir = tmp("announce");
         std::fs::write(
             dir.join("node.toml"),
@@ -758,21 +808,96 @@ mod tests {
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
         assert!(
-            resolved.announce_capabilities,
-            "announcing is the default posture"
+            !resolved.announce_capabilities,
+            "serving is now opt-in: the default posture stays out of every rendezvous pool"
         );
 
         std::fs::write(
             dir.join("node.toml"),
             "id = 0\nlisten = \"127.0.0.1:52221\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             announce_capabilities = false\n",
+             announce_capabilities = true\n",
         )
         .expect("write");
-        let resolved = resolve(&dir.join("node.toml")).expect("resolve suppressed");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve opted-in");
         assert!(
-            !resolved.announce_capabilities,
-            "false makes an accept-lane-only provider"
+            resolved.announce_capabilities,
+            "true opts this node into serving its discovered providers"
         );
+    }
+
+    #[test]
+    fn sandbox_parses_and_defaults_direct() {
+        let dir = tmp("sandbox");
+        let base = "id = 0\nlisten = \"127.0.0.1:52222\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+
+        // absent ⇒ Direct, and a direct node announces no capacity.
+        std::fs::write(dir.join("node.toml"), base).expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
+        assert_eq!(resolved.sandbox, SandboxBackend::Direct);
+        assert!(
+            resolved.sandbox_capacity.is_empty(),
+            "a direct spawn makes no capacity promise"
+        );
+
+        // "direct" is the explicit spelling of the default.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}sandbox = \"direct\"\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            resolve(&dir.join("node.toml")).expect("resolve").sandbox,
+            SandboxBackend::Direct
+        );
+
+        // "podman" ⇒ Podman with the default image + probed capacity.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}sandbox = \"podman\"\n"),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve podman");
+        assert_eq!(
+            resolved.sandbox,
+            SandboxBackend::Podman {
+                image: "docker.io/library/node:22-slim".into()
+            }
+        );
+        assert!(
+            resolved.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
+            "a podman node announces its probed capacity"
+        );
+
+        // an override wins over the probe; a custom image is honored.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "{base}sandbox = \"podman\"\nsandbox_image = \"docker.io/library/rust:1\"\n\
+                 sandbox_cores = 99\nsandbox_mem_gb = 128\n"
+            ),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
+        assert_eq!(
+            resolved.sandbox,
+            SandboxBackend::Podman {
+                image: "docker.io/library/rust:1".into()
+            }
+        );
+        assert_eq!(resolved.sandbox_capacity.get("cores"), Some(&99));
+        assert_eq!(resolved.sandbox_capacity.get("mem_gb"), Some(&128));
+
+        // "tart" is reserved — accepted, resolves to Direct for now.
+        std::fs::write(dir.join("node.toml"), format!("{base}sandbox = \"tart\"\n")).expect("write");
+        assert_eq!(
+            resolve(&dir.join("node.toml")).expect("tart accepted").sandbox,
+            SandboxBackend::Direct
+        );
+
+        // any other value is a loud config error.
+        std::fs::write(dir.join("node.toml"), format!("{base}sandbox = \"gvisor\"\n")).expect("write");
+        let err = resolve(&dir.join("node.toml")).expect_err("unknown sandbox refused");
+        assert!(err.contains("sandbox"), "{err}");
     }
 
     /// `primary_coordinator` (change 1, issue #331): the key ABSENT resolves

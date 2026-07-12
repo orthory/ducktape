@@ -329,6 +329,9 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
+    // serving is opt-in now (default OFF): this test needs node 1 in the
+    // rendezvous pool, so every node opts in.
+    cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),

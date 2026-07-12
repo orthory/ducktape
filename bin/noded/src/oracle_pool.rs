@@ -67,7 +67,9 @@ where
     let providers = capability_host::discover(
         agent_dirs,
         Some(run_output_sink(run_output)),
-        // Task 8 wires the operator's sandbox choice here; Direct for now.
+        // the embedded daemon stays Direct this phase: it exposes no operator
+        // sandbox knobs, so `DispatchPool::new` below keeps the bare (empty
+        // capacity) ledger — the sandbox/capacity plane is bin/node only.
         capability_host::SandboxBackend::Direct,
     )
     // BYO: run whatever executor CLIs the capability specs describe and

@@ -16,6 +16,7 @@
 //! permanently silent resident. duplicate announces are harmless: the module
 //! applies a declarative replace, so a re-send converges on the same state.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use host::Host;
@@ -37,9 +38,13 @@ pub(crate) struct ResidentAnnouncer {
 }
 
 impl ResidentAnnouncer {
-    pub(crate) fn new(me: Vec<u8>, capabilities: Vec<String>) -> Self {
+    pub(crate) fn new(
+        me: Vec<u8>,
+        capabilities: Vec<String>,
+        resources: BTreeMap<String, u64>,
+    ) -> Self {
         Self {
-            announcer: CapabilityAnnouncer::new(me, capabilities),
+            announcer: CapabilityAnnouncer::new(me, capabilities, resources),
             in_flight: None,
         }
     }
@@ -114,11 +119,12 @@ mod tests {
     }
 
     fn pump() -> ResidentAnnouncer {
-        let mut p = ResidentAnnouncer::new(vec![1u8; 32], vec!["codex".into()]);
+        // a resident on a direct-spawn host: tags only, no announced capacity.
+        let mut p = ResidentAnnouncer::new(vec![1u8; 32], vec!["codex".into()], BTreeMap::new());
         // simulate a decided announce: the decision core latched the set.
         assert_eq!(
-            p.announcer.decide(&[]),
-            Some(vec!["codex".to_string()]),
+            p.announcer.decide(&[], &BTreeMap::new()),
+            Some((vec!["codex".to_string()], BTreeMap::new())),
             "an empty committed registry decides an announce"
         );
         p
@@ -159,8 +165,8 @@ mod tests {
             "rejected: un-latched so the next tick re-decides"
         );
         assert_eq!(
-            p.announcer.decide(&[]),
-            Some(vec!["codex".to_string()]),
+            p.announcer.decide(&[], &BTreeMap::new()),
+            Some((vec!["codex".to_string()], BTreeMap::new())),
             "and the re-decision announces again"
         );
     }

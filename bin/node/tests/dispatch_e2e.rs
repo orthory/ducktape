@@ -395,6 +395,9 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
+    // serving is opt-in now (default OFF): this test wants the rendezvous
+    // pool, so it opts every node in explicitly.
+    cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();

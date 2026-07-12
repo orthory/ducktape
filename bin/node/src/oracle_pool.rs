@@ -10,6 +10,7 @@
 //! each op through the ordered lane under this node's key, so a result
 //! re-enters consensus exactly like any other local submit.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
@@ -21,6 +22,20 @@ use sdk::Msg;
 /// by the concurrency cap, so this never fills in practice; senders await
 /// (off-loop) rather than drop if it ever does.
 const ORACLE_RESULT_LANE: usize = 64;
+
+/// mirrors dispatch_oracle's private `max_concurrent_runs_from_env`
+/// (`DUCKTAPE_MAX_CONCURRENT_RUNS`, a positive int, else 4): `with_limit`
+/// needs the number explicitly so the announced capacity can ride alongside
+/// the env-derived concurrency cap, and the crate does not re-export the
+/// helper. ponytail: 6-line clone of a frozen crate constant; delete if the
+/// crate ever exports it.
+fn max_concurrent_runs() -> usize {
+    std::env::var("DUCKTAPE_MAX_CONCURRENT_RUNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+}
 
 /// build the dispatch worker for this validator: a pool that spawns provider
 /// runs as supervised children of `context` and hands completed results back
@@ -43,6 +58,11 @@ pub(crate) fn build<C>(
     blobs: blobstore::BlobHandle,
     provisioner: Option<SharedProvisioner>,
     blob_fetch: Option<crate::blob_fetch::BlobFetchFn>,
+    // the announced sandbox capacity — the pool's `ResourceLedger`. EMPTY for
+    // a direct-spawn node (demandless jobs only), the probed host totals for a
+    // Podman one. SAME map the capability announce carries, so the ledger and
+    // the registry can never disagree.
+    capacity: BTreeMap<String, u64>,
 ) -> (
     Box<dyn host::worker::Worker>,
     futures::channel::mpsc::Receiver<Msg>,
@@ -93,8 +113,15 @@ where
         })
     });
 
-    let mut pool =
-        DispatchPool::new(Arc::new(providers), node_key, spawn, deliver).with_resolver(resolver);
+    let mut pool = DispatchPool::with_limit(
+        Arc::new(providers),
+        node_key,
+        spawn,
+        deliver,
+        max_concurrent_runs(),
+        capacity,
+    )
+    .with_resolver(resolver);
     // portable (v3) runs materialize a per-run duckfs workspace through this,
     // over the SAME NodeHandle actor lane the /v1/fs/workspaces RPC uses. LIVE:
     // the composer emits v3 for every run (files module wired unconditionally),
