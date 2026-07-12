@@ -4596,6 +4596,7 @@ dependencies = [
  "statesync",
  "upgrade",
  "valset",
+ "vaults",
  "wasm-host",
 ]
 
@@ -6016,7 +6017,6 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "upgrade",
  "valset",
- "vaults",
  "wasm-host",
  "wireguard",
  "zeroize",

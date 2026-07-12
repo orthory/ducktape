@@ -211,6 +211,12 @@ wasm-modules:
 	wasm-tools component new \
 	  crates/examples/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
+	cd crates/examples/vaults-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/vaults-wasm/target/wasm32-unknown-unknown/release/vaults_wasm.wasm \
+	  -o crates/examples/vaults-wasm/component.wasm
+	cp crates/examples/vaults-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/vaults.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
@@ -223,6 +229,8 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
 	cmp crates/examples/directory-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/directory.component.wasm
+	cmp crates/examples/vaults-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/vaults.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

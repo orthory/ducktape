@@ -34,6 +34,10 @@ wasm-host = { workspace = true }
 # runtime and drives it through the host.
 kv = { workspace = true }
 directory = { workspace = true }
+# the adapter-port parity proof drives the SAME op matrix through the native
+# vaults module and its wasm port, asserting identical replies + the declared
+# state-schema break.
+vaults = { workspace = true }
 greeter = { workspace = true }
 # the deterministic-activation drain-injection test stands the real upgrade +
 # valset modules on the host and drives a block across an activation boundary.

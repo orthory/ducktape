@@ -34,7 +34,6 @@ use tagging::TaggingModule;
 use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
-use vaults::Vaults;
 use wasm_host::WasmModule;
 
 use crate::constants::current_state_schema_fingerprint;
@@ -103,6 +102,17 @@ const DIRECTORY_WASM_COMPONENT: &[u8] =
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
 
+/// the vaults module's GENESIS component — the first ADAPTER-ported tenant:
+/// the guest compiles the NATIVE `vaults` crate to wasm and persists its
+/// canonical snapshot as one host-KV value per dispatch, so the module's
+/// logic is single-sourced while the state schema breaks (revision 2 in
+/// `MODULE_STATE_SCHEMAS`; beta networks re-genesis, no back-compat shim).
+const VAULTS_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/vaults-wasm/component.wasm");
+
+/// the genesis-constant id the vaults module registers under.
+const VAULTS_MODULE_ID: &str = "vaults";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -116,6 +126,10 @@ fn seeded_modreg() -> Modreg {
     modreg.seed(
         DIRECTORY_MODULE_ID,
         sha2::Sha256::digest(DIRECTORY_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        VAULTS_MODULE_ID,
+        sha2::Sha256::digest(VAULTS_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -134,6 +148,16 @@ fn genesis_hello_wasm() -> WasmModule {
 fn genesis_directory_wasm() -> WasmModule {
     WasmModule::from_bytes(DIRECTORY_MODULE_ID, DIRECTORY_WASM_COMPONENT)
         .expect("embedded directory component loads")
+}
+
+/// the vaults module at its GENESIS code (same reconciliation story as
+/// [`genesis_hello_wasm`]). revision 2: the adapter port persists the native
+/// canonical snapshot under the host-KV encoding — a state-schema break from
+/// the native module's root, fenced by the recovery/state-sync preflight.
+fn genesis_vaults_wasm() -> WasmModule {
+    WasmModule::from_bytes(VAULTS_MODULE_ID, VAULTS_WASM_COMPONENT)
+        .expect("embedded vaults component loads")
+        .with_state_schema_revision(2)
 }
 
 pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
@@ -169,7 +193,7 @@ struct ProductionModules {
     dispatch: DispatchModule,
     tagging: TaggingModule,
     tasks: Tasks,
-    vaults: Vaults,
+    vaults: WasmModule,
     identity: Identity,
     duckdns: DuckDns,
     gateway: Gateway,
@@ -239,6 +263,7 @@ pub(super) async fn genesis_host(
     // (and re-fetch) every wasm tenant's initial code by content hash.
     blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(VAULTS_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -291,7 +316,10 @@ pub(super) async fn genesis_host(
         // modules receive engagement events — router only, module-agnostic.
         tagging: TaggingModule::new("tagging").with_direct_owner("runs"),
         tasks: Tasks::new("tasks"),
-        vaults: Vaults::new("vaults"),
+        // the first ADAPTER-ported wasm tenant: the native vaults logic
+        // compiled to wasm, whole-state persisted per dispatch (see
+        // `genesis_vaults_wasm`).
+        vaults: genesis_vaults_wasm(),
         // the deterministic user->nodes binding registry: certificates are
         // chain-scoped (this network's chain id), member-gated binds via valset,
         // and account display names have this single canonical owner.
@@ -452,8 +480,12 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
 
-    let mut vaults = Vaults::new("vaults");
-    let (bytes, root) = snapshot_of("vaults")?;
+    // the checkpoint bytes are the WasmModule host-KV snapshot (the adapter
+    // port's own canonical encoding), so a wasm-era checkpoint reinstalls
+    // self-consistently; pre-cutover checkpoints are fenced off by the
+    // state-schema preflight above (revision 2).
+    let mut vaults = genesis_vaults_wasm();
+    let (bytes, root) = snapshot_of(VAULTS_MODULE_ID)?;
     vaults
         .install(bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
@@ -813,8 +845,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("vaults").await?;
-    let mut vaults = Vaults::new("vaults");
+    let (bytes, root) = snapshot_of(VAULTS_MODULE_ID).await?;
+    let mut vaults = genesis_vaults_wasm();
     vaults
         .install(&bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;

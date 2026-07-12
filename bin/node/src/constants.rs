@@ -187,7 +187,9 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("tasks", 1),
     ("upgrade", 1),
     ("valset", 1),
-    ("vaults", 1),
+    // 2: the wasm adapter port — the native canonical snapshot persisted as
+    // one host-KV value, so root()/snapshot bytes changed shape at cutover.
+    ("vaults", 2),
 ];
 
 pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
