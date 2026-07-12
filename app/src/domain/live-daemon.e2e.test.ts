@@ -133,7 +133,6 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "runs",
       "pages",
       "forge",
-      "evm",
       "files",
       "identity",
       "duckdns",
