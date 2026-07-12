@@ -2,7 +2,7 @@
 // chain-scope banner when nothing is connected. Store comes in through a
 // ConsoleContext harness; custody's Tauri fetch through a mocked invoke.
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
