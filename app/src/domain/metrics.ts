@@ -1,6 +1,8 @@
 // The node's Prometheus/OpenMetrics scrape, parsed into the `ducktape_*` block
-// series the Metrics view charts. See `NodeTransport.metrics()` for the raw
-// text; the wire names are fixed by the node (bin/noded NodeMetrics):
+// series the Metrics view charts. The raw text arrives over the node stream's
+// `metrics` topic (one snapshot per heartbeat tick — the same exposition the
+// node's GET /metrics serves scrapers); the wire names are fixed by the node
+// (bin/noded NodeMetrics):
 //
 //   ducktape_block_height                       <gauge>
 //   ducktape_blocks_total                       <counter>

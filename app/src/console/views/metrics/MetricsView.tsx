@@ -1,11 +1,12 @@
-// The metrics surface: the node's own operational health, scraped from
-// GET /metrics (Prometheus) and read live. Unlike the Explorer (WHAT the chain
-// did — durable, canonical), this is HOW THIS node is running: block height and
-// throughput, apply-latency distribution, and which modules are busiest. Poll
-// only while mounted; a node that doesn't report the `ducktape_*` block series
-// (an older binary) says so plainly rather than drawing empty charts.
+// The metrics surface: the node's own operational health, streamed live over
+// the shared node socket's `metrics` topic (one OpenMetrics snapshot per
+// heartbeat tick, subscribed only while mounted). Unlike the Explorer (WHAT
+// the chain did — durable, canonical), this is HOW THIS node is running:
+// block height and throughput, apply-latency distribution, and which modules
+// are busiest. A node that doesn't report the `ducktape_*` block series (an
+// older binary) says so plainly rather than drawing empty charts.
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import {
   blocksPerSecond,
@@ -33,18 +34,10 @@ import {
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font } from "../../theme/tokens";
 import { Histogram, Panel, RankedBars, Sparkline, StatTile } from "./charts";
-
-/** How often to re-scrape, and how many samples the rolling window keeps. */
-const POLL_MS = 2_000;
-const WINDOW = 90; // ~3 min at 2s
-
-interface Sample {
-  t: number;
-  m: NodeMetrics;
-}
+import { useMetricsStream, type MetricsSample } from "./use-metrics-stream";
 
 /** One open plane with its window-derived rates: `series` is total (tx+rx)
- *  bytes/sec per poll step, `txRate`/`rxRate` the latest step's split. */
+ *  bytes/sec per sample step, `txRate`/`rxRate` the latest step's split. */
 interface PlaneRow {
   key: string;
   plane: DataPlaneMetric;
@@ -64,31 +57,9 @@ interface SyncPeerRow {
 const emptyStyle = { font: `400 12px ${font.sans}`, color: color.muted2 } as const;
 
 export function MetricsView() {
-  const { state, actions } = useDucktape();
-  const { connected, nodeUrl } = state;
-  const [samples, setSamples] = useState<Sample[]>([]);
-
-  // Scrape /metrics on an interval while mounted + connected. Reset the window
-  // when the node changes so one node's samples never bleed into another's.
-  useEffect(() => {
-    setSamples([]);
-    if (!connected) return;
-    let cancelled = false;
-    const poll = () => {
-      actions.readMetrics().then((m) => {
-        if (cancelled || !m) return;
-        setSamples((prev) => [...prev, { t: Date.now(), m }].slice(-WINDOW));
-      });
-    };
-    poll();
-    const timer = setInterval(poll, POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [connected, nodeUrl, actions]);
-
-  const latest = samples.length ? samples[samples.length - 1].m : undefined;
+  const { state, transport } = useDucktape();
+  const { connected } = state;
+  const { samples, latest, refused } = useMetricsStream(transport, connected);
 
   // blocks/second across the rolling window (counter deltas over wall time).
   const throughput = useMemo(() => {
@@ -120,7 +91,7 @@ export function MetricsView() {
     if (!latest) return [];
     return latest.planes.map((plane) => {
       const key = `${plane.service} ${plane.owner}`;
-      const inSample = (s: Sample) =>
+      const inSample = (s: MetricsSample) =>
         s.m.planes.find((p) => p.service === plane.service && p.owner === plane.owner);
       const series: number[] = [];
       let txRate = 0;
@@ -146,7 +117,7 @@ export function MetricsView() {
   const syncPeers = useMemo<SyncPeerRow[]>(() => {
     if (!latest) return [];
     return latest.syncPeers.map((peer) => {
-      const inSample = (s: Sample) => s.m.syncPeers.find((p) => p.peer === peer.peer);
+      const inSample = (s: MetricsSample) => s.m.syncPeers.find((p) => p.peer === peer.peer);
       const series: number[] = [];
       let txRate = 0;
       for (let i = 1; i < samples.length; i++) {
@@ -202,13 +173,20 @@ export function MetricsView() {
       {!connected ? (
         <div style={{ padding: 17 }}>
           <div style={emptyStyle}>
-            Not connected — metrics stream from the node's <code>/metrics</code> scrape once
-            it's reachable.
+            Not connected — metrics stream from the node once it's reachable.
+          </div>
+        </div>
+      ) : refused ? (
+        <div style={{ padding: 17 }}>
+          <div style={emptyStyle}>
+            This node doesn't stream metrics — its build predates the{" "}
+            <code>metrics</code> stream topic. Rebuild and restart it (
+            <code>make dev</code>) to chart it here.
           </div>
         </div>
       ) : !latest ? (
         <div style={{ padding: 17 }}>
-          <div style={emptyStyle}>Reading /metrics…</div>
+          <div style={emptyStyle}>Waiting for the first metrics sample…</div>
         </div>
       ) : !latest.present ? (
         <div style={{ padding: 17 }}>

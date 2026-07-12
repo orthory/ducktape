@@ -16,7 +16,6 @@ export const makeTransportStub = (
     height: 1,
     modules: [],
   }),
-  metrics: vi.fn().mockResolvedValue(""),
   blocks: vi.fn().mockResolvedValue([]),
   filesStage: vi.fn(),
   filesCommit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),

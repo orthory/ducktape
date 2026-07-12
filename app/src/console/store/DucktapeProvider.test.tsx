@@ -82,7 +82,6 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
     filesRead: vi.fn(),
     filesHistory: vi.fn(),
     status: vi.fn().mockRejectedValue(new Error("empty test node")),
-    metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
     subscribe: vi.fn(() => () => {}),
     onStream: vi.fn(() => () => {}),
@@ -285,7 +284,6 @@ const makeFakeNode = ({
         ...(publicKey ? { publicKey } : {}),
       }),
     ),
-    metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
     subscribe: vi.fn((topics: string[], handlers: TopicHandlers) => {
       for (const topic of topics) {

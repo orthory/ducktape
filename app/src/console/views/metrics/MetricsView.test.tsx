@@ -1,145 +1,165 @@
-// The Metrics view polls actions.readMetrics() while mounted and charts the
-// node's ducktape_* series — with honest empty states for disconnected and for
-// a node that reports only runtime metrics (an older binary).
+// The Metrics view subscribes to the node stream's `metrics` topic while
+// mounted and charts the ducktape_* series each pushed snapshot carries — with
+// honest empty states for disconnected, for an older daemon that refuses the
+// topic, and for a node that reports only runtime metrics (an older binary
+// whose scrape has no block series).
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { emptyMetrics, type NodeMetrics } from "../../../domain/metrics";
+import { METRICS_TOPIC } from "../../../domain/stream";
+import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { MetricsView } from "./MetricsView";
 
-const withData: NodeMetrics = {
-  present: true,
-  blockHeight: 42,
-  blocksTotal: 100,
-  latency: {
-    sum: 0.03,
-    count: 3,
-    buckets: [
-      { le: 0.001, cumulative: 0 },
-      { le: 0.01, cumulative: 2 },
-      { le: 0.1, cumulative: 3 },
-      { le: Infinity, cumulative: 3 },
-    ],
-  },
-  dispatches: [
-    { module: "chat", origin: "external", count: 5 },
-    { module: "chat", origin: "module", count: 2 },
-    { module: "tagging", origin: "module", count: 3 },
-  ],
-  planes: [],
-  syncPeers: [],
+// ── Exposition fixtures (what the stream's tail frames carry) ──
+
+const runtimeOnlyText = ["runtime_tasks_running 3", "# EOF", ""].join("\n");
+
+const withDataText = [
+  "# TYPE ducktape_block_height gauge",
+  "runtime_tasks_running 3", // runtime noise the parser must ignore
+  "ducktape_block_height 42",
+  "ducktape_blocks_total 100",
+  "ducktape_block_apply_latency_seconds_sum 0.03",
+  "ducktape_block_apply_latency_seconds_count 3",
+  'ducktape_block_apply_latency_seconds_bucket{le="0.001"} 0',
+  'ducktape_block_apply_latency_seconds_bucket{le="0.01"} 2',
+  'ducktape_block_apply_latency_seconds_bucket{le="0.1"} 3',
+  'ducktape_block_apply_latency_seconds_bucket{le="+Inf"} 3',
+  'ducktape_dispatch_total{module="chat",origin="external"} 5',
+  'ducktape_dispatch_total{module="chat",origin="module"} 2',
+  'ducktape_dispatch_total{module="tagging",origin="module"} 3',
+  "# EOF",
+  "",
+].join("\n");
+
+const withPlanesText = [
+  withDataText.replace("# EOF\n", ""),
+  'ducktape_dataplane_open{service="voice",owner="chat"} 1',
+  'ducktape_dataplane_age_seconds{service="voice",owner="chat"} 90',
+  'ducktape_dataplane_bytes{service="voice",owner="chat",dir="tx",class="datagram"} 640000',
+  'ducktape_dataplane_bytes{service="voice",owner="chat",dir="rx",class="datagram"} 320000',
+  'ducktape_dataplane_datagrams{service="voice",owner="chat",dir="tx"} 4000',
+  'ducktape_dataplane_datagrams{service="voice",owner="chat",dir="rx"} 2000',
+  'ducktape_dataplane_drops{service="voice",owner="chat",kind="shed"} 5',
+  'ducktape_dataplane_drops{service="voice",owner="chat",kind="rogue_datagrams"} 2',
+  'ducktape_dataplane_open{service="gateway",owner="gateway"} 1',
+  'ducktape_dataplane_halted{service="gateway",owner="gateway"} 1',
+  'ducktape_dataplane_age_seconds{service="gateway",owner="gateway"} 3725',
+  'ducktape_dataplane_bytes{service="gateway",owner="gateway",dir="tx",class="stream"} 150000',
+  'ducktape_dataplane_bytes{service="gateway",owner="gateway",dir="rx",class="stream"} 98000',
+  'ducktape_dataplane_streams{service="gateway",owner="gateway",kind="opened"} 12',
+  'ducktape_dataplane_streams{service="gateway",owner="gateway",kind="accepted"} 7',
+  "# EOF",
+  "",
+].join("\n");
+
+const withSyncPeersText = [
+  withDataText
+    .replace("ducktape_block_height 42", "ducktape_block_height 2000")
+    .replace("# EOF\n", ""),
+  'ducktape_statesync_serve_age_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 75',
+  'ducktape_statesync_serve_idle_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1',
+  'ducktape_statesync_serve_bytes{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 5250000',
+  'ducktape_statesync_serve_frames{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 40',
+  'ducktape_statesync_serve_boundary_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1500',
+  'ducktape_statesync_serve_frame_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1540',
+  'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="manifest"} 1',
+  'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="chunk"} 21',
+  'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 4',
+  // a tip poller: no manifest/frames served yet, so no height-shaped series.
+  'ducktape_statesync_serve_age_seconds{peer="0011223344556677"} 3000',
+  'ducktape_statesync_serve_idle_seconds{peer="0011223344556677"} 9',
+  'ducktape_statesync_serve_bytes{peer="0011223344556677"} 4200',
+  'ducktape_statesync_serve_frames{peer="0011223344556677"} 0',
+  'ducktape_statesync_serve_requests{peer="0011223344556677",kind="tip_coords"} 250',
+  "# EOF",
+  "",
+].join("\n");
+
+// ── Harness: a stub transport whose stream the test drives ──
+
+const streamHarness = () => {
+  const subs: TopicHandlers[] = [];
+  const subscribe = vi.fn((topics: string[], handlers: TopicHandlers) => {
+    if (topics.includes(METRICS_TOPIC)) subs.push(handlers);
+    return () => {
+      const at = subs.indexOf(handlers);
+      if (at >= 0) subs.splice(at, 1);
+    };
+  });
+  const transport = { subscribe } as unknown as NodeTransport;
+  const push = (text: string, timeMs = 1_000) =>
+    act(() => {
+      subs.forEach((handlers) =>
+        handlers.onTail?.({
+          type: "tail",
+          topic: METRICS_TOPIC,
+          cursor: String(timeMs),
+          item: { timeMs, text },
+        }),
+      );
+    });
+  const refuse = () =>
+    act(() => {
+      subs.forEach((handlers) =>
+        handlers.onRefused?.(METRICS_TOPIC, "unknownTopic", "unknown stream topic"),
+      );
+    });
+  return { transport, subscribe, push, refuse };
 };
 
-const withPlanes: NodeMetrics = {
-  ...withData,
-  planes: [
-    {
-      service: "voice",
-      owner: "chat",
-      ageSeconds: 90,
-      halted: false,
-      bytesTxDatagram: 640000,
-      bytesRxDatagram: 320000,
-      bytesTxStream: 0,
-      bytesRxStream: 0,
-      datagramsTx: 4000,
-      datagramsRx: 2000,
-      streamsOpened: 0,
-      streamsAccepted: 0,
-      drops: { shed: 5, rogue_datagrams: 2 },
-    },
-    {
-      service: "gateway",
-      owner: "gateway",
-      ageSeconds: 3725,
-      halted: true,
-      bytesTxDatagram: 0,
-      bytesRxDatagram: 0,
-      bytesTxStream: 150000,
-      bytesRxStream: 98000,
-      datagramsTx: 0,
-      datagramsRx: 0,
-      streamsOpened: 12,
-      streamsAccepted: 7,
-      drops: {},
-    },
-  ],
-};
-
-const withSyncPeers: NodeMetrics = {
-  ...withData,
-  blockHeight: 2000,
-  syncPeers: [
-    {
-      peer: "9f3ab2c1d4e5f607a8b9cadbecfd0e1f",
-      ageSeconds: 75,
-      idleSeconds: 1,
-      bytesTx: 5_250_000,
-      framesServed: 40,
-      boundaryHeight: 1500,
-      servedHeight: 1540,
-      requests: { manifest: 1, chunk: 21, frames: 4 },
-    },
-    {
-      peer: "0011223344556677",
-      ageSeconds: 3000,
-      idleSeconds: 9,
-      bytesTx: 4200,
-      framesServed: 0,
-      boundaryHeight: null,
-      servedHeight: null,
-      requests: { tip_coords: 250 },
-    },
-  ],
-};
-
-const renderMetrics = (
-  readMetrics: () => Promise<NodeMetrics | null>,
-  patch: Partial<ConsoleState> = {},
-) => {
+const renderMetrics = (patch: Partial<ConsoleState> = {}) => {
+  const harness = streamHarness();
   const state = { ...createInitialState(), connected: true, nodeUrl: "http://n", ...patch };
   const actions = new Proxy(
     {},
-    {
-      get: (_t, key: string) => {
-        if (key === "readMetrics") return readMetrics;
-        return vi.fn();
-      },
-    },
+    { get: () => vi.fn() },
   ) as ConsoleActions;
   render(
-    <ConsoleContext.Provider value={{ state, actions }}>
+    <ConsoleContext.Provider value={{ state, actions, transport: harness.transport }}>
       <MetricsView />
     </ConsoleContext.Provider>,
   );
+  return harness;
 };
 
 describe("MetricsView empty states", () => {
-  it("says the stream is paused when disconnected (and never polls)", () => {
-    const readMetrics = vi.fn().mockResolvedValue(withData);
-    renderMetrics(readMetrics, { connected: false });
+  it("says the stream is paused when disconnected (and never subscribes)", () => {
+    const { subscribe } = renderMetrics({ connected: false });
     expect(screen.getByText(/Not connected/)).toBeInTheDocument();
-    expect(readMetrics).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
-  it("is honest when the node reports no block metrics (older binary)", async () => {
-    renderMetrics(() => Promise.resolve(emptyMetrics()));
-    await waitFor(() =>
-      expect(screen.getByText(/isn't reporting block metrics/)).toBeInTheDocument(),
-    );
+  it("subscribes the metrics topic and waits for the first sample", () => {
+    const { subscribe } = renderMetrics();
+    expect(subscribe).toHaveBeenCalledWith([METRICS_TOPIC], expect.anything());
+    expect(screen.getByText(/Waiting for the first metrics sample/)).toBeInTheDocument();
+  });
+
+  it("is honest when an older daemon refuses the topic", () => {
+    const { refuse } = renderMetrics();
+    refuse();
+    expect(screen.getByText(/doesn't stream metrics/)).toBeInTheDocument();
+  });
+
+  it("is honest when the node reports no block metrics (older binary)", () => {
+    const { push } = renderMetrics();
+    push(runtimeOnlyText);
+    expect(screen.getByText(/isn't reporting block metrics/)).toBeInTheDocument();
   });
 });
 
 describe("MetricsView charts", () => {
-  it("renders the KPIs, latency/throughput panels, and dispatch bars", async () => {
-    renderMetrics(() => Promise.resolve(withData));
+  it("renders the KPIs, latency/throughput panels, and dispatch bars", () => {
+    const { push } = renderMetrics();
+    push(withDataText);
 
-    // KPI values (unique numbers) land once the first poll resolves.
-    await waitFor(() => expect(screen.getByText("42")).toBeInTheDocument()); // Height
+    // KPI values (unique numbers) land once the first sample arrives.
+    expect(screen.getByText("42")).toBeInTheDocument(); // Height
     expect(screen.getByText("100")).toBeInTheDocument(); // Blocks
 
     // the three panels are present…
@@ -167,10 +187,11 @@ describe("MetricsView charts", () => {
     expect(screen.getByText(/state-sync lane is idle/)).toBeInTheDocument();
   });
 
-  it("lists every open data plane with its creator and drop accounting", async () => {
-    renderMetrics(() => Promise.resolve(withPlanes));
+  it("lists every open data plane with its creator and drop accounting", () => {
+    const { push } = renderMetrics();
+    push(withPlanesText);
 
-    await waitFor(() => expect(screen.getByText("2 open")).toBeInTheDocument());
+    expect(screen.getByText("2 open")).toBeInTheDocument();
     // both planes, attributed to their creating module, with age.
     expect(screen.getByText("voice")).toBeInTheDocument();
     expect(screen.getByText("by chat · open 1m 30s")).toBeInTheDocument();
@@ -184,10 +205,19 @@ describe("MetricsView charts", () => {
     expect(screen.queryByText(/No open data planes/)).toBeNull();
   });
 
-  it("lists every served sync peer with its phase and block progression", async () => {
-    renderMetrics(() => Promise.resolve(withSyncPeers));
+  it("derives throughput from successive samples' counters and instants", () => {
+    const { push } = renderMetrics();
+    push(withDataText, 1_000);
+    // +4 blocks over 2 s of server time → 2.00 blocks/sec in the Rate tile.
+    push(withDataText.replace("ducktape_blocks_total 100", "ducktape_blocks_total 104"), 3_000);
+    expect(screen.getAllByText("2.00 /s").length).toBeGreaterThan(0);
+  });
 
-    await waitFor(() => expect(screen.getByText("serving 2")).toBeInTheDocument());
+  it("lists every served sync peer with its phase and block progression", () => {
+    const { push } = renderMetrics();
+    push(withSyncPeersText);
+
+    expect(screen.getByText("serving 2")).toBeInTheDocument();
     // peers are identified by their leading hex, with the phase under each.
     expect(screen.getByText("9f3ab2c1…")).toBeInTheDocument();
     expect(screen.getByText(/replaying frames · 1m 15s/)).toBeInTheDocument();
