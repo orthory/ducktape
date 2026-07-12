@@ -403,7 +403,7 @@ function LinkFlow({
   return (
     <GateCard
       title="Approve from your other device"
-      subtitle="On your other device, open Account → Link a device, then swap the two codes below. You can continue and finish the link later."
+      subtitle="On your other device, open Account → Link a device, then type the address under its QR here — or swap the two codes by hand. You can continue and finish the link later."
     >
       <LinkDeviceFlow onDone={onDone} doneLabel="Continue" />
     </GateCard>
