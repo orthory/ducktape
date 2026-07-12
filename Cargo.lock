@@ -6001,6 +6001,7 @@ dependencies = [
  "nat-traversal",
  "node",
  "noded",
+ "objc2-foundation",
  "overlay-net",
  "pages",
  "rand 0.8.6",

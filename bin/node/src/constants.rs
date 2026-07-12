@@ -66,6 +66,14 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= node::MAX_FRAME_BYTES + 1024)
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_BYTES + 1024);
 /// inbound backlog before a channel applies receive backpressure.
 pub(crate) const MAX_BACKLOG: usize = 128;
+/// per-read/write deadline for every mesh socket — the OS arm gets it via
+/// `with_read_write_timeout` at boot, and it IS the overlay seam's own
+/// `IO_TIMEOUT` (aliased, not copied, so the arms cannot drift). see the
+/// seam const's doc for the full rationale: this deadline is the only
+/// half-open-connection detector on the block-delivery path, and a slept /
+/// roamed / NAT-rebound laptop freezes for exactly this long before the
+/// dialer heals the mesh.
+pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TIMEOUT;
 /// pump drain cadence: how often the pump applies finalized frames (and runs
 /// everything that rides the drain arm — checkpoints, valset orchestration,
 /// the epoch cutover, the heartbeat). enforced as a FLOOR via an absolute

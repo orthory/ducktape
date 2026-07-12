@@ -816,10 +816,40 @@ pub(super) async fn park(
                             )
                             .await
                         {
+                            if e.permanent {
+                                // the source pruned the gap: no certificate
+                                // will ever make this range servable again
+                                // (the slept-laptop shape — the chain outran
+                                // the retention window while we were
+                                // suspended). DESCEND, exactly like the
+                                // epoch-cutover branch, so the fallback poll
+                                // re-ascends at a fresh boundary instead of
+                                // retrying the impossible range forever.
+                                println!(
+                                    "[node {label}] replica: backfill ({after_view}, \
+                                     {up_to_view}] pruned at the source ({}) — \
+                                     re-syncing at a fresh boundary",
+                                    e.detail
+                                );
+                                serving = None;
+                                replica_scheme = None;
+                                replica_orchestrator = None;
+                                recovery_slot = Some(
+                                    reopen_recovery(
+                                        &context,
+                                        &mut recovery_reopens,
+                                        &label,
+                                        code_source.clone(),
+                                    )
+                                    .await,
+                                );
+                                break;
+                            }
                             println!(
                                 "[node {label}] replica: backfill ({after_view}, \
-                                 {up_to_view}] unavailable: {e} — retrying on the \
-                                 next certificate"
+                                 {up_to_view}] unavailable: {} — retrying on the \
+                                 next certificate",
+                                e.detail
                             );
                             break;
                         }
@@ -852,10 +882,35 @@ pub(super) async fn park(
                                 )
                                 .await
                                 {
+                                    if e.permanent {
+                                        // same escalation as the gap branch
+                                        // above: a pruned range cannot heal
+                                        // by waiting.
+                                        println!(
+                                            "[node {label}] replica: unresolvable view \
+                                             {view} pruned at the source ({}) — \
+                                             re-syncing at a fresh boundary",
+                                            e.detail
+                                        );
+                                        serving = None;
+                                        replica_scheme = None;
+                                        replica_orchestrator = None;
+                                        recovery_slot = Some(
+                                            reopen_recovery(
+                                                &context,
+                                                &mut recovery_reopens,
+                                                &label,
+                                                code_source.clone(),
+                                            )
+                                            .await,
+                                        );
+                                        break;
+                                    }
                                     println!(
                                         "[node {label}] replica: unresolvable view \
-                                         {view} backfill failed: {e} — retrying on \
-                                         the next certificate"
+                                         {view} backfill failed: {} — retrying on \
+                                         the next certificate",
+                                        e.detail
                                     );
                                 }
                                 break;
