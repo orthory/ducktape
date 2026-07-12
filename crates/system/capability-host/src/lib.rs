@@ -55,7 +55,7 @@ mod session;
 mod spec;
 mod variants;
 mod workspace;
-pub use sandbox::{SandboxBackend, wrap_podman};
+pub use sandbox::{SandboxBackend, wrap_podman, wrap_tart};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{CapabilitySpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
@@ -269,6 +269,10 @@ impl AgentDirs {
     }
 }
 
+/// a sandbox backend's env overlay (`(key, value)` pairs) plus the spec's
+/// `~/`-relative rw mount dirs expanded to absolute host paths.
+type SandboxEnvRw = (Vec<(String, String)>, Vec<PathBuf>);
+
 /// a [`Provider`] that interprets one [`CapabilitySpec`] against one resolved
 /// binary: spawn `bin` with the spec's literal argv, feed the prompt on
 /// stdin, parse stdout with the spec's named format.
@@ -360,6 +364,9 @@ impl CliProvider {
         let mut cmd = match &self.backend {
             SandboxBackend::Direct => self.direct_command(args, ctx)?,
             SandboxBackend::Podman { image } => self.podman_command(image, args, workdir, ctx)?,
+            // the base image is used at CLONE time (tart_setup), not in the run
+            // argv — the run targets the already-cloned per-run VM.
+            SandboxBackend::Tart { .. } => self.tart_command(args, workdir, ctx)?,
         };
         cmd.current_dir(workdir)
             .stdin(Stdio::piped())
@@ -415,27 +422,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
     ) -> Result<tokio::process::Command, String> {
-        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-            format!(
-                "{}: the Podman backend needs $HOME set to mount the CLI's auth dirs",
-                self.spec.tag
-            )
-        })?;
-        // env carried into the container: HOME + the run PATH + this run's
-        // scoped ctx.env — deliberately NOT the node's ambient secrets.
-        let mut envs: Vec<(String, String)> = vec![("HOME".into(), home.display().to_string())];
-        if let Some(path) = self.run_path(ctx)? {
-            envs.push(("PATH".into(), path.to_string_lossy().into_owned()));
-        }
-        envs.extend(ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-        // the CLI's auth/state dirs cross rw at their identical host paths
-        // (spec.rs already rejected absolute / `..` entries, so join is safe).
-        let rw_dirs: Vec<PathBuf> = self
-            .spec
-            .rw_dirs
-            .iter()
-            .map(|d| home.join(d.strip_prefix("~/").unwrap_or(d)))
-            .collect();
+        let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx)?;
         let (bin, argv) = sandbox::wrap_podman(
             image,
             &self.bin,
@@ -449,6 +436,100 @@ impl CliProvider {
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(argv);
         Ok(cmd)
+    }
+
+    /// wrap the same invocation in `tart run <per-run-vm>`: the VM was already
+    /// COW-cloned by [`Self::tart_setup`]; this only assembles the run argv, at
+    /// identical host mount paths, with the same HOME/PATH/env + rw_dirs the
+    /// Podman backend crosses (see [`sandbox::wrap_tart`] for tart's guest-exec
+    /// and mount-point simplifications — real-Mac QA deferred).
+    fn tart_command(
+        &self,
+        args: &[String],
+        workdir: &Path,
+        ctx: &RunContext,
+    ) -> Result<tokio::process::Command, String> {
+        let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx)?;
+        let vm = sandbox::tart_vm_name(workdir);
+        let (bin, argv) = sandbox::wrap_tart(
+            &vm,
+            &self.bin,
+            args,
+            workdir,
+            &envs,
+            &ctx.path_entries,
+            &rw_dirs,
+            &ctx.limits,
+        );
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(argv);
+        Ok(cmd)
+    }
+
+    /// the env carried into a sandbox + the spec's `~/` rw_dirs expanded against
+    /// $HOME at their identical host paths — shared by the Podman and Tart
+    /// backends. both need the CLI's auth dotfiles under a SET HOME (so the CLI
+    /// finds them at their mounted paths) while deliberately NOT carrying the
+    /// node's ambient secrets; $HOME itself is never mounted (D7). $HOME unset
+    /// is a loud error, not a silent unsandboxed fallback.
+    fn sandbox_env_and_rw(&self, ctx: &RunContext) -> Result<SandboxEnvRw, String> {
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            format!(
+                "{}: a sandbox backend needs $HOME set to mount the CLI's auth dirs",
+                self.spec.tag
+            )
+        })?;
+        let mut envs: Vec<(String, String)> = vec![("HOME".into(), home.display().to_string())];
+        if let Some(path) = self.run_path(ctx)? {
+            envs.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        }
+        envs.extend(ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // spec.rs already rejected absolute / `..` entries, so join is safe.
+        let rw_dirs: Vec<PathBuf> = self
+            .spec
+            .rw_dirs
+            .iter()
+            .map(|d| home.join(d.strip_prefix("~/").unwrap_or(d)))
+            .collect();
+        Ok((envs, rw_dirs))
+    }
+
+    /// the Tart backend's impure per-run lifecycle: acquire the process-wide
+    /// concurrency permit (WAITS past 2, never errors — Apple's 2-VM limit),
+    /// then APFS-COW-clone the base image into this run's VM. returns a guard
+    /// whose Drop deletes the clone on EVERY exit path; `Ok(None)` for the
+    /// Direct/Podman backends (no-op).
+    ///
+    /// REAL-MAC QA DEFERRED: there is no tart or macOS on the build box, so the
+    /// clone/delete spawns are unit-untested — [`sandbox::wrap_tart`]'s pure
+    /// argv is the tested surface, and it documents the guest-exec/mount model
+    /// this lifecycle would need to grow (`tart set`, boot + `ssh`, guest path
+    /// remap) for a live run. clone failure is a LOUD error — no silent
+    /// fallback to unsandboxed execution.
+    async fn tart_setup(&self, workdir: &Path) -> Result<Option<TartGuard>, String> {
+        let SandboxBackend::Tart { image } = &self.backend else {
+            return Ok(None);
+        };
+        let vm = sandbox::tart_vm_name(workdir);
+        // WAITS if 2 tart runs are already live — this is the cap, not an error.
+        let permit = sandbox::tart_semaphore()
+            .acquire()
+            .await
+            .map_err(|e| format!("{}: tart concurrency gate closed: {e}", self.spec.tag))?;
+        let status = tokio::process::Command::new("tart")
+            .args(["clone", image, &vm])
+            .status()
+            .await
+            .map_err(|e| {
+                format!("{}: `tart clone {image} {vm}` failed to spawn: {e}", self.spec.tag)
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "{}: `tart clone {image} {vm}` exited with {status}",
+                self.spec.tag
+            ));
+        }
+        Ok(Some(TartGuard { vm, _permit: permit }))
     }
 
     /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
@@ -550,6 +631,34 @@ impl CliProvider {
     }
 }
 
+/// holds a Tart run's process-wide concurrency permit and deletes its per-run
+/// clone on drop — the run's LAST teardown step, on every exit path (success,
+/// error, timeout, panic). declared before the `tart run` child so the child
+/// drops first (kill_on_drop stops the VM), then this removes the clone and
+/// releases the permit. best-effort: a delete failure is logged, never
+/// surfaced (the run's own result already left).
+/// ponytail: a still-running VM may need `tart stop` before delete; the
+/// real-Mac pass confirms whether killing `tart run` frees the clone.
+struct TartGuard {
+    vm: String,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl Drop for TartGuard {
+    fn drop(&mut self) {
+        // synchronous best-effort cleanup: Drop can't await, and a brief block
+        // to reclaim a VM clone is acceptable teardown.
+        match std::process::Command::new("tart")
+            .args(["delete", &self.vm])
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("[capability-host] `tart delete {}` exited with {s}", self.vm),
+            Err(e) => eprintln!("[capability-host] `tart delete {}` failed to spawn: {e}", self.vm),
+        }
+    }
+}
+
 /// one finished invocation: the parsed answer plus the raw stdout the
 /// session capture reads (the session id is a sibling of the answer in the
 /// CLI's output, not part of it).
@@ -621,6 +730,11 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
     ) -> Result<Invocation, String> {
+        // Tart backend: acquire the concurrency permit + COW-clone the base
+        // image BEFORE spawning; the guard (declared first, so it drops LAST —
+        // after the `tart run` child) deletes the clone on every exit path. a
+        // no-op guard for Direct/Podman. clone failure aborts the run loudly.
+        let _tart_guard = self.tart_setup(workdir).await?;
         let mut child = self
             .command(args, workdir, ctx)?
             .spawn()
@@ -1299,6 +1413,63 @@ rw_dirs = ["~/.claude"]
         assert!(joined.contains(&format!("-e HOME={home}")), "{joined}");
         assert!(joined.contains("--cpus 2"), "{joined}");
         assert!(joined.ends_with("img /usr/bin/pod --go"), "{joined}");
+    }
+
+    #[test]
+    fn tart_backend_wraps_command_with_identical_mount_paths_and_rw_dirs() {
+        // the command() glue for Tart: HOME assembled, the spec's `~/` rw_dirs
+        // expanded against it, identical host mount paths handed to wrap_tart.
+        // wrap_tart's own translation is covered in sandbox.rs; the clone/delete
+        // lifecycle is real-Mac-QA-deferred (no tart on this box).
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "vm"
+[detect]
+bin = "vm"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+[sandbox]
+rw_dirs = ["~/.claude"]
+"#,
+            "test",
+        )
+        .unwrap();
+        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/vm"))
+            .with_backend(SandboxBackend::Tart {
+                image: "ghcr.io/example/macos-base:latest".into(),
+            });
+        let ctx = RunContext {
+            limits: BTreeMap::from([("mem_gb".to_string(), 4u64)]),
+            ..RunContext::default()
+        };
+        // workdir's final component becomes the (deterministic) per-run VM name.
+        let cmd = provider
+            .command(&["--go".into()], Path::new("/tmp/ducktape-run-7"), &ctx)
+            .expect("tart command builds");
+        let std = cmd.as_std();
+        assert_eq!(std.get_program(), std::ffi::OsStr::new("tart"));
+        let joined: Vec<String> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = joined.join(" ");
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        // the spec's `~/.claude` expands against the real HOME and mounts rw at
+        // its identical host path (source); memory is MB; HOME rides the env
+        // prefix; the run targets the per-run VM named for the workdir.
+        assert!(
+            joined.contains(&format!(":{home}/.claude ")),
+            "rw mount source at identical path: {joined}"
+        );
+        assert!(joined.contains("--memory 4096"), "{joined}");
+        assert!(joined.contains("ducktape-run-7 env "), "per-run vm name: {joined}");
+        assert!(joined.contains(&format!("HOME={home}")), "{joined}");
+        assert!(joined.ends_with("/usr/bin/vm --go"), "{joined}");
     }
 
     // ---- discovery ----------------------------------------------------------
