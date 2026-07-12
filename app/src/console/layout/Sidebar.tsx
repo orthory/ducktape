@@ -9,7 +9,7 @@ import { modulesInSection } from "../modules/registry";
 import type { NavSection } from "../modules/module-def";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
-import { initialsOf } from "../views/account/ProfileCard";
+import { initialsOf } from "../views/home/ProfileCard";
 
 const navBg = (active: boolean) => (active ? color.hover : "transparent");
 const navFg = (active: boolean) => (active ? color.inkSoft : color.muted);
@@ -162,10 +162,11 @@ export function Sidebar() {
 
       <div style={{ flex: 1 }} />
 
-      {/* The person's console — pinned above the gear: Account is a peer of
-          Settings, not a rail module (it isn't workspace content). */}
+      {/* The person's console — pinned above the gear: the avatar opens the
+          account Home (a full-window layer, not a rail module or a disconnect),
+          so it highlights on state.atHome. */}
       <button
-        onClick={() => actions.setScreen("account")}
+        onClick={() => actions.goHome()}
         title="Account"
         aria-label="Account"
         style={{
@@ -178,8 +179,8 @@ export function Sidebar() {
           height: 34,
           borderRadius: "50%",
           marginBottom: 2,
-          background: state.screen === "account" ? color.dark : color.iconIdle,
-          color: state.screen === "account" ? color.onDark : color.muted3,
+          background: state.atHome ? color.dark : color.iconIdle,
+          color: state.atHome ? color.onDark : color.muted3,
           font: `600 12px ${font.sans}`,
         }}
       >

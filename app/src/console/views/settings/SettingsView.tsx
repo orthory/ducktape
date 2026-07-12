@@ -30,7 +30,7 @@ function AccountLinkSection() {
           control={
             <HoverButton
               ariaLabel="Open Account"
-              onClick={() => actions.setScreen("account")}
+              onClick={() => actions.goHome()}
               hoverBg={color.titlebar}
               style={outlineButton}
             >

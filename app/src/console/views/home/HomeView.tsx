@@ -1,13 +1,14 @@
-// The Account console — the PERSON's surface, a shell-level screen beside
-// Settings: profile (name + account id), machine custody (password/recovery
-// phrase), the account's member keys with the device-link ceremony, and its
-// nodes. The account↔node split made navigable: nothing here is about "this
-// node" (that's the Node page) — it is about you and everything you own.
+// The account-centric Home — a shell-level layer (gated by state.atHome, not a
+// disconnect) that IS the person's surface: profile, the workspace table you
+// switch networks from, this device's Touch ID + linked keys, and machine
+// custody. Re-parented whole from the old in-shell Account view; the cards are
+// unchanged except that the workspace table replaces the old Nodes card's
+// machine-workspace list.
 //
-// Account data is chain-scoped (the identity module lives on each network),
-// so the account cards read the CONNECTED workspace's projections and an
-// honest banner says so when nothing is connected; custody and the local
-// workspace list are machine-scoped and always render.
+// Account data is chain-scoped (the identity module lives on each network), so
+// the account cards read the CONNECTED workspace's projections and an honest
+// banner says so when nothing is connected; custody, the Touch ID row, and the
+// workspace table are machine-scoped and always render.
 
 import { useCallback, useEffect, useState } from "react";
 
@@ -18,15 +19,15 @@ import { isDesktop } from "../../../domain/workspace-client";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { CustodyCard } from "./CustodyCard";
-import { DeviceKeysCard } from "./DeviceKeysCard";
-import { NodesCard } from "./NodesCard";
+import { DevicesCard } from "./DevicesCard";
 import { ProfileCard } from "./ProfileCard";
+import { WorkspacesTable } from "./WorkspacesTable";
 
-export function AccountView() {
+export function HomeView() {
   const { state } = useDucktape();
 
-  // One custody fetch feeds the custody card AND the this-device markers.
-  // Mutations inside CustodyCard re-fetch through the callback.
+  // One custody fetch feeds the custody card AND the devices card's this-device
+  // markers. Mutations inside those cards re-fetch through the callback.
   const [identity, setIdentity] = useState<IdentityStateReport | null>(null);
   const [identityFetchError, setIdentityFetchError] = useState<string | null>(null);
   const refreshIdentity = useCallback(() => {
@@ -53,7 +54,7 @@ export function AccountView() {
 
   return (
     <div
-      data-screen-label="Account"
+      data-screen-label="Home"
       style={{
         flex: 1,
         minWidth: 0,
@@ -65,12 +66,12 @@ export function AccountView() {
         overflowY: "auto",
       }}
     >
-      <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>
-        Account
-      </div>
+      <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Home</div>
 
-      <div style={{ maxWidth: 600 }}>
+      <div style={{ width: "100%", maxWidth: 720, alignSelf: "center" }}>
         <ProfileCard accountId={accountId} />
+
+        <WorkspacesTable />
 
         {disconnected && (
           <div
@@ -85,21 +86,19 @@ export function AccountView() {
               lineHeight: 1.5,
             }}
           >
-            Account data lives on each network — connect a workspace to see
-            this account's keys and nodes there. Device custody below always
-            works.
+            Account data lives on each network — enter a workspace above to see
+            this account&apos;s keys and standing there. Device custody below
+            always works.
           </div>
         )}
+
+        <DevicesCard accountId={accountId} identity={identity} />
 
         <CustodyCard
           identity={identity}
           fetchError={identityFetchError}
           onChanged={refreshIdentity}
         />
-
-        <DeviceKeysCard accountId={accountId} identity={identity} />
-
-        <NodesCard accountId={accountId} />
 
         <div style={{ height: 22 }} />
       </div>
