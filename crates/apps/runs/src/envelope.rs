@@ -249,6 +249,27 @@ pub(crate) fn render_job_payload(
     )
 }
 
+/// Compose a Pages-comment run. The whole referenced page is supplied as
+/// context, while the conversation keeps the triggering comment and stable
+/// thread/ordinal coordinates explicit.
+pub(crate) fn render_page_comment_payload(
+    agent: &AgentRecord,
+    thread_id: &str,
+    ordinal: u64,
+    author: &str,
+    text: &str,
+    portable: PortableInputs,
+) -> String {
+    envelope(
+        agent,
+        Some(format!("pages:{thread_id}")),
+        format!(
+            "Pages comment thread {thread_id}, comment {ordinal}. Reply to this comment thread.\n\n{author}: {text}"
+        ),
+        portable,
+    )
+}
+
 /// the transcript block, rendered exactly as the flat-payload era did — the
 /// host feeds it to the model verbatim, so the wording is part of the
 /// committed prompt input.

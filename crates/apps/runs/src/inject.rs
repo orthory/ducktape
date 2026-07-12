@@ -200,7 +200,12 @@ impl RunsModule {
     /// one committed page in preorder, or `None` when it does not exist —
     /// a query/decode error degrades to `None` too (page injection is
     /// context garnish; it never fails a run).
-    async fn page_blocks(&self, ctx: &dyn Ctx, pages: &str, page_id: &str) -> Option<Vec<Block>> {
+    pub(crate) async fn page_blocks(
+        &self,
+        ctx: &dyn Ctx,
+        pages: &str,
+        page_id: &str,
+    ) -> Option<Vec<Block>> {
         let reply = ctx
             .query(
                 pages,

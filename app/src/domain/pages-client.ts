@@ -248,7 +248,13 @@ export interface TargetThreads {
 
 export const addComment = (
   transport: NodeTransport,
-  params: { threadId: string; commentId: string; target: string; text: string },
+  params: {
+    threadId: string;
+    commentId: string;
+    target: string;
+    text: string;
+    mentions?: AuthorRef[];
+  },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
     add_comment: {
@@ -256,6 +262,7 @@ export const addComment = (
       comment_id: params.commentId,
       target: params.target,
       text: params.text,
+      mentions: params.mentions ?? [],
     },
   });
 

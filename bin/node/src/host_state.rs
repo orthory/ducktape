@@ -142,7 +142,9 @@ pub(super) async fn genesis_host(
     blobs: blobstore::BlobHandle,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let pages = Pages::init(context.child("pages"), "pages").await;
+    let pages = Pages::init(context.child("pages"), "pages")
+        .await
+        .with_tagging("tagging");
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
@@ -188,7 +190,7 @@ pub(super) async fn genesis_host(
         dispatch: DispatchModule::new("dispatch", "saga"),
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
-        tagging: TaggingModule::new("tagging"),
+        tagging: TaggingModule::new("tagging").with_direct_owner("runs"),
         tasks: Tasks::new("tasks"),
         vaults: Vaults::new("vaults"),
         // the deterministic user->nodes binding registry: certificates are
@@ -261,7 +263,9 @@ pub(super) async fn restore_host(
     blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let pages = Pages::init(context.child("pages"), "pages").await;
+    let pages = Pages::init(context.child("pages"), "pages")
+        .await
+        .with_tagging("tagging");
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
@@ -315,7 +319,7 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
-    let mut tagging = TaggingModule::new("tagging");
+    let mut tagging = TaggingModule::new("tagging").with_direct_owner("runs");
     let (bytes, root) = snapshot_of("tagging")?;
     tagging
         .install(bytes, root)
@@ -624,7 +628,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("dispatch install: {e}"))?;
 
     let (bytes, root) = snapshot_of("tagging").await?;
-    let mut tagging = TaggingModule::new("tagging");
+    let mut tagging = TaggingModule::new("tagging").with_direct_owner("runs");
     tagging
         .install(&bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;

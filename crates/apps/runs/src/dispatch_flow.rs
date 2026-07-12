@@ -253,6 +253,83 @@ impl RunsModule {
         })
     }
 
+    /// Prepare a run triggered by one Pages comment. `ordinal` is 1-based in
+    /// the thread and comes from Pages' same-block tag event.
+    pub(super) async fn prepare_page_dispatch(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &AgentRecord,
+        thread_id: &str,
+        ordinal: u64,
+    ) -> Result<PreparedDispatch, String> {
+        let pages = self
+            .pages
+            .as_deref()
+            .ok_or_else(|| "pages module is not configured".to_string())?;
+        let reply = ctx
+            .query(
+                pages,
+                &pages::encode_query(&pages::PageQuery::CommentThread {
+                    thread_id: thread_id.to_string(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("pages thread lookup failed: {e}"))?;
+        let view = match pages::decode_reply(&reply) {
+            Ok(pages::PageReply::CommentThread(Some(view))) => view,
+            Ok(_) => return Err(format!("pages thread is missing: {thread_id}")),
+            Err(e) => return Err(format!("pages thread reply failed to decode: {e}")),
+        };
+        let index = usize::try_from(ordinal.saturating_sub(1))
+            .map_err(|_| "pages comment ordinal exceeds host usize".to_string())?;
+        let comment = view
+            .comments
+            .get(index)
+            .filter(|comment| !comment.deleted)
+            .ok_or_else(|| format!("pages comment is missing: {thread_id}/{ordinal}"))?;
+        let author = match &comment.author {
+            pages::AuthorRef::User(key) => format!("user:{}", crate::hex(key)),
+            pages::AuthorRef::Agent { module, agent_id } => format!("{module}/{agent_id}"),
+            pages::AuthorRef::Module(module) => format!("module:{module}"),
+            pages::AuthorRef::System => "system".into(),
+        };
+        let block_reply = ctx
+            .query(
+                pages,
+                &pages::encode_query(&pages::PageQuery::GetBlock {
+                    block_id: view.thread.target.clone(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("pages target lookup failed: {e}"))?;
+        let page_id = match pages::decode_reply(&block_reply) {
+            Ok(pages::PageReply::Block(Some(block))) => block.page,
+            _ => return Err(format!("pages target is missing: {}", view.thread.target)),
+        };
+        let mut portable = self.portable_inputs(ctx, agent).await?;
+        let blocks = self.page_blocks(ctx, pages, &page_id).await;
+        portable.context = Some(inject::render_pages_section(&[(page_id, blocks)]));
+        let payload = envelope::render_page_comment_payload(
+            agent,
+            thread_id,
+            ordinal,
+            &author,
+            &comment.text,
+            portable,
+        )
+        .into_bytes();
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
+                payload.len()
+            ));
+        }
+        Ok(PreparedDispatch {
+            thread_root: None,
+            payload,
+        })
+    }
+
     /// stage a chat run's dispatch — one atomic unit with whatever op caused
     /// it (P2). the recipe is the agent's own (`agent/{agent_id}`, registered
     /// by the registry hook); the result lands as a next-block `ResultEvent`

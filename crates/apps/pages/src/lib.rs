@@ -71,6 +71,7 @@ use commonware_utils::range::NonEmptyRange;
 use sdk::{
     Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
+use tagging::{TagEvent, TaggingMsg};
 
 mod block_ops;
 mod comment_ops;
@@ -134,6 +135,9 @@ where
     /// read ahead of committed state by `get` (read-your-writes) and flushed
     /// to qmdb in one batch by `commit_block`; NOT in `root()` until then.
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Optional engagement router. Tests/minimal registries may leave it
+    /// unwired; production reports each newly-added comment after staging it.
+    tagging: Option<ModuleId>,
 }
 
 #[cfg(test)]

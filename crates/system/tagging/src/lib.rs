@@ -1,17 +1,19 @@
 //! the tagging plane — the cross-module engagement router.
 //!
 //! generalizes "content in module A names an entity of module B, and B gets
-//! engaged": a subscriber module registers interest in a `(source,
-//! container)` scope, a content module reports each content item as a
-//! [`TagEvent`] in the same block as the content, and this module fans one
-//! [`EngagementEvent`] follow-up `Msg` out to every subscriber of the scope.
+//! engaged": a content module reports each content item as a [`TagEvent`] in
+//! the same block as the content, and this module sends an [`EngagementEvent`]
+//! to every explicitly named, genesis-configured entity-owner module. Scope
+//! subscribers are added to that recipient set for policies that also engage
+//! on untagged content.
 //!
 //! ## router only
 //!
 //! the plane holds subscription state and routes — nothing else. engagement
-//! POLICY (mention-gating, assignment, round-robin) lives in each subscriber
-//! module; the plane delivers every user-authored content event in a
-//! subscribed scope, tags and all, and the subscriber decides what engages.
+//! POLICY (mention-gating, assignment, round-robin) lives in each recipient
+//! module; the plane delivers tagged content directly to tag owners and every
+//! user-authored content event to scope subscribers. The recipient decides
+//! what engages.
 //!
 //! ## origin-keyed trust (spoof-proof by construction)
 //!
@@ -185,6 +187,12 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
 
 pub struct TaggingModule {
     id: ModuleId,
+    /// Genesis-configured modules that may receive explicit entity mentions
+    /// without a scope subscription. This is deliberately not payload-driven:
+    /// an external author can construct a tag, so routing it to an arbitrary
+    /// registered module could make that module reject the foreign event and
+    /// abort the content block.
+    direct_owners: BTreeSet<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     committed: Committed,
     /// this block's staged writes, read ahead of committed state
@@ -197,9 +205,18 @@ impl TaggingModule {
     pub fn new(id: impl Into<ModuleId>) -> Self {
         Self {
             id: id.into(),
+            direct_owners: BTreeSet::new(),
             committed: Committed::default(),
             staged: BTreeMap::new(),
         }
+    }
+
+    /// Allow one engagement-aware module to receive explicit entity tags
+    /// directly. Genesis config, not committed state; every production host
+    /// must wire the same set just like its module registry.
+    pub fn with_direct_owner(mut self, owner: impl Into<ModuleId>) -> Self {
+        self.direct_owners.insert(owner.into());
+        self
     }
 
     // ---- staged-overlay reads ----------------------------------------------------
@@ -342,9 +359,27 @@ impl TaggingModule {
             self.note(ctx, "dropped malformed tags from a tag event".into());
             tags.retain(|t| !malformed(t));
         }
-        let Some(subscribers) = self.subscribers(&scope_key(&source, &container)) else {
+        // Exact-scope subscriptions continue to drive All/Assigned/RR
+        // policies. A structured entity mention additionally reaches the
+        // entity's owning module directly, even when this source/container
+        // has no pre-existing subscription (for example a fresh Pages
+        // comment thread). Deduping keeps a watched chat mention single-shot.
+        let mut recipients = self
+            .subscribers(&scope_key(&source, &container))
+            .cloned()
+            .unwrap_or_default();
+        for tag in &tags {
+            // Registry membership is genesis-fixed, so malformed/unknown
+            // owner ids are deterministic no-ops on this no-fail arm.
+            if self.direct_owners.contains(&tag.module)
+                && ctx.module_root(&tag.module).is_some()
+            {
+                recipients.insert(tag.module.clone());
+            }
+        }
+        if recipients.is_empty() {
             return Ok(());
-        };
+        }
         let delivery = EngagementEvent {
             source,
             container,
@@ -352,7 +387,7 @@ impl TaggingModule {
             author,
             tags,
         };
-        for subscriber in subscribers.clone() {
+        for subscriber in recipients {
             ctx.emit_msg(Msg {
                 target: subscriber,
                 payload: encode_event(&delivery),
@@ -461,7 +496,7 @@ mod tests {
                     protocol_version: 0,
                 },
                 msgs: Vec::new(),
-                registered: vec!["chat", "agent", "pages", "tagging"],
+                registered: vec!["chat", "agent", "pages", "runs", "tagging"],
             }
         }
         fn with_origin(mut self, origin: Origin) -> Self {
@@ -488,7 +523,7 @@ mod tests {
     }
 
     fn module() -> TaggingModule {
-        TaggingModule::new("tagging")
+        TaggingModule::new("tagging").with_direct_owner("runs")
     }
     fn exec(
         m: &mut TaggingModule,
@@ -600,6 +635,47 @@ mod tests {
         // source module is a different scope.
         let mut ctx = from_module("pages");
         exec(&mut m, &mut ctx, &user_tag("general", 1, vec![])).unwrap();
+        assert!(ctx.msgs.is_empty());
+    }
+
+    #[test]
+    fn entity_mention_routes_to_owner_without_a_scope_subscription() {
+        let mut m = module();
+        let mut ctx = from_module("pages");
+        let tag = EntityRef {
+            module: "runs".into(),
+            entity: "qa-luna".into(),
+        };
+        exec(
+            &mut m,
+            &mut ctx,
+            &user_tag("thread-1", 1, vec![tag.clone()]),
+        )
+        .unwrap();
+        assert_eq!(ctx.msgs.len(), 1);
+        assert_eq!(ctx.msgs[0].target, "runs");
+        let event = decode_event(&ctx.msgs[0].payload).unwrap();
+        assert_eq!(event.source, "pages");
+        assert_eq!(event.container, "thread-1");
+        assert_eq!(event.tags, vec![tag]);
+
+        // A crafted tag naming an arbitrary registered module is not a
+        // routing capability: Pages would reject EngagementEvent bytes and
+        // abort the user's content block if this were delivered.
+        let mut ctx = from_module("pages");
+        exec(
+            &mut m,
+            &mut ctx,
+            &user_tag(
+                "thread-2",
+                1,
+                vec![EntityRef {
+                    module: "pages".into(),
+                    entity: "not-an-agent".into(),
+                }],
+            ),
+        )
+        .unwrap();
         assert!(ctx.msgs.is_empty());
     }
 

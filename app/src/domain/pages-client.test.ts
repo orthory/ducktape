@@ -50,7 +50,15 @@ describe("pages-client comments", () => {
     await addComment(fakeTransport(sink), { threadId: "t1", commentId: "c1", target: "b1", text: "hi" });
     expect(sink[0]).toEqual({
       target: "pages",
-      payload: { add_comment: { thread_id: "t1", comment_id: "c1", target: "b1", text: "hi" } },
+      payload: {
+        add_comment: {
+          thread_id: "t1",
+          comment_id: "c1",
+          target: "b1",
+          text: "hi",
+          mentions: [],
+        },
+      },
     });
   });
   it("resolveThread wire shape", async () => {

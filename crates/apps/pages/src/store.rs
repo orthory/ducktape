@@ -71,7 +71,14 @@ where
             id,
             db,
             pending: BTreeMap::new(),
+            tagging: None,
         }
+    }
+
+    /// Report newly-added comments to the shared engagement router.
+    pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
+        self.tagging = Some(tagging.into());
+        self
     }
 
     /// read raw bytes for `key` through the staged overlay: a staged write
@@ -313,6 +320,7 @@ where
             id,
             db,
             pending: BTreeMap::new(),
+            tagging: None,
         })
     }
 }

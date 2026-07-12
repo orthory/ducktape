@@ -8,6 +8,7 @@ fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
         comment_id: comment.into(),
         target: target.into(),
         text: text.into(),
+        mentions: Vec::new(),
         as_agent: None,
     }
 }
@@ -18,8 +19,42 @@ fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageM
         comment_id: comment.into(),
         target: target.into(),
         text: "agent says".into(),
+        mentions: Vec::new(),
         as_agent: Some(agent.into()),
     }
+}
+
+#[test]
+fn add_comment_reports_structured_agent_mentions_to_tagging() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await.with_tagging("tagging");
+        let mut op = add("t1", "c1", "page-1", "@qa-luna please review");
+        let PageMsg::AddComment { mentions, .. } = &mut op else {
+            unreachable!()
+        };
+        mentions.push(AuthorRef::Agent {
+            module: "runs".into(),
+            agent_id: "qa-luna".into(),
+        });
+        let mut ctx = ctx_as(user("eddy"));
+        p.execute(&mut ctx, &msg(&op)).await.unwrap();
+        assert_eq!(ctx.msgs.len(), 1);
+        assert_eq!(ctx.msgs[0].target, "tagging");
+        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs[0].payload).unwrap()
+        else {
+            panic!("expected tag event")
+        };
+        assert_eq!(event.container, "t1");
+        assert_eq!(event.content_seq, 1);
+        assert_eq!(event.author, tagging::Author::User(b"eddy".to_vec()));
+        assert_eq!(
+            event.tags,
+            vec![tagging::EntityRef {
+                module: "runs".into(),
+                entity: "qa-luna".into(),
+            }]
+        );
+    });
 }
 
 #[test]

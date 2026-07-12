@@ -126,7 +126,10 @@ impl RunsModule {
     /// gate order: grant → target resolution → cap → payload → freshness
     /// probes. `already_staged` is how many threads this run has staged to
     /// this comment's target already (the same-block thread-cap accounting).
-    #[allow(clippy::too_many_arguments, reason = "run_id + index derive the deterministic ids; already_staged is the same-block cap counter")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "run_id + index derive the deterministic ids; already_staged is the same-block cap counter"
+    )]
     async fn pages_action_msg(
         &self,
         ctx: &dyn Ctx,
@@ -184,6 +187,7 @@ impl RunsModule {
                         comment_id: page_comment_id(run_id, index),
                         target: target.clone(),
                         text: body.clone(),
+                        mentions: Vec::new(),
                         // pages refines Module("runs") + as_agent into
                         // AuthorRef::Agent — the same wire chat replies use.
                         as_agent: Some(agent.agent_id.clone()),
@@ -211,7 +215,7 @@ impl RunsModule {
     }
 
     /// the D3 cap gate: pages_write is page-id scoped with `"*"` allowed.
-    fn check_pages_write(&self, agent: &AgentRecord, page: &str) -> Result<(), String> {
+    pub(super) fn check_pages_write(&self, agent: &AgentRecord, page: &str) -> Result<(), String> {
         if agent.permits(&CapRequest::PagesWrite(page)) {
             Ok(())
         } else {

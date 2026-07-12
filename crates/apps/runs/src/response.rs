@@ -2,15 +2,15 @@ use super::facets::{
     WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, output_ref_of,
     valid_data,
 };
-use super::{RunOutcome, RunRecord, sink};
 use super::{
-    ACTION_CHAT_POST, AgentAction, AgentRecord, AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery,
-    ChatReply, Ctx, Error, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
-    MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin,
-    TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
-    chat_encode_query, decode_result_event, reply_message_id, tasks_decode_reply,
-    tasks_encode_msg, tasks_encode_query,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
+    Block, ChatMsg, ChatQuery, ChatReply, Ctx, Error, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
+    MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ResultEvent,
+    RunsModule, SagaOrigin, TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply,
+    chat_encode_msg, chat_encode_query, decode_result_event, page_thread_id, reply_message_id,
+    tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
 };
+use super::{RunOutcome, RunRecord, sink};
 
 // ---- response normalization ---------------------------------------------------------
 // the dispatch-plane oracle returns the model's RAW text (opinion-free, Text
@@ -104,6 +104,28 @@ fn to_chat_blocks(blocks: &[ReplyBlock]) -> Vec<Block> {
             _ => Block::paragraph(block.text.clone()),
         })
         .collect()
+}
+
+fn to_page_comment_text(blocks: &[ReplyBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| {
+            if block.kind == REPLY_KIND_CODE {
+                format!(
+                    "```{}\n{}\n```",
+                    block.lang.as_deref().unwrap_or(""),
+                    block.text
+                )
+            } else {
+                block.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn page_reply_comment_id(run_id: &str) -> String {
+    format!("agent/{}/reply", crate::dispatch_id_for(run_id))
 }
 
 fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool) -> AgentResponse {
@@ -332,7 +354,7 @@ impl RunsModule {
         // pages action degrades to a breadcrumb, the run still delivers.
         self.emit_pages_effects(ctx, run_id, entry, &response.actions)
             .await;
-        self.emit_response(ctx, run_id, entry, response);
+        self.emit_response(ctx, run_id, entry, response).await;
         let pr_number = self
             .emit_sink(
                 ctx,
@@ -403,21 +425,36 @@ impl RunsModule {
         }
 
         if !response.reply_blocks.is_empty() {
-            if !allows(&agent, ACTION_CHAT_POST) {
+            let page_run = page_thread_id(&entry.channel_id).is_some();
+            let action = if page_run {
+                ACTION_PAGES_COMMENT
+            } else {
+                ACTION_CHAT_POST
+            };
+            if !allows(&agent, action) {
                 return Err(format!(
-                    "agent {} is not allowed to {ACTION_CHAT_POST}",
+                    "agent {} is not allowed to {action}",
                     entry.agent_id
                 ));
             }
-            let reply_bytes = serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
-                .expect("blocks are serializable");
+            let reply_bytes = if page_run {
+                to_page_comment_text(&response.reply_blocks).into_bytes()
+            } else {
+                serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
+                    .expect("blocks are serializable")
+            };
             if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
                 return Err(format!(
                     "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
                     reply_bytes.len()
                 ));
             }
-            self.probe_reply_postable(ctx, run_id, entry).await?;
+            if page_run {
+                self.page_reply_msg(ctx, run_id, entry, &response.reply_blocks)
+                    .await?;
+            } else {
+                self.probe_reply_postable(ctx, run_id, entry).await?;
+            }
         }
 
         // the strict all-or-nothing lane covers the TASK verbs only. the two
@@ -528,6 +565,97 @@ impl RunsModule {
         Ok(())
     }
 
+    /// Build a Pages reply only after proving every rejection surface: thread
+    /// and target still exist, reply id is free, thread has room, and the
+    /// agent holds pages_write for the owning page.
+    async fn page_reply_msg(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        blocks: &[ReplyBlock],
+    ) -> Result<Msg, String> {
+        let pages = self
+            .pages
+            .as_deref()
+            .ok_or_else(|| "pages module is not configured".to_string())?;
+        let thread_id = page_thread_id(&entry.channel_id)
+            .ok_or_else(|| "run is not a pages comment run".to_string())?;
+        let reply = ctx
+            .query(
+                pages,
+                &pages::encode_query(&pages::PageQuery::CommentThread {
+                    thread_id: thread_id.to_string(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("pages thread lookup failed: {e}"))?;
+        let view = match pages::decode_reply(&reply) {
+            Ok(pages::PageReply::CommentThread(Some(view))) => view,
+            _ => return Err(format!("pages thread is missing: {thread_id}")),
+        };
+        if view.thread.comment_ids.len() >= pages::MAX_COMMENTS_PER_THREAD {
+            return Err(format!("pages comment thread is full: {thread_id}"));
+        }
+        let target_reply = ctx
+            .query(
+                pages,
+                &pages::encode_query(&pages::PageQuery::GetBlock {
+                    block_id: view.thread.target.clone(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("pages target lookup failed: {e}"))?;
+        let target = match pages::decode_reply(&target_reply) {
+            Ok(pages::PageReply::Block(Some(block))) => block,
+            _ => return Err(format!("pages target is missing: {}", view.thread.target)),
+        };
+        let agent = self
+            .agent_record(ctx, &entry.agent_id)
+            .await?
+            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+        self.check_pages_write(&agent, &target.page)?;
+        let comment_id = page_reply_comment_id(run_id);
+        if comment_id.len() > pages::MAX_COMMENT_ID_BYTES || !pages::id_is_index_safe(&comment_id) {
+            return Err("derived pages reply id is invalid".into());
+        }
+        let existing = ctx
+            .query(
+                pages,
+                &pages::encode_query(&pages::PageQuery::GetComment {
+                    comment_id: comment_id.clone(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("pages comment lookup failed: {e}"))?;
+        match pages::decode_reply(&existing) {
+            Ok(pages::PageReply::Comment(None)) => {}
+            Ok(pages::PageReply::Comment(Some(_))) => {
+                return Err(format!("pages reply id already taken: {comment_id}"));
+            }
+            _ => return Err("unexpected pages reply for a comment lookup".into()),
+        }
+        let text = to_page_comment_text(blocks);
+        if text.len() > pages::MAX_COMMENT_TEXT_BYTES {
+            return Err(format!(
+                "pages reply is {} bytes; the cap is {}",
+                text.len(),
+                pages::MAX_COMMENT_TEXT_BYTES
+            ));
+        }
+        Ok(Msg {
+            target: pages.to_string(),
+            payload: pages::encode_msg(&pages::PageMsg::AddComment {
+                thread_id: thread_id.to_string(),
+                comment_id,
+                target: view.thread.target,
+                text,
+                mentions: Vec::new(),
+                as_agent: Some(entry.agent_id.clone()),
+            }),
+        })
+    }
+
     /// surface a failed CHAT run as a threaded reply authored by the agent —
     /// same message id as a success reply would use, so the one-reply-per-run
     /// dedup holds and a redelivered result (entry already pruned) can never
@@ -564,21 +692,41 @@ impl RunsModule {
             .agent_record(ctx, &entry.agent_id)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        // posting the failure is a chat post like any reply — ungranted
+        let page_run = page_thread_id(&entry.channel_id).is_some();
+        // posting the failure is a reply like any success — ungranted
         // agents keep the old silent-fail.
-        if !allows(&agent, ACTION_CHAT_POST) {
+        let action = if page_run {
+            ACTION_PAGES_COMMENT
+        } else {
+            ACTION_CHAT_POST
+        };
+        if !allows(&agent, action) {
             return Err(format!(
-                "agent {} is not allowed to {ACTION_CHAT_POST}",
+                "agent {} is not allowed to {action}",
                 entry.agent_id
             ));
         }
-        self.probe_reply_postable(ctx, run_id, entry).await?;
         let name = if agent.display_name.is_empty() {
             agent.agent_id.as_str()
         } else {
             agent.display_name.as_str()
         };
         let text = format!("⚠ {name} failed: {}", failure_excerpt(reason));
+        if page_run {
+            return self
+                .page_reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    &[ReplyBlock {
+                        kind: REPLY_KIND_PARAGRAPH.into(),
+                        text,
+                        lang: None,
+                    }],
+                )
+                .await;
+        }
+        self.probe_reply_postable(ctx, run_id, entry).await?;
         Ok(Msg {
             target: self.chat.clone(),
             payload: chat_encode_msg(&ChatMsg::PostMessage {
@@ -605,7 +753,7 @@ impl RunsModule {
     /// hand a VALIDATED response its follow-ups: the chat reply (authored as
     /// the agent, threaded like its anchor) and the task writes — all drained
     /// in this same delivery block (P2, P6).
-    fn emit_response(
+    async fn emit_response(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
@@ -613,16 +761,26 @@ impl RunsModule {
         response: AgentResponse,
     ) {
         if !response.reply_blocks.is_empty() {
-            ctx.emit_msg(Msg {
-                target: self.chat.clone(),
-                payload: chat_encode_msg(&ChatMsg::PostMessage {
-                    channel_id: entry.channel_id.clone(),
-                    message_id: reply_message_id(run_id),
-                    blocks: to_chat_blocks(&response.reply_blocks),
-                    thread: entry.thread_root,
-                    as_agent: Some(entry.agent_id.clone()),
-                }),
-            });
+            if page_thread_id(&entry.channel_id).is_some() {
+                match self
+                    .page_reply_msg(&*ctx, run_id, entry, &response.reply_blocks)
+                    .await
+                {
+                    Ok(msg) => ctx.emit_msg(msg),
+                    Err(why) => self.note(ctx, format!("run {run_id} page reply skipped: {why}")),
+                }
+            } else {
+                ctx.emit_msg(Msg {
+                    target: self.chat.clone(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: entry.channel_id.clone(),
+                        message_id: reply_message_id(run_id),
+                        blocks: to_chat_blocks(&response.reply_blocks),
+                        thread: entry.thread_root,
+                        as_agent: Some(entry.agent_id.clone()),
+                    }),
+                });
+            }
         }
         for action in response.actions {
             let payload = match action {

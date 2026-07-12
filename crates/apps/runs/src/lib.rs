@@ -190,6 +190,26 @@ pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
     )
 }
 
+/// Internal pending-state coordinate for a Pages comment thread. The `runs:`
+/// chat namespace is reserved to this module, and Runs never mints chat
+/// channels below this sub-prefix, so the existing snapshot shape can carry
+/// the source discriminator without colliding with a real chat run.
+const PAGE_CHANNEL_PREFIX: &str = "runs:pages:";
+
+fn page_channel_id(thread_id: &str) -> String {
+    format!("{PAGE_CHANNEL_PREFIX}{thread_id}")
+}
+
+fn page_thread_id(channel_id: &str) -> Option<&str> {
+    channel_id.strip_prefix(PAGE_CHANNEL_PREFIX)
+}
+
+pub fn page_run_id_for(thread_id: &str, ordinal: u64, agent_id: &str) -> String {
+    format!(
+        "page{RUN_KEY_SEPARATOR}{thread_id}{RUN_KEY_SEPARATOR}{ordinal}{RUN_KEY_SEPARATOR}{agent_id}"
+    )
+}
+
 /// the turn-claim key for a job-backed run.
 pub fn job_run_id_for(job_id: &str, agent_id: &str, claim_height: u64) -> String {
     format!(
@@ -295,7 +315,10 @@ impl PendingState {
     fn run_id(&self) -> String {
         match &self.job_id {
             Some(job_id) => job_run_id_for(job_id, &self.agent_id, self.job_claim_height),
-            None => run_id_for(&self.channel_id, self.anchor_seq, &self.agent_id),
+            None => match page_thread_id(&self.channel_id) {
+                Some(thread_id) => page_run_id_for(thread_id, self.anchor_seq, &self.agent_id),
+                None => run_id_for(&self.channel_id, self.anchor_seq, &self.agent_id),
+            },
         }
     }
 }

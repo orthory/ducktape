@@ -2,14 +2,14 @@
 //!
 //! the tagging plane is the network's cross-module engagement router: content
 //! in module A names an entity of module B, and B gets an engagement event.
-//! a subscriber module registers interest in a source scope
-//! ([`TaggingMsg::Subscribe`]); a content module reports each content item as
-//! a [`TagEvent`]; the plane fans one [`EngagementEvent`] out to every
-//! subscriber of that scope as a follow-up `Msg`.
+//! a content module reports each content item as a [`TagEvent`]; the plane
+//! routes it to every explicitly named, genesis-configured entity-owner
+//! module. A subscriber may also register interest in a source scope ([`TaggingMsg::Subscribe`]) to
+//! receive untagged content for assignment/all/round-robin policies.
 //!
 //! the plane is a ROUTER ONLY. it holds no engagement policy — whether and
 //! how a delivered event engages an entity (mention-gating, assignment,
-//! round-robin) is the subscriber module's business. and it is 100%
+//! round-robin) is the recipient module's business. and it is 100%
 //! module-agnostic: content modules translate their own author and mention
 //! shapes into this crate's vocabulary at their edge; the plane never decodes
 //! a content module's event payloads.
@@ -98,8 +98,8 @@ pub enum TaggingMsg {
     Tag(TagEvent),
 }
 
-/// the delivery a subscriber module receives as a follow-up `Msg` from the
-/// plane, in the same block as the content. `source` is the content module
+/// the delivery a tag-owner or scope-subscriber receives as a follow-up `Msg`
+/// from the plane, in the same block as the content. `source` is the content module
 /// the plane verified by origin; the rest is the [`TagEvent`] verbatim.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EngagementEvent {

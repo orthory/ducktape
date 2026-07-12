@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
+tagging = { workspace = true }
 serde = { workspace = true }
 indexer = { workspace = true }
 # kernel state-sync platform surface: the shared qmdb serve/wire helpers.
