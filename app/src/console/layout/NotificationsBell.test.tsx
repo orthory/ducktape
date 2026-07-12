@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NotifyItem } from "../../domain/notify-client";
 
 const notifyMocks = vi.hoisted(() => ({
-  recent: vi.fn(async (): Promise<unknown[]> => []),
+  recent: vi.fn(async (): Promise<unknown> => ({ unread: 0, items: [] })),
   onItem: vi.fn(async (_cb: (entry: unknown) => void) => () => {}),
   onUnread: vi.fn(async (_cb: (unread: number) => void) => () => {}),
   markSeen: vi.fn(async () => {}),
@@ -56,7 +56,7 @@ describe("NotificationsBell", () => {
 
   it("shows the unread badge, marks seen on open, and navigates on item click", async () => {
     markTauri();
-    notifyMocks.recent.mockResolvedValueOnce([item()]);
+    notifyMocks.recent.mockResolvedValueOnce({ unread: 0, items: [item()] });
     let pushUnread: (unread: number) => void = () => {};
     notifyMocks.onUnread.mockImplementation(async (cb) => {
       pushUnread = cb;
@@ -81,12 +81,20 @@ describe("NotificationsBell", () => {
 
   it("falls back to the category screen without a channel, and reroutes forge-item channels", async () => {
     markTauri();
-    notifyMocks.recent.mockResolvedValueOnce([
-      item({ title: "Run done", category: "run", channelId: null }),
-      item({ title: "PR reply", category: "reply", channelId: "forge:repo:4" }),
-    ]);
+    notifyMocks.recent.mockResolvedValueOnce({
+      unread: 2,
+      items: [
+        item({ title: "Run done", category: "run", channelId: null }),
+        item({ title: "PR reply", category: "reply", channelId: "forge:repo:4" }),
+      ],
+    });
 
     const { setScreen, selectChannel } = renderBell();
+    // The boot snapshot carries unread — the badge must show it even though
+    // no unread event ever fired (the engine badges before the webview mounts).
+    await waitFor(() =>
+      expect(screen.getByLabelText("Notifications")).toHaveTextContent("2"),
+    );
     fireEvent.click(screen.getByLabelText("Notifications"));
 
     fireEvent.click(await screen.findByText("Run done"));

@@ -160,18 +160,21 @@ describe("notify client", () => {
     expect(cb).not.toHaveBeenCalled();
   });
 
-  it("recent returns the command payload and [] on failure", async () => {
+  it("recent returns the snapshot and an empty one on failure", async () => {
     markTauri();
-    invokeMock.mockResolvedValueOnce([
-      { category: "mention", title: "t", body: "b", channelId: null, at: 1 },
-    ]);
+    invokeMock.mockResolvedValueOnce({
+      unread: 3,
+      items: [{ category: "mention", title: "t", body: "b", channelId: null, at: 1 }],
+    });
 
-    await expect(recent()).resolves.toHaveLength(1);
+    const snapshot = await recent();
+    expect(snapshot.unread).toBe(3);
+    expect(snapshot.items).toHaveLength(1);
     expect(invokeMock).toHaveBeenCalledWith("notify_recent");
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     invokeMock.mockRejectedValueOnce(new Error("nope"));
-    await expect(recent()).resolves.toEqual([]);
+    await expect(recent()).resolves.toEqual({ unread: 0, items: [] });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("recent"), expect.any(Error));
   });
 

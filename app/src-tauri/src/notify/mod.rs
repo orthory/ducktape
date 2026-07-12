@@ -14,11 +14,11 @@ pub mod present;
 pub mod stream;
 pub mod state;
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tauri::Manager as _;
 
+use engine::BellState;
 use state::StoredNotification;
 
 /// Webview-pushed runtime config, shared with the stream task.
@@ -45,9 +45,9 @@ pub struct NotifyHandles {
     /// is held for the graceful [`stream::StreamHandle::shutdown`] at app exit
     /// rather than for keep-alive.
     pub stream: stream::StreamHandle,
-    /// The engine's recent ring (newest first) read by [`notify_recent`];
-    /// the engine is the only writer.
-    pub recent: Arc<Mutex<VecDeque<StoredNotification>>>,
+    /// The engine's bell snapshot (unread + recent ring) read by
+    /// [`notify_recent`]; the engine is the only writer.
+    pub bell: Arc<Mutex<BellState>>,
 }
 
 /// Build the engine over the real [`present::AppSink`], spawn the stream loop,
@@ -59,8 +59,8 @@ pub fn init<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
         .app_data_dir()?
         .join("notify")
         .join("state.json");
-    let recent = Arc::new(Mutex::new(VecDeque::new()));
-    let engine = engine::Engine::new(present::AppSink(app.clone()), state_path, recent.clone());
+    let bell = Arc::new(Mutex::new(BellState::default()));
+    let engine = engine::Engine::new(present::AppSink(app.clone()), state_path, bell.clone());
 
     let (cmds, cmds_rx) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
@@ -93,7 +93,7 @@ pub fn init<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
         shared,
         cmds,
         stream,
-        recent,
+        bell,
     });
     Ok(())
 }
@@ -126,18 +126,25 @@ pub fn notify_mark_seen(state: tauri::State<'_, NotifyHandles>) -> Result<(), St
     Ok(())
 }
 
-/// Recent presented notifications, newest first, for the in-app bell dropdown.
+/// The bell's boot snapshot: the unread count plus recent presented
+/// notifications, newest first. `unread` rides along because the engine's
+/// boot-time badge event fires before the webview subscribes.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifySnapshot {
+    pub unread: u32,
+    pub items: Vec<StoredNotification>,
+}
+
 #[tauri::command]
 pub fn notify_recent(
     state: tauri::State<'_, NotifyHandles>,
-) -> Result<Vec<StoredNotification>, String> {
-    Ok(state
-        .recent
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .cloned()
-        .collect())
+) -> Result<NotifySnapshot, String> {
+    let bell = state.bell.lock().unwrap_or_else(PoisonError::into_inner);
+    Ok(NotifySnapshot {
+        unread: bell.unread,
+        items: bell.items.iter().cloned().collect(),
+    })
 }
 
 /// Commands crossing from tauri command handlers into the stream task.

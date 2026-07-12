@@ -48,8 +48,12 @@ export function NotificationsBell() {
     if (!isTauri()) return;
     let cancelled = false;
     const unlistens: Array<() => void> = [];
-    void notifyClient.recent().then((initial) => {
-      if (!cancelled) setItems(initial);
+    // The snapshot carries unread too: the engine's boot-time badge event
+    // fires before this listener attaches, so events alone would miss it.
+    void notifyClient.recent().then((snapshot) => {
+      if (cancelled) return;
+      setItems(snapshot.items);
+      setUnread(snapshot.unread);
     });
     void notifyClient
       .onItem((item) => setItems((previous) => [item, ...previous].slice(0, RECENT_CAP)))

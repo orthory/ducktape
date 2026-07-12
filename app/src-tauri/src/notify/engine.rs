@@ -23,6 +23,17 @@ use super::{
 /// How many presented notifications the bell dropdown keeps.
 pub const RECENT_CAP: usize = 50;
 
+/// The engine's bell-facing state, shared with [`super::NotifyHandles`] so the
+/// `notify_recent` command can snapshot it without actor plumbing; the engine
+/// is the only writer. `unread` rides along because the boot-time badge event
+/// fires before the webview subscribes — the bell must be able to ask.
+#[derive(Debug, Default)]
+pub struct BellState {
+    pub unread: u32,
+    /// Newest first, capped at [`RECENT_CAP`].
+    pub items: VecDeque<StoredNotification>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Frame {
     Event {
@@ -55,22 +66,19 @@ pub struct Engine<S: Sink> {
     /// IN-MEMORY ONLY, never persisted. These cursors resume a live stream only
     /// during a transient reconnect in the current app session.
     cursors: BTreeMap<String, String>,
-    /// Recent presented notifications, newest first, capped at [`RECENT_CAP`].
-    /// Shared with [`super::NotifyHandles`] so the `notify_recent` command can
-    /// read it without actor plumbing; the engine is the only writer.
-    recent: Arc<Mutex<VecDeque<StoredNotification>>>,
+    /// The bell's shared snapshot — see [`BellState`].
+    bell: Arc<Mutex<BellState>>,
 }
 
 impl<S: Sink> Engine<S> {
-    pub fn new(
-        sink: S,
-        state_path: PathBuf,
-        recent: Arc<Mutex<VecDeque<StoredNotification>>>,
-    ) -> Self {
+    pub fn new(sink: S, state_path: PathBuf, bell: Arc<Mutex<BellState>>) -> Self {
         let loaded = state::load(&state_path);
         sink.badge(loaded.unread);
-        *recent.lock().unwrap_or_else(PoisonError::into_inner) =
-            loaded.recent.into_iter().collect();
+        {
+            let mut bell = bell.lock().unwrap_or_else(PoisonError::into_inner);
+            bell.unread = loaded.unread;
+            bell.items = loaded.recent.into_iter().collect();
+        }
 
         Self {
             sink,
@@ -78,7 +86,7 @@ impl<S: Sink> Engine<S> {
             state_path,
             unread: loaded.unread,
             cursors: BTreeMap::new(),
-            recent,
+            bell,
         }
     }
 
@@ -121,14 +129,14 @@ impl<S: Sink> Engine<S> {
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| duration.as_millis() as u64),
                 };
+                self.unread = self.unread.saturating_add(1);
                 {
-                    let mut recent =
-                        self.recent.lock().unwrap_or_else(PoisonError::into_inner);
-                    recent.push_front(stored.clone());
-                    recent.truncate(RECENT_CAP);
+                    let mut bell = self.bell.lock().unwrap_or_else(PoisonError::into_inner);
+                    bell.items.push_front(stored.clone());
+                    bell.items.truncate(RECENT_CAP);
+                    bell.unread = self.unread;
                 }
                 self.sink.item(&stored);
-                self.unread = self.unread.saturating_add(1);
                 self.sink.badge(self.unread);
                 // Unconditional: even on a saturated count the ring gained an item.
                 self.persist();
@@ -141,6 +149,10 @@ impl<S: Sink> Engine<S> {
 
     pub fn mark_seen(&mut self) {
         self.unread = 0;
+        self.bell
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unread = 0;
         self.sink.badge(0);
         self.persist();
     }
@@ -160,9 +172,10 @@ impl<S: Sink> Engine<S> {
 
     fn persist(&self) {
         let recent = self
-            .recent
+            .bell
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .items
             .iter()
             .cloned()
             .collect();
@@ -621,11 +634,11 @@ mod tests {
     #[test]
     fn recent_ring_is_newest_first_capped_and_persisted() {
         let path = TestStatePath::new();
-        let recent = Arc::new(Mutex::new(VecDeque::new()));
+        let bell = Arc::new(Mutex::new(BellState::default()));
         let mut engine = Engine::new(
             CaptureSink::default(),
             path.path().to_path_buf(),
-            recent.clone(),
+            bell.clone(),
         );
         let config = config();
         for i in 0..(RECENT_CAP + 5) {
@@ -637,28 +650,35 @@ mod tests {
         }
 
         {
-            let ring = recent.lock().unwrap();
-            assert_eq!(ring.len(), RECENT_CAP);
+            let snapshot = bell.lock().unwrap();
+            assert_eq!(snapshot.items.len(), RECENT_CAP);
+            assert_eq!(snapshot.unread as usize, RECENT_CAP + 5);
             // Newest first: the LAST fed frame sits at the front.
             assert!(
-                ring[0].body.contains(&format!("msg {}", RECENT_CAP + 4)),
+                snapshot.items[0].body.contains(&format!("msg {}", RECENT_CAP + 4)),
                 "front should be the newest item, got body {:?}",
-                ring[0].body
+                snapshot.items[0].body
             );
-            assert_eq!(ring[0].category, Category::Mention);
-            assert_eq!(ring[0].channel_id.as_deref(), Some("general"));
-            assert!(ring[0].at > 0);
+            assert_eq!(snapshot.items[0].category, Category::Mention);
+            assert_eq!(snapshot.items[0].channel_id.as_deref(), Some("general"));
+            assert!(snapshot.items[0].at > 0);
         }
 
-        // A fresh engine over the same state file reloads the ring.
-        let reloaded = Arc::new(Mutex::new(VecDeque::new()));
+        // Opening the bell zeroes unread but keeps the ring.
+        engine.mark_seen();
+        assert_eq!(bell.lock().unwrap().unread, 0);
+        assert_eq!(bell.lock().unwrap().items.len(), RECENT_CAP);
+
+        // A fresh engine over the same state file reloads the whole snapshot.
+        let reloaded = Arc::new(Mutex::new(BellState::default()));
         let _restored = Engine::new(
             CaptureSink::default(),
             path.path().to_path_buf(),
             reloaded.clone(),
         );
-        let ring = reloaded.lock().unwrap();
-        assert_eq!(ring.len(), RECENT_CAP);
-        assert!(ring[0].body.contains(&format!("msg {}", RECENT_CAP + 4)));
+        let snapshot = reloaded.lock().unwrap();
+        assert_eq!(snapshot.items.len(), RECENT_CAP);
+        assert_eq!(snapshot.unread, 0);
+        assert!(snapshot.items[0].body.contains(&format!("msg {}", RECENT_CAP + 4)));
     }
 }
