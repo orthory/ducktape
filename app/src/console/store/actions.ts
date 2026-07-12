@@ -1616,15 +1616,32 @@ export function createActions({
     },
 
     // Identity is the only durable display-name authority. The module derives
-    // the account from the authenticated node and rejects an unbound origin.
+    // the account from the authenticated node and rejects an unbound origin —
+    // so refuse an unbound node up front (the op could never land; same gate
+    // as setDuckHandle below). `author` is the one optimistic slice the
+    // completion refresh cannot restore (nothing re-derives it from the chain
+    // once it left the boot placeholder), so a failed submit rolls it back
+    // here instead of leaving a phantom name the chain rejected.
     setDisplayName: (name) => {
       const current = getState();
-      const origin = current.author;
-      submitTracked(
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
+      const accountId = nodeKey
+        ? current.nodeUsers[nodeKey]?.accountId
+        : undefined;
+      if (!accountId) {
+        fail("bind this node to an identity account before setting a display name");
+        return;
+      }
+      const previous = current.author;
+      void submitTracked(
         opKey.accountName(),
-        (live) => identityClient.setAccountName(live, { displayName: name, origin }),
+        (live) =>
+          identityClient.setAccountName(live, { displayName: name, origin: previous }),
         () => ({ author: name }),
-      );
+      ).then((landed) => {
+        // un-paint only if no newer write replaced the name mid-flight.
+        if (!landed && getState().author === name) patch({ author: previous });
+      });
     },
 
     setDuckHandle: (handle) => {

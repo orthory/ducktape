@@ -18,6 +18,7 @@ import {
 } from "../../domain/transport";
 import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
+import { DEFAULT_AUTHOR } from "./state";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import { makeTransportStub } from "../../test/transport-stub";
@@ -1581,6 +1582,64 @@ describe("submitTracked lifecycle", () => {
       expect(capturedState!.ops[key].phase).toBe("failed");
       expect(capturedState!.ops[key].error).toContain("members-only");
     });
+  });
+});
+
+// ── Rename: rejected op must not leave a phantom author ─
+//
+// `author` is the one optimistically-patched slice that is NOT chain-derived:
+// the completion/rollback refresh re-reads identity into `authorNames`, but
+// nothing re-derives `author` from it once it left the boot placeholder. A
+// rejected SetAccountName therefore needs its own rollback, and an unbound
+// node (whose rename the identity module rejects unconditionally) must be
+// refused up front instead of painting a name that can never land.
+
+describe("setDisplayName on the identity module", () => {
+  it("rolls the optimistic author back when the rename op is rejected", async () => {
+    // JESS_USER binds node key "aa" — the fake node reports it as self.
+    const { transport } = makeFakeNode({ users: [JESS_USER], publicKey: "aa" });
+    let reject!: (err: Error) => void;
+    vi.mocked(transport.submit).mockImplementation(
+      () => new Promise((_resolve, rej) => (reject = rej)),
+    );
+    renderConsole(transport);
+    // hydration adopted the chain's committed name for our own node.
+    await waitFor(() => expect(capturedState!.author).toBe("Jess K"));
+
+    await act(async () => {
+      capturedActions!.setDisplayName("오소리");
+    });
+
+    // preconfirmed render: the new name paints before the node answers.
+    expect(capturedState!.author).toBe("오소리");
+    expect(capturedState!.ops["account/name/self"].phase).toBe("pending");
+
+    await act(async () => {
+      reject(new Error("identity: origin node is not bound to an account"));
+    });
+
+    // the rejection un-paints the phantom name and keeps the why.
+    await waitFor(() => {
+      expect(capturedState!.ops["account/name/self"].phase).toBe("failed");
+      expect(capturedState!.author).toBe("Jess K");
+    });
+  });
+
+  it("refuses the rename up front while this node is unbound", async () => {
+    const { transport } = makeFakeNode(); // no accounts, no publicKey → unbound
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("connected").textContent).toBe("true"),
+    );
+
+    await act(async () => {
+      capturedActions!.setDisplayName("오소리");
+    });
+
+    expect(capturedState!.author).toBe(DEFAULT_AUTHOR);
+    expect(capturedState!.error).toContain("bind this node");
+    expect(capturedState!.ops["account/name/self"]).toBeUndefined();
+    expect(transport.submit).not.toHaveBeenCalled();
   });
 });
 
