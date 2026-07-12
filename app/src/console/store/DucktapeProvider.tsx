@@ -747,8 +747,9 @@ export function DucktapeProvider({
             fn: (prev) => {
               const patch: Partial<typeof prev> = {};
               if (height > (prev.lastBlock ?? -1)) patch.lastBlock = height;
-              // Patch only on real movement: an idle chain heartbeats every 3s
-              // and an unconditional new status object would re-render each beat.
+              // Patch only on real movement: heartbeats arrive per block on a
+              // moving chain (nop fillers included) and every 3s on a stalled
+              // one; an unconditional new status object would re-render each beat.
               if (
                 prev.status &&
                 (prev.status.height !== height || prev.status.appHash !== appHash)

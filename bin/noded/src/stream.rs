@@ -13,6 +13,9 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use crate::{NodeCommand, NodeHandle};
 
+/// the TIMER beat: the liveness floor while no blocks commit, and (×2.5) the
+/// client watchdog's timeout basis. a heartbeat frame also rides every block
+/// wake, so on a moving chain the tip reaches clients per block, not per tick.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000;
 pub const STREAM_CATCHUP_BUDGET: usize = 256;
 /// per-connection subscription ceiling. the ws surface is unauthenticated
@@ -176,8 +179,9 @@ pub enum RunStream {
 
 #[derive(Clone)]
 pub struct StreamHub {
-    /// block wakeups: subscribers re-scan on any commit; the payload they'd
-    /// want (height/app-hash) lives in `tip`, which the heartbeat reads.
+    /// block wakeups: subscribers re-scan on any commit and push the fresh
+    /// tip (height/app-hash) as a heartbeat frame — `publish_block` primes
+    /// `tip` before broadcasting, so the wake always reads its own block.
     blocks: broadcast::Sender<()>,
     tip: Arc<RwLock<Option<(u64, String)>>>,
     logs: LogRing,
@@ -584,6 +588,12 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                 match note {
                     Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
+                }
+                // the tip rides every block wake — nop fillers included, which
+                // feed no topic — so a console's height ticks per block instead
+                // of waiting out the timer beat below (the idle/stall floor).
+                if !send_frame(&mut socket, heartbeat_frame(&hub)).await {
+                    return;
                 }
                 if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
                     return;
