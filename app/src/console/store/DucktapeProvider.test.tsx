@@ -1255,7 +1255,7 @@ describe("desktop notify config push", () => {
     expect(notifyMocks.configure.mock.calls.length).toBe(calls);
   });
 
-  it("tracks window focus and marks seen on the focus edge", async () => {
+  it("tracks window focus in the config without marking seen", async () => {
     markTauri();
     const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
@@ -1273,7 +1273,8 @@ describe("desktop notify config push", () => {
       window.dispatchEvent(new Event("focus"));
     });
     await waitFor(() => expect(lastConfig()).toMatchObject({ mainWindowFocused: true }));
-    expect(notifyMocks.markSeen).toHaveBeenCalled();
+    // Seen-marking belongs to the bell dropdown, not the focus edge.
+    expect(notifyMocks.markSeen).not.toHaveBeenCalled();
   });
 });
 
