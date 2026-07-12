@@ -78,7 +78,7 @@ mod imp {
 
 // ── macOS implementation (needs-mac-verify: not compiled on the Linux CI host) ──
 //
-// The `security-framework` v3 API surface below (ItemAddOptions setters,
+// The `security-framework` v3 API surface below (PasswordOptions setters,
 // SecAccessControl::create_with_protection, the passwords helpers) is confirmed
 // against the pinned crate version ON THE MAC during live QA. If the safe
 // `set_access_control` setter is absent in the pinned version, drop to
@@ -90,14 +90,13 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
-    use security_framework::item::{
-        ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions,
-    };
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    use security_framework::passwords::{set_generic_password_options, PasswordOptions};
 
     // kSecAccessControlBiometryCurrentSet = 1 << 3. Enrolling behind this flag
     // means REMOVING a fingerprint invalidates the item — the passphrase is
     // never recoverable without the current biometric set (or the 24-word phrase).
-    const BIOMETRY_CURRENT_SET: u32 = 1 << 3;
+    const BIOMETRY_CURRENT_SET: usize = 1 << 3;
 
     /// A biometric authenticator is usable iff we can build a
     /// biometry-current-set access control; that only succeeds on a platform
@@ -128,11 +127,10 @@ mod imp {
             BIOMETRY_CURRENT_SET,
         )
         .map_err(|e| format!("access-control: {e}"))?;
-        ItemAddOptions::new(ItemAddValue::Data(passphrase.into_bytes()))
-            .set_service(super::KEYCHAIN_SERVICE)
-            .set_account(super::KEYCHAIN_ACCOUNT)
-            .set_access_control(ac)
-            .add()
+        let mut options =
+            PasswordOptions::new_generic_password(super::KEYCHAIN_SERVICE, super::KEYCHAIN_ACCOUNT);
+        options.set_access_control(ac);
+        set_generic_password_options(passphrase.as_bytes(), options)
             .map_err(|e| format!("keychain add: {e}"))?;
         Ok(())
     }
@@ -163,8 +161,8 @@ mod imp {
                     super::KEYCHAIN_ACCOUNT,
                 )
                 .map_err(|_| "touchid-unavailable".to_string())?;
-                let pass = String::from_utf8(bytes)
-                    .map_err(|_| "corrupt keychain item".to_string())?;
+                let pass =
+                    String::from_utf8(bytes).map_err(|_| "corrupt keychain item".to_string())?;
                 crate::user_identity::unlock_with_secret(
                     &app,
                     crate::user_identity::SecretString::new(pass),
