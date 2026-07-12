@@ -1124,28 +1124,33 @@ async fn caller_ws_pump<S>(
     }
 }
 
-/// Map a typed failure onto a wire frame, redacting `Unavailable` detail
-/// (which may carry a workspace path / loopback port / library diagnostic).
-/// Drop any `Domain=` attribute from a Set-Cookie value so gateway cookies
-/// stay host-only. Chromium's handling of the synthetic `.duck` TLD is not a
+/// Drop any `Domain` attribute from a Set-Cookie value so gateway cookies stay
+/// host-only. Chromium's handling of the synthetic `.duck` TLD is not a
 /// boundary we rely on: without this, a publisher could try `Domain=.duck` to
 /// plant a cookie visible on every account's origins.
+///
+/// Attributes are `name=value` pairs split on `;` (RFC 6265 §5.2); the name is
+/// everything before the first `=`, whitespace-trimmed and case-insensitive —
+/// so `Domain=`, `domain =`, and ` DOMAIN = x ` are all caught. The first
+/// `;`-segment is the cookie's own `name=value` and is never an attribute, so
+/// it is kept verbatim (its value may itself contain `domain=`).
 fn scrub_cookie_domain(value: &str) -> String {
     value
         .split(';')
         .enumerate()
         .filter(|(index, attribute)| {
-            *index == 0
-                || !attribute
-                    .trim_start()
-                    .get(..7)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("domain="))
+            *index == 0 || {
+                let name = attribute.split('=').next().unwrap_or("").trim();
+                !name.eq_ignore_ascii_case("domain")
+            }
         })
         .map(|(_, attribute)| attribute)
         .collect::<Vec<_>>()
         .join(";")
 }
 
+/// Map a typed failure onto a wire frame, redacting `Unavailable` detail
+/// (which may carry a workspace path / loopback port / library diagnostic).
 fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
     use gateway::FailureKind;
     let (kind, mut detail) = match failure {
@@ -1304,6 +1309,13 @@ mod tests {
             scrub_cookie_domain("s=1; domain=other.duck"),
             "s=1"
         );
+        // Whitespace and casing around the attribute name must not sneak a
+        // Domain through — a browser trims these and honors the attribute.
+        assert_eq!(
+            scrub_cookie_domain("s=1; Domain =evil.duck; Path=/"),
+            "s=1; Path=/"
+        );
+        assert_eq!(scrub_cookie_domain("s=1;  DOMAIN = evil.duck "), "s=1");
         // Everything else survives untouched, and the cookie's own value —
         // which may legitimately contain "domain=" — is never treated as an
         // attribute.
