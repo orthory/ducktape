@@ -290,6 +290,11 @@ export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
       for (const u of users) {
         const accountId = chatClient.keyHex(u.account_id);
         accountKeys[accountId] = u.member_keys;
+        // A message AUTHOR is a node key, but a mention MARK carries the account
+        // id (mention.ts resolves a handle to `{ user: keyBytes(accountId) }`).
+        // Both go through `authorName`, so the name has to be reachable under
+        // both keys — keyed by node alone, every user mention rendered as hex.
+        if (u.display_name) authorNames[accountId] = u.display_name;
         for (const node of u.nodes) {
           const nodeHex = chatClient.keyHex(node);
           nodeUsers[nodeHex] = { accountId, name: u.display_name };

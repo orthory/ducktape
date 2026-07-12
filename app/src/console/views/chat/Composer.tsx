@@ -7,11 +7,12 @@
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
+import type { PageMeta } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import type { IconName } from "../../components/Icon";
 import { ConsoleContext } from "../../store/context";
 import { HoverButton } from "./HoverButton";
-import { MentionMenu } from "./MentionMenu";
+import { MentionMenu, PageMenu } from "./MentionMenu";
 import {
   insertMention,
   mentionCandidateToken,
@@ -19,10 +20,12 @@ import {
   mentionCandidatesAll,
   mentionTokenAt,
 } from "./mention";
+import { insertPageRef, pageRefCandidates, pageRefTokenAt } from "./page-ref";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
 const EMPTY_NODE_USERS: Record<string, { accountId: string; name: string | null }> = {};
+const EMPTY_PAGES: PageMeta[] = [];
 
 function FmtButton({
   label,
@@ -106,13 +109,39 @@ export function Composer({
         : [],
     [agents, mentionDismissedAt, mentionQuery, mentionStart, users],
   );
-  const menuOpen = menuCandidates.length > 0;
+
+  // ── `[[` page-ref typeahead ──
+  // The same shape as the @menu, over state.pages (hydrated at boot, so the
+  // list needs no fetch). Its own token detector: a page title has SPACES in
+  // it, which would close a mention token.
+  const pages = store?.state.pages ?? EMPTY_PAGES;
+  const [pageIndex, setPageIndex] = useState(0);
+  const [pageDismissedAt, setPageDismissedAt] = useState<number | null>(null);
+
+  const pageToken = pageRefTokenAt(value, caret);
+  const pageStart = pageToken?.start ?? null;
+  const pageQuery = pageToken?.query ?? "";
+  const pageMatches = useMemo(
+    () =>
+      pageStart !== null && pageStart !== pageDismissedAt
+        ? pageRefCandidates(pages, pageQuery)
+        : [],
+    [pageDismissedAt, pageQuery, pageStart, pages],
+  );
+
+  // Both tokens can be live at once ("@[[" opens each) — the `[[`, being the
+  // inner and more recently opened one, owns the keys.
+  const pageOpen = pageMatches.length > 0;
+  const menuOpen = !pageOpen && menuCandidates.length > 0;
 
   const handleChange = (next: string, nextCaret: number) => {
     setCaret(nextCaret);
     const nextToken = mentionTokenAt(next, nextCaret);
     if (nextToken) setMentionIndex(0);
     if (!nextToken || nextToken.start !== mentionDismissedAt) setMentionDismissedAt(null);
+    const nextPageToken = pageRefTokenAt(next, nextCaret);
+    if (nextPageToken) setPageIndex(0);
+    if (!nextPageToken || nextPageToken.start !== pageDismissedAt) setPageDismissedAt(null);
     onChange(next);
   };
 
@@ -125,6 +154,36 @@ export function Composer({
     setMentionIndex(0);
     onChange(next.text);
   };
+
+  const pickPage = (pageId: string) => {
+    if (!pageToken) return;
+    const el = ref.current;
+    const next = insertPageRef(value, pageToken, el?.selectionStart ?? caret, pageId);
+    pendingSelection.current = [next.caret, next.caret];
+    setCaret(next.caret);
+    setPageIndex(0);
+    onChange(next.text);
+  };
+
+  // Whichever menu is up owns the navigation keys — one contract, so Enter/Tab
+  // pick (never send) and Escape dismisses in both.
+  const active = pageOpen
+    ? {
+        count: pageMatches.length,
+        index: Math.min(pageIndex, pageMatches.length - 1),
+        step: (next: number) => setPageIndex(next),
+        pick: (i: number) => pickPage(pageMatches[i]!.id),
+        dismiss: () => setPageDismissedAt(pageStart),
+      }
+    : menuOpen
+      ? {
+          count: menuCandidates.length,
+          index: Math.min(mentionIndex, menuCandidates.length - 1),
+          step: (next: number) => setMentionIndex(next),
+          pick: (i: number) => pickMention(mentionCandidateToken(menuCandidates[i]!)),
+          dismiss: () => setMentionDismissedAt(mentionStart),
+        }
+      : null;
 
   // Auto-grow: reset to `auto` first so shrinking (deleting text) is picked
   // up too, then clamp to `maxHeight` — past that the textarea scrolls
@@ -205,24 +264,22 @@ export function Composer({
   const canSend = value.trim().length > 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    // An open mention menu owns the navigation keys; Enter/Tab pick instead of
+    // An open typeahead owns the navigation keys; Enter/Tab pick instead of
     // sending. IME guard as below — committing a candidate must not pick.
-    if (menuOpen && !event.nativeEvent.isComposing) {
+    if (active && !event.nativeEvent.isComposing) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
-        setMentionIndex((i) => (i + 1) % menuCandidates.length);
+        active.step((active.index + 1) % active.count);
         return;
       }
       if (event.key === "ArrowUp") {
         event.preventDefault();
-        setMentionIndex((i) => (i - 1 + menuCandidates.length) % menuCandidates.length);
+        active.step((active.index - 1 + active.count) % active.count);
         return;
       }
       if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
-        pickMention(
-          mentionCandidateToken(menuCandidates[Math.min(mentionIndex, menuCandidates.length - 1)]!),
-        );
+        active.pick(active.index);
         return;
       }
       if (event.key === "Escape") {
@@ -230,7 +287,7 @@ export function Composer({
         // stopPropagation: the ThreadPanel closes on a bubbled Escape — with
         // the menu open, Escape means "dismiss the menu", not "close the thread".
         event.stopPropagation();
-        setMentionDismissedAt(mentionToken?.start ?? null);
+        active.dismiss();
         return;
       }
     }
@@ -267,10 +324,13 @@ export function Composer({
         }}
       >
         <div style={{ position: "relative", minWidth: 0 }}>
+          {pageOpen && (
+            <PageMenu pages={pageMatches} activeIndex={active!.index} onPick={pickPage} />
+          )}
           {menuOpen && (
             <MentionMenu
               candidates={menuCandidates}
-              activeIndex={Math.min(mentionIndex, menuCandidates.length - 1)}
+              activeIndex={active!.index}
               onPick={pickMention}
             />
           )}
