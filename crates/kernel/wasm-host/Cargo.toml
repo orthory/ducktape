@@ -1,0 +1,18 @@
+# wasm-host — the frozen-substrate wasm runtime. Loads a `ducktape:module`
+# component and presents it to the host as a native `sdk::Module`, so a wasm
+# module drops into the existing registry and dispatches identically to native.
+# Design-B: the guest is pure logic; durable state is host-owned here, so root()
+# is host-computed and a code swap keeps the store (the live-update primitive).
+[package]
+name = "wasm-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+wasmtime = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

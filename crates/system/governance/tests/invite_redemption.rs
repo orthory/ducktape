@@ -65,7 +65,10 @@ fn gov_host() -> Host {
     valset.insert(key_bytes(&keypair(2)));
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "upgrade").with_invite_binding(BINDING)),
+        Box::new(
+            Governance::new("governance", "valset", "upgrade", "identity")
+                .with_invite_binding(BINDING),
+        ),
     ])
     .expect("genesis")
 }
@@ -191,8 +194,8 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
         }) else {
             panic!("governance must advertise snapshot bytes");
         };
-        let mut rebuilt =
-            Governance::new("governance", "valset", "upgrade").with_invite_binding(BINDING);
+        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity")
+            .with_invite_binding(BINDING);
         rebuilt.install(&bytes, expected_root).expect("install");
         assert_eq!(rebuilt.root(), expected_root, "round-trip root");
     });
@@ -250,7 +253,12 @@ fn a_network_without_a_binding_refuses_redemption() {
         let mut host = Host::genesis(vec![
             Box::new(valset),
             // no with_invite_binding — the dev-seed shape.
-            Box::new(Governance::new("governance", "valset", "upgrade")),
+            Box::new(Governance::new(
+                "governance",
+                "valset",
+                "upgrade",
+                "identity",
+            )),
         ])
         .expect("genesis");
 

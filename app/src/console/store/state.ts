@@ -4,7 +4,9 @@
 // thread panel).
 
 import type { AgentRecord } from "../../domain/agent-client";
+import type { BootErrorKind } from "../../domain/boot-error";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
+import type { RunLease } from "../../domain/dispatch-client";
 import type {
   Channel,
   ChatSearchHit,
@@ -15,7 +17,7 @@ import type {
 import type { FileEntry } from "../../domain/files-client";
 import type { MemberKeyView } from "../../domain/identity-client";
 import type { ForgeItemSummary, ForgeRefHead } from "../../domain/forge-client";
-import type { ProposalView } from "../../domain/governance-client";
+import type { ProposalView, SharesView } from "../../domain/governance-client";
 import type {
   PageBlock,
   PageMeta,
@@ -103,18 +105,19 @@ export interface TagFilter {
  *  failure. Distinct from `error` (transient, dismissible op failures) and from
  *  a joiner's `onboardingPhase: fatal` (shown in the waiting room). */
 export interface BootError {
+  kind: BootErrorKind;
   workspaceId: string | null;
   reason: string;
   logPath: string | null;
   logTail: string;
 }
 
-/** The node was reachable and then went away MID-SESSION (crash, stop, remote
- *  unplugged, a dev.sh restart, a wrong node grabbing the port) — drives a
- *  persistent reconnecting banner with the reason and (for a managed node) a
- *  Restart action, instead of a lone red dot beside a frozen-but-live-looking
- *  height. Null while connected or before the first connect. Distinct from
- *  `bootError` (never connected) and `error` (transient op failures). */
+/** A mid-session connection warning: either the stream proved the node went
+ *  away (crash, stop, remote unplug, wrong node on the port), or bounded status
+ *  probes found an established node temporarily busy while its stream remains
+ *  alive. Drives the persistent recovery banner; only authoritative stream
+ *  `down` makes the session disconnected. Distinct from `bootError` (never
+ *  connected) and `error` (transient op failures). */
 export interface ConnectionDown {
   reason: string;
   /** True when a DIFFERENT node answered the reused port (identity mismatch on
@@ -203,6 +206,8 @@ export interface ConsoleState {
   /** Every proposal from the `governance` module, sorted by id. Re-queried per
    *  block like the roster; empty when the node exposes no governance surface. */
   proposals: ProposalView[];
+  /** The current account-share registry; inactive preserves validator ballots. */
+  governanceShares: SharesView;
 
   // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
@@ -229,7 +234,8 @@ export interface ConsoleState {
    *  on open. The view derives depth/indent from the parent links. */
   activePageBlocks: PageBlock[];
   /** Ordered ids of the open document tabs. `activePage` is the active tab.
-   *  Persisted (loadDocTabs) and reconciled against the live enumeration. */
+   *  Persisted per workspace/node scope and reconciled against its live
+   *  enumeration. */
   openTabs: string[];
   /** Comment threads for the open page's blocks + the page itself, grouped by
    *  target. Loaded on page open and after any comment op. Not per-block
@@ -254,7 +260,7 @@ export interface ConsoleState {
   capabilitiesByNode: Map<string, string[]>;
   /** run_id -> hex node key currently executing it (the saga assignee, via the
    *  dispatch read facade). Only in-flight runs appear; empty otherwise. */
-  runAssignee: Map<string, string>;
+  runLease: Map<string, RunLease>;
 
   // ── Search (cross-module reads over the node's derived index) ──
   /** The last search's results, or null before any search ran. Query-driven —
@@ -294,6 +300,22 @@ export interface ConsoleState {
    *  a repo-only focus. Null when nothing is pending. */
   forgeFocus: { repo: string; number: number | null } | null;
 
+  /** The duckfs path the files browser should open on next render — the same
+   *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an
+   *  operator at a skill document. Null when nothing is pending. */
+  filesFocus: string | null;
+
+  /** The agent the agent view should select on next render — a clicked @agent
+   *  mention's hand-off (the explorerFocus idiom: the mention sets it, AgentView
+   *  consumes it and clears it). Null when nothing is pending. */
+  agentFocus: string | null;
+
+  /** The person the members view should select on next render — a clicked @user
+   *  mention's hand-off. An ACCOUNT id, not a node key: a mention mark carries
+   *  the account, and the view maps it back to one of that account's node rows
+   *  through `nodeUsers`. Null when nothing is pending. */
+  memberFocus: string | null;
+
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
    *  inclusion height + addressable op hash from the submit receipt. Client
@@ -317,6 +339,9 @@ export interface ConsoleState {
   workspace: Workspace | null;
   /** Desktop with no active workspace → show the onboarding gate. */
   needsOnboarding: boolean;
+  /** The account-centric Home layer is showing (the workspace shell is hidden).
+   *  Not a disconnect — the node connection is kept alive underneath. */
+  atHome: boolean;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
   /** The last guarded forget couldn't confirm the node left its valset (node
@@ -504,24 +529,44 @@ export const saveViewMode = (mode: ViewMode): void => {
 
 // ── Doc tab persistence ─────────────────────────────────
 //
-// The open Docs tabs survive restart as a single id list; on load they are
-// filtered against the live page enumeration (a stale id from another workspace
-// simply drops), so no per-workspace keying is needed.
+// Open Docs tabs survive restart, but page ids are only meaningful inside one
+// workspace/node. Persist a map by connection scope so an empty new workspace
+// cannot render another workspace's tabs while its enumeration is empty.
 const DOC_TABS_KEY = "ducktape.docTabs";
 
-export const loadDocTabs = (): string[] => {
+export const docTabsScope = (
+  workspaceId: string | null,
+  nodeUrl: string | null,
+): string =>
+  workspaceId ? `workspace:${workspaceId}` : nodeUrl ? `remote:${nodeUrl}` : "session";
+
+const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
+  if (!raw) return {};
+  const parsed: unknown = JSON.parse(raw);
+  // Pre-scoping builds stored one global array. It cannot safely be assigned
+  // to whichever workspace happens to boot first, so discard it.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  return Object.fromEntries(
+    Object.entries(parsed).filter(
+      (entry): entry is [string, string[]] =>
+        Array.isArray(entry[1]) && entry[1].every((id) => typeof id === "string"),
+    ),
+  );
+};
+
+export const loadDocTabs = (scope: string): string[] => {
   try {
-    const raw = localStorage.getItem(DOC_TABS_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+    return [...(parseDocTabStore(localStorage.getItem(DOC_TABS_KEY))[scope] ?? [])];
   } catch {
     return [];
   }
 };
 
-export const saveDocTabs = (tabs: string[]): void => {
+export const saveDocTabs = (scope: string, tabs: string[]): void => {
   try {
-    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(tabs));
+    const store = parseDocTabStore(localStorage.getItem(DOC_TABS_KEY));
+    store[scope] = [...tabs];
+    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(store));
   } catch {
     // persistence is best-effort; a failed write just doesn't survive restart.
   }
@@ -684,6 +729,7 @@ export const createInitialState = (): ConsoleState => {
     members: [],
     residents: [],
     proposals: [],
+    governanceShares: { active: false, allocations: [], total: 0 },
     forgeHead: null,
     forgeRepo: null,
     forgeItems: [],
@@ -691,14 +737,16 @@ export const createInitialState = (): ConsoleState => {
     pages: [],
     activePage: null,
     activePageBlocks: [],
-    openTabs: loadDocTabs(),
+    // The active workspace/node is resolved after mount; connectActive or
+    // connectRemote loads that scope's persisted tabs.
+    openTabs: [],
     pageThreads: [],
     agents: [],
     capabilities: [],
     watches: [],
     pendingRuns: [],
     capabilitiesByNode: new Map(),
-    runAssignee: new Map(),
+    runLease: new Map(),
     search: null,
     searchPending: false,
     searchOpen: false,
@@ -707,6 +755,10 @@ export const createInitialState = (): ConsoleState => {
     blocks: [],
     explorerFocus: null,
     forgeFocus: null,
+    filesFocus: null,
+
+    agentFocus: null,
+    memberFocus: null,
     ops: {},
     error: null,
     bootError: null,
@@ -714,6 +766,7 @@ export const createInitialState = (): ConsoleState => {
     workspaces: [],
     workspace: null,
     needsOnboarding: false,
+    atHome: false,
     onboardingBusy: false,
     forgetNeedsForce: false,
     deleteNeedsForce: null,
@@ -722,6 +775,60 @@ export const createInitialState = (): ConsoleState => {
   };
 };
 
+/** Fresh values for every projection owned by the connected node. Workspace
+ * switches keep global UI/preferences and the workspace registry, but no
+ * committed, query-driven, or operation state may cross the node boundary.
+ * Keep this single reset in lockstep with ConsoleState instead of maintaining
+ * subtly different hand-written lists in each switch/delete path. */
+export const resetNodeProjection = (): Partial<ConsoleState> => ({
+  connected: false,
+  status: null,
+  channels: [],
+  activeChannel: null,
+  messages: [],
+  activeThread: null,
+  tagFilter: null,
+  tagHits: [],
+  tagHitsPending: false,
+  channelTags: [],
+  authorNames: {},
+  nodeUsers: {},
+  accountKeys: {},
+  accountHandles: {},
+  members: [],
+  residents: [],
+  proposals: [],
+  governanceShares: { active: false, allocations: [], total: 0 },
+  forgeHead: null,
+  forgeRepo: null,
+  forgeItems: [],
+  forgeBranches: [],
+  pages: [],
+  activePage: null,
+  activePageBlocks: [],
+  openTabs: [],
+  pageThreads: [],
+  agents: [],
+  capabilities: [],
+  watches: [],
+  pendingRuns: [],
+  capabilitiesByNode: new Map(),
+  runLease: new Map(),
+  search: null,
+  searchPending: false,
+  files: [],
+  lastBlock: null,
+  blocks: [],
+  explorerFocus: null,
+  forgeFocus: null,
+  filesFocus: null,
+
+  agentFocus: null,
+  memberFocus: null,
+  ops: {},
+  connectionDown: null,
+});
+
 export interface ConsoleSnapshot {
   connected: boolean;
   status: NodeStatus | null;
@@ -729,6 +836,7 @@ export interface ConsoleSnapshot {
   members: string[];
   residents: string[];
   proposals: ProposalView[];
+  governanceShares: SharesView;
   forgeHead: string | null;
   activeChannel: string | null;
   messages: MessageView[];
@@ -743,7 +851,7 @@ export interface ConsoleSnapshot {
   watches: WatchView[];
   pendingRuns: PendingRun[];
   capabilitiesByNode: Map<string, string[]>;
-  runAssignee: Map<string, string>;
+  runLease: Map<string, RunLease>;
   files: FileEntry[];
   blocks: BlockRecord[];
 }
@@ -757,6 +865,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   members: snapshot.members,
   residents: snapshot.residents,
   proposals: snapshot.proposals,
+  governanceShares: snapshot.governanceShares,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
@@ -771,7 +880,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
   capabilitiesByNode: snapshot.capabilitiesByNode,
-  runAssignee: snapshot.runAssignee,
+  runLease: snapshot.runLease,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });

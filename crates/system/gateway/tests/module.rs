@@ -4,8 +4,8 @@ use commonware_cryptography::{Signer as _, ed25519};
 use futures::executor::block_on;
 use gateway::{
     GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
-    ROUTE_FORMAT_VERSION, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
-    RouteStatement, RouteTarget, decode_reply, encode_msg, encode_query, route_signing_preimage,
+    RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
+    RouteTarget, decode_reply, encode_msg, encode_query, route_signing_preimage,
 };
 use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView};
 use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
@@ -71,7 +71,7 @@ fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {
 
 fn statement(account_id: Vec<u8>, node: Vec<u8>, name: RouteName, revision: u64) -> RouteStatement {
     RouteStatement {
-        version: ROUTE_FORMAT_VERSION,
+        version: 1,
         chain_id: "test#12345678".into(),
         account_id,
         name,
@@ -85,6 +85,7 @@ fn statement(account_id: Vec<u8>, node: Vec<u8>, name: RouteName, revision: u64)
                 max_request_bytes: 4096,
                 max_response_bytes: 8192,
                 allow_authorization: false,
+                allow_upgrade: false,
             },
         }),
     }

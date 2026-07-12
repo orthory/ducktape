@@ -17,7 +17,9 @@ use sdk::Ctx;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{self, PortableInputs, WorkspaceSource};
-use crate::{ForgeSinkQuery, RunsModule, WireSink, inject};
+use crate::facets::WireSink;
+use crate::sink::ForgeSinkQuery;
+use crate::{RunsModule, inject};
 
 /// the branch an issue run forks from and PRs default-target. forge has no
 /// per-repo default-branch state — "main" is its constant
@@ -422,7 +424,7 @@ mod tests {
     #[test]
     fn list_refs_query_mirror_matches_forge_decode_query() {
         let bytes =
-            serde_json::to_vec(&crate::ForgeSinkQuery::ListRefs { repo: "app" }).unwrap();
+            serde_json::to_vec(&crate::sink::ForgeSinkQuery::ListRefs { repo: "app" }).unwrap();
         assert_eq!(
             forge::decode_query(&bytes).unwrap(),
             forge::ForgeQuery::ListRefs { repo: "app".into() }

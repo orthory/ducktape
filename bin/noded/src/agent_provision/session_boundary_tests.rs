@@ -1,0 +1,437 @@
+//! THE BOUNDARY: the id a run is named by, from the composer that mints it to
+//! the session `runs` binds — crossed in ONE piece, with nothing fabricated.
+//!
+//! every other test on this path fakes the seam it exists to prove. the
+//! provisioner tests hand `WorkspaceSpec` a hardcoded `"s1:0"` and assert the
+//! bind op carries `"s1:0"` back: that asserts FORWARDING, and it passes for any
+//! string on earth — including the one production actually sent, which `runs`
+//! could never resolve. the `runs` tests build their run ids with `run_id_for`:
+//! the right ids, from a composer the provisioner never talks to. between the
+//! two, the write plane shipped DEAD — `OpenAgentSession` named
+//! `{saga_id}:{attempt}`, `pending_entry` missed on every lookup, no session ever
+//! opened, and every agent write answered "this run has no agent session". a
+//! silent degrade, by design; nothing anywhere went red.
+//!
+//! so this test owns the seam and fakes NO id. it drives a real chat mention
+//! through the real modules until a run is in flight, hands the saga's real
+//! `WorkerRequest` to the REAL [`DispatchPool`] — which decodes the composed
+//! envelope and builds the `WorkspaceSpec` itself, exactly as production does —
+//! lets the REAL [`NodedProvisioner`] open the session off that spec, and routes
+//! the resulting op into the REAL `runs` module as the node holding the lease.
+//! then it asserts what only an end-to-end run can: the session BOUND, to the run
+//! the pending map is actually keyed by, and the agent's process was told THAT id.
+//!
+//! the duckfs checkout and the workspace commit are not the subject: their actor
+//! traffic is answered by the same stand-in the plane tests use. the `runs` ops
+//! are the ones that reach real consensus.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
+use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::Signer as _;
+use commonware_runtime::{Runner as _, Supervisor as _};
+use dispatch::DispatchModule;
+use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
+use futures::StreamExt as _;
+use host::worker::{WorkOutcome, Worker as _};
+use host::{BlockContext, Host};
+use jobs::Jobs;
+use saga::SagaModule;
+use sdk::{Effect, Msg, Origin};
+use tagging::TaggingModule;
+use tasks::Tasks;
+
+use super::plane_tests::{committed_block, files_reply};
+use super::*;
+use crate::NodeCommand;
+
+/// the agent under test, and the node that will claim its run's lease. the node
+/// key IS the pool's identity — the same bytes `runs` checks the bind's origin
+/// against — so there is nothing to line up by hand.
+const AGENT: &str = "quackbot";
+const CAPABILITY: &str = "mock-llm-1";
+const WORKER_NODE: &[u8] = b"worker-node";
+const CHANNEL: &str = "general";
+
+/// a provider that answers instantly and RECORDS the run context it was handed —
+/// the child's env among it. that env is what the agent's process would really
+/// see, so `DUCKTAPE_RUN_ID` here is the id the MCP server would stamp onto every
+/// mid-run write.
+struct RecordingProvider {
+    seen: Arc<std::sync::Mutex<Option<capability_host::RunContext>>>,
+}
+
+#[async_trait::async_trait]
+impl capability_host::Provider for RecordingProvider {
+    fn capability(&self) -> &str {
+        CAPABILITY
+    }
+    async fn run(
+        &self,
+        _prompt: &str,
+        ctx: &capability_host::RunContext,
+    ) -> Result<String, String> {
+        *self.seen.lock().unwrap() = Some(ctx.clone());
+        Ok(r#"{"reply_blocks":[],"actions":[]}"#.to_string())
+    }
+}
+
+fn provider_set(
+    seen: Arc<std::sync::Mutex<Option<capability_host::RunContext>>>,
+) -> Arc<capability_host::ProviderSet> {
+    let spec = capability_host::CapabilitySpec::parse(
+        &format!(
+            r#"
+spec = 1
+[capability]
+tag = "{CAPABILITY}"
+[detect]
+bin = "{CAPABILITY}-cli"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+"#
+        ),
+        "test",
+    )
+    .expect("the mock capability spec parses");
+    Arc::new(capability_host::ProviderSet::assemble(
+        capability_host::SpecSet::from_specs(vec![spec]),
+        vec![Box::new(RecordingProvider { seen })],
+    ))
+}
+
+fn at(height: u64, origin: Origin) -> BlockContext {
+    BlockContext {
+        protocol_version: 0,
+        height,
+        consensus_time: height,
+        origin,
+    }
+}
+
+fn alice() -> Origin {
+    Origin::External(b"alice".to_vec())
+}
+
+/// the genesis set the collaboration loop runs on — chat + the tagging plane +
+/// the dispatch plane + the registry + runs.
+async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
+    Host::genesis(vec![
+        Box::new(chat),
+        Box::new(TaggingModule::new("tagging")),
+        Box::new(SagaModule::new("saga")),
+        Box::new(DispatchModule::new("dispatch", "saga")),
+        Box::new(agent::AgentModule::new(
+            "agent",
+            "saga",
+            Some("runs".into()),
+        )),
+        Box::new(runs::RunsModule::new(
+            "runs",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            "agent",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        )),
+        Box::new(Tasks::new("tasks")),
+        Box::new(Jobs::new("jobs")),
+    ])
+    .expect("genesis")
+}
+
+/// channel → agent → watch → the human's mention. the post block stages the
+/// pending entry, the dispatch, and its saga trigger, and emits the announcement
+/// effect the pool claims.
+async fn mention_run(host: &mut Host) -> Effect {
+    let ops: Vec<Msg> = vec![
+        Msg {
+            target: "chat".into(),
+            payload: chat::encode_msg(&ChatMsg::CreateChannel {
+                channel_id: CHANNEL.into(),
+                name: "General".into(),
+                post_policy: PostPolicy::Open,
+            }),
+        },
+        Msg {
+            target: "agent".into(),
+            payload: agent::encode_msg(&AgentMsg::RegisterAgent {
+                agent_id: AGENT.into(),
+                display_name: "Quackbot".into(),
+                capability: CAPABILITY.into(),
+                allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
+                recipe_hash: None,
+                caps: None,
+                skills: None,
+            }),
+        },
+        Msg {
+            target: "runs".into(),
+            payload: runs::encode_msg(&runs::RunsMsg::WatchChannel {
+                channel_id: CHANNEL.into(),
+                policy: runs::TurnPolicy::Mention,
+            }),
+        },
+        Msg {
+            target: "chat".into(),
+            payload: chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: CHANNEL.into(),
+                message_id: "m1".into(),
+                blocks: vec![Block::Paragraph(vec![
+                    Span::plain("hey "),
+                    Span {
+                        text: format!("@{AGENT}"),
+                        marks: vec![Mark::Mention(chat::AuthorRef::Agent {
+                            module: "runs".into(),
+                            agent_id: AGENT.into(),
+                        })],
+                    },
+                    Span::plain(" pick this up"),
+                ])],
+                thread: None,
+                as_agent: None,
+            }),
+        },
+    ];
+    let mut last = None;
+    for (i, op) in ops.into_iter().enumerate() {
+        last = Some(
+            host.submit_at(at(i as u64 + 1, alice()), op)
+                .await
+                .expect("setup block"),
+        );
+    }
+    let mut effects = last.expect("the post block").effects;
+    assert_eq!(effects.len(), 1, "the post announces exactly one run");
+    effects.remove(0)
+}
+
+/// serve ONE actor command the live run made.
+///
+/// `runs` ops go to the REAL host, framed with the node key — precisely what the
+/// daemon does (it discards the caller-supplied origin and signs with its own
+/// identity, which is the assignee `runs` authorizes against). everything else is
+/// the duckfs lane's checkout/commit traffic, answered by the plane tests'
+/// stand-in: the workspace is not this test's subject, consensus is.
+async fn serve(host: &mut Host, height: u64, cmd: NodeCommand) -> Option<runs::RunsMsg> {
+    match cmd {
+        NodeCommand::Submit {
+            target,
+            payload,
+            reply,
+            ..
+        } if target == "runs" => {
+            let op = runs::decode_msg(&payload).expect("a runs op");
+            let outcome = host
+                .submit_at(
+                    at(height, Origin::External(WORKER_NODE.to_vec())),
+                    Msg { target, payload },
+                )
+                .await;
+            let _ = reply.send(
+                outcome
+                    .map(|_| committed_block())
+                    .map_err(|e| format!("{e:?}")),
+            );
+            Some(op)
+        }
+        NodeCommand::Submit { reply, .. } => {
+            let _ = reply.send(Ok(committed_block()));
+            None
+        }
+        NodeCommand::Query { req, reply, .. } => {
+            let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
+            None
+        }
+        _ => panic!("the run made an unexpected actor call"),
+    }
+}
+
+#[test]
+fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
+    let tmp = tempfile::tempdir().unwrap();
+    // a REAL tokio runtime with a commonware context: the modules need the
+    // context (chat is storage-backed), the pool needs the reactor.
+    let cfg = commonware_runtime::tokio::Config::default()
+        .with_storage_directory(tmp.path().join("storage"));
+    commonware_runtime::tokio::Runner::new(cfg).start(|context| async move {
+        let runs_root = tmp.path().join("runs");
+        let mut host = genesis(context).await;
+
+        // ---- a real run, in flight -----------------------------------------
+        let announce = mention_run(&mut host).await;
+        // THE ID CONSENSUS KNOWS. nothing below is allowed to invent it; every
+        // assertion measures against this.
+        let run_id = runs::run_id_for(CHANNEL, 1, AGENT);
+        assert!(
+            pending_runs(&host).await.iter().any(|p| p.run_id == run_id),
+            "the run is in flight, keyed by the id runs minted"
+        );
+
+        // ---- the real pool, the real provisioner ----------------------------
+        let (handle, mut rx, _hub) = NodeHandle::channel();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        // the pool RETURNS its claim/no-op op to the caller and pushes only the
+        // run's terminal result down the deliver lane; the node submits both. we
+        // never read the lane — the run's result is another test's subject.
+        let (deliver_tx, _deliver_rx) = futures::channel::mpsc::unbounded::<Msg>();
+        let spawn: SpawnFn = Box::new(|fut| {
+            tokio::spawn(fut);
+        });
+        let deliver: DeliverFn = Arc::new(move |msg| {
+            let tx = deliver_tx.clone();
+            Box::pin(async move {
+                let _ = tx.unbounded_send(msg);
+            })
+        });
+        let pool = DispatchPool::with_limit(
+            provider_set(seen.clone()),
+            WORKER_NODE.to_vec(),
+            spawn,
+            deliver,
+            1,
+            // no announced capacity: this bed is about the session boundary, and
+            // a bare node's ledger fits the demandless jobs it dispatches.
+            Default::default(),
+        )
+        .with_provisioner(Arc::new(
+            NodedProvisioner::new(handle, &runs_root)
+                .with_node_url(Some("http://127.0.0.1:8844".into())),
+        ));
+
+        // the announcement is an OFFER: the pool claims it with Accept, and the
+        // saga re-emits the request naming the winner. the lease this creates is
+        // the SAME committed lease `runs` authorizes the bind against.
+        let accept = match pool.run(&announce).await.expect("the pool gates the offer") {
+            WorkOutcome::Handled(Some(op)) => op,
+            other => panic!("the pool must CLAIM a servable announcement, got {other:?}"),
+        };
+        let assigned = host
+            .submit_at(at(5, Origin::External(WORKER_NODE.to_vec())), accept)
+            .await
+            .expect("accept block")
+            .effects;
+        assert_eq!(
+            assigned.len(),
+            1,
+            "the accepted attempt re-announces to its holder"
+        );
+
+        // EXECUTE. the pool decodes the composed envelope and builds the
+        // WorkspaceSpec itself — `run_id` = "{saga_id}:{attempt}",
+        // `consensus_run_id` = whatever the envelope carried — and the
+        // provisioner opens the session off it. no id in this test is written by
+        // hand; this is the production path, running.
+        pool.run(&assigned[0])
+            .await
+            .expect("the pool executes its lease");
+
+        // serve the run's actor traffic until its session bind reaches consensus.
+        let bound = loop {
+            let cmd = tokio::time::timeout(Duration::from_secs(10), rx.next())
+                .await
+                .expect("the run makes its actor calls within budget")
+                .expect("the actor lane stays open");
+            if let Some(runs::RunsMsg::OpenAgentSession {
+                run_id,
+                session_key,
+            }) = serve(&mut host, 6, cmd).await
+            {
+                break (run_id, session_key);
+            }
+        };
+
+        // ---- THE ASSERTION: the bind LANDED, on the run that exists ----------
+        assert_eq!(
+            bound.0, run_id,
+            "the provisioner must name the run in the id space runs resolves — \
+             NOT its own {{saga_id}}:{{attempt}} workspace key"
+        );
+        let sessions = agent_sessions(&host).await;
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the session BOUND: consensus holds exactly one live session for this run"
+        );
+        assert_eq!(sessions[0].run_id, run_id);
+        assert_eq!(
+            sessions[0].agent_id, AGENT,
+            "identity comes from the run's committed entry, never the payload"
+        );
+        assert_eq!(
+            sessions[0].session_key, bound.1,
+            "the bound key is the one the provisioner minted"
+        );
+
+        // and the AGENT was told the same id: the MCP server stamps this var onto
+        // every RunsMsg::AgentAction, so a host-local id here would make every
+        // mid-run write name a run that does not exist. the bind is the LAST
+        // actor call a provision makes, so the model call is still landing — wait
+        // for the context it was handed rather than racing it.
+        let ctx = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let seen = seen.lock().unwrap().clone();
+                if let Some(ctx) = seen {
+                    break ctx;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the provisioned run reaches the provider within budget");
+        assert_eq!(
+            ctx.env.get("DUCKTAPE_RUN_ID").map(String::as_str),
+            Some(run_id.as_str()),
+            "the run id in the agent's environment is the consensus one"
+        );
+        let key_hex = ctx
+            .env
+            .get("DUCKTAPE_RUN_SESSION_KEY")
+            .expect("the agent holds the session's private half");
+        let seed = duckfs_core::from_hex_32(key_hex).expect("lowercase hex");
+        let public = commonware_cryptography::ed25519::PrivateKey::decode(seed.as_slice())
+            .expect("32 bytes decode")
+            .public_key();
+        assert_eq!(
+            public.as_ref().to_vec(),
+            sessions[0].session_key,
+            "the key the agent signs with is the key consensus bound — one credential"
+        );
+    });
+}
+
+// ---- read the module back through its own query surface ---------------------
+
+async fn pending_runs(host: &Host) -> Vec<runs::PendingRun> {
+    let reply = host
+        .query("runs", &runs::encode_query(&runs::RunsQuery::PendingRuns))
+        .await
+        .unwrap();
+    match runs::decode_reply(&reply).unwrap() {
+        runs::RunsReply::PendingRuns(runs) => runs,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+async fn agent_sessions(host: &Host) -> Vec<runs::AgentSession> {
+    let reply = host
+        .query("runs", &runs::encode_query(&runs::RunsQuery::AgentSessions))
+        .await
+        .unwrap();
+    match runs::decode_reply(&reply).unwrap() {
+        runs::RunsReply::AgentSessions(sessions) => sessions,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}

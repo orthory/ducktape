@@ -8,7 +8,7 @@ mod engine;
 mod run;
 mod wiring;
 
-use commonware_cryptography::ed25519;
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_runtime::Quota;
@@ -48,6 +48,8 @@ pub(crate) async fn run_validator(
     promoted: bool,
     dev_demo: bool,
     announce_capabilities: bool,
+    sandbox: capability_host::SandboxBackend,
+    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
@@ -60,6 +62,7 @@ pub(crate) async fn run_validator(
     agent_dirs: capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
     gateway_workspace: std::path::PathBuf,
     mut recovery: Recovery<commonware_runtime::tokio::Context>,
     manifest: Option<Manifest>,
@@ -129,6 +132,7 @@ pub(crate) async fn run_validator(
         coord_cap,
         voice_requests,
         overlay_slot.clone(),
+        planes.clone(),
     )
     .await;
     let (
@@ -158,12 +162,7 @@ pub(crate) async fn run_validator(
         label.clone(),
         namespace.clone(),
         identity_chain_id.clone(),
-        peers.clone(),
         validators.clone(),
-        wireguard_listen,
-        wireguard_effect,
-        overlay_slot.clone(),
-        bulk_pacer.clone(),
         forge_repo.clone(),
         duckfs_dir.clone(),
         blobs.clone(),
@@ -178,10 +177,8 @@ pub(crate) async fn run_validator(
         bank_base,
         mesh_oracle,
         channel_bank,
-        sync_plane_book,
         gateway_book,
         blob_peers,
-        blob_fetcher,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -199,7 +196,8 @@ pub(crate) async fn run_validator(
         namespace.clone(),
         wireguard_effect,
         overlay_slot.clone(),
-        bulk_pacer,
+        bulk_pacer.clone(),
+        planes.clone(),
         gateway_requests,
         gateway_commands,
         gateway_workspace,
@@ -215,6 +213,23 @@ pub(crate) async fn run_validator(
         relay_rx,
     )
     .await;
+
+    if let Some(peers) = &media_peers {
+        let me: [u8; 32] = signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 keys are 32 bytes");
+        crate::agent_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(peers),
+            me,
+            bulk_pacer,
+            planes.clone(),
+            stream_hub.run_output(),
+        );
+    }
 
     let mut epoch_spawner = engine::EpochSpawner::new(
         &context,
@@ -252,11 +267,9 @@ pub(crate) async fn run_validator(
         last_cert_height,
         latest_floor,
         mesh_oracle,
-        sync_plane_book,
         gateway_book,
         media_peers,
         blob_peers,
-        blob_fetcher,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -273,6 +286,8 @@ pub(crate) async fn run_validator(
         dev_demo,
         checkpoint_blocks,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         rpc_listener,
         http_cmds,
         stream_hub,

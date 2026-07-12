@@ -10,6 +10,7 @@
 //! the impl crate validates shape (charset/length/count), not meaning.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// longest single capability tag, in bytes — a wire-format constant shared by
 /// everything that mints or checks a tag (the registry's Announce validation,
@@ -41,6 +42,29 @@ pub fn validate_tag(tag: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// most dimensions one node may announce / one job may demand — a bound, not
+/// a schema (dimensions are open-set data: "cores", "mem_gb", later "gpu").
+pub const MAX_RESOURCE_DIMS: usize = 16;
+
+/// the ONE rule for a resource map (announced capacity or demanded amounts):
+/// bounded size, keys under the tag rule, values non-zero (zero means "don't
+/// name the dimension").
+pub fn validate_resources(resources: &BTreeMap<String, u64>) -> Result<(), String> {
+    if resources.len() > MAX_RESOURCE_DIMS {
+        return Err(format!(
+            "too many resource dimensions: {} exceeds the {MAX_RESOURCE_DIMS} cap",
+            resources.len()
+        ));
+    }
+    for (key, value) in resources {
+        validate_tag(key).map_err(|e| format!("resource dimension {key:?}: {e}"))?;
+        if *value == 0 {
+            return Err(format!("resource dimension {key:?} is zero (omit it instead)"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityMsg {
@@ -49,7 +73,13 @@ pub enum CapabilityMsg {
     /// speak for itself. announcing an empty set removes the node. re-sending
     /// the current set is an idempotent no-op state-wise, so hosts may
     /// re-derive and re-announce freely (restart, rediscovery).
-    Announce { capabilities: Vec<String> },
+    Announce {
+        capabilities: Vec<String>,
+        /// announced numeric capacity (e.g. "cores", "mem_gb"). EMPTY for a
+        /// direct-spawn node: tags-only, never matches a demands-carrying job.
+        #[serde(default)]
+        resources: BTreeMap<String, u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -59,7 +89,19 @@ pub enum CapabilityQuery {
     Providers { capability: String },
     /// the capability set a single node announced (empty if absent).
     Node { node: Vec<u8> },
-    /// the full registry, sorted by node key.
+    /// every node that announced `capability` AND whose announced resources
+    /// cover `demands` per dimension (absent dimension ≠ infinite). empty
+    /// demands degrade to `Providers`.
+    CapableProviders {
+        capability: String,
+        demands: BTreeMap<String, u64>,
+    },
+    /// the resource map a single node announced (empty if absent) — the
+    /// announcer's idempotence read, beside `Node`.
+    Resources { node: Vec<u8> },
+    /// the full registry, sorted by node key. no Rust constructor exists —
+    /// this is the desktop app's registry-enumeration read (the executor
+    /// picker and per-member capability display), submitted as wire JSON.
     All,
 }
 
@@ -68,6 +110,7 @@ pub enum CapabilityQuery {
 pub enum CapabilityReply {
     Providers(Vec<Vec<u8>>),
     Node(Vec<String>),
+    Resources(BTreeMap<String, u64>),
     All(Vec<(Vec<u8>, Vec<String>)>),
 }
 
@@ -88,4 +131,35 @@ pub fn encode_reply(r: &CapabilityReply) -> Vec<u8> {
 }
 pub fn decode_reply(b: &[u8]) -> Result<CapabilityReply, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn res(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn validate_resources_accepts_sane_maps_and_rejects_bad_ones() {
+        assert!(validate_resources(&res(&[])).is_ok());
+        assert!(validate_resources(&res(&[("cores", 8), ("mem_gb", 32)])).is_ok());
+        // keys obey the ONE tag rule (charset/length), values must be non-zero
+        assert!(validate_resources(&res(&[("Cores", 8)])).is_err());
+        assert!(validate_resources(&res(&[("cores", 0)])).is_err());
+        let too_many: BTreeMap<String, u64> =
+            (0..=MAX_RESOURCE_DIMS).map(|i| (format!("d{i}"), 1)).collect();
+        assert!(validate_resources(&too_many).is_err());
+    }
+
+    #[test]
+    fn announce_without_resources_field_still_decodes() {
+        // old wire JSON (pre-resources) must decode with an empty map.
+        let old = br#"{"announce":{"capabilities":["codex"]}}"#;
+        let CapabilityMsg::Announce { capabilities, resources } = decode_msg(old).unwrap();
+        assert_eq!(capabilities, vec!["codex"]);
+        assert!(resources.is_empty());
+    }
 }

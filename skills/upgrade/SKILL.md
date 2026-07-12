@@ -142,8 +142,8 @@ until you roll it in Step 4.
 
 ```bash
 # local multi-node test net driven by the fleet harness
-ops/fleet.sh status
-ops/fleet.sh up <branch…>     # bring per-worktree apps up on the new build
+app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js status
+app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js up <revision…>
 ```
 
 **Admission gate during an open window:** any validator admitted after a

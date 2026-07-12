@@ -38,7 +38,7 @@ saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
 # the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
-# ForgeMsg::Push / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
+# ForgeMsg::PushRefs / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
 # route pair; every other route stays module-agnostic opaque json).
 # the duckfs module registration plus digest-hex validation on the blob route.
 files = { workspace = true }
@@ -48,7 +48,6 @@ duckfs-core = { workspace = true }
 # the node-local op-receipt blob store (the http blob lane): op payloads staged
 # at submit time, served back by digest. re-exported by `src/blobs.rs`.
 blobstore = { workspace = true }
-reactor = { workspace = true }
 # the derived read-model tier: the actor materializes per-module fluent31
 # indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
 # each module registers its `::index` mapper as its own view endpoint.
@@ -59,6 +58,18 @@ indexer = { workspace = true }
 duckfs-client = { workspace = true }
 # the workspace RPC decodes file-read replies (base64) off the actor lane.
 base64 = { workspace = true }
+# forge attribution emails include a bounded sha256-derived suffix so distinct
+# committed agent ids cannot collapse onto the same synthetic address.
+sha2 = { workspace = true }
+# the op-frame codec. `/v1/submit/frame` VERIFIES an already-signed frame before
+# it reaches any actor, and the embedded daemon takes the op's origin from that
+# verification — never from a caller-supplied string. same codec every validator
+# runs, so one definition of "who signed this op".
+node = { workspace = true }
+# the per-run agent session keypair: minted with the SAME ed25519 types
+# `node::encode_frame` signs with (no second crypto stack, no hand-rolled key).
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
@@ -80,15 +91,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
 tokio = { version = "1", features = ["test-util"] }
 # daemon_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
-# daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
-# of the doc's canonical rendering, computed test-side.
-sha2 = { workspace = true }
 # (duckfs-client and base64 are now direct deps above — daemon_e2e drives the
 # `HttpNode` transport through them as the full-stack proof of the client
 # transport, alongside the workspace RPC that uses them at runtime.)

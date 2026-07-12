@@ -19,7 +19,7 @@ use common::{Cluster, hex, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
 use duckdns::{DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply};
 use gateway::{
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, ROUTE_FORMAT_VERSION,
+    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
     RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
     RouteTarget,
 };
@@ -82,7 +82,7 @@ fn signed_route(
     audience: RouteAudience,
 ) -> GatewayMsg {
     let statement = RouteStatement {
-        version: ROUTE_FORMAT_VERSION,
+        version: 1,
         chain_id: chain.into(),
         account_id: member.public_key().as_ref().to_vec(),
         name: RouteName::named("api"),
@@ -96,6 +96,7 @@ fn signed_route(
                 max_request_bytes: 1024,
                 max_response_bytes: 4096,
                 allow_authorization: false,
+                allow_upgrade: false,
             },
         }),
     };
@@ -240,13 +241,15 @@ fn proxy_request(
     )
 }
 
-fn raw_browser_request(port: u16, host: &str, extra: &str) -> (u16, String, Vec<u8>) {
+fn raw_browser_request(port: u16, authority: &str, extra: &str) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect browser gateway");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
+    // The duck:// scheme handler forwards the page's authority and origin; there
+    // is no <token>.localhost Host any more.
     let request = format!(
-        "GET /page HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n{extra}Connection: close\r\n\r\n"
+        "GET /page HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Duck-Authority: {authority}\r\nOrigin: duck://{authority}\r\nSec-Fetch-Site: same-origin\r\n{extra}Connection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).unwrap();
     let mut raw = Vec::new();
@@ -364,49 +367,43 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
             .unwrap(),
         br#"{"ok":true}"#
     );
+    // v2 forwards Set-Cookie end to end (v1 stripped it).
     assert!(
         response["head"]["headers"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|header| header["name"] != "set-cookie")
+            .any(|header| header["name"] == "set-cookie")
     );
 
-    let (status, session) = cluster.http(
-        1,
-        "POST",
-        "/v1/gateway/session",
-        Some(&serde_json::json!({
-            "accountId": alice.public_key().as_ref(),
-            "name": { "label": "api" },
-            "revision": 1,
-        })),
-    );
-    assert_eq!(status, 200, "session failed: {session}");
-    let authority = session["url"]
+    // Discover the dedicated browser-gateway port, then browse api.alice.duck
+    // exactly as the duck:// scheme handler would: the node resolves the
+    // authority (duckdns + route) fresh, with no session token.
+    let (status, browser) = cluster.http(1, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let browser_port: u16 = browser["base"]
         .as_str()
         .unwrap()
-        .strip_prefix("http://")
-        .and_then(|value| value.strip_suffix('/'))
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .parse()
         .unwrap();
-    let (host, port) = authority.rsplit_once(':').unwrap();
-    let browser_port: u16 = port.parse().unwrap();
+    let authority = "api.alice.duck";
     let (status, headers, html) = raw_browser_request(browser_port, authority, "");
     assert_eq!(status, 200, "browser gateway failed: {headers}");
     let lower_headers = headers.to_ascii_lowercase();
     assert!(lower_headers.contains("content-security-policy:"));
-    assert!(lower_headers.contains("connect-src http://"));
+    assert!(lower_headers.contains(&format!("connect-src duck://{authority}")));
     assert!(lower_headers.contains("worker-src 'none'"));
     assert!(lower_headers.contains("webrtc 'block'"));
     assert!(!lower_headers.contains("set-cookie:"));
     assert!(String::from_utf8_lossy(&html).contains("<title>Alice</title>"));
-    assert_eq!(host.len(), 32 + ".localhost".len());
 
-    let (status, _, _) = raw_browser_request(browser_port, authority, "Cookie: ambient=yes\r\n");
-    assert_eq!(status, 400);
+    // A page whose Origin does not match the forwarded authority is rejected.
     let mut cross = TcpStream::connect(("127.0.0.1", browser_port)).unwrap();
     let request = format!(
-        "GET /page HTTP/1.1\r\nHost: {authority}\r\nOrigin: http://evil.localhost:{browser_port}\r\nConnection: close\r\n\r\n"
+        "GET /page HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Duck-Authority: {authority}\r\nOrigin: duck://evil.alice.duck\r\nConnection: close\r\n\r\n"
     );
     cross.write_all(request.as_bytes()).unwrap();
     let mut raw = String::new();
@@ -419,12 +416,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
 
     for (method, path, headers, expected) in [
         ("delete", "/items", serde_json::json!([]), 403),
-        (
-            "get",
-            "/items",
-            serde_json::json!([{ "name": "cookie", "value": "ambient=yes" }]),
-            400,
-        ),
+        // (v2: Cookie is no longer rejected at the proxy; it flows to upstream.)
         (
             "get",
             "/items",

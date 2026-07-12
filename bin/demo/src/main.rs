@@ -1,15 +1,9 @@
-//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
-//! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
-//! qmdb-backed block-based CHAT module, an
-//! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, the IDENTITY account registry, the AUTOMATIONS
-//! rule engine, the INBOX notification queues, a content-addressed FILES module,
-//! the MEMORY shared agent workspace, and the JOBS work board —
-//! dispatched over ONE host, showing
+//! a runnable super-app demo: twenty registered modules — including QMDB-backed
+//! KV and EVM state, Git/DuckFS substrates, collaboration apps, and system
+//! routing modules — dispatched over ONE host, showing
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
-//! mention becomes a run and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
 
@@ -87,7 +81,7 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
-        let tagging = tagging::TaggingModule::new("tagging");
+        let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         // the deterministic user->nodes binding registry: no valset gating and
         // a fixed demo chain id (the demo has no real network descriptor).
@@ -107,7 +101,10 @@ fn main() {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        );
+        )
+        // the duckfs/files module the portable (v3) composer pins its source
+        // head from (W2) — mandatory for envelope composition.
+        .with_files_module("files");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -132,7 +129,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!("=== super-app demo — 20 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -414,10 +411,12 @@ fn main() {
                     agent_id: "quackbot".into(),
                     display_name: "Quackbot".into(),
                     capability: "mock-llm-1".into(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                     recipe_hash: None,
                     caps: None,
+                    // the persona is a curated skill now (an `always` one), not a
+                    // prompt blob. the demo's mock provider ignores the composed
+                    // context anyway, so it registers soul-less.
                     skills: None,
                 }),
             },
@@ -581,25 +580,11 @@ fn main() {
         }
         println!("  app-hash       : {:?}", out.app_hash);
 
+        // every registered module, straight from the registry — the same set
+        // (and sorted-id order) the app-hash composes over.
         println!("\nmodule roots:");
-        for id in [
-            "agent",
-            "chat",
-            "directory",
-            "duckdns",
-            "gateway",
-            "files",
-            "forge",
-            "greeter",
-            "identity",
-            "inbox",
-            "jobs",
-            "kv",
-            "saga",
-            "tasks",
-            "valset",
-        ] {
-            println!("  {id:>10} : {:?}", host.module_root(id).unwrap());
+        for (id, root) in host.module_roots() {
+            println!("  {id:>11} : {root:?}");
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());
     });

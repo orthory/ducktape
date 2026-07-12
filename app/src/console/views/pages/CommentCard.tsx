@@ -28,6 +28,7 @@ export function CommentCard({
   anchor,
   threads,
   authorNames,
+  selfKey,
   onClose,
   onSubmitNew,
   onReply,
@@ -42,6 +43,8 @@ export function CommentCard({
   /** Threads for THIS target only. */
   threads: ThreadView[];
   authorNames: AuthorNames;
+  /** The local author's key — Edit/Delete render only on our own comments. */
+  selfKey: string;
   onClose: () => void;
   onSubmitNew: (target: string, text: string) => void;
   onReply: (threadId: string, text: string) => void;
@@ -146,6 +149,7 @@ export function CommentCard({
             key={view.thread.id}
             view={view}
             authorNames={authorNames}
+            selfKey={selfKey}
             onReply={onReply}
             onResolve={onResolve}
             onEdit={onEdit}

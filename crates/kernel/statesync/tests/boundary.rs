@@ -179,6 +179,7 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         current_version: host::BASELINE_VERSION,
         pending_upgrade: None,
         required_min_version: host::BASELINE_VERSION,
+        state_schema: [0xAB; 32],
         entries: vec![ManifestEntry {
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),
@@ -333,31 +334,4 @@ fn pruned_pinned_range_errors_for_refetch() {
         matches!(err, SyncError::Pruned { ref module, .. } if module == "kv"),
         "pruned pinned range must become a typed refetch error, got {err:?}"
     );
-}
-
-#[test]
-fn lease_retention_floor_uses_oldest_active_resolver_start() {
-    let mut srv = SyncServer::new();
-    let newer = BoundaryId {
-        height: 20,
-        app_hash: StateRoot([2u8; 32]),
-    };
-    let older = BoundaryId {
-        height: 10,
-        app_hash: StateRoot([1u8; 32]),
-    };
-
-    srv.insert_resolver_capture_for_test(newer, "kv", 50);
-    srv.insert_resolver_capture_for_test(older, "kv", 25);
-    srv.lease(newer);
-    srv.lease(older);
-
-    assert_eq!(
-        srv.oldest_active_lease_start_for_module("kv"),
-        Some(25),
-        "retention floor must honor the oldest leased pinned range"
-    );
-
-    srv.release(older);
-    assert_eq!(srv.oldest_active_lease_start_for_module("kv"), Some(50));
 }

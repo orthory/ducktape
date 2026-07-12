@@ -123,7 +123,7 @@ fn user_post_fires_rule_and_creates_task_atomically() {
         // register a CreateTask rule.
         let (ctx, msg) = from_user(create_rule_msg(
             "capture",
-            Trigger::MessagePosted {
+            Trigger {
                 channel_id: Some("general".into()),
                 mention: None,
                 text_contains: None,
@@ -169,7 +169,7 @@ fn module_authored_post_does_not_fire() {
         let mut host = genesis();
         let (ctx, msg) = from_user(create_rule_msg(
             "capture",
-            Trigger::MessagePosted {
+            Trigger {
                 channel_id: None,
                 mention: None,
                 text_contains: None,
@@ -207,7 +207,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
         let mut host = genesis();
         let (ctx, msg) = from_user(create_rule_msg(
             "capture",
-            Trigger::MessagePosted {
+            Trigger {
                 channel_id: None,
                 mention: None,
                 text_contains: None,
@@ -271,7 +271,7 @@ fn post_probe_collision_still_aborts_the_block() {
         for rule_id in ["r1", "r2"] {
             let (ctx, msg) = from_user(create_rule_msg(
                 rule_id,
-                Trigger::MessagePosted {
+                Trigger {
                     channel_id: None,
                     mention: None,
                     text_contains: None,

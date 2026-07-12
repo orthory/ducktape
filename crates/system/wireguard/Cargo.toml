@@ -1,0 +1,15 @@
+[package]
+name = "wireguard"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+commonware-codec = { workspace = true }
+commonware-cryptography = { workspace = true }
+defguard_wireguard_rs = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

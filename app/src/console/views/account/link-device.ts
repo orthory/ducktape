@@ -87,6 +87,16 @@ export const decodeLinkChallenge = (blob: string): LinkChallenge | null => {
   return { chainId: c.chainId, accountId: c.accountId, nonce: c.nonce, name: c.name };
 };
 
+// ── The QR / LAN link address (link_relay.rs) ────────────────────────────
+
+// The inviter's relay URL: `http://<host:port>/link#<32-hex-token>`. Detection
+// only — the strict parse (and the exchange itself) lives in the shell, which
+// does the LAN HTTP. Mirrors `parse_link_url` in link_relay.rs.
+const LINK_URL = /^http:\/\/[a-z0-9.:[\]-]+\/link#[0-9a-f]{32}$/i;
+
+/** Does this pasted/typed input name a link relay address (vs a blob)? */
+export const isLinkUrl = (text: string): boolean => LINK_URL.test(text.trim());
+
 export const encodeLinkResponse = (response: LinkResponse): string =>
   RESPONSE_PREFIX + b64encode(JSON.stringify(response));
 

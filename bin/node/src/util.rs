@@ -2,8 +2,6 @@ use commonware_cryptography::ed25519;
 use consensus::{Digest, digest_of};
 use sdk::StateRoot;
 
-use crate::config::hex_bytes;
-
 /// the per-epoch genesis floor: domain-separated by namespace AND epoch, so a
 /// respawned engine can never confuse an old epoch's certificates with its own
 /// (an old-epoch floor fails `Floor::assert` against the new epoch).
@@ -43,7 +41,7 @@ pub(crate) fn resident_bytes(
 
 /// hex-encode a state root for a stable, greppable log line.
 pub(crate) fn hex(root: &StateRoot) -> String {
-    hex_bytes(&root.0)
+    duckfs_core::to_hex(&root.0)
 }
 
 pub(crate) fn diag_log(line: impl AsRef<str>) {

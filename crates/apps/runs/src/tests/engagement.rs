@@ -1,5 +1,68 @@
 use super::*;
 
+#[test]
+fn pages_comment_mention_dispatches_without_a_chat_watch() {
+    let mut registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
+    registry.get_mut("bot").unwrap().caps.pages_write = vec!["p1".into()];
+    let mut m = module()
+        .with_files_module("files")
+        .with_pages_module("pages");
+    let thread = pages::ThreadView {
+        thread: pages::Thread {
+            id: "thread-1".into(),
+            target: "b-p".into(),
+            opener: pages::AuthorRef::User(vec![4; 32]),
+            created_at: 1,
+            resolved: false,
+            resolved_by: None,
+            comment_ids: vec!["comment-1".into()],
+        },
+        comments: vec![pages::Comment {
+            id: "comment-1".into(),
+            thread_id: "thread-1".into(),
+            author: pages::AuthorRef::User(vec![4; 32]),
+            text: "@bot review this page".into(),
+            created_at: 1,
+            edited_at: None,
+            deleted: false,
+        }],
+    };
+    let mut ctx = CaptureCtx::new()
+        .at(3)
+        .with_tagging_origin()
+        .with_registry(&registry)
+        .with_page("p1", page_blocks("p1", "Spec"))
+        .with_page_thread(thread);
+    let event = Msg {
+        target: "runs".into(),
+        payload: tagging_encode_event(&EngagementEvent {
+            source: "pages".into(),
+            container: "thread-1".into(),
+            content_seq: 1,
+            author: Author::User(vec![4; 32]),
+            tags: vec![agent_tag("bot")],
+        }),
+    };
+    exec(&mut m, &mut ctx, &event).unwrap();
+    commit(&mut m);
+
+    let run_id = page_run_id_for("thread-1", 1, "bot");
+    let pending = get_pending(&m, &run_id).expect("page mention engaged bot");
+    assert_eq!(pending.channel_id, "runs:pages:thread-1");
+    let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+        panic!("expected page dispatch")
+    };
+    let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(envelope["thread_key"], "pages:thread-1");
+    assert!(
+        envelope["conversation"]
+            .as_str()
+            .unwrap()
+            .contains("review this page")
+    );
+    assert!(envelope["context"].as_str().unwrap().contains("Spec"));
+}
+
 // ---- the engagement intake: turn policies ----------------------------------
 
 #[test]
@@ -40,14 +103,14 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
     assert_eq!(get_pending(&m, &run_id_for("general", 3, "bot2")), None);
 
     // exactly one dispatch, under the agent's own recipe, carrying the
-    // fully composed envelope — prompt pin, thread key, contract,
-    // transcript.
+    // fully composed envelope — thread key, contract, transcript, skills.
     let dispatches = ctx.dispatch_msgs();
     assert_eq!(dispatches.len(), 1);
     let DispatchMsg::Dispatch {
         dispatch_id,
         recipe_id,
         payload,
+        ..
     } = &dispatches[0]
     else {
         panic!("expected a dispatch");
@@ -56,12 +119,11 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
     assert_eq!(*recipe_id, recipe_id_for("bot1"));
     let envelope: serde_json::Value =
         serde_json::from_slice(payload).expect("the payload is a JSON envelope");
-    assert_eq!(envelope["ducktape_run"], RUN_ENVELOPE_VERSION);
+    assert_eq!(envelope["ducktape_run"], crate::envelope::RUN_ENVELOPE_VERSION);
     assert_eq!(envelope["agent_id"], "bot1");
-    assert_eq!(
-        envelope["prompt_hash"],
-        "07".repeat(PROMPT_HASH_LEN),
-        "the registry's prompt pin rides the envelope"
+    assert!(
+        envelope.get("prompt_hash").is_none(),
+        "the prompt pin retired: an agent is its curated skills"
     );
     assert_eq!(
         envelope["thread_key"], "general#3",
@@ -88,13 +150,20 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
 }
 
 #[test]
-fn the_envelope_tracks_the_registrys_live_prompt_pin() {
-    // runs never mirrors the pin: composition queries the registry at
+fn the_envelope_tracks_the_registrys_live_skill_set() {
+    // runs never mirrors the agent's soul: composition queries the registry at
     // dispatch time (staged same-block registrations included), so an
-    // UpdateAgent prompt rotation is picked up by the very next run
-    // without any hook payload carrying it, and a capability retune
-    // never disturbs it.
+    // UpdateAgent that re-curates the skills — including flipping one to
+    // `always`, which is what the persona IS — is picked up by the very next
+    // run without any hook payload carrying it, and a capability retune never
+    // disturbs it.
     let mut registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    registry.get_mut("bot").unwrap().skills = vec![agent::SkillRef {
+        name: "persona".into(),
+        source_prefix: "/shared/skills/persona".into(),
+        source_snapshot: Some("bb".repeat(32)),
+        load: agent::LoadMode::OnDemand,
+    }];
     let mut m = watched(TurnPolicy::All, &registry);
 
     // the registration hook fires as it would in the record's block.
@@ -118,11 +187,15 @@ fn the_envelope_tracks_the_registrys_live_prompt_pin() {
         panic!("expected a dispatch");
     };
     let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
-    assert_eq!(envelope["prompt_hash"], "07".repeat(PROMPT_HASH_LEN));
+    assert_eq!(
+        envelope["skills"][0]["always"], false,
+        "the skill starts on-demand: no persona yet"
+    );
 
-    // the owner rotates the prompt; the registry hook only ever carries
-    // capability retunes — process one to show it is orthogonal.
-    registry.get_mut("bot").unwrap().prompt_hash = vec![9u8; PROMPT_HASH_LEN];
+    // the owner promotes the skill to the agent's persona; the registry hook
+    // only ever carries capability retunes — process one to show it is
+    // orthogonal.
+    registry.get_mut("bot").unwrap().skills[0].load = agent::LoadMode::Always;
     let mut hook_ctx = CaptureCtx::new()
         .with_agent_origin()
         .with_registry(&registry);
@@ -144,17 +217,17 @@ fn the_envelope_tracks_the_registrys_live_prompt_pin() {
     };
     let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
     assert_eq!(
-        envelope["prompt_hash"],
-        "09".repeat(PROMPT_HASH_LEN),
-        "the next run composes from the updated record"
+        envelope["skills"][0]["always"], true,
+        "the next run composes from the updated record — the host now inlines it"
     );
     assert_eq!(envelope["agent_id"], "bot");
 }
 
 #[test]
-fn an_agent_without_a_prompt_pin_dispatches_a_null_prompt_hash() {
-    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    registry.get_mut("bot").unwrap().prompt_hash = Vec::new();
+fn an_agent_with_no_always_skill_dispatches_the_generic_instructions() {
+    // no curated skills at all: nothing to assemble a soul from, so the generic
+    // instructions are the floor. no prompt pin exists to hide them any more.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let mut m = watched(TurnPolicy::All, &registry);
     let ctx = engage_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
@@ -162,9 +235,10 @@ fn an_agent_without_a_prompt_pin_dispatches_a_null_prompt_hash() {
         panic!("expected a dispatch");
     };
     let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
-    assert!(
-        envelope["prompt_hash"].is_null(),
-        "no pin composes as null — the host falls back to instructions"
+    assert_eq!(
+        envelope["skills"].as_array().unwrap().len(),
+        0,
+        "no skills is []"
     );
     assert!(
         envelope["instructions"]
@@ -356,6 +430,7 @@ fn duplicate_turn_claims_are_deterministic_no_ops() {
             agent_id: "bot".into(),
             channel_id: "general".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap();
@@ -409,6 +484,7 @@ fn a_delivered_turn_stays_claimed_via_the_dispatch_record() {
             agent_id: "bot".into(),
             channel_id: "general".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap();
@@ -455,6 +531,7 @@ fn chat_and_job_run_keys_are_structurally_disjoint_and_reject_separator_inputs()
             agent_id: "bot".into(),
             channel_id: "bad\u{1f}channel".into(),
             anchor_seq: 1,
+            demands: Default::default(),
         }),
     )
     .unwrap_err();

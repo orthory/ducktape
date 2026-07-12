@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { Icon } from "../../components/Icon";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
@@ -31,18 +31,24 @@ export function PageTree({
   const rows = flattenVisible(nodes, collapsed);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [hoverId, setHoverId] = useState<string | null>(null);
+
+  // The open row's own subtree — the pages it may NOT move under. It was
+  // recomputed (a full DFS) inside a filter callback, i.e. once per candidate
+  // row, so opening one menu cost O(N²) walks of the whole forest. It is one
+  // Set, and only the open menu needs it.
+  const forbidden = useMemo(
+    () => (menuFor ? subtreeIds(nodes, menuFor) : null),
+    [nodes, menuFor],
+  );
+
   return (
     <div role="tree" aria-label="Pages">
       {rows.map((row) => {
         const active = row.id === activeId;
         const isCollapsed = collapsed.has(row.id);
-        // legal move targets (every page outside this row's own subtree) are
-        // only needed when THIS row's menu is open — computing the O(N) subtree
-        // DFS + filter for every row on every render is O(N^2) and wasted.
         const menuOpen = menuFor === row.id;
-        const moveTargets = menuOpen
-          ? rows.filter((r) => !subtreeIds(nodes, row.id).has(r.id))
-          : [];
+        const moveTargets =
+          menuOpen && forbidden ? rows.filter((r) => !forbidden.has(r.id)) : [];
         const rowStyle: CSSProperties = {
           display: "flex",
           alignItems: "center",
@@ -196,6 +202,9 @@ export function PageTree({
                 >
                   Top level
                 </button>
+                {/* indented by depth: a FLAT list of every title said nothing
+                    about where a page would actually land, and two pages with
+                    the same name were indistinguishable. */}
                 {moveTargets.map((t) => (
                   <button
                     key={t.id}
@@ -205,7 +214,7 @@ export function PageTree({
                       setMenuFor(null);
                       onMove(row.id, t.id);
                     }}
-                    style={menuItem}
+                    style={{ ...menuItem, paddingLeft: 9 + t.depth * 11 }}
                   >
                     {t.title}
                   </button>

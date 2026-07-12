@@ -94,6 +94,7 @@ pub fn spawn_hub(
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
+    planes: data_plane::PlaneMonitor,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("voice-hub".into())
@@ -103,7 +104,7 @@ pub fn spawn_hub(
                 .enable_all()
                 .build()
                 .expect("voice-hub tokio runtime")
-                .block_on(hub_loop(requests, factory, peers, me));
+                .block_on(hub_loop(requests, factory, peers, me, planes));
         })
         .expect("spawn voice-hub thread")
 }
@@ -160,6 +161,7 @@ async fn hub_loop(
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
+    planes: data_plane::PlaneMonitor,
 ) {
     let flows = Arc::new(ActiveFlows::default());
     let (voice_plane, video_plane) = crate::voice_plane::bind_media_planes(
@@ -169,6 +171,9 @@ async fn hub_loop(
         flows.clone() as Arc<dyn AdmissionPolicy>,
     )
     .await;
+    // huddle media is the chat module's: both planes report under it.
+    planes.register("chat", Service::Voice, voice_plane.watch());
+    planes.register("chat", Service::Video, video_plane.watch());
     serve_sessions(requests, voice_plane, video_plane, flows).await;
 }
 
@@ -666,10 +671,6 @@ mod tests {
 
     impl DataPlaneTransport for MemLink {
         type Stream = tokio::io::DuplexStream;
-
-        fn max_datagram(&self) -> usize {
-            data_plane::MAX_DATAGRAM
-        }
 
         async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
             // fire-and-forget: a full lane drops the frame, exactly as an
@@ -1256,7 +1257,7 @@ mod overlay_e2e {
     use commonware_cryptography::{Signer as _, ed25519};
     use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
     use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
-    use wireguard_effect::WireGuardEffect;
+    use wireguard::effect::WireGuardEffect;
 
     use super::*;
 
@@ -1310,9 +1311,9 @@ mod overlay_e2e {
     fn stand_up(node_seed: u64, wg_seed: u8) -> OverlayNode {
         let node_key = ed25519::PrivateKey::from_seed(node_seed).public_key();
         let raw_key: [u8; 32] = node_key.as_ref().try_into().expect("ed25519 is 32 bytes");
-        let ula = wireguard_upgrade::ula_v6_member_addr(
+        let ula = wireguard::ula_v6_member_addr(
             NS,
-            wireguard_upgrade::ValidatorIdentity(raw_key),
+            wireguard::ValidatorIdentity(raw_key),
         );
         let mut node = OverlayNode {
             effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
@@ -1360,7 +1361,13 @@ mod overlay_e2e {
         let (req_tx, req_rx) = mpsc::channel(4);
         let factory: Arc<dyn SocketFactory> =
             Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));
-        spawn_hub(req_rx, factory, peers, node.raw_key);
+        spawn_hub(
+            req_rx,
+            factory,
+            peers,
+            node.raw_key,
+            data_plane::PlaneMonitor::default(),
+        );
         req_tx
     }
 

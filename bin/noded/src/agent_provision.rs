@@ -18,24 +18,47 @@
 //! forge repo base are all reachable, the reachability wall dispatch-oracle
 //! cannot cross.
 //!
+//! whichever lane materializes it, every run is handed the same TOOL PLANE
+//! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
+//! `PATH` (where `ducktape-mcp` ships), the node's http base as `DUCKTAPE_NODE`,
+//! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
+//! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
+//! and know who it acts for; the GRANT itself is never in the env (see
+//! [`run_env`]).
+//!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
 //! a root VALIDATED at boot to be OUTSIDE `<storage>` — so a `..` from a
 //! checkout can NOT reach `user.key`, the node keys, qmdb, the blobstore, or
 //! forge's git substrate. the managed `/v1/fs/workspaces` root stays under
 //! `<storage>`; this is a distinct, relocated root for live agent runs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
+    assemble_context_doc, parse_skill_md,
 };
+use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 
 use crate::NodeHandle;
+use crate::actor_api::ActorNodeApi;
 
 mod duckfs;
 mod forge;
+mod session;
 
 pub use forge::forge_push_base;
+
+#[cfg(test)]
+#[path = "agent_provision/plane_tests.rs"]
+mod plane_tests;
+
+// the composer → provisioner → consensus id boundary, crossed end to end: the
+// one test that fails when a session bind names a run `runs` cannot resolve.
+#[cfg(test)]
+#[path = "agent_provision/session_boundary_tests.rs"]
+mod session_boundary_tests;
 
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
@@ -142,6 +165,208 @@ fn mount_dir_name(subpath: &str) -> Result<(), String> {
     }
 }
 
+/// this node's OWN http base — `http://<host>:<port>`, derived from its listen
+/// address, with a wildcard bind rewritten to the SAME family's loopback
+/// (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]` — a bindv6only `[::]` listener
+/// refuses v4 loopback dials). the base must be a CONNECTABLE host: a run's
+/// tool plane dials it back (`DUCKTAPE_NODE`), and the forge lane pushes to it
+/// ([`forge_push_base`] is exactly this base plus `/forge`). `None` in = no
+/// http surface = nothing to dial.
+pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
+    let listen = http_listen?;
+    let base = match listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let loopback = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+            format!("{loopback}:{}", addr.port())
+        }
+        Ok(addr) => addr.to_string(),
+        // not a socket address (hostname:port) — trust the operator's string.
+        Err(_) => listen.to_string(),
+    };
+    Some(format!("http://{base}"))
+}
+
+/// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
+/// binary. `ducktape-mcp` ships beside `noded`/`node`, and the runner CLI
+/// (codex/claude) spawns the MCP server by BARE command name from OUTSIDE the
+/// agent's sandbox — so putting this one dir on the child's PATH is the whole
+/// of how `ducktape-mcp` resolves.
+///
+/// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
+/// degrades to NO entry rather than failing the run: the agent still runs,
+/// just without the tool plane. never the other way round.
+fn tool_path_entries() -> Vec<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .into_iter()
+        .collect()
+}
+
+/// the run child's environment, shared by both lanes: where its writable tree
+/// is, where its W6 skill trees are, which node its tools dial, and which agent
+/// it is acting for.
+///
+/// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape-fs` reads — one
+/// name for "the node this process talks to", so every Ducktape tool a run
+/// spawns (the `ducktape-mcp` server the runner CLI starts, outside the agent's
+/// sandbox, included) finds the node without a second convention. a node with
+/// no http surface has nothing to name, so the var is simply absent.
+///
+/// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the grant —
+/// owner, allowed_actions, ResourceCaps — is read back from the COMMITTED agent
+/// registry by whoever holds this id; copying it into the env would mint a
+/// second, unversioned copy that drifts from the record it came from the moment
+/// the registry moves. the committed record is the one truth.
+///
+/// `DUCKTAPE_RUN_SESSION_KEY` + `DUCKTAPE_RUN_ID` are the WRITE half of the tool
+/// plane, and they appear together or not at all: the key signs the op, the run
+/// id says which session it belongs to, and neither is any use alone. absent =
+/// no session opened ([`session::open`]) = the read-only plane, which is the
+/// pre-session behaviour and never an error.
+///
+/// `DUCKTAPE_RUN_ID` is the session's own [`session::RunSession::run_id`] — the
+/// CONSENSUS run id, the only id space `runs` resolves. it is deliberately NOT
+/// `spec.run_id` (`{saga_id}:{attempt}`, the on-disk dir key): the MCP server
+/// stamps this var onto every `RunsMsg::AgentAction` the agent submits, so a
+/// host-local id here would make every mid-run write name a run that does not
+/// exist — which is exactly how the write plane came to be dead-on-arrival.
+///
+/// the key is the agent's PRIVATE half, in a process the agent can read — a
+/// BEARER CREDENTIAL, not a least-privilege token. it can sign any `Msg` to any
+/// module, and consensus only re-checks the grant on the `AgentAction` lane; a
+/// leaked key posts to open channels as a plain user, run or no run. what
+/// contains it is the run's SANDBOX (no network), not its authority — see
+/// [`session`]. the NODE key, which signs validator votes and every op the human
+/// makes, must never be here at all.
+fn run_env(
+    dir: &Path,
+    ro_dir: Option<&Path>,
+    node_url: Option<&str>,
+    spec: &WorkspaceSpec,
+    session: Option<&session::RunSession>,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
+    if let Some(ro) = ro_dir {
+        // the consumer hook: skill trees live under this root, one dir per
+        // mount name.
+        env.insert("DUCKTAPE_RUN_SKILLS".into(), ro.display().to_string());
+    }
+    if let Some(url) = node_url {
+        env.insert("DUCKTAPE_NODE".into(), url.to_string());
+    }
+    if let Some(agent) = &spec.agent_id {
+        env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
+    }
+    if let Some(session) = session {
+        env.insert(
+            "DUCKTAPE_RUN_SESSION_KEY".into(),
+            session.private_hex.clone(),
+        );
+        env.insert("DUCKTAPE_RUN_ID".into(), session.run_id.clone());
+    }
+    env
+}
+
+/// the file every skill document is read from, inside its mount — the
+/// convention this repo's own `skills/` already follow.
+const SKILL_DOC: &str = "SKILL.md";
+
+/// materialize the run's W6 skill mounts under `ro_root` — one duckfs checkout
+/// per mount at `<ro_root>/<name>` — and ASSEMBLE THE RUN'S SOUL from them. the
+/// ONE implementation both lanes call.
+///
+/// the two jobs live together because this is the only place that has both
+/// halves: the committed curation (`mounts`: names, order, load modes) and the
+/// materialized bodies. dispatch-oracle owns the pure assembly
+/// ([`dispatch_oracle::assemble_context_doc`]) but cannot cross the reachability
+/// wall to read a duckfs checkout; the binary can read files but must not decide
+/// the document's shape. so: read here, assemble there.
+///
+/// the ro root is a SUFFIXED SIBLING of the run's writable tree (`<slug>-ro`),
+/// never a child of it: the duckfs lane's `commit` scans only under the rw dir
+/// and the forge lane's `git add -A` only sees its own worktree, so a skill
+/// tree beside them can never leak into an output snapshot or ride a pushed
+/// branch. mount names arrive PRE-VALIDATED ([`mount_dir_name`] + dedup) from
+/// [`NodedProvisioner::provision`].
+///
+/// SYNC on purpose: the engine is blocking std::fs + `block_on` of the actor,
+/// so every caller runs this on `spawn_blocking` — NEVER an async worker.
+///
+/// W5 on the error path: a checkout can fail PARTWAY (transport mid-read,
+/// verify mismatch) after materializing some of the tree, and a failed
+/// provision hands the run no workspace to clean up — so this removes its OWN
+/// debris (the whole ro root) before returning. the caller unwinds the rw tree
+/// it already materialized. an over-budget soul (a blown context bound) fails on
+/// that same path: the mounts are already on disk when the assembler refuses.
+fn checkout_ro_mounts(
+    handle: &NodeHandle,
+    ro_root: &Path,
+    mounts: &[RoMount],
+    library_readable: bool,
+) -> Result<String, String> {
+    let api = ActorNodeApi::new(handle.clone());
+    mounts
+        .iter()
+        .map(|m| {
+            checkout_with(
+                &api,
+                &ro_root.join(&m.mount_subpath),
+                &m.source_prefix,
+                m.source_snapshot.as_deref(),
+                &CheckoutOptions::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            read_skill_doc(ro_root, m)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|docs| assemble_context_doc(&docs, library_readable))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(ro_root);
+        })
+}
+
+/// read one materialized mount's `SKILL.md` into the plain-data [`SkillDoc`] the
+/// assembler takes. the mount's COMMITTED name is the heading — never a name
+/// read out of the document, which would let a doc rename itself into another
+/// agent's persona.
+///
+/// the two degrade rules are deliberately asymmetric:
+/// - an `always` skill whose body is missing or unreadable FAILS THE RUN. it is
+///   the agent's persona: running without it would quietly produce a different
+///   agent, which is exactly the class of silent corruption a loud failure is
+///   cheaper than.
+/// - an on-demand skill degrades to a name-only index entry (no body read is
+///   even needed for it beyond its description) — a cosmetic parse must never
+///   cost a run. non-utf8 or frontmatter-less is the same story: index it.
+fn read_skill_doc(ro_root: &Path, mount: &RoMount) -> Result<SkillDoc, String> {
+    let path = ro_root.join(&mount.mount_subpath).join(SKILL_DOC);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if mount.always => {
+            return Err(format!(
+                "skill {:?} is loaded ALWAYS (it is this agent's persona) but its \
+                 {SKILL_DOC} could not be read at {}: {e} — refusing to run a \
+                 different agent",
+                mount.mount_subpath,
+                path.display()
+            ));
+        }
+        // on-demand: the agent is told the skill exists and where to read it;
+        // whether THIS node could read the body now changes nothing about the
+        // run it is about to do.
+        Err(_) => None,
+    };
+    let (description, body) = text.as_deref().map(parse_skill_md).unwrap_or_default();
+    Ok(SkillDoc {
+        name: mount.mount_subpath.clone(),
+        description,
+        body,
+        always: mount.always,
+    })
+}
+
 /// the real provisioner: mints per-run workspaces under `root`, driving the
 /// duckfs engine over `handle`'s actor lane and (when [`Self::with_forge`]
 /// configured a usable lane) the forge worktree engine over host `git`.
@@ -152,6 +377,10 @@ pub struct NodedProvisioner {
     /// `Err(reason)` — decided ONCE at construction, permanent and loud —
     /// when it can't. the duckfs lane is unaffected either way.
     forge: Result<forge::ForgeLane, String>,
+    /// this node's http base, handed to every run as `DUCKTAPE_NODE` so its
+    /// tool plane can dial back. `None` = no http surface = the var is unset
+    /// (see [`Self::with_node_url`]).
+    node_url: Option<String>,
 }
 
 impl NodedProvisioner {
@@ -162,7 +391,18 @@ impl NodedProvisioner {
             forge: Err("this provisioner was built without a forge lane \
                         (with_forge was never called)"
                 .into()),
+            node_url: None,
         }
+    }
+
+    /// bind the agent tool plane to this node: `node_url` is the base every run
+    /// dials as `DUCKTAPE_NODE` ([`node_http_base`] derives it from the node's
+    /// http listen address). `None` — a node serving no http surface — leaves
+    /// the var unset: there is nothing for a run's tools to talk to, and a
+    /// guessed URL would be worse than an absent one.
+    pub fn with_node_url(mut self, node_url: Option<String>) -> Self {
+        self.node_url = node_url;
+        self
     }
 
     /// configure the forge worktree lane: `push_base` is the loopback
@@ -220,6 +460,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 ));
             }
         }
+        let ro_root = self.root.join(format!("{slug}-ro"));
         match &spec.source {
             WorkspaceSource::Duckfs {
                 source_prefix,
@@ -228,15 +469,26 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 duckfs::provision(
                     self.handle.clone(),
                     run_dir,
-                    self.root.join(format!("{slug}-ro")),
+                    ro_root,
                     source_prefix.clone(),
                     source_snapshot.clone(),
+                    self.node_url.clone(),
                     spec,
                 )
                 .await
             }
             WorkspaceSource::Forge { repo, .. } => match &self.forge {
-                Ok(lane) => forge::provision(lane, run_dir, spec).await,
+                Ok(lane) => {
+                    forge::provision(
+                        lane,
+                        self.handle.clone(),
+                        run_dir,
+                        ro_root,
+                        self.node_url.clone(),
+                        spec,
+                    )
+                    .await
+                }
                 // a loud attempt failure BEFORE any on-disk debris — the saga
                 // settles the attempt (liveness is its job, not ours).
                 Err(reason) => Err(format!(
@@ -299,6 +551,68 @@ mod tests {
         assert_ne!(a0, a1, "attempt 0 and 1 get distinct dirs");
         // deterministic per run_id (idempotent provision + cleanup).
         assert_eq!(run_slug("saga:2"), run_slug("saga:2"));
+    }
+
+    /// a materialized mount on disk — what `checkout_ro_mounts` leaves behind.
+    fn materialize(ro_root: &Path, name: &str, body: Option<&str>) -> RoMount {
+        std::fs::create_dir_all(ro_root.join(name)).unwrap();
+        if let Some(body) = body {
+            std::fs::write(ro_root.join(name).join(SKILL_DOC), body).unwrap();
+        }
+        RoMount {
+            source_prefix: format!("/shared/skills/{name}"),
+            source_snapshot: None,
+            mount_subpath: name.into(),
+            always: false,
+        }
+    }
+
+    #[test]
+    fn an_always_skill_with_no_readable_body_fails_the_run_loudly() {
+        // THE asymmetry: an `always` skill IS the agent's persona. a run that
+        // silently proceeds without it is a DIFFERENT agent answering under the
+        // same name — so the missing body is a loud provision failure, never a
+        // degrade. (an on-demand body is another matter: see below.)
+        let ro_root = std::env::temp_dir().join(format!("soul-always-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ro_root);
+        let mut mount = materialize(&ro_root, "persona", None);
+        mount.always = true;
+
+        let err = read_skill_doc(&ro_root, &mount).unwrap_err();
+        assert!(err.contains("persona"), "names the skill: {err}");
+        assert!(
+            err.contains("refusing to run a different agent"),
+            "states WHY it is fatal: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&ro_root);
+    }
+
+    #[test]
+    fn an_on_demand_skill_degrades_to_a_name_only_entry_rather_than_failing() {
+        // a cosmetic parse (or an unreadable body) on a skill the agent was only
+        // ever going to READ IF RELEVANT must never cost the run: it degrades to
+        // a name-only index entry, and the agent can still go look.
+        let ro_root = std::env::temp_dir().join(format!("soul-ondemand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ro_root);
+
+        let missing = materialize(&ro_root, "gone", None);
+        let doc = read_skill_doc(&ro_root, &missing).expect("an on-demand miss never fails a run");
+        assert_eq!(doc.name, "gone");
+        assert_eq!(doc.description, None);
+        assert!(doc.body.is_empty());
+
+        // frontmatter present ⇒ the description reaches the index, and the
+        // heading is the COMMITTED mount name, never a name from the document.
+        let described = materialize(
+            &ro_root,
+            "release",
+            Some("---\nname: not-my-name\ndescription: Cut a release.\n---\nthe body\n"),
+        );
+        let doc = read_skill_doc(&ro_root, &described).unwrap();
+        assert_eq!(doc.name, "release", "a doc cannot rename itself");
+        assert_eq!(doc.description.as_deref(), Some("Cut a release."));
+        assert_eq!(doc.body, "the body\n");
+        let _ = std::fs::remove_dir_all(&ro_root);
     }
 
     #[test]

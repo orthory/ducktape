@@ -14,18 +14,75 @@ import { accentVar, color, font, radius, shadow, tint } from "../../theme/tokens
 // ── Static labels ───────────────────────────────────────
 
 export const ACTION_LABEL: Record<string, string> = {
-  "chat.post": "Post to chat",
+  "chat.post": "Reply in chat",
+  "chat.post_message": "Post to any channel",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
+  "pages.comment": "Comment on pages",
+  "pages.set_checked": "Check off page todos",
 };
 
 // Permission checkboxes read as plain abilities ("what this agent can do"),
 // not as the wire action ids they map to.
+//
+// chat.post and chat.post_message are deliberately worded as the different
+// powers they are: the first only lets an agent answer where it was spoken to,
+// the second lets it speak, unprompted, anywhere. Granting the reply must never
+// look like it grants the broadcast.
 export const ACTION_HINT: Record<string, string> = {
-  "chat.post": "Reply in chat",
+  "chat.post": "Reply in the thread it was mentioned in",
+  "chat.post_message": "Start messages in any channel, on its own initiative",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
+  "pages.comment": "Comment on pages",
+  "pages.set_checked": "Check off page todos",
 };
+
+/** Parse the pages_write caps field: whitespace/comma-separated page ids,
+ *  the literal "*" allowed. The node canonicalizes (sort + dedup). */
+export const parsePagesWrite = (text: string): string[] =>
+  text.split(/[\s,]+/).filter(Boolean);
+
+/** One permission pill: the checkbox affordance the register and edit forms both
+ *  use for a grant that is NOT one of KNOWN_ACTIONS (a resource cap). Same look
+ *  as the action checkboxes beside it — a grant is a grant, whichever list it
+ *  lands in on the wire. */
+export const CapCheckbox = ({
+  id,
+  label,
+  checked,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) => (
+  <label
+    htmlFor={id}
+    style={{
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 7,
+      border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
+      borderRadius: radius.sm,
+      background: checked ? statusTone.agent.bg : color.paper,
+      padding: "6px 9px",
+      cursor: "pointer",
+      font: `600 10.5px ${font.sans}`,
+      color: checked ? accentVar : color.muted3,
+    }}
+  >
+    <input
+      id={id}
+      type="checkbox"
+      checked={checked}
+      onChange={(event) => onChange(event.target.checked)}
+      style={{ margin: 0 }}
+    />
+    <span>{label}</span>
+  </label>
+);
 
 export type Tone = { text: string; bg: string; border: string };
 
@@ -83,22 +140,47 @@ export const primaryButton = (enabled: boolean): CSSProperties => ({
   boxShadow: enabled ? "0 1px 2px rgba(160,90,60,.30)" : undefined,
 });
 
+/** Mix the filled control's foreground and background so overlays follow the
+ * filled surface when the theme flips its polarity. */
+export const filledMix = (onFilledPercent: number): string =>
+  `color-mix(in srgb, ${color.onDark} ${onFilledPercent}%, ${color.dark})`;
+
+export const FILLED_IDENTITY_TEXT_PERCENT = 70;
+export const FILLED_SEMANTIC_TEXT_PERCENT = 35;
+
+/** Keep semantic foregrounds readable on the filled identity band. The
+ * status hue stays visible, but the on-filled token supplies the contrast when
+ * dark mode turns that band light. */
+export const filledForeground = (base: string): string =>
+  `color-mix(in srgb, ${base} ${FILLED_SEMANTIC_TEXT_PERCENT}%, ${color.onDark})`;
+
 // A control styled to sit on the agent card's dark identity band.
 export const onDarkButton: CSSProperties = {
   ...secondaryButton,
   minHeight: 30,
-  border: "1px solid rgba(239,239,239,.22)",
-  background: "rgba(239,239,239,.07)",
+  border: `1px solid ${filledMix(22)}`,
+  background: filledMix(7),
   color: color.onDark,
 };
 
 // ── Wire → display helpers ──────────────────────────────
 
+/** Consensus admits only DNS-label agent ids (`validate_agent_id`,
+ *  crates/apps/agent/src/lib.rs) — the id IS the local part of
+ *  `<agent_id>@agents.duck`. The Rust const is the source of truth; the drift
+ *  test in parts.test.ts reads it. */
+export const MAX_AGENT_ID_LEN = 63;
+
+/** Derive an agent id from free text. TOTAL: the result is always a legal
+ *  label or the empty string (the caller's only failure case) — truncation to
+ *  the length cap happens BEFORE the hyphen trim, so a cut mid-word can't
+ *  leave a trailing hyphen. */
 export const slug = (raw: string): string =>
   raw
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
+    .slice(0, MAX_AGENT_ID_LEN)
     .replace(/(^-|-$)/g, "");
 
 /** Present a lowercase executor tag ("codex") as a friendly label ("Codex").

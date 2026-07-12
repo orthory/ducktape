@@ -1,53 +1,18 @@
-//! the replication layer — a [`Node`] wraps a [`host::Host`] and gives it a
-//! byte-oriented [`Transport`] seam so one host can run REPLICATED across peers.
-//!
-//! ## the two msg flows
-//!
-//! **outbound** (a locally-originated msg): [`Node::apply_local`] submits the msg
-//! to the local host first (so our own view advances immediately — the "echo"),
-//! then propagates the msg's bytes to peers over its [`Transport`]. this is the
-//! ONLY path that ever touches the wire.
-//!
-//! **inbound** (a msg that arrived from a peer): [`Node::poll_inbound`] drains
-//! the transport's inbound queue, decodes each batch, and submits every msg to
-//! the local host — and NEVER re-propagates. that wire-level asymmetry (outbound
-//! propagates, inbound does not) IS the local-only rule: it is what keeps a
-//! two-node loop from ping-ponging a msg back and forth forever.
-//!
-//! ## why the node's re-entry rule is only wire-level
-//!
-//! [`host::Host::submit`] already runs the intra-block follow-up drain: a module
-//! that emits a [`Msg`] via `ctx.emit_msg` has it re-dispatched as a LOCAL-ONLY
-//! follow-up op (`Origin::Module`), capped at `host::MAX_DISPATCHES`, never
-//! surfaced for broadcast. so module-level re-entry is already contained inside
-//! one block. the node only has to enforce the rule at the network boundary:
-//! ops that came off the wire are applied, not rebroadcast.
-//!
-//! ## pull-based, single-owner
-//!
-//! unlike the legacy background-task node, inbound is PULL-based
-//! ([`Node::poll_inbound`]) rather than a spawned reader loop. that lets the
-//! node OWN its `Host` directly (no `Arc<Mutex>`), keeps the convergence test
-//! deterministic (no interval / notify race to wait on), and keeps this crate
-//! runtime-agnostic — it spawns nothing and depends on no async runtime. the
-//! real commonware transport (a later slice) will add its own inbound plumbing
-//! behind the same [`Transport`] seam.
+//! the replication layer — an [`OrderedNode`] wraps a [`host::Host`] with an
+//! [`Orderer`] seam so N validators apply an AGREED TOTAL ORDER of signed op
+//! frames identically. a locally-originated msg is NOT applied on submission;
+//! it is proposed into the order and applied via `host.submit` ONLY when the
+//! order delivers it — in the identical sequence on every validator — so even
+//! an order-DEPENDENT qmdb root converges (the ordering-seam section below
+//! carries the full rationale). the crate is runtime-agnostic — it spawns
+//! nothing and depends on no async runtime; the real commonware simplex
+//! orderer is the drop-in behind the same [`Orderer`] trait.
 
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-
-use serde::{Deserialize, Serialize};
-
-use host::{BlockContext, BlockOutcome, Host, MemberOutcome};
+use host::{BlockContext, Host, MemberOutcome};
 use sdk::{Effect, Msg, StateRoot};
-
-/// the bytes delivered on the inbound channel: a serialized msg-batch.
-pub type Inbound = Vec<u8>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("wire decode failed: {0}")]
-    Decode(#[from] serde_json::Error),
     #[error("host error: {0}")]
     Host(#[from] sdk::Error),
     /// a node-local block-boundary fault (see [`host::FatalError`]): this node's
@@ -82,260 +47,16 @@ impl From<host::SubmitError> for Error {
 }
 
 // ============================================================================
-// wire codec — encode Msg in THIS crate (encode-in-node), not on sdk::Msg.
-// ============================================================================
-//
-// sdk deliberately carries no serde dep ("async-trait is the one exception"), so
-// the wire concern lives here rather than deriving Serialize on `Msg`. `WireMsg`
-// is a private serde mirror of the two public `Msg` fields; a batch is a plain
-// `Vec<WireMsg>` over serde_json. only the app-hash has to match across nodes,
-// not the wire bytes, so a json envelope is free to evolve independently.
-//
-// NB: this is the GOSSIP-lane msg batch (`encode_msg_batch`/`decode_msg_batch`),
-// distinct from the ordered-lane op-frame batch super-frame
-// (`encode_batch`/`decode_batch`, defined near the frame codec below) — same
-// word "batch", two unrelated wire units.
-
-#[derive(Serialize, Deserialize)]
-struct WireMsg {
-    target: String,
-    payload: Vec<u8>,
-}
-
-impl From<&Msg> for WireMsg {
-    fn from(m: &Msg) -> Self {
-        WireMsg {
-            target: m.target.clone(),
-            payload: m.payload.clone(),
-        }
-    }
-}
-
-impl From<WireMsg> for Msg {
-    fn from(w: WireMsg) -> Self {
-        Msg {
-            target: w.target,
-            payload: w.payload,
-        }
-    }
-}
-
-/// serialize a GOSSIP-lane msg-batch to bytes. infallible — the fields are plain
-/// data. (the ordered-lane op-frame batch is [`encode_batch`], unrelated.)
-pub fn encode_msg_batch(msgs: &[Msg]) -> Vec<u8> {
-    let wire: Vec<WireMsg> = msgs.iter().map(WireMsg::from).collect();
-    serde_json::to_vec(&wire).expect("msg batch serializes")
-}
-
-/// deserialize a GOSSIP-lane msg-batch from bytes.
-pub fn decode_msg_batch(bytes: &[u8]) -> Result<Vec<Msg>, Error> {
-    let wire: Vec<WireMsg> = serde_json::from_slice(bytes)?;
-    Ok(wire.into_iter().map(Msg::from).collect())
-}
-
-// ============================================================================
-// the transport seam + the in-process loopback impl.
-// ============================================================================
-
-/// byte-oriented transport seam: send an already-serialized msg-batch to peers.
-///
-/// `send` is async so the seam fits an over-the-wire impl (the later commonware
-/// p2p transport) without changing shape; the loopback impl's body is a plain
-/// synchronous push into each peer's queue wrapped in an `async move`, so it
-/// never actually suspends. the inbound side is NOT on the trait: each transport
-/// hands back its receiver at construction (see [`LoopbackHub::node`]), which
-/// sidesteps the object-safety question and lets a caller hold the concrete
-/// receiver type. (the trait is used behind a generic `T`, never `dyn`, so the
-/// return-position `impl Future` is fine.)
-pub trait Transport {
-    /// send a serialized msg-batch out to every peer (not back to self).
-    fn send(&self, bytes: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>>;
-}
-
-/// mints N connected in-memory transports. when one node sends, every OTHER
-/// node's inbound receiver gets the bytes — the sender does not.
-#[derive(Clone, Default)]
-pub struct LoopbackHub {
-    peers: Arc<Mutex<Vec<mpsc::Sender<Inbound>>>>,
-}
-
-impl LoopbackHub {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// register a new node. returns its transport handle and inbound receiver.
-    pub fn node(&self) -> (LoopbackTransport, mpsc::Receiver<Inbound>) {
-        let (tx, rx) = mpsc::channel();
-        let id = {
-            let mut peers = self.peers.lock().expect("hub lock poisoned");
-            peers.push(tx);
-            peers.len() - 1
-        };
-        (
-            LoopbackTransport {
-                id,
-                peers: self.peers.clone(),
-            },
-            rx,
-        )
-    }
-}
-
-/// a single node's handle onto the [`LoopbackHub`]. `Clone` so it can be shared;
-/// `id` is the sender's own index, skipped on fan-out so it never receives its
-/// own sends.
-#[derive(Clone)]
-pub struct LoopbackTransport {
-    id: usize,
-    peers: Arc<Mutex<Vec<mpsc::Sender<Inbound>>>>,
-}
-
-impl Transport for LoopbackTransport {
-    fn send(&self, bytes: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>> {
-        // capture cloned handles so the returned future owns its data (no borrow
-        // of `self` escapes). the body never awaits — loopback delivery is a
-        // synchronous fan-out — it just satisfies the async seam.
-        let peers = self.peers.clone();
-        let id = self.id;
-        async move {
-            let peers = peers.lock().expect("hub lock poisoned");
-            for (i, tx) in peers.iter().enumerate() {
-                if i == id {
-                    continue; // never deliver a node its own send.
-                }
-                // best-effort gossip: a gone peer must not fail the whole send.
-                let _ = tx.send(bytes.clone());
-            }
-            Ok(())
-        }
-    }
-}
-
-// ============================================================================
-// the node — a replicated wrapper over host::Host.
-// ============================================================================
-
-/// a replicated host. owns its [`Host`], a [`Transport`] handle, and the inbound
-/// receiver the transport handed back at construction. generic over the concrete
-/// transport `T` (no `dyn`), so the same type serves loopback today and the
-/// commonware transport later.
-pub struct Node<T: Transport> {
-    host: Host,
-    transport: T,
-    inbound: mpsc::Receiver<Inbound>,
-}
-
-impl<T: Transport> Node<T> {
-    /// wrap `host` with a `transport` handle and that transport's `inbound`
-    /// receiver.
-    pub fn new(host: Host, transport: T, inbound: mpsc::Receiver<Inbound>) -> Self {
-        Self {
-            host,
-            transport,
-            inbound,
-        }
-    }
-
-    /// OUTBOUND — a locally-originated msg. apply it to the local host first (the
-    /// echo: our view advances without waiting on a round-trip), then propagate
-    /// the msg's bytes to peers. this is the ONLY path that propagates. returns
-    /// the local [`BlockOutcome`] so the caller sees the resulting app-hash.
-    ///
-    /// `Msg` is `Clone`, so — unlike the legacy `!Clone` op — we simply clone for
-    /// the wire and submit the original; no encode-first dance, no re-decode.
-    pub async fn apply_local(&mut self, msg: Msg) -> Result<BlockOutcome, Error> {
-        let bytes = encode_msg_batch(std::slice::from_ref(&msg));
-        let outcome = self.host.submit(msg).await?;
-        // propagate AFTER the local apply so a slow peer never stalls our block.
-        let _ = self.transport.send(bytes).await;
-        Ok(outcome)
-    }
-
-    /// INBOUND — drain every msg-batch the transport delivered and submit each to
-    /// the local host. NEVER re-propagates: that asymmetry vs [`apply_local`] is
-    /// the local-only rule. returns the count of msgs applied (0 when idle), so a
-    /// test can await convergence deterministically without a wall-clock sleep.
-    ///
-    /// the inbound queue is drained into an owned `Vec` up front so no channel
-    /// borrow is held across the `host.submit(..).await`.
-    pub async fn poll_inbound(&mut self) -> Result<usize, Error> {
-        let batches: Vec<Inbound> = std::iter::from_fn(|| self.inbound.try_recv().ok()).collect();
-        let mut applied = 0usize;
-        for bytes in batches {
-            for msg in decode_msg_batch(&bytes)? {
-                self.host.submit(msg).await?;
-                applied += 1;
-            }
-        }
-        Ok(applied)
-    }
-
-    /// the current app-hash of the wrapped host.
-    pub fn app_hash(&self) -> StateRoot {
-        self.host.app_hash()
-    }
-
-    /// borrow the wrapped host (queries, module_root inspection, ...).
-    pub fn host(&self) -> &Host {
-        &self.host
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loopback_other_nodes_receive_sender_does_not() {
-        let hub = LoopbackHub::new();
-        let (node0, node0_rx) = hub.node();
-        let (_node1, node1_rx) = hub.node();
-
-        futures::executor::block_on(node0.send(b"hi".to_vec())).expect("send ok");
-
-        // node1 receives it.
-        assert_eq!(node1_rx.recv().expect("node1 got msg"), b"hi");
-        // node0 (the sender) does not.
-        assert!(matches!(
-            node0_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-    }
-
-    #[test]
-    fn wire_roundtrip_preserves_target_and_payload() {
-        let msgs = vec![
-            Msg {
-                target: "directory".into(),
-                payload: b"hello".to_vec(),
-            },
-            Msg {
-                target: "kv".into(),
-                payload: vec![],
-            },
-        ];
-        let decoded = decode_msg_batch(&encode_msg_batch(&msgs)).expect("roundtrips");
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].target, "directory");
-        assert_eq!(decoded[0].payload, b"hello");
-        assert_eq!(decoded[1].target, "kv");
-        assert!(decoded[1].payload.is_empty());
-    }
-}
-
-// ============================================================================
 // the ordering seam — an AGREED TOTAL ORDER over opaque op frames.
 // ============================================================================
 //
-// ## the semantic shift (why this is NOT the gossip path above)
+// ## why an agreed order (not gossip)
 //
-// the [`Transport`]/[`LoopbackHub`] path is GOSSIP: [`Node::apply_local`] applies
-// a msg to the local host IMMEDIATELY (the echo) then fans it out. that converges
-// only for order-INdependent module roots (a state-based `directory` root). a
-// qmdb root is op-log/MMR-order-DEPENDENT: the same SET of ops in different
-// orders yields a different root, so the instant two validators apply in
-// different orders their app-hash FORKS.
+// a gossip path (apply a locally-originated msg IMMEDIATELY — the echo — then
+// fan it out to peers) converges only for order-INdependent module roots (a
+// state-based `directory` root). a qmdb root is op-log/MMR-order-DEPENDENT:
+// the same SET of ops in different orders yields a different root, so the
+// instant two validators apply in different orders their app-hash FORKS.
 //
 // the fix is an AGREED TOTAL ORDER. a locally-originated msg is **NOT** applied
 // on submission — that optimistic echo is exactly what forks the chain the
@@ -536,8 +257,6 @@ pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
 // container's own content address is `frame_id(&batch_bytes)`; the orderer
 // orders these containers, and [`OrderedNode::drain_delivered`] decodes one into
 // its members and applies them as ONE block at ONE height under ONE app-hash.
-// (this is the ORDERED-lane batch — unrelated to the gossip-lane
-// [`encode_msg_batch`] above, which shares only the word "batch".)
 
 /// hard cap on ONE encoded batch super-frame — the packing target for
 /// [`OrderedNode::flush_batch`]. equal to [`MAX_FRAME_BYTES`]: a single member
@@ -1009,6 +728,12 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
     /// `None` until the first frame applies.
     finalized: Option<host::FinalizedBlock>,
+    /// the ENGINE view whose seal set `finalized` — what a recovery layer
+    /// matches finalization certificates against when persisting the floor.
+    /// `None` until a block seals under the CURRENT engine (fresh boot,
+    /// resume, or right after a cutover): a recovered boundary's floor is
+    /// already persisted, and a new epoch's floor waits for its first block.
+    finalized_view: Option<u64>,
     /// the app-height offset of the CURRENT engine's view 0. epoch cutover
     /// respawns the engine with views restarting at 0; the base keeps `Env`
     /// heights and the finalized boundary monotone across epochs
@@ -1078,6 +803,15 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// always a subset of `outstanding` (an un-flushed member is still in
     /// custody), so a cutover rebuilds it from `outstanding` and re-flushes.
     pending_batch: Vec<(FrameId, Vec<u8>)>,
+    /// the out-of-band source of component BYTES for code-registry swaps. the
+    /// drain reconciles running module code against the committed registry
+    /// (`Host::realize_module_swaps`) BEFORE applying each block, fetching any
+    /// newly-designated component through this. defaults to
+    /// [`host::NoCodeSource`]: a net with no armed swap never touches it, and a
+    /// node that never wired a real source FAILS CLOSED at the first armed
+    /// boundary instead of silently running stale code. `Arc` so the node and
+    /// its recovery sink can share the one source.
+    code_source: std::sync::Arc<dyn host::CodeSource>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -1097,6 +831,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized: None,
+            finalized_view: None,
             view_base: 0,
             last_engine_view: None,
             view_ceiling: None,
@@ -1106,6 +841,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         }
     }
 
@@ -1128,6 +864,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized,
+            finalized_view: None,
             view_base,
             last_engine_view: None,
             view_ceiling: None,
@@ -1137,7 +874,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
+            code_source: std::sync::Arc::new(host::NoCodeSource),
         }
+    }
+
+    /// wire the out-of-band component-byte source for code-registry swaps (the
+    /// node injects a blobstore-backed one; tests inject an in-memory map). the
+    /// default is [`host::NoCodeSource`] — see the field doc.
+    pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
+        self.code_source = src;
     }
 
     /// arm the observation barrier on `module` (see the field doc): every
@@ -1184,6 +929,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
+        // the finalized boundary carries over, but its VIEW belonged to the
+        // torn-down engine's clock — the new epoch's floor waits for its own
+        // first sealed block.
+        self.finalized_view = None;
         self.view_ceiling = None;
         // effects of pre-cutover blocks remain takeable. deferred frames
         // carry OLD-epoch views — stamping them under the new base would
@@ -1435,6 +1184,25 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 }
                 continue;
             }
+            // CODE-SWAP REALIZATION: reconcile every hot-swappable module's
+            // running code against the committed code registry's decision for
+            // `height`, BEFORE this block journals or applies — its dispatches
+            // must execute the code the registry designates for `height`. keyed
+            // purely on committed state + height, so live, restart-replay, and
+            // catch-up all realize the identical swap points. FAIL-CLOSED: a
+            // node lacking (or holding tampered) bytes for an armed hash must
+            // not apply this block on stale code — put the frame back (nothing
+            // journaled yet) and surface the stall; the drain retries once the
+            // bytes arrive. NEVER a fork: every honest node holding the bytes
+            // realizes identically, and one that doesn't stops here.
+            if let Err(e) = self
+                .host
+                .realize_module_swaps(height, self.code_source.as_ref())
+                .await
+            {
+                self.deferred.push_front((view, frame));
+                return Err(Error::Host(e));
+            }
             // below the ceiling this batch RESOLVES here as ONE block at ONE
             // height. WAL discipline: the batch bytes are finalized and about to
             // mutate state — journal them ONCE FIRST, so a crash mid-apply rolls
@@ -1647,6 +1415,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     height,
                     app_hash: self.host.app_hash(),
                 });
+                self.finalized_view = Some(view);
             }
         }
         Ok(applied)
@@ -1668,6 +1437,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// from. `None` until the first delivered frame applies.
     pub fn finalized(&self) -> Option<host::FinalizedBlock> {
         self.finalized
+    }
+
+    /// the ENGINE view whose seal set [`OrderedNode::finalized`] — what a
+    /// recovery layer matches finalization certificates against when
+    /// persisting the floor. `None` until a block seals under the current
+    /// engine (fresh boot, resume, or right after a cutover).
+    pub fn finalized_view(&self) -> Option<u64> {
+        self.finalized_view
     }
 
     /// the current app-hash of the wrapped host.

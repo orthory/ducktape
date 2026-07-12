@@ -39,10 +39,10 @@
 //! [`SagaModule::new`] runs [`LeasePolicy::Open`]: no assignee, any
 //! submitter's result accepted (first agreed one wins), lease windows still
 //! tracked when the trigger asks (so `Crank` can retry a silent worker).
-//! [`SagaModule::with_valset`] additionally rendezvous-assigns each attempt to
-//! `pool[H(saga_id ‖ attempt ‖ height) % n]` over the valset module's
-//! membership; [`SagaModule::with_assignment`] adds a capability registry,
-//! and a trigger that names a capability then draws its pool from that tag's
+//! [`SagaModule::with_assignment`] additionally rendezvous-assigns each
+//! attempt to `pool[H(saga_id ‖ attempt ‖ height) % n]` over the valset
+//! module's membership, with a capability registry on the side: a trigger
+//! that names a capability then draws its pool from that tag's
 //! ANNOUNCED PROVIDERS instead — only nodes that can execute the work ever
 //! hold its lease, and a tag nobody provides assigns nobody (never the raw
 //! valset). under [`LeasePolicy::Strict`] a result is accepted only from the
@@ -70,12 +70,16 @@
 mod interface;
 pub use interface::*;
 
+// the usage ledger: a node-local derived index over this module's op stream.
+pub mod index;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use capability::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
-    encode_query as capability_encode_query,
+    encode_query as capability_encode_query, validate_resources,
 };
+use sdk::codec;
 use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
@@ -120,6 +124,11 @@ struct Saga {
     /// attempt is then rendezvous-assigned over the tag's announced providers
     /// instead of the raw validator set. opaque to this module.
     capability: Option<String>,
+    /// numeric resource demands, when the trigger named any: assignment then
+    /// draws from providers whose announced resources cover every dimension.
+    /// ignored when `capability` is `None` (untagged sagas keep valset
+    /// assignment). validated via `validate_resources` at trigger time.
+    demands: BTreeMap<String, u64>,
     status: SagaStatus,
     /// the current attempt (0-based); the half of the idempotency key that
     /// makes retried work distinguishable from stale results.
@@ -153,48 +162,20 @@ struct Saga {
 /// [`Module::root`] hashes, so a snapshot and the root that must authenticate
 /// it cannot drift.
 fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
-    fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-    }
-    fn put_opt_bytes(out: &mut Vec<u8>, opt: Option<&[u8]>) {
-        match opt {
-            None => out.push(0),
-            Some(bytes) => {
-                out.push(1);
-                put_bytes(out, bytes);
-            }
-        }
-    }
-    fn put_opt_u64(out: &mut Vec<u8>, opt: Option<u64>) {
-        match opt {
-            None => out.push(0),
-            Some(v) => {
-                out.push(1);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-    }
-
     let mut out = Vec::new();
     out.extend_from_slice(&(sagas.len() as u64).to_le_bytes());
     for (id, s) in sagas {
-        put_bytes(&mut out, id.as_bytes());
-        match &s.origin {
-            SagaOrigin::External(key) => {
-                out.push(0);
-                put_bytes(&mut out, key);
-            }
-            SagaOrigin::Module(module) => {
-                out.push(1);
-                put_bytes(&mut out, module.as_bytes());
-            }
-            SagaOrigin::System => out.push(2),
+        codec::push_str(&mut out, id);
+        put_origin(&mut out, &s.origin);
+        codec::push_opt_str(&mut out, s.reply_to.as_deref());
+        codec::push_bytes(&mut out, &s.reply_payload);
+        codec::push_bytes(&mut out, &s.spec);
+        codec::push_opt_str(&mut out, s.capability.as_deref());
+        out.extend_from_slice(&(s.demands.len() as u64).to_le_bytes());
+        for (dim, value) in &s.demands {
+            codec::push_str(&mut out, dim);
+            out.extend_from_slice(&value.to_le_bytes());
         }
-        put_opt_bytes(&mut out, s.reply_to.as_ref().map(|m| m.as_bytes()));
-        put_bytes(&mut out, &s.reply_payload);
-        put_bytes(&mut out, &s.spec);
-        put_opt_bytes(&mut out, s.capability.as_ref().map(|c| c.as_bytes()));
         out.push(match s.status {
             SagaStatus::Pending => 0,
             SagaStatus::Done => 1,
@@ -204,13 +185,13 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
         });
         out.extend_from_slice(&s.attempt.to_le_bytes());
         out.extend_from_slice(&s.max_attempts.to_le_bytes());
-        put_opt_bytes(&mut out, s.assignee.as_deref());
-        put_opt_bytes(&mut out, s.pinned_assignee.as_deref());
-        put_opt_u64(&mut out, s.lease_views);
-        put_opt_u64(&mut out, s.lease_expires_at);
-        put_opt_u64(&mut out, s.deadline);
-        put_opt_bytes(&mut out, s.result.as_deref());
-        put_opt_bytes(&mut out, s.error.as_ref().map(|e| e.as_bytes()));
+        codec::push_opt_bytes(&mut out, s.assignee.as_deref());
+        codec::push_opt_bytes(&mut out, s.pinned_assignee.as_deref());
+        codec::push_opt_u64(&mut out, s.lease_views);
+        codec::push_opt_u64(&mut out, s.lease_expires_at);
+        codec::push_opt_u64(&mut out, s.deadline);
+        codec::push_opt_bytes(&mut out, s.result.as_deref());
+        codec::push_opt_str(&mut out, s.error.as_deref());
         out.extend_from_slice(&s.created_at.to_le_bytes());
         out.extend_from_slice(&s.updated_at.to_le_bytes());
     }
@@ -224,83 +205,18 @@ fn committed_root(sagas: &BTreeMap<String, Saga>) -> StateRoot {
     StateRoot(Sha256::digest(encode_committed(sagas)).into())
 }
 
-/// pull `n` bytes off the front of `buf`, checked against the remaining input
-/// BEFORE any slicing — a lying length cannot over-read or panic.
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-    if n > buf.len() {
-        return Err("snapshot truncated".into());
-    }
-    let (head, tail) = buf.split_at(n);
-    *buf = tail;
-    Ok(head)
-}
-
-fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        take(buf, 8)?.try_into().expect("8 bytes"),
-    ))
-}
-
-fn take_u32(buf: &mut &[u8]) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(
-        take(buf, 4)?.try_into().expect("4 bytes"),
-    ))
-}
-
-/// a length prefix, validated against the remaining input before the caller
-/// allocates anything of that size.
-fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
-    let n = take_u64(buf)?;
-    if n > buf.len() as u64 {
-        return Err("snapshot length prefix exceeds input".into());
-    }
-    Ok(n as usize)
-}
-
-fn take_lp_bytes(buf: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let len = take_len(buf)?;
-    Ok(take(buf, len)?.to_vec())
-}
-
-fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
-    let len = take_len(buf)?;
-    Ok(std::str::from_utf8(take(buf, len)?)
-        .map_err(|_| "snapshot string is not utf-8".to_string())?
-        .to_owned())
-}
-
-/// a 0/1 option tag; anything else is rejected so a state has exactly one
-/// valid encoding.
-fn take_tag(buf: &mut &[u8]) -> Result<bool, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(false),
-        1 => Ok(true),
-        t => Err(format!("snapshot has unknown option tag {t}")),
-    }
-}
-
-fn take_opt_bytes(buf: &mut &[u8]) -> Result<Option<Vec<u8>>, String> {
-    Ok(if take_tag(buf)? {
-        Some(take_lp_bytes(buf)?)
-    } else {
-        None
-    })
-}
-
-fn take_opt_string(buf: &mut &[u8]) -> Result<Option<String>, String> {
-    Ok(if take_tag(buf)? {
-        Some(take_lp_string(buf)?)
-    } else {
-        None
-    })
-}
-
-fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
-    Ok(if take_tag(buf)? {
-        Some(take_u64(buf)?)
-    } else {
-        None
-    })
+/// an optional utf-8 string in the plain option layout — [`codec::Cursor`]
+/// keeps only the byte primitive; the utf-8 check layers here (opt_str's
+/// non-empty/bounded rules would reject valid states, e.g. an empty stored
+/// error string).
+fn take_opt_string(cur: &mut codec::Cursor, what: &str) -> Result<Option<String>, Error> {
+    cur.opt_bytes(what)?
+        .map(|raw| {
+            std::str::from_utf8(raw)
+                .map(str::to_string)
+                .map_err(|e| Error::Module(format!("{what} is not utf-8: {e}")))
+        })
+        .transpose()
 }
 
 /// strict decode of an [`encode_committed`] snapshot. the input is UNTRUSTED —
@@ -309,57 +225,80 @@ fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
 /// byte encoding per state, and uniqueness for free), unknown discriminants
 /// and option tags are rejected, and trailing bytes are rejected. never panics
 /// on malformed input.
-fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
-    let count = take_u64(&mut buf)?;
+fn decode_committed(buf: &[u8]) -> Result<BTreeMap<String, Saga>, Error> {
+    let mut cur = codec::Cursor::new(buf);
+    let count = cur.u64("snapshot saga count")?;
     // every saga costs at least its fixed-width fields — the id length prefix,
-    // one origin discriminant, nine option tags, three length prefixes,
-    // status, two u32s, and two u64s — so a count the input cannot possibly
-    // hold is rejected before the loop builds anything.
+    // one origin discriminant, nine option tags, three length prefixes, one
+    // demands-map count, status, two u32s, and two u64s — so a count the
+    // input cannot possibly hold is rejected before the loop builds anything.
     const MIN_SAGA_BYTES: u64 =
-        8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
-    if count
-        .checked_mul(MIN_SAGA_BYTES)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err("snapshot saga count exceeds input".into());
-    }
+        8 + 1 + 1 + 8 + 8 + 1 + 8 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
+    cur.bound(count, MIN_SAGA_BYTES, "snapshot saga")?;
     let mut sagas: BTreeMap<String, Saga> = BTreeMap::new();
     for _ in 0..count {
-        let id = take_lp_string(&mut buf)?;
+        let id = cur.string("snapshot saga id")?;
         if let Some((last, _)) = sagas.iter().next_back()
             && last.as_str() >= id.as_str()
         {
-            return Err("snapshot saga ids not strictly ascending".into());
+            return Err(Error::Module(
+                "snapshot saga ids not strictly ascending".into(),
+            ));
         }
-        let origin = match take(&mut buf, 1)?[0] {
-            0 => SagaOrigin::External(take_lp_bytes(&mut buf)?),
-            1 => SagaOrigin::Module(take_lp_string(&mut buf)?),
-            2 => SagaOrigin::System,
-            d => return Err(format!("snapshot has unknown origin discriminant {d}")),
-        };
-        let reply_to = take_opt_string(&mut buf)?;
-        let reply_payload = take_lp_bytes(&mut buf)?;
-        let spec = take_lp_bytes(&mut buf)?;
-        let capability = take_opt_string(&mut buf)?;
-        let status = match take(&mut buf, 1)?[0] {
+        let origin = take_origin(&mut cur)?;
+        let reply_to = take_opt_string(&mut cur, "snapshot reply_to")?;
+        let reply_payload = cur.bytes("snapshot reply_payload")?.to_vec();
+        let spec = cur.bytes("snapshot spec")?.to_vec();
+        let capability = take_opt_string(&mut cur, "snapshot capability")?;
+        let demand_count = cur.u64("snapshot demands count")?;
+        // each dimension costs at least its 8-byte key-length prefix plus an
+        // 8-byte value.
+        cur.bound(demand_count, 16, "snapshot demand")?;
+        let mut demands = BTreeMap::new();
+        let mut prev_dim: Option<&[u8]> = None;
+        for _ in 0..demand_count {
+            let dim = cur.bytes("snapshot demand key")?;
+            if prev_dim.is_some_and(|p| p >= dim) {
+                return Err(Error::Module(
+                    "snapshot demand keys must be strictly increasing".into(),
+                ));
+            }
+            prev_dim = Some(dim);
+            let dim = std::str::from_utf8(dim)
+                .map_err(|e| Error::Module(format!("snapshot demand key is not utf-8: {e}")))?;
+            let value = cur.u64("snapshot demand value")?;
+            if value == 0 {
+                return Err(Error::Module(
+                    "snapshot demand value is zero (omit the dimension instead)".into(),
+                ));
+            }
+            demands.insert(dim.to_string(), value);
+        }
+        let status = match cur.byte("snapshot status")? {
             0 => SagaStatus::Pending,
             1 => SagaStatus::Done,
             2 => SagaStatus::Failed,
             3 => SagaStatus::TimedOut,
             4 => SagaStatus::Cancelled,
-            d => return Err(format!("snapshot has unknown status discriminant {d}")),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown status discriminant {d}"
+                )));
+            }
         };
-        let attempt = take_u32(&mut buf)?;
-        let max_attempts = take_u32(&mut buf)?;
-        let assignee = take_opt_bytes(&mut buf)?;
-        let pinned_assignee = take_opt_bytes(&mut buf)?;
-        let lease_views = take_opt_u64(&mut buf)?;
-        let lease_expires_at = take_opt_u64(&mut buf)?;
-        let deadline = take_opt_u64(&mut buf)?;
-        let result = take_opt_bytes(&mut buf)?;
-        let error = take_opt_string(&mut buf)?;
-        let created_at = take_u64(&mut buf)?;
-        let updated_at = take_u64(&mut buf)?;
+        let attempt = cur.u32("snapshot attempt")?;
+        let max_attempts = cur.u32("snapshot max_attempts")?;
+        let assignee = cur.opt_bytes("snapshot assignee")?.map(<[u8]>::to_vec);
+        let pinned_assignee = cur
+            .opt_bytes("snapshot pinned_assignee")?
+            .map(<[u8]>::to_vec);
+        let lease_views = cur.opt_u64("snapshot lease_views")?;
+        let lease_expires_at = cur.opt_u64("snapshot lease_expires_at")?;
+        let deadline = cur.opt_u64("snapshot deadline")?;
+        let result = cur.opt_bytes("snapshot result")?.map(<[u8]>::to_vec);
+        let error = take_opt_string(&mut cur, "snapshot error")?;
+        let created_at = cur.u64("snapshot created_at")?;
+        let updated_at = cur.u64("snapshot updated_at")?;
         sagas.insert(
             id,
             Saga {
@@ -368,6 +307,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
                 reply_payload,
                 spec,
                 capability,
+                demands,
                 status,
                 attempt,
                 max_attempts,
@@ -383,9 +323,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
             },
         );
     }
-    if !buf.is_empty() {
-        return Err("snapshot has trailing bytes".into());
-    }
+    cur.finish("snapshot")?;
     Ok(sagas)
 }
 
@@ -407,6 +345,16 @@ fn lease_expiry(height: u64, assignee: &Option<Vec<u8>>, lease_views: Option<u64
         (Some(_), None) => Some(height.saturating_add(DEFAULT_LEASE_VIEWS)),
         (None, None) => None,
     }
+}
+
+fn bounded_lease_expiry(
+    height: u64,
+    assignee: &Option<Vec<u8>>,
+    lease_views: Option<u64>,
+    deadline: Option<u64>,
+) -> Option<u64> {
+    lease_expiry(height, assignee, lease_views)
+        .map(|expiry| deadline.map_or(expiry, |deadline| expiry.min(deadline)))
 }
 
 pub struct SagaModule {
@@ -444,8 +392,10 @@ impl SagaModule {
     }
 
     /// a ledger that rendezvous-assigns each attempt over `valset`'s
-    /// committed membership, gated by `policy`.
-    pub fn with_valset(
+    /// committed membership, gated by `policy` — the shared base of
+    /// [`SagaModule::with_assignment`], which is the constructor real
+    /// deployments use.
+    fn with_valset(
         id: impl Into<ModuleId>,
         valset: impl Into<ModuleId>,
         policy: LeasePolicy,
@@ -460,7 +410,7 @@ impl SagaModule {
         }
     }
 
-    /// [`SagaModule::with_valset`] plus capability-aware assignment: an
+    /// valset rendezvous assignment plus capability-aware assignment: an
     /// attempt of a saga whose trigger named a capability is
     /// rendezvous-assigned over `capability_registry`'s announced providers
     /// of that tag; untagged sagas keep valset assignment.
@@ -533,25 +483,35 @@ impl SagaModule {
     /// the candidate pool one attempt is assigned from. a saga that names a
     /// capability draws from that tag's ANNOUNCED PROVIDERS (the capability
     /// registry's sorted committed view) — never from the raw valset, so a
-    /// node that cannot execute the work never holds its lease. an untagged
-    /// saga draws from the valset as before. every failure path — module not
-    /// configured, query unavailable, empty set — yields `None`: no
-    /// assignment, and strict degrades to accept-any for the attempt.
+    /// node that cannot execute the work never holds its lease; when the
+    /// trigger also carries non-empty `demands`, the pool narrows further to
+    /// providers whose ANNOUNCED capacity covers every demanded dimension
+    /// (`CapableProviders` instead of `Providers`). an untagged saga draws
+    /// from the valset as before and ignores demands entirely. every failure
+    /// path — module not configured, query unavailable, empty set — yields
+    /// `None`: no assignment, and strict degrades to accept-any for the
+    /// attempt.
     async fn assignment_pool(
         &self,
         ctx: &dyn Ctx,
         capability: Option<&str>,
+        demands: &BTreeMap<String, u64>,
     ) -> Option<Vec<Vec<u8>>> {
         let pool = match capability {
             Some(tag) => {
                 let registry = self.capability_registry.as_deref()?;
+                let query = if demands.is_empty() {
+                    CapabilityQuery::Providers {
+                        capability: tag.to_string(),
+                    }
+                } else {
+                    CapabilityQuery::CapableProviders {
+                        capability: tag.to_string(),
+                        demands: demands.clone(),
+                    }
+                };
                 let reply = ctx
-                    .query(
-                        registry,
-                        &capability_encode_query(&CapabilityQuery::Providers {
-                            capability: tag.to_string(),
-                        }),
-                    )
+                    .query(registry, &capability_encode_query(&query))
                     .await
                     .ok()?;
                 match capability_decode_reply(&reply).ok()? {
@@ -575,28 +535,60 @@ impl SagaModule {
         (!pool.is_empty()).then_some(pool)
     }
 
-    /// rendezvous-assign one attempt: `pool[H(saga_id ‖ attempt-le ‖
-    /// height-le) % n]` over the (sorted) assignment pool. every input is
-    /// agreed, so every validator derives the same assignee. `None` when no
-    /// pool is available — no assignment, and strict degrades to accept-any
-    /// for the attempt.
-    async fn compute_assignee(
-        &self,
-        ctx: &dyn Ctx,
+    fn pick_assignee(
+        pool: &[Vec<u8>],
         saga_id: &str,
-        capability: Option<&str>,
         attempt: u32,
         height: u64,
     ) -> Option<Vec<u8>> {
-        let pool = self.assignment_pool(ctx, capability).await?;
+        if pool.is_empty() {
+            return None;
+        }
         let mut hasher = Sha256::new();
         hasher.update(saga_id.as_bytes());
         hasher.update(attempt.to_le_bytes());
         hasher.update(height.to_le_bytes());
         let digest = hasher.finalize();
         let pick = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
-        let index = (pick % pool.len() as u64) as usize;
-        Some(pool[index].clone())
+        Some(pool[(pick % pool.len() as u64) as usize].clone())
+    }
+
+    /// rendezvous-assign one attempt over the sorted assignment pool. every
+    /// input is agreed, so every validator derives the same assignee.
+    async fn compute_assignee(
+        &self,
+        ctx: &dyn Ctx,
+        saga_id: &str,
+        capability: Option<&str>,
+        demands: &BTreeMap<String, u64>,
+        attempt: u32,
+        height: u64,
+    ) -> Option<Vec<u8>> {
+        let pool = self.assignment_pool(ctx, capability, demands).await?;
+        Self::pick_assignee(&pool, saga_id, attempt, height)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is an independent agreed input to the rendezvous pick \
+                  (saga_id/capability/demands/attempt/height) plus the reassignment-only \
+                  exclusion; bundling them into a struct for one caller is not a savings"
+    )]
+    async fn compute_assignee_excluding(
+        &self,
+        ctx: &dyn Ctx,
+        saga_id: &str,
+        capability: Option<&str>,
+        demands: &BTreeMap<String, u64>,
+        attempt: u32,
+        height: u64,
+        excluded: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let mut pool = self.assignment_pool(ctx, capability, demands).await?;
+        if let Some(excluded) = excluded {
+            pool.retain(|candidate| candidate.as_slice() != excluded);
+        }
+        Self::pick_assignee(&pool, saga_id, attempt, height)
     }
 
     /// the P6 promise: on a terminal transition, hand the requester its
@@ -618,22 +610,17 @@ impl SagaModule {
     /// shared tail of trigger, error-retry, and lease-expiry-retry. a pinned
     /// saga leases every attempt to its pinned key; everything else is
     /// rendezvous-assigned from the pool.
-    async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, mut saga: Saga) {
+    fn request_assigned(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        saga_id: String,
+        mut saga: Saga,
+        assignee: Option<Vec<u8>>,
+    ) {
         let height = ctx.env().height;
-        saga.assignee = match &saga.pinned_assignee {
-            Some(key) => Some(key.clone()),
-            None => {
-                self.compute_assignee(
-                    ctx,
-                    &saga_id,
-                    saga.capability.as_deref(),
-                    saga.attempt,
-                    height,
-                )
-                .await
-            }
-        };
-        saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
+        saga.assignee = assignee;
+        saga.lease_expires_at =
+            bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
         ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
             saga_id: saga_id.clone(),
             attempt: saga.attempt,
@@ -642,6 +629,25 @@ impl SagaModule {
             assignee: saga.assignee.clone(),
         })));
         self.stage(saga_id, saga);
+    }
+
+    async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, saga: Saga) {
+        let height = ctx.env().height;
+        let assignee = match &saga.pinned_assignee {
+            Some(key) => Some(key.clone()),
+            None => {
+                self.compute_assignee(
+                    ctx,
+                    &saga_id,
+                    saga.capability.as_deref(),
+                    &saga.demands,
+                    saga.attempt,
+                    height,
+                )
+                .await
+            }
+        };
+        self.request_assigned(ctx, saga_id, saga, assignee);
     }
 
     // ---- state-sync ---------------------------------------------------------
@@ -662,7 +668,7 @@ impl SagaModule {
     /// before the call. on success the staged overlay is dropped — a snapshot
     /// describes a block boundary, and nothing half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let sagas = decode_committed(bytes).map_err(Error::Module)?;
+        let sagas = decode_committed(bytes)?;
         if committed_root(&sagas) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
@@ -705,6 +711,7 @@ impl Module for SagaModule {
                 max_attempts,
                 lease_views,
                 capability,
+                demands,
                 pinned_assignee,
             } => {
                 // a duplicate saga_id — staged this block or already committed
@@ -749,6 +756,10 @@ impl Module for SagaModule {
                         )));
                     }
                 }
+                // the same validate_resources invariant the capability
+                // registry itself enforces on an announce: bounded dimension
+                // count, non-empty tag-shaped keys, non-zero values.
+                validate_resources(&demands).map_err(Error::Module)?;
                 // an empty pinned key is a caller bug, rejected rather than
                 // silently read as "no binding" (the same rule as an empty
                 // capability tag).
@@ -783,6 +794,7 @@ impl Module for SagaModule {
                     reply_payload,
                     spec,
                     capability,
+                    demands,
                     status: SagaStatus::Pending,
                     attempt: 0,
                     max_attempts,
@@ -802,6 +814,7 @@ impl Module for SagaModule {
                 saga_id,
                 attempt,
                 outcome,
+                ..
             } => {
                 // P5 gates, all deterministic no-ops: unknown saga (never
                 // triggered, or pruned), terminal saga (a duplicate — the
@@ -875,6 +888,80 @@ impl Module for SagaModule {
                     }
                 }
             }
+            SagaMsg::RenewLease { saga_id, attempt } => {
+                let Some(current) = self.get(&saga_id) else {
+                    return Ok(());
+                };
+                if current.status.is_terminal() || attempt != current.attempt {
+                    return Ok(());
+                }
+                let held = matches!(
+                    (&ctx.env().origin, &current.assignee),
+                    (Origin::External(key), Some(assignee)) if key == assignee
+                );
+                if !held {
+                    return Ok(());
+                }
+                let height = ctx.env().height;
+                let Some(expiry) = current.lease_expires_at else {
+                    return Ok(());
+                };
+                if height >= expiry {
+                    return Ok(());
+                }
+                let window = current.lease_views.unwrap_or(DEFAULT_LEASE_VIEWS);
+                let mut saga = current.clone();
+                if height >= expiry.saturating_sub(window / 2) {
+                    let next = bounded_lease_expiry(
+                        height,
+                        &current.assignee,
+                        current.lease_views,
+                        current.deadline,
+                    );
+                    if next.is_some_and(|next| next > expiry) {
+                        saga.lease_expires_at = next;
+                    }
+                }
+                saga.updated_at = ctx.env().consensus_time;
+                self.stage(saga_id, saga);
+            }
+            SagaMsg::Reassign { saga_id, attempt } => {
+                let Some(current) = self.get(&saga_id) else {
+                    return Ok(());
+                };
+                if current.status.is_terminal()
+                    || attempt != current.attempt
+                    || current.origin != saga_origin(&ctx.env().origin)
+                {
+                    return Ok(());
+                }
+                let mut saga = current.clone();
+                saga.updated_at = ctx.env().consensus_time;
+                if saga.pinned_assignee.is_some() {
+                    return Err(Error::Module("pinned saga cannot be reassigned".into()));
+                }
+                if saga.attempt + 1 >= saga.max_attempts {
+                    return Err(Error::Module("reassignment attempts exhausted".into()));
+                }
+
+                let old_assignee = saga.assignee.clone();
+                saga.attempt += 1;
+                let next = self
+                    .compute_assignee_excluding(
+                        ctx,
+                        &saga_id,
+                        saga.capability.as_deref(),
+                        &saga.demands,
+                        saga.attempt,
+                        ctx.env().height,
+                        old_assignee.as_deref(),
+                    )
+                    .await;
+                let Some(next) = next else {
+                    return Err(Error::Module("no alternate assignee is available".into()));
+                };
+                self.request_assigned(ctx, saga_id, saga, Some(next));
+            }
             SagaMsg::Accept { saga_id, attempt } => {
                 // the claim lane for UNASSIGNED attempts: first accept in
                 // consensus order wins the lease; everything else — unknown
@@ -904,7 +991,8 @@ impl Module for SagaModule {
                 let height = ctx.env().height;
                 let mut saga = current.clone();
                 saga.assignee = Some(key.clone());
-                saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
+                saga.lease_expires_at =
+                    bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
                 saga.updated_at = ctx.env().consensus_time;
                 // the actual work order: the announcement's request, re-emitted
                 // naming the winner — every other node's worker skips it.
@@ -1083,8 +1171,11 @@ mod tests {
         known_modules: BTreeSet<String>,
         /// a canned validator set served for a "valset" query when present.
         validators: Option<Vec<Vec<u8>>>,
-        /// canned capability providers served for a "capability" query.
+        /// canned capability providers served for a `Providers` query.
         providers: Option<Vec<Vec<u8>>>,
+        /// canned capability providers served for a `CapableProviders`
+        /// query — the demand-filtered subset of `providers`.
+        capable_providers: Option<Vec<Vec<u8>>>,
         msgs: Vec<Msg>,
         effects: Vec<Effect>,
     }
@@ -1101,6 +1192,7 @@ mod tests {
                 known_modules: BTreeSet::new(),
                 validators: None,
                 providers: None,
+                capable_providers: None,
                 msgs: Vec::new(),
                 effects: Vec::new(),
             }
@@ -1126,6 +1218,10 @@ mod tests {
             self.providers = Some(providers);
             self
         }
+        fn with_capable_providers(mut self, providers: Vec<Vec<u8>>) -> Self {
+            self.capable_providers = Some(providers);
+            self
+        }
         fn callbacks(&self) -> Vec<SagaCallback> {
             self.msgs
                 .iter()
@@ -1149,18 +1245,29 @@ mod tests {
                 .contains(target)
                 .then_some(StateRoot::ZERO)
         }
-        async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
                 "valset" => match &self.validators {
                     Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(v.clone()))),
                     None => Err(Error::QueryUnsupported),
                 },
-                "capability" => match &self.providers {
-                    Some(p) => Ok(capability::encode_reply(&CapabilityReply::Providers(
-                        p.clone(),
-                    ))),
-                    None => Err(Error::QueryUnsupported),
-                },
+                // key on the decoded query variant: CapableProviders answers
+                // from the demand-filtered pool, everything else (Providers)
+                // from the full announced pool — mirrors the real registry's
+                // "empty demands degrade to Providers" contract.
+                "capability" => {
+                    let query = capability::decode_query(req).map_err(Error::Module)?;
+                    let pool = match query {
+                        CapabilityQuery::CapableProviders { .. } => &self.capable_providers,
+                        _ => &self.providers,
+                    };
+                    match pool {
+                        Some(p) => Ok(capability::encode_reply(&CapabilityReply::Providers(
+                            p.clone(),
+                        ))),
+                        None => Err(Error::QueryUnsupported),
+                    }
+                }
                 _ => Err(Error::QueryUnsupported),
             }
         }
@@ -1185,6 +1292,7 @@ mod tests {
             max_attempts: 1,
             lease_views: None,
             capability: None,
+            demands: Default::default(),
         }
     }
     fn msg(m: &SagaMsg) -> Msg {
@@ -1201,6 +1309,7 @@ mod tests {
             saga_id: id.into(),
             attempt,
             outcome,
+            usage: None,
         })
     }
     fn crank() -> Msg {
@@ -1256,6 +1365,7 @@ mod tests {
                 max_attempts: 3,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1343,6 +1453,7 @@ mod tests {
                 max_attempts: 0,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap_err();
@@ -1370,6 +1481,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap_err();
@@ -1393,6 +1505,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap_err();
@@ -1415,6 +1528,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1438,6 +1552,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1484,6 +1599,7 @@ mod tests {
                 max_attempts: 2,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1548,6 +1664,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1591,6 +1708,7 @@ mod tests {
                 max_attempts: 3,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1660,6 +1778,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap_err();
@@ -1683,6 +1802,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap_err();
@@ -1775,6 +1895,7 @@ mod tests {
                 max_attempts: 5,
                 lease_views: Some(4),
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1833,6 +1954,7 @@ mod tests {
                 max_attempts: 2,
                 lease_views: Some(5),
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -1867,6 +1989,113 @@ mod tests {
     }
 
     #[test]
+    fn assignee_renews_and_requester_reassigns_with_attempt_fencing() {
+        let validators = vec![b"node-a".to_vec(), b"node-b".to_vec()];
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .with_origin(Origin::Module("dispatch".into()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(100),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: None,
+                demands: Default::default(),
+                pinned_assignee: None,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let first = get(&m, "s1").unwrap().assignee.unwrap();
+
+        let mut ctx = CaptureCtx::new()
+            .at(4)
+            .with_origin(Origin::External(first.clone()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::RenewLease {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let view = get(&m, "s1").unwrap();
+        assert_eq!(view.lease_expires_at, Some(10));
+        assert_eq!(view.updated_at, 4, "every valid heartbeat is observable");
+
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .with_origin(Origin::External(first.clone()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::RenewLease {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().lease_expires_at, Some(15));
+
+        let before = m.root();
+        let mut ctx = CaptureCtx::new()
+            .at(6)
+            .with_origin(Origin::External(first.clone()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Reassign {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), before, "the assignee cannot reassign itself");
+
+        let mut ctx = CaptureCtx::new()
+            .at(7)
+            .with_origin(Origin::Module("dispatch".into()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Reassign {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let view = get(&m, "s1").unwrap();
+        assert_eq!(view.attempt, 1);
+        assert_ne!(view.assignee.as_deref(), Some(first.as_slice()));
+        assert_eq!(ctx.worker_requests()[0].attempt, 1);
+
+        let fenced_root = m.root();
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_origin(Origin::External(first))
+            .with_validators(validators);
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stale".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), fenced_root, "the revoked attempt cannot finish");
+    }
+
+    #[test]
     fn crank_budget_bounds_one_sweep_and_the_next_crank_finishes() {
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new();
@@ -1886,6 +2115,7 @@ mod tests {
                     max_attempts: 1,
                     lease_views: None,
                     capability: None,
+                    demands: Default::default(),
                 }),
             )
             .unwrap();
@@ -1939,6 +2169,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -2291,7 +2522,17 @@ mod tests {
             max_attempts: 1,
             lease_views: None,
             capability: Some(tag.into()),
+            demands: Default::default(),
         })
+    }
+
+    /// a `CaptureCtx` that answers a plain `Providers` query with `all` and a
+    /// `CapableProviders` query with `capable` — the demand-filtered subset —
+    /// so a test can assert assignment draws from the RIGHT one.
+    fn capability_ctx_with(all: Vec<Vec<u8>>, capable: Vec<Vec<u8>>) -> CaptureCtx {
+        CaptureCtx::new()
+            .with_providers(all)
+            .with_capable_providers(capable)
     }
 
     #[test]
@@ -2428,6 +2669,7 @@ mod tests {
                 max_attempts: 2,
                 lease_views: None,
                 capability: Some("alpha".into()),
+                demands: Default::default(),
                 pinned_assignee: Some(pinned.clone()),
             }),
         )
@@ -2477,6 +2719,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
                 pinned_assignee: Some(Vec::new()),
             }),
         )
@@ -2503,6 +2746,7 @@ mod tests {
                     max_attempts: 1,
                     lease_views: None,
                     capability: Some(bad.to_string()),
+                    demands: Default::default(),
                 }),
             )
             .unwrap_err();
@@ -2532,6 +2776,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: None,
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -2548,6 +2793,7 @@ mod tests {
                 max_attempts: 1,
                 lease_views: Some(7),
                 capability: None,
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -2591,6 +2837,7 @@ mod tests {
                 max_attempts: 3,
                 lease_views: Some(10),
                 capability: Some("codex".into()),
+                demands: Default::default(),
             }),
         )
         .unwrap();
@@ -2638,6 +2885,7 @@ mod tests {
                     max_attempts,
                     lease_views: Some(3),
                     capability: None,
+                    demands: Default::default(),
                 })
             };
             vec![
@@ -2657,6 +2905,7 @@ mod tests {
                         max_attempts: 1,
                         lease_views: None,
                         capability: Some("alpha".into()),
+                        demands: Default::default(),
                     }),
                 ],
                 vec![
@@ -2693,5 +2942,160 @@ mod tests {
         let (roots_b, snapshot_b) = run();
         assert_eq!(roots_a, roots_b, "identical roots after every block");
         assert_eq!(snapshot_a, snapshot_b, "byte-identical final snapshots");
+    }
+
+    #[test]
+    fn demands_filter_the_assignment_pool_via_capable_providers() {
+        // ctx answers CapableProviders with only the big node; a trigger
+        // carrying demands must assign there, never to the small provider.
+        let big = b"node-big".to_vec();
+        let small = b"node-small".to_vec();
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut ctx = capability_ctx_with(vec![small.clone(), big.clone()], vec![big.clone()]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s-demand".into(),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(100),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: Some("codex".into()),
+                pinned_assignee: None,
+                demands: [("cores".to_string(), 8u64)].into_iter().collect(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let pending = assigned_pending(&m, &big);
+        assert_eq!(pending.len(), 1, "the demand-capable node holds the lease");
+        assert!(
+            assigned_pending(&m, &small).is_empty(),
+            "the demand-incapable node holds nothing, even though it announced the capability"
+        );
+    }
+
+    #[test]
+    fn trigger_demands_survive_snapshot_round_trip() {
+        // same trigger as above, then snapshot/install into a fresh module:
+        // roots equal, and the reassignment pool still filters by demands.
+        let big = b"node-big".to_vec();
+        let small = b"node-small".to_vec();
+        let trigger_msg = SagaMsg::Trigger {
+            saga_id: "s-demand".into(),
+            spec: b"w".to_vec(),
+            reply_to: None,
+            reply_payload: Vec::new(),
+            deadline: Some(100),
+            max_attempts: 3,
+            lease_views: Some(10),
+            capability: Some("codex".into()),
+            pinned_assignee: None,
+            demands: [("cores".to_string(), 8u64)].into_iter().collect(),
+        };
+
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut ctx = capability_ctx_with(vec![small.clone(), big.clone()], vec![big.clone()]);
+        exec(&mut m, &mut ctx, &msg(&trigger_msg)).unwrap();
+        commit(&mut m);
+        let src_root = m.root();
+        assert_eq!(
+            get(&m, "s-demand").unwrap().assignee,
+            Some(big.clone()),
+            "the demand-capable node holds the initial lease"
+        );
+
+        let mut dst =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        dst.install(&m.snapshot(), src_root).unwrap();
+        assert_eq!(
+            dst.root(),
+            src_root,
+            "installed root must equal the source root — demands ride the snapshot"
+        );
+        assert_eq!(
+            get(&dst, "s-demand"),
+            get(&m, "s-demand"),
+            "query parity after install"
+        );
+
+        // the reassignment pool is STILL demand-filtered on the installed
+        // module: excluding the sole demand-capable provider (big) from a
+        // pool that also contains a demand-incapable one (small) must find
+        // NO alternate — if reassignment fell back to the raw provider list
+        // instead of CapableProviders, it would (wrongly) hand the lease to
+        // `small`.
+        let mut ctx2 = capability_ctx_with(vec![small.clone(), big.clone()], vec![big.clone()]);
+        let err = exec(
+            &mut dst,
+            &mut ctx2,
+            &msg(&SagaMsg::Reassign {
+                saga_id: "s-demand".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no alternate assignee"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_or_malformed_demands_reject_at_trigger() {
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new();
+
+        // validate_resources is THE rule: too many dimensions...
+        let too_many: BTreeMap<String, u64> = (0..=capability::MAX_RESOURCE_DIMS)
+            .map(|i| (format!("d{i}"), 1))
+            .collect();
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: Vec::new(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+                pinned_assignee: None,
+                demands: too_many,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+
+        // ...and a zero value both reject.
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s2".into(),
+                spec: Vec::new(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+                pinned_assignee: None,
+                demands: [("cores".to_string(), 0u64)].into_iter().collect(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)), "got {err:?}");
+
+        assert!(ctx.effects.is_empty(), "rejected triggers fire no worker");
+        assert_eq!(get(&m, "s1"), None, "nothing was staged");
+        assert_eq!(get(&m, "s2"), None, "nothing was staged");
     }
 }

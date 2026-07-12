@@ -10,7 +10,7 @@ use crate::{Result, ViewReader};
 
 /// cap on distinct tokens indexed per text (alphabetical truncation beyond
 /// it) — bounds the fan-out of a pathological message/block.
-pub const MAX_TOKENS_PER_TEXT: usize = 256;
+const MAX_TOKENS_PER_TEXT: usize = 256;
 /// default cap on how many postings of the first (driving) token one search
 /// walks. results beyond it are silently out of reach — callers that care
 /// should surface their own "narrow the query" signal.

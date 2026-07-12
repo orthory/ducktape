@@ -14,28 +14,14 @@ import { replyVariant } from "./wire";
 export const TARGET = "gateway";
 export const ROUTE_FORMAT_VERSION = 1;
 export const GATEWAY_ROUTE_NAMESPACE = "ducktape-gateway-route-v1";
-export const MAX_CONTENT_FILES = 128;
+export const MANIFEST_FILE = ".manifest.json";
+export const MAX_MANIFEST_FILES = 16_384;
 export const MAX_CONTENT_PATH_BYTES = 512;
 export const MAX_CONTENT_SEGMENT_BYTES = 128;
-export const MAX_CONTENT_FILE_BYTES = 1024 * 1024;
-export const MAX_CONTENT_TOTAL_BYTES = 4 * 1024 * 1024;
+export const MAX_FILE_BYTES = 64 * 1024 * 1024;
+export const MAX_SITE_BYTES = 1024 * 1024 * 1024;
+export const MAX_MIME_BYTES = 128;
 export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
-export const MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
-
-export const ALLOWED_CONTENT_MIME_TYPES = new Set([
-  "application/javascript",
-  "application/json",
-  "application/wasm",
-  "font/woff2",
-  "image/gif",
-  "image/jpeg",
-  "image/png",
-  "image/svg+xml",
-  "image/webp",
-  "text/css",
-  "text/html",
-  "text/plain",
-]);
 
 export interface RouteName {
   label: string | null;
@@ -52,8 +38,12 @@ export interface RoutePolicy {
   audience: RouteAudience;
   methods: RouteMethod[];
   max_request_bytes: number;
+  /** `0` = unbounded stream (SSE), LoopbackHttp only. */
   max_response_bytes: number;
+  /** Signed opt-in; when false the proxy strips inbound Authorization. */
   allow_authorization: boolean;
+  /** Signed opt-in for a LoopbackHttp WebSocket upgrade. */
+  allow_upgrade: boolean;
 }
 
 export interface ContentFile {
@@ -63,13 +53,15 @@ export interface ContentFile {
   sha256: string;
 }
 
-export interface DuckFsContent {
+/** The off-consensus content table (`.manifest.json`) addressed by the signed
+ * `manifest_sha256`. Mirrors `gateway::RouteManifest`. */
+export interface RouteManifest {
   default_path: string | null;
   files: ContentFile[];
 }
 
 export type RouteTarget =
-  | { kind: "duck_fs"; content: DuckFsContent }
+  | { kind: "duck_fs"; manifest_sha256: string }
   | { kind: "loopback_http" };
 
 export interface RouteDefinition {
@@ -245,14 +237,15 @@ export const validatePolicy = (policy: RoutePolicy): void => {
   if (policy.max_request_bytes > MAX_REQUEST_BODY_BYTES) {
     throw new Error("gateway: request cap is too large");
   }
-  if (policy.max_response_bytes < 1 || policy.max_response_bytes > MAX_RESPONSE_BODY_BYTES) {
-    throw new Error("gateway: response cap is out of range");
-  }
+  // `0` means an unbounded stream (SSE); a non-zero value is a serve-time cap.
   if (
     policy.methods.some((method) => ["post", "put", "patch", "delete"].includes(method)) &&
     policy.max_request_bytes === 0
   ) {
     throw new Error("gateway: body-bearing methods require a request cap");
+  }
+  if (typeof policy.allow_upgrade !== "boolean") {
+    throw new Error("gateway: invalid upgrade policy");
   }
   if (typeof policy.allow_authorization !== "boolean") {
     throw new Error("gateway: invalid Authorization policy");
@@ -275,29 +268,30 @@ export const validatePolicy = (policy: RoutePolicy): void => {
   }
 };
 
-export const validateContent = (content: DuckFsContent): void => {
-  if (!Array.isArray(content.files) || content.files.length === 0 || content.files.length > MAX_CONTENT_FILES) {
-    throw new Error("gateway: invalid DuckFS file count");
+/** Mirrors `gateway::validate_manifest`. Content is opaque: no MIME whitelist. */
+export const validateManifest = (manifest: RouteManifest): void => {
+  if (!Array.isArray(manifest.files) || manifest.files.length === 0 || manifest.files.length > MAX_MANIFEST_FILES) {
+    throw new Error("gateway: invalid manifest file count");
   }
-  if (content.default_path !== null) validateContentPath(content.default_path);
+  if (manifest.default_path !== null) validateContentPath(manifest.default_path);
   let previous = "";
   let total = 0;
-  let defaultExists = content.default_path === null;
-  for (const file of content.files) {
+  let defaultExists = manifest.default_path === null;
+  for (const file of manifest.files) {
     validateContentPath(file.path);
     if (previous && previous >= file.path) throw new Error("gateway: files must be path-sorted");
     previous = file.path;
-    if (!ALLOWED_CONTENT_MIME_TYPES.has(file.mime)) {
-      throw new Error(`gateway: MIME type is not allowed: ${file.mime}`);
+    if (file.mime.length === 0 || encoder.encode(file.mime).length > MAX_MIME_BYTES) {
+      throw new Error(`gateway: invalid mime for ${file.path}`);
     }
     validateU64(file.size, `size for ${file.path}`);
-    if (file.size > MAX_CONTENT_FILE_BYTES) throw new Error(`gateway: ${file.path} is too large`);
+    if (file.size > MAX_FILE_BYTES) throw new Error(`gateway: ${file.path} is too large`);
     total += file.size;
-    if (total > MAX_CONTENT_TOTAL_BYTES) throw new Error("gateway: DuckFS target is too large");
+    if (total > MAX_SITE_BYTES) throw new Error("gateway: manifest content is too large");
     if (!/^[0-9a-f]{64}$/.test(file.sha256)) {
       throw new Error(`gateway: invalid SHA-256 for ${file.path}`);
     }
-    if (file.path === content.default_path) defaultExists = true;
+    if (file.path === manifest.default_path) defaultExists = true;
   }
   if (!defaultExists) throw new Error("gateway: default path is not declared");
 };
@@ -314,19 +308,22 @@ export const validateStatement = (statement: RouteStatement): void => {
   if (!statement.route) return;
   validatePolicy(statement.route.policy);
   if (statement.route.target.kind === "duck_fs") {
-    validateContent(statement.route.target.content);
+    if (!/^[0-9a-f]{64}$/.test(statement.route.target.manifest_sha256)) {
+      throw new Error("gateway: manifest_sha256 must be 64 lowercase hex chars");
+    }
     const policy = statement.route.policy;
     if (
       policy.methods.length !== 2 ||
       policy.methods[0] !== "get" ||
       policy.methods[1] !== "head" ||
       policy.max_request_bytes !== 0 ||
-      policy.allow_authorization
+      policy.allow_authorization ||
+      policy.allow_upgrade ||
+      policy.max_response_bytes === 0
     ) {
-      throw new Error("gateway: DuckFS routes require GET+HEAD without request credentials");
-    }
-    if (statement.route.target.content.files.some((file) => file.size > policy.max_response_bytes)) {
-      throw new Error("gateway: a DuckFS file exceeds the response cap");
+      throw new Error(
+        "gateway: DuckFS routes require GET+HEAD, no request credentials, no upgrade, and a bounded response cap",
+      );
     }
   } else if (statement.route.target.kind !== "loopback_http") {
     throw new Error("gateway: unsupported route target");
@@ -346,6 +343,7 @@ const encodePolicy = (out: number[], policy: RoutePolicy): void => {
   pushU64(out, policy.max_request_bytes);
   pushU64(out, policy.max_response_bytes);
   out.push(policy.allow_authorization ? 1 : 0);
+  out.push(policy.allow_upgrade ? 1 : 0);
 };
 
 /** Byte-identical mirror of `gateway::route_signing_preimage`. */
@@ -369,19 +367,7 @@ export const routeSigningPreimage = (statement: RouteStatement): Uint8Array => {
   encodePolicy(out, statement.route.policy);
   if (statement.route.target.kind === "duck_fs") {
     out.push(1);
-    const content = statement.route.target.content;
-    if (content.default_path === null) out.push(0);
-    else {
-      out.push(1);
-      pushBytes(out, encoder.encode(content.default_path));
-    }
-    pushU64(out, content.files.length);
-    for (const file of content.files) {
-      pushBytes(out, encoder.encode(file.path));
-      pushBytes(out, encoder.encode(file.mime));
-      pushU64(out, file.size);
-      out.push(...hexToBytes(file.sha256));
-    }
+    out.push(...hexToBytes(statement.route.target.manifest_sha256));
   } else {
     out.push(2);
   }
@@ -465,9 +451,9 @@ export const probeRouteHealth = async (
   if (!transport.gatewayProxy) {
     throw new Error("gateway: this node has no active gateway plane");
   }
-  const path = route.target.kind === "duck_fs"
-    ? `/${route.target.content.default_path ?? route.target.content.files[0].path}`
-    : "/";
+  // "/" resolves to the manifest's default_path at serve time; the record no
+  // longer carries the file table, so probe the root for both target kinds.
+  const path = "/";
   const reply = await transport.gatewayProxy({
     head: {
       account_id: record.statement.account_id,
@@ -502,16 +488,10 @@ export const submitStatement = async (
   statement: RouteStatement,
 ): Promise<BlockEvent> => transport.submit(TARGET, await signStatement(statement));
 
-export const openWindow = async (url: string, title: string): Promise<void> => {
-  if (!isTauri()) throw new Error("an isolated gateway window requires the desktop app");
-  await invoke<void>("gateway_open_window", { url, title });
-};
-
-// ── Inline gateway view (CEF shells only) ───────────────
+// ── Inline gateway view ─────────────────────────────────
 // On the CEF runtime every gateway session is its own renderer process and the
 // inline child webview's label matches no capability, so embedding in the
-// Browser pane is as isolated as the separate window. wry shells report
-// unsupported and keep the window path.
+// Browser pane is fully isolated from the app's command surface.
 
 export interface InlineRect {
   x: number;
@@ -520,23 +500,24 @@ export interface InlineRect {
   height: number;
 }
 
-let inlineSupport: Promise<boolean> | null = null;
-export const inlineSupported = (): Promise<boolean> => {
-  if (!isTauri()) return Promise.resolve(false);
-  inlineSupport ??= invoke<boolean>("gateway_inline_supported").catch(() => false);
-  return inlineSupport;
+// `title` is the .duck route the user navigated to. The shell needs it because
+// the session origin is a random loopback token: it is the only honest name a
+// permission prompt can put in front of the user (see src-tauri/permissions.rs).
+export const openInline = async (url: string, title: string, tabId: string, rect: InlineRect): Promise<void> => {
+  if (!isTauri()) throw new Error("executable gateway routes require the desktop app");
+  await invoke<void>("gateway_open_inline", { url, title, tabId, rect });
 };
 
-export const openInline = async (url: string, rect: InlineRect): Promise<void> => {
-  await invoke<void>("gateway_open_inline", { url, rect });
+export const placeInline = async (tabId: string, rect: InlineRect): Promise<void> => {
+  await invoke<void>("gateway_inline_place", { tabId, rect });
 };
 
-export const placeInline = async (rect: InlineRect): Promise<void> => {
-  await invoke<void>("gateway_inline_place", { rect });
+export const closeInline = async (tabId: string): Promise<void> => {
+  await invoke<void>("gateway_inline_close", { tabId }).catch(() => undefined);
 };
 
-export const closeInline = async (): Promise<void> => {
-  await invoke<void>("gateway_inline_close").catch(() => undefined);
+export const hideAllInline = async (): Promise<void> => {
+  await invoke<void>("gateway_inline_hide_all").catch(() => undefined);
 };
 
 export const contentRoot = (

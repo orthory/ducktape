@@ -1,26 +1,32 @@
 use super::*;
 
-// ---- the composer's v2-vs-v3 selection (files presence) ---------------------
+// ---- the composer always emits the portable v3 wire --------------------------
 
 #[test]
-fn a_run_composes_v2_without_files_and_v3_with_files_wired() {
+fn a_run_composes_v3_with_or_without_files_wired() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let agent = record("bot", &[ACTION_CHAT_POST]);
     let head = "aa".repeat(32);
 
-    // no files module: the byte-identical v2 payload, no portable fields.
+    // no files module (dev tools/tests): still the v3 wire, with a null pin.
     let m0 = module();
     let ctx0 = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
-    let prepared = block_on(m0.prepare_dispatch(&ctx0, &agent, "general", 2)).unwrap();
+    let prepared = block_on(m0.prepare_dispatch(
+        &ctx0,
+        &agent,
+        &crate::run_id_for("general", 2, "bot"),
+        "general",
+        2,
+    ))
+    .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
-    assert_eq!(v["ducktape_run"], 2, "no files module composes v2");
+    assert_eq!(v["ducktape_run"], 3, "every composer emits v3 (flag day)");
     assert!(
-        v.get("workspace").is_none(),
-        "no v3 workspace without files"
+        v["workspace"]["source_snapshot"].is_null(),
+        "an unwired files module composes an explicit null pin"
     );
-    assert!(v.get("skills").is_none());
 
     // files wired: the v3 payload pins the committed head.
     let m4 = module().with_files_module("files");
@@ -28,7 +34,14 @@ fn a_run_composes_v2_without_files_and_v3_with_files_wired() {
         .with_registry(&registry)
         .with_transcript("general", transcript(2))
         .with_files_head(&head);
-    let prepared = block_on(m4.prepare_dispatch(&ctx4, &agent, "general", 2)).unwrap();
+    let prepared = block_on(m4.prepare_dispatch(
+        &ctx4,
+        &agent,
+        &crate::run_id_for("general", 2, "bot"),
+        "general",
+        2,
+    ))
+    .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
     assert_eq!(v["ducktape_run"], 3, "a wired files module composes v3");
     assert_eq!(
@@ -54,23 +67,15 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
             name: "pinned".into(),
             source_prefix: "/shared/skills/pinned".into(),
             source_snapshot: Some("bb".repeat(32)),
+            load: agent::LoadMode::Always,
         },
         agent::SkillRef {
             name: "tracking".into(),
             source_prefix: "/shared/skills/tracking".into(),
             source_snapshot: None,
+            load: agent::LoadMode::OnDemand,
         },
     ];
-
-    // no files module: None (the composer takes its v2 path).
-    let unwired = module();
-    let ctx0 = CaptureCtx::new().with_files_head(&head);
-    assert!(
-        block_on(unwired.portable_inputs(&ctx0, &agent))
-            .unwrap()
-            .is_none(),
-        "no portable inputs without a wired files module"
-    );
 
     let m = module().with_files_module("files");
 
@@ -84,12 +89,15 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
         }
     }
 
-    // files wired + a committed head: Some, head pinned, skills resolved.
+    // files wired + a committed head: head pinned, skills resolved.
     let ctx4 = CaptureCtx::new().with_files_head(&head);
-    let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap().unwrap();
+    let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap();
     assert_eq!(duckfs_pin(&inputs).as_deref(), Some(head.as_str()));
     assert!(inputs.sink.is_chain(), "the duckfs lane requests no sink");
-    assert!(inputs.context.is_none(), "the duckfs lane injects no context");
+    assert!(
+        inputs.context.is_none(),
+        "the duckfs lane injects no context"
+    );
     // pinned skill passes its snapshot through; tracking resolves to the head.
     assert_eq!(
         inputs.skills[0].source_snapshot.as_deref(),
@@ -100,43 +108,55 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
         Some(head.as_str()),
         "a tracking skill pins the same committed head (W2)"
     );
+    // the curated load mode rides through pin resolution untouched — it is what
+    // tells the host which bodies to inline into the agent's context document.
+    assert!(inputs.skills[0].always, "the persona loads always");
+    assert!(!inputs.skills[1].always, "the reference skill is on demand");
 
-    // files wired + an unresolved head: Some with a null pin (fresh network).
+    // files wired + an unresolved head: a null pin (fresh network).
     let ctx_empty = CaptureCtx::new();
-    let inputs = block_on(m.portable_inputs(&ctx_empty, &agent))
-        .unwrap()
-        .unwrap();
+    let inputs = block_on(m.portable_inputs(&ctx_empty, &agent)).unwrap();
     assert!(
         duckfs_pin(&inputs).is_none(),
-        "an unresolved head is a legitimate null pin, still Some"
+        "an unresolved head is a legitimate null pin"
+    );
+
+    // no files module (dev tools/tests): no query is issued, the pin is null,
+    // skills still resolve (a tracking skill then has no head to pin to).
+    let unwired = module();
+    let ctx0 = CaptureCtx::new().with_files_head(&head);
+    let inputs = block_on(unwired.portable_inputs(&ctx0, &agent)).unwrap();
+    assert!(
+        duckfs_pin(&inputs).is_none(),
+        "an unwired files module composes a null pin, never a files query"
+    );
+    assert_eq!(
+        inputs.skills[1].source_snapshot, None,
+        "a tracking skill stays unpinned without a files head"
     );
 }
 
 // ---- runner-result decode (facet-free + faceted) ----------------------------
 
 #[test]
-fn legacy_raw_text_results_decode_as_message_only() {
-    // a raw-text result (or the AgentResponse JSON the model emits) carries
-    // no runner marker, so it decodes to a facet-free message-only result:
-    // response_text = the lossy-decoded bytes, no effects, Chain sink, Ok.
+fn marker_less_results_are_loud_errors_not_message_only_delivery() {
+    // FLAG DAY: the flat-string passthrough is gone. bytes without the
+    // ducktape_runner_result marker — raw prose, bare AgentResponse JSON,
+    // invalid utf-8 — fail the decode deterministically (the run fails).
     for raw in [
-        "just a prose answer",
-        "",
-        r#"{"reply_blocks":[{"id":"x","kind":"paragraph","text":"hi"}],"actions":[]}"#,
+        "just a prose answer".as_bytes(),
+        "".as_bytes(),
+        br#"{"reply_blocks":[{"id":"x","kind":"paragraph","text":"hi"}],"actions":[]}"#.as_slice(),
         // a JSON object WITHOUT the marker is not a runner wrapper.
-        r#"{"response_text":"nope"}"#,
+        br#"{"response_text":"nope"}"#.as_slice(),
+        &[0xff, 0xfe],
     ] {
-        let result = decode_run_result_v1(raw.as_bytes()).unwrap();
-        assert_eq!(result.response_text, raw);
-        assert!(result.effects.is_empty());
-        assert!(matches!(result.sink, WireSink::Chain));
-        assert_eq!(result.status, WireStatus::Ok);
+        let err = decode_run_result_v1(raw).unwrap_err();
+        assert!(
+            err.contains("malformed"),
+            "{raw:?} must be a loud error, got {err:?}"
+        );
     }
-    // invalid utf-8 still degrades lossily rather than erroring.
-    assert_eq!(
-        decode_run_result_v1(&[0xff, 0xfe]).unwrap().response_text,
-        "\u{fffd}\u{fffd}"
-    );
 }
 
 #[test]
@@ -192,7 +212,13 @@ fn compose_forge(
     channel: &str,
 ) -> Result<serde_json::Value, String> {
     let agent = registry.get("bot").expect("bot registered");
-    let prepared = block_on(m.prepare_dispatch(ctx, agent, channel, 2))?;
+    let prepared = block_on(m.prepare_dispatch(
+        ctx,
+        agent,
+        &crate::run_id_for(channel, 2, "bot"),
+        channel,
+        2,
+    ))?;
     Ok(serde_json::from_slice(&prepared.payload).expect("payload is JSON"))
 }
 
@@ -221,7 +247,10 @@ fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
     // the requested sink: a PR of the work branch onto main, no title/body.
     assert_eq!(v["result_contract"]["sink"]["mode"], "pr");
     assert_eq!(v["result_contract"]["sink"]["repo"], "app");
-    assert_eq!(v["result_contract"]["sink"]["source_branch"], "agent/item-7");
+    assert_eq!(
+        v["result_contract"]["sink"]["source_branch"],
+        "agent/item-7"
+    );
     assert_eq!(v["result_contract"]["sink"]["target_branch"], "main");
     assert!(v["result_contract"]["sink"].get("title").is_none());
     assert!(v["result_contract"]["sink"].get("body").is_none());
@@ -285,6 +314,150 @@ fn a_pr_item_run_works_the_prs_own_source_branch() {
     assert!(context.contains("pr #8"), "{context}");
     assert!(context.contains("pr source branch: feature/x"), "{context}");
     assert!(context.contains("pr target branch: dev"), "{context}");
+}
+
+// ---- `[[page:<id>]]` page-spec injection (M2) ---------------------------------
+
+#[test]
+fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
+    // a PLAIN channel (the duckfs lane): the trigger message's ref alone
+    // composes a context section carrying the page subtree.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let agent = record("bot", &[ACTION_CHAT_POST]);
+    let m = module()
+        .with_files_module("files")
+        .with_pages_module("pages");
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript(
+            "general",
+            vec![
+                message(1, "msg 1"),
+                message(2, "please work from [[page:plan]]"),
+            ],
+        )
+        .with_page("plan", page_blocks("plan", "Project Plan"));
+    let prepared = block_on(m.prepare_dispatch(
+        &ctx,
+        &agent,
+        &crate::run_id_for("general", 2, "bot"),
+        "general",
+        2,
+    ))
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    let context = v["context"].as_str().expect("a page ref composes context");
+    assert!(context.starts_with("Referenced pages:"), "{context}");
+    assert!(
+        context.contains("[[page:plan]] — Project Plan"),
+        "{context}"
+    );
+    assert!(context.contains("spec paragraph"), "{context}");
+    assert!(
+        context.contains("- [ ] do the thing [blk:b-t]"),
+        "{context}"
+    );
+}
+
+#[test]
+fn a_page_ref_in_the_forge_item_body_appends_after_the_item_context() {
+    let registry = forge_read_registry();
+    let m = forge_module();
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript("forge:app:7", transcript(2))
+        .with_forge_item(
+            "app",
+            forge_issue(7, "Fix the gate", "spec at [[page:plan]]"),
+        )
+        .with_forge_tip("app", "main", &"cd".repeat(20))
+        .with_page("plan", page_blocks("plan", "Project Plan"));
+    let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
+    let context = v["context"].as_str().unwrap();
+    // the M1 item context is untouched and leads; the page section follows.
+    assert!(context.starts_with("Forge item context"), "{context}");
+    assert!(context.contains("spec at [[page:plan]]"), "{context}");
+    let item_body = context.find("spec at").unwrap();
+    let pages_at = context
+        .find("Referenced pages:")
+        .expect("page section rides");
+    assert!(
+        item_body < pages_at,
+        "the page section follows the item context: {context}"
+    );
+    assert!(
+        context.contains("[[page:plan]] — Project Plan"),
+        "{context}"
+    );
+    assert!(
+        context.contains("- [ ] do the thing [blk:b-t]"),
+        "{context}"
+    );
+}
+
+#[test]
+fn a_missing_page_ref_composes_its_marker_never_a_failure() {
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let agent = record("bot", &[ACTION_CHAT_POST]);
+    let m = module()
+        .with_files_module("files")
+        .with_pages_module("pages");
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript("general", vec![message(1, "see [[page:gone]]")]);
+    let prepared = block_on(m.prepare_dispatch(
+        &ctx,
+        &agent,
+        &crate::run_id_for("general", 1, "bot"),
+        "general",
+        1,
+    ))
+    .expect("an unresolvable ref never fails compose");
+    let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    let context = v["context"].as_str().unwrap();
+    assert!(context.contains("[[page:gone — not found]]"), "{context}");
+}
+
+#[test]
+fn page_refs_without_a_wired_pages_module_compose_no_page_section() {
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let agent = record("bot", &[ACTION_CHAT_POST]);
+    let m = module().with_files_module("files");
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript("general", vec![message(1, "see [[page:plan]]")]);
+    let prepared = block_on(m.prepare_dispatch(
+        &ctx,
+        &agent,
+        &crate::run_id_for("general", 1, "bot"),
+        "general",
+        1,
+    ))
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    assert!(
+        v.get("context").is_none(),
+        "no pages module wired composes no context key"
+    );
+}
+
+#[test]
+fn page_injection_composes_byte_deterministically() {
+    let registry = forge_read_registry();
+    let m = forge_module();
+    let ctx = || {
+        CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "Fix", "see [[page:plan]]"))
+            .with_forge_tip("app", "main", &"cd".repeat(20))
+            .with_page("plan", page_blocks("plan", "Project Plan"))
+    };
+    let agent = registry.get("bot").unwrap();
+    let run = crate::run_id_for("forge:app:7", 2, "bot");
+    let a = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2)).unwrap();
+    let b = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2)).unwrap();
+    assert_eq!(a.payload, b.payload, "same committed state, same bytes");
 }
 
 #[test]
@@ -366,7 +539,9 @@ fn an_engagement_on_a_forge_channel_without_the_cap_skips_with_a_breadcrumb() {
     // never a dispatch and never a block abort.
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let mut m = forge_module();
-    let mut watch_ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
+    let mut watch_ctx = CaptureCtx::new()
+        .with_origin(user(9))
+        .with_registry(&registry);
     exec(
         &mut m,
         &mut watch_ctx,
@@ -415,6 +590,7 @@ fn a_request_run_on_a_forge_channel_without_the_cap_rejects_with_the_reason() {
             agent_id: "bot".into(),
             channel_id: "forge:app:7".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap_err();
@@ -430,7 +606,9 @@ fn a_forge_engagement_with_the_cap_stages_the_dispatch() {
     // channel, mention-free All engagement, forge workspace composed.
     let registry = forge_read_registry();
     let mut m = forge_module();
-    let mut watch_ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
+    let mut watch_ctx = CaptureCtx::new()
+        .with_origin(user(9))
+        .with_registry(&registry);
     exec(
         &mut m,
         &mut watch_ctx,

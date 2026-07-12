@@ -4,10 +4,9 @@
 //! modules, live proof-carrying qmdb op-range fetches for the resolver-lane
 //! modules — and composes the source's exact app-hash.
 //!
-//! this supersedes the in-process handoffs of `joiner_rebuilds_global_app_hash`
-//! (which still pins the per-module sync primitives): here NOTHING crosses the
-//! boundary except protocol bytes. the transport is an in-process channel; the
-//! bytes, frames, and client code are identical to what a p2p channel carries.
+//! NOTHING crosses the boundary except protocol bytes. the transport is an
+//! in-process channel; the bytes, frames, and client code are identical to
+//! what a p2p channel carries.
 
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
@@ -24,7 +23,7 @@ use kv::{KvMsg, encode as kv_encode};
 use saga::SagaModule;
 use saga::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Module, Msg, StateRoot};
-use state::global_root;
+use host::global_root;
 use valset::Valset;
 use valset::{ValsetMsg, encode_msg as valset_encode_msg};
 
@@ -191,6 +190,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                     max_attempts: 1,
                     lease_views: None,
                     capability: None,
+                    demands: Default::default(),
                 }),
             },
         ];

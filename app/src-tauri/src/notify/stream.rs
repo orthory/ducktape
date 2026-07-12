@@ -20,12 +20,9 @@ use tokio_tungstenite::tungstenite::Message;
 use super::engine::{Engine, Frame, Sink};
 
 /// The notifier's fixed topic set — subscribed once per connection.
-/// `module:dispatch` carries the runs module's Dispatch ops, whose envelope
-/// names the chat thread a run answers — the run-finished deep-link's source.
-pub const TOPICS: [&str; 5] = [
+pub const TOPICS: [&str; 4] = [
     "module:chat",
     "module:runs",
-    "module:dispatch",
     "module:forge",
     "module:governance",
 ];
@@ -38,10 +35,6 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Handle to the spawned stream task. Dropping it does NOT stop the loop;
 /// call [`StreamHandle::shutdown`].
 pub struct StreamHandle {
-    /// Owned but never read: the task detaches on drop, so this exists only
-    /// to keep a join/abort route open for future lifecycle needs.
-    #[allow(dead_code)]
-    task: tauri::async_runtime::JoinHandle<()>,
     shutdown: Arc<Notify>,
 }
 
@@ -61,8 +54,10 @@ pub fn spawn<S: Sink + 'static>(
     cmds: UnboundedReceiver<super::Cmd>,
 ) -> StreamHandle {
     let shutdown = Arc::new(Notify::new());
-    let task = tauri::async_runtime::spawn(run_loop(shared, engine, cmds, shutdown.clone()));
-    StreamHandle { task, shutdown }
+    // The JoinHandle is dropped deliberately: the task detaches on drop, and
+    // shutdown rides the Notify, not the handle.
+    tauri::async_runtime::spawn(run_loop(shared, engine, cmds, shutdown.clone()));
+    StreamHandle { shutdown }
 }
 
 /// The actual loop — factored so tests drive it directly under #[tokio::test].
@@ -458,7 +453,7 @@ mod tests {
                 assert_eq!(op, op_row());
                 // the op is exactly what decode::decode_op_row parses.
                 let row = crate::notify::decode::decode_op_row(&op).expect("op row decodes");
-                assert_eq!(row.height, 6);
+                assert_eq!(row.origin.id.as_deref(), Some("cccc"));
             }
             other => panic!("expected Event, got {other:?}"),
         }
@@ -520,7 +515,7 @@ mod tests {
         assert_eq!(frame["op"], "subscribe");
         assert_eq!(
             frame["topics"],
-            json!(["module:chat", "module:runs", "module:dispatch", "module:forge", "module:governance"])
+            json!(["module:chat", "module:runs", "module:forge", "module:governance"])
         );
         assert!(
             frame.get("resume").is_none(),
@@ -683,7 +678,7 @@ mod tests {
             let sink = CaptureSink::default();
             let presented = sink.presented.clone();
             let state = TestState::new();
-            let engine = Engine::new(sink, state.path());
+            let engine = Engine::new(sink, state.path(), Arc::default());
             let shared = shared_for(format!("http://{addr}/"));
             let (_cmds_tx, cmds_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
             let shutdown = Arc::new(Notify::new());
@@ -794,7 +789,7 @@ mod tests {
         let sink = CaptureSink::default();
         let presented = sink.presented.clone();
         let state = TestState::new();
-        let engine = Engine::new(sink, state.path());
+        let engine = Engine::new(sink, state.path(), Arc::default());
         let shared = shared_for(base.clone());
         let (_cmds_tx, cmds_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         let shutdown = Arc::new(Notify::new());

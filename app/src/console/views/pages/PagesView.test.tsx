@@ -1,11 +1,12 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 
 import type { PageBlock } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { color } from "../../theme/tokens";
+import { MAX_PASTE_BLOCKS } from "./page-paste";
 import { EDIT_BOUNDARY_MS, PagesView } from "./PagesView";
 
 const makeActions = () => {
@@ -14,7 +15,12 @@ const makeActions = () => {
     {},
     {
       get: (_target, key: string) => {
-        spies[key] ??= vi.fn() as (...args: unknown[]) => void;
+        // the block-write actions resolve true once the op commits (false on a
+        // surfaced failure); the editor's split/merge await that to compensate.
+        // Void actions resolving a promise nobody reads is harmless.
+        spies[key] ??= vi.fn(() => Promise.resolve(true)) as unknown as (
+          ...args: unknown[]
+        ) => void;
         return spies[key];
       },
     },
@@ -55,9 +61,44 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
       <PagesView />
     </ConsoleContext.Provider>
   );
-  const { rerender } = render(view(patch));
-  return { spies, rerender: (p: Partial<ConsoleState>) => rerender(view(p)) };
+  const { rerender, unmount } = render(view(patch));
+  // the Proxy mints a spy on first access, so `spies.x` is undefined until the
+  // view calls `actions.x`. Asserting "never called" needs the spy to exist:
+  // touch it through `actions` first.
+  const materialize = (...names: (keyof ConsoleActions)[]) => {
+    for (const name of names) void actions[name];
+  };
+  // Make an op NOT LAND — the action resolves false, exactly as submitTracked
+  // does for a write the node rejected or never answered. The editor's whole
+  // safety net (the compensating split, the merge that refuses to remove a block
+  // whose children did not make it across) hangs off that boolean, so this is the
+  // ONLY way to exercise it. Without it the net was never once tested.
+  const fails = (...names: (keyof ConsoleActions)[]) => {
+    materialize(...names);
+    for (const name of names) {
+      (spies[name as string] as unknown as Mock).mockReturnValue(Promise.resolve(false));
+    }
+  };
+  return {
+    spies,
+    materialize,
+    fails,
+    unmount,
+    rerender: (p: Partial<ConsoleState>) => rerender(view(p)),
+  };
 };
+
+/** Drain the microtask queue (the compensations and the merge's adoption chain
+ *  hang off promise `.then`s, several deep) and let React commit what they
+ *  patched. A bare `await` only runs one tick of the chain. */
+const settle = () =>
+  act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+/** The order calls were made in, across DIFFERENT spies. */
+const callOrder = (spy: (...args: unknown[]) => void): number[] =>
+  (spy as unknown as Mock).mock.invocationCallOrder;
 
 describe("PagesView", () => {
   it("enumerates pages on mount and via the refresh control", () => {
@@ -442,7 +483,19 @@ describe("subpages", () => {
 
   it("renders no Subpages section when the page has no children", () => {
     renderPagesView();
-    expect(screen.queryByText("Subpages")).toBeNull();
+    // by LABEL, not by text: child pages now render as inline page blocks in
+    // the document flow, so there is no "SUBPAGES" heading left to look for and
+    // a text query would pass vacuously.
+    expect(screen.queryByLabelText("Subpages")).toBeNull();
+  });
+
+  it("renders child pages as inline page blocks, not a boxed-off section", () => {
+    renderPagesView(withChild);
+    const section = screen.getByLabelText("Subpages");
+    // no uppercase mono section header, no underlined title.
+    expect(section.textContent).toBe("Child");
+    const row = within(section).getByRole("button", { name: "Open subpage Child" });
+    expect(row.innerHTML).not.toContain("border-bottom");
   });
 
   it("creates a subpage from /page instead of converting the block", () => {
@@ -499,5 +552,795 @@ describe("endless canvas", () => {
   it("drops the bordered page card — the scroll surface itself is paper", () => {
     renderPagesView();
     expect(screen.getByTestId("doc-scroll")).toHaveStyle({ background: color.paper });
+  });
+});
+
+// The block used to be an atomic text cell: Enter appended an empty sibling and
+// left your text behind, Backspace never joined two blocks, and Cmd+Enter on a
+// to-do made a block instead of checking it. jsdom does not place a caret for
+// us, so every test here sets the selection before dispatching the key.
+describe("text moves across block boundaries", () => {
+  const caretAt = (area: HTMLTextAreaElement, at: number) => {
+    fireEvent.focus(area);
+    area.setSelectionRange(at, at);
+  };
+
+  it("splits at the caret: this block keeps the left half, the sibling takes the right", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    caretAt(area, 5); // "First| draft"
+    fireEvent.keyDown(area, { key: "Enter" });
+
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ parent: "p1", after: "a", kind: "paragraph", text: " draft" }),
+    );
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "First" });
+  });
+
+  it("continues a list on Enter, carrying the right half into the new item", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 4); // "Ship| it"
+    fireEvent.keyDown(area, { key: "Enter" });
+
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "todo", text: " it" }),
+    );
+  });
+
+  it("merges into the previous block on Backspace at offset 0, caret at the seam", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "a",
+      text: "First draftShip it",
+    });
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  it("leaves Backspace alone in the middle of a block", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("removePageBlock", "updatePageBlockText");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 3);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+  });
+
+  it("checks a to-do with Cmd+Enter, and makes no block", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 2);
+    fireEvent.keyDown(area, { key: "Enter", metaKey: true });
+
+    expect(spies.setPageBlockChecked).toHaveBeenCalledWith({ blockId: "b", checked: true });
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+});
+
+describe("the caret lands on the adjacent line", () => {
+  it("ArrowDown from the end of a block lands at the START of the next", () => {
+    renderPagesView();
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    const second = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    fireEvent.focus(first);
+    first.setSelectionRange(first.value.length, first.value.length);
+    fireEvent.keyDown(first, { key: "ArrowDown" });
+
+    expect(document.activeElement).toBe(second);
+    expect(second.selectionStart).toBe(0);
+  });
+
+  it("ArrowUp from the start of a block lands at the END of the previous", () => {
+    renderPagesView();
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    const second = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    fireEvent.focus(second);
+    second.setSelectionRange(0, 0);
+    fireEvent.keyDown(second, { key: "ArrowUp" });
+
+    expect(document.activeElement).toBe(first);
+    expect(first.selectionStart).toBe(first.value.length);
+  });
+
+  it("ArrowUp from the first block reaches the title", () => {
+    renderPagesView();
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(first);
+    first.setSelectionRange(0, 0);
+    fireEvent.keyDown(first, { key: "ArrowUp" });
+
+    expect(document.activeElement).toBe(screen.getByLabelText("Page title"));
+  });
+});
+
+describe("the title descends into the body", () => {
+  it("focuses the first block at its start, inserting nothing", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    const title = screen.getByLabelText("Page title");
+    fireEvent.keyDown(title, { key: "Enter" });
+
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    expect(document.activeElement).toBe(first);
+    expect(first.selectionStart).toBe(0);
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+
+  // the reported papercut: on a page with no body there was nothing to focus,
+  // and focusRow(undefined) means "focus the title", so Enter did nothing.
+  it("creates the first block when the page has no body yet", () => {
+    const empty: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: [] }),
+    ];
+    const { spies } = renderPagesView({ activePageBlocks: empty });
+    fireEvent.keyDown(screen.getByLabelText("Page title"), { key: "Enter" });
+
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ parent: "p1", kind: "paragraph", text: "" }),
+    );
+  });
+});
+
+describe("a divider is reachable from the keyboard", () => {
+  it("Backspace at the start of the block below removes the divider above", () => {
+    const withDivider: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["d", "a"] }),
+      blockOf({ id: "d", kind: "divider" }),
+      blockOf({ id: "a", text: "First draft" }),
+    ];
+    const { spies, materialize } = renderPagesView({ activePageBlocks: withDivider });
+    materialize("updatePageBlockText");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.removePageBlock).toHaveBeenCalledWith("d");
+    // the text is not merged into a divider, and this block survives.
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+  });
+
+  // THE BLOCKER. `indentTarget` had no kind check and MoveBlock validates only
+  // page-match + cycles, so Tab really could make a DIVIDER the parent of the
+  // block you were typing in. That block's row then sits directly under the rule,
+  // so Backspace at offset 0 reads as "remove the divider above" — and the old
+  // removeDividerAbove called removePageBlock bare, with no children check and no
+  // confirm. RemoveBlock runs delete_subtree: it took the divider, the block
+  // holding the caret, and everything under it. One keystroke, no dialog, no undo.
+  //
+  // The suite passed because it only ever tested a CHILDLESS divider (above).
+  it("CONFIRMS instead of deleting a divider that adopted the caret's own block", () => {
+    const adopted: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["d"] }),
+      blockOf({ id: "d", kind: "divider", children: ["x"] }),
+      blockOf({ id: "x", parent: "d", text: "the text I am typing" }),
+    ];
+    const { spies, materialize } = renderPagesView({ activePageBlocks: adopted });
+    materialize("removePageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // it must NOT go straight to the wire — that op destroys "x" too.
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    within(screen.getByRole("dialog", { name: /delete this block/i })).getByText(/1 nested block/);
+  });
+});
+
+describe("the document has one left edge", () => {
+  it("hangs a list marker in the margin instead of indenting the text column", () => {
+    renderPagesView();
+    const checkbox = screen.getByRole("button", { name: "Check to-do block 2" });
+    const gutter = checkbox.parentElement as HTMLElement;
+
+    // out of flow, so the text column beside it starts at offset 0.
+    expect(gutter.style.position).toBe("absolute");
+    expect(gutter.style.left).toBe("-28px");
+  });
+
+  it("gives prose no marker box to pay for", () => {
+    renderPagesView();
+    const rowOf = (label: string) =>
+      screen.getByLabelText(label).closest('[style*="margin-left"]') as HTMLElement;
+
+    // a paragraph renders no marker element at all. It used to render an empty
+    // 20px box + an 8px gap, which is what pushed every line of body text 28px
+    // right of the title. A to-do still renders its checkbox — hanging, now.
+    const prose = rowOf("Edit paragraph block 1");
+    const todo = rowOf("Edit todo block 2");
+    expect(prose.children.length).toBe(todo.children.length - 1);
+    expect(prose.querySelector('[style*="-28px"]')).toBeNull();
+    expect(todo.querySelector('[style*="-28px"]')).not.toBeNull();
+  });
+
+  it("keeps the title flush with the text column", () => {
+    renderPagesView();
+    const title = screen.getByLabelText("Page title") as HTMLInputElement;
+    expect(title.style.padding).toBe("0px");
+  });
+
+  it("stops padding the add-block button around a gutter that no longer exists", () => {
+    renderPagesView();
+    const add = screen.getByRole("button", { name: /add a block|start writing/i });
+    expect(add.style.padding).toBe("8px 0px");
+  });
+});
+
+// ── The left gutter: the affordances that replaced a one-click subtree bomb ──
+
+describe("the left hover gutter", () => {
+  const NESTED: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a", "b"] }),
+    blockOf({ id: "a", kind: "toggle", text: "Parent", children: ["a1"] }),
+    blockOf({ id: "a1", parent: "a", text: "Child" }),
+    blockOf({ id: "b", text: "Leaf" }),
+  ];
+
+  const openMenu = (n: number) =>
+    fireEvent.click(screen.getByRole("button", { name: `Block ${n} actions` }));
+
+  it("inserts a paragraph below from the + affordance", () => {
+    const { spies } = renderPagesView();
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Insert block below block 1" }));
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ parent: "p1", after: "a", kind: "paragraph", text: "" }),
+    );
+  });
+
+  it("turns a block into another kind from the handle menu — the slash catalogue, reused", () => {
+    const { spies } = renderPagesView();
+    openMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Heading 1/ }));
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({ blockId: "a", kind: "heading1" });
+  });
+
+  it("never offers Page as a conversion (it would create, not convert)", () => {
+    renderPagesView();
+    openMenu(1);
+    const menu = screen.getByRole("menu", { name: "Block 1 actions" });
+    expect(within(menu).queryByRole("menuitem", { name: /new subpage/i })).toBeNull();
+  });
+
+  it("duplicates a block and its whole subtree", () => {
+    const { spies } = renderPagesView({ activePageBlocks: NESTED });
+    openMenu(1); // the toggle, which holds a child
+    fireEvent.click(screen.getByRole("menuitem", { name: "Duplicate" }));
+    // one insert for the toggle, one for the nested child.
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(2);
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ parent: "p1", after: "a", kind: "toggle", text: "Parent" }),
+    );
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ after: null, kind: "paragraph", text: "Child" }),
+    );
+  });
+
+  it("deletes a childless block outright", () => {
+    const { spies } = renderPagesView({ activePageBlocks: NESTED });
+    openMenu(3); // the leaf
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  // this is the dangerous one: the old bare `X` took the entire subtree with a
+  // single click, no confirm, no undo.
+  it("CONFIRMS before deleting a block that has children", () => {
+    const { spies, materialize } = renderPagesView({ activePageBlocks: NESTED });
+    materialize("removePageBlock");
+    openMenu(1); // the toggle, which holds a child
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    const dialog = screen.getByRole("dialog", { name: /delete this block/i });
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    within(dialog).getByText(/1 nested block/);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /delete block/i }));
+    expect(spies.removePageBlock).toHaveBeenCalledWith("a");
+  });
+
+  it("reserves no column width on the right — the finalization tray hangs out of the row", () => {
+    renderPagesView();
+    const row = screen
+      .getByLabelText("Edit paragraph block 1")
+      .closest('[style*="margin-left"]') as HTMLElement;
+    // the old tray was an in-flow flex item with `min-width: 44px` on EVERY row.
+    expect(row.innerHTML).not.toContain("min-width: 44px");
+    expect(row.querySelector('[style*="left: 100%"]')).not.toBeNull();
+  });
+});
+
+describe("breadcrumbs", () => {
+  const NESTED_PAGES = {
+    pages: [
+      { id: "top", title: "Handbook", parent: null },
+      { id: "mid", title: "Engineering", parent: "top" },
+      { id: "p1", title: "Launch plan", parent: "mid" },
+    ],
+  };
+
+  it("renders the TRUE ancestry, not a hardcoded 'Pages / <title>'", () => {
+    renderPagesView(NESTED_PAGES);
+    const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
+    expect(
+      within(crumbs)
+        .getAllByRole("button")
+        .map((b) => b.textContent),
+    ).toEqual(["Handbook", "Engineering", "Launch plan"]);
+  });
+
+  it("opens an ancestor from its segment; the current page is not a link", () => {
+    const { spies } = renderPagesView(NESTED_PAGES);
+    const crumbs = screen.getByRole("navigation", { name: "Breadcrumb" });
+    fireEvent.click(within(crumbs).getByRole("button", { name: "Engineering" }));
+    expect(spies.openPage).toHaveBeenCalledWith("mid");
+    expect(within(crumbs).getByRole("button", { name: "Launch plan" })).toBeDisabled();
+  });
+});
+
+describe("pasting a document", () => {
+  const pasteInto = (label: string, text: string, selection?: [number, number]) => {
+    const area = screen.getByLabelText(label) as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    if (selection) area.setSelectionRange(selection[0], selection[1]);
+    fireEvent.paste(area, { clipboardData: { getData: () => text } });
+    return area;
+  };
+
+  it("splits a markdown paste into blocks instead of dumping literal newlines", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({ id: "e", text: "" }),
+      ],
+    });
+    pasteInto("Edit paragraph block 1", "# Title\n\nintro\n- one\n- two");
+
+    // the empty paragraph adopts the first line — kind and text.
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({ blockId: "e", kind: "heading1" });
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "e", text: "Title" });
+    // the rest become their own blocks, in order, each with its own kind.
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(3);
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ kind: "paragraph", text: "intro" }),
+    );
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ kind: "bulleted", text: "one" }),
+    );
+    expect(spies.insertPageBlock).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ kind: "bulleted", text: "two" }),
+    );
+  });
+
+  it("leaves a single-line paste to the browser", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    pasteInto("Edit paragraph block 1", "just some words");
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+
+  it("caps the burst and says so — every block is one consensus write", () => {
+    const { spies } = renderPagesView();
+    pasteInto(
+      "Edit paragraph block 1",
+      Array.from({ length: MAX_PASTE_BLOCKS + 5 }, (_, i) => `line ${i}`).join("\n"),
+    );
+    // first line lands in the row itself; the other 59 are inserts.
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(MAX_PASTE_BLOCKS - 1);
+    screen.getByRole("status");
+    expect(screen.getByRole("status").textContent).toMatch(/5 more lines were dropped/);
+  });
+});
+
+describe("toggle collapse", () => {
+  const TOGGLES: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["t", "e"] }),
+    blockOf({ id: "t", kind: "toggle", text: "Parent", children: ["c"] }),
+    blockOf({ id: "c", parent: "t", text: "Child" }),
+    blockOf({ id: "e", kind: "toggle", text: "Childless" }),
+  ];
+
+  it("shows a chevron only on a toggle that has something to hide", () => {
+    renderPagesView({ activePageBlocks: TOGGLES });
+    screen.getByRole("button", { name: /collapse toggle block 1/i });
+    expect(screen.queryByRole("button", { name: /toggle block 3/i })).toBeNull();
+  });
+
+  it("persists the collapsed set per page across a remount", () => {
+    localStorage.clear();
+    const first = renderPagesView({ activePageBlocks: TOGGLES });
+    fireEvent.click(screen.getByRole("button", { name: /collapse toggle block 1/i }));
+    expect(screen.queryByLabelText("Edit paragraph block 2")).toBeNull();
+    first.unmount();
+
+    // a remount used to re-expand every toggle in the document.
+    renderPagesView({ activePageBlocks: TOGGLES });
+    expect(screen.queryByLabelText("Edit paragraph block 2")).toBeNull();
+    screen.getByRole("button", { name: /expand toggle block 1/i });
+  });
+});
+
+describe("the page icon", () => {
+  it("shows the title's leading emoji as an icon, and edits the title without it", () => {
+    renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "🦆 Launch plan", children: [] }),
+      ],
+    });
+    expect(screen.getByLabelText("Page title")).toHaveValue("Launch plan");
+    expect(screen.getByRole("button", { name: "Change page icon" }).textContent).toBe("🦆");
+  });
+
+  it("composes the icon back onto the title when the rename commits", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "🦆 Launch plan", children: [] }),
+      ],
+    });
+    const title = screen.getByLabelText("Page title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Launch plan v2" } });
+    fireEvent.blur(title);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "p1",
+      text: "🦆 Launch plan v2",
+    });
+  });
+
+  it("takes the icon off again — the input alone could never reach it", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "🦆 Launch plan", children: [] }),
+      ],
+    });
+    // the affordance shows on hover, like Notion's.
+    fireEvent.mouseOver(screen.getByLabelText("Page title"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove page icon" }));
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "p1", text: "Launch plan" });
+  });
+
+  const pageTitled = (text: string) => ({
+    activePageBlocks: [blockOf({ id: "p1", parent: null, kind: "page", text, children: [] })],
+  });
+
+  // The icon is derived from the STORE every render; the draft is a local copy of
+  // an older store. Type an emoji and it commits verbatim — and now it is BOTH
+  // the store's leading emoji (the icon) and still in the focused draft, which the
+  // draft-protection guard refuses to resync. commit() then composed one onto the
+  // other, and did it again at every boundary: "🚀 plan" -> "🚀 🚀 plan" -> …
+  it("does not double an emoji typed into the title", () => {
+    vi.useFakeTimers();
+    try {
+      const { spies, rerender } = renderPagesView(pageTitled("Launch plan"));
+      const title = screen.getByLabelText("Page title");
+      fireEvent.focus(title);
+      fireEvent.change(title, { target: { value: "🚀 Launch plan" } });
+      act(() => {
+        vi.advanceTimersByTime(EDIT_BOUNDARY_MS);
+      });
+      expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+        blockId: "p1",
+        text: "🚀 Launch plan",
+      });
+
+      // the commit lands: the store now reads the emoji as the page's ICON, while
+      // the still-focused input keeps it in the draft. This is the exact state the
+      // old commit doubled from.
+      rerender(pageTitled("🚀 Launch plan"));
+      act(() => {
+        vi.advanceTimersByTime(EDIT_BOUNDARY_MS * 3);
+      });
+      expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+      expect(spies.updatePageBlockText).not.toHaveBeenCalledWith(
+        expect.objectContaining({ text: "🚀 🚀 Launch plan" }),
+      );
+
+      // and leaving the field moves it out of the input for good — the icon
+      // button shows it, the input holds the title.
+      fireEvent.blur(title);
+      expect(title).toHaveValue("Launch plan");
+      expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // splitTitleEmoji eats the whitespace after the emoji and composeTitle re-emits
+  // exactly one space, so the round-trip is NOT the identity for "🦆Launch plan".
+  // The boundary condition was `composeTitle(icon, draft) !== raw`, which is
+  // therefore true on MOUNT — merely opening the page renamed it, with no
+  // keystroke anywhere near the input.
+  it("never rewrites a title on open, however it is spaced", () => {
+    vi.useFakeTimers();
+    try {
+      const { spies, materialize } = renderPagesView(pageTitled("🦆Launch plan"));
+      materialize("updatePageBlockText");
+      act(() => {
+        vi.advanceTimersByTime(EDIT_BOUNDARY_MS * 3);
+      });
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+
+      // a focus and a blur are not an edit either.
+      const title = screen.getByLabelText("Page title");
+      fireEvent.focus(title);
+      fireEvent.blur(title);
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+      // it still READS as an icon + title, it is only not rewritten.
+      expect(screen.getByRole("button", { name: "Change page icon" }).textContent).toBe("🦆");
+      expect(title).toHaveValue("Launch plan");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// RemoveBlock takes the whole subtree with it. Every path that reaches it —
+// the menu, Backspace on an empty block, the merge — has to reckon with that,
+// or a keystroke silently destroys nested work.
+describe("no delete path quietly eats a subtree", () => {
+  const PARENTED: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a", "b"] }),
+    blockOf({ id: "a", text: "First" }),
+    blockOf({ id: "b", kind: "toggle", text: "", children: ["b1"] }),
+    blockOf({ id: "b1", parent: "b", text: "buried note" }),
+  ];
+
+  it("CONFIRMS a Backspace that would delete an empty block holding children", () => {
+    const { spies, materialize } = renderPagesView({ activePageBlocks: PARENTED });
+    materialize("removePageBlock");
+    const area = screen.getByLabelText("Edit toggle block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: /delete this block/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: /delete block/i }));
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  it("hands the children over before merging a block away", async () => {
+    const withText: PageBlock[] = [
+      ...PARENTED.slice(0, 2),
+      blockOf({ id: "b", text: "second", children: ["b1"] }),
+      blockOf({ id: "b1", parent: "b", text: "buried note" }),
+    ];
+    const { spies } = renderPagesView({ activePageBlocks: withText });
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    // the text merges up…
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "Firstsecond" });
+    // …and the child follows it, instead of dying with its old parent.
+    expect(spies.movePageBlock).toHaveBeenCalledWith({
+      blockId: "b1",
+      parent: "a",
+      after: null,
+    });
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  // Reported by a live-QA pass: merging a parent with TWO children lost the
+  // second one. Both children ride an anchor chain (child 2 lands `after` child
+  // 1) and the remove has to follow both — and the wire orders NOTHING, so the
+  // three ops raced. RemoveBlock reaching the node before child 2's move took
+  // child 2 down with the subtree.
+  const TWO_CHILDREN: PageBlock[] = [
+    blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a", "b"] }),
+    blockOf({ id: "a", text: "First" }),
+    blockOf({ id: "b", text: "second", children: ["b1", "b2"] }),
+    blockOf({ id: "b1", parent: "b", text: "child one" }),
+    blockOf({ id: "b2", parent: "b", text: "child two" }),
+  ];
+
+  it("adopts BOTH children of a merged parent, in order, and removes it only after", async () => {
+    const { spies, materialize } = renderPagesView({ activePageBlocks: TWO_CHILDREN });
+    materialize("movePageBlock", "removePageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // NOTHING destructive goes out in this tick. The ops used to be fired off
+    // together and left to race — which is the bug: each one's anchor is the op
+    // before it, and the wire orders nothing. Every one of these waits for the op
+    // it depends on to actually LAND.
+    expect(spies.movePageBlock).not.toHaveBeenCalled();
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    await settle();
+
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "Firstsecond" });
+    // CHILD2 is the one that went missing. Its anchor is CHILD1, so it can only
+    // be issued once CHILD1 has actually landed.
+    expect(spies.movePageBlock).toHaveBeenNthCalledWith(1, {
+      blockId: "b1",
+      parent: "a",
+      after: null,
+    });
+    expect(spies.movePageBlock).toHaveBeenNthCalledWith(2, {
+      blockId: "b2",
+      parent: "a",
+      after: "b1",
+    });
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+    // and the remove is issued LAST — it deletes a subtree, so it can never
+    // precede the moves that empty it.
+    expect(Math.max(...callOrder(spies.movePageBlock))).toBeLessThan(
+      callOrder(spies.removePageBlock)[0],
+    );
+  });
+
+  it("keeps the merged block when a child's adoption never lands", async () => {
+    const { spies, fails, materialize } = renderPagesView({ activePageBlocks: TWO_CHILDREN });
+    materialize("removePageBlock");
+    fails("movePageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    // the chain stops at the first move that did not land: child 2's anchor was
+    // never created, so issuing its move would only add a second rejection.
+    expect(spies.movePageBlock).toHaveBeenCalledTimes(1);
+    // and the block is NOT removed — its children are still under it, and
+    // RemoveBlock takes the whole subtree. A duplicate row is recoverable.
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+  });
+
+});
+
+// The headline of this whole change: an op that does not land must never cost
+// the user text. Every additive op is compensated, and the compensation had
+// never once been exercised — `submitTracked` resolving false is the seam, and
+// the suite could not reach it until `fails()` existed.
+describe("a write that never lands does not eat your text", () => {
+  const caretAt = (area: HTMLTextAreaElement, at: number) => {
+    fireEvent.focus(area);
+    area.setSelectionRange(at, at);
+  };
+
+  it("restores the whole line when the split's insert never lands", async () => {
+    const { spies, fails } = renderPagesView();
+    fails("insertPageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    caretAt(area, 5); // "First| draft"
+    fireEvent.keyDown(area, { key: "Enter" });
+
+    // the truncation commits immediately — the right half now lives ONLY in the
+    // insert that is about to fail.
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "First" });
+    await settle();
+    // …so when it fails, the whole line goes back. A failed op is never rolled
+    // back — it is erased by the next authoritative refresh — so without this the
+    // right half is gone for good.
+    expect(spies.updatePageBlockText).toHaveBeenLastCalledWith({
+      blockId: "a",
+      text: "First draft",
+    });
+  });
+
+  it("does not compensate a split that DID land", async () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    caretAt(area, 5);
+    fireEvent.keyDown(area, { key: "Enter" });
+    await settle();
+
+    // one truncation, and no "restore" behind it — a compensation that always
+    // fires would resurrect the right half as a duplicate on every Enter.
+    expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "First" });
+  });
+
+  it("puts a merged-away block back when the merge never lands", async () => {
+    const { spies, fails } = renderPagesView();
+    fails("updatePageBlockText");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    // the block is removed on the spot: the row has to vanish under the caret.
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+    await settle();
+    // its text went nowhere, so the block comes back — kind, text and all. (The
+    // wire is a FIFO, so this re-insert reaches the node behind the remove and
+    // the id is free.)
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "b", parent: "p1", after: "a", kind: "todo", text: "Ship it" }),
+    );
+  });
+
+  it("does not resurrect a merged-away block when the merge DID land", async () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+});
+
+describe("drag to reorder", () => {
+  // jsdom has NO layout engine: getBoundingClientRect is all zeros, so the
+  // before/after edge cannot be exercised here (page-drag.test.ts covers that
+  // geometry as a pure function). What this proves is the WIRING — that the
+  // handle's drag reaches MoveBlock at all, and as exactly ONE op.
+  const dataTransfer = () => {
+    const store = new Map<string, string>();
+    return {
+      effectAllowed: "",
+      dropEffect: "",
+      types: ["application/x-ducktape-block"],
+      setData: (type: string, value: string) => store.set(type, value),
+      getData: (type: string) => store.get(type) ?? "",
+    };
+  };
+
+  it("moves the dragged block with a single MoveBlock op", () => {
+    const { spies } = renderPagesView();
+    const dt = dataTransfer();
+    const rowOf = (label: string) =>
+      screen.getByLabelText(label).closest('[style*="margin-left"]') as HTMLElement;
+
+    // drag block 1 ("First draft") down onto block 2 ("Ship it").
+    fireEvent.dragStart(screen.getByRole("button", { name: "Block 1 actions" }), {
+      dataTransfer: dt,
+    });
+    fireEvent.dragOver(rowOf("Edit todo block 2"), { dataTransfer: dt });
+    fireEvent.drop(rowOf("Edit todo block 2"), { dataTransfer: dt });
+
+    // ONE op for the whole gesture — never one per dragover.
+    expect(spies.movePageBlock).toHaveBeenCalledTimes(1);
+    expect(spies.movePageBlock).toHaveBeenCalledWith({
+      blockId: "a",
+      parent: "p1",
+      after: "b",
+    });
+  });
+
+  it("does not submit an op for a drop that changes nothing", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("movePageBlock");
+    const dt = dataTransfer();
+    const row = screen
+      .getByLabelText("Edit paragraph block 1")
+      .closest('[style*="margin-left"]') as HTMLElement;
+    // block 2 dropped below block 1 — it is already there.
+    fireEvent.dragStart(screen.getByRole("button", { name: "Block 2 actions" }), {
+      dataTransfer: dt,
+    });
+    fireEvent.dragOver(row, { dataTransfer: dt });
+    fireEvent.drop(row, { dataTransfer: dt });
+    expect(spies.movePageBlock).not.toHaveBeenCalled();
+  });
+
+  it("ignores a drag that is not one of our blocks", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("movePageBlock");
+    const foreign = { ...dataTransfer(), types: ["Files"] };
+    const row = screen
+      .getByLabelText("Edit paragraph block 1")
+      .closest('[style*="margin-left"]') as HTMLElement;
+    fireEvent.drop(row, { dataTransfer: foreign });
+    expect(spies.movePageBlock).not.toHaveBeenCalled();
   });
 });

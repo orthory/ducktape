@@ -64,7 +64,7 @@ where
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let install = reachability::ReachabilityCommand::InstallInvitePeer {
         peer: verified.joiner.clone(),
-        wireguard_public_key: wireguard_upgrade::X25519PublicKey(verified.wg_public_key),
+        wireguard_public_key: wireguard::X25519PublicKey(verified.wg_public_key),
         endpoint: src,
         reply: reachability::InstallReply(reply_tx),
     };
@@ -322,10 +322,10 @@ async fn reachability_plane(
         );
         return;
     };
-    let control_endpoint = match wireguard_upgrade::Endpoint::new(
+    let control_endpoint = match wireguard::Endpoint::new(
         control_addr.ip(),
         control_addr.port(),
-        wireguard_upgrade::Transport::Tcp,
+        wireguard::Transport::Tcp,
         &policy,
     ) {
         Ok(endpoint) => endpoint,
@@ -356,10 +356,10 @@ async fn reachability_plane(
         // `advertised` above, independent of whether `wireguard_listen` is
         // itself unspecified.
         Some(ingress) => match resolve_ingress(ingress) {
-            Some(addr) => match wireguard_upgrade::Endpoint::new(
+            Some(addr) => match wireguard::Endpoint::new(
                 addr.ip(),
                 addr.port(),
-                wireguard_upgrade::Transport::Udp,
+                wireguard::Transport::Udp,
                 &policy,
             ) {
                 Ok(endpoint) => Some(endpoint),
@@ -382,10 +382,10 @@ async fn reachability_plane(
         // no override: derive from the bind address exactly like today —
         // unspecified means endpoint-less/roaming, concrete advertises itself.
         None if wireguard_listen.ip().is_unspecified() => None,
-        None => match wireguard_upgrade::Endpoint::new(
+        None => match wireguard::Endpoint::new(
             wireguard_listen.ip(),
             wireguard_listen.port(),
-            wireguard_upgrade::Transport::Udp,
+            wireguard::Transport::Udp,
             &policy,
         ) {
             Ok(endpoint) => Some(endpoint),
@@ -664,7 +664,7 @@ async fn reachability_plane(
             );
             if let Err(err) = reachability::run(
                 config,
-                wireguard_effect::FakeWireGuardEffect::default(),
+                wireguard::effect::FakeWireGuardEffect::default(),
                 resolver,
                 commands,
                 events,
@@ -696,7 +696,7 @@ async fn reachability_plane(
                 // InterfaceConfiguration it applies — the WGApi handle and
                 // the configs it receives must agree on the interface.
                 let ifname = reachability::interface_name(&config.chain_id);
-                let effect = match wireguard_effect::DefguardWireGuardEffect::new(&ifname) {
+                let effect = match wireguard::effect::DefguardWireGuardEffect::new(&ifname) {
                     Ok(effect) => effect,
                     Err(err) => {
                         eprintln!(

@@ -11,11 +11,11 @@
 //! `Service::Voice`'s overlay datagram port and video binds `Service::Video`'s,
 //! so the two streams never share a socket, a queue, or a byte of head-of-line.
 //!
-//! Shape mirrors [`crate::statesync_plane`]: the host supplies the tracked
+//! Shape mirrors [`crate::gateway_plane`]: the host supplies the tracked
 //! peer set ([`MediaPeers`], refreshed on every valset cutover) and the socket
 //! factory; the plane binds lazily (the overlay `/128` only exists once the
 //! reachability plane has the interface up, so the bind retries in the
-//! background). Unlike statesync, media is datagram-only and fire-and-forget,
+//! background). Unlike gateway, media is datagram-only and fire-and-forget,
 //! and — per the overlay-only cutover decision — has NO mesh fallback: with no
 //! overlay there is simply no media transport.
 
@@ -47,7 +47,7 @@ const BIND_RETRY: Duration = Duration::from_secs(3);
 /// `(namespace, identity)` function statesync's book and the reachability
 /// plane route by, so all three agree on every member's `/128`.
 fn ula_of(namespace: &str, raw: &[u8; 32]) -> Ipv6Addr {
-    wireguard_upgrade::ula_v6_member_addr(namespace, wireguard_upgrade::ValidatorIdentity(*raw))
+    wireguard::ula_v6_member_addr(namespace, wireguard::ValidatorIdentity(*raw))
 }
 
 /// The tracked media peer set: every workspace member's identity → overlay
@@ -84,20 +84,37 @@ impl MediaPeers {
     }
 
     /// This node's own overlay `/128` — where its media sockets bind.
-    fn own_ip(&self, me: &[u8; 32]) -> IpAddr {
+    pub(crate) fn own_ip(&self, me: &[u8; 32]) -> IpAddr {
         IpAddr::V6(ula_of(&self.namespace, me))
     }
 
-    fn overlay_ip(&self, raw: &[u8; 32]) -> IpAddr {
+    pub(crate) fn overlay_ip(&self, raw: &[u8; 32]) -> IpAddr {
         IpAddr::V6(ula_of(&self.namespace, raw))
     }
 
-    fn peer_at(&self, src: IpAddr) -> Option<PeerId> {
+    pub(crate) fn peer_at(&self, src: IpAddr) -> Option<PeerId> {
         self.reverse
             .read()
             .expect("media peers lock")
             .get(&src)
             .copied()
+    }
+
+    pub(crate) fn contains(&self, peer: PeerId) -> bool {
+        self.reverse
+            .read()
+            .expect("media peers lock")
+            .values()
+            .any(|known| *known == peer)
+    }
+
+    pub(crate) fn peer_ids(&self) -> Vec<PeerId> {
+        self.reverse
+            .read()
+            .expect("media peers lock")
+            .values()
+            .copied()
+            .collect()
     }
 }
 

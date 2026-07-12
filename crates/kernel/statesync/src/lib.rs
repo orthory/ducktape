@@ -163,8 +163,6 @@ pub enum SyncError {
         requested_after: u64,
         retained_from: u64,
     },
-    #[error("app-hash mismatch after rebuild: manifest {expected}, composed {actual}")]
-    AppHashMismatch { expected: String, actual: String },
 }
 
 // ============================================================================
@@ -269,10 +267,7 @@ pub struct Manifest {
     /// necessarily the valset projection at `height`, which may already
     /// stage a change awaiting its cutover.
     pub participants: Vec<Vec<u8>>,
-    /// the epoch's RESIDENT set (transport standing, no quorum seat). rides
-    /// an ADDITIVE wire tail — omitted when empty, so pre-resident binaries
-    /// interoperate until the first grant (which the v3 gate defers past the
-    /// upgrade that replaces those binaries anyway).
+    /// the epoch's RESIDENT set (transport standing, no quorum seat).
     pub residents: Vec<Vec<u8>>,
     /// the scheme-encoded finalization certificate for exactly `height`,
     /// when the serving node holds one (`None` right after a cutover, when
@@ -291,6 +286,9 @@ pub struct Manifest {
     /// joiner's boot preflight fence (`to_version` once `height >=
     /// pending.activation_height`, else `current_version`).
     pub required_min_version: u32,
+    /// Canonical ordered module/state-schema fingerprint of the serving
+    /// binary. A joiner checks this before opening any destination substrate.
+    pub state_schema: [u8; 32],
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -309,7 +307,8 @@ impl Manifest {
     /// boot preflight: fail loud when the local build's `max_supported`
     /// protocol version is below this boundary's `required_min_version`. an
     /// early, actionable refusal instead of an opaque post-rebuild app-hash
-    /// mismatch. NOT yet wired into the live join path (a later phase).
+    /// mismatch. wired into every join lane (park, sync-only boot, validator
+    /// recovery).
     pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
         sdk::check_required_version(self.required_min_version, max_supported)
     }
@@ -487,9 +486,6 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&offset.to_le_bytes());
         }
         SyncRequest::TipCoords => out.push(6u8),
-        // tag 7, appended after TipCoords: an old server answers with its
-        // decoder's BadTag turned into an Error, which the fetch fan-out
-        // treats as a miss — a mixed-version mesh degrades, never wedges.
         SyncRequest::Blob { digest } => {
             out.push(7u8);
             out.extend_from_slice(digest);
@@ -581,6 +577,7 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 None => out.push(0),
             }
             out.extend_from_slice(&m.required_min_version.to_le_bytes());
+            out.extend_from_slice(&m.state_schema);
             out.extend_from_slice(&(m.entries.len() as u64).to_le_bytes());
             for e in &m.entries {
                 wire::put_str(&mut out, &e.module_id);
@@ -596,16 +593,9 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                     None => out.push(0),
                 }
             }
-            // ADDITIVE resident tail — omitted when empty so the byte stream
-            // is identical to the pre-resident wire until a grant exists (a
-            // pre-resident decoder rejects trailing bytes, but it can only
-            // meet a non-empty set on a >=v3 net, which its boot preflight
-            // refuses right after this decode anyway).
-            if !m.residents.is_empty() {
-                out.extend_from_slice(&(m.residents.len() as u64).to_le_bytes());
-                for o in &m.residents {
-                    wire::put_bytes(&mut out, o);
-                }
+            out.extend_from_slice(&(m.residents.len() as u64).to_le_bytes());
+            for o in &m.residents {
+                wire::put_bytes(&mut out, o);
             }
         }
         SyncResponse::Chunk { total, bytes } => {
@@ -644,10 +634,6 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             out.push(5u8);
             wire::put_str(&mut out, msg);
         }
-        // tag 6, appended after Error: an OLD binary answering a new joiner
-        // never emits it, and a new joiner asking an old server just gets the
-        // old decoder's BadTag turned into an Error — the optional lane
-        // degrades to lane 1 instead of wedging a mixed-version sync.
         SyncResponse::IndexModules { entries } => {
             out.push(6u8);
             out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
@@ -656,8 +642,6 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 out.extend_from_slice(&len.to_le_bytes());
             }
         }
-        // tag 8, appended after TipCoords (the IndexModules precedent): an
-        // old requester never asks, so it never has to decode this.
         SyncResponse::Blob { bytes } => {
             out.push(8u8);
             match bytes {
@@ -726,6 +710,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 t => return Err(WireError::BadTag("pending_upgrade", t)),
             };
             let required_min_version = wire::take_u32(&mut buf)?;
+            let state_schema = wire::take_array::<32>(&mut buf)?;
             let n = wire::take_u64(&mut buf)?;
             // each entry costs at least its id length prefix + root + kind, so
             // a forged count can never drive allocation past the buffer.
@@ -761,23 +746,19 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                     resolver_target,
                 });
             }
-            // ADDITIVE resident tail — absent on the pre-resident wire.
-            let residents = if buf.is_empty() {
-                Vec::new()
-            } else {
-                let o = wire::take_u64(&mut buf)?;
-                if o == 0 || o > (buf.len() / 8) as u64 {
-                    return Err(WireError::Codec(format!(
-                        "resident count {o} invalid against the {} remaining bytes",
-                        buf.len()
-                    )));
-                }
-                let mut residents = Vec::with_capacity(o as usize);
-                for _ in 0..o {
-                    residents.push(wire::take_bytes(&mut buf)?.to_vec());
-                }
-                residents
-            };
+            let o = wire::take_u64(&mut buf)?;
+            // each resident costs at least its 8-byte length prefix, so a
+            // forged count can never drive allocation past the buffer.
+            if o > (buf.len() / 8) as u64 {
+                return Err(WireError::Codec(format!(
+                    "resident count {o} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut residents = Vec::with_capacity(o as usize);
+            for _ in 0..o {
+                residents.push(wire::take_bytes(&mut buf)?.to_vec());
+            }
             SyncResponse::Manifest(Manifest {
                 height,
                 app_hash,
@@ -789,6 +770,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 current_version,
                 pending_upgrade,
                 required_min_version,
+                state_schema,
                 entries,
             })
         }
@@ -994,6 +976,7 @@ pub struct BoundaryCoords {
 #[derive(Debug, Clone)]
 struct Capture {
     app_hash: StateRoot,
+    state_schema: [u8; 32],
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
     /// shipped-index archive blobs, keyed by database name — the unverified
@@ -1011,6 +994,7 @@ struct Capture {
 #[derive(Debug, Clone)]
 pub struct CaptureData {
     app_hash: StateRoot,
+    state_schema: [u8; 32],
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
 }
@@ -1075,6 +1059,7 @@ pub async fn capture_boundary(
         id,
         CaptureData {
             app_hash: snapshot.app_hash,
+            state_schema: host.state_schema_fingerprint(),
             coords: coords.clone(),
             modules,
         },
@@ -1090,8 +1075,8 @@ pub enum ServeStep {
     Reply(SyncResponse),
     /// Manifest: obtain the current finalized boundary from the state owner
     /// ([`capture_boundary`] there unless this server already holds the id —
-    /// see [`SyncServer::has_boundary`]), install/refresh it, then finish with
-    /// [`SyncServer::manifest_for`].
+    /// see [`SyncServer::known_boundaries`]), install/refresh it, then finish
+    /// with [`SyncServer::manifest_for`].
     NeedBoundary,
     /// Module lane, checks passed: route `body` to the live host's
     /// `serve_sync` and wrap the bytes in [`SyncResponse::Module`].
@@ -1133,13 +1118,6 @@ impl SyncServer {
         self.evict_unleased_overflow();
     }
 
-    /// whether a capture for `id` is already installed — lets the serve
-    /// task's boundary request tell the state owner what it holds, so a
-    /// known boundary round-trips coordinates only, never payload bytes.
-    pub fn has_boundary(&self, id: BoundaryId) -> bool {
-        self.captures.contains_key(&id)
-    }
-
     /// every installed capture's id — the `known` list a boundary request
     /// carries (bounded by [`MAX_CAPTURES`]).
     pub fn known_boundaries(&self) -> Vec<BoundaryId> {
@@ -1164,6 +1142,7 @@ impl SyncServer {
                     id,
                     Capture {
                         app_hash: data.app_hash,
+                        state_schema: data.state_schema,
                         coords: data.coords,
                         modules: data.modules,
                         index_blobs: None,
@@ -1215,6 +1194,7 @@ impl SyncServer {
             current_version: capture.coords.current_version,
             pending_upgrade: capture.coords.pending_upgrade.clone(),
             required_min_version,
+            state_schema: capture.state_schema,
             entries: capture
                 .modules
                 .iter()
@@ -1347,11 +1327,6 @@ impl SyncServer {
         })
     }
 
-    pub fn release(&mut self, id: BoundaryId) {
-        self.leased.remove(&id);
-        self.evict_unleased_overflow();
-    }
-
     /// whether shipped-index blobs are already attached at `id` — the caller
     /// (who owns the index store; this crate deliberately does not) checks
     /// this on an [`SyncRequest::IndexModules`] and cuts + attaches first
@@ -1392,6 +1367,7 @@ impl SyncServer {
             id,
             Capture {
                 app_hash: id.app_hash,
+                state_schema: [0; 32],
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
                 index_blobs: None,
@@ -1408,38 +1384,9 @@ impl SyncServer {
             id,
             CaptureData {
                 app_hash: id.app_hash,
+                state_schema: [0; 32],
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
-            },
-        );
-    }
-
-    #[doc(hidden)]
-    pub fn insert_resolver_capture_for_test(
-        &mut self,
-        id: BoundaryId,
-        module_id: impl Into<ModuleId>,
-        start: u64,
-    ) {
-        let mut modules = BTreeMap::new();
-        modules.insert(
-            module_id.into(),
-            CapturedModule {
-                root: StateRoot([7u8; ROOT_LEN]),
-                payload: CapturedPayload::Resolver(ResolverTarget {
-                    root: commonware_cryptography::sha256::Digest([7u8; ROOT_LEN]),
-                    start,
-                    op_count: start + 1,
-                }),
-            },
-        );
-        self.captures.insert(
-            id,
-            Capture {
-                app_hash: id.app_hash,
-                coords: BoundaryCoords::default(),
-                modules,
-                index_blobs: None,
             },
         );
     }
@@ -1457,20 +1404,6 @@ impl SyncServer {
     #[doc(hidden)]
     pub fn is_leased_for_test(&self, id: BoundaryId) -> bool {
         self.leased.contains_key(&id)
-    }
-
-    pub fn oldest_active_lease_start_for_module(&self, module_id: &str) -> Option<u64> {
-        self.leased
-            .keys()
-            .filter_map(|id| {
-                let capture = self.captures.get(id)?;
-                let module = capture.modules.get(module_id)?;
-                match &module.payload {
-                    CapturedPayload::Resolver(target) => Some(target.start),
-                    _ => None,
-                }
-            })
-            .min()
     }
 
     /// handle one decoded request. `finalized` is the node's latest applied
@@ -1649,27 +1582,22 @@ pub async fn fetch_tip_coords<C: SyncClient>(client: &C) -> Result<TipCoords, Sy
     }
 }
 
-/// fetch a captured module's full snapshot payload, chunk by chunk.
-pub async fn fetch_snapshot<C: SyncClient>(
+/// reassemble one chunked payload: `req(offset)` builds the per-chunk request
+/// (Chunk or IndexChunk), `module` and `what` shape the mid-payload error.
+async fn fetch_chunked<C: SyncClient>(
     client: &C,
-    boundary: BoundaryId,
-    module_id: &str,
+    module: &str,
+    what: &str,
+    req: impl Fn(u64) -> SyncRequest,
 ) -> Result<Vec<u8>, SyncError> {
     let mut out: Vec<u8> = Vec::new();
     loop {
-        let resp = client
-            .request(SyncRequest::Chunk {
-                boundary,
-                module_id: module_id.to_string(),
-                offset: out.len() as u64,
-            })
-            .await?;
-        match resp {
+        match client.request(req(out.len() as u64)).await? {
             SyncResponse::Chunk { total, bytes } => {
                 if bytes.is_empty() && out.len() < total as usize {
                     return Err(SyncError::Module {
-                        module: module_id.to_string(),
-                        reason: "server returned an empty chunk mid-payload".into(),
+                        module: module.to_string(),
+                        reason: format!("server returned an empty {what} mid-payload"),
                     });
                 }
                 out.extend_from_slice(&bytes);
@@ -1685,6 +1613,20 @@ pub async fn fetch_snapshot<C: SyncClient>(
             other => return Err(SyncError::UnexpectedResponse(other.kind_name())),
         }
     }
+}
+
+/// fetch a captured module's full snapshot payload, chunk by chunk.
+pub async fn fetch_snapshot<C: SyncClient>(
+    client: &C,
+    boundary: BoundaryId,
+    module_id: &str,
+) -> Result<Vec<u8>, SyncError> {
+    fetch_chunked(client, module_id, "chunk", |offset| SyncRequest::Chunk {
+        boundary,
+        module_id: module_id.to_string(),
+        offset,
+    })
+    .await
 }
 
 // ---- the shipped-index archive framing ------------------------------------
@@ -1737,33 +1679,12 @@ pub async fn fetch_index_db<C: SyncClient>(
     boundary: BoundaryId,
     db: &str,
 ) -> Result<Vec<u8>, SyncError> {
-    let mut out: Vec<u8> = Vec::new();
-    loop {
-        let resp = client
-            .request(SyncRequest::IndexChunk {
-                boundary,
-                db: db.to_string(),
-                offset: out.len() as u64,
-            })
-            .await?;
-        match resp {
-            SyncResponse::Chunk { total, bytes } => {
-                if bytes.is_empty() && out.len() < total as usize {
-                    return Err(SyncError::Module {
-                        module: db.to_string(),
-                        reason: "server returned an empty index chunk mid-payload".into(),
-                    });
-                }
-                out.extend_from_slice(&bytes);
-                if out.len() as u64 >= total {
-                    out.truncate(total as usize);
-                    return Ok(out);
-                }
-            }
-            SyncResponse::Error(e) => return Err(SyncError::Server(e)),
-            other => return Err(SyncError::UnexpectedResponse(other.kind_name())),
-        }
-    }
+    fetch_chunked(client, db, "index chunk", |offset| SyncRequest::IndexChunk {
+        boundary,
+        db: db.to_string(),
+        offset,
+    })
+    .await
 }
 
 /// fetch a finite, ordered recovery-frame suffix in bounded batches.
@@ -2061,6 +1982,7 @@ mod tests {
                     to_version: 4,
                 }),
                 required_min_version: 3,
+                state_schema: [0xAB; 32],
                 entries: vec![
                     ManifestEntry {
                         module_id: "kv".into(),
@@ -2094,6 +2016,7 @@ mod tests {
                 current_version: 0,
                 pending_upgrade: None,
                 required_min_version: 0,
+                state_schema: [0xAB; 32],
                 entries: vec![],
             }),
             SyncResponse::Chunk {
@@ -2193,6 +2116,7 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes()); // current_version
         bytes.push(0); // pending_upgrade: None
         bytes.extend_from_slice(&0u32.to_le_bytes()); // required_min_version
+        bytes.extend_from_slice(&[0xAB; 32]); // state_schema
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
     }
@@ -2212,12 +2136,14 @@ mod tests {
             current_version: 3,
             pending_upgrade: None,
             required_min_version: 3,
+            state_schema: [0xAB; 32],
             entries: vec![],
         });
         let bytes = encode_response(&resp);
-        // drop the trailing entries-count u64 + the required_min u32 + part of
-        // the pending tag, landing inside the version tail.
-        for cut in 1..=13 {
+        // drop the trailing residents-count and entries-count u64s + the
+        // required_min u32 + part of the pending tag, landing inside the
+        // version tail.
+        for cut in 1..=21 {
             let torn = &bytes[..bytes.len() - cut];
             assert!(
                 decode_response(torn).is_err(),
@@ -2239,6 +2165,7 @@ mod tests {
             current_version: 3,
             pending_upgrade: None,
             required_min_version: 3,
+            state_schema: [0xAB; 32],
             entries: vec![],
         };
         assert!(m.preflight(3).is_ok());

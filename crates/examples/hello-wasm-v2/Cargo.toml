@@ -1,0 +1,20 @@
+# The v2 reference wasm module: same `ducktape:module` world and same durable
+# state layout as `hello-wasm`, but observably DIFFERENT logic (`inc` steps by
+# 100, not 1). It is the swap TARGET in the host-level live-update proof: swapping
+# hello -> hello-v2 must keep the host-owned counter (app-hash continuous) while
+# the next `inc` runs the new step — proving new code went live over kept state.
+# Standalone workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+[package]
+name = "hello-wasm-v2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57"
+
+[workspace]

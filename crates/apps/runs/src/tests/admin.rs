@@ -144,6 +144,7 @@ fn request_run_validates_agent_origin_and_anchor() {
             agent_id: agent.into(),
             channel_id: "general".into(),
             anchor_seq: seq,
+            demands: Default::default(),
         })
     };
 
@@ -198,6 +199,39 @@ fn request_run_validates_agent_origin_and_anchor() {
 }
 
 #[test]
+fn request_run_threads_demands_into_the_dispatch_emit() {
+    // an explicit RequestRun's demands ride verbatim onto the emitted
+    // DispatchMsg::Dispatch — the only demand surface in this phase.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let mut m = watched(TurnPolicy::Mention, &registry);
+    let demands = BTreeMap::from([("cores".to_string(), 4u64)]);
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript("general", transcript(3));
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&RunsMsg::RequestRun {
+            agent_id: "bot".into(),
+            channel_id: "general".into(),
+            anchor_seq: 3,
+            demands: demands.clone(),
+        }),
+    )
+    .unwrap();
+    let dispatches = ctx.dispatch_msgs();
+    assert_eq!(dispatches.len(), 1);
+    let DispatchMsg::Dispatch {
+        demands: captured, ..
+    } = &dispatches[0]
+    else {
+        panic!("expected a Dispatch");
+    };
+    assert_eq!(captured, &demands);
+}
+
+#[test]
 fn cancel_run_is_gated_to_the_requester_or_the_owner() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let mut m = watched(TurnPolicy::Mention, &registry);
@@ -212,6 +246,7 @@ fn cancel_run_is_gated_to_the_requester_or_the_owner() {
             agent_id: "bot".into(),
             channel_id: "general".into(),
             anchor_seq: 3,
+            demands: Default::default(),
         }),
     )
     .unwrap();
@@ -242,6 +277,27 @@ fn cancel_run_is_gated_to_the_requester_or_the_owner() {
         .is_err()
     );
     abort(&mut m);
+
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry);
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&RunsMsg::ReassignRun {
+            run_id: run_id.clone(),
+            attempt: 0,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.dispatch_msgs(),
+        vec![DispatchMsg::ReassignDispatch {
+            dispatch_id: dispatch_id_for(&run_id),
+            attempt: 0,
+        }]
+    );
+    commit(&mut m);
 
     // the REQUESTER cancels: the dispatch plane is told; the entry STAYS
     // pending — the plane's Err("cancelled") delivery is the one result

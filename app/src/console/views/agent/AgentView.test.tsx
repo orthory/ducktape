@@ -1,16 +1,23 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import { color } from "../../theme/tokens";
 import type { Channel } from "../../../domain/chat-client";
 import type { Workspace } from "../../../domain/workspace-client";
+import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
+import { makeTransportStub } from "../../../test/transport-stub";
 import { AgentView, runIsMine } from "./AgentView";
+import {
+  FILLED_IDENTITY_TEXT_PERCENT,
+  FILLED_SEMANTIC_TEXT_PERCENT,
+  filledForeground,
+  filledMix,
+} from "./parts";
 import type { PendingRun } from "../../../domain/runs-client";
-
-const bytes = (value: number) => Array.from({ length: 32 }, () => value);
 
 const channels: Channel[] = [
   {
@@ -33,7 +40,10 @@ const channels: Channel[] = [
   },
 ];
 
-const renderAgents = (patch: Partial<ConsoleState> = {}) => {
+const renderAgents = (
+  patch: Partial<ConsoleState> = {},
+  transport?: NodeTransport,
+) => {
   const initialState = {
     ...createInitialState(),
     connected: true,
@@ -45,18 +55,23 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
         owner: "system" as const,
         display_name: "Summary Agent",
         capability: "alpha",
-        prompt_hash: bytes(0xab),
         allowed_actions: ["chat.post", "tasks.create"],
         status: "active" as const,
         created_at: 10,
         updated_at: 20,
+        skills: [
+          {
+            name: "persona",
+            source_prefix: "/shared/agents/summarizer/persona",
+            load: "always" as const,
+          },
+        ],
       },
       {
         agent_id: "qa-agent",
         owner: "system" as const,
         display_name: "QA Agent",
         capability: "beta",
-        prompt_hash: bytes(0xcd),
         allowed_actions: ["chat.post"],
         status: "paused" as const,
         created_at: 11,
@@ -96,7 +111,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
     ) as ConsoleActions;
 
     return (
-      <ConsoleContext.Provider value={{ state, actions }}>
+      <ConsoleContext.Provider value={{ state, actions, transport }}>
         <AgentView />
       </ConsoleContext.Provider>
     );
@@ -109,6 +124,26 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
 const openTab = (name: RegExp) => fireEvent.click(screen.getByRole("tab", { name }));
 
 describe("AgentView", () => {
+  // A clicked @agent mention hands off through state.agentFocus. If the agent is
+  // gone from the roster, the pane used to fall back to `agents[0]` — showing a
+  // DIFFERENT agent as if it were the one clicked. A miss must read as a miss.
+  it("says an agent is missing rather than showing a different one", () => {
+    renderAgents({ agentFocus: "ghost-bot" });
+
+    expect(screen.getByText(/agent not found/i)).toBeInTheDocument();
+    expect(screen.getByText("ghost-bot")).toBeInTheDocument();
+    // the first agent's detail must NOT be standing in for the one that was
+    // clicked. (Summary Agent still appears in the ROSTER — that's the list, not
+    // the pane; the defect was the DETAIL pane silently showing it.)
+    expect(screen.queryByRole("region", { name: /agent detail/i })).not.toBeInTheDocument();
+  });
+
+  it("still defaults to the first agent when nothing is selected", () => {
+    renderAgents();
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
+  });
+
   it("shows the selected agent's detail and pauses/resumes it", () => {
     const { spies } = renderAgents();
 
@@ -120,7 +155,10 @@ describe("AgentView", () => {
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
     expect(within(detail).getByText("summarizer")).toBeInTheDocument();
     expect(within(detail).getByText("Alpha")).toBeInTheDocument();
-    expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
+    // "chat.post" is the REPLY grant — it only lets an agent answer where it was
+    // engaged. Posting into arbitrary channels is the separate chat.post_message
+    // grant, so the two must never read as the same permission.
+    expect(within(detail).getByText("Reply in chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
 
     fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));
@@ -145,12 +183,136 @@ describe("AgentView", () => {
     expect(screen.getByRole("tab", { name: /activity/i })).toBeInTheDocument();
   });
 
+  it("keeps the Agents title on an ink token for light and dark headers", () => {
+    document.documentElement.dataset.theme = "dark";
+    renderAgents();
+
+    const heading = screen.getByRole("heading", { name: "Agents" });
+    expect(heading).toHaveStyle({ color: color.ink, letterSpacing: "0" });
+
+    document.documentElement.dataset.theme = "light";
+  });
+
+  it("derives identity-band overlays from filled tokens in both themes", () => {
+    document.documentElement.dataset.theme = "dark";
+    renderAgents();
+
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    const agentId = within(detail).getByText("summarizer");
+    const status = within(detail).getByText("Active", { exact: true });
+    const edit = within(detail).getByRole("button", { name: /^edit$/i });
+    const pause = within(detail).getByRole("button", { name: /pause agent/i });
+
+    const styleText = (element: HTMLElement) => element.getAttribute("style") ?? "";
+    expect(styleText(agentId)).toContain(`color: ${filledMix(FILLED_IDENTITY_TEXT_PERCENT)}`);
+    expect(styleText(status)).toContain(`background: ${filledMix(8)}`);
+    expect(styleText(status)).toContain(`border: 1px solid ${filledMix(16)}`);
+    for (const button of [edit, pause]) {
+      expect(styleText(button)).toContain(`background: ${filledMix(7)}`);
+      expect(styleText(button)).toContain(`border: 1px solid ${filledMix(22)}`);
+    }
+    expect(styleText(edit)).toContain(`color: ${color.onDark}`);
+    expect(styleText(status)).toContain(`color: ${filledForeground(color.green)}`);
+    expect(styleText(pause)).toContain(`color: ${filledForeground(color.amber)}`);
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for qa agent/i }));
+    const pausedDetail = screen.getByRole("region", { name: /agent detail/i });
+    const pausedStatus = within(pausedDetail).getByText("Paused", { exact: true });
+    const resume = within(pausedDetail).getByRole("button", { name: /resume agent/i });
+    expect(styleText(pausedStatus)).toContain(`color: ${filledForeground(color.amber)}`);
+    expect(styleText(resume)).toContain(`color: ${filledForeground(color.green)}`);
+
+    // The inline styles keep referring to live theme variables after the
+    // filled surface changes polarity, rather than baking in light overlays.
+    document.documentElement.dataset.theme = "light";
+    expect(styleText(agentId)).toContain(`color: ${filledMix(FILLED_IDENTITY_TEXT_PERCENT)}`);
+    expect(styleText(pausedStatus)).toContain(`color: ${filledForeground(color.amber)}`);
+    expect(styleText(resume)).toContain(`color: ${filledForeground(color.green)}`);
+    expect(styleText(status)).toContain(`background: ${filledMix(8)}`);
+    document.documentElement.dataset.theme = "light";
+  });
+
+  it("keeps every identity-band label at 4.5:1 in both committed palettes", () => {
+    const palettes = [
+      {
+        name: "light",
+        filled: "#26251f",
+        onFilled: "#efefef",
+        green: "#5cb45f",
+        amber: "#c08a3e",
+      },
+      {
+        name: "dark",
+        filled: "#ecebe5",
+        onFilled: "#1b1a17",
+        green: "#6cc06f",
+        amber: "#d3a25c",
+      },
+    ] as const;
+
+    const channels = (hex: string): [number, number, number] => [
+      parseInt(hex.slice(1, 3), 16) / 255,
+      parseInt(hex.slice(3, 5), 16) / 255,
+      parseInt(hex.slice(5, 7), 16) / 255,
+    ];
+    const mix = (foreground: string, percent: number, background: string) => {
+      const fg = channels(foreground);
+      const bg = channels(background);
+      const weight = percent / 100;
+      return fg.map((value, index) => value * weight + bg[index] * (1 - weight));
+    };
+    const luminance = (rgb: number[]) => {
+      const linear = rgb.map((value) =>
+        value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4,
+      );
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const contrast = (foreground: number[], background: number[]) => {
+      const foregroundLuminance = luminance(foreground);
+      const backgroundLuminance = luminance(background);
+      return (
+        (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
+        (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
+      );
+    };
+
+    for (const palette of palettes) {
+      const band = channels(palette.filled);
+      const chip = mix(palette.onFilled, 8, palette.filled);
+      const control = mix(palette.onFilled, 7, palette.filled);
+      const identityText = mix(
+        palette.onFilled,
+        FILLED_IDENTITY_TEXT_PERCENT,
+        palette.filled,
+      );
+
+      expect(contrast(identityText, band), `${palette.name} agent id`).toBeGreaterThanOrEqual(4.5);
+      for (const [label, hue] of [
+        ["green", palette.green],
+        ["amber", palette.amber],
+      ] as const) {
+        const semanticText = mix(hue, FILLED_SEMANTIC_TEXT_PERCENT, palette.onFilled);
+        expect(contrast(semanticText, chip), `${palette.name} ${label} status`).toBeGreaterThanOrEqual(
+          4.5,
+        );
+        expect(contrast(semanticText, control), `${palette.name} ${label} action`).toBeGreaterThanOrEqual(
+          4.5,
+        );
+      }
+      expect(contrast(channels(palette.onFilled), control), `${palette.name} edit action`).toBeGreaterThanOrEqual(
+        4.5,
+      );
+    }
+  });
+
   it("adds an agent through the focused Add-agent pane", () => {
     const { spies } = renderAgents();
 
-    // No always-on register form: it opens on demand.
+    // No always-on register form: it opens on demand. And no prompt textarea —
+    // an agent's persona is a document, not form text.
     expect(screen.queryByLabelText("System prompt")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    expect(screen.queryByLabelText("System prompt")).toBeNull();
 
     // Agent ID is auto-derived from the name; with no executors announced,
     // "Runs on" degrades to a text field so setup is never blocked.
@@ -158,16 +320,270 @@ describe("AgentView", () => {
       target: { value: "Triage Agent" },
     });
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
-    fireEvent.change(screen.getByLabelText("System prompt"), {
-      target: { value: "Summarize incoming incidents." },
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    // Exact match: an agent with no curated skills sends no skills key at all
+    // (and never a prompt). It DOES send the library read cap: that grant is on
+    // by default, and it is what earns the run's assembled context the paragraph
+    // telling the agent the shared library exists.
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      allowedActions: ["chat.post"],
+      caps: { duckfs_read: ["/shared/skills"] },
     });
+  });
+
+  it("grants the skill library by default, and lets the operator withhold it", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The affordance is a plain checkbox, ON out of the box.
+    const grant = screen.getByLabelText(/search the global skill library/i);
+    expect((grant as HTMLInputElement).checked).toBe(true);
+
+    // Unticked, the agent registers with NO duckfs_read grant — and the node's
+    // assembler, asking the same caps, then never tells it the library is there.
+    fireEvent.click(grant);
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith({
       displayName: "Triage Agent",
       agentId: "triage-agent",
       capability: "beta",
-      prompt: "Summarize incoming incidents.",
       allowedActions: ["chat.post"],
+    });
+  });
+
+  it("an agent registered without the library grant can be given it by editing", () => {
+    const { spies } = renderAgents();
+
+    // `summarizer` (the fixture) carries no duckfs_read cap at all.
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    fireEvent.click(within(detail).getByRole("button", { name: /^edit$/i }));
+    const grant = screen.getByLabelText(/search the global skill library/i);
+    expect((grant as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(grant);
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    // caps REPLACE wholesale, so the save carries the library grant alongside
+    // every other cap the record already held.
+    expect(spies.updateAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "summarizer",
+        caps: { pages_write: [], duckfs_read: ["/shared/skills"] },
+      }),
+    );
+  });
+
+  it("curates skills: the persona is always-loaded, the rest on demand", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The persona affordance seeds an always-loaded skill under the agent's own
+    // duckfs folder — the document lives in Files, not in this form.
+    fireEvent.click(screen.getByRole("button", { name: /persona \(always loaded\)/i }));
+    expect(screen.getByLabelText("Skill name")).toHaveValue("persona");
+    expect(screen.getByLabelText("Document folder (duckfs)")).toHaveValue(
+      "/shared/agents/triage-agent/persona",
+    );
+
+    // A second, on-demand skill: named + pointed at a shared skill folder.
+    fireEvent.click(screen.getByRole("button", { name: /skill \(on demand\)/i }));
+    const names = screen.getAllByLabelText("Skill name");
+    const folders = screen.getAllByLabelText("Document folder (duckfs)");
+    fireEvent.change(names[1], { target: { value: "release" } });
+    fireEvent.change(folders[1], { target: { value: "/shared/skills/release" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "triage-agent",
+        skills: [
+          {
+            name: "persona",
+            source_prefix: "/shared/agents/triage-agent/persona",
+            load: "always",
+          },
+          { name: "release", source_prefix: "/shared/skills/release", load: "on_demand" },
+        ],
+      }),
+    );
+  });
+
+  it("the always-load toggle flips a skill between soul and on-demand", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+    fireEvent.click(screen.getByRole("button", { name: /persona \(always loaded\)/i }));
+
+    // Untick "always load": the same document becomes an on-demand skill.
+    fireEvent.click(screen.getByLabelText("Always load persona"));
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        skills: [
+          {
+            name: "persona",
+            source_prefix: "/shared/agents/triage-agent/persona",
+            load: "on_demand",
+          },
+        ],
+      }),
+    );
+  });
+
+  it("opens a curated skill's document in the Files surface", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+
+    // The detail pane names the persona and its document, and hands off to Files.
+    expect(within(detail).getByText("ALWAYS")).toBeInTheDocument();
+    expect(
+      within(detail).getByText("/shared/agents/summarizer/persona/SKILL.md"),
+    ).toBeInTheDocument();
+    fireEvent.click(within(detail).getByRole("button", { name: /^open$/i }));
+    expect(spies.openFiles).toHaveBeenCalledWith("/shared/agents/summarizer/persona");
+  });
+
+  it("seeds a persona document in duckfs — and never clobbers an existing one", async () => {
+    const filesStat = vi.fn().mockResolvedValue(null);
+    const filesCommit = vi
+      .fn()
+      .mockResolvedValue({ height: 2, appHash: "aa".repeat(32) });
+    // The commit's CAS base is the live head, read over the generic query lane.
+    const query = vi.fn().mockResolvedValue({ refs: { head: "beef", pins: {}, window: 1 } });
+    const transport = makeTransportStub({ filesStat, filesCommit, query });
+    renderAgents({}, transport);
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /persona \(always loaded\)/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /create doc/i }));
+    });
+
+    // One ordinary duckfs commit — a put of the starter SKILL.md at the prefix.
+    expect(filesStat).toHaveBeenCalledWith({
+      path: "/shared/agents/triage-agent/persona/SKILL.md",
+    });
+    const body = filesCommit.mock.calls[0][0];
+    expect(body.changes[0].put.path).toBe("/shared/agents/triage-agent/persona/SKILL.md");
+    expect(await screen.findByRole("status")).toHaveTextContent(/Created .*Edit it in Files/);
+
+    // A second click finds the document and refuses to overwrite it.
+    filesStat.mockResolvedValue({ path: "x", kind: "file", size: 1, exec: false, object: "", meta: {} });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /create doc/i }));
+    });
+    expect(filesCommit).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("status")).toHaveTextContent(/already exists/);
+  });
+
+  it("composes an agent out of the global skill library — and publishes into it", async () => {
+    const dir = (path: string) => ({
+      path,
+      kind: "dir" as const,
+      size: 0,
+      exec: false,
+      object: "",
+      meta: {},
+    });
+    const docs: Record<string, string> = {
+      "/shared/skills/release/SKILL.md": "---\nname: release\ndescription: Cut a release.\n---\n",
+      // No frontmatter: still a library skill, listed under its folder name.
+      "/shared/skills/triage/SKILL.md": "# triage\n",
+    };
+    const filesLs = vi.fn().mockResolvedValue({
+      entries: [dir("/shared/skills/release"), dir("/shared/skills/triage")],
+      next: null,
+    });
+    const filesRead = vi.fn(async ({ path }: { path: string }) => ({
+      b64: btoa(docs[path] ?? ""),
+      eof: true,
+    }));
+    const filesStat = vi.fn().mockResolvedValue(null);
+    const filesCommit = vi.fn().mockResolvedValue({ height: 2, appHash: "aa".repeat(32) });
+    const query = vi.fn().mockResolvedValue({ refs: { head: "beef", pins: {}, window: 1 } });
+    const transport = makeTransportStub({ filesLs, filesRead, filesStat, filesCommit, query });
+    const { spies } = renderAgents({}, transport);
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The library is one duckfs directory — browsed with the ordinary files
+    // client, described by each SKILL.md's frontmatter.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /from library/i }));
+    });
+    expect(filesLs).toHaveBeenCalledWith({ path: "/shared/skills" });
+    expect(await screen.findByText("Cut a release.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /add triage from the library/i }),
+    ).toBeInTheDocument();
+
+    // Search narrows the pool; picking curates the skill with its prefix filled in.
+    fireEvent.change(screen.getByLabelText("Search the skill library"), {
+      target: { value: "release" },
+    });
+    expect(screen.queryByRole("button", { name: /add triage from the library/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /add release from the library/i }));
+    expect(screen.getByLabelText("Document folder (duckfs)")).toHaveValue(
+      "/shared/skills/release",
+    );
+
+    // Publishing a skill the library doesn't have yet seeds its SKILL.md through
+    // the same create-doc commit — under the shared root, not the agent's folder.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /from library/i }));
+    });
+    fireEvent.change(screen.getByLabelText("Search the skill library"), {
+      target: { value: "Release Notes" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /publish .*to the library/i }));
+    });
+    const put = filesCommit.mock.calls[0][0].changes[0].put;
+    expect(put.path).toBe("/shared/skills/release-notes/SKILL.md");
+
+    // Exact match: library skills ride the ordinary skills key (with `load`),
+    // and no prompt blob is ever sent.
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      allowedActions: ["chat.post"],
+      caps: { duckfs_read: ["/shared/skills"] },
+      skills: [
+        { name: "release", source_prefix: "/shared/skills/release", load: "on_demand" },
+        {
+          name: "Release Notes",
+          source_prefix: "/shared/skills/release-notes",
+          load: "on_demand",
+        },
+      ],
     });
   });
 
@@ -192,10 +608,30 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
-  it("cancels an in-progress run and toggles the jobs worker on the Activity tab", () => {
-    const { spies } = renderAgents();
+  it("reassigns or cancels an in-progress run and toggles the jobs worker", () => {
+    const { spies } = renderAgents({
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: "cd".repeat(32),
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
+    });
 
     openTab(/activity/i);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /force reassign run general\/42\/summarizer/i }),
+    );
+    expect(spies.reassignRun).toHaveBeenCalledWith("general/42/summarizer", 0);
 
     fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
@@ -229,9 +665,6 @@ describe("AgentView", () => {
       target: { value: "Triage Agent" },
     });
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
-    fireEvent.change(screen.getByLabelText("System prompt"), {
-      target: { value: "Do things." },
-    });
 
     // Power users can still pin a specific id under Advanced.
     fireEvent.click(screen.getByRole("button", { name: /^advanced$/i }));
@@ -259,7 +692,6 @@ describe("AgentView", () => {
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
-    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
       expect.objectContaining({ capability: "codex" }),
@@ -279,25 +711,77 @@ describe("AgentView", () => {
     fireEvent.change(nameField, { target: { value: "Renamed Agent" } });
 
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
-    // Exact match proves a blank prompt is omitted (never sent as an empty
-    // string), while the other fields keep their current values.
+    // Exact match: no prompt key survives anywhere in the edit payload, and the
+    // other fields keep their current values.
     expect(spies.updateAgent).toHaveBeenCalledWith({
       agentId: "summarizer",
       displayName: "Renamed Agent",
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
+      // the caps record rides every save (untouched field -> empty list).
+      caps: { pages_write: [] },
+      // so does the curated skill set — an update REPLACES it wholesale, so an
+      // untouched form must send the record's own skills back unchanged.
+      skills: [
+        {
+          name: "persona",
+          source_prefix: "/shared/agents/summarizer/persona",
+          load: "always",
+        },
+      ],
     });
   });
 
   it("shows which node is executing an in-flight run", () => {
     const nodeKey = "cd".repeat(32);
     renderAgents({
-      runAssignee: new Map([["general/42/summarizer", nodeKey]]),
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: nodeKey,
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
       authorNames: { [nodeKey]: "Node Bob" },
     });
 
     openTab(/activity/i);
     expect(screen.getByText("on Node Bob")).toBeInTheDocument();
+  });
+
+  it("opens a running session and tails its live output", () => {
+    let handlers: TopicHandlers | undefined;
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe: vi.fn((_topics, next) => {
+        handlers = next;
+        return () => {};
+      }),
+    });
+    renderAgents({}, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(screen.getByRole("button", { name: /show live log for run/i }));
+    act(() => {
+      const frame = {
+        type: "tail",
+        topic: `run-output:${"ef".repeat(32)}`,
+        cursor: "1",
+        item: { stream: "stdout", line: "[node cafe1234] working" },
+      } as const;
+      handlers?.onTail?.(frame);
+      handlers?.onTail?.(frame); // StrictMode can race a subscribe replay.
+    });
+
+    expect(screen.getAllByText("[node cafe1234] working")).toHaveLength(1);
   });
 
   it("filters the timeline to the runs I requested", () => {
@@ -379,7 +863,6 @@ describe("RunsOnPicker", () => {
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
-    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
       expect.objectContaining({ capability: "claude" }),
@@ -392,7 +875,7 @@ describe("RunsOnPicker", () => {
         "codex",
         "codex_gpt-5.5_low",
         "codex_gpt-5.5_xhigh",
-        "codex_gpt-5.4-mini_high",
+        "codex_gpt-5.6-terra_high",
         "claude_opus_max",
       ],
     });
@@ -408,7 +891,7 @@ describe("RunsOnPicker", () => {
     const model = screen.getByLabelText("Model");
     expect(within(model).getByRole("option", { name: "Default" })).toBeInTheDocument();
     expect(within(model).getByRole("option", { name: "gpt-5.5" })).toBeInTheDocument();
-    expect(within(model).getByRole("option", { name: "gpt-5.4-mini" })).toBeInTheDocument();
+    expect(within(model).getByRole("option", { name: "gpt-5.6-terra" })).toBeInTheDocument();
 
     // Picking a model adopts its first announced effort; the composed tag
     // is shown verbatim under the picker.
@@ -420,7 +903,7 @@ describe("RunsOnPicker", () => {
     expect(screen.getByText("codex_gpt-5.5_xhigh")).toBeInTheDocument();
 
     // Switching model narrows efforts to what that model announced.
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4-mini" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.6-terra" } });
     expect(screen.getByLabelText("Effort")).toHaveValue("high");
 
     // A provider with no base tag composes its first variant.
@@ -431,7 +914,6 @@ describe("RunsOnPicker", () => {
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
-    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
       expect.objectContaining({ capability: "claude_opus_max" }),
@@ -468,7 +950,6 @@ describe("RunsOnPicker", () => {
           owner: "system" as const,
           display_name: "Researcher",
           capability: "claude_opus_max",
-          prompt_hash: bytes(0x11),
           allowed_actions: ["chat.post"],
           status: "active" as const,
           created_at: 10,

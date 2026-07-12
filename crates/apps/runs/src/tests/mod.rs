@@ -1,14 +1,14 @@
 use super::*;
-use crate::facets::{WireSink, WireStatus, decode_run_result_v1};
+use crate::facets::{WireSink, decode_run_result_v1};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
 use agent::{
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PROMPT_HASH_LEN,
+    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
     encode_event as agent_encode_event, encode_reply as agent_encode_reply,
 };
-use chat::{AuthorRef, MessageHead, decode_msg as chat_decode_msg};
+use chat::{AuthorRef, Channel, MessageHead, decode_msg as chat_decode_msg};
 use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
     encode_reply as dispatch_encode_reply, encode_result_event,
@@ -40,6 +40,11 @@ struct CaptureCtx {
     /// dispatch ids the dispatch module already has a record for — the
     /// committed turn-claim layer the module probes.
     taken_dispatches: BTreeSet<String>,
+    /// dispatch id -> the node key holding the run's execution lease, served as
+    /// `DispatchView.assignee` (the session lane's authorization). a dispatch
+    /// listed here is AwaitingResult; one only in `taken_dispatches` is
+    /// delivered, and a delivered run runs nowhere (assignee `None`).
+    dispatch_assignees: BTreeMap<String, Vec<u8>>,
     /// job_id -> board record served by the jobs arm (finalize guard).
     jobs: BTreeMap<String, Job>,
     /// repo -> born (branch, tip-hex) pairs, served by the "forge"
@@ -53,6 +58,18 @@ struct CaptureCtx {
     /// saga_id -> the winning attempt's lease holder, served by the "saga"
     /// Get arm as a Done saga (the sink's executing-node attribution).
     saga_assignees: BTreeMap<String, Vec<u8>>,
+    /// page_id -> the whole page in preorder, served by the "pages" GetPage
+    /// arm (the M2 `[[page:<id>]]` injection lane); the GetBlock arm scans
+    /// these pages by block id (the pages-effects target resolution).
+    pages: BTreeMap<String, Vec<pages::Block>>,
+    /// explicit committed page comment threads used by Pages-triggered runs.
+    page_threads: BTreeMap<String, pages::ThreadView>,
+    /// thread/comment ids the pages module already holds — the squat
+    /// simulation the CommentThread/GetComment freshness probes hit.
+    taken_page_ids: BTreeSet<String>,
+    /// target -> committed thread count served by the ThreadsForTargets arm
+    /// (the capacity probe); absent targets serve zero threads.
+    page_target_threads: BTreeMap<String, usize>,
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
@@ -75,10 +92,15 @@ impl CaptureCtx {
             transcripts: BTreeMap::new(),
             tasks: Vec::new(),
             taken_dispatches: BTreeSet::new(),
+            dispatch_assignees: BTreeMap::new(),
             jobs: BTreeMap::new(),
             forge_refs: BTreeMap::new(),
             forge_items: BTreeMap::new(),
             saga_assignees: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            page_threads: BTreeMap::new(),
+            taken_page_ids: BTreeSet::new(),
+            page_target_threads: BTreeMap::new(),
             files_head: None,
             msgs: Vec::new(),
             effects: Vec::new(),
@@ -115,6 +137,31 @@ impl CaptureCtx {
     /// the "saga" Get arm (the sink's executing-node attribution).
     fn with_saga_assignee(mut self, saga_id: &str, key: &[u8]) -> Self {
         self.saga_assignees.insert(saga_id.into(), key.to_vec());
+        self
+    }
+    /// register a committed page (whole preorder Vec, root first) served by
+    /// the "pages" GetPage arm.
+    fn with_page(mut self, page_id: &str, blocks: Vec<pages::Block>) -> Self {
+        self.pages.insert(page_id.into(), blocks);
+        self
+    }
+    fn with_page_thread(mut self, view: pages::ThreadView) -> Self {
+        self.page_threads.insert(view.thread.id.clone(), view);
+        self
+    }
+    /// mark a thread/comment id as already minted in the pages module (the
+    /// freshness probes then see it taken).
+    fn with_taken_page_id(mut self, id: &str) -> Self {
+        self.taken_page_ids.insert(id.into());
+        self
+    }
+    /// mark a target as already holding the thread cap.
+    fn with_crowded_page_target(self, target: &str) -> Self {
+        self.with_page_target_threads(target, pages::MAX_THREADS_PER_TARGET)
+    }
+    /// serve `count` committed threads for `target` (the capacity probe).
+    fn with_page_target_threads(mut self, target: &str, count: usize) -> Self {
+        self.page_target_threads.insert(target.into(), count);
         self
     }
     /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -159,6 +206,14 @@ impl CaptureCtx {
     }
     fn with_taken_dispatch(mut self, dispatch_id: &str) -> Self {
         self.taken_dispatches.insert(dispatch_id.into());
+        self
+    }
+    /// serve `key` as the node holding `run_id`'s execution lease — what the
+    /// dispatch read facade resolves from saga's committed lease, and the ONLY
+    /// origin the session lane lets open a session.
+    fn with_lease_holder(mut self, run_id: &str, key: &[u8]) -> Self {
+        self.dispatch_assignees
+            .insert(dispatch_id_for(run_id), key.to_vec());
         self
     }
     /// a job the board holds as Processing, claimed by "runs" at `height`.
@@ -224,6 +279,52 @@ impl CaptureCtx {
             .map(|m| tagging::decode_msg(&m.payload).expect("tagging msg"))
             .collect()
     }
+    /// decoded pages msgs emitted this dispatch.
+    fn page_msgs(&self) -> Vec<pages::PageMsg> {
+        self.msgs
+            .iter()
+            .filter(|m| m.target == "pages")
+            .map(|m| pages::decode_msg(&m.payload).expect("pages msg"))
+            .collect()
+    }
+    /// the breadcrumb notes emitted this dispatch, as strings.
+    fn notes(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect()
+    }
+}
+
+/// a minimal committed thread view, as the "pages" CommentThread arm serves a
+/// taken thread id.
+fn dummy_thread_view(id: &str) -> pages::ThreadView {
+    pages::ThreadView {
+        thread: pages::Thread {
+            id: id.into(),
+            target: "elsewhere".into(),
+            opener: pages::AuthorRef::System,
+            created_at: 0,
+            resolved: false,
+            resolved_by: None,
+            comment_ids: Vec::new(),
+        },
+        comments: Vec::new(),
+    }
+}
+
+/// a minimal committed comment, as the "pages" GetComment arm serves a taken
+/// comment id.
+fn dummy_comment(id: &str) -> pages::Comment {
+    pages::Comment {
+        id: id.into(),
+        thread_id: "elsewhere".into(),
+        author: pages::AuthorRef::System,
+        text: String::new(),
+        created_at: 0,
+        edited_at: None,
+        deleted: false,
+    }
 }
 #[async_trait::async_trait(?Send)]
 impl Ctx for CaptureCtx {
@@ -269,6 +370,21 @@ impl Ctx for CaptureCtx {
                         .find(|v| v.head.message_id == message_id)
                         .cloned(),
                 ))),
+                // a channel EXISTS exactly when it has a transcript — the
+                // fixture idiom already in use everywhere (a channel with no
+                // messages is `with_transcript(ch, vec![])`).
+                ChatQuery::Channel { channel_id } => Ok(chat::encode_reply(&ChatReply::Channel(
+                    self.transcripts.get(&channel_id).map(|msgs| Channel {
+                        id: channel_id.clone(),
+                        name: channel_id,
+                        created_at: 0,
+                        head_seq: msgs.len() as u64,
+                        post_policy: chat::PostPolicy::Open,
+                        hooks: Vec::new(),
+                        pinned: Vec::new(),
+                        huddle: Vec::new(),
+                    }),
+                ))),
                 _ => Err(Error::QueryUnsupported),
             },
             "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
@@ -280,18 +396,34 @@ impl Ctx for CaptureCtx {
             },
             "dispatch" => match dispatch::decode_query(req).map_err(Error::Module)? {
                 DispatchQuery::Dispatch { dispatch_id, .. } => {
-                    let view = self
-                        .taken_dispatches
-                        .contains(&dispatch_id)
-                        .then(|| DispatchView {
-                            dispatch_id,
-                            recipe_id: "agent/x".into(),
-                            receiver: "runs".into(),
-                            status: DispatchStatus::Delivered,
-                            outcome: Some(Ok(Vec::new())),
-                            assignee: None,
-                            created_at: 0,
-                            updated_at: 0,
+                    // an assigned dispatch is still AwaitingResult (a lease is
+                    // held); a merely `taken` one already delivered.
+                    let assignee = self.dispatch_assignees.get(&dispatch_id).cloned();
+                    let awaiting = assignee.is_some();
+                    let view =
+                        (awaiting || self.taken_dispatches.contains(&dispatch_id)).then(|| {
+                            DispatchView {
+                                dispatch_id,
+                                recipe_id: "agent/x".into(),
+                                receiver: "runs".into(),
+                                status: if awaiting {
+                                    DispatchStatus::AwaitingResult {
+                                        saga_id: "saga-1".into(),
+                                    }
+                                } else {
+                                    DispatchStatus::Delivered
+                                },
+                                outcome: (!awaiting).then(|| Ok(Vec::new())),
+                                assignee,
+                                attempt: None,
+                                max_attempts: None,
+                                lease_expires_at: None,
+                                deadline: None,
+                                lease_updated_at: None,
+                                reassignable: None,
+                                created_at: 0,
+                                updated_at: 0,
+                            }
                         });
                     Ok(dispatch_encode_reply(&DispatchReply::Dispatch(view)))
                 }
@@ -337,6 +469,52 @@ impl Ctx for CaptureCtx {
                         .collect();
                     Ok(forge::encode_reply(&forge::ForgeReply::Items(items)))
                 }
+                _ => Err(Error::QueryUnsupported),
+            },
+            "pages" => match pages::decode_query(req).map_err(Error::Module)? {
+                pages::PageQuery::GetPage { page_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Page(self.pages.get(&page_id).cloned()),
+                )),
+                pages::PageQuery::GetBlock { block_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Block(
+                        self.pages
+                            .values()
+                            .flatten()
+                            .find(|b| b.id == block_id)
+                            .cloned(),
+                    ),
+                )),
+                pages::PageQuery::CommentThread { thread_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::CommentThread(
+                        self.page_threads.get(&thread_id).cloned().or_else(|| {
+                            self.taken_page_ids
+                                .contains(&thread_id)
+                                .then(|| dummy_thread_view(&thread_id))
+                        }),
+                    ),
+                )),
+                pages::PageQuery::GetComment { comment_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Comment(
+                        self.taken_page_ids
+                            .contains(&comment_id)
+                            .then(|| dummy_comment(&comment_id)),
+                    ),
+                )),
+                pages::PageQuery::ThreadsForTargets { targets } => Ok(pages::encode_reply(
+                    &pages::PageReply::CommentThreads(
+                        targets
+                            .into_iter()
+                            .map(|target| {
+                                let count =
+                                    self.page_target_threads.get(&target).copied().unwrap_or(0);
+                                let threads = (0..count)
+                                    .map(|i| dummy_thread_view(&format!("t{i}")))
+                                    .collect();
+                                pages::TargetThreads { target, threads }
+                            })
+                            .collect(),
+                    ),
+                )),
                 _ => Err(Error::QueryUnsupported),
             },
             "saga" => match saga::decode_query(req).map_err(Error::Module)? {
@@ -413,7 +591,6 @@ fn record(agent_id: &str, actions: &[&str]) -> AgentRecord {
         owner: SagaOrigin::External(vec![9; 32]),
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
-        prompt_hash: vec![7u8; PROMPT_HASH_LEN],
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         status: AgentStatus::Active,
         created_at: 0,
@@ -604,9 +781,37 @@ fn forge_read_registry() -> Registry {
     r
 }
 
-/// the forge-lane module: forge + files wired (the production wiring).
+/// the forge-lane module: forge + files + pages wired (the production wiring).
 fn forge_module() -> RunsModule {
-    module().with_sink_forge("forge").with_files_module("files")
+    module()
+        .with_sink_forge("forge")
+        .with_files_module("files")
+        .with_pages_module("pages")
+}
+
+/// a committed page in preorder as the "pages" GetPage arm serves it: the
+/// root (title), a paragraph, and one unchecked todo — enough surface for
+/// the injection assertions. the root names itself as `page`.
+fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
+    let block = |id: &str, parent: Option<&str>, kind, text: &str| pages::Block {
+        id: id.into(),
+        parent: parent.map(str::to_string),
+        page: page_id.into(),
+        kind,
+        text: text.into(),
+        checked: false,
+        children: Vec::new(),
+    };
+    vec![
+        block(page_id, None, pages::BlockKind::Page, title),
+        block(
+            "b-p",
+            Some(page_id),
+            pages::BlockKind::Paragraph,
+            "spec paragraph",
+        ),
+        block("b-t", Some(page_id), pages::BlockKind::Todo, "do the thing"),
+    ]
 }
 
 /// a committed module with one watch on "general" under `policy`. the
@@ -646,7 +851,42 @@ fn engage_post(
     ctx
 }
 
+/// build a faceted RunnerResult wrapper: the three core fields plus whatever
+/// facet keys `facets` carries (data / effects / sink / status, and a
+/// `workspace_receipt` override when present).
+fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
+    let mut obj = serde_json::json!({
+        "ducktape_runner_result": 1,
+        "response_text": response_text,
+        "workspace_receipt": {
+            "source_prefix": "/shared/agent-workspaces/bot",
+            "source_snapshot": null,
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": true
+        }
+    });
+    if let serde_json::Value::Object(extra) = facets {
+        let base = obj.as_object_mut().expect("object");
+        for (k, v) in extra {
+            base.insert(k, v);
+        }
+    }
+    serde_json::to_vec(&obj).expect("wrapper serializes")
+}
+
+/// the model's strict-output prose (a bare AgentResponse JSON), wrapped in
+/// the host-assembled runner result the oracle now ALWAYS delivers (the
+/// marker-less flat tolerance is gone — flag day).
 fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
+    let prose = String::from_utf8(response_json(reply, actions)).expect("utf-8");
+    runner_wrapper(&prose, serde_json::json!({}))
+}
+
+/// the bare AgentResponse wire JSON — the PROSE inside [`response`], and the
+/// expected-value shape assertions compare against.
+fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
     agent::encode_response(&AgentResponse {
         reply_blocks: reply
             .iter()
@@ -679,6 +919,8 @@ mod delivery;
 mod engagement;
 mod facets;
 mod job_runs;
+mod pages_actions;
 mod registry;
+mod sessions;
 mod state;
 mod validation;

@@ -37,7 +37,8 @@ pub use interface::*;
 
 use std::collections::BTreeMap;
 
-use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::codec::{self, Cursor};
+use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
 
 /// one member's queue: a monotonic seq counter plus its live items. `next_seq`
@@ -255,14 +256,14 @@ impl Inbox {
         let mut out = Vec::new();
         out.extend_from_slice(&(members.len() as u64).to_le_bytes());
         for (member, queue) in members {
-            push_string(&mut out, member);
+            codec::push_str(&mut out, member);
             out.extend_from_slice(&queue.next_seq.to_le_bytes());
             out.extend_from_slice(&(queue.items.len() as u64).to_le_bytes());
             for item in queue.items.values() {
                 out.extend_from_slice(&item.seq.to_le_bytes());
-                push_string(&mut out, &item.kind);
-                push_string(&mut out, &item.body);
-                push_string(&mut out, &item.source);
+                codec::push_str(&mut out, &item.kind);
+                codec::push_str(&mut out, &item.body);
+                codec::push_str(&mut out, &item.source);
                 out.extend_from_slice(&item.created_at.to_le_bytes());
                 out.push(item.read as u8);
             }
@@ -286,49 +287,21 @@ impl Inbox {
     }
 }
 
-/// derive the delivering `source` from the dispatch origin — the only source of
-/// truth for who delivered. NEVER caller-supplied. a module is recorded as its
-/// id verbatim; an external submitter as `"ext:"` + the lowercase hex of its id
-/// bytes (empty bytes -> `"ext:"`); genesis / system-internal as `"system"`.
-/// the `ext:` prefix is actor DOMAIN SEPARATION: a future module whose id
-/// happens to be pure hex can never collide with an external key's hex.
-fn source_from_origin(origin: &Origin) -> String {
-    match origin {
-        Origin::Module(id) => id.clone(),
-        Origin::External(bytes) => format!("ext:{}", hex_lower(bytes)),
-        Origin::System => "system".to_owned(),
-    }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).expect("nibble"));
-        out.push(char::from_digit((b & 0x0f) as u32, 16).expect("nibble"));
-    }
-    out
-}
-
-fn push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
-}
-
 /// decode (and validate) a snapshot. install must accept every
 /// execute-reachable state — the root comparison is the integrity check — but
 /// states execute can NEVER produce are rejected as defense-in-depth: the caps
 /// below are all enforced at execute time, so an image violating them is
 /// corrupt or hostile, never an honest validator's state.
 fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error> {
-    let mut off = 0usize;
-    let member_count = read_u64(bytes, &mut off)?;
+    let mut c = Cursor::new(bytes);
+    let member_count = c.u64("snapshot member count")?;
     if member_count > MAX_MEMBERS as u64 {
         return Err(Error::Module("snapshot exceeds member capacity".into()));
     }
 
     let mut members: BTreeMap<String, MemberQueue> = BTreeMap::new();
     for _ in 0..member_count {
-        let member = read_string(bytes, &mut off)?;
+        let member = c.string("snapshot member id")?;
         if member.is_empty() {
             return Err(Error::Module("snapshot member id is empty".into()));
         }
@@ -344,12 +317,12 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error>
             ));
         }
 
-        let next_seq = read_u64(bytes, &mut off)?;
+        let next_seq = c.u64("snapshot next_seq")?;
         if next_seq == 0 {
             // next_seq starts at 1 and only ever increments.
             return Err(Error::Module("snapshot next_seq is zero".into()));
         }
-        let item_count = read_u64(bytes, &mut off)?;
+        let item_count = c.u64("snapshot item count")?;
         if item_count > MAX_ITEMS_PER_MEMBER as u64 {
             return Err(Error::Module(
                 "snapshot member queue exceeds item capacity".into(),
@@ -357,7 +330,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error>
         }
         let mut items: BTreeMap<u64, Notification> = BTreeMap::new();
         for _ in 0..item_count {
-            let seq = read_u64(bytes, &mut off)?;
+            let seq = c.u64("snapshot item seq")?;
             if items.last_key_value().is_some_and(|(last, _)| *last >= seq) {
                 return Err(Error::Module(
                     "snapshot item seqs not strictly ascending".into(),
@@ -368,17 +341,17 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error>
                 // a seq at/above it is not execute-reachable.
                 return Err(Error::Module("snapshot item seq exceeds next_seq".into()));
             }
-            let kind = read_string(bytes, &mut off)?;
+            let kind = c.string("snapshot kind")?;
             if kind.len() > MAX_KIND_BYTES {
                 return Err(Error::Module("snapshot kind exceeds cap".into()));
             }
-            let body = read_string(bytes, &mut off)?;
+            let body = c.string("snapshot body")?;
             if body.len() > MAX_BODY_BYTES {
                 return Err(Error::Module("snapshot body exceeds cap".into()));
             }
-            let source = read_string(bytes, &mut off)?;
-            let created_at = read_u64(bytes, &mut off)?;
-            let read = read_bool(bytes, &mut off)?;
+            let source = c.string("snapshot source")?;
+            let created_at = c.u64("snapshot created_at")?;
+            let read = c.bool("snapshot read flag")?;
             items.insert(
                 seq,
                 Notification {
@@ -394,51 +367,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error>
         }
         members.insert(member, MemberQueue { next_seq, items });
     }
-    if off != bytes.len() {
-        return Err(Error::Module("snapshot has trailing bytes".into()));
-    }
+    c.finish("inbox snapshot")?;
     Ok(members)
-}
-
-fn read_bool(bytes: &[u8], off: &mut usize) -> Result<bool, Error> {
-    match read_u8(bytes, off)? {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(Error::Module("snapshot read flag is not 0/1".into())),
-    }
-}
-
-fn read_u8(bytes: &[u8], off: &mut usize) -> Result<u8, Error> {
-    let end = off
-        .checked_add(1)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
-    let value = bytes[*off];
-    *off = end;
-    Ok(value)
-}
-
-fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {
-    let end = off
-        .checked_add(8)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[*off..end]);
-    *off = end;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
-    let len = read_u64(bytes, off)?;
-    let len = usize::try_from(len).map_err(|_| Error::Module("snapshot truncated".into()))?;
-    if len > bytes.len() - *off {
-        return Err(Error::Module("snapshot truncated".into()));
-    }
-    let value = std::str::from_utf8(&bytes[*off..*off + len])
-        .map_err(|_| Error::Module("snapshot string is not utf-8".into()))?;
-    *off += len;
-    Ok(value.to_owned())
 }
 
 #[async_trait::async_trait(?Send)]
@@ -461,7 +391,9 @@ impl Module for Inbox {
         let Env { consensus_time, .. } = *ctx.env();
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             InboxMsg::Deliver { member, kind, body } => {
-                let source = source_from_origin(&ctx.env().origin);
+                // the delivering `source` is origin-derived — the only source of
+                // truth for who delivered, NEVER caller-supplied.
+                let source = ctx.env().origin.actor_string();
                 self.stage_deliver(member, kind, body, source, consensus_time)
             }
             InboxMsg::MarkRead { member, up_to_seq } => {

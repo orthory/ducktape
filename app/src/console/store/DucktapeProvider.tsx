@@ -22,7 +22,12 @@ import * as notifyClient from "../../domain/notify-client";
 import type { NotifyConfigPayload } from "../../domain/notify-client";
 import type { PageMeta } from "../../domain/pages-client";
 import { moduleTopic } from "../../domain/stream";
-import type { BlockRecord, NodeTransport } from "../../domain/transport";
+import {
+  NodeError,
+  type BlockRecord,
+  type NodeStatus,
+  type NodeTransport,
+} from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
@@ -53,12 +58,20 @@ import {
   buildHuddleContext,
 } from "./huddle-window";
 import type { HuddleWindowCmd } from "./huddle-window";
+import {
+  latchOneShots,
+  navSnapshotOf,
+  navTransition,
+  readNavEntry,
+  stampNav,
+} from "./nav-history";
 import { reducer } from "./reducer";
 import { normalizeKey } from "../../domain/names";
 import {
   applySnapshot,
   createInitialState,
   DEFAULT_AUTHOR,
+  docTabsScope,
   loadRemoteUrl,
   saveDocTabs,
 } from "./state";
@@ -139,10 +152,127 @@ export function DucktapeProvider({
   const bootGenRef = useRef(0);
   const bootStartedRef = useRef(false);
 
+  // Every status consumer for the CURRENT transport shares the same bounded
+  // probe (including its one timeout-only retry). A node switch may start a
+  // different flight before the old one settles, so completion clears the slot
+  // only while it still owns it.
+  // Server follow-up (deliberately outside this UI fix): serve status from
+  // freshness-bounded committed data, and decouple Forge full-pack state sync
+  // from frequent local recovery checkpoints.
+  const statusFlightRef = useRef<{
+    transport: NodeTransport;
+    promise: Promise<NodeStatus>;
+  } | null>(null);
+  const recoveryFlightRef = useRef<{
+    transport: NodeTransport;
+    promise: Promise<void>;
+  } | null>(null);
+  // Identity rejection belongs to the transport that produced it. Keeping the
+  // latch outside global UI state lets a newly selected transport prove itself
+  // while the rejected transport stays permanently unable to recover.
+  const rejectedTransportsRef = useRef(new WeakSet<NodeTransport>());
+  // HTTP success cannot overrule an authoritative stream-down edge. Keep the
+  // fence transport-scoped so refreshes queued (or submitted) after the edge
+  // may still land safe data without claiming the stream recovered.
+  const streamDownTransportsRef = useRef(new WeakSet<NodeTransport>());
+  // A newer hydrate against the same transport owns the UI. This prevents a
+  // slower, older slice failure from overwriting a snapshot that already won.
+  const hydrateGenRef = useRef(0);
+
   const fail = useCallback(
     (err: unknown) =>
       dispatch({ type: "patch", patch: { error: String(err) } }),
     [],
+  );
+
+  const probeStatus = useCallback((live: NodeTransport): Promise<NodeStatus> => {
+    const existing = statusFlightRef.current;
+    if (existing?.transport === live) return existing.promise;
+
+    const promise = Promise.resolve()
+      .then(() => live.status())
+      .catch((err: unknown) => {
+        if (err instanceof NodeError && err.kind === "timeout") {
+          return live.status();
+        }
+        throw err;
+      });
+    const flight = { transport: live, promise };
+    statusFlightRef.current = flight;
+    void promise.then(
+      () => {
+        if (statusFlightRef.current === flight) statusFlightRef.current = null;
+      },
+      () => {
+        if (statusFlightRef.current === flight) statusFlightRef.current = null;
+      },
+    );
+    return promise;
+  }, []);
+
+  // Status is also the recovery identity proof. In particular, a successful
+  // timeout retry must not skip the managed-workspace impostor guard.
+  const acceptsStatus = useCallback((live: NodeTransport, status: NodeStatus): boolean => {
+    if (nodeRef.current !== live) return false;
+    // An impostor finding is sticky for this transport. Stream noise from the
+    // foreign process must never promote it back into an established session.
+    if (rejectedTransportsRef.current.has(live)) return false;
+    const expected = stateRef.current.workspace?.pubkey;
+    const got = status.publicKey;
+    if (!expected || !got || got.toLowerCase() === expected.toLowerCase()) return true;
+    rejectedTransportsRef.current.add(live);
+    dispatch({
+      type: "patch",
+      patch: {
+        connected: false,
+        connectionDown: {
+          reason:
+            "a different node is now answering this workspace's port — not reconnecting",
+          impostor: true,
+        },
+      },
+    });
+    return false;
+  }, []);
+
+  const handleHydrateFailure = useCallback(
+    (err: unknown, hadSnapshot: boolean) => {
+      // A slice query failing after status succeeded says nothing about stream
+      // liveness. Preserve an established session and keep the query failure
+      // loud; a later scoped refresh or guarded stream recovery can converge.
+      if (!hadSnapshot) {
+        dispatch({ type: "patch", patch: { connected: false } });
+      }
+      fail(err);
+    },
+    [fail],
+  );
+
+  const handleStatusFailure = useCallback(
+    (err: unknown, hadSnapshot: boolean) => {
+      if (hadSnapshot) {
+        if (err instanceof NodeError && err.kind === "timeout") {
+          // A status deadline is not a stream-down signal. Preserve the last
+          // good snapshot and connectivity; the live stream triggers recovery.
+          dispatch({
+            type: "update",
+            fn: (prev) =>
+              prev.connected && !prev.connectionDown?.impostor
+                ? { connectionDown: { reason: "Node is busy — retrying…" } }
+                : {},
+          });
+          return;
+        }
+        // An HTTP/malformed response is actionable but still is not proof the
+        // established stream died. Keep its error loud without a false drop.
+        fail(err);
+        return;
+      }
+      // Cold boot has no safe snapshot to retain, so every failure remains loud.
+      dispatch({ type: "patch", patch: { connected: false } });
+      fail(err);
+    },
+    [fail],
   );
 
   // Reconcile doc tabs against a live enumeration: a tab whose page no longer
@@ -157,7 +287,15 @@ export function DucktapeProvider({
     if (pages.length === 0) return { openTabs: prevTabs, activePage: prevActive };
     const liveIds = new Set(pages.map((p) => p.id));
     const openTabs = prevTabs.filter((id) => liveIds.has(id));
-    if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+    if (openTabs.length !== prevTabs.length) {
+      saveDocTabs(
+        docTabsScope(
+          stateRef.current.workspace?.id ?? null,
+          stateRef.current.nodeUrl,
+        ),
+        openTabs,
+      );
+    }
     const activePage =
       prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
     return { openTabs, activePage };
@@ -181,98 +319,124 @@ export function DucktapeProvider({
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
+    // A node switch cannot cancel the transport's already-issued requests.
+    // Bind this hydrate to the exact transport that started it so a late
+    // response from the previous workspace cannot repopulate cleared slices.
+    const generation = (hydrateGenRef.current += 1);
+    const stale = () =>
+      nodeRef.current !== live || hydrateGenRef.current !== generation;
+    const hadSnapshot = stateRef.current.status !== null;
     // the pages (docs) slice refreshes by enumeration + the open page's tree.
     const fetchedPage = stateRef.current.activePage;
     // ops submitted at or after this instant cannot be in the snapshot the
     // queries below return — pageSnapshotSuperseded keys off it at apply time.
     const fetchStartedAt = Date.now();
-    return Promise.resolve()
-      .then(() =>
-        Promise.all([
-          live.status(),
-          fetchChatSlices(live, stateRef.current.activeChannel),
-          fetchValsetSlices(live),
-          fetchGovernanceSlices(live),
-          fetchForgeSlices(live),
-          fetchPagesSlices(live, fetchedPage),
-          fetchAgentsSlices(live),
-          fetchCapabilitySlices(live),
-          fetchRunsSlices(live),
-          fetchPeopleSlices(live),
-          fetchFilesSlices(live),
-          // the explorer's ring pull — best-effort, so a node without
-          // /v1/blocks reads as "no blocks yet".
-          live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
-        ]),
-      )
-      .then(
-        ([
-          status,
-          chat,
-          valset,
-          governance,
-          forge,
-          pagesSlices,
-          agents,
-          capability,
-          runs,
-          people,
-          files,
-          blocks,
-        ]) => {
-          // read-your-writes floor (the follow-the-head handoff's bug B): a
-          // snapshot below a height this console holds a receipt for would
-          // un-render the confirmed write until a later refresh — skip; the
-          // next block's hydrate carries a taller status.
-          if (status.height < receiptFloor(stateRef.current.ops)) return;
-          const holdPages = shouldHoldPages(fetchedPage, fetchStartedAt);
-          const { openTabs, activePage } = holdPages
-            ? {
-                openTabs: stateRef.current.openTabs,
-                activePage: stateRef.current.activePage,
-              }
-            : reconcileDocTabs(pagesSlices.pages);
-          return dispatch({
-            type: "patch",
-            patch: {
-              ...applySnapshot({
-                connected: true,
-                status,
-                channels: chat.channels,
-                members: valset.members,
-                residents: valset.residents,
-                proposals: governance.proposals,
-                forgeHead: forge.forgeHead,
-                activeChannel: chat.activeChannel,
-                messages: chat.messages,
-                authorNames: people.authorNames,
-                nodeUsers: people.nodeUsers,
-                accountKeys: people.accountKeys,
-                accountHandles: people.accountHandles,
-                pages: holdPages ? stateRef.current.pages : pagesSlices.pages,
-                activePageBlocks: holdPages
-                  ? stateRef.current.activePageBlocks
-                  : (pagesSlices.pageBlocks ?? []),
-                agents: agents.agents,
-                capabilities: capability.capabilities,
-                capabilitiesByNode: capability.capabilitiesByNode,
-                watches: runs.watches,
-                pendingRuns: runs.pendingRuns,
-                runAssignee: runs.runAssignee,
-                files: files.files,
-                blocks,
-              }),
-              openTabs,
-              activePage,
-            },
-          });
-        },
-      )
-      .catch((err) => {
-        dispatch({ type: "patch", patch: { connected: false } });
-        fail(err);
-      });
-  }, [fail, reconcileDocTabs, shouldHoldPages]);
+    const hydrate = (status: NodeStatus) => {
+      if (stale() || !acceptsStatus(live, status)) return Promise.resolve();
+      return Promise.resolve()
+        .then(() =>
+          Promise.all([
+            fetchChatSlices(live, stateRef.current.activeChannel),
+            fetchValsetSlices(live),
+            fetchGovernanceSlices(live),
+            fetchForgeSlices(live),
+            fetchPagesSlices(live, fetchedPage),
+            fetchAgentsSlices(live),
+            fetchCapabilitySlices(live),
+            fetchRunsSlices(live),
+            fetchPeopleSlices(live),
+            fetchFilesSlices(live),
+            // the explorer's ring pull — best-effort, so a node without
+            // /v1/blocks reads as "no blocks yet".
+            live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
+          ]),
+        )
+        .then(
+          ([
+            chat,
+            valset,
+            governance,
+            forge,
+            pagesSlices,
+            agents,
+            capability,
+            runs,
+            people,
+            files,
+            blocks,
+          ]) => {
+            if (stale()) return;
+            // read-your-writes floor (the follow-the-head handoff's bug B): a
+            // snapshot below a height this console holds a receipt for would
+            // un-render the confirmed write until a later refresh — skip; the
+            // next block's hydrate carries a taller status.
+            if (status.height < receiptFloor(stateRef.current.ops)) return;
+            const holdPages = shouldHoldPages(fetchedPage, fetchStartedAt);
+            const { openTabs, activePage } = holdPages
+              ? {
+                  openTabs: stateRef.current.openTabs,
+                  activePage: stateRef.current.activePage,
+                }
+              : reconcileDocTabs(pagesSlices.pages);
+            const streamDown = streamDownTransportsRef.current.has(live);
+            return dispatch({
+              type: "patch",
+              patch: {
+                ...applySnapshot({
+                  connected: !streamDown,
+                  status,
+                  channels: chat.channels,
+                  members: valset.members,
+                  residents: valset.residents,
+                  proposals: governance.proposals,
+                  governanceShares: governance.governanceShares,
+                  forgeHead: forge.forgeHead,
+                  activeChannel: chat.activeChannel,
+                  messages: chat.messages,
+                  authorNames: people.authorNames,
+                  nodeUsers: people.nodeUsers,
+                  accountKeys: people.accountKeys,
+                  accountHandles: people.accountHandles,
+                  pages: holdPages ? stateRef.current.pages : pagesSlices.pages,
+                  activePageBlocks: holdPages
+                    ? stateRef.current.activePageBlocks
+                    : (pagesSlices.pageBlocks ?? []),
+                  agents: agents.agents,
+                  capabilities: capability.capabilities,
+                  capabilitiesByNode: capability.capabilitiesByNode,
+                  watches: runs.watches,
+                  pendingRuns: runs.pendingRuns,
+                  runLease: runs.runLease,
+                  files: files.files,
+                  blocks,
+                }),
+                ...(streamDown ? {} : { connectionDown: null }),
+                openTabs,
+                activePage,
+              },
+            });
+          },
+        )
+        .catch((err) => {
+          if (stale()) return;
+          handleHydrateFailure(err, hadSnapshot);
+        });
+    };
+    return probeStatus(live).then(
+      hydrate,
+      (err: unknown) => {
+        if (!stale()) handleStatusFailure(err, hadSnapshot);
+      },
+    );
+  }, [
+    acceptsStatus,
+    fail,
+    handleHydrateFailure,
+    handleStatusFailure,
+    probeStatus,
+    reconcileDocTabs,
+    shouldHoldPages,
+  ]);
 
   // Scoped hydration for block events: ONE status read names the modules the
   // block changed (their state roots ride status().modules[]), and only the
@@ -283,88 +447,107 @@ export function DucktapeProvider({
   const refreshScoped = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
+    const generation = (hydrateGenRef.current += 1);
+    const stale = () =>
+      nodeRef.current !== live || hydrateGenRef.current !== generation;
+    const hadSnapshot = stateRef.current.status !== null;
     const fetchStartedAt = Date.now();
-    return Promise.resolve()
-      .then(() => live.status())
-      .then((status) => {
-        // read-your-writes floor, checked BEFORE fanning out: a lagging
-        // status buys nothing — the next block event retries.
-        if (status.height < receiptFloor(stateRef.current.ops)) return;
-        const prev = stateRef.current.status;
-        if (!prev) return refresh();
-        const scope = scopeFor(changedModules(prev, status));
-        const fetchedPage = stateRef.current.activePage;
-        return Promise.resolve()
-          .then(() =>
-            Promise.all([
-              scope.has("chat")
-                ? fetchChatSlices(live, stateRef.current.activeChannel)
-                : null,
-              scope.has("valset") ? fetchValsetSlices(live) : null,
-              scope.has("governance") ? fetchGovernanceSlices(live) : null,
-              scope.has("forge") ? fetchForgeSlices(live) : null,
-              scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
-              scope.has("agents") ? fetchAgentsSlices(live) : null,
-              scope.has("capability") ? fetchCapabilitySlices(live) : null,
-              scope.has("runs") ? fetchRunsSlices(live) : null,
-              scope.has("people") ? fetchPeopleSlices(live) : null,
-              scope.has("files") ? fetchFilesSlices(live) : null,
-              // the explorer ring follows every block regardless of scope.
-              live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
-            ]),
-          )
-          .then(
-            ([
-              chat,
-              valset,
-              governance,
-              forge,
-              pagesSlices,
-              agents,
-              capability,
-              runs,
-              people,
-              files,
-              blocks,
-            ]) => {
-              const holdPages =
-                !pagesSlices || shouldHoldPages(fetchedPage, fetchStartedAt);
-              const tabs =
-                !holdPages && pagesSlices
-                  ? reconcileDocTabs(pagesSlices.pages)
-                  : null;
-              return dispatch({
-                type: "patch",
-                patch: {
-                  connected: true,
-                  status,
-                  blocks,
-                  ...(chat ?? {}),
-                  ...(valset ?? {}),
-                  ...(governance ?? {}),
-                  ...(forge ?? {}),
-                  ...(agents ?? {}),
-                  ...(capability ?? {}),
-                  ...(runs ?? {}),
-                  ...(people ?? {}),
-                  ...(files ?? {}),
-                  ...(!holdPages && pagesSlices
-                    ? {
-                        pages: pagesSlices.pages,
-                        activePageBlocks: pagesSlices.pageBlocks ?? [],
-                      }
-                    : {}),
-                  ...(tabs ?? {}),
-                },
-              });
-            },
-          );
+    const hydrate = (status: NodeStatus) => {
+      if (stale() || !acceptsStatus(live, status)) return Promise.resolve();
+      // read-your-writes floor, checked BEFORE fanning out: a lagging
+      // status buys nothing — the next block event retries.
+      if (status.height < receiptFloor(stateRef.current.ops)) return;
+      const prev = stateRef.current.status;
+      if (!prev) return refresh();
+      const scope = scopeFor(changedModules(prev, status));
+      const fetchedPage = stateRef.current.activePage;
+      return Promise.resolve()
+        .then(() =>
+          Promise.all([
+            scope.has("chat")
+              ? fetchChatSlices(live, stateRef.current.activeChannel)
+              : null,
+            scope.has("valset") ? fetchValsetSlices(live) : null,
+            scope.has("governance") ? fetchGovernanceSlices(live) : null,
+            scope.has("forge") ? fetchForgeSlices(live) : null,
+            scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
+            scope.has("agents") ? fetchAgentsSlices(live) : null,
+            scope.has("capability") ? fetchCapabilitySlices(live) : null,
+            scope.has("runs") ? fetchRunsSlices(live) : null,
+            scope.has("people") ? fetchPeopleSlices(live) : null,
+            scope.has("files") ? fetchFilesSlices(live) : null,
+            // the explorer ring follows every block regardless of scope.
+            live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
+          ]),
+        )
+        .then(
+          ([
+            chat,
+            valset,
+            governance,
+            forge,
+            pagesSlices,
+            agents,
+            capability,
+            runs,
+            people,
+            files,
+            blocks,
+          ]) => {
+            if (stale()) return;
+            const holdPages =
+              !pagesSlices || shouldHoldPages(fetchedPage, fetchStartedAt);
+            const tabs =
+              !holdPages && pagesSlices
+                ? reconcileDocTabs(pagesSlices.pages)
+                : null;
+            return dispatch({
+              type: "patch",
+              patch: {
+                ...(streamDownTransportsRef.current.has(live)
+                  ? {}
+                  : { connected: true, connectionDown: null }),
+                status,
+                blocks,
+                ...(chat ?? {}),
+                ...(valset ?? {}),
+                ...(governance ?? {}),
+                ...(forge ?? {}),
+                ...(agents ?? {}),
+                ...(capability ?? {}),
+                ...(runs ?? {}),
+                ...(people ?? {}),
+                ...(files ?? {}),
+                ...(!holdPages && pagesSlices
+                  ? {
+                      pages: pagesSlices.pages,
+                      activePageBlocks: pagesSlices.pageBlocks ?? [],
+                    }
+                  : {}),
+                ...(tabs ?? {}),
+              },
+            });
+          },
+        );
+    };
+    return probeStatus(live)
+      .then(hydrate, (err: unknown) => {
+        if (!stale()) handleStatusFailure(err, hadSnapshot);
       })
       .catch((err) => {
-        dispatch({ type: "patch", patch: { connected: false } });
-        fail(err);
+        if (stale()) return;
+        handleHydrateFailure(err, hadSnapshot);
       });
-  }, [fail, refresh, reconcileDocTabs, shouldHoldPages]);
+  }, [
+    acceptsStatus,
+    fail,
+    handleHydrateFailure,
+    handleStatusFailure,
+    probeStatus,
+    refresh,
+    reconcileDocTabs,
+    shouldHoldPages,
+  ]);
 
   const actions = useMemo(
     () =>
@@ -427,7 +610,13 @@ export function DucktapeProvider({
           return;
         }
         if (!active) {
-          dispatch({ type: "patch", patch: { needsOnboarding: true } });
+          // First run (no workspaces at all) → the onboarding gate. Workspaces
+          // registered but none active → the account-centric Home layer, not a
+          // re-onboard. Either way the shell stays hidden until one is entered.
+          dispatch({
+            type: "patch",
+            patch: all.length > 0 ? { atHome: true } : { needsOnboarding: true },
+          });
           return;
         }
         return actions.connectActive(active);
@@ -528,67 +717,58 @@ export function DucktapeProvider({
     if (!node) return;
     if (state.needsOnboarding || state.onboardingPhase) return;
     const recover = () => {
-      void node.status().then(
-        (s) => {
-          // Recovery identity re-check: a foreign / different-build node could
-          // have grabbed the reused port while ours was down (only the INITIAL
-          // adopt used to verify this). Adopting it would silently show another
-          // node's state. Guarded to when we know both keys (managed workspace).
-          const expected = stateRef.current.workspace?.pubkey;
-          const got = s.publicKey;
-          if (expected && got && got.toLowerCase() !== expected.toLowerCase()) {
-            if (stateRef.current.connected || !stateRef.current.connectionDown?.impostor) {
-              dispatch({
-                type: "patch",
-                patch: {
-                  connected: false,
-                  connectionDown: {
-                    reason:
-                      "a different node is now answering this workspace's port — not reconnecting",
-                    impostor: true,
-                  },
-                },
-              });
-            }
-            return;
-          }
-          dispatch({ type: "patch", patch: { connectionDown: null } });
-          refresh();
+      const down = stateRef.current.connectionDown;
+      if (down?.impostor || rejectedTransportsRef.current.has(node)) return;
+      if (stateRef.current.connected && !down) return;
+      const existing = recoveryFlightRef.current;
+      if (existing?.transport === node) return;
+      const promise = refresh();
+      const flight = { transport: node, promise };
+      recoveryFlightRef.current = flight;
+      void promise.then(
+        () => {
+          if (recoveryFlightRef.current === flight) recoveryFlightRef.current = null;
         },
-        (err: unknown) => {
-          if (stateRef.current.connected || !stateRef.current.connectionDown) {
-            const reason = err instanceof Error ? err.message : String(err);
-            dispatch({
-              type: "patch",
-              patch: { connected: false, connectionDown: { reason } },
-            });
-          }
+        () => {
+          if (recoveryFlightRef.current === flight) recoveryFlightRef.current = null;
         },
       );
     };
     const off = node.onStream((signal) => {
       if (signal.kind === "heartbeat") {
+        // A heartbeat is transport-level proof the stream is live again. It
+        // may report height zero before the node has a tip, but it still opens
+        // the liveness gate so guarded recovery can prove identity via status.
+        streamDownTransportsRef.current.delete(node);
         const { height, appHash } = signal.frame;
-        if (height <= 0) return;
-        dispatch({
-          type: "update",
-          fn: (prev) => {
-            const patch: Partial<typeof prev> = {};
-            if (height > (prev.lastBlock ?? -1)) patch.lastBlock = height;
-            // Patch only on real movement: an idle chain heartbeats every 3s
-            // and an unconditional new status object would re-render each beat.
-            if (
-              prev.status &&
-              (prev.status.height !== height || prev.status.appHash !== appHash)
-            ) {
-              patch.status = { ...prev.status, height, appHash };
-            }
-            return patch;
-          },
-        });
+        if (height > 0) {
+          dispatch({
+            type: "update",
+            fn: (prev) => {
+              const patch: Partial<typeof prev> = {};
+              if (height > (prev.lastBlock ?? -1)) patch.lastBlock = height;
+              // Patch only on real movement: an idle chain heartbeats every 3s
+              // and an unconditional new status object would re-render each beat.
+              if (
+                prev.status &&
+                (prev.status.height !== height || prev.status.appHash !== appHash)
+              ) {
+                patch.status = { ...prev.status, height, appHash };
+              }
+              return patch;
+            },
+          });
+        }
+        if (!stateRef.current.connected || stateRef.current.connectionDown) {
+          recover();
+        }
         return;
       }
       if (signal.kind === "down") {
+        streamDownTransportsRef.current.add(node);
+        // Stream down is authoritative. Supersede every hydrate already past
+        // status so its late slice completion cannot clear this down edge.
+        hydrateGenRef.current += 1;
         if (stateRef.current.connected || !stateRef.current.connectionDown) {
           dispatch({
             type: "patch",
@@ -600,6 +780,7 @@ export function DucktapeProvider({
         }
         return;
       }
+      streamDownTransportsRef.current.delete(node);
       if (!stateRef.current.connected || stateRef.current.connectionDown) {
         recover();
       }
@@ -858,18 +1039,75 @@ export function DucktapeProvider({
     }
   }, [state.screen, state.forgeFocus]);
 
+  // 5d. filesFocus rides the same idiom: the files browser navigates to it, and
+  //     the provider retires it once the user leaves the files screen.
+  useEffect(() => {
+    if (state.screen !== "files" && state.filesFocus) {
+      dispatch({ type: "patch", patch: { filesFocus: null } });
+    }
+  }, [state.screen, state.filesFocus]);
+
+  // 5d. Browser-history navigation (see nav-history.ts): apply traversal
+  //     (popstate — the webview's back/forward buttons) through the actions
+  //     facade, whose entry points re-fetch the restored target's data from
+  //     the node. The entry is then re-stamped with what was actually honored
+  //     (a vanished channel/page is skipped), so the stack and the store
+  //     converge instead of fighting over a dead target.
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      const entry = readNavEntry(event.state);
+      if (!entry) return;
+      window.history.replaceState(stampNav(actions.applyNavSnapshot(entry)), "");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [actions]);
+
+  // 5e. The outbound half: mirror the nav slice into history entries. Surface
+  //     moves push; boot hydration filling an empty selection slot replaces
+  //     (no phantom boot entries); a one-shot focus consumption latches into
+  //     the current entry (see latchOneShots) so traversing back re-issues the
+  //     hand-off. Deps are the nav slice ONLY — data churn (blocks, messages)
+  //     must never touch the history stack.
+  useEffect(() => {
+    const entry = readNavEntry(window.history.state);
+    const next = latchOneShots(navSnapshotOf(state), entry);
+    switch (navTransition(next, entry)) {
+      case "push":
+        window.history.pushState(stampNav(next), "");
+        return;
+      case "replace":
+        window.history.replaceState(stampNav(next), "");
+        return;
+      case "none":
+        return;
+    }
+  }, [
+    state.atHome,
+    state.screen,
+    state.viewMode,
+    state.activeChannel,
+    state.activePage,
+    state.forgeFocus,
+    state.forgeRepo,
+    state.explorerFocus,
+    state.agentFocus,
+    state.memberFocus,
+    state.workspace,
+    state.nodeUrl,
+  ]);
+
   // 6. Desktop notifier config push: the Rust notifier learns who "me" is (the
   //    identity account behind our node key and EVERY node bound to it), what
   //    is focused, and which categories are enabled — all from this webview.
   //    Re-pushed whenever an input changes; the JSON fingerprint (the huddle-
   //    context idiom) swallows the per-block identity churn of re-fetched but
-  //    unchanged projections. The window focus edge also marks everything seen
-  //    — the webview-side complement of the notifier's native focus backstop.
+  //    unchanged projections. Focus feeds ONLY the config (focus-suppression
+  //    of the viewed channel) — seen-marking belongs to the bell dropdown.
   useEffect(() => {
     if (!isTauri()) return;
     const onFocus = () => {
       setWindowFocused(true);
-      void notifyClient.markSeen();
     };
     const onBlur = () => setWindowFocused(false);
     window.addEventListener("focus", onFocus);

@@ -7,6 +7,34 @@ use super::{
 impl RunsModule {
     // ---- admin ops + explicit runs (any other origin) --------------------------------
 
+    async fn controlled_dispatch_id(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        action: &str,
+    ) -> Result<Option<String>, Error> {
+        let submitter = canonical_origin(&ctx.env().origin);
+        let dispatch_id = dispatch_id_for(run_id);
+        let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
+            return match self.turn_taken(ctx, &dispatch_id).await {
+                Ok(true) => Ok(None),
+                Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
+                Err(reason) => Err(Error::Module(reason)),
+            };
+        };
+        let owner = self
+            .agent_record(ctx, &entry.agent_id)
+            .await
+            .map_err(Error::Module)?
+            .map(|a| a.owner);
+        if submitter != entry.requester && Some(&submitter) != owner.as_ref() {
+            return Err(Error::Module(format!(
+                "only the run creator or the agent owner may {action} a run"
+            )));
+        }
+        Ok(Some(dispatch_id))
+    }
+
     pub(super) async fn on_admin(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             RunsMsg::WatchChannel { channel_id, policy } => {
@@ -77,6 +105,7 @@ impl RunsModule {
                 agent_id,
                 channel_id,
                 anchor_seq,
+                demands,
             } => {
                 // an explicit turn claim: same run id, same dedup as the
                 // engagement path — first in consensus order wins, the loser
@@ -112,39 +141,21 @@ impl RunsModule {
                 // on a failed preparation: this is the root op of its own
                 // block, so an error poisons nothing but the request itself.
                 let prepared = self
-                    .prepare_dispatch(&*ctx, &agent, &channel_id, anchor_seq)
+                    .prepare_dispatch(&*ctx, &agent, &run_id, &channel_id, anchor_seq)
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(
-                    ctx, &run_id, agent_id, channel_id, anchor_seq, requester, prepared,
+                    ctx, &run_id, agent_id, channel_id, anchor_seq, requester, prepared, demands,
                 );
                 Ok(())
             }
             RunsMsg::CancelRun { run_id } => {
-                let submitter = canonical_origin(&ctx.env().origin);
-                let dispatch_id = dispatch_id_for(&run_id);
-                let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
-                    // not pending: a run whose dispatch already exists is
-                    // terminal (delivered and pruned) — cancelling it is an
-                    // idempotent no-op; anything else is unknown.
-                    return match self.turn_taken(&*ctx, &dispatch_id).await {
-                        Ok(true) => Ok(()),
-                        Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
-                        Err(reason) => Err(Error::Module(reason)),
-                    };
+                let Some(dispatch_id) = self
+                    .controlled_dispatch_id(&*ctx, &run_id, "cancel")
+                    .await?
+                else {
+                    return Ok(());
                 };
-                let owner = self
-                    .agent_record(&*ctx, &entry.agent_id)
-                    .await
-                    .map_err(Error::Module)?
-                    .map(|a| a.owner);
-                // the empty external default can never match: requesters and
-                // owners are always non-empty by construction.
-                if submitter != entry.requester && Some(&submitter) != owner.as_ref() {
-                    return Err(Error::Module(
-                        "only the run creator or the agent owner may cancel a run".into(),
-                    ));
-                }
                 // cancel through the dispatch plane; the entry stays pending
                 // and the plane's Err("cancelled") delivery prunes it (and
                 // finalizes a job-backed run's job) through the ONE result
@@ -155,6 +166,32 @@ impl RunsModule {
                 });
                 Ok(())
             }
+            RunsMsg::ReassignRun { run_id, attempt } => {
+                let Some(dispatch_id) = self
+                    .controlled_dispatch_id(&*ctx, &run_id, "reassign")
+                    .await?
+                else {
+                    return Ok(());
+                };
+                ctx.emit_msg(Msg {
+                    target: self.dispatch.clone(),
+                    payload: dispatch_encode_msg(&DispatchMsg::ReassignDispatch {
+                        dispatch_id,
+                        attempt,
+                    }),
+                });
+                Ok(())
+            }
+            // the session lane (see [`super::sessions`]). deliberately NOT under
+            // `admin_origin`: these two ops carry their own, STRICTER
+            // authorization — the run's committed lease-holder opens, and only
+            // the bound session key acts — and neither is a capability any
+            // "non-empty submitter" has.
+            RunsMsg::OpenAgentSession {
+                run_id,
+                session_key,
+            } => self.open_agent_session(ctx, run_id, session_key).await,
+            RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
         }
     }
 }

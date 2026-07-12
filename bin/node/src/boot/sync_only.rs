@@ -140,6 +140,10 @@ pub(crate) async fn run(
         eprintln!("[node {label}] SYNC REFUSED: {e}");
         std::process::exit(1);
     }
+    if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
+        eprintln!("[node {label}] SYNC REFUSED: {e}");
+        std::process::exit(1);
+    }
 
     // rebuild EVERY module in the manifest (a REAL joiner owns its
     // disk, so every store opens under its canonical module id) and

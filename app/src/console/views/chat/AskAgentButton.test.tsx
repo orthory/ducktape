@@ -21,7 +21,6 @@ const agent = (
   owner: { external: [1] },
   display_name: agentId,
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status,
   created_at: 1,
@@ -95,6 +94,23 @@ describe("AskAgentButton", () => {
       anchorSeq: 7,
     });
     expect(screen.queryByText("ASK TO RESPOND")).toBeNull();
+  });
+
+  it("passes valid resource demands and drops zero/blank fields", () => {
+    const requestRun = renderRow([agent("scribe")]);
+    fireEvent.click(screen.getByTitle("Ask an agent to respond"));
+
+    fireEvent.change(screen.getByLabelText("CORES"), { target: { value: "4" } });
+    // Zero is invalid on the wire — it must be dropped, not sent as mem_gb: 0.
+    fireEvent.change(screen.getByLabelText("MEMORY (GB)"), { target: { value: "0" } });
+
+    fireEvent.click(screen.getByText("@scribe"));
+    expect(requestRun).toHaveBeenCalledWith({
+      agentId: "scribe",
+      channelId: "general",
+      anchorSeq: 7,
+      demands: { cores: 4 },
+    });
   });
 
   it("offers nothing when no agent is Active", () => {

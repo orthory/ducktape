@@ -1,7 +1,6 @@
 use gateway::{
-    GatewayReply, ROUTE_FORMAT_VERSION, RouteAudience, RouteDefinition, RouteMethod, RouteName,
-    RoutePolicy, RouteStatement, RouteSummary, RouteTarget, RouteTargetKind,
-    route_signing_preimage,
+    GatewayReply, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
+    RouteStatement, RouteSummary, RouteTarget, route_signing_preimage,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -10,7 +9,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn statement() -> RouteStatement {
     RouteStatement {
-        version: ROUTE_FORMAT_VERSION,
+        version: 1,
         chain_id: "test".into(),
         account_id: vec![1, 2],
         name: RouteName::named("api"),
@@ -24,6 +23,7 @@ fn statement() -> RouteStatement {
                 max_request_bytes: 1024,
                 max_response_bytes: 4096,
                 allow_authorization: false,
+                allow_upgrade: true,
             },
         }),
     }
@@ -34,7 +34,30 @@ fn signing_preimage_has_a_cross_language_fixed_vector() {
     let encoded = hex(&route_signing_preimage(&statement()).unwrap());
     assert_eq!(
         encoded,
-        "010400000000000000746573740200000000000000010201030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020300000000000000010203000400000000000000100000000000000002"
+        "01040000000000000074657374020000000000000001020103000000000000006170692000000000000000030303030303030303030303030303030303030303030303030303030303030307000000000000000102030000000000000001020300040000000000000010000000000000000102"
+    );
+}
+
+#[test]
+fn content_route_preimage_binds_only_the_manifest_hash() {
+    let mut statement = statement();
+    statement.route = Some(RouteDefinition {
+        target: RouteTarget::DuckFs {
+            manifest_sha256: "b".repeat(64),
+        },
+        policy: RoutePolicy {
+            audience: RouteAudience::Network,
+            methods: vec![RouteMethod::Get, RouteMethod::Head],
+            max_request_bytes: 0,
+            max_response_bytes: 4096,
+            allow_authorization: false,
+            allow_upgrade: false,
+        },
+    });
+    let encoded = hex(&route_signing_preimage(&statement).unwrap());
+    assert_eq!(
+        encoded,
+        "010400000000000000746573740200000000000000010201030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020200000000000000010200000000000000000010000000000000000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     );
 }
 
@@ -55,7 +78,7 @@ fn management_replies_keep_the_small_external_json_shape() {
         name: RouteName::named("api"),
         publisher_node: vec![3; 32],
         revision: 7,
-        target: RouteTargetKind::LoopbackHttp,
+        target: "loopback_http".into(),
     };
     assert_eq!(
         serde_json::to_value(GatewayReply::Routes(vec![summary])).unwrap(),

@@ -12,18 +12,32 @@ version.workspace = true
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# The feat/cef Tauri CLI discovers CEF bundling through the app's enabled
+# Cargo features. The standalone runtime no longer enables `tauri/cef`, so
+# keep the optional direct `cef` dependency below in the default feature set
+# as the packaging signal. Without it, macOS builds silently omit the CEF
+# framework/helper apps and panic in cef::library_loader at launch.
+default = ["cef"]
+cef = ["dep:cef"]
+# `cargo-tauri dev`'s current macOS CEF branch builds an app bundle without
+# the framework/helper payloads. The dev launcher enables this alias instead:
+# it keeps the exact same direct CEF dependency while deliberately avoiding
+# the CLI's feature-name probe, then runs through our validated bundle runner.
+dev-cef = ["dep:cef"]
+
 [dependencies]
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
-# cef: this branch runs on tauri-runtime-cef (bundled Chromium) — wry is fully
-# replaced (default-features off drops wry/x11/dbus; compression + dynamic-acl
-# are kept from the defaults). Requires the patched feat/cef checkout
-# (ops/cef-probe/setup.sh appends the [patch.crates-io] section); registry
-# tauri has no `cef` feature yet.
+# The shell runs on the standalone tauri-runtime-cef crate (bundled Chromium)
+# against REGISTRY tauri — wry is fully replaced (default-features off drops
+# wry/x11/dbus; compression + dynamic-acl are kept from the defaults). The
+# runtime is wired explicitly — Builder::<rt::Cef> plus the rt.rs aliases —
+# and main() dispatches CEF subprocesses to run_cef_helper_process, since
+# registry tauri has no cef feature, Cef alias, or cef_entry_point macro.
 # unstable: tauri's multiwebview API (Window::add_child) for the inline
 # gateway view (gateway_window.rs).
 tauri = { version = "2", default-features = false, features = [
-  "cef",
   "unstable",
   "compression",
   "dynamic-acl",
@@ -31,6 +45,20 @@ tauri = { version = "2", default-features = false, features = [
   "tray-icon",
   "image-png",
 ] }
+# Rev-pinned like the plugin above: bump deliberately (push to the repo,
+# update the rev, rebuild to refresh Cargo.lock).
+# macos-private-api must stay in sync with the tauri feature above: tauri only
+# forwards it to tauri-runtime-wry, so an out-of-tree runtime has to be synced
+# by hand or macOS builds fail E0046 (WindowBuilder::transparent required by
+# the trait but cfg'd out of the impl).
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "7f8491f220cdc0d5aa955db5d5fa6d6d60c8398d", features = [
+  "macos-private-api",
+] }
+# See the default feature above. This resolves to the same package/version the
+# runtime already uses; making it a direct optional dependency gives Cargo and
+# the feat/cef bundler the `cef` feature signal without re-coupling tauri itself
+# to the unreleased runtime feature.
+cef = { version = "=148.0.0", optional = true }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
@@ -40,6 +68,7 @@ getrandom = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
+http = "1"
 toml = "0.8"
 # notify/stream.rs: the async ws client of the node's typed /v1/ws stream.
 # tokio-tungstenite deliberately builds without TLS features — the stream dials
@@ -54,10 +83,15 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # CLI / tauri-agent MCP server drive (semantic tree / input / DOM-SVG shot / logs).
 # registration is cfg-gated to debug + desktop in main.rs so a release runtime
 # registers nothing.
-tauri-plugin-agent = "0.0.1"
+tauri-agent-plugin = { version = "0.0.2", default-features = false, features = ["cef"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Touch ID custody (src/touchid.rs): the vault passphrase behind a biometric
+# Keychain ACL. macOS-target-scoped so the Linux/wasm build is untouched.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

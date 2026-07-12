@@ -9,7 +9,7 @@ import { AsyncEngine } from '../../../../components/diagram/AsyncEngine.client'
 <AsyncEngine />
 
 Ducktape splits asynchronous work into deterministic continuation state and a
-host-owned non-deterministic worker loop.
+host-owned non-deterministic worker seam.
 
 Related: [Product Modules](/en/human/modules/product-modules) covers Agents and
 Runs, [Determinism Contract](/en/agent/architecture/determinism-contract)
@@ -23,11 +23,14 @@ The saga module stores continuation state under the app-hash. A trigger records
 that work is pending and emits a worker request as an effect. The pending state
 is deterministic and committed like any other module state.
 
-## Reactor
+## Worker Seam
 
-The reactor owns workers outside module execution. A worker may claim an effect,
-perform the non-deterministic work, and return a `Msg`. That message re-enters
-the host as an ordinary op in a later block.
+`host::worker` defines the seam outside module execution: a `Worker` may claim
+an emitted `Effect`, perform the non-deterministic work, and return a `Msg`.
+That message is submitted as an ordinary op in a separate block. The drive loop
+itself lives with each binary (validator drain, `noded`, `simnode`), all the
+same shape: submit, offer each emitted effect to every worker, submit each
+claimed follow-up as its own block.
 
 The important rule is that workers never receive module handles. They cannot
 mutate state directly. Their only path back into consensus state is the message

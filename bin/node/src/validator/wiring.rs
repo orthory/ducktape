@@ -23,7 +23,7 @@ use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::reachability_plane::wire_reachability_plane;
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
-use crate::{blob_fetch, statesync_plane, voice, voice_plane};
+use crate::{blob_fetch, voice, voice_plane};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -51,10 +51,8 @@ pub(super) struct RuntimeWiring {
     pub(super) bank_base: u64,
     pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
     pub(super) channel_bank: super::ChannelBank,
-    pub(super) sync_plane_book: Option<Arc<statesync_plane::OverlayBook>>,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
-    pub(super) blob_fetcher: blob_fetch::BlobFetchFn,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -77,6 +75,7 @@ pub(super) async fn finish(
     wireguard_effect: config::WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
@@ -177,10 +176,9 @@ pub(super) async fn finish(
     // future between ticks is lossless, whereas dropping the p2p receiver's
     // actor-backed `recv()` future mid-flight could eat a delivered
     // message. bounded + drop-on-full: clients time out and retry, so a
-    // flood degrades to retries instead of unbounded memory. the queue
-    // carries BOTH statesync carriers — mesh rpc frames and data-plane
-    // request streams — so one serve task answers both.
-    let (bridge_tx, sync_ingress) = futures::channel::mpsc::channel::<statesync_plane::SyncJob>(64);
+    // flood degrades to retries instead of unbounded memory.
+    let (bridge_tx, sync_ingress) =
+        futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
     // the blob fetch-on-miss lane (the #298 prompt-blob cross-node gap):
     // the oracle pool's resolver asks current peers for a digest its own
     // store lacks, over this same statesync channel. the pending map is
@@ -196,54 +194,21 @@ pub(super) async fn finish(
                 .cloned()
                 .collect(),
         ));
-    let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
-        sync_tx.clone(),
-        blob_pending.clone(),
-        std::sync::Arc::clone(&blob_peers),
-        signer.public_key(),
-    )
-    .into_fetch_fn();
-    {
-        let mut bridge_tx = bridge_tx.clone();
-        context.child("sync_ingress").spawn(move |_ctx| {
-            let mut receiver = sync_rx;
-            async move {
-                loop {
-                    match receiver.recv().await {
-                        Ok((peer, msg)) => {
-                            let bytes: Vec<u8> = msg.into();
-                            // full bridge = flood pressure: drop; clients retry.
-                            let _ = bridge_tx.try_send(statesync_plane::SyncJob::Mesh(peer, bytes));
-                        }
-                        Err(_) => return, // network shutdown — nothing to serve.
+    context.child("sync_ingress").spawn(move |_ctx| {
+        let mut receiver = sync_rx;
+        let mut bridge_tx = bridge_tx;
+        async move {
+            loop {
+                match receiver.recv().await {
+                    Ok((peer, msg)) => {
+                        let bytes: Vec<u8> = msg.into();
+                        // full bridge = flood pressure: drop; clients retry.
+                        let _ = bridge_tx.try_send((peer, bytes));
                     }
+                    Err(_) => return, // network shutdown — nothing to serve.
                 }
             }
-        });
-    }
-    // statesync's per-use data plane (env-gated, default off): the same
-    // requests over overlay stream sockets, accepted into the same queue.
-    // the address book doubles as admission — members + standbys of the
-    // tracked view, updated at every cutover re-track below.
-    let sync_plane_book = statesync_plane::enabled().then(|| {
-        let book = statesync_plane::OverlayBook::new(
-            String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-        );
-        book.set_peers(
-            initial_member_keys
-                .iter()
-                .chain(initial_resident_keys.iter()),
-        );
-        statesync_plane::spawn_bring_up(
-            label.clone(),
-            std::sync::Arc::clone(&book),
-            signer.public_key(),
-            std::sync::Arc::new(std::sync::OnceLock::new()),
-            statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
-            bulk_pacer.clone(),
-            Some(bridge_tx.clone()),
-        );
-        book
+        }
     });
     // Gateway has its own flow, socket, queue, and admission policy. It shares
     // only the process-wide bulk pacer with state sync and follows the same
@@ -262,8 +227,9 @@ pub(super) async fn finish(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 pacer: bulk_pacer,
+                planes,
                 commands: gateway_commands,
                 workspace: gateway_workspace,
             },
@@ -271,13 +237,12 @@ pub(super) async fn finish(
         );
         book
     });
-    drop(bridge_tx);
     // the statesync SERVE task (the [`SyncStateRequest`] seam): owns the
-    // capture cache and both statesync carriers end-to-end — decode,
-    // leases, chunk slicing, and the mesh/plane replies — so serving a
-    // joiner never occupies the consensus loop. the loop answers only
-    // the bounded state touches crossing `sync_state_tx`; when the loop
-    // is busy the serve lane backpressures, never the reverse.
+    // capture cache and the mesh statesync carrier end-to-end — decode,
+    // leases, chunk slicing, and the mesh replies — so serving a joiner
+    // never occupies the consensus loop. the loop answers only the
+    // bounded state touches crossing `sync_state_tx`; when the loop is
+    // busy the serve lane backpressures, never the reverse.
     let (sync_state_tx, sync_state_rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
     {
         let state_tx = sync_state_tx;
@@ -289,65 +254,38 @@ pub(super) async fn finish(
             .child("statesync_serve")
             .spawn(move |_ctx| async move {
                 let mut server = SyncServer::new();
-                while let Some(job) = ingress.next().await {
-                    // both carriers land here: mesh frames ride an rpc
-                    // envelope (multiplexed channel — the id correlates);
-                    // a plane stream IS its own correlation and reply path.
-                    let (reply_to, rpc_id, request) = match job {
-                        statesync_plane::SyncJob::Mesh(peer, bytes) => {
-                            let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
-                                continue; // malformed rpc envelope: drop, never crash.
-                            };
-                            // the mesh demux: OUR fetch answers are consumed,
-                            // stray responses (a blob answer landing after its
-                            // fan-out's sweep) and unparseable frames are
-                            // DROPPED — answering either is how two serve
-                            // loops bounce Error frames forever. only a real
-                            // request proceeds; the reply-on-bad-frame lane is
-                            // stream-only below.
-                            match blob_fetch::classify_mesh_frame(&blob_pending, rpc_id, body) {
-                                blob_fetch::MeshFrame::OurResponse
-                                | blob_fetch::MeshFrame::StrayResponse
-                                | blob_fetch::MeshFrame::Junk => continue,
-                                blob_fetch::MeshFrame::Request(req) => {
-                                    (statesync_plane::SyncReplyTo::Mesh(peer), rpc_id, Ok(req))
-                                }
-                            }
-                        }
-                        statesync_plane::SyncJob::Plane(stream, req) => (
-                            statesync_plane::SyncReplyTo::Plane(stream),
-                            0,
-                            statesync::decode_request(&req),
-                        ),
+                while let Some((peer, bytes)) = ingress.next().await {
+                    // mesh frames ride an rpc envelope (multiplexed
+                    // channel — the id correlates).
+                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                        continue; // malformed rpc envelope: drop, never crash.
                     };
-                    let resp = match request {
+                    // the mesh demux: OUR fetch answers are consumed,
+                    // stray responses (a blob answer landing after its
+                    // fan-out's sweep) and unparseable frames are
+                    // DROPPED — answering either is how two serve
+                    // loops bounce Error frames forever. only a real
+                    // request proceeds.
+                    let req = match blob_fetch::classify_mesh_frame(&blob_pending, rpc_id, body) {
+                        blob_fetch::MeshFrame::OurResponse
+                        | blob_fetch::MeshFrame::StrayResponse
+                        | blob_fetch::MeshFrame::Junk => continue,
+                        blob_fetch::MeshFrame::Request(req) => req,
+                    };
+                    let resp = match req {
                         // blob fetches are host state — answered from the
                         // node-local store, never routed into SyncServer.
-                        Ok(statesync::SyncRequest::Blob { digest }) => {
+                        statesync::SyncRequest::Blob { digest } => {
                             blob_fetch::serve_blob(&sync_blobs, &digest)
                         }
-                        Ok(req) => drive_sync_request(&mut server, &state_tx, req).await,
-                        // stream-only by construction: a plane stream is a
-                        // one-shot request/response, so an Error reply here
-                        // can never re-enter a serve loop and oscillate.
-                        Err(e) => statesync::SyncResponse::Error(format!("bad request frame: {e}")),
+                        req => drive_sync_request(&mut server, &state_tx, req).await,
                     };
                     let resp = statesync::encode_response(&resp);
-                    match reply_to {
-                        statesync_plane::SyncReplyTo::Mesh(peer) => {
-                            let _ = sync_tx.send(
-                                Recipients::One(peer),
-                                IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                                false,
-                            );
-                        }
-                        statesync_plane::SyncReplyTo::Plane(mut stream) => {
-                            // one request per stream: write the response
-                            // and drop — the close is the client's
-                            // completion.
-                            let _ = statesync::dataplane::write_frame(&mut stream, &resp).await;
-                        }
-                    }
+                    let _ = sync_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                        false,
+                    );
                 }
             });
     }
@@ -399,10 +337,8 @@ pub(super) async fn finish(
         bank_base,
         mesh_oracle,
         channel_bank,
-        sync_plane_book,
         gateway_book,
         blob_peers,
-        blob_fetcher,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -446,6 +382,7 @@ pub(super) async fn wire(
     coord_cap: Option<nat_traversal::CoordCap>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
+    planes: data_plane::PlaneMonitor,
 ) -> PreWiring {
     // consensus membership comes from the RECOVERY RECORD: the epoch's
     // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
@@ -578,9 +515,10 @@ pub(super) async fn wire(
                 .expect("ed25519 keys are 32 bytes");
             voice::spawn_hub(
                 voice_requests,
-                statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
+                planes,
             );
             Some(peers)
         } else {

@@ -30,6 +30,8 @@
   --c-border-soft: #ececec;
   --c-border-strong: #d6d6d6;
   --c-chip: #e3e3e3;
+  /* filled/on-filled/green/amber are duplicated in AgentView.test.tsx's WCAG
+     contrast test (jsdom can't evaluate color-mix) — update both together. */
   --c-filled: #26251f;
   --c-on-filled: #efefef;
   --c-green: #5cb45f;
@@ -62,6 +64,7 @@
   --c-border-soft: #292823;
   --c-border-strong: #3b3a33;
   --c-chip: #323029;
+  /* mirrored in AgentView.test.tsx's WCAG contrast test — update both. */
   --c-filled: #ecebe5;
   --c-on-filled: #1b1a17;
   --c-green: #6cc06f;
@@ -95,6 +98,15 @@ textarea {
   border: none;
   outline: none;
   background: none;
+}
+
+/* Placeholders follow the theme instead of the engine's default grey — the
+   pages editor now names an empty block AT REST ("Heading 1", "To-do"), so this
+   text is document furniture, not a stray hint. */
+input::placeholder,
+textarea::placeholder {
+  color: var(--c-muted2, #a1a1a1);
+  opacity: 1;
 }
 
 /* Safari / WKWebView (the macOS app's engine) ignore autocomplete="off" for
@@ -139,6 +151,19 @@ button:focus-visible,
 ::-webkit-scrollbar-thumb:hover {
   background: var(--c-icon-idle);
   background-clip: content-box;
+}
+
+/* A syntax-highlighted code token (forge's CodeView). shiki tokenizes against
+   github-light AND github-dark at once and hands each token both colors as
+   inline custom properties; this picks the one matching the live `data-theme`,
+   so the Code tab re-paints on a theme flip with no re-tokenize. Without the
+   dark arm, every token would keep its light-theme color and vanish against the
+   dark paper. */
+.code-tok {
+  color: var(--shiki-light);
+}
+:root[data-theme="dark"] .code-tok {
+  color: var(--shiki-dark);
 }
 
 /* Scrollable, but with no visible scrollbar chrome — the doc tab strip still

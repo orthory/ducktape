@@ -10,6 +10,7 @@ import {
   decodeLinkResponse,
   encodeLinkChallenge,
   encodeLinkResponse,
+  isLinkUrl,
   type LinkChallenge,
   type LinkResponse,
 } from "./link-device";
@@ -93,5 +94,22 @@ describe("link response codec", () => {
 
   it("rejects a challenge blob fed to the response decoder", () => {
     expect(decodeLinkResponse(encodeLinkChallenge(challenge))).toBeNull();
+  });
+});
+
+describe("link address detection", () => {
+  const token = "0123456789abcdef0123456789abcdef";
+
+  it("accepts a relay address, with whitespace and uppercase hex", () => {
+    expect(isLinkUrl(`http://192.168.1.23:40000/link#${token}`)).toBe(true);
+    expect(isLinkUrl(`  http://10.0.0.2:1/link#${token.toUpperCase()} \n`)).toBe(true);
+  });
+
+  it("rejects blobs, wrong paths, wrong schemes, and bad tokens", () => {
+    expect(isLinkUrl(encodeLinkChallenge(challenge))).toBe(false);
+    expect(isLinkUrl(`https://192.168.1.23:40000/link#${token}`)).toBe(false);
+    expect(isLinkUrl(`http://192.168.1.23:40000/enroll#${token}`)).toBe(false);
+    expect(isLinkUrl("http://192.168.1.23:40000/link#short")).toBe(false);
+    expect(isLinkUrl("")).toBe(false);
   });
 });

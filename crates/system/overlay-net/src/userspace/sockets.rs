@@ -202,15 +202,6 @@ impl VirtualTcpStream {
     pub(super) fn new(shared: Arc<StackShared>, handle: SocketHandle) -> Self {
         Self { shared, handle }
     }
-
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        let mut state = self.shared.lock();
-        let socket = state.sockets.get_mut::<tcp::Socket>(self.handle);
-        socket
-            .remote_endpoint()
-            .map(endpoint_to_addr)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no remote endpoint"))
-    }
 }
 
 impl AsyncRead for VirtualTcpStream {

@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest as _, Sha256};
 
+// crate-internal: [`BlobHandle`] is the public type embedders share.
 #[derive(Default)]
-pub struct BlobStore {
+pub(crate) struct BlobStore {
     chunks: HashMap<[u8; 32], Vec<u8>>,
     /// write-through persistence root; `None` = pure in-memory.
     root: Option<PathBuf>,

@@ -42,6 +42,12 @@ const PATHS: Record<string, ReactNode> = {
     </>
   ),
   moon: <path d="M20.5 13.2A8 8 0 1 1 10.8 3.5a6.3 6.3 0 0 0 9.7 9.7z" />,
+  bell: (
+    <>
+      <path d="M6.5 15.5v-5a5.5 5.5 0 0 1 11 0v5l1.5 2H5z" />
+      <path d="M10.5 18.5a1.5 1.5 0 0 0 3 0" />
+    </>
+  ),
   search: (
     <>
       <circle cx="11" cy="11" r="6" />

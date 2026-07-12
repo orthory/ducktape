@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use forge::Forge;
 use forge::{
-    ForgeMsg, ForgeQuery, ForgeReply, RepoHead, decode_reply, encode_msg, encode_query,
+    ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, RepoHead, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
@@ -77,7 +77,7 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         *p += 4;
         v
     }
-    let mut p = 0;
+    let mut p = 4; // skip the 4-byte "FGv2" container magic
     let count = u32_at(bytes, &mut p);
     let mut out = Vec::new();
     for _ in 0..count {
@@ -119,11 +119,14 @@ fn commit_msg(repo: &str, path: &str, content: &str, message: &str) -> Msg {
 fn push_msg(repo: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
     Msg {
         target: "forge".into(),
-        payload: encode_msg(&ForgeMsg::Push {
+        payload: encode_msg(&ForgeMsg::PushRefs {
             repo: repo.into(),
-            prev_oid: prev.map(<[u8]>::to_vec),
-            new_oid: new.to_vec(),
-            pack_digest: digest.to_vec(),
+            updates: vec![RefUpdate {
+                ref_name: "main".into(),
+                prev_oid: prev.map(<[u8]>::to_vec),
+                new_oid: Some(new.to_vec()),
+            }],
+            pack_digest: Some(digest.to_vec()),
         }),
     }
 }

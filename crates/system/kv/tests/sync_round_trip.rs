@@ -19,9 +19,9 @@ fn synced_store_reconstructs_source_root() {
     deterministic::Runner::default().start(|context| async move {
         // SOURCE: commit several ops, including an overwrite of `a`.
         let mut src = Kv::init(context.child("src"), "src").await;
-        src.set(b"a".to_vec(), b"1".to_vec()).await;
-        src.set(b"b".to_vec(), b"2".to_vec()).await;
-        src.set(b"a".to_vec(), b"3".to_vec()).await; // overwrite: op-log order matters
+        src.set(b"a".to_vec(), b"1".to_vec()).await.expect("set");
+        src.set(b"b".to_vec(), b"2".to_vec()).await.expect("set");
+        src.set(b"a".to_vec(), b"3".to_vec()).await.expect("set"); // overwrite: op-log order matters
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 

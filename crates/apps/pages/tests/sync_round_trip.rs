@@ -149,6 +149,8 @@ fn synced_store_reconstructs_source_root() {
                 comment_id: "cm1".into(),
                 target: "b1".into(),
                 text: "review this".into(),
+                mentions: Vec::new(),
+                as_agent: None,
             },
         )
         .await;

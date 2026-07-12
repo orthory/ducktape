@@ -8,15 +8,12 @@ showAskAi: false
 
 ## WireGuard Tunnel Runtime
 
-`crates/system/wireguard-upgrade`는 아직 protocol leaf다. `bin/node`나
-`bin/noded`에서 검증된 `TunnelInstallPlan`을 defguard `WGApi`로 apply하는 consumer가
-없다. 다음 slice는 upgrade effect를 내보내는 mesh module, `WGApi`를 drive하는
-reactor worker, finalized admission commitment가 생기기 전에는 fail-closed로
-동작하는 `admission_root` producer, responder-side install-plan constructor다.
-
-두 mesh contract(`valset::mesh`, `wireguard-upgrade`)는 하나의 shape로
-합쳐져야 한다. 실제 WireGuard interface를 Linux netns에서 올리는 privileged e2e는
-아직 deliberately descoped다.
+`crates/system/wireguard`(crate root가 validation, `wireguard::effect`가 apply
+layer; 이전의 `wireguard-upgrade` + `wireguard-effect` crate가 merge된 것)는 더
+이상 protocol leaf가 아니다. node의 reachability plane이 검증된
+`TunnelInstallPlan`을 설정된 `WireGuardEffect`로 apply하고, parallel
+`valset::mesh` contract는 unify 대신 삭제됐다. 실제 WireGuard interface를 Linux
+netns에서 올리는 privileged e2e는 아직 deliberately descoped다.
 
 ## Demotion And Promotion Edges
 
@@ -43,7 +40,7 @@ certificate로 current node를 recover한다. 남은 edge는 older/pre-recovery 
 directory다. local state가 recovery checkpoint 없이 존재하면 boot는 in-place migrate가
 아니라 wipe/re-sync 안내와 함께 loud failure로 끝난다.
 
-## Agent/Reactor Product Path
+## Agent Product Path
 
 live node는 이제 module set에 `agent`, `runs`, `jobs`, `dispatch`, `saga`,
 `capability`, `tagging`을 포함한다. local capability provider를 discover하고,

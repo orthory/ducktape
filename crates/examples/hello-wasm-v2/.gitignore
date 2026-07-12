@@ -1,0 +1,5 @@
+# standalone guest crate build artifacts (the componentized fixture is
+# committed under crates/kernel/host/tests/fixtures instead).
+/target
+/out
+/Cargo.lock

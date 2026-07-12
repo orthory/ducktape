@@ -16,15 +16,18 @@
 //! key the user must still approve. The token, the bind-only-during-enrollment
 //! lifetime, and the strict input validation are defense-in-depth on top.
 
-use std::io::{Cursor, Read as _};
-use std::net::{IpAddr, UdpSocket};
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Method, Request, Response, Server};
 
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
+use crate::lan_http::{
+    MAX_REQUEST_BODY_BYTES, html, is_hex, js, json, lan_ipv4, random_token, read_json, serve,
+    status, token_matches,
+};
 
 // ── session state ────────────────────────────────────────
 
@@ -78,76 +81,12 @@ struct PossessionReq {
 
 // ── helpers ──────────────────────────────────────────────
 
-/// the LAN-facing IPv4: connect a UDP socket at a public address (no packets
-/// are sent) and read back which local interface the OS would route through.
-fn lan_ipv4() -> Result<IpAddr, String> {
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("udp bind: {e}"))?;
-    sock.connect("8.8.8.8:80")
-        .map_err(|e| format!("udp connect: {e}"))?;
-    Ok(sock
-        .local_addr()
-        .map_err(|e| format!("local addr: {e}"))?
-        .ip())
-}
-
-/// a 128-bit hex session token from OS randomness.
-fn random_token() -> Result<String, String> {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).map_err(|err| format!("os randomness: {err}"))?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// hex bytes only — reject anything else before it reaches the node verb.
-fn is_hex(s: &str) -> bool {
-    !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn token_matches(expected: &str, supplied: &str) -> bool {
-    let expected = expected.as_bytes();
-    let supplied = supplied.as_bytes();
-    let mut different = expected.len() ^ supplied.len();
-    for (index, byte) in expected.iter().enumerate() {
-        different |= usize::from(*byte ^ supplied.get(index).copied().unwrap_or(0));
-    }
-    different == 0
-}
-
 fn valid_p256_key(value: &str) -> bool {
     value.len() == 66 && is_hex(value) && (value.starts_with("02") || value.starts_with("03"))
 }
 
 fn valid_compact_p256_signature(value: &str) -> bool {
     value.len() == 128 && is_hex(value)
-}
-
-fn header(name: &[u8], value: &[u8]) -> Header {
-    Header::from_bytes(name, value).expect("static response header")
-}
-
-fn json(body: String) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body)
-        .with_header(header(b"Content-Type", b"application/json"))
-        .with_header(header(b"Cache-Control", b"no-store"))
-        .with_header(header(b"X-Content-Type-Options", b"nosniff"))
-}
-fn html(body: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body)
-        .with_header(header(b"Content-Type", b"text/html; charset=utf-8"))
-        .with_header(header(b"Cache-Control", b"no-store"))
-        .with_header(header(b"X-Content-Type-Options", b"nosniff"))
-        .with_header(header(
-            b"Content-Security-Policy",
-            b"default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
-        ))
-}
-fn js(body: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body)
-        .with_header(header(b"Content-Type", b"text/javascript; charset=utf-8"))
-        .with_header(header(b"Cache-Control", b"no-store"))
-        .with_header(header(b"X-Content-Type-Options", b"nosniff"))
-}
-fn status(code: u16) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string("").with_status_code(code)
 }
 
 // ── the served phone page ────────────────────────────────
@@ -184,20 +123,6 @@ fn handle(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
         (Method::Post, "/possession") => possession(req),
         _ => status(404),
     }
-}
-
-const MAX_REQUEST_BODY_BYTES: u64 = 8 * 1024;
-
-fn read_json<T: for<'de> Deserialize<'de>>(req: &mut Request) -> Option<T> {
-    let mut body = String::new();
-    req.as_reader()
-        .take(MAX_REQUEST_BODY_BYTES + 1)
-        .read_to_string(&mut body)
-        .ok()?;
-    if body.len() as u64 > MAX_REQUEST_BODY_BYTES {
-        return None;
-    }
-    serde_json::from_str(&body).ok()
 }
 
 /// POST /payload {token,new_key} → the exact hex bytes to ECDSA-sign, from the
@@ -270,14 +195,6 @@ fn possession(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     json(r#"{"ok":true}"#.to_string())
 }
 
-fn serve(server: Arc<Server>) {
-    // `incoming_requests` ends when the server is `unblock`ed (cancel/restart).
-    for mut req in server.incoming_requests() {
-        let resp = handle(&mut req);
-        let _ = req.respond(resp);
-    }
-}
-
 // ── Tauri commands ───────────────────────────────────────
 
 /// start an enrollment: bind an ephemeral LAN server and return the QR URL.
@@ -285,7 +202,7 @@ fn serve(server: Arc<Server>) {
 /// its current nonce (the caller reads it from the chain).
 #[tauri::command]
 pub fn enroll_start(
-    window: tauri::WebviewWindow,
+    window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     chain_id: String,
     account_id: String,
@@ -322,10 +239,10 @@ pub fn enroll_start(
             result: None,
         });
     }
-    thread::spawn(move || serve(server));
+    thread::spawn(move || serve(server, handle));
 
     // token rides the fragment: it stays client-side on the page GET and is
-    // sent back only on the explicit /context, /payload, /possession calls.
+    // sent back only on the explicit /payload and /possession calls.
     Ok(EnrollStart {
         url: format!("http://{ip}:{port}/enroll#{token}"),
     })
@@ -334,7 +251,7 @@ pub fn enroll_start(
 /// poll for the phone's result. returns `null` until the phone posts its
 /// signature; then the caller signs the add-member authorizer + submits.
 #[tauri::command]
-pub fn enroll_poll(window: tauri::WebviewWindow) -> Result<Option<(String, String)>, String> {
+pub fn enroll_poll(window: crate::rt::WebviewWindow) -> Result<Option<(String, String)>, String> {
     require_main_window(&window)?;
     Ok(enroll_poll_inner())
 }
@@ -348,7 +265,7 @@ fn enroll_poll_inner() -> Option<(String, String)> {
 
 /// tear the enrollment server down (on success, cancel, or leaving the screen).
 #[tauri::command]
-pub fn enroll_cancel(window: tauri::WebviewWindow) -> Result<(), String> {
+pub fn enroll_cancel(window: crate::rt::WebviewWindow) -> Result<(), String> {
     require_main_window(&window)?;
     enroll_cancel_inner();
     Ok(())
@@ -365,22 +282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_hex_accepts_only_even_length_hex() {
-        assert!(is_hex("00ff"));
-        assert!(is_hex("deadbeef"));
-        assert!(!is_hex(""));
-        assert!(!is_hex("abc")); // odd length
-        assert!(!is_hex("zz")); // non-hex
-        assert!(!is_hex("00 ff")); // space
-    }
-
-    #[test]
     fn enrollment_auth_and_crypto_fields_are_strictly_shaped() {
-        assert!(token_matches("0123456789abcdef", "0123456789abcdef"));
-        assert!(!token_matches("0123456789abcdef", "0123456789abcdee"));
-        assert!(!token_matches("0123456789abcdef", "0123456789abcdef00"));
-        assert!(!token_matches("0123456789abcdef", "01234567"));
-
         let compressed = format!("02{}", "11".repeat(32));
         assert!(valid_p256_key(&compressed));
         assert!(valid_p256_key(&format!("03{}", "aa".repeat(32))));
@@ -406,9 +308,9 @@ mod tests {
             server: server.clone(),
             result: None,
         });
-        let handle = {
+        let join = {
             let srv = server.clone();
-            thread::spawn(move || serve(srv))
+            thread::spawn(move || serve(srv, handle))
         };
 
         let req = |raw: &str| -> String {
@@ -458,6 +360,6 @@ mod tests {
         );
 
         enroll_cancel_inner();
-        let _ = handle.join();
+        let _ = join.join();
     }
 }

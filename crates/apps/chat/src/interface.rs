@@ -138,7 +138,6 @@ pub struct Channel {
     /// the channel's live huddle roster, join order. empty = no huddle. the
     /// roster is consensus state (who is in the room); the audio itself rides
     /// the off-consensus voice plane.
-    #[serde(default)]
     pub huddle: Vec<HuddleMember>,
 }
 

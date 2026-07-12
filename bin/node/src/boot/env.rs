@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use capability_host::SandboxBackend;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
@@ -50,6 +52,13 @@ pub(crate) struct BootEnv {
     pub(crate) dev_demo: bool,
     pub(crate) sync_index: bool,
     pub(crate) announce_capabilities: bool,
+    /// how provider runs are spawned (`node.toml sandbox`) — threaded to both
+    /// `capability_host::discover` call sites (validator + resident).
+    pub(crate) sandbox: SandboxBackend,
+    /// the capacity a sandboxed node announces AND enforces: the single source
+    /// for both the dispatch pool's ledger and the capability announce's
+    /// resources. EMPTY for a direct-spawn node.
+    pub(crate) sandbox_capacity: BTreeMap<String, u64>,
     pub(crate) promoted: bool,
     pub(crate) joiner: bool,
 }
@@ -91,6 +100,8 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         workspace,
         primary_coordinator,
         wireguard_advertised,
+        sandbox,
+        sandbox_capacity,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -302,6 +313,8 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         dev_demo,
         sync_index,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         promoted,
         joiner,
     }

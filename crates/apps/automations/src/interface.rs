@@ -7,22 +7,26 @@
 
 use serde::{Deserialize, Serialize};
 
-/// what makes a rule fire. every `None` field is a wildcard; every `Some` field
-/// must match the triggering event. kept an enum (single variant today) so a
-/// future filesystem-change trigger can join without a wire break.
+/// what makes a rule fire: a chat message-posted filter. every `None` field is
+/// a wildcard; every `Some` field must match the triggering event. (formerly a
+/// single-variant `MessagePosted` enum; the snapshot layout still carries a
+/// trigger-kind byte so a future non-chat trigger can join that codec without
+/// a state break.)
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Trigger {
-    MessagePosted {
-        /// an exact channel id, or `None` for any channel.
-        channel_id: Option<String>,
-        /// a substring tested against each mention's display form (see the
-        /// module's `display_author`); `None` = no mention constraint.
-        mention: Option<String>,
-        /// a case-sensitive substring tested against the post's concatenated
-        /// text blocks; `None` = no text constraint.
-        text_contains: Option<String>,
-    },
+// deny_unknown_fields is load-bearing: every field is an Option, so without
+// it the RETIRED tagged shape ({"message_posted":{...}}) would silently parse
+// as an all-None trigger that fires on every message — a quiet-corruption
+// hazard, not a flag day. Unknown keys must reject loudly.
+#[serde(deny_unknown_fields)]
+pub struct Trigger {
+    /// an exact channel id, or `None` for any channel.
+    pub channel_id: Option<String>,
+    /// a substring tested against each mention's display form (see the
+    /// module's `display_author`); `None` = no mention constraint.
+    pub mention: Option<String>,
+    /// a case-sensitive substring tested against the post's concatenated
+    /// text blocks; `None` = no text constraint.
+    pub text_contains: Option<String>,
 }
 
 /// what a firing rule does.

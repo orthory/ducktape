@@ -8,7 +8,7 @@
 //! wrapper's [`StateRoot`], commit/abort, and sync boundary. in facade mode, the
 //! storage implementation is an explicitly registered backing module and durable
 //! state belongs to that backing module's root. the host composes each module's
-//! [`StateRoot`] into the global app-hash (see the `state` crate); how a module
+//! [`StateRoot`] into the global app-hash (see `host::global_root`); how a module
 //! *computes* that root — a qmdb merkle root, a git HEAD oid — is private to the
 //! module. the host only ever sees `root() -> StateRoot`.
 //!
@@ -21,6 +21,10 @@
 //!
 //! keep this crate types + traits with no domain deps (async-trait is the one
 //! greenlit exception): everything here is a shared surface for every module.
+//! [`codec`] carries the shared zero-dep snapshot-codec primitives on the same
+//! everyone-needs-it grounds.
+
+pub mod codec;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module
@@ -208,6 +212,40 @@ pub enum Origin {
     System,
 }
 
+impl Origin {
+    /// the cross-module ACTOR STRING convention (inbox source, jobs
+    /// submitter/worker, files owner): a module id verbatim, `"ext:"` +
+    /// lowercase hex of an external submitter's id bytes, or the literal
+    /// `"system"`. the `ext:` prefix is actor DOMAIN SEPARATION — a module
+    /// whose id happens to be pure hex can never collide with an external
+    /// key's hex. empty external bytes render as `"ext:"`; callers that must
+    /// reject an unauthenticated empty submitter check before calling.
+    pub fn actor_string(&self) -> String {
+        use core::fmt::Write as _;
+        match self {
+            Origin::Module(id) => id.clone(),
+            Origin::External(bytes) => {
+                let mut out = String::with_capacity(4 + bytes.len() * 2);
+                out.push_str("ext:");
+                for b in bytes {
+                    let _ = write!(out, "{b:02x}");
+                }
+                out
+            }
+            Origin::System => "system".to_owned(),
+        }
+    }
+}
+
+/// reject an empty required string field with the uniform module error
+/// message — the op-validation guard shared by tasks/automations/vaults.
+pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::Module(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
 /// the deterministic environment handed to `execute`. block-constant fields
 /// (`height`, `consensus_time`) are identical across every dispatch in one
 /// `submit`; `origin` and `me` vary per dispatch. NOT wall clock, NOT per-node.
@@ -250,6 +288,9 @@ pub enum Error {
     /// a module has no byte-level state-sync serve surface (the default
     /// [`Module::serve_sync`]).
     SyncUnsupported,
+    /// a module's code is the node binary itself — it has no hot-swappable
+    /// component (the default [`Module::swap_code`]).
+    SwapUnsupported,
     /// the local follow-up drain exceeded its dispatch budget (non-termination
     /// guard).
     BudgetExceeded,
@@ -264,6 +305,7 @@ impl core::fmt::Debug for Error {
             Error::SelfQuery => write!(f, "SelfQuery"),
             Error::QueryUnsupported => write!(f, "QueryUnsupported"),
             Error::SyncUnsupported => write!(f, "SyncUnsupported"),
+            Error::SwapUnsupported => write!(f, "SwapUnsupported"),
             Error::BudgetExceeded => write!(f, "BudgetExceeded"),
             Error::Module(m) => write!(f, "Module({m})"),
         }
@@ -320,6 +362,17 @@ pub trait Ctx {
 pub trait Module {
     /// this module's genesis-assigned id (e.g. "documents", "forge").
     fn id(&self) -> ModuleId;
+
+    /// Revision of this module's canonical committed-state encoding.
+    ///
+    /// Bump this whenever `root()` or installable snapshot bytes change shape
+    /// in a way an older/newer binary cannot decode byte-for-byte. This is a
+    /// clean-break fence, not a migration selector: recovery compares the
+    /// ordered production module/revision fingerprint before opening module
+    /// storage and refuses an incompatible workspace without mutating it.
+    fn state_schema_revision(&self) -> u32 {
+        1
+    }
 
     /// the module's current authenticated root. called by the host to fold into
     /// the global app-hash after a block applies.
@@ -436,6 +489,29 @@ pub trait Module {
     /// override it. driven ONLY by the agreed boundary version, so every honest
     /// node sets the identical value — never a wall-clock/IO/RNG input.
     fn set_active_version(&mut self, _version: u32) {}
+
+    /// this module's currently-running CODE identity: the 32-byte content hash
+    /// (sha256) of the component bytes it will execute, or `None` for a native
+    /// module whose code IS the node binary (nothing to hot-swap). the host
+    /// reconciles this against the code registry's committed active hash to
+    /// decide whether a boundary swap is needed — a cheap hash compare, so it
+    /// re-instantiates a component only on an actual change, never every block.
+    /// NEVER a consensus input: code is invisible to `root()` (state, not code,
+    /// composes the app-hash), so this is per-node realization bookkeeping only.
+    fn code_hash(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// hot-swap this module's executable CODE in place, KEEPING its host-owned
+    /// state — the live-update primitive. the host calls this at a code-registry
+    /// activation boundary AFTER it has fetched the out-of-band component bytes
+    /// and verified `sha256(bytes)` equals the consensus-committed hash; because
+    /// durable state is untouched, `root()` is unchanged and the app-hash stays
+    /// continuous across the swap. the default is unsupported — only the wasm
+    /// runtime module overrides it (a native module cannot swap its code).
+    fn swap_code(&mut self, _component_bytes: &[u8]) -> Result<(), Error> {
+        Err(Error::SwapUnsupported)
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +530,24 @@ mod tests {
         assert_eq!(err.max_supported, 3);
         assert!(err.to_string().contains("v4"));
         assert!(err.to_string().contains("v3"));
+    }
+
+    #[test]
+    fn origin_actor_string_convention() {
+        assert_eq!(Origin::Module("chat".into()).actor_string(), "chat");
+        assert_eq!(
+            Origin::External(vec![0xAB, 0x01, 0xFF]).actor_string(),
+            "ext:ab01ff"
+        );
+        assert_eq!(Origin::External(Vec::new()).actor_string(), "ext:");
+        assert_eq!(Origin::System.actor_string(), "system");
+    }
+
+    #[test]
+    fn require_non_empty_guard() {
+        assert!(require_non_empty("id", "x").is_ok());
+        let err = require_non_empty("id", "").unwrap_err().to_string();
+        assert!(err.contains("id must not be empty"), "{err}");
     }
 
     #[test]

@@ -2,31 +2,6 @@ use super::*;
 
 // ---- faceted delivery -------------------------------------------------------
 
-/// build a faceted RunnerResult wrapper: the three core fields plus whatever
-/// facet keys `facets` carries (data / effects / sink / status, and a
-/// `workspace_receipt` override when present).
-fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
-    let mut obj = serde_json::json!({
-        "ducktape_runner_result": 1,
-        "response_text": response_text,
-        "workspace_receipt": {
-            "source_prefix": "/shared/agent-workspaces/bot",
-            "source_snapshot": null,
-            "output_snapshot": null,
-            "commit_height": null,
-            "rebased": false,
-            "no_changes": true
-        }
-    });
-    if let serde_json::Value::Object(extra) = facets {
-        let base = obj.as_object_mut().expect("object");
-        for (k, v) in extra {
-            base.insert(k, v);
-        }
-    }
-    serde_json::to_vec(&obj).expect("wrapper serializes")
-}
-
 /// a module wired with the forge sink, one watch on "general", one engaged
 /// run for agent "bot" at seq 2.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
@@ -51,10 +26,10 @@ fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
 
 #[test]
 fn a_plain_result_delivers_its_prose_and_parsed_actions() {
-    // a bare response_text (no runner marker, no facets) flows through the
-    // single delivery path: the message is delivered and the prose-parsed
-    // action is applied — exactly as today's message-only delivery did.
-    let response_text = String::from_utf8(response(
+    // a facet-free wrapper (prose only, no effects/sink/data) flows through
+    // the single delivery path: the message is delivered and the PROSE-parsed
+    // action is applied (the effects-facet fallback).
+    let response_text = String::from_utf8(response_json(
         &["on it"],
         vec![AgentAction::CreateTask {
             task_id: "from_prose".into(),
@@ -71,7 +46,7 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(response_text.into_bytes())),
+        &result_event(&run_id, Ok(runner_wrapper(&response_text, serde_json::json!({})))),
     )
     .unwrap();
     assert_eq!(ctx.chat_msgs().len(), 1, "the run delivers its message");
@@ -157,7 +132,7 @@ fn empty_effects_falls_back_to_response_parsed_actions() {
     // critic #4 fallback: with an EMPTY effects facet, a model that emitted
     // the action only in prose still gets it applied — never a silent drop.
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
-    let response_text = String::from_utf8(response(
+    let response_text = String::from_utf8(response_json(
         &["on it"],
         vec![AgentAction::CreateTask {
             task_id: "t1".into(),
@@ -915,6 +890,7 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
                 dispatch_id: "d1".into(),
                 recipe_id: "agent/bot".into(),
                 payload: b"in".to_vec(),
+                demands: Default::default(),
             }),
         },
     ))

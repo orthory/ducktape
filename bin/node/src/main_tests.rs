@@ -69,6 +69,7 @@ fn test_manifest(
         current_version: host::BASELINE_VERSION,
         pending_upgrade: None,
         required_min_version: host::BASELINE_VERSION,
+        state_schema: crate::constants::current_state_schema_fingerprint(),
         entries: vec![],
     }
 }
@@ -516,7 +517,7 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             app_hash: StateRoot([0xA5; sdk::ROOT_LEN]),
         };
         let mut host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
-        let err = apply_verified_suffix_frame(&mut host, &served)
+        let err = apply_verified_suffix_frame(&mut host, &served, &host::NoCodeSource)
             .await
             .expect_err("served seal mismatch must abort");
         assert!(
@@ -595,6 +596,7 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
             required_min_version: host::BASELINE_VERSION,
+            state_schema: crate::constants::current_state_schema_fingerprint(),
             entries: vec![],
         };
 

@@ -484,12 +484,78 @@ fn read_residents(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
+fn account_of_node(addr: &str, node_key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
+    let raw = rpc_query(
+        addr,
+        "identity",
+        &encode_query(&IdentityQuery::OfNode {
+            node_key: node_key.to_vec(),
+        }),
+    )?;
+    match decode_reply(&raw)? {
+        IdentityReply::Account(account) => Ok(account.map(|account| account.account_id)),
+        other => Err(format!("expected Account, got {other:?}")),
+    }
+}
+
+fn proposal_principal(
+    addr: &str,
+    proposal: &governance::ProposalView,
+    node_key: &[u8],
+) -> Result<Vec<u8>, String> {
+    match proposal.voter_kind {
+        governance::VoterKind::ValidatorNode => Ok(node_key.to_vec()),
+        governance::VoterKind::Account => account_of_node(addr, node_key)?
+            .ok_or_else(|| "this node is not bound to an Identity account".into()),
+    }
+}
+
+fn proposal_progress(proposal: &governance::ProposalView, members: &[Vec<u8>]) -> (u64, u64, bool) {
+    let powers: std::collections::BTreeMap<&[u8], u64> = if proposal.electorate.is_empty() {
+        members
+            .iter()
+            .map(|member| (member.as_slice(), 1))
+            .collect()
+    } else {
+        proposal
+            .electorate
+            .iter()
+            .map(|(principal, power)| (principal.as_slice(), *power))
+            .collect()
+    };
+    let mut yes = 0u64;
+    let mut no = 0u64;
+    for (voter, approve) in &proposal.votes {
+        let power = powers.get(voter.as_slice()).copied().unwrap_or(0);
+        if *approve {
+            yes += power;
+        } else {
+            no += power;
+        }
+    }
+    let total: u64 = powers.values().sum();
+    match proposal.voting_rule {
+        governance::VotingRule::DynamicValidatorMajority => {
+            let required = total / 2 + 1;
+            (yes, required, yes >= required)
+        }
+        governance::VotingRule::Threshold { required_yes } => {
+            (yes, required_yes, yes >= required_yes)
+        }
+        governance::VotingRule::ParticipatingMajority { quorum } => {
+            let ready = yes + no >= quorum && yes > total - yes;
+            (yes, quorum, ready)
+        }
+    }
+}
+
 /// `join-requests [--config node.toml]` — the verified join announces parked
 /// joiners delivered to THIS member's running node, as one JSON array on
 /// stdout (machine-parseable — the app's members view renders it). approving
 /// is a separate, deliberate act: `invite-accept <joiner>` (or the app's
-/// approve button) casts this member's governance ballot, and a strict
-/// majority admits.
+/// approve button) casts this account's governance ballot; the proposal's
+/// frozen rule decides admission.
 fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -602,16 +668,57 @@ fn poll_proposal(
     }
 }
 
+fn cast_yes_once(
+    addr: &str,
+    proposal_id: &str,
+    opened: governance::ProposalView,
+    principal: &[u8],
+) -> Result<governance::ProposalView, String> {
+    use governance::{GovMsg, ProposalStatus, encode_msg};
+
+    if opened.status != ProposalStatus::Open {
+        return Ok(opened);
+    }
+    if opened
+        .votes
+        .iter()
+        .any(|(voter, yes)| voter == principal && *yes)
+    {
+        eprintln!("ballot already cast as {}", hex_bytes(principal));
+        return Ok(opened);
+    }
+    rpc_submit(
+        addr,
+        "governance",
+        &encode_msg(&GovMsg::Vote {
+            proposal_id: proposal_id.into(),
+            approve: true,
+        }),
+    )?;
+    let proposal = poll_proposal(addr, proposal_id, "this ballot to finalize", |p| {
+        p.as_ref().is_some_and(|proposal| {
+            proposal.status != ProposalStatus::Open
+                || proposal
+                    .votes
+                    .iter()
+                    .any(|(voter, yes)| voter == principal && *yes)
+        })
+    })?
+    .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    eprintln!("ballot cast as {}", hex_bytes(principal));
+    Ok(proposal)
+}
+
 /// how a driven membership ceremony left the proposal.
 enum CeremonyOutcome {
     /// passed and executed — the set changes at the next epoch cutover.
     Passed,
-    /// this ballot landed but a strict majority is still outstanding.
+    /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,
 }
 
-/// drive a strict-majority governance membership ceremony for `wanted`
-/// through this member's own running node: adopt an existing OPEN proposal
+/// drive a governance membership ceremony for `wanted` through this eligible
+/// account's running node: adopt an existing OPEN proposal
 /// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
 /// propose), cast a yes ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
@@ -667,39 +774,18 @@ fn drive_membership_ceremony(
         }
     };
 
-    rpc_submit(
-        rpc_addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
-            proposal_id: proposal_id.clone(),
-            approve: true,
-        }),
-    )?;
-    let after_vote = poll_proposal(rpc_addr, &proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|v| {
-            v.status != ProposalStatus::Open
-                || v.votes.iter().any(|(voter, yes)| voter == me_bytes && *yes)
-        })
-    })?
-    .expect("the poll only accepts a present proposal");
-    eprintln!("ballot cast as {}", hex_bytes(me_bytes));
+    let opened = read_proposal(rpc_addr, &proposal_id)?
+        .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    let principal = proposal_principal(rpc_addr, &opened, me_bytes)?;
+    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, &principal)?;
 
-    // execute only when decidable — a strict-majority shortfall is the
-    // normal n>=2 intermediate state, not an error.
+    // Execute only when the proposal's frozen rule says the yes power is
+    // irreversible. A shortfall is the normal intermediate state, not an error.
     let members = read_members(rpc_addr)?;
-    let yes = members
-        .iter()
-        .filter(|m| {
-            after_vote
-                .votes
-                .iter()
-                .any(|(voter, approve)| voter == *m && *approve)
-        })
-        .count();
-    let majority = members.len() / 2 + 1;
-    if after_vote.status == ProposalStatus::Open && yes < majority {
+    let (yes, required, ready) = proposal_progress(&after_vote, &members);
+    if after_vote.status == ProposalStatus::Open && !ready {
         eprintln!(
-            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
+            "{yes} of {required} required voting power — waiting on other voters. each runs:\n    \
              ducktape-node {verb} {pubkey_hex} --config <their node.toml>"
         );
         return Ok(CeremonyOutcome::AwaitingBallots);
@@ -725,7 +811,7 @@ fn drive_membership_ceremony(
 
 /// `invite-accept <hex pubkey> [--config node.toml]` — approve a join request
 /// as RESIDENT standing (the staged-admission tier): drive a governance
-/// AddResident proposal for `pubkey` through this member's own RUNNING node.
+/// AddResident proposal for `pubkey` through this account's own RUNNING node.
 /// the passing proposal's valset Grant schedules the epoch cutover that
 /// admits the key to the mesh, at which point its parked node PRE-SYNCS
 /// state on a stride cadence. promotion into the quorum is the separate,
@@ -740,10 +826,8 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
     let cfg_path = config_path(&flags)?;
-    // full config resolution (network- or dev-shape) so the verb derives the
-    // SAME identity the running node signs with — the ballots this verb
-    // casts are signed by the NODE (the ordered lane signs every rpc
-    // submit), and that key must be the member.
+    // Full config resolution derives the same node identity the daemon signs
+    // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen
@@ -763,14 +847,6 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         );
         return Ok(());
     }
-    if !members.contains(&me_bytes) {
-        return Err(
-            "this node's identity is not a current member — only members admit \
-                    residents"
-                .into(),
-        );
-    }
-
     match drive_membership_ceremony(
         &rpc_addr,
         &me_bytes,
@@ -792,7 +868,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// `promote <hex pubkey> [--config node.toml]` — seat a key in the consensus
-/// quorum: drive a governance AddValidator proposal through this member's own
+/// quorum: drive a governance AddValidator proposal through this account's own
 /// RUNNING node. the passing proposal's valset Join clears any resident
 /// standing in the same block and schedules the epoch cutover; a pre-synced
 /// resident then catches up a small delta and reboots as a validator, so the
@@ -820,14 +896,6 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
-    if !members.contains(&me_bytes) {
-        return Err(
-            "this node's identity is not a current member — only members promote \
-                    validators"
-                .into(),
-        );
-    }
-
     match drive_membership_ceremony(
         &rpc_addr,
         &me_bytes,
@@ -849,13 +917,14 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `resident-remove <hex pubkey> [--config node.toml]` — revoke resident
-/// standing: drive a governance RemoveResident proposal through this member's
+/// standing: drive a governance RemoveResident proposal through this account's
 /// own RUNNING node. the mirror of `invite-accept` with inverted guards — a
-/// no-op when the key holds no resident standing, and only members may drive
-/// it. the passing proposal's valset Revoke schedules the epoch cutover that
-/// drops the key from the mesh; its node falls back to a parked joiner, and
-/// `invite-accept` re-grants. a seated validator is `member-remove`'s job —
-/// standing never overlaps (Grant refuses validators, Join clears standing).
+/// no-op when the key holds no resident standing, and only the governance
+/// electorate may drive it. the passing proposal's valset Revoke schedules the
+/// epoch cutover that drops the key from the mesh; its node falls back to a
+/// parked joiner, and `invite-accept` re-grants. a seated validator is
+/// `member-remove`'s job — standing never overlaps (Grant refuses validators,
+/// Join clears standing).
 fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -866,9 +935,8 @@ fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
     let cfg_path = config_path(&flags)?;
-    // full config resolution so the verb derives the SAME identity the running
-    // node signs with — the ballots this verb casts are signed by the NODE, and
-    // that key must be a current member.
+    // Full config resolution derives the same node identity the daemon signs
+    // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen
@@ -888,14 +956,6 @@ fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
         return Ok(());
     }
-    if !members.contains(&me_bytes) {
-        return Err(
-            "this node's identity is not a current member — only members remove \
-                    residents"
-                .into(),
-        );
-    }
-
     match drive_membership_ceremony(
         &rpc_addr,
         &me_bytes,
@@ -920,12 +980,12 @@ fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
 
 /// `member-remove <hex pubkey> [--config node.toml]` — post-genesis removal:
 /// drive a governance RemoveValidator proposal for `pubkey` through this
-/// member's own RUNNING node. the mirror of `invite-accept` with inverted
-/// guards — a no-op when the key is NOT a member, and only members may drive
-/// it. idempotent across members: each runs the same command (propose if
-/// absent, cast a yes ballot, execute once decidable); the run that lands the
-/// deciding ballot executes. the passing proposal's valset Leave schedules the
-/// epoch cutover that drops the key from the tracked set.
+/// account's own RUNNING node. the mirror of `invite-accept` with inverted
+/// guards — a no-op when the key is NOT a member, and only the governance
+/// electorate may drive it. idempotent across voters: each runs the same
+/// command (propose if absent, cast a yes ballot, execute once decidable); the
+/// run that lands the deciding ballot executes. the passing proposal's valset
+/// Leave schedules the epoch cutover that drops the key from the tracked set.
 fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::{GovAction, GovMsg, ProposalStatus, encode_msg};
 
@@ -936,9 +996,8 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
     let cfg_path = config_path(&flags)?;
-    // full config resolution so the verb derives the SAME identity the running
-    // node signs with — the ballots this verb casts are signed by the NODE, and
-    // that key must be a current member.
+    // Full config resolution derives the same node identity the daemon signs
+    // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen
@@ -947,20 +1006,11 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let me_bytes = resolved.signer.public_key().as_ref().to_vec();
 
     let members = read_members(&rpc_addr)?;
-    // inverted admission guards: nothing to remove if the key is not a member,
-    // and only current members may open/decide a removal.
+    // Inverted admission guard: nothing to remove if the key is not a member.
     if !members.contains(&key_bytes) {
         eprintln!("{pubkey_hex} is not a validator — nothing to do");
         return Ok(());
     }
-    if !members.contains(&me_bytes) {
-        return Err(
-            "this node's identity is not a current member — only members remove \
-                    validators"
-                .into(),
-        );
-    }
-
     // adopt an existing OPEN proposal for exactly this action, else mint an
     // unused id (settled proposals keep their ids forever — a re-removed key
     // gets a fresh suffix).
@@ -1007,41 +1057,17 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
 
-    rpc_submit(
-        &rpc_addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
-            proposal_id: proposal_id.clone(),
-            approve: true,
-        }),
-    )?;
-    let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|v| {
-            v.status != ProposalStatus::Open
-                || v.votes
-                    .iter()
-                    .any(|(voter, yes)| voter == &me_bytes && *yes)
-        })
-    })?
-    .expect("the poll only accepts a present proposal");
-    eprintln!("ballot cast as {}", hex_bytes(&me_bytes));
+    let opened = read_proposal(&rpc_addr, &proposal_id)?
+        .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    let principal = proposal_principal(&rpc_addr, &opened, &me_bytes)?;
+    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &principal)?;
 
-    // execute only when decidable — a strict-majority shortfall is the normal
-    // n>=2 intermediate state, not an error.
+    // Execute only once the proposal's own frozen voting rule is satisfied.
     let members = read_members(&rpc_addr)?;
-    let yes = members
-        .iter()
-        .filter(|m| {
-            after_vote
-                .votes
-                .iter()
-                .any(|(voter, approve)| voter == *m && *approve)
-        })
-        .count();
-    let majority = members.len() / 2 + 1;
-    if after_vote.status == ProposalStatus::Open && yes < majority {
+    let (yes, required, ready) = proposal_progress(&after_vote, &members);
+    if after_vote.status == ProposalStatus::Open && !ready {
         eprintln!(
-            "{yes} of {majority} required ballots — waiting on other members. each runs:\n    \
+            "{yes} of {required} required voting power — waiting on other voters. each runs:\n    \
              ducktape-node member-remove {pubkey_hex} --config <their node.toml>"
         );
         return Ok(());
@@ -1076,11 +1102,10 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// is no separate governance logic — it hands off to [`cmd_member_remove`] with
 /// this node's own pubkey.
 ///
-/// honesty: leaving is NOT unilateral in a set of n>=2. this casts only this
-/// node's own yes-ballot, so the removal stays PENDING until a strict majority
-/// (n/2+1) of the members approve — member-remove's own output prints the tally
-/// and names the command the remaining members run (`member-remove <this key>`).
-/// a lone member (n==1) meets its own majority-of-one and executes at once.
+/// honesty: leaving is NOT unilateral when this account lacks the proposal's
+/// required power. this casts only its account ballot (or the legacy node
+/// ballot), and member-remove prints the remaining threshold plus the command
+/// other voters run (`member-remove <this key>`).
 fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -1200,9 +1225,9 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(wg) = &invite.wireguard {
             let issuer_identity =
-                wireguard_upgrade::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+                wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
                     .map_err(|e| format!("inviter identity: {e:?}"))?;
-            let inviter_ula = wireguard_upgrade::ula_v6_member_addr(
+            let inviter_ula = wireguard::ula_v6_member_addr(
                 &descriptor.genesis_namespace(),
                 issuer_identity,
             );
@@ -1220,12 +1245,12 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             let Ok(identity) =
-                wireguard_upgrade::ValidatorIdentity::try_from(&front.member_key[..])
+                wireguard::ValidatorIdentity::try_from(&front.member_key[..])
             else {
                 continue;
             };
             let ula =
-                wireguard_upgrade::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
+                wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
             descriptor.add_reach_route(&config::ReachHint {
                 expected_key: member,
                 reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),

@@ -38,8 +38,7 @@ pub enum CallControl {
     KeyframeRequest,
     /// 1 Hz presence + ephemeral state (drives tiles, NOT consensus). `sharing`
     /// marks the video lane as a screen share (vs the camera) so peers render it
-    /// letterboxed + labelled — appended as an optional 5th byte, so a pre-share
-    /// node's 4-byte frame still decodes (sharing = false).
+    /// letterboxed + labelled.
     Beacon {
         muted: bool,
         camera_on: bool,
@@ -91,11 +90,10 @@ impl CallControl {
         }
         match frame[1] {
             TAG_KEYFRAME_REQUEST => Ok(CallControl::KeyframeRequest),
-            TAG_BEACON if frame.len() >= 4 => Ok(CallControl::Beacon {
+            TAG_BEACON if frame.len() >= 5 => Ok(CallControl::Beacon {
                 muted: frame[2] != 0,
                 camera_on: frame[3] != 0,
-                // Optional 5th byte — absent on a pre-share sender → not sharing.
-                sharing: frame.get(4).is_some_and(|b| *b != 0),
+                sharing: frame[4] != 0,
             }),
             TAG_RATE_HINT if frame.len() >= 6 => Ok(CallControl::RateHint {
                 max_kbps: u32::from_be_bytes(frame[2..6].try_into().expect("4 bytes")),
@@ -137,20 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn beacon_decodes_legacy_four_byte_frame_as_not_sharing() {
-        // A pre-share sender emits only 4 bytes; it must still decode, sharing=false.
-        let legacy = vec![CTL_VERSION, TAG_BEACON, 1, 1];
-        assert_eq!(
-            CallControl::decode(&legacy).unwrap(),
-            CallControl::Beacon {
-                muted: true,
-                camera_on: true,
-                sharing: false,
-            },
-        );
-    }
-
-    #[test]
     fn rate_hint_round_trips() {
         let control = CallControl::RateHint { max_kbps: 500 };
         let frame = control.encode();
@@ -165,6 +149,11 @@ mod tests {
         ));
         assert!(matches!(
             CallControl::decode(&[CTL_VERSION, TAG_BEACON, 1]),
+            Err(ControlError::Truncated)
+        ));
+        // 4-byte beacons (pre-share wire) are retired: short = truncated.
+        assert!(matches!(
+            CallControl::decode(&[CTL_VERSION, TAG_BEACON, 1, 1]),
             Err(ControlError::Truncated)
         ));
         assert!(matches!(

@@ -2,9 +2,11 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { makeTransportStub } from "../test/transport-stub";
-import { buildContentDefinition, loadDuckPage, parseDuckAddress } from "./duck-browser";
+import { buildContentManifest, loadDuckPage, parseDuckAddress } from "./duck-browser";
 import * as gateway from "./gateway-client";
 import * as nodeBootstrap from "./node-bootstrap";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const encoder = new TextEncoder();
 const b64 = (bytes: Uint8Array): string => {
@@ -12,6 +14,8 @@ const b64 = (bytes: Uint8Array): string => {
   bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
   return btoa(binary);
 };
+const fromB64 = (value: string): Uint8Array =>
+  Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -74,13 +78,27 @@ describe("browser authority boundaries", () => {
         b64: b64(contents.get(path)!),
         eof: true,
       })),
+      filesCommit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
     });
 
-    const manifest = await buildContentDefinition(transport, publisher, name, "A.html");
+    const hash = await buildContentManifest(transport, publisher, name, "A.html");
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+
+    // The committed .manifest.json carries the canonically-ordered file table,
+    // and the returned hash is its exact byte digest.
+    const calls = vi.mocked(transport.filesCommit).mock.calls;
+    const request = calls[calls.length - 1]![0] as {
+      changes: { put: { path: string; content: { inline: { b64: string } } } }[];
+    };
+    const put = request.changes[0].put;
+    expect(put.path).toBe(`${gateway.contentRoot(publisher, name)}/${gateway.MANIFEST_FILE}`);
+    const manifestBytes = fromB64(put.content.inline.b64);
+    const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as gateway.RouteManifest;
     expect(manifest.files.map((file) => file.path)).toEqual([
       "-x.html", ".x.html", "0.html", "A.html", "_x.html", "a.html",
     ]);
-    expect(() => gateway.validateContent(manifest)).not.toThrow();
+    expect(() => gateway.validateManifest(manifest)).not.toThrow();
+    expect(hash).toBe(gateway.sha256Hex(manifestBytes));
   });
 
   it("loads net.duck from one pinned local snapshot and strips executable markup", async () => {
@@ -134,6 +152,7 @@ describe("browser authority boundaries", () => {
           max_request_bytes: 1024,
           max_response_bytes: 4096,
           allow_authorization: false,
+          allow_upgrade: false,
         },
       },
     };
@@ -158,72 +177,23 @@ describe("browser authority boundaries", () => {
       if (target === "gateway") return { route: record };
       throw new Error(`unexpected query target ${target}`);
     });
-    const gatewaySession = vi.fn().mockResolvedValue({
-      url: "http://0123456789abcdef0123456789abcdef.localhost:49152/",
-    });
+    const gatewayBrowserBase = vi
+      .fn()
+      .mockResolvedValue({ base: "http://127.0.0.1:49152" });
     const page = await loadDuckPage(
-      makeTransportStub({ query, gatewaySession }),
+      makeTransportStub({ query, gatewayBrowserBase }),
       "api.alice.duck/v1/health?q=1",
     );
 
     expect(page).toMatchObject({
       hosting: "gateway",
       target: "loopback_http",
-      srcUrl: "http://0123456789abcdef0123456789abcdef.localhost:49152/v1/health?q=1",
+      // A stable duck:// origin — no session token; the node re-resolves each request.
+      srcUrl: "duck://api.alice.duck/v1/health?q=1",
       revision: 2,
     });
-    expect(gatewaySession).toHaveBeenCalledWith({
-      accountId: [...signer],
-      name: { label: "api" },
-      revision: 2,
-    });
-    expect(query.mock.calls.filter(([target]) => target === "duckdns")).toHaveLength(2);
-    expect(query.mock.calls.filter(([target]) => target === "gateway")).toHaveLength(2);
-  });
-
-  it("rejects a session URL that is not the exact random localhost origin", async () => {
-    vi.spyOn(nodeBootstrap, "isTauri").mockReturnValue(true);
-    const secret = new Uint8Array(32).fill(6);
-    const signer = ed25519.getPublicKey(secret);
-    const publisher = new Array(32).fill(9);
-    const statement: gateway.RouteStatement = {
-      version: 1,
-      chain_id: "test",
-      account_id: [...signer],
-      name: { label: null },
-      publisher_node: publisher,
-      revision: 1,
-      route: {
-        target: { kind: "loopback_http" },
-        policy: {
-          audience: { kind: "owner" },
-          methods: ["get"],
-          max_request_bytes: 0,
-          max_response_bytes: 1024,
-          allow_authorization: false,
-        },
-      },
-    };
-    const record: gateway.RouteRecord = {
-      statement,
-      authorization: {
-        signer: [...signer],
-        signature: [...ed25519.sign(gateway.verificationPayload(statement), secret)],
-      },
-    };
-    const query = vi.fn(async (target: string) => {
-      if (target === "duckdns") return { resolved: { account_id: [...signer] } };
-      if (target === "identity") return { account: {
-        account_id: [...signer], display_name: null, nonce: 0,
-        member_keys: [{ pubkey: [...signer], kind: "ed25519", label: null, added_at: 0 }],
-        nodes: [publisher], updated_at: 0,
-      } };
-      return { route: record };
-    });
-    const transport = makeTransportStub({
-      query,
-      gatewaySession: vi.fn().mockResolvedValue({ url: "http://localhost:49152/" }),
-    });
-    await expect(loadDuckPage(transport, "alice.duck")).rejects.toThrow(/unsafe gateway session/);
+    expect(gatewayBrowserBase).toHaveBeenCalled();
+    expect(query.mock.calls.filter(([target]) => target === "duckdns")).toHaveLength(1);
+    expect(query.mock.calls.filter(([target]) => target === "gateway")).toHaveLength(1);
   });
 });

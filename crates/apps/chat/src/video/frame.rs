@@ -115,7 +115,7 @@ pub fn fragment_frame(
 }
 
 /// Wrapping frame_no comparison: is `a` newer than `b`?
-pub fn frame_newer(a: u32, b: u32) -> bool {
+pub(crate) fn frame_newer(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) > 0
 }
 

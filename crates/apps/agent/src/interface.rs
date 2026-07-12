@@ -2,7 +2,7 @@
 //!
 //! the agent module is the platform's agent REGISTRY and nothing more: a
 //! self-contained record book of which agents exist — owner, capability tag,
-//! prompt pin, granted actions, status. it consumes no other module's events
+//! curated skill set, granted actions, status. it consumes no other module's events
 //! and emits exactly one follow-up shape ([`AgentEvent`], to a
 //! genesis-configured hook target) so the module that runs agents can keep
 //! each agent's dispatch-plane recipe in lockstep, atomically with the
@@ -22,8 +22,6 @@
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_AGENT_TARGET: &str = "agent";
-
 // ---- consensus constants ----------------------------------------------------
 
 /// hard cap on the actions one run's response may carry — the blast-radius
@@ -42,6 +40,34 @@ pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
 /// root preimage and every snapshot, so registration is size-gated up front.
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 
+/// hard cap on the COUNT of skills one agent curates. an unbounded skill list
+/// is unbounded replicated state (it rides the record, hence every snapshot)
+/// AND an unbounded run context — every one of them costs at least an index
+/// line in the assembled context document, and an `Always` one costs its whole
+/// body. [`MAX_AGENT_RECORD_BYTES`] bounds the BYTES and usually bites first;
+/// this bounds the SHAPE, and it is the same number the host-side assembler
+/// checks (`dispatch_oracle::assemble_context_doc`) — one rule, not two that
+/// could drift into a record consensus accepts but no run can load.
+///
+/// deliberately generous, because curation is not the only door: an uncurated
+/// skill belongs in the global library at `/shared/skills/`, which every run is
+/// told about and which costs a run nothing until it reads one.
+pub const MAX_SKILLS_PER_AGENT: usize = 64;
+
+/// the duckfs directory the GLOBAL SKILL LIBRARY lives under, one subdirectory
+/// per skill (`<name>/SKILL.md`). a CONVENTION, not a consensus-enforced
+/// namespace: the library is ordinary duckfs state, and an agent reaches it
+/// through the same `duckfs_read` cap as any other path
+/// ([`AgentRecord::library_readable`]).
+///
+/// it lives HERE, beside the caps that gate it, because three surfaces have to
+/// agree on one string: the cap the app grants, the check the run assembler
+/// makes before telling an agent the library exists, and the prefix the MCP
+/// tool plane is asked to read. NO trailing slash — a cap entry is a path
+/// prefix, and `permits` grants children by `"{prefix}/"`, so a trailing slash
+/// would grant the directory and none of its contents.
+pub const SKILL_LIBRARY_PREFIX: &str = "/shared/skills";
+
 /// hard cap on the serialized CHAT blocks a response's `reply_blocks` map to.
 /// deliberately well under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is
 /// emitted as a chat post inside the delivery block, and a post that chat
@@ -49,10 +75,8 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// module must be able to prove the post will fit BEFORE emitting.
 pub const MAX_REPLY_BLOCKS_BYTES: usize = 32 * 1024;
 
-/// required byte length of an agent's prompt hash (a sha256 digest). prompt
-/// CONTENT lives off-registry (e.g. in `document`); consensus commits to the
-/// hash, so which prompt an agent runs is part of the app-hash.
-pub const PROMPT_HASH_LEN: usize = 32;
+/// required byte length of a recipe content-address (a sha256 digest).
+pub const RECIPE_HASH_LEN: usize = 32;
 
 /// the reserved unit separator agent ids must never contain: the runs module
 /// keys its run records with `\x1f`-delimited fields, and an agent id
@@ -62,20 +86,47 @@ pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
 
-/// permission to post reply blocks into chat.
+/// permission to post reply blocks into chat — the run's ANSWER, in the channel
+/// and thread it was engaged from. deliberately NOT the permission to post
+/// wherever it likes: see [`ACTION_CHAT_POST_MESSAGE`].
 pub const ACTION_CHAT_POST: &str = "chat.post";
+/// permission to post a message to an ARBITRARY channel
+/// ([`AgentAction::PostMessage`]) — a strictly wider grant than
+/// [`ACTION_CHAT_POST`], which only ever lets an agent answer where it was
+/// spoken to.
+///
+/// a separate name on purpose. folding "post anywhere, unprompted" into
+/// `chat.post` would have SILENTLY widened every agent already registered with
+/// it — an owner who granted "may answer me" would have been giving "may post
+/// in any channel at any time" without ever being asked. a new action name means
+/// the wider power can only arrive by an owner deliberately granting it.
+pub const ACTION_CHAT_POST_MESSAGE: &str = "chat.post_message";
 /// permission to create a task ([`AgentAction::CreateTask`]).
 pub const ACTION_TASKS_CREATE: &str = "tasks.create";
 /// permission to move a task ([`AgentAction::UpdateTaskStatus`]).
 pub const ACTION_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
+/// permission to anchor a comment to a page or block
+/// ([`AgentAction::AddPageComment`]).
+pub const ACTION_PAGES_COMMENT: &str = "pages.comment";
+/// permission to flip a todo block's checked state
+/// ([`AgentAction::SetPageChecked`]).
+pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 
 /// every action name the platform knows. `RegisterAgent`/`UpdateAgent` reject
 /// an `allowed_actions` entry outside this vocabulary, so a granted permission
 /// always means something.
-pub const KNOWN_ACTIONS: [&str; 3] = [
+///
+/// ADDITIVE only: an existing record's `allowed_actions` is a set of these
+/// names, so a NEW name grants nothing to an agent already registered — it can
+/// only arrive through an owner-gated `UpdateAgent`. removing or renaming one,
+/// by contrast, would strand every record that holds it.
+pub const KNOWN_ACTIONS: [&str; 6] = [
     ACTION_CHAT_POST,
+    ACTION_CHAT_POST_MESSAGE,
     ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS,
+    ACTION_PAGES_COMMENT,
+    ACTION_PAGES_SET_CHECKED,
 ];
 
 // ---- runtime identity ---------------------------------------------------------
@@ -107,6 +158,11 @@ pub struct ResourceCaps {
     /// host-side and NEVER crosses consensus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// page ids this agent may WRITE (comment on / check off). page ids are
+    /// opaque, so matching is exact — no prefix containment — with the one
+    /// literal entry `"*"` granting every page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages_write: Vec<String>,
     /// the D3 sub-agent spawn ceiling; 0 = none. consumption is the runtime's
     /// concern; the record only states the ceiling.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -124,16 +180,38 @@ pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
     *c == ResourceCaps::default()
 }
 
+/// how a curated skill reaches the model. the agent's SOUL is its `Always`
+/// skills: the host assembles their full bodies into the one context document
+/// the executor auto-loads, in curation order — this is where the old
+/// `prompt_hash` blob went. an `OnDemand` skill is listed by name and
+/// description in that document's index and read from its read-only mount only
+/// when the task calls for it.
+///
+/// the mode rides the agent's skill REFERENCE, not the skill document, because
+/// curation is per-agent: the same skill is one agent's persona and another's
+/// reference material. it lives in consensus (rather than in the document's own
+/// frontmatter) so "what does this agent always load" is visible to the app-hash
+/// and to the UI.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadMode {
+    /// inlined verbatim into the assembled context document — the persona.
+    Always,
+    /// indexed by name + description; the body is read from the mount on demand.
+    #[default]
+    OnDemand,
+}
+
 /// a C4 skill reference an agent's runs mount. this pins the REF, never the
 /// content: `source_prefix` is a duckfs read-only subtree and
 /// `source_snapshot` is its optional consensus pin — `Some` is a PINNED skill
 /// (immutable), `None` is a TRACKING skill (the phase-5 composer resolves the
 /// committed head at compose time). the list is ORDERED (later entries override
-/// earlier), so it is a `Vec`, not a set — order is significant to the hash.
+/// earlier, and `Always` bodies assemble in this order), so it is a `Vec`, not a
+/// set — order is significant to the hash.
 ///
 /// deliberately a struct (not an enum): the phase-5 envelope composer reads
-/// `name` + `source_prefix` + `source_snapshot` straight through into a skill
-/// mount, so the same three fields live here.
+/// every field straight through into a skill mount, so the same fields live here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SkillRef {
     pub name: String,
@@ -142,6 +220,10 @@ pub struct SkillRef {
     /// compose time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_snapshot: Option<String>,
+    /// `default` so a submitter's JSON that omits it decodes as `OnDemand` —
+    /// the conservative mode: an unstated skill never silently becomes persona.
+    #[serde(default)]
+    pub load: LoadMode,
 }
 
 /// a D3 capability request the runtime probes an [`AgentRecord`] with before
@@ -161,6 +243,8 @@ pub enum CapRequest<'a> {
     Tool(&'a str),
     /// resolve the named vault secret ref.
     Secret(&'a str),
+    /// write (comment on / check off) the named page.
+    PagesWrite(&'a str),
     /// spawn a sub-agent (checked against the budget ceiling).
     SpawnSubagent,
 }
@@ -177,13 +261,19 @@ pub enum AgentStatus {
 }
 
 /// one registered agent — an ordered-op registration, so which capability and
-/// prompt an agent runs is part of the app-hash and auditable. `owner` is the
-/// registration origin and gates every mutation of the record.
+/// which SKILLS an agent runs is part of the app-hash and auditable. `owner` is
+/// the registration origin and gates every mutation of the record.
 ///
 /// `capability` names WHAT the run needs (an open-set registry tag like
 /// "codex" — dispatch selects providers of that tag); HOW it runs — binary,
 /// flags, model — is host policy in each provider's capability spec, and
 /// consensus never sees it. the record is a recipe, not an executor config.
+///
+/// there is no prompt pin: an agent is DEFINED by its curated `skills`, and its
+/// persona is simply a skill loaded [`LoadMode::Always`]. determinism is
+/// unchanged in kind — consensus used to commit which prompt bytes ran (a
+/// hash), and now commits which skill snapshots ran (pins). both are content
+/// addresses; the skill one is also editable, diffable, and reviewable.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub agent_id: String,
@@ -191,16 +281,12 @@ pub struct AgentRecord {
     pub display_name: String,
     /// the capability registry tag this agent's runs are dispatched on.
     pub capability: String,
-    /// sha256 of the agent's prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
-    /// the content itself is content-addressed in the blob store under this
-    /// digest; consensus pins only the hash, and the host resolves the prompt.
-    pub prompt_hash: Vec<u8>,
     /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
     pub allowed_actions: Vec<String>,
     pub status: AgentStatus,
     pub created_at: u64,
     pub updated_at: u64,
-    /// W4 recipe content-address: empty (unset) or exactly [`PROMPT_HASH_LEN`]
+    /// W4 recipe content-address: empty (unset) or exactly [`RECIPE_HASH_LEN`]
     /// bytes. the committed encoding always carries it (empty when unset).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipe_hash: Vec<u8>,
@@ -215,19 +301,14 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
-    /// D2 two-level attribution: an agent's effect is charged to
-    /// `(owner, agent_id)`. keyless (D1): this returns coordinates, never a key
-    /// — no key material exists on the record to return.
-    pub fn attribution(&self) -> (&SagaOrigin, &str) {
-        (&self.owner, &self.agent_id)
-    }
-
     /// the pure D3 cap gate. the runtime calls this before applying an effect
     /// or opening a sink; a record with empty caps denies every request except a
     /// positive budget check. forge/tool/
     /// secret use exact membership; duckfs uses path-PREFIX containment (a
     /// prefix grants itself and any child path, but never a sibling that merely
-    /// shares a textual prefix — `src` does not grant `srcx`). budget
+    /// shares a textual prefix — `src` does not grant `srcx`); pages use exact
+    /// membership with the literal `"*"` entry granting every page (ids are
+    /// opaque — never a prefix). budget
     /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
     pub fn permits(&self, req: &CapRequest) -> bool {
         let c = &self.caps;
@@ -243,8 +324,23 @@ impl AgentRecord {
             CapRequest::DuckfsRead(p) => under(&c.duckfs_read, p) || under(&c.duckfs_write, p),
             CapRequest::Tool(t) => has(&c.tools, t),
             CapRequest::Secret(s) => has(&c.secrets, s),
+            CapRequest::PagesWrite(p) => has(&c.pages_write, "*") || has(&c.pages_write, p),
             CapRequest::SpawnSubagent => c.subagent_budget > 0,
         }
+    }
+
+    /// whether this agent may READ the global skill library
+    /// ([`SKILL_LIBRARY_PREFIX`]) — the one question the host-side run assembler
+    /// asks before telling the agent the library is there.
+    ///
+    /// deliberately [`Self::permits`] and nothing else: the assembled document
+    /// tells the agent to call the MCP tool plane's `ducktape_files_grep` /
+    /// `ducktape_files_read`, and those tools gate on exactly this call. a
+    /// second, hand-rolled prefix rule here could drift from the one that
+    /// enforces — and the drift would show up as a document that promises a door
+    /// the tool plane then refuses to open.
+    pub fn library_readable(&self) -> bool {
+        self.permits(&CapRequest::DuckfsRead(SKILL_LIBRARY_PREFIX))
     }
 }
 
@@ -252,8 +348,8 @@ impl AgentRecord {
 
 /// one reply block in this surface's OWN vocabulary — exactly the shape the
 /// strict-output instruction asks the model for. `kind` is one of
-/// "Paragraph", "Heading", or "Code" (anything else drops in normalization);
-/// the consuming module maps these to chat blocks at emission.
+/// "paragraph", "heading", or "code" (lowercase; anything else drops in
+/// normalization); the consuming module maps these to chat blocks at emission.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReplyBlock {
     pub kind: String,
@@ -279,6 +375,20 @@ pub struct AgentResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    /// post a message to a named channel ([`ACTION_CHAT_POST_MESSAGE`]) — the
+    /// agent SPEAKING, as opposed to `reply_blocks`, which is the agent
+    /// ANSWERING where it was engaged. `thread` makes it a reply under that
+    /// root sequence.
+    ///
+    /// this is what lets an agent report progress while it works instead of
+    /// saving everything for the end. it is a genuinely wider power than a
+    /// reply, which is exactly why it carries its own action name.
+    PostMessage {
+        channel_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<u64>,
+    },
     CreateTask {
         task_id: String,
         title: String,
@@ -289,14 +399,28 @@ pub enum AgentAction {
         task_id: String,
         status: String,
     },
+    /// anchor a comment to `target` — a page id or a block id in the pages
+    /// module ([`ACTION_PAGES_COMMENT`]).
+    AddPageComment {
+        target: String,
+        body: String,
+    },
+    /// flip a todo block's checked state ([`ACTION_PAGES_SET_CHECKED`]).
+    SetPageChecked {
+        block: String,
+        checked: bool,
+    },
 }
 
 impl AgentAction {
     /// the vocabulary name this action needs in the agent's `allowed_actions`.
     pub fn vocabulary_name(&self) -> &'static str {
         match self {
+            AgentAction::PostMessage { .. } => ACTION_CHAT_POST_MESSAGE,
             AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
+            AgentAction::AddPageComment { .. } => ACTION_PAGES_COMMENT,
+            AgentAction::SetPageChecked { .. } => ACTION_PAGES_SET_CHECKED,
         }
     }
 }
@@ -315,7 +439,6 @@ pub enum AgentMsg {
         agent_id: String,
         display_name: String,
         capability: String,
-        prompt_hash: Vec<u8>,
         allowed_actions: Vec<String>,
         /// runtime-identity fields. `default` so a submitter's JSON that omits
         /// them still decodes; the module accepts them unconditionally.
@@ -333,7 +456,6 @@ pub enum AgentMsg {
         agent_id: String,
         display_name: Option<String>,
         capability: Option<String>,
-        prompt_hash: Option<Vec<u8>>,
         allowed_actions: Option<Vec<String>>,
         /// runtime-identity fields; `None` keeps the current value.
         #[serde(default, skip_serializing_if = "Option::is_none")]

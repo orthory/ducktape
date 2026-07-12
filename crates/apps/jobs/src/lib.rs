@@ -64,6 +64,7 @@ pub use interface::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sdk::codec::{self, Cursor};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 
@@ -471,17 +472,17 @@ impl Jobs {
         let mut out = Vec::new();
         out.extend_from_slice(&(jobs.len() as u64).to_le_bytes());
         for job in jobs.values() {
-            push_string(&mut out, &job.job_id);
-            push_string(&mut out, &job.kind);
-            push_string(&mut out, &job.spec);
-            push_string(&mut out, &job.submitter);
+            codec::push_str(&mut out, &job.job_id);
+            codec::push_str(&mut out, &job.kind);
+            codec::push_str(&mut out, &job.spec);
+            codec::push_str(&mut out, &job.submitter);
             out.push(status_byte(&job.status));
             out.extend_from_slice(&job.attempt.to_le_bytes());
             match &job.claim {
                 None => out.push(0),
                 Some(c) => {
                     out.push(1);
-                    push_string(&mut out, &c.worker);
+                    codec::push_str(&mut out, &c.worker);
                     out.extend_from_slice(&c.claimed_at_height.to_le_bytes());
                     out.extend_from_slice(&c.lease_views.to_le_bytes());
                 }
@@ -491,7 +492,7 @@ impl Jobs {
                 Some(r) => {
                     out.push(1);
                     out.push(u8::from(r.ok));
-                    push_string(&mut out, &r.payload);
+                    codec::push_str(&mut out, &r.payload);
                 }
             }
             out.extend_from_slice(&job.created_at_height.to_le_bytes());
@@ -499,7 +500,7 @@ impl Jobs {
         }
         out.extend_from_slice(&(workers.len() as u64).to_le_bytes());
         for worker in workers {
-            push_string(&mut out, worker);
+            codec::push_str(&mut out, worker);
         }
         out
     }
@@ -523,36 +524,15 @@ impl Jobs {
 
 /// derive the acting identity from the dispatch origin -- the ONLY authorship
 /// path. an empty external origin (the pre-consensus `Origin::External(vec![])`
-/// default) is not an authenticated submitter and is rejected.
-///
-/// external keys are domain-separated as `ext:` + lowercase hex (the cross-
-/// branch module convention) so a future module registered under a pure-hex id
-/// can never collide with an external key's hex; module ids pass verbatim and
-/// system is the literal "system".
+/// default) is not an authenticated submitter and is rejected; the string form
+/// is the shared [`Origin::actor_string`] convention.
 fn actor_from_origin(origin: &Origin) -> Result<String, Error> {
-    match origin {
-        Origin::External(bytes) if bytes.is_empty() => Err(Error::Module(
+    if matches!(origin, Origin::External(bytes) if bytes.is_empty()) {
+        return Err(Error::Module(
             "external origin must carry a non-empty submitter id".into(),
-        )),
-        Origin::External(bytes) => Ok(format!("ext:{}", hex_lower(bytes))),
-        Origin::Module(id) => Ok(id.clone()),
-        Origin::System => Ok("system".into()),
+        ));
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
+    Ok(origin.actor_string())
 }
 
 fn status_byte(status: &JobStatus) -> u8 {
@@ -577,23 +557,23 @@ fn status_from_byte(value: u8) -> Result<JobStatus, Error> {
 }
 
 fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<ModuleId>), Error> {
-    let mut off = 0usize;
-    let count = read_u64(bytes, &mut off)?;
+    let mut c = Cursor::new(bytes);
+    let count = c.u64("snapshot job count")?;
 
     let mut jobs: BTreeMap<String, Job> = BTreeMap::new();
     for _ in 0..count {
-        let job_id = read_string(bytes, &mut off)?;
-        let kind = read_string(bytes, &mut off)?;
-        let spec = read_string(bytes, &mut off)?;
-        let submitter = read_string(bytes, &mut off)?;
-        let status = status_from_byte(read_u8(bytes, &mut off)?)?;
-        let attempt = read_u64(bytes, &mut off)?;
-        let claim = match read_u8(bytes, &mut off)? {
+        let job_id = c.string("snapshot job_id")?;
+        let kind = c.string("snapshot kind")?;
+        let spec = c.string("snapshot spec")?;
+        let submitter = c.string("snapshot submitter")?;
+        let status = status_from_byte(c.byte("snapshot status")?)?;
+        let attempt = c.u64("snapshot attempt")?;
+        let claim = match c.byte("snapshot claim flag")? {
             0 => None,
             1 => Some(Claim {
-                worker: read_string(bytes, &mut off)?,
-                claimed_at_height: read_u64(bytes, &mut off)?,
-                lease_views: read_u64(bytes, &mut off)?,
+                worker: c.string("snapshot claim worker")?,
+                claimed_at_height: c.u64("snapshot claimed_at_height")?,
+                lease_views: c.u64("snapshot lease_views")?,
             }),
             other => {
                 return Err(Error::Module(format!(
@@ -601,11 +581,11 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<Modu
                 )));
             }
         };
-        let result = match read_u8(bytes, &mut off)? {
+        let result = match c.byte("snapshot result flag")? {
             0 => None,
             1 => Some(JobResult {
-                ok: read_bool(bytes, &mut off)?,
-                payload: read_string(bytes, &mut off)?,
+                ok: c.bool("snapshot result ok")?,
+                payload: c.string("snapshot result payload")?,
             }),
             other => {
                 return Err(Error::Module(format!(
@@ -613,8 +593,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<Modu
                 )));
             }
         };
-        let created_at_height = read_u64(bytes, &mut off)?;
-        let updated_at_height = read_u64(bytes, &mut off)?;
+        let created_at_height = c.u64("snapshot created_at_height")?;
+        let updated_at_height = c.u64("snapshot updated_at_height")?;
 
         // structural check: strictly-ascending ids match `BTreeMap` iteration,
         // so a byte stream that would not re-encode to itself is rejected.
@@ -669,7 +649,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<Modu
             },
         );
     }
-    let worker_count = read_u64(bytes, &mut off)?;
+    let worker_count = c.u64("snapshot worker count")?;
     let worker_count = usize::try_from(worker_count)
         .map_err(|_| Error::Module("snapshot worker cap exceeded".into()))?;
     if worker_count > MAX_WORKERS {
@@ -677,7 +657,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<Modu
     }
     let mut workers = BTreeSet::new();
     for _ in 0..worker_count {
-        let worker = read_string(bytes, &mut off)?;
+        let worker = c.string("snapshot worker id")?;
         if worker.is_empty() || worker.len() > MAX_WORKER_MODULE_ID {
             return Err(Error::Module("snapshot worker module id is invalid".into()));
         }
@@ -691,51 +671,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeMap<String, Job>, BTreeSet<Modu
         }
         workers.insert(worker);
     }
-    if off != bytes.len() {
-        return Err(Error::Module("snapshot has trailing bytes".into()));
-    }
+    c.finish("jobs snapshot")?;
     Ok((jobs, workers))
-}
-
-fn read_u8(bytes: &[u8], off: &mut usize) -> Result<u8, Error> {
-    let end = off
-        .checked_add(1)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
-    let value = bytes[*off];
-    *off = end;
-    Ok(value)
-}
-
-fn read_bool(bytes: &[u8], off: &mut usize) -> Result<bool, Error> {
-    match read_u8(bytes, off)? {
-        0 => Ok(false),
-        1 => Ok(true),
-        other => Err(Error::Module(format!("snapshot has invalid bool: {other}"))),
-    }
-}
-
-fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {
-    let end = off
-        .checked_add(8)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[*off..end]);
-    *off = end;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
-    let len = read_u64(bytes, off)?;
-    let len = usize::try_from(len).map_err(|_| Error::Module("snapshot truncated".into()))?;
-    if len > bytes.len() - *off {
-        return Err(Error::Module("snapshot truncated".into()));
-    }
-    let value = std::str::from_utf8(&bytes[*off..*off + len])
-        .map_err(|_| Error::Module("snapshot string is not utf-8".into()))?;
-    *off += len;
-    Ok(value.to_owned())
 }
 
 #[async_trait::async_trait(?Send)]

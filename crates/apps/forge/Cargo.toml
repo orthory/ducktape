@@ -12,7 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # the node-local blob store forge fetches Push packfiles from by digest. the
 # same node-local receipt lane the daemon and the files module share; the
-# packfile bytes never enter consensus (see the `Push` op in lib.rs).
+# packfile bytes never enter consensus (see the `PushRefs` op in lib.rs).
 blobstore = { workspace = true }
 # sha2 rehashes the 20-byte sha1 HEAD oid into a 32-byte StateRoot (always used).
 sha2 = { workspace = true }
@@ -29,5 +29,5 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 [dev-dependencies]
 # dev-only: prove forge's root composes into the global app-hash. not a
 # production dep — a module still depends on sdk + its interface only.
-state = { workspace = true }
+host = { workspace = true }
 futures = "0.3"

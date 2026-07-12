@@ -52,15 +52,17 @@
 //! ## the load-bearing composition invariant
 //!
 //! forge's authenticated [`StateRoot`] is a CANONICAL SORTED HASH over every
-//! born branch of every repo, folded with the tracker's canonical bytes:
+//! born branch of every repo, folded with the tracker's canonical bytes and
+//! domain-separated under `FORGE_ROOT_DOMAIN`:
 //!
 //! ```text
-//! root = sha256(  for each repo sorted-by-name with >=1 born branch:
+//! root = sha256( FORGE_ROOT_DOMAIN ++ sha256(
+//!                 for each repo sorted-by-name with >=1 born branch:
 //!                     u32-LE(name.len) ++ name ++ u32-LE(ref_count) ++
 //!                     for each (branch, head) sorted-by-branch:
 //!                         u32-LE(branch.len) ++ branch ++ head.oid[20]
 //!                 ++ if tracker non-empty:
-//!                     TRACKER_DOMAIN ++ sha256(tracker.canonical_bytes())  )
+//!                     TRACKER_DOMAIN ++ sha256(tracker.canonical_bytes()) ) )
 //! ```
 //!
 //! with `root() == StateRoot::ZERO` on the empty state (the empty-genesis root).
@@ -72,14 +74,12 @@
 //! (never deleted, fast-forward-guarded at materialize); other branches may
 //! force-push and be deleted — the GitHub flow.
 //!
-//! ## back-compat: the default repo and the legacy Push (no app change)
+//! ## back-compat: the default repo (no app change)
 //!
-//! [`ForgeMsg::Commit`]/[`ForgeMsg::Push`] carry a `#[serde(default)] repo`, so a
-//! legacy wire message with no `repo` deserializes with `repo == ""`; the module
+//! every [`ForgeMsg`] carries a `#[serde(default)] repo`, so a legacy wire
+//! message with no `repo` deserializes with `repo == ""`; the module
 //! normalizes an empty repo to the well-known `"default"` repo. the unit
-//! [`ForgeQuery::Head`] answers the default repo's `main` head. the legacy
-//! single-ref [`ForgeMsg::Push`] stays decodable and is exactly a one-update
-//! [`ForgeMsg::PushRefs`] on `main`.
+//! [`ForgeQuery::Head`] answers the default repo's `main` head.
 //!
 //! ## the determinism landmine (per repo)
 //!
@@ -90,7 +90,7 @@
 //!
 //! KNOWN PRE-EXISTING HAZARD (unchanged by the multi-branch work): a `Commit`
 //! op builds on the parent COMMIT OBJECT, which only exists in odbs that have
-//! materialized the history — mixing `Commit` and `Push` on one repo can make
+//! materialized the history — mixing `Commit` and `PushRefs` on one repo can make
 //! `Commit` fail on validators that still lack the pushed pack. the app commits
 //! to app-managed repos and git users push to git-managed repos, so the mix
 //! does not occur in practice; a consensus-visible "pushed" flag is the proper
@@ -112,6 +112,9 @@ pub use tracker_iface::*;
 
 mod codec;
 mod git;
+/// the multi-head pack builder, shared with bin/noded's git upload-pack
+/// (fetch/clone) lane — packing has ONE implementation on both surfaces.
+pub use git::pack_closure_many;
 pub mod refs;
 mod snapshot;
 pub mod tracker;
@@ -149,8 +152,9 @@ const TRACKER_ROOT_DOMAIN: &[u8] = b"ducktape.forge.tracker.v1\x00";
 /// `"default"`; otherwise it must be 1..=`MAX_REPO_NAME_LEN` bytes of
 /// `[a-z0-9._-]` and never `.`/`..` (those would escape or collide with the base
 /// dir as a path segment). a valid non-empty slug returns unchanged, so the map
-/// key equals the on-disk directory name.
-pub(crate) fn norm_repo(repo: &str) -> Result<String, Error> {
+/// key equals the on-disk directory name. `pub`: bin/noded's git smart-HTTP
+/// layer shares this validator — the security-relevant check has ONE home.
+pub fn norm_repo(repo: &str) -> Result<String, Error> {
     if repo.is_empty() {
         return Ok(DEFAULT_REPO.to_string());
     }
@@ -176,65 +180,14 @@ pub(crate) fn norm_repo(repo: &str) -> Result<String, Error> {
     Ok(repo.to_string())
 }
 
-// ============================================================================
-// upgrade dual-path SEAM — the version-selected behavior branch.
-// ============================================================================
-//
-// forge is a `root()`-changing module, so a no-downtime protocol upgrade that
-// alters its root preimage / wire format ships as a DUAL-PATH binary. the seam
-// maps a version to a behavior branch; the one real divergence today is the
-// Phase-9 demonstrator (a domain-separated v2 root + v2-tagged snapshot). the
-// multi-branch + tracker generalization below is a FLAG DAY (like duckfs
-// FRAME_NS v2): both layout arms compose the NEW preimage — existing networks
-// upgrade lockstep or rebuild.
+/// the domain tag forge's root preimage is separated under — a fixed constant
+/// hashed over the folded preimage in [`compose_state_root`]. (historical note:
+/// the `.v2` in the bytes is the retired dual-path era's version tag, kept
+/// verbatim so the constant is self-describing on the wire.)
+const FORGE_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v2\x00";
 
-/// the forge protocol baseline — see the seam note above.
-const FORGE_BASELINE_VERSION: u32 = 0;
-
-/// the first protocol version that selects the forge v2 layout (Phase 9): the
-/// height-gated no-downtime demonstrator. below this version every seam picks
-/// the baseline behavior; at/after it the SAME committed state composes a
-/// domain-separated v2 root and ships a v2-tagged snapshot container.
-const FORGE_MULTIREPO_V2: u32 = 2;
-
-/// the domain tag that separates the v2 root preimage from v1 — a fixed
-/// constant; the version only SELECTS the branch, never enters the preimage.
-const FORGE_V2_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v2\x00";
-
-/// the 4-byte magic a v2 snapshot container leads with.
-pub(crate) const FORGE_V2_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv2";
-
-/// the version-selected behavior branch for forge's root preimage and snapshot
-/// wire format.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ForgeLayout {
-    /// the baseline behavior: the sorted multi-branch `compose_state_root` and
-    /// the plain snapshot container.
-    MultiRepo,
-    /// the v2 behavior: the DOMAIN-SEPARATED root and the v2-magic snapshot
-    /// container. reached only after a scheduled `to_version >=
-    /// FORGE_MULTIREPO_V2` activates at `H`.
-    MultiRepoV2,
-}
-
-/// map a protocol / active version to the behavior branch it selects — the
-/// SOLE dual-path decision point.
-pub(crate) fn forge_layout(version: u32) -> ForgeLayout {
-    if version >= FORGE_MULTIREPO_V2 {
-        ForgeLayout::MultiRepoV2
-    } else {
-        ForgeLayout::MultiRepo
-    }
-}
-
-/// normalize a wire `repo` field UNDER the selected layout. both layouts honor
-/// the multi-repo field — the v2 divergence is in the root preimage / snapshot
-/// wire, not in op routing.
-fn norm_repo_at(repo: &str, layout: ForgeLayout) -> Result<String, Error> {
-    match layout {
-        ForgeLayout::MultiRepo | ForgeLayout::MultiRepoV2 => norm_repo(repo),
-    }
-}
+/// the 4-byte magic every forge snapshot container leads with.
+pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv2";
 
 /// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
 /// deterministic module error on any other length.
@@ -286,9 +239,10 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// the composition [`StateRoot`] over the whole forge state: every born branch
 /// of every repo (callers pass repos SORTED by name; branch maps are sorted
-/// `BTreeMap`s) folded with the tracker's canonical-bytes hash. the empty
-/// state -> [`StateRoot::ZERO`] (the empty-genesis root). see the composition
-/// invariant in the module doc.
+/// `BTreeMap`s) folded with the tracker's canonical-bytes hash, then
+/// domain-separated under [`FORGE_ROOT_DOMAIN`]. the empty state ->
+/// [`StateRoot::ZERO`] (the empty-genesis root). see the composition invariant
+/// in the module doc.
 pub(crate) fn compose_state_root<'a>(
     repos: impl Iterator<Item = (&'a str, &'a BTreeMap<String, Oid>)>,
     tracker: &Tracker,
@@ -316,28 +270,14 @@ pub(crate) fn compose_state_root<'a>(
         h.update(TRACKER_ROOT_DOMAIN);
         h.update(Sha256::digest(tracker.canonical_bytes()));
     }
-    if any {
-        StateRoot(h.finalize().into())
-    } else {
-        StateRoot::ZERO
-    }
-}
-
-/// the v2 composition: the SAME preimage domain-separated under
-/// [`FORGE_V2_ROOT_DOMAIN`] — the observable flip at `H`. preserves the
-/// empty-genesis sentinel.
-pub(crate) fn compose_state_root_v2<'a>(
-    repos: impl Iterator<Item = (&'a str, &'a BTreeMap<String, Oid>)>,
-    tracker: &Tracker,
-) -> StateRoot {
-    let inner = compose_state_root(repos, tracker);
-    if inner == StateRoot::ZERO {
+    if !any {
         return StateRoot::ZERO;
     }
-    let mut h = Sha256::new();
-    h.update(FORGE_V2_ROOT_DOMAIN);
-    h.update(inner.0);
-    StateRoot(h.finalize().into())
+    let inner: [u8; 32] = h.finalize().into();
+    let mut outer = Sha256::new();
+    outer.update(FORGE_ROOT_DOMAIN);
+    outer.update(inner);
+    StateRoot(outer.finalize().into())
 }
 
 pub struct Forge {
@@ -363,9 +303,6 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
-    /// the cached dual-path branch selector (see the SEAM section). NEVER part
-    /// of the `root()`/`snapshot()` preimage — it only SELECTS the branch.
-    pub(crate) active_version: u32,
 }
 
 impl Forge {
@@ -439,7 +376,6 @@ impl Forge {
             tracker,
             staged_tracker: None,
             chat_target: None,
-            active_version: FORGE_BASELINE_VERSION,
         })
     }
 
@@ -449,18 +385,6 @@ impl Forge {
     pub fn with_chat(mut self, target: impl Into<String>) -> Self {
         self.chat_target = Some(target.into());
         self
-    }
-
-    /// the current dual-path branch selector.
-    pub fn active_version(&self) -> u32 {
-        self.active_version
-    }
-
-    /// deterministically set the dual-path branch selector (host activation
-    /// hook / restart / state-sync restoration; also the inherent counterpart
-    /// for concrete-typed tests).
-    pub fn set_active_version(&mut self, v: u32) {
-        self.active_version = v;
     }
 
     /// ensure a [`RepoState`] entry exists for `name` (already normalized).
@@ -639,20 +563,10 @@ impl Module for Forge {
         self.id.clone()
     }
 
-    /// ACTIVATION HOOK: the host drives this across the registry at the
-    /// finalized boundary, so forge selects its dual-path branch
-    /// deterministically at `H`. `version` is a non-hashed branch selector.
-    fn set_active_version(&mut self, version: u32) {
-        self.active_version = version;
-    }
-
     /// the composed state root — pure, no IO. see the composition invariant.
     fn root(&self) -> StateRoot {
         let entries = self.repos.iter().map(|(n, s)| (n.as_str(), &s.refs));
-        match forge_layout(self.active_version) {
-            ForgeLayout::MultiRepo => compose_state_root(entries, &self.tracker),
-            ForgeLayout::MultiRepoV2 => compose_state_root_v2(entries, &self.tracker),
-        }
+        compose_state_root(entries, &self.tracker)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -665,7 +579,6 @@ impl Module for Forge {
     /// commit atomically with the block. all git2 IO is blocking with no
     /// `.await`.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let layout = forge_layout(ctx.env().protocol_version);
         let now = ctx.env().consensus_time;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ForgeMsg::Commit {
@@ -674,40 +587,21 @@ impl Module for Forge {
                 content,
                 message,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 self.ensure_repo(&name);
                 self.stage_commit(&name, now, path, content, message)
-            }
-            ForgeMsg::Push {
-                repo,
-                prev_oid,
-                new_oid,
-                pack_digest,
-            } => {
-                // the legacy single-ref push == a one-update PushRefs on main.
-                let name = norm_repo_at(&repo, layout)?;
-                self.ensure_repo(&name);
-                self.stage_push_refs(
-                    &name,
-                    vec![RefUpdate {
-                        ref_name: MAIN_BRANCH.to_string(),
-                        prev_oid,
-                        new_oid: Some(new_oid),
-                    }],
-                    Some(pack_digest),
-                )
             }
             ForgeMsg::PushRefs {
                 repo,
                 updates,
                 pack_digest,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 self.ensure_repo(&name);
                 self.stage_push_refs(&name, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 let number = self.staged_tracker_mut().open_item(
                     &name,
@@ -730,7 +624,7 @@ impl Module for Forge {
                 source_branch,
                 target_branch,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 let target = if target_branch.is_empty() {
                     MAIN_BRANCH.to_string()
@@ -778,13 +672,13 @@ impl Module for Forge {
                 title,
                 body,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let editor = author_from_origin(&ctx.env().origin)?;
                 self.staged_tracker_mut()
                     .edit_item(&name, number, &editor, title, body, now)
             }
             ForgeMsg::SetItemState { repo, number, open } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 author_from_origin(&ctx.env().origin)?;
                 if let Some(verb) = self.staged_tracker_mut().set_state(&name, number, open, now)?
                 {
@@ -800,7 +694,7 @@ impl Module for Forge {
                 merge_oid,
                 pack_digest,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 author_from_origin(&ctx.env().origin)?;
                 let prev_target = parse_hex_oid(&prev_target_oid, "prev_target_oid")?;
                 let expected_source = parse_hex_oid(&expected_source_oid, "expected_source_oid")?;
@@ -836,7 +730,7 @@ impl Module for Forge {
                 commit_oid,
                 comments,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 self.staged_tracker_mut().submit_review(
                     &name, number, author, verdict, body, &commit_oid, comments, now,
@@ -858,13 +752,12 @@ impl Module for Forge {
     /// `Head`/`HeadOf` are read-your-writes on `main`; the rest serve
     /// COMMITTED state.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let layout = forge_layout(self.active_version);
         match decode_query(req).map_err(Error::Module)? {
             ForgeQuery::Head => Ok(encode_reply(&ForgeReply::Head(
                 self.read_head(DEFAULT_REPO),
             ))),
             ForgeQuery::HeadOf { repo } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 Ok(encode_reply(&ForgeReply::Head(self.read_head(&name))))
             }
             ForgeQuery::ListRepos => {
@@ -879,7 +772,7 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Repos(repos)))
             }
             ForgeQuery::ListRefs { repo } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let refs = self
                     .repos
                     .get(&name)
@@ -896,11 +789,11 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Refs(refs)))
             }
             ForgeQuery::ListItems { repo } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 Ok(encode_reply(&ForgeReply::Items(self.tracker.list(&name))))
             }
             ForgeQuery::GetItem { repo, number } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 Ok(encode_reply(&ForgeReply::Item(
                     self.tracker.get(&name, number).map(Box::new),
                 )))
@@ -1088,9 +981,9 @@ mod tests {
     fn root_composes_into_global_root() {
         let base = tmp_base("compose");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let before = state::global_root(&[&forge as &dyn Module]);
+        let before = host::global_root(&[&forge as &dyn Module]);
         commit(&mut forge, 7, "", "a.txt", "x", "c");
-        let after = state::global_root(&[&forge as &dyn Module]);
+        let after = host::global_root(&[&forge as &dyn Module]);
         assert_ne!(before, after, "forge's root must move the global app-hash");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1471,47 +1364,29 @@ mod tests {
         assert_eq!(run("det-t-a"), run("det-t-b"));
     }
 
-    // upgrade dual-path: v0/v1 stay byte-identical (inert), v2 domain-separates
-    // the SAME committed state and round-trips through a v2 install.
+    // every snapshot leads with the container magic; install requires it.
     #[test]
-    fn v2_layout_diverges_and_round_trips_while_v1_stays_inert() {
-        let base = tmp_base("v2");
+    fn snapshot_leads_with_magic_and_install_requires_it() {
+        let base = tmp_base("magic");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-
-        assert_eq!(forge_layout(0), ForgeLayout::MultiRepo);
-        assert_eq!(forge_layout(1), ForgeLayout::MultiRepo);
-        assert_eq!(forge_layout(2), ForgeLayout::MultiRepoV2);
-
         commit(&mut forge, 42, "docs", "a.txt", "x", "c");
-        commit(&mut forge, 42, "", "b.txt", "y", "c");
+        let root = forge.root();
+        let snap = forge.snapshot().unwrap();
+        assert!(snap.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
 
-        forge.set_active_version(0);
-        let root_v1 = forge.root();
-        let snap_v1 = forge.snapshot().unwrap();
-        forge.set_active_version(1);
-        assert_eq!(forge.root(), root_v1, "v1 must equal the baseline root");
-        assert_eq!(forge.snapshot().unwrap(), snap_v1);
-
-        forge.set_active_version(FORGE_MULTIREPO_V2);
-        let root_v2 = forge.root();
-        let snap_v2 = forge.snapshot().unwrap();
-        assert_ne!(root_v2, root_v1, "v2 root must diverge (the flip)");
-        assert!(snap_v2.starts_with(FORGE_V2_SNAPSHOT_MAGIC.as_slice()));
-
-        let rt = tmp_base("v2-rt");
+        let rt = tmp_base("magic-rt");
         let mut fresh = Forge::init("forge", rt.clone()).unwrap();
-        fresh.set_active_version(FORGE_MULTIREPO_V2);
-        fresh.install(&snap_v2, root_v2).unwrap();
-        assert_eq!(fresh.root(), root_v2, "v2 install reproduces the v2 root");
-
-        let rt2 = tmp_base("v2-rt-mismatch");
-        let mut mismatch = Forge::init("forge", rt2.clone()).unwrap();
-        mismatch.set_active_version(0);
-        assert!(mismatch.install(&snap_v2, root_v2).is_err());
+        assert!(
+            fresh
+                .install(&snap[FORGE_SNAPSHOT_MAGIC.len()..], root)
+                .is_err(),
+            "a container missing the magic must be rejected"
+        );
+        fresh.install(&snap, root).unwrap();
+        assert_eq!(fresh.root(), root, "install reproduces the root");
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&rt);
-        let _ = std::fs::remove_dir_all(&rt2);
     }
 
     // a snapshot carries branches AND tracker; install onto a fresh namespace

@@ -6,6 +6,8 @@ import { useState } from "react";
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames } from "../../../domain/chat-client";
 import type { ThreadView } from "../../../domain/pages-client";
+import { authorKey } from "../chat/chat-helpers";
+import { PageRefText } from "../chat/rich-text";
 import { color, font, radius } from "../../theme/tokens";
 
 /** What the new-thread composer is aimed at: the target id the thread will
@@ -77,6 +79,7 @@ export function NewThreadComposer({
 export function ThreadCard({
   view,
   authorNames,
+  selfKey,
   onReply,
   onResolve,
   onEdit,
@@ -84,6 +87,11 @@ export function ThreadCard({
 }: {
   view: ThreadView;
   authorNames: AuthorNames;
+  /** The local author's key (`selfAuthorKeyOf(selfAuthorBytes(...))`). Edit and
+   *  Delete used to render on EVERY comment while the module enforces
+   *  author-only — so a click on someone else's comment bought a rejected op
+   *  and an error, never an edit. */
+  selfKey: string;
   onReply: (threadId: string, text: string) => void;
   onResolve: (threadId: string, resolved: boolean) => void;
   onEdit: (commentId: string, text: string) => void;
@@ -93,6 +101,11 @@ export function ThreadCard({
   const [reply, setReply] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
+  const submitReply = () => {
+    if (!reply.trim()) return;
+    onReply(thread.id, reply);
+    setReply("");
+  };
   return (
     <div
       style={{
@@ -113,27 +126,29 @@ export function ThreadCard({
               {c.edited_at ? (
                 <span style={{ font: `400 9.5px ${font.mono}`, color: color.muted2 }}>edited</span>
               ) : null}
-              <div style={{ marginLeft: "auto", display: "flex", gap: 2 }}>
-                <button
-                  type="button"
-                  aria-label="Edit comment"
-                  onClick={() => {
-                    setEditing(c.id);
-                    setEditText(c.text);
-                  }}
-                  style={miniBtn}
-                >
-                  Edit
-                </button>
-                <button
-                  type="button"
-                  aria-label="Delete comment"
-                  onClick={() => onDelete(c.id)}
-                  style={miniBtn}
-                >
-                  Delete
-                </button>
-              </div>
+              {authorKey(c.author) === selfKey ? (
+                <div style={{ marginLeft: "auto", display: "flex", gap: 2 }}>
+                  <button
+                    type="button"
+                    aria-label="Edit comment"
+                    onClick={() => {
+                      setEditing(c.id);
+                      setEditText(c.text);
+                    }}
+                    style={miniBtn}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Delete comment"
+                    onClick={() => onDelete(c.id)}
+                    style={miniBtn}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ) : null}
             </div>
             {editing === c.id ? (
               <div style={{ marginTop: 4 }}>
@@ -162,33 +177,41 @@ export function ThreadCard({
               </div>
             ) : (
               <div style={{ marginTop: 2, font: `400 12.5px/1.5 ${font.sans}`, color: color.ink, whiteSpace: "pre-wrap" }}>
-                {c.text}
+                {/* Page comments store PLAIN TEXT on the wire — no marks — so a
+                    `[[page:…]]` ref is all there is to resolve here. An @handle
+                    stays literal: without a mention mark there is no principal
+                    behind it, only a string that looks like one. */}
+                <PageRefText text={c.text} />
               </div>
             )}
           </div>
         ))}
       </div>
 
+      {/* the reply used to be a single-line <input> while the new-thread
+          composer was a textarea with Shift+Enter — the same act of writing a
+          comment, with two different grammars. One grammar now. */}
       <div
         style={{
           display: "flex",
-          alignItems: "center",
+          alignItems: "flex-end",
           gap: 6,
           padding: "6px 12px 10px",
         }}
       >
-        <input
+        <textarea
           aria-label="Reply to thread"
           value={reply}
           onChange={(e) => setReply(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && reply.trim()) {
-              onReply(thread.id, reply);
-              setReply("");
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              submitReply();
             }
           }}
-          placeholder="Reply…"
-          style={{ ...composerStyle, height: 30, flex: 1 }}
+          rows={1}
+          placeholder="Reply… (Shift+Enter for a new line)"
+          style={{ ...composerStyle, flex: 1 }}
         />
         <button
           type="button"

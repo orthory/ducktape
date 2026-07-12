@@ -17,11 +17,13 @@
 # status app-hashes agree afterward.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+command -v bun >/dev/null || { echo "bun is required" >&2; exit 1; }
+command -v nc  >/dev/null || { echo "nc is required" >&2; exit 1; }
 
 BIN=ducktape-node
 echo "building $BIN..."
 cargo build -p node-bin --bin "$BIN" >/dev/null 2>&1
-BIN_PATH="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug/$BIN"
+BIN_PATH="$(cargo metadata --no-deps --format-version 1 | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/$BIN"
 
 WORK=$(mktemp -d)
 A="$WORK/founder"
@@ -31,13 +33,15 @@ trap cleanup EXIT
 
 echo "founder: init..."
 chain_id=$("$BIN_PATH" init --name demo --dir "$A" \
-  --listen 127.0.0.1:53200 --rpc 127.0.0.1:53300 2>/dev/null)
+  --listen 127.0.0.1:53200 --advertised 127.0.0.1:53200 \
+  --rpc 127.0.0.1:53300 2>/dev/null)
 echo "  chain-id: $chain_id"
 invite=$("$BIN_PATH" invite --config "$A/node.toml" 2>/dev/null)
 
 echo "friend: join (first pass — identity only)..."
 friend_key=$("$BIN_PATH" join "$invite" --dir "$B" \
-  --listen 127.0.0.1:53201 --rpc 127.0.0.1:53301 2>/dev/null)
+  --listen 127.0.0.1:53201 --advertised 127.0.0.1:53201 \
+  --rpc 127.0.0.1:53301 2>/dev/null)
 echo "  friend identity: $friend_key"
 
 echo "founder: admit + refreshed invite..."
@@ -46,7 +50,8 @@ invite2=$("$BIN_PATH" invite --config "$A/node.toml" 2>/dev/null)
 
 echo "friend: join (refreshed — now a member)..."
 "$BIN_PATH" join "$invite2" --dir "$B" \
-  --listen 127.0.0.1:53201 --rpc 127.0.0.1:53301 >/dev/null 2>&1
+  --listen 127.0.0.1:53201 --advertised 127.0.0.1:53201 \
+  --rpc 127.0.0.1:53301 >/dev/null 2>&1
 
 loga=$(mktemp)
 logb=$(mktemp)
@@ -57,21 +62,9 @@ pa=$!
 pb=$!
 
 rpc() { # rpc <port> <json>
-  python3 - "$1" "$2" <<'PY'
-import socket, sys
-port, req = int(sys.argv[1]), sys.argv[2]
-s = socket.create_connection(("127.0.0.1", port), timeout=10)
-s.sendall(req.encode() + b"\n")
-buf = b""
-while not buf.endswith(b"\n"):
-    chunk = s.recv(65536)
-    if not chunk:
-        break
-    buf += chunk
-print(buf.decode().strip())
-PY
+  printf '%s\n' "$2" | nc -w 10 127.0.0.1 "$1"
 }
-hexenc() { python3 -c "import sys; print(sys.argv[1].encode().hex())" "$1"; }
+hexenc() { printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n'; }
 
 # identical descriptor -> identical genesis app-hash on both.
 genesis_ok=""
@@ -87,7 +80,7 @@ for _ in $(seq 1 60); do
 done
 if [ -z "$genesis_ok" ]; then
   echo "FAIL: genesis hashes absent or diverged (founder=$ga friend=$gb)"
-  tail -5 "$loga" "$logb"
+  tail -n 5 "$loga" "$logb"
   exit 1
 fi
 echo "genesis agreed: $ga"
@@ -100,27 +93,24 @@ rpc 53300 "{\"cmd\":\"submit\",\"target\":\"directory\",\"payload_hex\":\"$set_o
 converge_ok=""
 for _ in $(seq 1 60); do
   reply=$(rpc 53301 "{\"cmd\":\"query\",\"target\":\"directory\",\"req_hex\":\"$get_q\"}" || true)
-  decoded=$(python3 - "$reply" <<'PY'
-import json, sys
-try:
-    r = json.loads(sys.argv[1])
-    print(bytes.fromhex(r.get("reply_hex", "")).decode() if r.get("ok") else "")
-except Exception:
-    print("")
-PY
-)
+  decoded=$(printf '%s' "$reply" | bun -e '
+try {
+  const response = await Bun.stdin.json();
+  if (response.ok) process.stdout.write(Buffer.from(response.reply_hex ?? "", "hex").toString());
+} catch {}
+')
   if echo "$decoded" | grep -q "two members, zero seeds"; then converge_ok="yes"; break; fi
   sleep 0.5
 done
 if [ -z "$converge_ok" ]; then
   echo "FAIL: the founder's op never became readable on the friend"
-  tail -5 "$loga" "$logb"
+  tail -n 5 "$loga" "$logb"
   exit 1
 fi
 
 # both status app-hashes agree at the settled boundary.
 hash_of() { # hash_of <port>
-  rpc "$1" '{"cmd":"status"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["app_hash"])'
+  rpc "$1" '{"cmd":"status"}' | bun -e 'console.log((await Bun.stdin.json()).status.app_hash)'
 }
 final_ok=""
 for _ in $(seq 1 20); do

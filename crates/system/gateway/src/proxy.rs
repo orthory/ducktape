@@ -9,35 +9,74 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord, RouteTarget,
-    validate_account_id, validate_content_path,
+    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord, validate_account_id,
 };
 
 pub const PROXY_FLOW_DOMAIN: &[u8] = b"ducktape-gateway-proxy-v1";
 pub const PROXY_INTENT: u8 = 1;
-pub const MAX_PROXY_HEAD_BYTES: usize = 1024;
+pub const MAX_PROXY_HEAD_BYTES: usize = 8192;
 pub const MAX_PATH_AND_QUERY_BYTES: usize = 2048;
-pub const MAX_HEADERS: usize = 8;
+pub const MAX_HEADERS: usize = 32;
 pub const MAX_HEADER_NAME_BYTES: usize = 64;
-pub const MAX_HEADER_VALUE_BYTES: usize = 1024;
-pub const MAX_HEADER_BYTES: usize = 4096;
-pub const MAX_RESPONSE_HEAD_BYTES: usize = 4096;
+pub const MAX_HEADER_VALUE_BYTES: usize = 4096;
+pub const MAX_HEADER_BYTES: usize = 16384;
+pub const MAX_RESPONSE_HEAD_BYTES: usize = 8192;
 
-pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
-    "accept",
-    "authorization",
-    "content-type",
-    "idempotency-key",
-    "if-match",
-    "if-none-match",
-];
+/// Request headers stripped before the publisher forwards to its upstream:
+/// hop-by-hop, forwarding/identity spoofables, and every `x-duck-*` (the proxy
+/// alone mints those). Compared case-insensitively; the wire also rejects
+/// non-lowercase and `x-duck-*` names at decode, so this is defense in depth
+/// against a raw peer that never went through decode.
+pub fn header_forwardable(name: &str) -> bool {
+    const DENY: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        // The publisher sets these itself; a forwarded copy would duplicate or
+        // fight the proxy's value.
+        "accept-encoding",
+        "content-length",
+        "user-agent",
+        "host",
+        "origin",
+        "referer",
+        "via",
+        "forwarded",
+        "x-forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "client-ip",
+    ];
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("x-duck-") || lower.starts_with("x_duck_") {
+        return false;
+    }
+    !DENY.contains(&lower.as_str())
+}
 
+/// Response headers a publisher may return. Response stays fail-closed
+/// (allowlist) because a response header can carry policy weight (cookies,
+/// caching, redirects); request headers are the denylisted direction.
 pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
+    "cache-control",
+    "content-disposition",
+    "content-language",
     "content-type",
     "etag",
     "last-modified",
     "location",
     "retry-after",
+    "set-cookie",
+    "vary",
 ];
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -61,6 +100,10 @@ pub struct ProxyRequestHead {
     /// Strictly name-sorted, unique, allowlisted request headers.
     pub headers: Vec<ProxyHeader>,
     pub body_len: u64,
+    /// Request a WebSocket upgrade (GET, no body) on a route signed
+    /// `allow_upgrade`. Defaults false so older/non-WS callers stay wire-compatible.
+    #[serde(default)]
+    pub upgrade: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -101,7 +144,10 @@ pub fn validate_proxy_request_head(head: &ProxyRequestHead) -> Result<(), String
         return Err("gateway proxy: revision starts at 1".into());
     }
     validate_origin_form(&head.path_and_query)?;
-    validate_headers(&head.headers, ALLOWED_REQUEST_HEADERS, "request")?;
+    validate_headers(&head.headers, "request")?;
+    if head.upgrade && (head.method != RouteMethod::Get || head.body_len != 0) {
+        return Err("gateway proxy: a WebSocket upgrade must be a bodyless GET".into());
+    }
     if head.body_len > MAX_REQUEST_BODY_BYTES {
         return Err(format!(
             "gateway proxy: body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
@@ -117,7 +163,16 @@ pub fn validate_response_head(head: &ProxyResponseHead) -> Result<(), String> {
     if !(200..=599).contains(&head.status) {
         return Err("gateway proxy: invalid upstream status".into());
     }
-    validate_headers(&head.headers, ALLOWED_RESPONSE_HEADERS, "response")?;
+    validate_headers(&head.headers, "response")?;
+    // Responses stay fail-closed on an allowlist (see `ALLOWED_RESPONSE_HEADERS`).
+    for header in &head.headers {
+        if !ALLOWED_RESPONSE_HEADERS.contains(&header.name.as_str()) {
+            return Err(format!(
+                "gateway proxy: disallowed response header {:?}",
+                header.name
+            ));
+        }
+    }
     if let Some(location) = header_value(&head.headers, "location") {
         validate_safe_location(location)?;
     }
@@ -150,11 +205,7 @@ pub fn validate_safe_location(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_headers(
-    headers: &[ProxyHeader],
-    allowed: &[&str],
-    kind: &str,
-) -> Result<(), String> {
+pub fn validate_headers(headers: &[ProxyHeader], kind: &str) -> Result<(), String> {
     if headers.len() > MAX_HEADERS {
         return Err(format!(
             "gateway proxy: too many {kind} headers (max {MAX_HEADERS})"
@@ -163,22 +214,41 @@ pub fn validate_headers(
     let mut previous: Option<&str> = None;
     let mut total = 0usize;
     for header in headers {
+        // Names are strict lowercase HTTP tokens. Rejecting non-lowercase and
+        // underscore names here is what stops an `X-Duck-Caller-Account` /
+        // `x_duck_caller_account` spoof from ever reaching the forward step —
+        // the proxy alone mints the authenticated `x-duck-*` headers.
         if header.name.is_empty()
             || header.name.len() > MAX_HEADER_NAME_BYTES
             || !header
                 .name
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
-            || !allowed.contains(&header.name.as_str())
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         {
             return Err(format!(
-                "gateway proxy: disallowed {kind} header {:?}",
+                "gateway proxy: malformed {kind} header name {:?}",
                 header.name
             ));
         }
-        if previous.is_some_and(|old| old >= header.name.as_str()) {
+        if header.name.starts_with("x-duck-") {
             return Err(format!(
-                "gateway proxy: {kind} headers must be strictly sorted and unique"
+                "gateway proxy: {kind} header {:?} spoofs a proxy-minted header",
+                header.name
+            ));
+        }
+        // Sorted, and unique except for `set-cookie` — the one header HTTP
+        // genuinely repeats (each cookie needs its own line; folding them into
+        // one value is illegal). Repeats must still be adjacent, so the list
+        // stays canonical and a receiver can group by name in one pass.
+        let repeatable = kind == "response" && header.name == "set-cookie";
+        let out_of_order = previous.is_some_and(|old| match old.cmp(header.name.as_str()) {
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => !repeatable,
+            std::cmp::Ordering::Greater => true,
+        });
+        if out_of_order {
+            return Err(format!(
+                "gateway proxy: {kind} headers must be sorted, and unique except set-cookie"
             ));
         }
         previous = Some(&header.name);
@@ -242,53 +312,17 @@ pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> 
             || header_value(&head.headers, "authorization").is_none())
 }
 
-/// Resolve a strict content request to the signed manifest entry. Query
-/// strings and percent-decoding are deliberately absent for immutable content.
-pub fn content_file_for_request<'a>(
-    head: &ProxyRequestHead,
-    record: &'a RouteRecord,
-) -> Result<&'a crate::ContentFile, String> {
-    if !matches!(head.method, RouteMethod::Get | RouteMethod::Head) || head.body_len != 0 {
-        return Err("gateway content: only bodyless GET/HEAD are supported".into());
-    }
-    let Some(route) = &record.statement.route else {
-        return Err("gateway content: route is unpublished".into());
-    };
-    let RouteTarget::DuckFs { content } = &route.target else {
-        return Err("gateway content: route is not content-backed".into());
-    };
-    if head.path_and_query.contains('?') {
-        return Err("gateway content: query strings are not supported".into());
-    }
-    let path = match head.path_and_query.as_str() {
-        "/" => content
-            .default_path
-            .as_deref()
-            .ok_or_else(|| "gateway content: no default path".to_string())?,
-        path => path
-            .strip_prefix('/')
-            .ok_or_else(|| "gateway content: path is not origin-form".to_string())?,
-    };
-    validate_content_path(path)?;
-    content
-        .files
-        .binary_search_by(|file| file.path.as_str().cmp(path))
-        .ok()
-        .map(|index| &content.files[index])
-        .ok_or_else(|| "gateway content: file is not declared".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        MemberAuthorization, ROUTE_FORMAT_VERSION, RouteDefinition, RoutePolicy, RouteStatement,
+        MemberAuthorization, RouteDefinition, RoutePolicy, RouteStatement, RouteTarget,
     };
 
     fn record() -> RouteRecord {
         RouteRecord {
             statement: RouteStatement {
-                version: ROUTE_FORMAT_VERSION,
+                version: 1,
                 chain_id: "test".into(),
                 account_id: vec![1; 32],
                 name: RouteName::named("api"),
@@ -302,6 +336,7 @@ mod tests {
                         max_request_bytes: 1024,
                         max_response_bytes: 4096,
                         allow_authorization: false,
+                        allow_upgrade: false,
                     },
                 }),
             },
@@ -325,6 +360,7 @@ mod tests {
                 value: "application/json".into(),
             }],
             body_len: 12,
+            upgrade: false,
         };
         let encoded = encode_proxy_request_head(&head).unwrap();
         assert_eq!(decode_proxy_request_head(&encoded).unwrap(), head);
@@ -345,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_urls_smuggling_and_ambient_headers_fail_closed() {
+    fn absolute_urls_and_smuggling_fail_closed() {
         for path in [
             "https://evil.test",
             "//evil.test/x",
@@ -355,20 +391,68 @@ mod tests {
         ] {
             assert!(validate_origin_form(path).is_err(), "accepted {path:?}");
         }
-        for name in ["cookie", "host", "origin", "x-forwarded-for"] {
-            assert!(
-                validate_headers(
-                    &[ProxyHeader {
-                        name: name.into(),
-                        value: "x".into(),
-                    }],
-                    ALLOWED_REQUEST_HEADERS,
-                    "request",
-                )
-                .is_err(),
-                "accepted {name}"
-            );
+    }
+
+    fn one_header(name: &str) -> Vec<ProxyHeader> {
+        vec![ProxyHeader {
+            name: name.into(),
+            value: "x".into(),
+        }]
+    }
+
+    #[test]
+    fn decode_rejects_caller_account_spoofs() {
+        // Any x-duck-* is rejected at decode; the proxy alone mints those.
+        assert!(validate_headers(&one_header("x-duck-caller-account"), "request").is_err());
+        // Non-lowercase / underscore names never reach the denylist.
+        assert!(validate_headers(&one_header("X-Duck-Caller-Account"), "request").is_err());
+        assert!(validate_headers(&one_header("x_duck_caller_account"), "request").is_err());
+        // Ordinary credential/content headers now pass decode (they flow e2e).
+        assert!(validate_headers(&one_header("cookie"), "request").is_ok());
+        assert!(validate_headers(&one_header("authorization"), "request").is_ok());
+        assert!(validate_headers(&one_header("content-type"), "request").is_ok());
+    }
+
+    #[test]
+    fn forward_denylist_strips_hop_by_hop_and_identity() {
+        for name in [
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "origin",
+            "referer",
+            "via",
+            "x-forwarded-for",
+            "x-real-ip",
+            "cf-connecting-ip",
+            "x-duck-caller-account",
+        ] {
+            assert!(!header_forwardable(name), "should have stripped {name}");
         }
+        for name in ["cookie", "authorization", "content-type", "accept", "if-none-match"] {
+            assert!(header_forwardable(name), "should have forwarded {name}");
+        }
+    }
+
+    #[test]
+    fn response_headers_stay_allowlisted() {
+        let ok = ProxyResponseHead {
+            status: 200,
+            headers: vec![ProxyHeader {
+                name: "set-cookie".into(),
+                value: "s=1".into(),
+            }],
+        };
+        assert!(validate_response_head(&ok).is_ok());
+        let bad = ProxyResponseHead {
+            status: 200,
+            headers: vec![ProxyHeader {
+                name: "x-frame-options".into(),
+                value: "DENY".into(),
+            }],
+        };
+        assert!(validate_response_head(&bad).is_err());
     }
 
     #[test]
@@ -397,6 +481,7 @@ mod tests {
             path_and_query: "/".into(),
             headers: vec![],
             body_len: MAX_REQUEST_BODY_BYTES + 1,
+            upgrade: false,
         };
         assert!(validate_proxy_request_head(&head).is_err());
         let mut json = serde_json::to_value(&head).unwrap();

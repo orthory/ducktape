@@ -67,9 +67,10 @@ height-gated activation.
 
 ## Mesh
 
-- The two parallel mesh type systems (`valset::mesh` and
-  `wireguard-upgrade`) should unify on one contract, and the validated WireGuard
-  upgrade path needs a runtime consumer to bring up the private overlay.
+- The mesh contract now lives in one crate: `valset::mesh` was deleted and
+  `crates/system/wireguard` owns the tunnel-upgrade protocol, which the node's
+  reachability plane drives at runtime. What is left is a privileged e2e that
+  brings up a real WireGuard interface, still deliberately descoped.
 
 ## Deferred Deliberately
 

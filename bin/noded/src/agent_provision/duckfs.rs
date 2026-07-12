@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
@@ -32,12 +32,16 @@ use crate::actor_api::ActorNodeApi;
 /// materialize the duckfs source at `dir` (plus W6 skill ro mounts under the
 /// sibling `ro_root`) and hand back the live workspace. mount names arrive
 /// PRE-VALIDATED by the dispatching provisioner (`mount_dir_name` + dedup).
+/// `node_url` is this node's http base (`None` = no http surface), handed to
+/// the run as `DUCKTAPE_NODE` so its tool plane can dial back.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn provision(
     handle: NodeHandle,
     dir: PathBuf,
     ro_root: PathBuf,
     prefix: String,
     snapshot: Option<String>,
+    node_url: Option<String>,
     spec: &WorkspaceSpec,
 ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
     let api = ActorNodeApi::new(handle.clone());
@@ -67,53 +71,59 @@ pub(super) async fn provision(
     .map_err(|e| e.to_string())?;
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
     // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
-    // skill tree beside it can never leak into the output snapshot.
-    let ro_dir = if spec.ro_mounts.is_empty() {
-        None
+    // skill tree beside it can never leak into the output snapshot. the same
+    // step assembles the run's SOUL from those mounts (it is the only place
+    // that holds both the curation and the materialized bodies).
+    let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
+        // nothing to mount — but the document still ships. the tool-plane
+        // instruction is a fact about the world the run wakes up in, not part of
+        // the agent's curation: a skill-less agent that is never told the MCP
+        // plane exists is a blind one. the library pointer rides the agent's own
+        // read cap (`library_readable`), so a skill-less agent WITH the grant is
+        // told where to find skills, and one without it is told nothing it could
+        // not act on.
+        (
+            None,
+            Some(assemble_context_doc(&[], spec.library_readable)?),
+        )
     } else {
-        let api = ActorNodeApi::new(handle.clone());
+        let mount_handle = handle.clone();
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let checkout_rw = dir.clone();
-        tokio::task::spawn_blocking(move || {
-            mounts
-                .iter()
-                .try_for_each(|m| {
-                    checkout_with(
-                        &api,
-                        &checkout_ro.join(&m.mount_subpath),
-                        &m.source_prefix,
-                        m.source_snapshot.as_deref(),
-                        &CheckoutOptions::default(),
-                    )
-                    .map(|_| ())
-                })
+        // the committed library grant (consensus said it; the assembler obeys).
+        let library_readable = spec.library_readable;
+        let context_doc = tokio::task::spawn_blocking(move || {
+            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
                 .inspect_err(|_| {
                     // W5 again: the run never gets a workspace handle on a
-                    // failed provision, so BOTH trees (the partial ro root
-                    // and the already-materialized rw checkout) must go.
-                    let _ = std::fs::remove_dir_all(&checkout_ro);
+                    // failed provision, so the already-materialized rw checkout
+                    // goes too (the mount helper removed its own partial tree).
                     let _ = std::fs::remove_dir_all(&checkout_rw);
                 })
         })
         .await
-        .map_err(|_| "skill mount checkout task panicked".to_string())?
-        .map_err(|e| e.to_string())?;
-        Some(ro_root)
+        .map_err(|_| "skill mount checkout task panicked".to_string())??;
+        (Some(ro_root), Some(context_doc))
     };
-    let mut env = BTreeMap::new();
-    env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
-    if let Some(ro) = &ro_dir {
-        // the consumer hook: skill trees live under this root, one dir
-        // per mount name. nothing reads it yet.
-        env.insert("DUCKTAPE_RUN_SKILLS".into(), ro.display().to_string());
-    }
+    // the workspace EXISTS now, so ask consensus to bind the run's agent session
+    // — never before: a bind for a run that failed to materialize would spend an
+    // op on a run that never starts.
+    let session = super::session::open(&handle, spec).await;
+    let env = super::run_env(
+        &dir,
+        ro_dir.as_deref(),
+        node_url.as_deref(),
+        spec,
+        session.as_ref(),
+    );
     Ok(Box::new(NodedWorkspace {
         handle,
         dir,
         ro_dir,
         source: spec.source.clone(),
         env,
+        context_doc,
     }))
 }
 
@@ -127,19 +137,24 @@ struct NodedWorkspace {
     ro_dir: Option<PathBuf>,
     source: WorkspaceSource,
     env: BTreeMap<String, String>,
+    /// the run's assembled soul — its `always` skills inlined, the rest indexed.
+    /// `None` when the agent curated no skills. capability-host delivers it.
+    context_doc: Option<String>,
 }
 
 impl NodedWorkspace {
     /// a receipt-only spec: `commit`/`no_changes` read only the source coords,
-    /// so the run_id/tools/mount are irrelevant here.
+    /// so the run ids/tools/mount are irrelevant here.
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
+            consensus_run_id: None,
             agent_id: None,
+            agent_display_name: None,
             source: self.source.clone(),
-            mount_path: String::new(),
-            base_tools: Vec::new(),
             ro_mounts: Vec::new(),
+            // receipts never assemble a document, so the grant is moot here.
+            library_readable: false,
         }
     }
 }
@@ -155,14 +170,23 @@ impl ProvisionedWorkspace for NodedWorkspace {
     }
 
     fn path_entries(&self) -> Vec<PathBuf> {
-        Vec::new()
+        super::tool_path_entries()
+    }
+
+    fn context_doc(&self) -> Option<String> {
+        self.context_doc.clone()
     }
 
     async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
         let api = ActorNodeApi::new(self.handle.clone());
         let dir = self.dir.clone();
         let message = message.to_string();
-        let result = tokio::task::spawn_blocking(move || commit(&api, &dir, &message))
+        let result = tokio::task::spawn_blocking(move || {
+            // Provider HOME/auth/temp/build state is reserved runtime debris,
+            // never an agent output facet. Remove it before duckfs scans.
+            let _ = std::fs::remove_dir_all(dir.join(capability_host::RUN_RUNTIME_DIR));
+            commit(&api, &dir, &message)
+        })
             .await
             .map_err(|_| "workspace commit task panicked".to_string())?;
         let spec = self.receipt_spec();

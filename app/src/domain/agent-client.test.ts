@@ -1,14 +1,15 @@
 // The agent client mirrors agent-interface: AgentMsg encoding (ownership from
 // the block origin, never in a payload; snake_case fields) + AgentReply
 // decoding for the Agents / Agent queries, including the null (absent agent)
-// case. The prompt-upload flow itself lives in the store; here we only prove
-// the wire shapes and the hex→bytes hash helper. The acting half (watches,
-// runs) is runs-client — see runs-client.test.
+// case. An agent's soul is its curated skills, so the wire carries SkillRefs
+// with their load mode and NO prompt/prompt_hash at all — both asserted here.
+// The acting half (watches, runs) is runs-client — see runs-client.test.
 
 import { describe, expect, it, vi } from "vitest";
 
 import {
   agent,
+  agentAddress,
   agents,
   hexToBytes,
   pauseAgent,
@@ -16,7 +17,8 @@ import {
   resumeAgent,
   updateAgent,
 } from "./agent-client";
-import type { AgentRecord } from "./agent-client";
+import type { AgentRecord, SkillRef } from "./agent-client";
+import { RESERVED_ROOT_LABELS } from "./duckdns-client";
 import { makeTransportStub } from "../test/transport-stub";
 
 const stubTransport = (reply?: unknown) =>
@@ -36,15 +38,51 @@ describe("hexToBytes", () => {
 });
 
 describe("agent msgs", () => {
+  const persona: SkillRef = {
+    name: "persona",
+    source_prefix: "/shared/agents/helper/persona",
+    load: "always",
+  };
+  const runbook: SkillRef = {
+    name: "runbook",
+    source_prefix: "/shared/skills/runbook",
+    source_snapshot: "cafe",
+    load: "on_demand",
+  };
+
   it("encodes RegisterAgent, passing the origin for owner-gating", async () => {
     const transport = stubTransport();
-    const promptHash = hexToBytes("cd".repeat(32));
     await registerAgent(transport, {
       agentId: "helper",
       displayName: "Helper",
       capability: "alpha",
-      promptHash,
       allowedActions: ["chat.post"],
+      origin: "operator",
+    });
+    // Exact match: no prompt / prompt_hash key is ever sent, and an empty skill
+    // set is omitted rather than sent as [].
+    expect(transport.submit).toHaveBeenCalledWith(
+      "agent",
+      {
+        register_agent: {
+          agent_id: "helper",
+          display_name: "Helper",
+          capability: "alpha",
+          allowed_actions: ["chat.post"],
+        },
+      },
+      "operator",
+    );
+  });
+
+  it("carries the curated skills — each with its load mode — in order", async () => {
+    const transport = stubTransport();
+    await registerAgent(transport, {
+      agentId: "helper",
+      displayName: "Helper",
+      capability: "alpha",
+      allowedActions: ["chat.post"],
+      skills: [persona, runbook],
       origin: "operator",
     });
     expect(transport.submit).toHaveBeenCalledWith(
@@ -54,8 +92,8 @@ describe("agent msgs", () => {
           agent_id: "helper",
           display_name: "Helper",
           capability: "alpha",
-          prompt_hash: promptHash,
           allowed_actions: ["chat.post"],
+          skills: [persona, runbook],
         },
       },
       "operator",
@@ -76,8 +114,28 @@ describe("agent msgs", () => {
           agent_id: "helper",
           display_name: "Helper 2",
           capability: null,
-          prompt_hash: null,
           allowed_actions: null,
+          caps: null,
+          skills: null,
+        },
+      },
+      "operator",
+    );
+  });
+
+  it("UpdateAgent replaces the curated set wholesale — [] clears it", async () => {
+    const transport = stubTransport();
+    await updateAgent(transport, { agentId: "helper", skills: [], origin: "operator" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "agent",
+      {
+        update_agent: {
+          agent_id: "helper",
+          display_name: null,
+          capability: null,
+          allowed_actions: null,
+          caps: null,
+          skills: [],
         },
       },
       "operator",
@@ -109,11 +167,13 @@ describe("agent queries", () => {
     owner: { external: [1, 2, 3] },
     display_name: "Helper",
     capability: "alpha",
-    prompt_hash: hexToBytes("cd".repeat(32)),
     allowed_actions: ["chat.post"],
     status: "active",
     created_at: 1,
     updated_at: 2,
+    skills: [
+      { name: "persona", source_prefix: "/shared/agents/helper/persona", load: "always" },
+    ],
   };
 
   it("sends the bare string Agents and decodes the roster", async () => {
@@ -131,5 +191,40 @@ describe("agent queries", () => {
 
     const absent = stubTransport({ agent: null });
     await expect(agent(absent, "ghost")).resolves.toBeNull();
+  });
+});
+
+// An address the agent cannot be reached at is worse than no address. Consensus
+// admits only DNS-label ids, and those ARE the local part verbatim. A LEGACY
+// agent (registered before that rule) holds any id, and forge addresses it as
+// `<slug>.<hash>@agents.duck` off the complete id — so `<id>@agents.duck` would
+// be a plain lie. Show nothing instead.
+describe("agent address", () => {
+  it("is the id verbatim for every id consensus admits", () => {
+    for (const id of ["quackbot", "qa-luna", "a", "9", "a--b", "x".repeat(63)]) {
+      expect(agentAddress(id)).toBe(`${id}@agents.duck`);
+    }
+  });
+
+  it("is absent for a legacy id, never a false address", () => {
+    for (const legacy of [
+      "qa luna",
+      "QA-Luna",
+      "quack/bot@example",
+      "under_score",
+      "dot.ted",
+      "-lead",
+      "trail-",
+      "",
+      "x".repeat(64),
+    ]) {
+      expect(agentAddress(legacy), legacy).toBeNull();
+    }
+  });
+
+  // the domain is unownable only because `agents` is reserved in duckdns.
+  it("lives under the reserved root label", () => {
+    expect(RESERVED_ROOT_LABELS.has("agents")).toBe(true);
+    expect(agentAddress("quackbot")).toContain("@agents.duck");
   });
 });

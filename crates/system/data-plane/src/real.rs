@@ -262,10 +262,6 @@ impl OverlaySockets {
 impl DataPlaneTransport for OverlaySockets {
     type Stream = PlaneStream;
 
-    fn max_datagram(&self) -> usize {
-        MAX_DATAGRAM
-    }
-
     async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
         let dest = self
             .addresses

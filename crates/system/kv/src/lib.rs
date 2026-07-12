@@ -4,7 +4,7 @@
 //! variable-length byte values, sha256-merkleized) and exposes it as an
 //! [`sdk::Module`]. the module's authenticated [`StateRoot`] IS the qmdb merkle
 //! root — a real cryptographic commitment to the whole store, refreshed on every
-//! write — so it flows directly into the global app-hash via `state::global_root`.
+//! write — so it flows directly into the global app-hash via `host::global_root`.
 //!
 //! ## keys are hashed to a fixed width
 //!
@@ -169,9 +169,11 @@ where
 
     /// upsert `key -> value`, re-merkleize, apply, and flush. after this returns
     /// `root()` reflects the new committed merkle root. the qmdb key is
-    /// `sha256(key)`. a direct test/dev convenience — the consensus write path is
-    /// `execute` -> `stage`, which enforces the write-time size caps.
-    pub async fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    /// `sha256(key)`. a direct test/dev convenience — but it enforces the same
+    /// write-time size caps as the consensus path (`execute` -> `stage`), so it
+    /// can never commit the poison-pill value the caps exist to keep out.
+    pub async fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
+        Self::check_write_caps(&key, &value)?;
         let batch = self
             .db
             .new_batch()
@@ -184,6 +186,7 @@ where
             .await
             .expect("apply_batch failed");
         self.db.commit().await.expect("commit failed");
+        Ok(())
     }
 
     /// reject a write that would poison the store: [`kv_config`]'s codec bound is
@@ -393,7 +396,7 @@ where
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-    use state::global_root;
+    use host::global_root;
 
     // a fixed-root stand-in module, so we can prove the kv root composes into the
     // global app-hash alongside another module.
@@ -419,14 +422,14 @@ mod tests {
 
             let r0 = kv.root();
 
-            kv.set(b"k1".to_vec(), b"v1".to_vec()).await;
+            kv.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
             let r1 = kv.root();
             let app1 = {
                 let mods: [&dyn Module; 2] = [&kv, &stub];
                 global_root(&mods)
             };
 
-            kv.set(b"k2".to_vec(), b"v2".to_vec()).await;
+            kv.set(b"k2".to_vec(), b"v2".to_vec()).await.expect("set");
             let r2 = kv.root();
             let app2 = {
                 let mods: [&dyn Module; 2] = [&kv, &stub];
@@ -463,9 +466,9 @@ mod tests {
         for seed in 0..64u64 {
             let ok = deterministic::Runner::seeded(seed).start(|context| async move {
                 let mut kv = Kv::init(context, "kv").await;
-                kv.set(b"k1".to_vec(), b"v1".to_vec()).await;
+                kv.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
                 let g1 = kv.get(b"k1").await;
-                kv.set(b"k2".to_vec(), b"v2".to_vec()).await;
+                kv.set(b"k2".to_vec(), b"v2".to_vec()).await.expect("set");
                 let g2 = kv.get(b"k2").await;
                 g1.as_deref() == Some(b"v1".as_ref())
                     && g2.as_deref() == Some(b"v2".as_ref())
@@ -566,6 +569,18 @@ mod tests {
             kv.commit_block().await.expect("commit");
             assert_eq!(kv.root(), r0, "a rejected write must not move the root");
 
+            // the direct `set` convenience enforces the same caps — it must
+            // never commit a poison-pill value either.
+            let err = kv
+                .set(b"k".to_vec(), vec![0u8; MAX_VALUE_LEN + 1])
+                .await
+                .expect_err("over-cap set must be rejected");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("value too large")),
+                "unexpected error: {err:?}"
+            );
+            assert_eq!(kv.root(), r0, "a rejected set must not move the root");
+
             // boundary: exactly-at-cap writes are accepted and commit fine.
             kv.stage(vec![b'k'; MAX_KEY_LEN], vec![0u8; MAX_VALUE_LEN])
                 .expect("at-cap write");
@@ -584,8 +599,8 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let mut a = Kv::init(context.child("alpha"), "alpha").await;
             let mut b = Kv::init(context.child("beta"), "beta").await;
-            a.set(b"x".to_vec(), b"1".to_vec()).await;
-            b.set(b"x".to_vec(), b"2".to_vec()).await;
+            a.set(b"x".to_vec(), b"1".to_vec()).await.expect("set");
+            b.set(b"x".to_vec(), b"2".to_vec()).await.expect("set");
             assert_eq!(a.get(b"x").await.as_deref(), Some(b"1".as_ref()));
             assert_eq!(b.get(b"x").await.as_deref(), Some(b"2".as_ref()));
             assert_ne!(

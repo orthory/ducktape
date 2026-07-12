@@ -304,7 +304,7 @@ async fn direct_attempt(
     if reach
         .send(reachability::ReachabilityCommand::InstallInvitePeer {
             peer: candidate.key.clone(),
-            wireguard_public_key: wireguard_upgrade::X25519PublicKey(candidate.wg),
+            wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
             endpoint: endpoint_addr,
             reply: reachability::InstallReply(install_tx),
         })
@@ -406,7 +406,7 @@ async fn coordinated_attempt(
         if reach
             .send(reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
                 peer: candidate.key.clone(),
-                wireguard_public_key: wireguard_upgrade::X25519PublicKey(candidate.wg),
+                wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
                 intro: intro.clone(),
                 reply: reachability::CoordinatedInviteReply(reply_tx),
             })

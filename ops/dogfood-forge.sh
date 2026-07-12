@@ -2,9 +2,9 @@
 # make dogfood-forge — host ducktape's OWN source in ducktape's forge module.
 #
 # Registers a static git remote `ducktape-dev` pointing at the local dev node's
-# forge git smart-HTTP endpoint, then pushes `main` into it. From then on,
-# dogfooding is just `git push ducktape-dev main` — real ducktape history flows
-# into ducktape's own forge, browsable in the desktop Forge view.
+# forge git smart-HTTP endpoint, fetches the canonical development branch, then
+# pushes that exact commit into Forge `main`. From then on, re-running this
+# command refreshes Forge from the canonical source before any agent dispatch.
 #
 # This is the INTENDED big-repo path: `git-receive-pack` lifts the body cap to
 # 512 MB and stores the whole packfile node-locally, submitting only a tiny
@@ -23,12 +23,15 @@
 #   DUCKTAPE_DEV_FORGE_URL  node base URL override (no trailing /forge/<repo>)
 #   FORGE_REPO              forge repo name in the URL   (default: ducktape)
 #   FORGE_REMOTE            local git remote name        (default: ducktape-dev)
-#   SRC_REF                 local ref pushed to main     (default: HEAD)
+#   SOURCE_REMOTE           canonical source remote      (default: origin)
+#   SOURCE_BRANCH           canonical source branch      (default: dev)
+#   SRC_REF                 explicit local ref override  (default: fetched
+#                                                        SOURCE_REMOTE/BRANCH)
 #
-# SRC_REF defaults to HEAD (the currently checked-out branch), NOT `main`:
-# per this repo's branching rules `main` only advances on an explicit release
-# and lags the `dev` trunk, so pushing the literal `main` ref would dogfood a
-# stale snapshot. HEAD dogfoods whatever you're actually working on.
+# The default deliberately does NOT use HEAD. A clean-but-stale primary checkout
+# can trail origin/dev while still looking healthy, which silently pins every
+# later agent run to an obsolete source tree. An explicit SRC_REF remains useful
+# for intentional branch dogfood, but callers then own that override.
 #
 # NOTE: `ducktape-dev` is a normal git remote, and git stores remotes in the
 # SHARED .git/config (git-common-dir) — visible to every `git worktree` of this
@@ -42,7 +45,9 @@ cd "$(dirname "$0")/.."
 
 FORGE_REPO="${FORGE_REPO:-ducktape}"
 FORGE_REMOTE="${FORGE_REMOTE:-ducktape-dev}"
-SRC_REF="${SRC_REF:-HEAD}"
+SOURCE_REMOTE="${SOURCE_REMOTE:-origin}"
+SOURCE_BRANCH="${SOURCE_BRANCH:-dev}"
+SRC_REF="${SRC_REF:-}"
 
 log() { printf '\033[36m[dogfood]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[dogfood]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -76,6 +81,19 @@ REMOTE_URL="$BASE_URL/forge/$FORGE_REPO"
 
 log "node forge endpoint: $REMOTE_URL"
 
+if [ -z "$SRC_REF" ]; then
+  log "fetching canonical source: $SOURCE_REMOTE $SOURCE_BRANCH"
+  git fetch "$SOURCE_REMOTE" "$SOURCE_BRANCH"
+  # Resolve the result of THIS fetch, not a synthesized remote-tracking ref.
+  # A remote with a missing/nonstandard fetch refspec may update FETCH_HEAD
+  # while leaving refs/remotes/<remote>/<branch> stale.
+  SRC_REF="FETCH_HEAD"
+fi
+
+SOURCE_OID="$(git rev-parse --verify "$SRC_REF^{commit}")" ||
+  die "source ref '$SRC_REF' does not resolve to a commit"
+log "source commit: $SOURCE_OID ($SRC_REF)"
+
 # a healthy node is required (git-receive-pack is served off the node's http
 # surface). fail fast with an actionable message rather than a git transport error.
 if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
@@ -97,9 +115,22 @@ else
   log "added remote '$FORGE_REMOTE' -> $REMOTE_URL"
 fi
 
-# forge only accepts refs/heads/main; push whatever SRC_REF names into it.
-log "pushing '$SRC_REF' -> $FORGE_REMOTE main (whole-repo pack over git-receive-pack)"
-git push "$FORGE_REMOTE" "$SRC_REF:refs/heads/main"
+# Forge only accepts refs/heads/main. Push the immutable OID verified above;
+# do not resolve a mutable ref again after network and health checks have run.
+log "pushing '$SOURCE_OID' -> $FORGE_REMOTE main (whole-repo pack over git-receive-pack)"
+git push "$FORGE_REMOTE" "$SOURCE_OID:refs/heads/main"
 
-log "done. ducktape now hosts itself in forge — browse it in the desktop Forge view."
-log "re-run \`make dogfood-forge\` (or \`git push $FORGE_REMOTE main\`) to update."
+# A successful git process is not enough evidence for the next dispatch. Read
+# the committed Forge ref back through the same smart-HTTP boundary and require
+# exact equality with the source commit we just selected.
+FORGE_OID="$(git ls-remote "$REMOTE_URL" refs/heads/main | awk 'NR == 1 { print $1 }')"
+if [ -z "$FORGE_OID" ]; then
+  die "Forge main is missing after push"
+fi
+if [ "$FORGE_OID" != "$SOURCE_OID" ]; then
+  die "Forge main verification failed: expected $SOURCE_OID, got $FORGE_OID"
+fi
+
+log "verified Forge main at $FORGE_OID"
+log "done. ducktape now hosts the canonical dev source in Forge."
+log "re-run \`make dogfood-forge\` before creating agent work."

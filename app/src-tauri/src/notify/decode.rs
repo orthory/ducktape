@@ -17,13 +17,6 @@ pub struct Origin {
 
 #[derive(Debug, Clone)]
 pub struct OpRow {
-    // These block coordinates are retained for future toast timestamps and debugging.
-    #[allow(dead_code)]
-    pub height: u64,
-    #[allow(dead_code)]
-    pub seq: u32,
-    #[allow(dead_code)]
-    pub time: u64,
     pub origin: Origin,
     /// the embedded op payload; None when the row carried `payloadHex` or nothing.
     pub payload: Option<Value>,
@@ -31,21 +24,18 @@ pub struct OpRow {
 
 /// Decode one OpRow envelope. Returns None on any malformed/missing field
 /// (the notifier skips what it cannot read -- never panics on wire data).
+/// The block coordinates (height/seq/time) are shape-checked but not kept:
+/// nothing downstream reads them, yet a row missing them is malformed wire
+/// data and must be skipped like any other.
 pub fn decode_op_row(v: &Value) -> Option<OpRow> {
     let obj = v.as_object()?;
-    let height = obj.get("height")?.as_u64()?;
-    let seq = u32::try_from(obj.get("seq")?.as_u64()?).ok()?;
-    let time = obj.get("time")?.as_u64()?;
+    obj.get("height")?.as_u64()?;
+    u32::try_from(obj.get("seq")?.as_u64()?).ok()?;
+    obj.get("time")?.as_u64()?;
     let origin = decode_origin(obj.get("origin")?)?;
     let payload = obj.get("payload").cloned();
 
-    Some(OpRow {
-        height,
-        seq,
-        time,
-        origin,
-        payload,
-    })
+    Some(OpRow { origin, payload })
 }
 
 fn decode_origin(v: &Value) -> Option<Origin> {
@@ -211,9 +201,6 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(row.height, 42);
-        assert_eq!(row.seq, 1);
-        assert_eq!(row.time, 1720000000);
         assert_eq!(row.origin.kind, OriginKind::External);
         assert_eq!(row.origin.id.as_deref(), Some("aabb"));
 
@@ -234,9 +221,6 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(row.height, 43);
-        assert_eq!(row.seq, 2);
-        assert_eq!(row.time, 1720000001);
         assert_eq!(row.origin.kind, OriginKind::System);
         assert_eq!(row.origin.id, None);
         assert_eq!(row.payload, None);

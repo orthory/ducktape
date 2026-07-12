@@ -46,15 +46,16 @@ product depth다.
 
 - Origin-bound message authorship. signed frame은 authenticated origin을 제공하지만,
   product-level author string은 아직 caller-supplied다.
-- agent module은 reactor worker seam에 연결되어야 한다. LLM output은 hidden
-  non-determinism이 아니라 ordered data로 commit되어야 하며, tasks module과도 live
-  pipeline으로 연결되어야 한다.
+- 기본 agent/runs/dispatch/jobs loop는 live node에 등록되어 있다. 남은 product
+  depth는 더 풍부한 app UX, packaged agent와 harness, 더 넓은 action vocabulary,
+  debug surface가 아니라 native하게 느껴지는 durable task obligation이다.
 
 ## Mesh
 
-두 parallel mesh type system(`valset::mesh`, `wireguard-upgrade`)은 하나의
-contract로 합쳐져야 하며, validated WireGuard upgrade path는 private overlay를 실제로
-올리는 runtime consumer가 필요하다.
+mesh contract는 이제 하나의 crate에 있다. `valset::mesh`는 삭제됐고
+`crates/system/wireguard`가 tunnel-upgrade protocol을 소유하며, node의
+reachability plane이 runtime에 이를 drive한다. 남은 것은 실제 WireGuard
+interface를 올리는 privileged e2e이고, 아직 deliberately descoped다.
 
 ## Deferred Deliberately
 

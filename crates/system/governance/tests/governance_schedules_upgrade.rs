@@ -80,7 +80,12 @@ fn gov_host_with_upgrade(reject_schedule: bool) -> (Host, Spy) {
     valset.insert(member_key(2));
     let host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "upgrade")),
+        Box::new(Governance::new(
+            "governance",
+            "valset",
+            "upgrade",
+            "identity",
+        )),
         Box::new(UpgradeStub {
             id: "upgrade".into(),
             seen: seen.clone(),
@@ -434,7 +439,7 @@ fn snapshot_install_round_trips_a_schedule_upgrade_proposal() {
 
         // a fresh instance rebuilt from the snapshot recomputes the same root,
         // so tag 3 (ScheduleUpgrade) round-trips through encode/decode_state.
-        let mut rebuilt = Governance::new("governance", "valset", "upgrade");
+        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(
             rebuilt.root(),
@@ -565,7 +570,7 @@ fn snapshot_install_round_trips_a_cancel_upgrade_proposal() {
         };
 
         // tag 4 (CancelUpgrade) round-trips through encode/decode_state.
-        let mut rebuilt = Governance::new("governance", "valset", "upgrade");
+        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(
             rebuilt.root(),

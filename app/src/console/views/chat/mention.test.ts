@@ -4,12 +4,15 @@ import type { AgentRecord } from "../../../domain/agent-client";
 import { keyBytes, type ChatBlock } from "../../../domain/chat-client";
 import { parseMessageInput } from "./chat-input";
 import {
+  agentMentions,
   hasAgentMention,
   insertMention,
   mentionCandidates,
   mentionCandidatesAll,
   mentionableUsers,
+  mentionLabel,
   mentionResolverOf,
+  mentionTarget,
   mentionTokenAt,
 } from "./mention";
 
@@ -22,7 +25,6 @@ const agent = (
   owner: { external: [1] },
   display_name: displayName,
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status,
   created_at: 1,
@@ -252,6 +254,23 @@ describe("hasAgentMention", () => {
   });
 });
 
+describe("agentMentions", () => {
+  it("returns distinct structured agent refs and ignores plain/user mentions", () => {
+    const ref = { agent: { module: "runs", agent_id: "quackbot" } };
+    const blocks: ChatBlock[] = [
+      {
+        paragraph: [
+          { text: "@quackbot", marks: [{ mention: ref }] },
+          { text: " again", marks: [{ mention: ref }] },
+          { text: " @eddy", marks: [{ mention: { user: [1, 2] } }] },
+        ],
+      },
+      { code: { lang: null, text: "@quackbot" } },
+    ];
+    expect(agentMentions(blocks)).toEqual([ref]);
+  });
+});
+
 describe("user mention parsing", () => {
   it("round-trips a user handle through parseMessageInput with the mention resolver", () => {
     const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -265,5 +284,48 @@ describe("user mention parsing", () => {
         ],
       },
     ]);
+  });
+});
+
+describe("mentionTarget", () => {
+  it("points an agent mention at the agent id (the module is not the target)", () => {
+    expect(mentionTarget({ agent: { module: "runs", agent_id: "quackbot" } })).toEqual({
+      agentId: "quackbot",
+    });
+  });
+
+  it("points a user mention at the ACCOUNT id its bytes carry", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    expect(mentionTarget({ user: keyBytes(jessKey) })).toEqual({ accountId: jessKey });
+  });
+
+  it("has nothing to open for a module or system author", () => {
+    expect(mentionTarget({ module: "forge" })).toBeNull();
+    expect(mentionTarget("system")).toBeNull();
+  });
+});
+
+describe("mentionLabel", () => {
+  const roster = [agent("quackbot", "Quackbot")];
+
+  it("renders an agent under its display name — NOT the module path", () => {
+    const ref = { agent: { module: "runs", agent_id: "quackbot" } };
+    expect(mentionLabel(ref, {}, roster)).toBe("Quackbot");
+  });
+
+  it("falls back to the agent_id when the roster doesn't hold it (deleted, or pre-connect)", () => {
+    const ref = { agent: { module: "runs", agent_id: "ghost" } };
+    expect(mentionLabel(ref, {}, roster)).toBe("ghost");
+    expect(mentionLabel(ref, {}, [])).toBe("ghost");
+  });
+
+  it("never renders an empty label for an agent with a blank display name", () => {
+    const ref = { agent: { module: "runs", agent_id: "blank" } };
+    expect(mentionLabel(ref, {}, [agent("blank", "  ")])).toBe("blank");
+  });
+
+  it("resolves a user mention through authorName, keyed by the ACCOUNT id", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    expect(mentionLabel({ user: keyBytes(jessKey) }, { [jessKey]: "Jess K" }, [])).toBe("Jess K");
   });
 });

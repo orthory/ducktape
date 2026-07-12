@@ -1,4 +1,4 @@
-use nat_traversal::{Msg, NatClient, NodeKey, run_coordinator};
+use nat_traversal::{ClientEvent, Msg, NatClient, NodeKey, SocketEvent, run_coordinator};
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, timeout};
 
@@ -28,10 +28,19 @@ async fn two_clients_rendezvous_through_coordinator_and_send_directly() {
 
     // B learns A's reflexive from the PunchSync the coordinator fans out to
     // the other side of a Lookup — again, no direct access to A's socket.
-    let a_reflexive = timeout(Duration::from_secs(2), b.recv_punch_sync())
-        .await
-        .expect("no timeout")
-        .expect("recv PunchSync");
+    // Consumed through the dispatch API, as the reachability pump does.
+    let a_reflexive = timeout(Duration::from_secs(2), async {
+        loop {
+            if let SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. }) =
+                b.recv_socket_event().await?
+            {
+                return Ok::<_, std::io::Error>(peer_reflexive);
+            }
+        }
+    })
+    .await
+    .expect("no timeout")
+    .expect("recv PunchSync");
 
     // Only now, armed with what the coordinator resolved, does A send a
     // direct datagram to B's reflexive address.
@@ -39,9 +48,18 @@ async fn two_clients_rendezvous_through_coordinator_and_send_directly() {
 
     // B accepts the Punch only if it actually arrives from the address the
     // rendezvous resolved for A.
-    let got = timeout(Duration::from_secs(2), b.recv_punch_from(a_reflexive))
-        .await
-        .expect("no timeout")
-        .expect("recv");
+    let got = timeout(Duration::from_secs(2), async {
+        loop {
+            if let SocketEvent::Rendezvous(ClientEvent::Punch { from, src }) =
+                b.recv_socket_event().await?
+                && src == a_reflexive
+            {
+                return Ok::<_, std::io::Error>(Msg::Punch { from });
+            }
+        }
+    })
+    .await
+    .expect("no timeout")
+    .expect("recv");
     assert_eq!(got, Msg::Punch { from: a_key });
 }

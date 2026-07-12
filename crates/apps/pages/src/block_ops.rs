@@ -171,19 +171,10 @@ where
                     .ok_or(PageError::Corrupt)?;
                 p.children.remove(pos);
                 self.store_block(&p)?;
-                // delete the WHOLE subtree, depth-first. a child listed but
-                // absent from the store is a broken invariant, surfaced loudly.
-                // no page root can live below a non-root block (block ops
-                // can't mint kind Page), so the index never needs updating.
-                let mut stack = vec![blk];
-                while let Some(cur) = stack.pop() {
-                    for child in &cur.children {
-                        stack.push(self.require_block(child, PageError::Corrupt).await?);
-                    }
-                    self.purge_comments_for_target(&cur.id).await?;
-                    self.delete_block(&cur.id);
-                }
-                Ok(())
+                // delete the WHOLE subtree, depth-first. no page root can
+                // live below a non-root block (block ops can't mint kind
+                // Page), so the index never needs updating.
+                self.delete_subtree(blk).await
             }
             _ => unreachable!("non-block op routed to apply_block_op"),
         }

@@ -61,7 +61,6 @@ impl TestCtx {
                 owner: SagaOrigin::External(b"alice".to_vec()),
                 display_name: agent_id.to_uppercase(),
                 capability: "model-1".into(),
-                prompt_hash: vec![7u8; 32],
                 allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
                 status: AgentStatus::Active,
                 created_at: 0,
@@ -253,6 +252,7 @@ fn source() -> RunsModule {
         agent_id: agent.into(),
         channel_id: channel.into(),
         anchor_seq,
+        demands: Default::default(),
     };
     exec(
         &mut m,
@@ -455,10 +455,11 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// the canonical bytes of a minimal one-watch / one-pending-run state, built
 /// through the real op path. the layout is pinned by the asserted length so
 /// the discriminant-tampering test can index into it:
-/// watches: count 8 | channel 8+1 | policy 1
-/// pending: count 8 | dispatch id 8+64 | agent 8+1 | channel 8+1 | anchor 8
-///          | thread tag 1 | job id tag 1 | job claim height 8
-///          | requester disc 1 + key 8+1 | created_at 8
+/// watches:  count 8 | channel 8+1 | policy 1
+/// pending:  count 8 | dispatch id 8+64 | agent 8+1 | channel 8+1 | anchor 8
+///           | thread tag 1 | job id tag 1 | job claim height 8
+///           | requester disc 1 + key 8+1 | created_at 8
+/// sessions: count 8 (none open — the run holds no agent session)
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
     let mut m = module();
@@ -479,11 +480,12 @@ fn minimal_snapshot() -> Vec<u8> {
             agent_id: "a".into(),
             channel_id: "c".into(),
             anchor_seq: 1,
+            demands: Default::default(),
         },
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 152, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 160, "the minimal layout this test indexes into");
     snap
 }
 
@@ -553,9 +555,9 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     commit(&mut m);
     let snap = m.snapshot();
     let good_root = m.root();
-    // watches section: count 8, then two 10-byte bodies; the pending count
-    // trails.
-    assert_eq!(snap.len(), 8 + 10 * 2 + 8);
+    // watches section: count 8, then two 10-byte bodies; the pending and
+    // session counts trail.
+    assert_eq!(snap.len(), 8 + 10 * 2 + 8 + 8);
     let body_a = snap[8..18].to_vec();
     let body_b = snap[18..28].to_vec();
 

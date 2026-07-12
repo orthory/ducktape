@@ -1,77 +1,125 @@
 ---
 name: qa
-description: Use to DRIVE the fleet's real Ducktape desktop instances for agent QA — one live app per git worktree. The fleet (ops/fleet.sh + the dashboard) brings each worktree's app up headless, VNCs it, and exposes its tauri-plugin-agent debug endpoint; this skill drives that endpoint (screenshot, run JS, assert the DOM, seed data) so an agent can QA a branch while you watch it live in the dashboard. For the single already-running app, use tauri-debug directly.
+description: Use to drive or test isolated real Ducktape CEF desktop instances managed by tauri-agent-fleet. Fleet builds once, launches private instances, exposes loopback VNC on Linux or a native window on macOS, and drives the direct tauri-agent endpoint. For one already-running app outside Fleet, use tauri-debug.
 ---
 
-# QA (drive the fleet)
+# QA with tauri-agent-fleet
 
-The **fleet** (`ops/fleet.sh` + `ops/fleet-console`, the live noVNC grid) runs the
-real Ducktape desktop app for each git worktree, headless, and exposes them all
-through one token-multiplexed web port. Each instance already ships the driving
-seam this skill needs: `ops/fleet.sh up_one` starts `tauri dev` with
-`XDG_RUNTIME_DIR=$STATE/<id>` — the same dev-only [[tauri-debug]] bridge
-(`tauri-plugin-agent`). Because the runtime base is per-instance, each app's
-endpoint registry lands under its own state dir; the app id stays the constant
-`com.ducktape.app` across worktrees. This skill is the **driving** layer over
-that: an agent QAs a worktree's branch through its endpoint while you watch the
-tile live.
+Ducktape delegates generic build caching, process ownership, scheduling, runner
+budgets, artifacts, and dashboard serving to `tauri-agent-fleet`. This repository
+owns only `.tauri-agent/` and `qa/fleet/`.
 
-`<id>` is the branch slugged (`re.sub` of non-alnum → `-`), e.g. `feat/x` → `feat-x`.
-
-## The loop
+## Interactive loop
 
 ```bash
-ops/fleet.sh up <branch>                       # bring the worktree's app up (headless + VNC + dashboard tile)
-export XDG_RUNTIME_DIR=<fleet-state>/<id>      # the instance's runtime base ($STATE/<id>)
+FLEET="${FLEET:-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js}"
 
-app/scripts/tauri-agent tree --app com.ducktape.app                       # semantic tree / drive the UI
-app/scripts/tauri-agent find --role button --name Forge --app com.ducktape.app
-app/scripts/tauri-agent click @3 --app com.ducktape.app
-app/scripts/tauri-agent eval "document.title" --app com.ducktape.app      # assert DOM
-curl -s "$DUCKTAPE_QA_NODE_URL/v1/submit" -d '<op>'                       # seed node state; the app re-renders
+"$FLEET" up HEAD
+"$FLEET" status --json
+"$FLEET" dashboard
 
-ops/fleet.sh refresh                           # re-emit fleet.json so the dashboard reflects new state
-ops/fleet.sh down <branch>                     # when done
+# Pick the instance's directories.runtime value from status --json.
+export XDG_RUNTIME_DIR=<runtime-directory>
+app/scripts/tauri-agent tree --app com.ducktape.app
+app/scripts/tauri-agent find --role button --name Create --app com.ducktape.app
+
+"$FLEET" down <instance-id>
 ```
 
-- **Scope every call to the instance** by exporting the same
-  `XDG_RUNTIME_DIR=$STATE/<id>` the fleet launched the app with, then
-  `--app com.ducktape.app`. The app id is constant; the runtime base is what
-  routes a driver call to one tile. (`$STATE` is `ops/fleet.sh`'s state dir; the
-  endpoint is `$STATE/<id>/tauri-agent/com.ducktape.app/endpoint.json`.)
-- **Assertions go over the endpoint** (`tree` / `find` / `eval`) —
-  display-independent, the primary QA signal. Screenshots come from the dashboard
-  tile (noVNC), `tauri-agent shot out.svg --app com.ducktape.app` (DOM-SVG,
-  WM-free), or `import -window root` under the instance's `DISPLAY`
-  (`fleet.sh status` lists it).
-- **Feeding the dashboard:** `fleet.sh up` already writes the token→VNC file and
-  starts x11vnc; `fleet.sh refresh` regenerates `fleet.json` (served at
-  `/fleet.json`, polled by the console). So an agent "feeds" the dashboard just by
-  calling `up` then `refresh` — no separate VNC plumbing. `fleet.json`'s "up" gate
-  is exactly `$STATE/<id>/tauri-agent/com.ducktape.app/endpoint.json` present + the
-  VNC port open, so a driveable instance is a visible one.
+The opaque instance ID, not the branch, owns HOME, XDG runtime/data, display,
+ports, endpoint, observation capability, and exact process groups. Linux uses a
+private X display and VNC token. macOS launches the native app with
+`display=native`, `vncPort=0`, and no fake VNC route. Never find or stop desktop
+processes with `pkill -f`. Fleet runs Ducktape's cleanup hook after stopping the
+desktop so its recorded detached workspace-node group cannot survive teardown.
 
-## Several worktrees at once
+## Deterministic suites
 
-`ops/fleet.sh up` (no args) brings up every worktree; drive each by exporting its
-own `XDG_RUNTIME_DIR=$STATE/<id>` + `--app com.ducktape.app`. Independent
-instances are a natural fit for parallel agents — one per worktree, each
-runtime-base-scoped.
+```bash
+export FLEET_MODEL_PROVIDER=claude   # CLAUDE_MODEL defaults to haiku
+"$FLEET" test cef-smoke notification-bell --jobs 1
+```
 
-## Isolation — root cause fixed (PR #90 on `dev`)
+Suites let the model choose only typed UI actions. `expect`, state, and IPC pass
+conditions determine the result. Fleet enforces step, wall-time, token, and
+repetition limits and persists actions, usage, semantic frames, console,
+network, IPC, screenshot, and replay artifacts outside the model context.
 
-Tiles used to look un-isolated (all like the shared `8844`) because the headless app
-never reached its workspace: a **React StrictMode boot race** in `DucktapeProvider`
-dropped `connectActive`. Fixed in **PR #90** (merged to `dev`). To make a tile show a
-**live isolated** workspace, the fleet worktree must be on `dev` (for #90) and
-`fleet.sh up_one` must seed a workspace + set `DUCKTAPE_NODE_BIN` per instance.
-Until a given tile has that, its node-backed data is shared, not isolated
-(DOM/UI QA is valid regardless).
+Ducktape is CEF-only on `dev`; use `runtime: cef`. The plugin endpoint is a
+debug-build seam and is intentionally absent from release builds.
 
-## Notes
+### Action model: local binary execution, not an API key
 
-- **Dev only.** The debug endpoint rides the same dev-only `tauri-plugin-agent` seam
-  as [[tauri-debug]]; a release build registers nothing.
-- Bring instances up/down with `ops/fleet.sh` (see `ops/README.md`); this skill never
-  manages lifecycle itself — it drives what the fleet already runs. Pair it with
-  the repo worktree workflow for branch isolation.
+Fleet ≥ `17b2b40` runs the suite's action-chooser through a LOCAL binary; no
+`OPENAI_API_KEY` is needed (that requirement only exists on older fleet pins
+whose sole provider was the OpenAI Responses API — `app/package.json` pins the
+fleet revision; if `test` demands a key, the pin predates the binary runner).
+
+Two providers, both verified green on the `notification-bell` suite:
+
+- `FLEET_MODEL_PROVIDER=claude` — uses the `claude` CLI and its existing
+  Claude Code login, which every dev in this repo already has. `CLAUDE_MODEL`
+  defaults to `haiku` — the right tier for choosing one typed UI action per
+  step; don't reach for a bigger model unless a suite's objective genuinely
+  needs multi-step reasoning.
+- `FLEET_MODEL_PROVIDER=codex` (fleet's default) — uses the `codex` CLI
+  (`CODEX_MODEL` defaults to `gpt-5.3-codex-spark`). Requires a ChatGPT/Codex
+  subscription, which not every dev has — prefer `claude` in shared docs and
+  CI recipes.
+
+### Writing pass conditions — what each kind can and cannot see
+
+- **`expect` conditions are evaluated from step 0 and THROW on an absent
+  element** (`BRIDGE_UNAVAILABLE` → the whole run dies as
+  `infrastructure_failure` before the model acts). Only use `expect` for
+  elements that exist at app boot. Never gate on something the objective is
+  supposed to create.
+- **`ipc` conditions currently see nothing under CEF** — the captured invoke
+  ledger is empty (`tauri-agent ipc` returns `[]` even after real commands
+  run), so an `ipc: {command, ok}` condition can never pass. Don't use them
+  until IPC capture works in the CEF runtime.
+- **`state` probes are the reliable post-action assertion.** Register a
+  DOM-derived probe in `app/src/main.tsx`'s `WebviewAgentInstrumentation`
+  install (`state: { probeName: () => … }`), then assert it. `state.key`
+  resolves TOP-LEVEL only (`url` | `title` | `values` | `probes`) — a probe is
+  matched by deep-equalling the whole `probes` map:
+
+  ```json
+  { "state": { "key": "probes", "equals": { "notifyDropdownOpen": true } } }
+  ```
+
+  (Deep-equal over the full map means every registered probe appears in
+  `equals` — revisit if the probe set grows.)
+- **Budget for the binary runner is much larger than the old API runner**: the
+  semantic-tree observation rides through the model each step. `tokens: 30000`
+  passes; 1–2k dies at step 0 with `token limit exceeded`. `repetitions` counts
+  identical consecutive actions — a correct click that fails a broken pass
+  condition burns one repetition per retry, so a too-strict budget converts a
+  pass-condition bug into `repeated action limit exceeded`.
+
+Worked example: `.tauri-agent/suites/notification-bell.toon` (boot-safe button
+`expect` + the `notifyDropdownOpen` probe). Diagnose failures from the run
+artifacts under the instance directory: `run.json` (failure + message),
+`actions.jsonl` (what the model actually did), `ipc.jsonl`, `failure.png`.
+
+## Several worktrees or same-artifact instances
+
+```bash
+"$FLEET" up dev agent/my-branch
+"$FLEET" test cef-smoke cef-smoke --jobs 2
+```
+
+The first form builds each selected revision. The second builds the selected
+revision/CEF runtime once and launches isolated instances from the same cached
+artifact.
+
+## Linux host prerequisite fallback
+
+Linux Fleet expects `Xvfb` and `x11vnc` on PATH. macOS must not install or invoke
+either helper; Fleet launches the native application bundle directly. The
+existing remote-tauri staging can be used during Linux host migration:
+
+```bash
+export FLEET_VNC_COMMAND="$HOME/.local/opt/remote-tauri/root/usr/bin/x11vnc"
+export LD_LIBRARY_PATH="$HOME/.local/opt/remote-tauri/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```

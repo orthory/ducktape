@@ -16,7 +16,7 @@ use std::time::Duration;
 use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
 use overlay_net::userspace::UserspaceWireGuardEffect;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wireguard_effect::WireGuardEffect;
+use wireguard::effect::WireGuardEffect;
 
 /// a fixture chain /48 (the shape `ula_v6_prefix` mints) with per-node
 /// member /128s.

@@ -185,13 +185,17 @@ altered how forge composes its state root — from a single committed head to a
 canonical sorted hash over per-repo heads — which is precisely the kind of
 consensus-breaking change that a naive rolling restart would fork on.
 
-With this mechanism it ships cleanly: pre-ship a dual-path forge that computes the
-old single-head root below `H` and the new multi-repo root at and after `H`;
-schedule the upgrade through governance; roll the binary out node by node with
-each node signaling ready; and at `H` every ready node flips together over the
-teardown-respawn boundary. Nothing on disk moves — only the in-memory head
-encoding changes — which is what makes forge the safe first example of the policy
-in action.
+With this mechanism such a change ships cleanly: pre-ship a dual-path forge that
+computes the old single-head root below `H` and the new multi-repo root at and
+after `H`; schedule the upgrade through governance; roll the binary out node by
+node with each node signaling ready; and at `H` every ready node flips together
+over the teardown-respawn boundary. Nothing on disk moves — only the in-memory
+head encoding changes.
+
+In practice Ducktape shipped forge's root change as a flag day: with no
+production network to keep live, the in-tree dual-path forge demonstrator was
+retired and the new layout became the only one. The example stands as the shape
+any root-changing module upgrade takes once a live network exists.
 
 ## What this policy does not cover
 

@@ -10,14 +10,14 @@ use commonware_p2p::authenticated::discovery;
 use commonware_runtime::Supervisor;
 use commonware_utils::ordered::Set;
 
-use consensus::{ConsensusScheme, ContentStore, SimplexOrderer};
+use consensus::{ContentStore, SimplexOrderer};
 use directory::{DirMsg, encode_msg};
 use host::Host;
 use node::OrderedNode;
 use recovery::Recovery;
 use sdk::Msg;
 
-use crate::constants::{CONSENSUS_SCHEME, CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
+use crate::constants::{CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
 use crate::host_reads::resume_resident_keys;
 use crate::util::{diag_log, epoch_floor, hex};
 
@@ -70,22 +70,11 @@ impl<'a> EpochSpawner<'a> {
             std::process::exit(1);
         });
         let (vote, certificate, resolver, payload, fetch) = slot;
-        let scheme = match CONSENSUS_SCHEME {
-            ConsensusScheme::V1Ed25519 => {
-                simplex_ed25519::Scheme::signer(&self.namespace, participants, self.signer.clone())
-                    .expect("our key is in the validator participant set")
-            }
-            // the engine and tests are V2-capable (see consensus::BlsScheme);
-            // wiring V2 into the epoch respawn machinery needs the bls
-            // participant BiMap derived per epoch (valset-registered bls
-            // keys + proof-of-possession) — fail-stop until that lands.
-            ConsensusScheme::V2Bls => {
-                unimplemented!(
-                    "V2Bls node wiring lands with valset bls key registration; \
-                 the consensus engine itself is V2-capable"
-                )
-            }
-        };
+        // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
+        // rekey/respawn contract for what a scheme migration would take.
+        let scheme =
+            simplex_ed25519::Scheme::signer(&self.namespace, participants, self.signer.clone())
+                .expect("our key is in the validator participant set");
         // a SAME-EPOCH respawn passes the persisted finalization floor so
         // the reopened journal's replay does not re-report history the
         // recovered state already contains. a damaged floor FAILS — a
@@ -202,6 +191,9 @@ pub(super) async fn resume(
         boot_floor.map(|c| c.cert),
     );
     let view_base = resumed.as_ref().map(|r| r.view_base).unwrap_or(0);
+    // the drain realizes code-registry swaps through the SAME source recovery
+    // replay used (wired at Recovery::open) — lift it off before the move.
+    let code_source = recovery.code_source();
     let mut node = match resumed {
         Some(rec) => OrderedNode::resume(
             host,
@@ -215,6 +207,7 @@ pub(super) async fn resume(
         ),
         None => OrderedNode::with_sink(host, orderer, recovery),
     };
+    node.set_code_source(code_source);
     // the observation barrier: every drain batch ends AT a block that
     // moves the valset root, so the orchestration step below observes a
     // membership change at exactly its block's view — the same view on

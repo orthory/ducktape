@@ -19,6 +19,7 @@ import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
+import { classifyBootError } from "../../domain/boot-error";
 import type { NodeTransport } from "../../domain/transport";
 import { callSocketUrl } from "../../domain/transport";
 // Task 7 moved the huddle session to call-session (typed /v1/call/ws + audio +
@@ -38,6 +39,7 @@ import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
 import {
+  agentMentions,
   hasAgentMention,
   mentionableUsers,
   mentionResolverOf,
@@ -58,6 +60,8 @@ import {
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity } from "./auto-bind";
+import { navSnapshotOf } from "./nav-history";
+import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -66,8 +70,11 @@ import {
   channelIdOf,
   clearPendingDisplayName,
   clearRemoteUrl,
+  docTabsScope,
+  loadDocTabs,
   loadPendingDisplayName,
   removeTab,
+  resetNodeProjection,
   saveAccent,
   saveTheme,
   saveDocTabs,
@@ -107,13 +114,35 @@ export interface ConsoleActions {
    *  mark's cross-link. Best-effort: if the ring no longer holds that height
    *  the explorer just lands on the list. */
   openExplorerAt(height: number): void;
+  /** Jump to a forge item — the screen switch plus the one-shot forgeFocus
+   *  hand-off (the explorerFocus idiom). Used by the notification bell; the
+   *  navigate deep-link listener patches the same fields. */
+  openForgeItem(repo: string, number: number | null): void;
+  /** Jump to the files browser opened on `path` — the same one-shot hand-off,
+   *  used by the agent form to open a skill document in Files. */
+  openFiles(path: string): void;
+  /** Jump to an agent's detail — a clicked @agent mention (the forgeFocus idiom). */
+  openAgent(agentId: string): void;
+  /** Jump to a person in Members — a clicked @user mention. Takes the ACCOUNT id
+   *  the mention mark carries; the view resolves it to that account's node rows. */
+  openMember(accountId: string): void;
   /** The explorer calls this once it has consumed (or given up on) a pending
    *  focus hand-off. */
   clearExplorerFocus(): void;
+  /** AgentView / MembersView call these once the mention hand-off is consumed —
+   *  the focus is one-shot, so the same person can be clicked twice. */
+  clearAgentFocus(): void;
+  clearMemberFocus(): void;
   /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
    *  Jumps to the target rail's default surface when the current screen belongs
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
+  /** Apply a browser-history entry's nav snapshot — the popstate half of
+   *  back/forward (see nav-history.ts). Selections re-apply through the
+   *  rehydrating entry points, so a restored surface re-fetches recent data;
+   *  returns the snapshot actually honored (vanished targets are skipped) for
+   *  the caller to re-stamp onto the entry. */
+  applyNavSnapshot(snap: NavSnapshot): NavSnapshot;
   setAccent(accent: string): void;
   /** Flip the light/dark color theme and persist the choice. */
   toggleTheme(): void;
@@ -302,28 +331,37 @@ export interface ConsoleActions {
   /** Close a document tab; activates a neighbor if it was active. */
   closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
-   *  focus to the new block, so it must know the id before the round-trip). */
+   *  focus to the new block, so it must know the id before the round-trip).
+   *
+   *  Resolves true once the op commits, false if it failed (the failure is
+   *  already surfaced). The pages editor's split/merge use this to compensate:
+   *  a failed op is never rolled back, it is erased by the next authoritative
+   *  refresh, so a lost additive op would silently destroy text. */
   insertPageBlock(params: {
     blockId: string;
     parent: string;
     after: string | null;
     kind: PageBlockKind;
     text: string;
-  }): void;
-  /** Replace a block's text; on the page root this renames the page. */
-  updatePageBlockText(params: { blockId: string; text: string }): void;
+  }): Promise<boolean>;
+  /** Replace a block's text; on the page root this renames the page.
+   *  Resolves true once the op commits — see `insertPageBlock`. */
+  updatePageBlockText(params: { blockId: string; text: string }): Promise<boolean>;
   /** Convert a block to another kind (markdown shortcuts, slash menu). */
   setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
   /** Flip a Todo block's checked state. */
   setPageBlockChecked(params: { blockId: string; checked: boolean }): void;
-  /** Move a block under a (possibly new) parent in the active page. */
+  /** Move a block under a (possibly new) parent in the active page.
+   *  Resolves true once the op commits — see `insertPageBlock`. The merge gates
+   *  its RemoveBlock on this: a child that did not make it across to the adopter
+   *  is still under the block about to be deleted, subtree and all. */
   movePageBlock(params: {
     blockId: string;
     parent: string;
     after: string | null;
-  }): void;
-  /** Remove a block and its whole subtree. */
-  removePageBlock(blockId: string): void;
+  }): Promise<boolean>;
+  /** Remove a block AND ITS WHOLE SUBTREE. Resolves true once the op commits. */
+  removePageBlock(blockId: string): Promise<boolean>;
 
   // ── Comments (threads over the `comments` module) ──
   /** Load the open page's comment threads (page + every visible block). */
@@ -339,14 +377,15 @@ export interface ConsoleActions {
   resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
-  /** Upload the prompt text to the blob store, then RegisterAgent with the
-   *  resulting 32-byte digest as its prompt_hash. */
+  /** RegisterAgent with the agent's curated skill set — the `always` skills are
+   *  its persona, inlined into every run; nothing is staged in the blob store. */
   registerAgent(params: {
     displayName: string;
     agentId: string;
     capability: string;
-    prompt: string;
     allowedActions: string[];
+    caps?: agentClient.ResourceCaps;
+    skills?: agentClient.SkillRef[];
   }): void;
   /** Pause / resume an agent (owner-gated). */
   pauseAgent(agentId: string): void;
@@ -354,19 +393,35 @@ export interface ConsoleActions {
   /** Watch a channel under a turn policy / drop the watch. */
   watchChannel(params: { channelId: string; policy: TurnPolicy }): void;
   unwatchChannel(channelId: string): void;
-  /** Explicitly run an agent against a channel anchor. */
-  requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
+  /** Explicitly run an agent against a channel anchor. Optional `demands` are
+   *  per-run resource requirements (dimension → positive integer); omitted
+   *  from the wire when absent or empty. */
+  requestRun(params: {
+    agentId: string;
+    channelId: string;
+    anchorSeq: number;
+    demands?: Record<string, number>;
+  }): void;
+  /** Post a canned prompt to the active channel, then run an agent anchored on
+   *  it — the one-click "set up with an agent" path used by the sandbox
+   *  onboarding section. No-op without an active channel. */
+  startSetupRun(params: { agentId: string; prompt: string }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
-  /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
-   *  the blob store and its digest committed as the new prompt_hash; every
-   *  omitted field keeps its current value. */
+  /** Fence one attempt and move the run to a different provider. */
+  reassignRun(runId: string, attempt: number): void;
+  /** Owner-gated edit of a registered agent. Every omitted field keeps its
+   *  current value. */
   updateAgent(params: {
     agentId: string;
     displayName?: string;
     capability?: string;
-    prompt?: string;
     allowedActions?: string[];
+    /** REPLACES the whole caps record when present; omit to keep it. */
+    caps?: agentClient.ResourceCaps;
+    /** REPLACES the whole curated skill set when present (an empty array clears
+     *  it); omit to keep it. */
+    skills?: agentClient.SkillRef[];
   }): void;
   /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
    *  can process job-backed runs. */
@@ -374,8 +429,14 @@ export interface ConsoleActions {
 
   // ── Governance (proposals + votes over the `governance` module) ──
   /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
-   *  Membership-gated by the module: only a current validator can propose. */
+   *  The module gates this to the proposal-time governance electorate. */
   proposeSignal(text: string): void;
+  /** Initialize explicit, non-transferable Identity-account shares. */
+  proposeAdoptShares(allocations: Array<{ accountId: string; shares: number }>): void;
+  /** Set one account's shares; zero removes it from future electorates. */
+  proposeSetShares(accountId: string, shares: number): void;
+  /** Switch future proposals between account shares and validator ballots. */
+  proposeSetShareMode(enabled: boolean): void;
   /** Cast (or change) this node's ballot on an open proposal. */
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
@@ -477,6 +538,9 @@ export interface ConsoleActions {
    *  the node left its valset flags `state.deleteNeedsForce` with this id —
    *  call again with `force` to override that uncertainty. */
   deleteWorkspace(id: string, force?: boolean): void;
+  /** Show the account-centric Home layer over the shell — a pure view toggle,
+   *  the node connection is kept alive underneath (not a disconnect). */
+  goHome(): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -512,6 +576,7 @@ export function createActions({
   const patch = (p: Partial<ConsoleState>) => dispatch({ type: "patch", patch: p });
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
+  const isCurrentNode = (live: NodeTransport): boolean => getNode() === live;
 
   /** The live transport + active workspace the account writes sign against.
    *  Throws when disconnected — callers wrap it in a promise chain, so the
@@ -532,6 +597,16 @@ export function createActions({
   // The tag filter's own token, same discipline: setTagFilter/clearTagFilter
   // (and a channel switch) bump it so a stale tagSearch can't land.
   let tagToken = 0;
+
+  /** Clear every node-owned slice and supersede query fan-outs that use local
+   * tokens rather than the provider's transport-bound hydration guard. */
+  const resetForNodeChange = (): Partial<ConsoleState> => {
+    searchToken += 1;
+    tagToken += 1;
+    return resetNodeProjection();
+  };
+  const currentDocTabsScope = (): string =>
+    docTabsScope(getState().workspace?.id ?? null, getState().nodeUrl);
 
   // The live call session (the browser audio graph + camera + ws), or null when
   // not in a huddle. Ephemeral and per-client — it lives here, not in state;
@@ -801,7 +876,7 @@ export function createActions({
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
   ) => {
     const live = getNode();
-    if (!live) return Promise.resolve();
+    if (!live) return Promise.resolve(false);
     const startedAt = Date.now();
     update((prev) => ({
       ...(preconfirm ? preconfirm(prev) : {}),
@@ -810,14 +885,51 @@ export function createActions({
     return Promise.resolve()
       .then(() => submit(live))
       .then((result) => {
+        if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: finalizeOp(prev.ops, key, receiptOf(result)) }));
-        return refresh();
+        return refresh().then(() => true);
       })
       .catch((err) => {
+        if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
         fail(err);
-        return refresh();
+        // resolve false rather than reject: a failed op is already surfaced to
+        // the user here, and rejecting would turn every caller that ignores the
+        // result into an unhandled rejection. `false` therefore means "this op
+        // did not land" — whether it failed or the node switched underneath it.
+        // Callers gate their follow-up work on it, so a failed write can no
+        // longer trigger a success-only side effect (the pages editor's
+        // compensating split/merge depends on this, and it stops
+        // `createChildPage` from opening a page that was never created).
+        return refresh().then(() => false);
       });
+  };
+
+  // The transport gives NO ordering guarantee. `/v1/submit` is one independent
+  // HTTP POST per op (transport.ts), and the node's handler pushes each one onto
+  // the mempool as it ARRIVES, so ops drain in arrival order — two submits fired
+  // in the same tick can reach it either way round.
+  //
+  // The pages editor issues ANCHOR-CHAINED ops: a paste inserts each block
+  // `after` the one before it, a duplicate parents each copy under the copy
+  // above it, and a merge re-parents children onto the adopter and only THEN
+  // removes their old parent. Every one of those is a rejected op
+  // (AnchorNotFound / ParentNotFound) or a destroyed subtree if it lands early —
+  // that is how a merge of a parent with two children lost the second one.
+  //
+  // So page-block ops reach the node one at a time, in issue order. Only the
+  // WIRE is serialized: submitTracked applies the optimistic projection before
+  // it ever calls the submit thunk, so a 60-block paste still renders in one
+  // tick. A rejected op must not wedge the queue behind it, so the chain swallows
+  // its outcome (submitTracked still sees the real one).
+  let pageWire: Promise<unknown> = Promise.resolve();
+  const inPageOrder = <T,>(send: () => Promise<T>): Promise<T> => {
+    const sent = pageWire.then(send, send);
+    pageWire = sent.then(
+      () => undefined,
+      () => undefined,
+    );
+    return sent;
   };
 
   // switching channels means: new active channel, thread panel closed, any
@@ -837,15 +949,26 @@ export function createActions({
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
-      .then((messages) => patch({ messages }))
-      .catch(fail);
+      .then((messages) =>
+        update((prev) =>
+          isCurrentNode(live) && prev.activeChannel === channelId ? { messages } : {},
+        ),
+      )
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // A first agent mention in an UNWATCHED channel creates the runs watch the
   // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
   // the post — otherwise the mention commits with nothing routing it to the
   // agent. An existing watch of ANY policy is respected, never overwritten.
-  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<unknown> => {
+  //
+  // It resolves VOID, not the op's outcome, and that is deliberate: the post
+  // waits for the watch but must never be GATED on it. A failed watch is already
+  // surfaced in the ledger and costs the user a routed mention; swallowing the
+  // message they typed costs them the message.
+  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<void> => {
     if (!hasAgentMention(blocks)) return Promise.resolve();
     if (getState().watches.some((watch) => watch.channel_id === channelId))
       return Promise.resolve();
@@ -858,7 +981,7 @@ export function createActions({
           origin: getState().author,
         }),
       (prev) => optimistic.watchSet(prev, { channelId, policy: "mention" }),
-    );
+    ).then(() => undefined);
   };
 
   const mentionResolver = () => {
@@ -879,7 +1002,7 @@ export function createActions({
     channelId: string,
     body: string,
     thread: number | null,
-  ): Promise<unknown> => {
+  ): Promise<boolean> => {
     const messageId = crypto.randomUUID();
     const blocks = parseMessageInput(body, mentionResolver());
     const author = getState().author;
@@ -911,6 +1034,12 @@ export function createActions({
   // have touched the root or a reply. `submitTracked` already refreshed the
   // flat `state.messages` (every sequence, replies included), but the thread
   // panel reads a separate snapshot, so it needs this extra cheap re-query.
+  //
+  // It runs whether the write LANDED OR NOT, and that is the point: an edit /
+  // delete / reaction paints an optimistic projection into the thread panel, and
+  // a failed op is never rolled back — it is erased by the authoritative refresh.
+  // `refresh()` does not cover this per-screen slice. Skipping the resync on
+  // failure is what left a deleted-but-still-there message on screen.
   const resyncOpenThread = (): Promise<void> => {
     const live = getNode();
     const channelId = getState().activeChannel;
@@ -919,19 +1048,28 @@ export function createActions({
     return chatClient
       .thread(live, { channelId, rootSeq: root.seq })
       .then((activeThread) =>
-        update((prev) => (prev.activeThread?.root.seq === root.seq ? { activeThread } : {})),
+        update((prev) =>
+          isCurrentNode(live) && prev.activeThread?.root.seq === root.seq
+            ? { activeThread }
+            : {},
+        ),
       )
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // load the comment threads for the open page (the page id + every visible
   // block id) in one batch; refreshed on open and after any comment op.
-  const loadPageThreads = (blocksOverride?: PageBlock[]): Promise<void> => {
+  const loadPageThreads = (
+    blocksOverride?: PageBlock[],
+    source?: { live: NodeTransport; page: string },
+  ): Promise<void> => {
     // `blocks` is passed by callers that JUST fetched the tree, because
     // getState().activePageBlocks lags a dispatch (stateRef updates on render);
     // reading it here would ship only the page target and miss every block.
-    const live = getNode();
-    const page = getState().activePage;
+    const live = source?.live ?? getNode();
+    const page = source?.page ?? getState().activePage;
     if (!live || !page) {
       patch({ pageThreads: [] });
       return Promise.resolve();
@@ -948,8 +1086,16 @@ export function createActions({
     const batches: string[][] = [];
     for (let i = 0; i < targets.length; i += CHUNK) batches.push(targets.slice(i, i + CHUNK));
     return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
-      .then((results) => patch({ pageThreads: results.flat() }))
-      .catch(fail);
+      .then((results) =>
+        update((prev) =>
+          isCurrentNode(live) && prev.activePage === page
+            ? { pageThreads: results.flat() }
+            : {},
+        ),
+      )
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // load the active page's block tree + its comment threads (threads keyed off
@@ -961,10 +1107,15 @@ export function createActions({
     Promise.resolve()
       .then(() => pagesClient.getPage(live, pageId))
       .then((blocks) => {
-        patch({ activePageBlocks: blocks ?? [] });
-        return loadPageThreads(blocks ?? []);
+        if (!isCurrentNode(live)) return;
+        update((prev) =>
+          prev.activePage === pageId ? { activePageBlocks: blocks ?? [] } : {},
+        );
+        return loadPageThreads(blocks ?? [], { live, page: pageId });
       })
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   // the single entry point into a page: make it active (opening a tab), then
@@ -974,7 +1125,7 @@ export function createActions({
     const live = getNode();
     if (!live || !pageId) return;
     const tabs = addTab(getState().openTabs, pageId);
-    saveDocTabs(tabs);
+    saveDocTabs(currentDocTabsScope(), tabs);
     patch({
       activePage: pageId,
       activePageBlocks: [],
@@ -991,7 +1142,7 @@ export function createActions({
   // would re-stage the just-closed id.
   const closeTabLocal = (pageId: string) => {
     const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
-    saveDocTabs(tabs);
+    saveDocTabs(currentDocTabsScope(), tabs);
     if (active && active !== getState().activePage) {
       patch({ openTabs: tabs, activePage: active, activePageBlocks: [], pageThreads: [] });
       loadActivePage(active);
@@ -1024,9 +1175,13 @@ export function createActions({
     return forgeClient
       .listItems(live, repo)
       .then((items) =>
-        update((prev) => (prev.forgeRepo === repo ? { forgeItems: items } : {})),
+        update((prev) =>
+          isCurrentNode(live) && prev.forgeRepo === repo ? { forgeItems: items } : {},
+        ),
       )
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
   };
 
   const loadForgeBranches = (repo: string): Promise<void> => {
@@ -1036,9 +1191,83 @@ export function createActions({
     return forgeClient
       .listRefs(live, repo)
       .then((refs) =>
-        update((prev) => (prev.forgeRepo === repo ? { forgeBranches: refs } : {})),
+        update((prev) =>
+          isCurrentNode(live) && prev.forgeRepo === repo ? { forgeBranches: refs } : {},
+        ),
       )
-      .catch(fail);
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
+  };
+
+  // ── Browser-history traversal ──
+  // Apply a history entry's NavSnapshot (see nav-history.ts) — the popstate
+  // half of browser back/forward. Selections route through the same entry
+  // points user clicks take (enterChannel / enterPage / the one-shot focus
+  // hand-offs), so every restored target re-fetches its data from the node
+  // rather than rendering a stale copy. Returns the snapshot actually
+  // honored — a selection whose target vanished from the committed data (or
+  // that another workspace minted) is skipped, and the caller re-stamps the
+  // entry with the honored result so the stack and the store converge.
+  const applyNavSnapshot = (snap: NavSnapshot): NavSnapshot => {
+    const before = getState();
+    // Gated bodies (onboarding, the join waiting room, a boot failure) own
+    // the window — traversal must not fight them.
+    if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
+      return navSnapshotOf(before);
+    }
+
+    // Selections apply only within the scope that minted them, only under the
+    // shell (never through the Home layer), and only when the target still
+    // exists in the recentmost committed data.
+    const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
+    const channel =
+      scopeMatches && snap.channel && before.channels.some((c) => c.id === snap.channel)
+        ? snap.channel
+        : null;
+    const page =
+      scopeMatches && snap.page && before.pages.some((p) => p.id === snap.page)
+        ? snap.page
+        : null;
+    const forge =
+      scopeMatches && snap.screen === "forge" && snap.forgeRepo
+        ? { repo: snap.forgeRepo, number: snap.forgeItem }
+        : null;
+    const explorer =
+      scopeMatches && snap.screen === "explorer" ? snap.explorer : null;
+    const agent = scopeMatches && snap.screen === "agent" ? snap.agent : null;
+    const member = scopeMatches && snap.screen === "members" ? snap.member : null;
+
+    // The entry recorded the LIVE rail, so adopt it verbatim — re-deriving via
+    // sectionForScreen would lose a shell screen's remembered rail.
+    saveViewMode(snap.viewMode);
+    patch({
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      ...(forge ? { forgeFocus: forge } : {}),
+      ...(explorer !== null ? { explorerFocus: explorer } : {}),
+      ...(agent ? { agentFocus: agent } : {}),
+      ...(member ? { memberFocus: member } : {}),
+    });
+    if (channel && channel !== before.activeChannel) enterChannel(channel);
+    if (page && page !== before.activePage) enterPage(page);
+
+    // Built from what was applied, not re-read: the reducer runs on the next
+    // render tick, so getState() here would still see the pre-apply state.
+    return {
+      scope: currentDocTabsScope(),
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      channel: channel ?? before.activeChannel,
+      page: page ?? before.activePage,
+      forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
+      forgeItem: forge ? forge.number : (before.forgeFocus?.number ?? null),
+      explorer: explorer ?? before.explorerFocus,
+      agent: agent ?? before.agentFocus,
+      member: member ?? before.memberFocus,
+    };
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -1058,8 +1287,12 @@ export function createActions({
     // staleness this clear prevents.
     setNode(null);
     patch({
+      ...resetForNodeChange(),
       workspace: target,
+      openTabs: loadDocTabs(docTabsScope(target.id, null)),
       needsOnboarding: false,
+      // entering a workspace shell leaves the Home layer (no disconnect elsewhere).
+      atHome: false,
       onboardingBusy: false,
       // a force-forget/delete offer is scoped to the workspace it was raised
       // for; switching targets clears it so it can never fire on the wrong one.
@@ -1072,11 +1305,6 @@ export function createActions({
       bootError: null,
       connectionDown: null,
       error: null,
-      // per-node observability belonging to the workspace we're leaving; the
-      // node effect re-hydrates blocks and re-follows the block stream once
-      // the new node is set below.
-      lastBlock: null,
-      blocks: [],
       // a non-member target parks first: seed the waiting-room phase NOW so
       // the console shell (still holding the previous workspace's residual
       // projections) can never flash during the async select/poll below.
@@ -1210,6 +1438,7 @@ export function createActions({
               // a hollow disconnected console whose toast then vanishes.
               patch({
                 bootError: {
+                  kind: classifyBootError(reason, log.tail),
                   workspaceId: target.id,
                   reason,
                   logPath: log.path,
@@ -1256,6 +1485,60 @@ export function createActions({
     clearExplorerFocus: () => {
       patch({ explorerFocus: null });
     },
+
+    openAgent: (agentId) => {
+      // Same rail-adoption contract as setScreen.
+      const section = sectionForScreen("agent");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "agent", viewMode: section, agentFocus: agentId });
+      } else {
+        patch({ screen: "agent", agentFocus: agentId });
+      }
+    },
+
+    clearAgentFocus: () => {
+      patch({ agentFocus: null });
+    },
+
+    openMember: (accountId) => {
+      // Members lives on the OPERATOR rail — a mention clicked from chat (a user
+      // surface) has to move the rail with it or the sidebar and body disagree.
+      const section = sectionForScreen("members");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "members", viewMode: section, memberFocus: accountId });
+      } else {
+        patch({ screen: "members", memberFocus: accountId });
+      }
+    },
+
+    clearMemberFocus: () => {
+      patch({ memberFocus: null });
+    },
+
+    openForgeItem: (repo, number) => {
+      // Same rail-adoption contract as setScreen.
+      const section = sectionForScreen("forge");
+      const forgeFocus = { repo, number };
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "forge", viewMode: section, forgeFocus });
+      } else {
+        patch({ screen: "forge", forgeFocus });
+      }
+    },
+
+    openFiles: (path) => {
+      const section = sectionForScreen("files");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "files", viewMode: section, filesFocus: path });
+      } else {
+        patch({ screen: "files", filesFocus: path });
+      }
+    },
+    applyNavSnapshot,
 
     setViewMode: (mode) => {
       saveViewMode(mode);
@@ -1398,7 +1681,9 @@ export function createActions({
             postPolicy,
             at: Date.now(),
           }),
-      ).then(() => enterChannel(channelId));
+      ).then((current) => {
+        if (current) enterChannel(channelId);
+      });
     },
 
     sendMessage: (body) => {
@@ -1418,8 +1703,16 @@ export function createActions({
       if (!live || !channelId) return;
       Promise.resolve()
         .then(() => chatClient.thread(live, { channelId, rootSeq }))
-        .then((activeThread) => patch({ activeThread }))
-        .catch(fail);
+        .then((activeThread) =>
+          update((prev) =>
+            isCurrentNode(live) && prev.activeChannel === channelId
+              ? { activeThread }
+              : {},
+          ),
+        )
+        .catch((err) => {
+          if (isCurrentNode(live)) fail(err);
+        });
     },
 
     closeThread: () => patch({ activeThread: null }),
@@ -1461,7 +1754,7 @@ export function createActions({
             origin: getState().author,
           }),
         (prev) => optimistic.editedMessage(prev, channelId, seq, blocks, Date.now()),
-      ).then(resyncOpenThread);
+      ).then(() => resyncOpenThread());
     },
 
     deleteMessage: (seq) => {
@@ -1472,7 +1765,7 @@ export function createActions({
         (live) =>
           chatClient.deleteMessage(live, { channelId, seq, origin: getState().author }),
         (prev) => optimistic.deletedMessage(prev, channelId, seq),
-      ).then(resyncOpenThread);
+      ).then(() => resyncOpenThread());
     },
 
     toggleReaction: (seq, emoji) => {
@@ -1504,19 +1797,7 @@ export function createActions({
             : chatClient.addReaction(live, { channelId, seq, emoji, origin }),
         (prev) =>
           optimistic.reactionToggled(prev, channelId, seq, emoji, selfBytes, Boolean(mine)),
-      ).then(() => {
-        const live = getNode();
-        const root = getState().activeThread?.root;
-        if (!live || !root) return;
-        return chatClient
-          .thread(live, { channelId, rootSeq: root.seq })
-          .then((activeThread) =>
-            update((prev) =>
-              prev.activeThread?.root.seq === root.seq ? { activeThread } : {},
-            ),
-          )
-          .catch(fail);
-      });
+      ).then(() => resyncOpenThread());
     },
 
     // ── Huddle ──
@@ -1547,20 +1828,23 @@ export function createActions({
             authorBytes: selfAuthorBytes(prev.status, prev.author),
             at: Math.floor(Date.now() / 1000),
           }),
-      ).then(() => {
-        // consensus refused the join (members-only, roster full): the audio
-        // session must not keep streaming into a huddle we are not in.
-        const settled = getState();
-        if (
-          settled.ops[opKey.huddle(channelId)]?.phase === "failed" &&
-          settled.voice.channelId === channelId
-        ) {
-          stopVoice();
-          // the session is gone — camera/beacon state must not outlive it.
-          update((prev) => ({
-            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
-          }));
-        }
+      ).then((current) => {
+        if (current) return; // the join landed
+        // The join did NOT land — consensus refused it (members-only, roster
+        // full) or the node went away. The audio session must not keep streaming
+        // into a huddle we are not in.
+        //
+        // This branch used to be gated on `current` being TRUE and then re-read
+        // the op's "failed" phase out of the ledger. Once submitTracked started
+        // resolving FALSE on a failed op, `if (!current) return` bailed out on
+        // exactly the case it was written to catch, and a refused join went on
+        // streaming. The boolean IS the phase; ask it directly.
+        if (getState().voice.channelId !== channelId) return;
+        stopVoice();
+        // the session is gone — camera/beacon state must not outlive it.
+        update((prev) => ({
+          voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
+        }));
       });
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
@@ -1735,7 +2019,7 @@ export function createActions({
           body,
           origin: getState().author,
         }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     openForgePr: ({ repo, title, body, sourceBranch, targetBranch }) => {
@@ -1749,7 +2033,7 @@ export function createActions({
           targetBranch,
           origin: getState().author,
         }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     editForgeItem: ({ repo, number, title, body }) => {
@@ -1757,14 +2041,14 @@ export function createActions({
       if (!repo || (title === null && body === null)) return Promise.resolve();
       return submitTracked(opKey.forgeItem(repo, number), (live) =>
         forgeClient.editItem(live, { repo, number, title, body, origin: getState().author }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     setForgeItemState: ({ repo, number, open }) => {
       if (!repo) return Promise.resolve();
       return submitTracked(opKey.forgeItem(repo, number), (live) =>
         forgeClient.setItemState(live, { repo, number, open, origin: getState().author }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     mergeForgePr: ({ repo, number, prevTargetOid, expectedSourceOid, mergeOid, packDigest }) => {
@@ -1780,7 +2064,11 @@ export function createActions({
           origin: getState().author,
         }),
         // a merge moves the target branch head too — reload both slices.
-      ).then(() => Promise.all([loadForgeItems(repo), loadForgeBranches(repo)])).then(() => {});
+      ).then((current) =>
+        current
+          ? Promise.all([loadForgeItems(repo), loadForgeBranches(repo)]).then(() => {})
+          : undefined,
+      );
     },
 
     submitForgeReview: ({ repo, number, verdict, body, commitOid, comments }) => {
@@ -1795,7 +2083,7 @@ export function createActions({
           comments,
           origin: getState().author,
         }),
-      ).then(() => loadForgeItems(repo));
+      ).then((current) => (current ? loadForgeItems(repo) : undefined));
     },
 
     // ── Docs ──
@@ -1804,8 +2092,12 @@ export function createActions({
       if (!live) return;
       Promise.resolve()
         .then(() => pagesClient.listPages(live))
-        .then((pages) => patch({ pages }))
-        .catch(fail);
+        .then((pages) => {
+          if (isCurrentNode(live)) patch({ pages });
+        })
+        .catch((err) => {
+          if (isCurrentNode(live)) fail(err);
+        });
     },
 
     openPage: enterPage,
@@ -1820,7 +2112,9 @@ export function createActions({
         opKey.page(pageId),
         (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
         (prev) => optimistic.pageCreated(prev, { pageId, title: "", parent }),
-      ).then(() => enterPage(pageId));
+      ).then((current) => {
+        if (current) enterPage(pageId);
+      });
     },
 
     // kept for programmatic/test callers that pass a title.
@@ -1830,7 +2124,9 @@ export function createActions({
         opKey.page(pageId),
         (live) => pagesClient.createPage(live, { pageId, title: title.trim() }),
         (prev) => optimistic.pageCreated(prev, { pageId, title: title.trim() }),
-      ).then(() => enterPage(pageId));
+      ).then((current) => {
+        if (current) enterPage(pageId);
+      });
     },
 
     setPageParent: ({ pageId, parent }) => {
@@ -1842,9 +2138,19 @@ export function createActions({
     deletePage: (pageId) => {
       if (!pageId) return;
       submitTracked(opKey.page(pageId), (live) => pagesClient.deletePage(live, pageId))
-        .then(() => {
+        .then((current) => {
+          if (!current) return;
           const live = getNode();
-          if (live) pagesClient.listPages(live).then((pages) => patch({ pages })).catch(fail);
+          if (live) {
+            pagesClient
+              .listPages(live)
+              .then((pages) => {
+                if (isCurrentNode(live)) patch({ pages });
+              })
+              .catch((err) => {
+                if (isCurrentNode(live)) fail(err);
+              });
+          }
         })
         .catch(fail);
       // close its tab immediately (optimistic UX).
@@ -1861,9 +2167,18 @@ export function createActions({
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
+      const mentions = agentMentions(parseMessageInput(clean, mentionResolver()));
       submitTracked(opKey.commentThread(tid), (live) =>
-        pagesClient.addComment(live, { threadId: tid, commentId, target, text: clean }),
-      ).then(() => loadPageThreads());
+        pagesClient.addComment(live, {
+          threadId: tid,
+          commentId,
+          target,
+          text: clean,
+          mentions,
+        }),
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     editComment: ({ commentId, text }) => {
@@ -1871,32 +2186,42 @@ export function createActions({
       if (!clean) return;
       submitTracked(opKey.comment(commentId), (live) =>
         pagesClient.editComment(live, { commentId, text: clean }),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     deleteComment: (commentId) => {
       submitTracked(opKey.comment(commentId), (live) =>
         pagesClient.deleteComment(live, commentId),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
     resolveThread: ({ threadId, resolved }) => {
       submitTracked(opKey.commentThread(threadId), (live) =>
         pagesClient.resolveThread(live, { threadId, resolved }),
-      ).then(() => loadPageThreads());
+      ).then((current) => {
+        if (current) return loadPageThreads();
+      });
     },
 
+    // Every page-block write goes out through `inPageOrder` — the editor's ops
+    // are anchor-chained and the wire has no ordering of its own.
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
       const page = getState().activePage;
-      if (!page) return;
-      submitTracked(
+      if (!page) return Promise.resolve(false);
+      return submitTracked(
         opKey.pageBlock(blockId),
         (live) =>
-          pagesClient.insertBlock(live, {
-            parent,
-            after,
-            block: { id: blockId, kind, text },
-          }),
+          inPageOrder(() =>
+            pagesClient.insertBlock(live, {
+              parent,
+              after,
+              block: { id: blockId, kind, text },
+            }),
+          ),
         (prev) =>
           optimistic.pageBlockInserted(prev, {
             parent,
@@ -1906,67 +2231,63 @@ export function createActions({
       );
     },
 
-    updatePageBlockText: ({ blockId, text }) => {
+    updatePageBlockText: ({ blockId, text }) =>
       submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.updateText(live, { blockId, text }),
+        (live) => inPageOrder(() => pagesClient.updateText(live, { blockId, text })),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
-      );
-    },
+      ),
 
     setPageBlockKind: ({ blockId, kind }) => {
-      submitTracked(
+      void submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.setKind(live, { blockId, kind }),
+        (live) => inPageOrder(() => pagesClient.setKind(live, { blockId, kind })),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { kind }),
       );
     },
 
     setPageBlockChecked: ({ blockId, checked }) => {
-      submitTracked(
+      void submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.setChecked(live, { blockId, checked }),
+        (live) => inPageOrder(() => pagesClient.setChecked(live, { blockId, checked })),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { checked }),
       );
     },
 
-    movePageBlock: ({ blockId, parent, after }) => {
-      submitTracked(opKey.pageBlock(blockId), (live) =>
-        pagesClient.moveBlock(live, { blockId, parent, after }),
-      );
-    },
-
-    removePageBlock: (blockId) => {
-      if (!blockId) return;
+    movePageBlock: ({ blockId, parent, after }) =>
       submitTracked(
         opKey.pageBlock(blockId),
-        (live) => pagesClient.removeBlock(live, blockId),
+        (live) => inPageOrder(() => pagesClient.moveBlock(live, { blockId, parent, after })),
+        (prev) => optimistic.pageBlockMoved(prev, { blockId, parent, after }),
+      ),
+
+    removePageBlock: (blockId) => {
+      if (!blockId) return Promise.resolve(false);
+      return submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => inPageOrder(() => pagesClient.removeBlock(live, blockId)),
         (prev) => optimistic.pageBlockRemoved(prev, blockId),
       );
     },
 
     // ── Agents ──
-    registerAgent: ({ displayName, agentId, capability, prompt, allowedActions }) => {
+    registerAgent: ({ displayName, agentId, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       const name = displayName.trim();
       const tag = capability.trim();
       if (!id || !name || !tag) return;
+      // No blob upload: the agent's persona is a duckfs document its skill refs
+      // point at, so registration commits pins — never prompt bytes.
       submitTracked(opKey.agent(id), (live) =>
-        // stage the prompt in the node's blob store, then register with its
-        // digest as prompt_hash — the blob is keyed by sha256(bytes), which
-        // IS the hash the oracle worker fetches the prompt by.
-        Promise.resolve()
-          .then(() => live.putBlob(new TextEncoder().encode(prompt)))
-          .then((digest) =>
-            agentClient.registerAgent(live, {
-              agentId: id,
-              displayName: name,
-              capability: tag,
-              promptHash: agentClient.hexToBytes(digest),
-              allowedActions,
-              origin: getState().author,
-            }),
-          ),
+        agentClient.registerAgent(live, {
+          agentId: id,
+          displayName: name,
+          capability: tag,
+          allowedActions,
+          caps,
+          skills,
+          origin: getState().author,
+        }),
       );
     },
 
@@ -2015,16 +2336,40 @@ export function createActions({
       );
     },
 
-    requestRun: ({ agentId, channelId, anchorSeq }) => {
+    requestRun: ({ agentId, channelId, anchorSeq, demands }) => {
       if (!agentId || !channelId) return;
       submitTracked(opKey.runRequest(agentId), (live) =>
         runsClient.requestRun(live, {
           agentId,
           channelId,
           anchorSeq,
+          demands,
           origin: getState().author,
         }),
       );
+    },
+
+    startSetupRun: ({ agentId, prompt }) => {
+      const channelId = getState().activeChannel;
+      if (!agentId || !channelId || !prompt.trim()) return;
+      // Post the canned prompt, then anchor the run on it. postToChannel
+      // resolves after the submit + refresh, so the committed message is in
+      // state; its seq is the newest in the channel (single-writer node).
+      void postToChannel(channelId, prompt, null).then((ok) => {
+        if (!ok) return;
+        const seq = getState()
+          .messages.filter((m) => m.channel_id === channelId)
+          .reduce((max, m) => Math.max(max, m.seq), 0);
+        if (seq <= 0) return;
+        submitTracked(opKey.runRequest(agentId), (live) =>
+          runsClient.requestRun(live, {
+            agentId,
+            channelId,
+            anchorSeq: seq,
+            origin: getState().author,
+          }),
+        );
+      });
     },
 
     cancelRun: (runId) => {
@@ -2036,32 +2381,34 @@ export function createActions({
       );
     },
 
-    updateAgent: ({ agentId, displayName, capability, prompt, allowedActions }) => {
+    reassignRun: (runId, attempt) => {
+      if (!runId || attempt < 0) return;
+      submitTracked(opKey.run(runId), (live) =>
+        runsClient.reassignRun(live, {
+          runId,
+          attempt,
+          origin: getState().author,
+        }),
+      );
+    },
+
+    updateAgent: ({ agentId, displayName, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       if (!id) return;
       submitTracked(
         opKey.agent(id),
         (live) =>
-        Promise.resolve()
-          // a provided prompt is re-staged in the blob store; its digest becomes
-          // the new prompt_hash. An absent prompt leaves the hash untouched.
-          .then(() =>
-            prompt !== undefined && prompt.length > 0
-              ? live
-                  .putBlob(new TextEncoder().encode(prompt))
-                  .then((digest) => agentClient.hexToBytes(digest))
-              : null,
-          )
-          .then((promptHash) =>
-            agentClient.updateAgent(live, {
-              agentId: id,
-              displayName: displayName?.trim() || null,
-              capability: capability?.trim() || null,
-              promptHash,
-              allowedActions: allowedActions ?? null,
-              origin: getState().author,
-            }),
-          ),
+          agentClient.updateAgent(live, {
+            agentId: id,
+            displayName: displayName?.trim() || null,
+            capability: capability?.trim() || null,
+            allowedActions: allowedActions ?? null,
+            caps: caps ?? null,
+            // A provided list REPLACES the curated set wholesale (an empty array
+            // clears it); undefined keeps whatever is committed.
+            skills: skills ?? null,
+            origin: getState().author,
+          }),
         (prev) =>
           optimistic.agentPatched(prev, id, {
             ...(displayName?.trim() ? { display_name: displayName.trim() } : {}),
@@ -2077,9 +2424,9 @@ export function createActions({
     },
 
     // ── Governance ──
-    // Every submit is signed by THIS node's validator key (the daemon ignores the
-    // claimed origin), so these carry no origin. `refresh()` re-reads the proposal
-    // set after each write.
+    // Every submit is signed by THIS node's authenticated key (the daemon ignores
+    // the claimed origin), so these carry no origin. `refresh()` re-reads the
+    // proposal set after each write.
     proposeSignal: (text) => {
       const body = text.trim();
       if (!body) return;
@@ -2088,6 +2435,50 @@ export function createActions({
         governanceClient.propose(live, {
           proposalId,
           action: { signal: { text: body } },
+        }),
+      );
+    },
+
+    proposeAdoptShares: (allocations) => {
+      if (allocations.length === 0) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: {
+            adopt_shares: {
+              allocations: allocations.map(({ accountId, shares }) => ({
+                account_id: agentClient.hexToBytes(accountId),
+                shares,
+              })),
+            },
+          },
+        }),
+      );
+    },
+
+    proposeSetShares: (accountId, shares) => {
+      if (!accountId) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: {
+            set_shares: {
+              account_id: agentClient.hexToBytes(accountId),
+              shares,
+            },
+          },
+        }),
+      );
+    },
+
+    proposeSetShareMode: (enabled) => {
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: { set_share_mode: { enabled } },
         }),
       );
     },
@@ -2126,11 +2517,11 @@ export function createActions({
           ]),
         )
         .then(([chat, docs]) => {
-          if (token !== searchToken) return; // a newer query superseded this one
+          if (!isCurrentNode(live) || token !== searchToken) return;
           patch({ search: { query, chat, docs }, searchPending: false });
         })
         .catch((err) => {
-          if (token !== searchToken) return;
+          if (!isCurrentNode(live) || token !== searchToken) return;
           patch({ searchPending: false });
           fail(err);
         });
@@ -2157,11 +2548,11 @@ export function createActions({
       chatClient
         .tagSearch(live, { tag: clean, channelId: channelId ?? undefined, limit: 100 })
         .then((hits) => {
-          if (token !== tagToken) return; // superseded by a newer filter/clear
+          if (!isCurrentNode(live) || token !== tagToken) return;
           patch({ tagHits: hits, tagHitsPending: false });
         })
         .catch((err) => {
-          if (token !== tagToken) return;
+          if (!isCurrentNode(live) || token !== tagToken) return;
           patch({ tagHitsPending: false });
           fail(err);
         });
@@ -2180,7 +2571,11 @@ export function createActions({
         .tags(live, { channelId, limit: 20 })
         .then((rows) => {
           // only land on the channel the load was asked for.
-          if (getState().activeChannel === channelId) patch({ channelTags: rows });
+          update((prev) =>
+            isCurrentNode(live) && prev.activeChannel === channelId
+              ? { channelTags: rows }
+              : {},
+          );
         })
         // best-effort: an older node without the index tier 404s the view.
         .catch(() => {});
@@ -2264,29 +2659,8 @@ export function createActions({
       // progressing one just re-runs the idempotent connect).
       if (target.id === getState().workspace?.id && target.member) return;
       const enter = (): void => {
-        // drop the old node + its projections so the switch shows no stale state.
-        setNode(null);
-        patch({
-          connected: false,
-          status: null,
-          channels: [],
-          messages: [],
-          activeChannel: null,
-          activeThread: null,
-          authorNames: {},
-          nodeUsers: {},
-          accountKeys: {},
-          accountHandles: {},
-          pages: [],
-          activePage: null,
-          activePageBlocks: [],
-          agents: [],
-          watches: [],
-          pendingRuns: [],
-          files: [],
-          ops: {},
-          onboardingPhase: null,
-        });
+        // connectActive synchronously drops the old transport and clears the
+        // complete node projection before its first async workspace call.
         connectActive(target).catch(fail);
       };
       if (target.member) {
@@ -2329,33 +2703,9 @@ export function createActions({
       // (mirrors selectWorkspace's reset).
       setNode(null);
       patch({
+        ...resetForNodeChange(),
         workspace: null,
-        connected: false,
-        status: null,
-        // per-node observability: the live chain tip and the node's own
-        // durable block history. clear them on a node switch so the new
-        // node's explorer never shows the previous node's rows.
-        lastBlock: null,
-        blocks: [],
-        channels: [],
-        messages: [],
-        activeChannel: null,
-        activeThread: null,
-        authorNames: {},
-        nodeUsers: {},
-        accountKeys: {},
-        accountHandles: {},
-        members: [],
-        proposals: [],
-        forgeHead: null,
-        pages: [],
-        activePage: null,
-        activePageBlocks: [],
-        agents: [],
-        watches: [],
-        pendingRuns: [],
-        files: [],
-        ops: {},
+        openTabs: loadDocTabs(docTabsScope(null, url)),
         onboardingPhase: null,
         onboardingBusy: false,
         inviteBlob: null,
@@ -2363,6 +2713,7 @@ export function createActions({
         nodeUrl: url,
         managed: false,
         needsOnboarding: false,
+        atHome: false,
         error: null,
       });
       // Remember it for next launch, then dial. The hydrate effect (keyed on the
@@ -2446,23 +2797,7 @@ export function createActions({
           // selectWorkspace's reset), then repoint the switcher.
           setNode(null);
           patch({
-            connected: false,
-            status: null,
-            channels: [],
-            messages: [],
-            activeChannel: null,
-            activeThread: null,
-            authorNames: {},
-            nodeUsers: {},
-            accountKeys: {},
-            accountHandles: {},
-            pages: [],
-            activePage: null,
-            activePageBlocks: [],
-            agents: [],
-            watches: [],
-            pendingRuns: [],
-            ops: {},
+            ...resetForNodeChange(),
             onboardingPhase: null,
             inviteBlob: null,
           });
@@ -2514,23 +2849,7 @@ export function createActions({
           // (mirrors forgetWorkspace), then repoint or fall back to the gate.
           setNode(null);
           patch({
-            connected: false,
-            status: null,
-            channels: [],
-            messages: [],
-            activeChannel: null,
-            activeThread: null,
-            authorNames: {},
-            nodeUsers: {},
-            accountKeys: {},
-            accountHandles: {},
-            pages: [],
-            activePage: null,
-            activePageBlocks: [],
-            agents: [],
-            watches: [],
-            pendingRuns: [],
-            ops: {},
+            ...resetForNodeChange(),
             onboardingPhase: null,
             inviteBlob: null,
           });
@@ -2551,6 +2870,8 @@ export function createActions({
           fail(err);
         });
     },
+
+    goHome: () => patch({ atHome: true }),
 
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 

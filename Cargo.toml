@@ -2,12 +2,26 @@
 # publishes its wire surface (types-only payload/query/reply shapes + codecs)
 # at its crate root; cross-module product interaction goes through those wire
 # types and host-mediated queries, never another module's internals. layout:
-#   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
-#                      (dispatch), node (transport seam), consensus (BFT orderer)
-#   crates/system/   — consensus infrastructure modules (kv, valset)
-#   crates/apps/     — product feature modules (forge, chat, tasks, pages, …)
-#   crates/examples/ — demo + test scaffolding modules (directory, greeter)
-#   bin/             — runnable binaries (in-process demo, real-socket node)
+#   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
+#                      host (submit/execute loop, app-hash composition, the
+#                      host::worker seam), node (ordered replication), consensus
+#                      (BFT orderer), statesync, recovery, indexer
+#   crates/system/   — system modules and their host-side counterparts:
+#                      consensus modules (kv, valset, governance, identity,
+#                      upgrade, saga, capability, dispatch, tagging, duckdns,
+#                      gateway) and off-consensus infra (blobstore,
+#                      dispatch-oracle, capability-host, wireguard,
+#                      nat-traversal, reachability, data-plane, overlay-net)
+#   crates/apps/     — product feature modules (forge, chat, pages, agent,
+#                      runs, tasks, vaults, automations, inbox, files, jobs)
+#   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
+#                      — the `files` module wraps it), disk, client (OS-side)
+#   crates/examples/ — reference modules: directory (also bin/node's liveness
+#                      canary), greeter (the types-only composition example),
+#                      evm (experimental; genesis-registered in the daemons)
+#   bin/             — demo (in-process walkthrough), node (validator),
+#                      noded (the app-facing daemon), simnode (deterministic
+#                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -15,10 +29,10 @@
 resolver = "2"
 members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
-    "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
-    "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
+    "crates/kernel/sdk", "crates/kernel/host",
+    "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
-    "crates/kernel/capability-host",
+    "crates/kernel/wasm-host",
     # system — consensus infrastructure modules
     "crates/system/kv", 
     "crates/system/valset", 
@@ -26,19 +40,19 @@ members = [
     "crates/system/governance",
     "crates/system/identity",
     "crates/system/upgrade", 
-    "crates/system/wireguard-upgrade",
-    "crates/system/wireguard-effect",
+    "crates/system/wireguard",
     "crates/system/nat-traversal",
     "crates/system/reachability",
     "crates/system/data-plane",
     "crates/system/overlay-net",
     "crates/system/saga",
     "crates/system/capability",
+    "crates/system/capability-host",
     "crates/system/blobstore",
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging",
-    "crates/duckdns/core",
+    "crates/system/modreg",
     "crates/system/duckdns",
     "crates/system/gateway",
     "crates/duckfs/core",
@@ -58,9 +72,12 @@ members = [
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
+    # labs — consensus modules deliberately absent from every genesis set
+    "crates/labs",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
+    "bin/mcp",
     # app — the desktop shell of the react client (web twin ships from app/)
     "app/src-tauri",
 ]
@@ -78,9 +95,11 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+revm = { version = "41", default-features = false, features = ["std"] }
+alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
 async-trait = "0.1"
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
@@ -142,17 +161,22 @@ zeroize = "1"
 # default-features = false drops the in-database WASM layer (wasmtime).
 fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
 
+# wasmtime — the frozen-substrate wasm runtime that executes hot-swappable
+# modules inside the host. pinned EXACTLY: the runtime IS the module execution
+# semantics, so it is consensus-affecting and every validator must run the
+# identical build; changing it is a binary upgrade, never a live module swap.
+wasmtime = "=46.0.1"
+
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
-state = { path = "crates/kernel/state" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
-reactor = { path = "crates/kernel/reactor" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
-capability-host = { path = "crates/kernel/capability-host" }
+capability-host = { path = "crates/system/capability-host" }
+wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
@@ -167,7 +191,7 @@ blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
-duckdns-core = { path = "crates/duckdns/core" }
+modreg = { path = "crates/system/modreg" }
 duckdns = { path = "crates/system/duckdns" }
 gateway = { path = "crates/system/gateway" }
 forge = { path = "crates/apps/forge" }
@@ -177,6 +201,7 @@ agent = { path = "crates/apps/agent" }
 runs = { path = "crates/apps/runs" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
+labs = { path = "crates/labs" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
@@ -187,8 +212,7 @@ jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
-wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
-wireguard-effect = { path = "crates/system/wireguard-effect" }
+wireguard = { path = "crates/system/wireguard" }
 nat-traversal = { path = "crates/system/nat-traversal" }
 reachability = { path = "crates/system/reachability" }
 data-plane = { path = "crates/system/data-plane" }
@@ -200,3 +224,9 @@ overlay-net = { path = "crates/system/overlay-net" }
 # would be a different trait).
 governor = "0.10.2"
 rand_core = "0.6.4"
+
+# The desktop shell runs on the standalone tauri-runtime-cef crate
+# (github.com/byeongsu-hong/tauri-runtime-cef) against PUBLISHED tauri
+# crates — no tauri fork, no [patch.crates-io]. The dep lives in
+# app/src-tauri/Cargo.toml; the shell aliases the runtime generics itself
+# (app/src-tauri/src/rt.rs) since registry tauri only defaults them to wry.

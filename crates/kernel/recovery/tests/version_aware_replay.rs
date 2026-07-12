@@ -243,7 +243,7 @@ fn replay_recomputes_the_identical_app_hash_across_an_armed_boundary() {
         )
         .expect("capture");
         assert_eq!(
-            manifest.required_min_version(),
+            manifest.required_min_version,
             0,
             "below H the boundary still runs baseline"
         );

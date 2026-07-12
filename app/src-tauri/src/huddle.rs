@@ -1,15 +1,15 @@
 //! The pop-out huddle window — a small companion window rendering the frontend
 //! at `?view=huddle`. It is a pure event mirror of the main window's voice
 //! session (protocol in app/src/console/store/huddle-window.ts); this module
-//! owns the window lifecycle plus the native media-permission wiring every
-//! huddle-capable webview needs (`allow_user_media`). Whatever way the window
-//! dies — native close button, the pop-in control, or `huddle_pop_in` — the
-//! Destroyed hook tells the main window so its in-app card comes back.
+//! owns the window lifecycle. Whatever way the window dies — native close
+//! button, the pop-in control, or `huddle_pop_in` — the Destroyed hook tells
+//! the main window so its in-app card comes back.
+//!
+//! Its microphone and camera come from the shell's permission policy, which
+//! grants the bundled UI labels (this window included) the capabilities the
+//! product declares — see `permissions`.
 
-use tauri::{
-    AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
-};
+use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const LABEL: &str = "huddle";
 const CLOSED_EVENT: &str = "ducktape://huddle-closed";
@@ -19,22 +19,6 @@ const WIDTH: f64 = 380.0;
 const HEIGHT: f64 = 300.0;
 const MIN_WIDTH: f64 = 300.0;
 const MIN_HEIGHT: f64 = 220.0;
-
-/// Media-permission seam for huddle-capable webviews (currently a no-op).
-///
-/// Under wry/WebKitGTK this installed the embedder-side `permission-request`
-/// grant, without which every Linux huddle failed `NotAllowedError`. The CEF
-/// runtime replaced that engine, and the seam stays so the grant has one home
-/// once tauri-runtime-cef exposes a media-permission handler.
-pub fn allow_user_media<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
-    // CEF runs its own permission flow, so the WebKitGTK embedder hook this
-    // used to install is gone with wry. tauri-runtime-cef does not answer
-    // OnRequestMediaAccessPermission yet — until that lands upstream, live
-    // mic/camera relies on Chromium's default flow (QA passes
-    // --use-fake-device/-ui-for-media-stream switches through app argv).
-    let _ = window;
-    Ok(())
-}
 
 /// Create (or re-show) the huddle window.
 #[tauri::command]
@@ -62,7 +46,6 @@ pub fn huddle_pop_out<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     .skip_taskbar(true)
     .build()
     .map_err(|e| e.to_string())?;
-    allow_user_media(&win).map_err(|e| e.to_string())?;
 
     let handle = app.clone();
     win.on_window_event(move |event| {

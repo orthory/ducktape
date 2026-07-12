@@ -572,7 +572,7 @@ impl<S: ObjectStore> Fs<S> {
     ///
     /// 1. `store_mut().put` every returned object (idempotent, content-addressed)
     /// 2. fsync the touched odb dirs (object dir-entries durable)
-    /// 3. persist the refs file via `RefsStore::save` (the commit point)
+    /// 3. persist the refs file via duckfs-disk's `DiskRefs::save` (the commit point)
     /// 4. only THEN [`Fs::adopt_refs`] — root moves here and nowhere else
     ///
     /// a crash before step 3 leaves the old refs file, the old root, and at

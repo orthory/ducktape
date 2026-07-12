@@ -5,11 +5,11 @@ version.workspace = true
 
 # the deterministic state-machine spine: a module registry, the dispatch +
 # local-only follow-up drain, and app-hash composition over the registered
-# modules. depends on sdk (the contract) + state (root composition); it knows
-# nothing of any concrete module beyond `dyn Module`.
+# modules (`global_root` — sha2 is its one hashing dep). depends on sdk (the
+# contract); it knows nothing of any concrete module beyond `dyn Module`.
 [dependencies]
 sdk = { workspace = true }
-state = { workspace = true }
+sha2 = { workspace = true }
 async-trait = { workspace = true }
 # WIRE-TYPES-ONLY dep: `Host::effective_version` decodes the upgrade module's
 # `Status` reply and applies the shared version derivation. host uses only
@@ -19,8 +19,15 @@ upgrade = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
 dispatch = { workspace = true }
+# WIRE-TYPES-ONLY dep, same shape: the boundary code-swap realization reads the
+# code registry's committed active/pending hashes and injects its Advance tick.
+# host never constructs or registers the modreg impl — only its crate-root types.
+modreg = { workspace = true }
 
 [dev-dependencies]
+# the live-code-update proof stands a real wasm module on the host and swaps its
+# component across a code-registry activation boundary (modreg is a normal dep).
+wasm-host = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
 kv = { workspace = true }

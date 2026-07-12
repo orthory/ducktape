@@ -8,12 +8,23 @@ import type { AgentRecord } from "../../domain/agent-client";
 import type { AccountView } from "../../domain/identity-client";
 import { moduleTopic } from "../../domain/stream";
 import type { EventFrame, HeartbeatFrame } from "../../domain/stream";
-import type { NodeTransport, SubmitReceipt, StreamSignal, TopicHandlers } from "../../domain/transport";
+import {
+  NodeError,
+  type NodeStatus,
+  type NodeTransport,
+  type SubmitReceipt,
+  type StreamSignal,
+  type TopicHandlers,
+} from "../../domain/transport";
 import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import { makeTransportStub } from "../../test/transport-stub";
+
+const nodeBootstrapMocks = vi.hoisted(() => ({
+  remoteTransport: null as unknown,
+}));
 
 // The desktop-only effects (notify config push, navigate deep-link) talk to
 // the Rust side through notify-client and the Tauri event plane — both mocked
@@ -79,11 +90,16 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
   return {
     ...actual,
     connectRemote: vi.fn((httpUrl: string) => ({
-      transport: emptyNode,
+      transport:
+        (nodeBootstrapMocks.remoteTransport as NodeTransport | null) ?? emptyNode,
       url: httpUrl,
       managed: false,
     })),
   };
+});
+
+afterEach(() => {
+  nodeBootstrapMocks.remoteTransport = null;
 });
 
 // ── Fake node ───────────────────────────────────────────
@@ -124,7 +140,6 @@ const QUACKBOT: AgentRecord = {
   owner: { external: [1] },
   display_name: "Quackbot",
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status: "active",
   created_at: 1,
@@ -140,6 +155,37 @@ const wireChannel = (id: string, name: string, created_at: number) => ({
   hooks: [],
   pinned: [],
 });
+
+const timeoutError = () =>
+  new NodeError(
+    "timeout",
+    "the node accepted the connection but did not answer within 6000ms",
+  );
+
+const statusAt = (
+  height: number,
+  over: Partial<NodeStatus> = {},
+): NodeStatus => ({
+  version: "0.1.0",
+  appHash: height.toString(16).padStart(2, "0").repeat(32).slice(0, 64),
+  height,
+  modules: [
+    { id: "chat", root: height.toString(16).padStart(2, "0").repeat(32).slice(0, 64) },
+    { id: "agent", root: "ee".repeat(32) },
+    { id: "identity", root: "11".repeat(32) },
+  ],
+  ...over,
+});
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+};
 
 const makeFakeNode = ({
   agents = [],
@@ -350,6 +396,20 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("channel").textContent).toBe("general");
       expect(screen.getByTestId("messages").textContent).toBe("1");
     });
+  });
+
+  it("keeps an initial status timeout loud after the one bounded retry", async () => {
+    const { transport } = makeFakeNode();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockRejectedValueOnce(timeoutError());
+    renderConsole(transport);
+
+    await waitFor(() => expect(capturedState!.error).toContain("6000ms"));
+    expect(transport.status).toHaveBeenCalledTimes(2);
+    expect(capturedState!.status).toBeNull();
+    expect(capturedState!.connected).toBe(false);
+    expect(capturedState!.connectionDown).toBeNull();
   });
 
   it("hydrates validator members from valset", async () => {
@@ -603,6 +663,548 @@ describe("DucktapeProvider", () => {
     expect(capturedState!.lastBlock).toBe(5);
   });
 
+  it("coalesces a scoped status timeout into one retry without disturbing the session", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    const retry = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockImplementationOnce(() => retry.promise);
+
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(2));
+
+    // The first bounded attempt timed out, but the retry is still in flight:
+    // keep the established snapshot and every visible slice untouched.
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.activeChannel).toBe("general");
+    expect(capturedState!.messages).toHaveLength(1);
+    expect(capturedState!.error).toBeNull();
+    expect(capturedState!.connectionDown).toBeNull();
+
+    await act(async () => retry.resolve(statusAt(5)));
+    await waitFor(() => expect(capturedState!.status?.height).toBe(5));
+    expect(transport.status).toHaveBeenCalledTimes(2);
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.messages).toHaveLength(1);
+    expect(capturedState!.error).toBeNull();
+    expect(capturedState!.connectionDown).toBeNull();
+  });
+
+  it("keeps two status timeouts out of the global error and shows the busy banner", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockRejectedValueOnce(timeoutError());
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+
+    await waitFor(() =>
+      expect(capturedState!.connectionDown?.reason).toBe("Node is busy — retrying…"),
+    );
+    expect(transport.status).toHaveBeenCalledTimes(2);
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.activeChannel).toBe("general");
+    expect(capturedState!.messages).toHaveLength(1);
+    expect(capturedState!.error).toBeNull();
+  });
+
+  it("uses a later heartbeat for one guarded recovery and applies the restored snapshot", async () => {
+    const { transport, emitOps, emitHeartbeat } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockRejectedValueOnce(timeoutError());
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(capturedState!.connectionDown).not.toBeNull());
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockResolvedValueOnce(
+      statusAt(9, { version: "0.2.0" }),
+    );
+    await act(async () => emitHeartbeat(9));
+
+    await waitFor(() => {
+      expect(capturedState!.connectionDown).toBeNull();
+      expect(capturedState!.status?.version).toBe("0.2.0");
+      expect(capturedState!.status?.height).toBe(9);
+    });
+    expect(transport.status).toHaveBeenCalledTimes(1);
+    expect(capturedState!.connected).toBe(true);
+  });
+
+  it("keeps stream down authoritative over a hydrate already fetching slices", async () => {
+    const { transport, emitOps, emitDown } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    const channels = deferred<unknown>();
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    let fetchingChannels = false;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (!fetchingChannels && target === "chat" && query === "channels") {
+        fetchingChannels = true;
+        return channels.promise;
+      }
+      return baseQuery(target, query);
+    });
+
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(fetchingChannels).toBe(true));
+
+    await act(async () => emitDown("stream heartbeat timed out"));
+    expect(capturedState!.connected).toBe(false);
+    expect(capturedState!.connectionDown?.reason).toBe(
+      "stream heartbeat timed out",
+    );
+
+    await act(async () => {
+      channels.resolve({ channels: [wireChannel("general", "General", 1)] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.connected).toBe(false);
+    expect(capturedState!.connectionDown?.reason).toBe(
+      "stream heartbeat timed out",
+    );
+  });
+
+  it("keeps stream down authoritative over a queued scoped refresh until up", async () => {
+    const { transport, emitOps, emitDown, emitUp } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    const queuedStatus = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(() => queuedStatus.promise);
+
+    await act(async () => {
+      // The event arms refreshScoped's 100ms timer. Down arrives before that
+      // timer starts any HTTP work, so generation invalidation alone cannot
+      // fence the later hydrate.
+      emitOps("chat", [{ height: 5 }]);
+      emitDown("stream heartbeat timed out");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+    expect(capturedState!.connected).toBe(false);
+
+    await act(async () => queuedStatus.resolve(statusAt(5)));
+    await waitFor(() => expect(capturedState!.status?.height).toBe(5));
+    expect(capturedState!.connected).toBe(false);
+    expect(capturedState!.connectionDown?.reason).toBe(
+      "stream heartbeat timed out",
+    );
+
+    const recovered = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(() => recovered.promise);
+    await act(async () => emitUp());
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+    expect(capturedState!.connected).toBe(false);
+
+    await act(async () => recovered.resolve(statusAt(6)));
+    await waitFor(() => {
+      expect(capturedState!.connected).toBe(true);
+      expect(capturedState!.connectionDown).toBeNull();
+      expect(capturedState!.status?.height).toBe(6);
+    });
+  });
+
+  it("keeps stream down authoritative over a submit refresh until heartbeat", async () => {
+    const { transport, emitDown, emitHeartbeat } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    const submitted = deferred<SubmitReceipt>();
+    const baseSubmit = vi.mocked(transport.submit).getMockImplementation()!;
+    vi.mocked(transport.submit).mockImplementation((target, payload, origin) =>
+      target === "chat" ? submitted.promise : baseSubmit(target, payload, origin),
+    );
+    let completion!: Promise<void>;
+    act(() => {
+      completion = capturedActions!.postInChannel("general", "held through down");
+    });
+    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(1));
+
+    await act(async () => emitDown("stream heartbeat timed out"));
+    const completionStatus = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(
+      () => completionStatus.promise,
+    );
+    await act(async () => {
+      submitted.resolve({ height: 2, appHash: "bb".repeat(32) });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      completionStatus.resolve(statusAt(2));
+      await completion;
+    });
+    expect(capturedState!.connected).toBe(false);
+    expect(capturedState!.connectionDown?.reason).toBe(
+      "stream heartbeat timed out",
+    );
+
+    const recovered = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(() => recovered.promise);
+    await act(async () => emitHeartbeat(0));
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+    expect(capturedState!.connected).toBe(false);
+
+    await act(async () => recovered.resolve(statusAt(3)));
+    await waitFor(() => {
+      expect(capturedState!.connected).toBe(true);
+      expect(capturedState!.connectionDown).toBeNull();
+      expect(capturedState!.status?.height).toBe(3);
+    });
+  });
+
+  it("retries guarded recovery on a later height-zero heartbeat", async () => {
+    const { transport, emitDown, emitUp, emitHeartbeat } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockRejectedValueOnce(timeoutError());
+    await act(async () => emitDown("stream heartbeat timed out"));
+    await waitFor(() => expect(capturedState!.connected).toBe(false));
+    await act(async () => emitUp());
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(2));
+    expect(capturedState!.connected).toBe(false);
+
+    const restored = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(() => restored.promise);
+    await act(async () => emitHeartbeat(0));
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+    expect(capturedState!.connected).toBe(false);
+
+    await act(async () => restored.resolve(statusAt(2, { version: "0.2.0" })));
+    await waitFor(() => {
+      expect(capturedState!.connected).toBe(true);
+      expect(capturedState!.connectionDown).toBeNull();
+      expect(capturedState!.status?.version).toBe("0.2.0");
+    });
+  });
+
+  it("scopes an impostor latch to its transport across a remote switch", async () => {
+    const nodeA = makeFakeNode({ publicKey: "expected" });
+    const nodeB = makeFakeNode({ publicKey: "expected" });
+    renderConsole(nodeA.transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+
+    const oldChannels = deferred<unknown>();
+    const baseQueryA = vi.mocked(nodeA.transport.query).getMockImplementation()!;
+    let oldHydrateStarted = false;
+    vi.mocked(nodeA.transport.query).mockImplementation((target, query) => {
+      if (!oldHydrateStarted && target === "chat" && query === "channels") {
+        oldHydrateStarted = true;
+        return oldChannels.promise;
+      }
+      return baseQueryA(target, query);
+    });
+    vi.mocked(nodeA.transport.status).mockResolvedValueOnce(
+      statusAt(5, { publicKey: "expected" }),
+    );
+    await act(async () => {
+      nodeA.emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(oldHydrateStarted).toBe(true));
+
+    await act(async () => nodeA.emitDown("stream heartbeat timed out"));
+    vi.mocked(nodeA.transport.status).mockResolvedValueOnce(
+      statusAt(6, { publicKey: "foreign" }),
+    );
+    await act(async () => nodeA.emitUp());
+    await waitFor(() =>
+      expect(capturedState!.connectionDown?.impostor).toBe(true),
+    );
+
+    vi.mocked(nodeA.transport.status).mockClear();
+    await act(async () => {
+      nodeA.emitHeartbeat(0);
+      nodeA.emitUp();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(nodeA.transport.status).not.toHaveBeenCalled();
+
+    vi.mocked(nodeB.transport.status).mockResolvedValue(
+      statusAt(9, { version: "transport-b", publicKey: "expected" }),
+    );
+    nodeBootstrapMocks.remoteTransport = nodeB.transport;
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    await waitFor(() => {
+      expect(capturedState!.connected).toBe(true);
+      expect(capturedState!.connectionDown).toBeNull();
+      expect(capturedState!.status?.version).toBe("transport-b");
+    });
+
+    await act(async () => {
+      oldChannels.resolve({ channels: [wireChannel("old", "Old", 1)] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.status?.version).toBe("transport-b");
+    expect(capturedState!.channels.map((channel) => channel.id)).toEqual([
+      "general",
+    ]);
+  });
+
+  it("keeps established connectivity after a deferred slice failure and recovers later", async () => {
+    const { transport, emitOps, emitDown, emitUp } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    const channels = deferred<unknown>();
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    let fetchingChannels = false;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (!fetchingChannels && target === "chat" && query === "channels") {
+        fetchingChannels = true;
+        return channels.promise;
+      }
+      return baseQuery(target, query);
+    });
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(fetchingChannels).toBe(true));
+
+    await act(async () => channels.reject(new Error("channels query failed")));
+    await waitFor(() =>
+      expect(capturedState!.error).toContain("channels query failed"),
+    );
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.connectionDown).toBeNull();
+
+    const restored = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(() => restored.promise);
+    await act(async () => emitDown("stream heartbeat timed out"));
+    await waitFor(() => expect(capturedState!.connected).toBe(false));
+    await act(async () => emitUp());
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+    expect(capturedState!.connected).toBe(false);
+
+    await act(async () => restored.resolve(statusAt(6)));
+    await waitFor(() => {
+      expect(capturedState!.connected).toBe(true);
+      expect(capturedState!.connectionDown).toBeNull();
+      expect(capturedState!.status?.height).toBe(6);
+    });
+  });
+
+  it("recovers a cold-boot slice failure from a height-zero heartbeat", async () => {
+    const { transport, emitHeartbeat } = makeFakeNode();
+    const channels = deferred<unknown>();
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    let fetchingChannels = false;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (!fetchingChannels && target === "chat" && query === "channels") {
+        fetchingChannels = true;
+        return channels.promise;
+      }
+      return baseQuery(target, query);
+    });
+    renderConsole(transport);
+    await waitFor(() => expect(fetchingChannels).toBe(true));
+
+    await act(async () => channels.reject(new Error("cold channels failed")));
+    await waitFor(() =>
+      expect(capturedState!.error).toContain("cold channels failed"),
+    );
+    expect(capturedState!.status).toBeNull();
+    expect(capturedState!.connected).toBe(false);
+
+    const restored = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockImplementationOnce(() => restored.promise);
+    await act(async () => emitHeartbeat(0));
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+
+    await act(async () => restored.resolve(statusAt(1)));
+    await waitFor(() => {
+      expect(capturedState!.status?.height).toBe(1);
+      expect(capturedState!.connected).toBe(true);
+    });
+  });
+
+  it("shares scoped and recovery probes and ignores an older hydrate's late failure", async () => {
+    const { transport, emitOps, emitDown, emitUp } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    const retry = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockImplementationOnce(() => retry.promise);
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(2));
+
+    await act(async () => emitDown("stream heartbeat timed out"));
+    await waitFor(() => expect(capturedState!.connected).toBe(false));
+    await act(async () => emitUp());
+    expect(transport.status).toHaveBeenCalledTimes(2);
+
+    const oldChat = deferred<unknown>();
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    let heldOldHydrate = false;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (!heldOldHydrate && target === "chat" && query === "channels") {
+        heldOldHydrate = true;
+        return oldChat.promise;
+      }
+      return baseQuery(target, query);
+    });
+    await act(async () => retry.resolve(statusAt(6)));
+    await waitFor(() => expect(heldOldHydrate).toBe(true));
+    expect(transport.status).toHaveBeenCalledTimes(2);
+
+    vi.mocked(transport.status).mockResolvedValueOnce(
+      statusAt(7, {
+        modules: [
+          { id: "chat", root: statusAt(6).modules[0].root },
+          { id: "agent", root: "77".repeat(32) },
+          { id: "identity", root: "11".repeat(32) },
+        ],
+      }),
+    );
+    await act(async () => {
+      emitOps("agent", [{ height: 7 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(capturedState!.status?.height).toBe(7));
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.connectionDown).toBeNull();
+
+    await act(async () => oldChat.reject(new Error("late old hydrate failure")));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(capturedState!.status?.height).toBe(7);
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.error).toBeNull();
+  });
+
+  it.each([
+    ["httpError" as const, "node replied 503"],
+    ["badBody" as const, "/v1/status returned an invalid response"],
+  ])("does not retry or hide a %s status failure", async (kind, message) => {
+    const { transport, emitOps } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockRejectedValueOnce(new NodeError(kind, message));
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+
+    await waitFor(() => expect(capturedState!.error).toContain(message));
+    expect(transport.status).toHaveBeenCalledTimes(1);
+    expect(capturedState!.connected).toBe(true);
+    expect(capturedState!.connectionDown).toBeNull();
+  });
+
+  it("keeps the impostor guard sticky after a timeout retry", async () => {
+    const { transport, emitOps, emitHeartbeat, emitUp } = makeFakeNode({
+      publicKey: "expected",
+    });
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockRejectedValueOnce(timeoutError())
+      .mockResolvedValueOnce(statusAt(5, { publicKey: "foreign" }));
+    await act(async () => {
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+
+    await waitFor(() => expect(capturedState!.connectionDown?.impostor).toBe(true));
+    expect(transport.status).toHaveBeenCalledTimes(2);
+    expect(capturedState!.connected).toBe(false);
+    expect(capturedState!.error).toBeNull();
+
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockResolvedValue(statusAt(6, { publicKey: "expected" }));
+    await act(async () => {
+      emitHeartbeat(6);
+      emitUp();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(transport.status).not.toHaveBeenCalled();
+    expect(capturedState!.connectionDown?.impostor).toBe(true);
+    expect(capturedState!.connected).toBe(false);
+  });
+
+  it("does not retry a submit timeout and keeps the mutation error visible", async () => {
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.activeChannel).toBe("general"));
+    vi.mocked(transport.submit).mockClear();
+    vi.mocked(transport.submit).mockRejectedValueOnce(timeoutError());
+
+    await act(async () => capturedActions!.sendMessage("one attempt only"));
+
+    await waitFor(() => expect(capturedState!.error).toContain("6000ms"));
+    expect(transport.submit).toHaveBeenCalledTimes(1);
+    const key = Object.keys(capturedState!.ops)[0];
+    expect(capturedState!.ops[key].phase).toBe("failed");
+    expect(capturedState!.ops[key].error).toContain("6000ms");
+  });
+
   it("createChannel enters the new channel: its messages load, the thread closes", async () => {
     const { transport } = makeFakeNode();
     renderConsole(transport);
@@ -738,6 +1340,154 @@ describe("DucktapeProvider", () => {
     });
     expect(capturedState!.lastBlock).toBeNull();
     expect(capturedState!.blocks.length).toBe(0);
+  });
+
+  it("ignores an old node hydrate that settles after switching nodes", async () => {
+    const { transport } = makeFakeNode({ agents: [QUACKBOT] });
+    let releaseAgents!: () => void;
+    const agentsGate = new Promise<void>((resolve) => {
+      releaseAgents = resolve;
+    });
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target === "agent") {
+        return agentsGate.then(() => ({ agents: [QUACKBOT] }));
+      }
+      if (target === "pages" && query === "list_pages") {
+        return Promise.resolve({
+          pages: [{ id: "old-page", title: "Old workspace", parent: null }],
+        });
+      }
+      return baseQuery(target, query);
+    });
+
+    renderConsole(transport);
+    await waitFor(() => expect(transport.status).toHaveBeenCalled());
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.agents).toEqual([]);
+    expect(capturedState!.pages).toEqual([]);
+
+    // The old node's full hydrate finishes after the reset. It must be a
+    // no-op: neither its agent roster nor its Pages enumeration belongs to
+    // the newly selected node.
+    await act(async () => {
+      releaseAgents();
+      await agentsGate;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.agents).toEqual([]);
+    expect(capturedState!.pages).toEqual([]);
+  });
+
+  it("ignores an old page load that settles after switching nodes", async () => {
+    const { transport } = makeFakeNode();
+    let releasePage!: () => void;
+    const pageGate = new Promise<void>((resolve) => {
+      releasePage = resolve;
+    });
+    const oldRoot: PageBlock = {
+      id: "old-page",
+      parent: null,
+      page: "old-page",
+      kind: "page",
+      text: "Old workspace",
+      checked: false,
+      children: [],
+    };
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target === "pages" && (query as { get_page?: unknown }).get_page) {
+        return pageGate.then(() => ({ page: [oldRoot] }));
+      }
+      return baseQuery(target, query);
+    });
+
+    renderConsole(transport);
+    await waitFor(() => expect(screen.getByTestId("connected").textContent).toBe("true"));
+    act(() => capturedActions!.openPage("old-page"));
+    expect(capturedState!.activePage).toBe("old-page");
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.activePage).toBeNull();
+
+    await act(async () => {
+      releasePage();
+      await pageGate;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.activePageBlocks).toEqual([]);
+    expect(capturedState!.pageThreads).toEqual([]);
+  });
+
+  it("does not run an old write's UI continuation in the new workspace", async () => {
+    const { transport } = makeFakeNode();
+    let settleCreate!: (receipt: SubmitReceipt) => void;
+    const baseSubmit = vi.mocked(transport.submit).getMockImplementation()!;
+    vi.mocked(transport.submit).mockImplementation((target, payload, origin) => {
+      if (target === "chat" && (payload as { create_channel?: unknown }).create_channel) {
+        return new Promise((resolve) => {
+          settleCreate = resolve;
+        });
+      }
+      return baseSubmit(target, payload, origin);
+    });
+
+    renderConsole(transport);
+    await waitFor(() => expect(screen.getByTestId("connected").textContent).toBe("true"));
+    act(() => capturedActions!.createChannel("Old Room", "open"));
+    await waitFor(() => expect(transport.submit).toHaveBeenCalled());
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.activeChannel).toBeNull();
+
+    // The old create receipt used to continue into enterChannel("old-room")
+    // after the reset, reopening old coordinates against the new node.
+    await act(async () => {
+      settleCreate({ height: 2, appHash: "bb".repeat(32) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.activeChannel).toBeNull();
+    expect(capturedState!.channels).toEqual([]);
+    expect(capturedState!.ops).toEqual({});
+  });
+
+  it("clears every node-scoped projection when switching nodes", async () => {
+    const { transport } = makeFakeNode({ agents: [QUACKBOT] });
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.agents).toEqual([QUACKBOT]));
+
+    // Seed query-driven and secondary slices that the old hand-written reset
+    // lists omitted. They are all owned by the current node/workspace.
+    Object.assign(capturedState!, {
+      tagFilter: { tag: "old", channelId: "general" },
+      pageThreads: [{ target: "old-page", threads: [] }],
+      capabilities: ["old-capability"],
+      capabilitiesByNode: new Map([["old-node", ["old-capability"]]]),
+      runLease: new Map([["old-run", {}]]),
+      forgeRepo: "old-repo",
+      search: { query: "old", chat: [], docs: [] },
+      openTabs: ["old-page"],
+    });
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+
+    expect(capturedState!.tagFilter).toBeNull();
+    expect(capturedState!.pageThreads).toEqual([]);
+    expect(capturedState!.capabilities).toEqual([]);
+    expect(capturedState!.capabilitiesByNode.size).toBe(0);
+    expect(capturedState!.runLease.size).toBe(0);
+    expect(capturedState!.forgeRepo).toBeNull();
+    expect(capturedState!.search).toBeNull();
+    expect(capturedState!.openTabs).toEqual([]);
   });
 
   it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {
@@ -990,6 +1740,64 @@ describe("pages snapshot refresh vs in-flight ops", () => {
       expect(capturedState!.activePageBlocks[1].text).toBe("hello world");
     });
   });
+
+  // Tab/Shift+Tab, the alt-arrows, and drag-drop are all ONE MoveBlock op.
+  // Like every other page-block write it must paint at submit time — the
+  // projection re-nests the row instantly, and the consensus round-trip only
+  // finalizes the ledger record behind it.
+  it("renders a block move preconfirmed, before the node confirms", async () => {
+    const { transport } = makeFakeNode();
+    const pageBlock = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
+      parent: "p1",
+      page: "p1",
+      kind: "paragraph",
+      text: "",
+      checked: false,
+      children: [],
+      ...patch,
+    });
+    const tree = [
+      pageBlock({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a", "b"] }),
+      pageBlock({ id: "a", text: "first" }),
+      pageBlock({ id: "b", text: "second" }),
+    ];
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target !== "pages") return baseQuery(target, query);
+      if (query === "list_pages") {
+        return Promise.resolve({
+          page_list: [{ id: "p1", title: "Plan", parent: null }],
+        });
+      }
+      if ((query as { get_page?: unknown }).get_page) {
+        return Promise.resolve({ page: [...tree] });
+      }
+      return Promise.resolve({ comment_threads: [] });
+    });
+    // the submit never resolves: everything asserted below is the
+    // preconfirmed render alone, no refresh ever lands.
+    vi.mocked(transport.submit).mockImplementation(() => new Promise(() => {}));
+
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    await act(async () => {
+      capturedActions!.openPage("p1");
+    });
+    await waitFor(() =>
+      expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]),
+    );
+
+    // the Tab indent: b re-homes under its previous sibling a.
+    await act(async () => {
+      capturedActions!.movePageBlock({ blockId: "b", parent: "a", after: null });
+    });
+    const byId = new Map(capturedState!.activePageBlocks.map((b) => [b.id, b]));
+    expect(byId.get("p1")!.children).toEqual(["a"]);
+    expect(byId.get("a")!.children).toEqual(["b"]);
+    expect(byId.get("b")!.parent).toBe("a");
+  });
 });
 
 // ── Desktop notifier: config push + deep-link navigation ─
@@ -1107,7 +1915,7 @@ describe("desktop notify config push", () => {
     expect(notifyMocks.configure.mock.calls.length).toBe(calls);
   });
 
-  it("tracks window focus and marks seen on the focus edge", async () => {
+  it("tracks window focus in the config without marking seen", async () => {
     markTauri();
     const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
@@ -1125,7 +1933,8 @@ describe("desktop notify config push", () => {
       window.dispatchEvent(new Event("focus"));
     });
     await waitFor(() => expect(lastConfig()).toMatchObject({ mainWindowFocused: true }));
-    expect(notifyMocks.markSeen).toHaveBeenCalled();
+    // Seen-marking belongs to the bell dropdown, not the focus edge.
+    expect(notifyMocks.markSeen).not.toHaveBeenCalled();
   });
 });
 

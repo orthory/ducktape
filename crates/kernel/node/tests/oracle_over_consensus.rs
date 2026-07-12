@@ -47,6 +47,7 @@ fn trigger(id: &str, spec: &[u8]) -> Msg {
             max_attempts: 1,
             lease_views: None,
             capability: None,
+            demands: Default::default(),
         }),
     }
 }
@@ -64,6 +65,7 @@ fn mock_worker(eff: &Effect) -> Option<Msg> {
             saga_id: wr.saga_id,
             attempt: wr.attempt,
             outcome: Ok(result),
+            usage: None,
         }),
     })
 }

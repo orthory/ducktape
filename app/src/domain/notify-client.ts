@@ -64,3 +64,54 @@ export const onUnread = async (
     return noop;
   }
 };
+
+/** One entry of the notifier's recent ring (the bell dropdown's rows). */
+export interface NotifyItem {
+  category: "mention" | "reply" | "huddle" | "run" | "forge" | "governance";
+  title: string;
+  body: string;
+  channelId: string | null;
+  at: number;
+}
+
+/** The bell's boot snapshot: unread rides along because the engine's
+ *  boot-time badge event fires before the webview subscribes. */
+export interface NotifySnapshot {
+  unread: number;
+  items: NotifyItem[];
+}
+
+export const recent = async (): Promise<NotifySnapshot> => {
+  if (!isTauri()) return { unread: 0, items: [] };
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    // The IPC payload is untyped at runtime — a null/malformed reply (e.g. a
+    // stubbed invoke in tests) must read as empty, not crash the bell.
+    const snapshot = await invoke<NotifySnapshot | null>("notify_recent");
+    return snapshot && Array.isArray(snapshot.items)
+      ? snapshot
+      : { unread: 0, items: [] };
+  } catch (error) {
+    warnFailure("recent", "notification history is unavailable", error);
+    return { unread: 0, items: [] };
+  }
+};
+
+export const onItem = async (
+  cb: (item: NotifyItem) => void,
+): Promise<() => void> => {
+  if (!isTauri()) return noop;
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    return await listen<NotifyItem>("ducktape://notify-item", (event) => {
+      cb(event.payload);
+    });
+  } catch (error) {
+    warnFailure(
+      "onItem",
+      "live notification items are inactive; returning a no-op unlisten",
+      error,
+    );
+    return noop;
+  }
+};

@@ -9,13 +9,17 @@ version.workspace = true
 # no output parsing opinions, no credential handling — contract enforcement
 # is the dispatch module's consensus-side validation.
 [dependencies]
+# for the ONE skill-count cap: the assembler re-checks what the registry
+# enforces (agent::MAX_SKILLS_PER_AGENT) rather than restating it — two numbers
+# that can drift is how a record consensus accepts becomes a run nothing loads.
+agent = { workspace = true }
 async-trait = { workspace = true }
 capability-host = { workspace = true }
 dispatch = { workspace = true }
 # the pool's spawn/deliver/resolver seams are boxed futures; the semaphore
 # caps concurrent provider runs (tokio::sync is runtime-agnostic).
 futures = { workspace = true }
-reactor = { workspace = true }
+host = { workspace = true }
 saga = { workspace = true }
 sdk = { workspace = true }
 # the run envelope is JSON (see src/envelope.rs).

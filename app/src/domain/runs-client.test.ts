@@ -9,6 +9,7 @@ import {
   enableJobWorker,
   pendingRuns,
   recentRuns,
+  reassignRun,
   requestRun,
   unwatchChannel,
   watchChannel,
@@ -75,6 +76,55 @@ describe("runs msgs", () => {
       { cancel_run: { run_id: "run-1" } },
       "operator",
     );
+
+    await reassignRun(transport, { runId: "run-1", attempt: 2, origin: "operator" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "runs",
+      { reassign_run: { run_id: "run-1", attempt: 2 } },
+      "operator",
+    );
+  });
+
+  it("encodes RequestRun demands only when non-empty — key absent otherwise", async () => {
+    const transport = stubTransport();
+
+    await requestRun(transport, {
+      agentId: "helper",
+      channelId: "general",
+      anchorSeq: 12,
+      origin: "operator",
+      demands: { cores: 4, mem_gb: 8 },
+    });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "runs",
+      {
+        request_run: {
+          agent_id: "helper",
+          channel_id: "general",
+          anchor_seq: 12,
+          demands: { cores: 4, mem_gb: 8 },
+        },
+      },
+      "operator",
+    );
+
+    // Empty demands → the field is omitted entirely (never send `{}`: consensus
+    // reads a missing key as legacy, but an empty map is not valid wire).
+    await requestRun(transport, {
+      agentId: "helper",
+      channelId: "general",
+      anchorSeq: 12,
+      origin: "operator",
+      demands: {},
+    });
+    const calls = vi.mocked(transport.submit).mock.calls;
+    const msg = calls[calls.length - 1][1] as {
+      request_run: Record<string, unknown>;
+    };
+    expect(msg.request_run).not.toHaveProperty("demands");
+    expect(msg).toEqual({
+      request_run: { agent_id: "helper", channel_id: "general", anchor_seq: 12 },
+    });
   });
 
   it("encodes EnableJobWorker with the origin", async () => {

@@ -59,6 +59,7 @@ function Probe() {
   return (
     <div>
       <span data-testid="gate">{String(state.needsOnboarding)}</span>
+      <span data-testid="home">{String(state.atHome)}</span>
       <span data-testid="ws">{state.workspace?.name ?? "none"}</span>
       <span data-testid="phase">{state.onboardingPhase?.phase ?? "none"}</span>
       <span data-testid="error">{state.error ?? "none"}</span>
@@ -99,8 +100,12 @@ const nodeFetch = (
     return Promise.resolve(jsonResponse(200, { channels: [] }));
   });
 
-/** Boot the provider to the raised gate with `list` in the registry and no
- *  active workspace; `handlers` overlay per-command invoke behavior. */
+/** Boot the provider with `list` in the registry and no active workspace;
+ *  `handlers` overlay per-command invoke behavior. Smart boot lands at the
+ *  account Home when workspaces exist (state.atHome), or the first-run
+ *  onboarding gate when the registry is empty — either way no workspace is
+ *  entered and the OnboardingGate UI is rendered in the tree for the picker
+ *  affordances the tests drive. */
 const bootGate = async (
   list: Workspace[],
   handlers: Record<string, (args?: Record<string, unknown>) => unknown> = {},
@@ -123,7 +128,13 @@ const bootGate = async (
       <Probe />
     </DucktapeProvider>,
   );
-  await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+  // boot settled and no workspace entered: Home (workspaces present) or the
+  // onboarding gate (empty registry).
+  await waitFor(() =>
+    expect(
+      screen.getByTestId(list.length > 0 ? "home" : "gate").textContent,
+    ).toBe("true"),
+  );
 };
 
 describe("selecting a not-admitted workspace from the picker", () => {
@@ -140,9 +151,9 @@ describe("selecting a not-admitted workspace from the picker", () => {
     await waitFor(() =>
       expect(screen.getByTestId("error").textContent).toMatch(/hasn't been admitted/i),
     );
-    // never repointed the registry, never spawned, never left the picker.
+    // never repointed the registry, never spawned, never entered a workspace.
     expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
-    expect(screen.getByTestId("gate").textContent).toBe("true");
+    expect(screen.getByTestId("home").textContent).toBe("true");
     expect(screen.getByTestId("ws").textContent).toBe("none");
   });
 
@@ -160,7 +171,7 @@ describe("selecting a not-admitted workspace from the picker", () => {
       expect(screen.getByTestId("error").textContent).toMatch(/not admitted after/i),
     );
     expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
-    expect(screen.getByTestId("gate").textContent).toBe("true");
+    expect(screen.getByTestId("home").textContent).toBe("true");
   });
 
   it("re-clicking the CURRENT not-admitted workspace still surfaces the error", async () => {
@@ -393,8 +404,8 @@ describe("deleteWorkspace", () => {
       expect(invokeMock).toHaveBeenCalledWith("workspace_forget", { id: "g", force: false });
       expect(screen.getByTestId("list").textContent).toBe("team");
     });
-    // stays on the picker; never connected anywhere as a side effect.
-    expect(screen.getByTestId("gate").textContent).toBe("true");
+    // stays at Home; never connected anywhere as a side effect.
+    expect(screen.getByTestId("home").textContent).toBe("true");
     expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
   });
 

@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use host::Host;
 use sdk::Msg;
 
 /// the node-local worker that self-emits a validator-origin `SignalReady` op
 /// ONCE per pending upgrade this binary can execute. deliberately NOT a
-/// `reactor::Worker`: readiness must survive restart/late-join, so it polls the
+/// `host::worker::Worker`: readiness must survive restart/late-join, so it polls the
 /// COMMITTED upgrade state each pump tick and re-derives its decision idempotently
 /// rather than reacting to a one-shot block effect. "ready" is a truthful machine
 /// statement about the running binary — it signals iff `MAX_PROTOCOL_VERSION >=
@@ -96,49 +98,80 @@ pub(crate) struct CapabilityAnnouncer {
     /// the capability tags discovery found on this host, sorted — the truthful
     /// set to announce. empty means this node provides nothing.
     pub(crate) capabilities: Vec<String>,
-    /// the set we last SUBMITTED (not yet observed committed), latched so an
-    /// in-flight announce is not re-sent every tick.
-    pub(crate) announced: Option<Vec<String>>,
+    /// the numeric capacity announced ALONGSIDE the tags: probed host totals
+    /// for a Podman node, EMPTY for a direct-spawn one (a direct node makes no
+    /// capacity promise). Forced empty whenever `capabilities` is empty —
+    /// resources-without-tags is a consensus-level reject, never emitted.
+    pub(crate) resources: BTreeMap<String, u64>,
+    /// the (tags, resources) pair we last SUBMITTED (not yet observed
+    /// committed), latched so an in-flight announce is not re-sent every tick.
+    pub(crate) announced: Option<(Vec<String>, BTreeMap<String, u64>)>,
 }
 
 impl CapabilityAnnouncer {
-    pub(crate) fn new(me: Vec<u8>, capabilities: Vec<String>) -> Self {
+    pub(crate) fn new(
+        me: Vec<u8>,
+        capabilities: Vec<String>,
+        resources: BTreeMap<String, u64>,
+    ) -> Self {
         Self {
             me,
             capabilities,
+            resources,
             announced: None,
         }
     }
 
-    /// the PURE decision core: given this node's committed announced set,
-    /// decide whether to (re)announce. `None` when the registry already matches
-    /// what we'd announce, or an identical announce is already in flight.
-    pub(crate) fn decide(&mut self, committed: &[String]) -> Option<Vec<String>> {
+    /// this announce's resources, with the invariant applied: empty tags carry
+    /// no resources (resources-without-tags is a module-level reject).
+    fn effective_resources(&self) -> BTreeMap<String, u64> {
+        if self.capabilities.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.resources.clone()
+        }
+    }
+
+    /// the PURE decision core: given this node's committed tags AND resources,
+    /// decide whether to (re)announce. re-announces when EITHER the committed
+    /// tags or the committed resources differ from what this node would emit.
+    /// `None` when the registry already matches, an identical announce is
+    /// already in flight, or nothing is provided and nothing is recorded.
+    pub(crate) fn decide(
+        &mut self,
+        committed_tags: &[String],
+        committed_resources: &BTreeMap<String, u64>,
+    ) -> Option<(Vec<String>, BTreeMap<String, u64>)> {
+        let resources = self.effective_resources();
         // nothing to provide and nothing recorded: stay silent (genesis state).
-        if self.capabilities.is_empty() && committed.is_empty() {
+        if self.capabilities.is_empty()
+            && committed_tags.is_empty()
+            && committed_resources.is_empty()
+        {
             return None;
         }
-        // the registry already reflects our providers — nothing to do.
-        if committed == self.capabilities.as_slice() {
+        // the registry already reflects our providers AND resources.
+        if committed_tags == self.capabilities.as_slice() && committed_resources == &resources {
             self.announced = None;
             return None;
         }
-        // an announce for this exact set is already in flight.
-        if self.announced.as_deref() == Some(self.capabilities.as_slice()) {
+        // an announce for this exact pair is already in flight.
+        if self.announced.as_ref() == Some(&(self.capabilities.clone(), resources.clone())) {
             return None;
         }
-        self.announced = Some(self.capabilities.clone());
-        Some(self.capabilities.clone())
+        self.announced = Some((self.capabilities.clone(), resources.clone()));
+        Some((self.capabilities.clone(), resources))
     }
 
-    /// query this node's committed capability set and, when an announce is due,
-    /// build the external-origin `Announce` op. gracefully `None` when the
-    /// module is absent (pre-retrofit net) or the reply is unreadable.
+    /// query this node's committed capability set AND resources and, when an
+    /// announce is due, build the external-origin `Announce` op. gracefully
+    /// `None` when the module is absent (pre-retrofit net) or a reply is
+    /// unreadable.
     pub(crate) async fn maybe_announce(&mut self, host: &Host) -> Option<Msg> {
         use capability::{
             CapabilityMsg, CapabilityQuery, CapabilityReply, decode_reply, encode_msg, encode_query,
         };
-        let reply = host
+        let node_reply = host
             .query(
                 "capability",
                 &encode_query(&CapabilityQuery::Node {
@@ -147,13 +180,28 @@ impl CapabilityAnnouncer {
             )
             .await
             .ok()?;
-        let CapabilityReply::Node(committed) = decode_reply(&reply).ok()? else {
+        let CapabilityReply::Node(committed_tags) = decode_reply(&node_reply).ok()? else {
             return None;
         };
-        let capabilities = self.decide(&committed)?;
+        let res_reply = host
+            .query(
+                "capability",
+                &encode_query(&CapabilityQuery::Resources {
+                    node: self.me.clone(),
+                }),
+            )
+            .await
+            .ok()?;
+        let CapabilityReply::Resources(committed_resources) = decode_reply(&res_reply).ok()? else {
+            return None;
+        };
+        let (capabilities, resources) = self.decide(&committed_tags, &committed_resources)?;
         Some(Msg {
             target: "capability".into(),
-            payload: encode_msg(&CapabilityMsg::Announce { capabilities }),
+            payload: encode_msg(&CapabilityMsg::Announce {
+                capabilities,
+                resources,
+            }),
         })
     }
 }
@@ -186,5 +234,73 @@ pub(crate) async fn saga_next_expiry(host: &Host) -> Option<u64> {
     match decode_reply(&reply).ok()? {
         SagaReply::NextExpiry(v) => v,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod capability_announcer_tests {
+    use super::*;
+
+    fn tags(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn caps(cores: u64) -> BTreeMap<String, u64> {
+        BTreeMap::from([("cores".to_string(), cores)])
+    }
+
+    #[test]
+    fn re_announces_when_only_resources_drift() {
+        // a Podman node: tags already committed, but its announced capacity
+        // differs from what the registry holds → re-announce the pair.
+        let mut a = CapabilityAnnouncer::new(vec![1u8; 32], tags(&["codex"]), caps(8));
+        assert_eq!(
+            a.decide(&tags(&["codex"]), &caps(4)),
+            Some((tags(&["codex"]), caps(8))),
+            "matching tags but drifted resources still re-announce"
+        );
+        // once the registry reflects both, it goes quiet.
+        assert_eq!(a.decide(&tags(&["codex"]), &caps(8)), None);
+    }
+
+    #[test]
+    fn a_direct_backend_announcer_carries_no_resources() {
+        // empty capacity (direct spawn): the announce is tags-only, and it
+        // never emits resources even when told the registry is bare.
+        let mut a = CapabilityAnnouncer::new(vec![2u8; 32], tags(&["codex"]), BTreeMap::new());
+        let (announced_tags, announced_res) = a
+            .decide(&[], &BTreeMap::new())
+            .expect("a fresh direct node announces its tags");
+        assert_eq!(announced_tags, tags(&["codex"]));
+        assert!(announced_res.is_empty(), "direct: never any resources");
+    }
+
+    #[test]
+    fn empty_tags_force_empty_resources() {
+        // resources-without-tags is a consensus-level reject: even if a
+        // Podman node somehow discovered no executors, it never emits the
+        // resources-only shape (and with nothing recorded, it stays silent).
+        let mut a = CapabilityAnnouncer::new(vec![3u8; 32], Vec::new(), caps(8));
+        assert_eq!(
+            a.decide(&[], &BTreeMap::new()),
+            None,
+            "no tags + nothing recorded: genesis silence"
+        );
+    }
+
+    #[test]
+    fn the_in_flight_latch_covers_the_pair() {
+        let mut a = CapabilityAnnouncer::new(vec![4u8; 32], tags(&["codex"]), caps(8));
+        // first decide latches the pair.
+        assert_eq!(
+            a.decide(&[], &BTreeMap::new()),
+            Some((tags(&["codex"]), caps(8)))
+        );
+        // an identical decision while it is still in flight stays quiet.
+        assert_eq!(
+            a.decide(&[], &BTreeMap::new()),
+            None,
+            "the latch dedups the exact (tags, resources) pair"
+        );
     }
 }

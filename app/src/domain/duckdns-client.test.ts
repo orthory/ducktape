@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { repoFile } from "../test/repo-file";
 import {
   handleError,
   normalizeHandle,
   registrations,
+  RESERVED_ROOT_LABELS,
   resolve,
   setHandle,
 } from "./duckdns-client";
@@ -70,7 +72,29 @@ describe("DuckDNS handle validation", () => {
 
   it("rejects reserved and malformed root labels", () => {
     expect(handleError("net")).toMatch(/reserved/);
+    expect(handleError("agents")).toMatch(/reserved/);
     expect(handleError("-rae")).toMatch(/start or end/);
     expect(handleError("rae_team")).toMatch(/lowercase/);
+  });
+
+  // Consensus is the authority: a handle this client accepts but the node
+  // reserves is a squat the UI walks the user into (`agents.duck` owns every
+  // agent's attribution ident). Read the Rust const so a label added on one
+  // side only turns this red.
+  it("mirrors the consensus reserved-root-label set exactly", () => {
+    const wire = repoFile("crates/system/duckdns/src/wire.rs");
+    const literal = /RESERVED_ROOT_LABELS: &\[&str\] = &\[([^\]]*)\]/.exec(wire);
+    expect(literal, "RESERVED_ROOT_LABELS not found in wire.rs").not.toBeNull();
+    const consensus = [...literal![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(consensus.length).toBeGreaterThan(0);
+    expect([...RESERVED_ROOT_LABELS].sort()).toEqual([...consensus].sort());
+
+    // …and ops/demo-gateway.mjs, the third copy (a plain node script — it can't
+    // import this module).
+    const seed = repoFile("ops/demo-gateway.mjs");
+    const seedLiteral = /RESERVED_ROOT_LABELS = \[([^\]]*)\]/.exec(seed);
+    expect(seedLiteral, "RESERVED_ROOT_LABELS not found in demo-gateway.mjs").not.toBeNull();
+    const seedLabels = [...seedLiteral![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect([...seedLabels].sort()).toEqual([...consensus].sort());
   });
 });

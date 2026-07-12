@@ -136,12 +136,12 @@ struct NodeToml {
 /// real on-disk names — the desktop Forge view's repo list. Repo-name-agnostic:
 /// whatever was pushed (`ducktape`, `default`, ...) shows up under its own name.
 #[tauri::command]
-pub fn forge_list_repos(app: tauri::AppHandle) -> Result<Vec<RepoMeta>, String> {
+pub fn forge_list_repos(app: crate::rt::AppHandle) -> Result<Vec<RepoMeta>, String> {
     list_forge_repos(&app)
 }
 
 #[tauri::command]
-pub fn forge_head(app: tauri::AppHandle, repo: String) -> Result<Option<String>, String> {
+pub fn forge_head(app: crate::rt::AppHandle, repo: String) -> Result<Option<String>, String> {
     let Some(git) = open_named_repo(&app, &repo)? else {
         return Ok(None);
     };
@@ -151,7 +151,7 @@ pub fn forge_head(app: tauri::AppHandle, repo: String) -> Result<Option<String>,
 /// Every local branch (`refs/heads/*`) by SHORT name with its 40-hex head,
 /// sorted by name — the PR pickers' branch list.
 #[tauri::command]
-pub fn forge_list_branches(app: tauri::AppHandle, repo: String) -> Result<Vec<BranchInfo>, String> {
+pub fn forge_list_branches(app: crate::rt::AppHandle, repo: String) -> Result<Vec<BranchInfo>, String> {
     let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
     };
@@ -180,7 +180,7 @@ pub fn forge_list_branches(app: tauri::AppHandle, repo: String) -> Result<Vec<Br
 /// whole reachable history, `Some(n)` caps to the newest `n`.
 #[tauri::command]
 pub fn forge_log(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     limit: Option<usize>,
     reference: Option<String>,
@@ -229,7 +229,7 @@ pub fn forge_log(
 
 #[tauri::command]
 pub fn forge_tree(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     path: String,
     reference: Option<String>,
@@ -272,7 +272,7 @@ pub fn forge_tree(
 
 #[tauri::command]
 pub fn forge_read_file(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     path: String,
     reference: Option<String>,
@@ -303,7 +303,7 @@ pub fn forge_read_file(
 
 #[tauri::command]
 pub fn forge_read_file_page(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     path: String,
     reference: Option<String>,
@@ -335,7 +335,7 @@ pub fn forge_read_file_page(
 
 #[tauri::command]
 pub fn forge_diff(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     from: Option<String>,
     to: Option<String>,
@@ -429,7 +429,7 @@ pub fn forge_diff(
 /// "files changed" payload.
 #[tauri::command]
 pub fn forge_compare(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     base: String,
     head: String,
@@ -513,7 +513,7 @@ pub fn forge_compare(
 /// the conflicting paths and NO merge.
 #[tauri::command]
 pub fn forge_build_merge(
-    app: tauri::AppHandle,
+    app: crate::rt::AppHandle,
     repo: String,
     ours: String,
     theirs: String,
@@ -650,7 +650,7 @@ fn clean_repo_name(name: &str) -> Result<&str, String> {
 /// name it wants to read (from [`list_forge_repos`]/the UI's selection), so
 /// nothing here hardcodes or guesses a repo name; the name is validated as a
 /// single path segment first so it cannot escape the base.
-fn open_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Option<Repository>, String> {
+fn open_named_repo(app: &crate::rt::AppHandle, repo: &str) -> Result<Option<Repository>, String> {
     let repo = clean_repo_name(repo)?;
     for base in forge_base_dirs(app)? {
         let dir = base.join(repo);
@@ -665,7 +665,7 @@ fn open_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Option<Reposito
 
 /// Like [`open_named_repo`] but the repo MUST be materialized — compare/merge
 /// have no meaningful empty shape.
-fn require_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Repository, String> {
+fn require_named_repo(app: &crate::rt::AppHandle, repo: &str) -> Result<Repository, String> {
     open_named_repo(app, repo)?
         .ok_or_else(|| format!("forge repo {repo:?} is not materialized on this node"))
 }
@@ -675,7 +675,7 @@ fn require_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Repository, 
 /// Sorted by name and de-duplicated (the first base wins) so the list is
 /// deterministic. A missing base is simply empty; a single flaky dir entry is
 /// skipped, not fatal.
-fn list_forge_repos(app: &tauri::AppHandle) -> Result<Vec<RepoMeta>, String> {
+fn list_forge_repos(app: &crate::rt::AppHandle) -> Result<Vec<RepoMeta>, String> {
     let mut repos: BTreeMap<String, Option<String>> = BTreeMap::new();
     for base in forge_base_dirs(app)? {
         let read = match fs::read_dir(&base) {
@@ -712,7 +712,7 @@ fn list_forge_repos(app: &tauri::AppHandle) -> Result<Vec<RepoMeta>, String> {
 /// the forge base container dir(s) this node materializes repos under, in
 /// priority order (active workspace storage, then the app-data node dir). each
 /// holds repos at `<base>/<name>`.
-fn forge_base_dirs(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
+fn forge_base_dirs(app: &crate::rt::AppHandle) -> Result<Vec<PathBuf>, String> {
     let mut storages = Vec::new();
     if let Some(active) = active_workspace_storage(app)? {
         storages.push(active);
@@ -736,7 +736,7 @@ fn forge_base_dirs(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
-fn active_workspace_storage(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
+fn active_workspace_storage(app: &crate::rt::AppHandle) -> Result<Option<PathBuf>, String> {
     let home = app
         .path()
         .home_dir()

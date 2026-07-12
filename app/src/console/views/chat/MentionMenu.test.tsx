@@ -23,7 +23,6 @@ const agent = (
   owner: { external: [1] },
   display_name: displayName,
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status,
   created_at: 1,
@@ -242,5 +241,75 @@ describe("Composer @mention typeahead", () => {
     fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
     expect((textarea as HTMLTextAreaElement).value).toBe("@qu");
     expect(onSend).not.toHaveBeenCalled();
+  });
+});
+
+// The `[[` typeahead rides the same listbox and the same keydown contract as
+// the @menu — what differs is the token grammar (a page title has SPACES, so
+// whitespace must not close it) and what it inserts.
+describe("Composer [[ page-ref typeahead", () => {
+  const PAGES = [
+    { id: "p1", title: "Launch plan", parent: null },
+    { id: "p2", title: "Roadmap", parent: null },
+  ];
+
+  it("opens on `[[`, lists the pages, and inserts the full ref on pick", () => {
+    const { textarea } = setup(vi.fn(), { pages: PAGES });
+
+    type(textarea, "see [[");
+    expect(screen.getByRole("listbox", { name: "Link a page" })).toBeTruthy();
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Launch planp1",
+      "Roadmapp2",
+    ]);
+
+    fireEvent.mouseDown(screen.getAllByRole("option")[0]!);
+
+    expect((textarea as HTMLTextAreaElement).value).toBe("see [[page:p1]] ");
+  });
+
+  it("keeps filtering across a SPACE — a page title is not a mention handle", () => {
+    const { textarea } = setup(vi.fn(), { pages: PAGES });
+
+    type(textarea, "[[launch pl");
+
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Launch planp1"]);
+  });
+
+  it("Enter picks the page instead of sending; Escape dismisses the menu", () => {
+    const { textarea, onSend } = setup(vi.fn(), { pages: PAGES });
+
+    type(textarea, "[[road");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect((textarea as HTMLTextAreaElement).value).toBe("[[page:p2]] ");
+
+    type(textarea, "[[ro");
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("ArrowDown moves the active row", () => {
+    const { textarea } = setup(vi.fn(), { pages: PAGES });
+
+    type(textarea, "[[");
+    fireEvent.keyDown(textarea, { key: "ArrowDown" });
+
+    const options = screen.getAllByRole("option");
+    expect(options[0]!.getAttribute("aria-selected")).toBe("false");
+    expect(options[1]!.getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("stays shut with no pages to link", () => {
+    const { textarea } = setup(vi.fn(), { pages: [] });
+    type(textarea, "[[");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("does not disturb the @menu", () => {
+    const { textarea } = setup(vi.fn(), { pages: PAGES });
+    type(textarea, "@qu");
+    expect(screen.getByRole("listbox", { name: "Mention a person or agent" })).toBeTruthy();
   });
 });

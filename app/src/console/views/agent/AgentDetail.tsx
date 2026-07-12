@@ -1,11 +1,13 @@
 // The detail pane for the selected agent: identity header, pause/resume,
-// permissions, and the inline edit toggle. Asking an agent to respond lives
-// on the message in chat now — this pane manages the record only.
+// curated skills, permissions, and the inline edit toggle. Asking an agent to
+// respond lives on the message in chat now — this pane manages the record only.
 
 import { useState } from "react";
 
-import type { AgentRecord } from "../../../domain/agent-client";
+import type { AgentRecord, ResourceCaps, SkillRef } from "../../../domain/agent-client";
+import { agentAddress } from "../../../domain/agent-client";
 import { Icon } from "../../components/Icon";
+import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { AgentEditForm } from "./AgentEditForm";
 import {
@@ -14,15 +16,69 @@ import {
   CapabilityStrip,
   Chip,
   EmptyState,
+  FILLED_IDENTITY_TEXT_PERCENT,
+  filledForeground,
+  filledMix,
   GroupCard,
   InfoRow,
   onDarkButton,
   ownerText,
   primaryButton,
+  secondaryButton,
   SectionLabel,
-  shortHex,
   statusTone,
 } from "./parts";
+import { cleanPrefix, skillDocPath, skillsSummary } from "./skills";
+
+/** One curated skill, read-only: what it is, where it lives, and whether it is
+ *  part of the agent's soul (always loaded) or something it reaches for. */
+function SkillRow({ skill }: { skill: SkillRef }) {
+  const { actions } = useDucktape();
+  const always = skill.load === "always";
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 9,
+        minWidth: 0,
+        padding: "8px 10px",
+        borderRadius: radius.sm,
+        border: `1px solid ${always ? statusTone.agent.border : color.border}`,
+        background: always ? statusTone.agent.bg : color.paper,
+      }}
+    >
+      <Chip
+        text={always ? "ALWAYS" : "ON DEMAND"}
+        tone={always ? statusTone.agent : statusTone.neutral}
+      />
+      <span style={{ font: `600 12px ${font.sans}`, color: color.ink, flexShrink: 0 }}>
+        {skill.name}
+      </span>
+      <span
+        translate="no"
+        style={{
+          flex: 1,
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          font: `400 10.5px ${font.mono}`,
+          color: color.muted2,
+        }}
+      >
+        {skillDocPath(skill.source_prefix)}
+      </span>
+      <button
+        type="button"
+        onClick={() => actions.openFiles(cleanPrefix(skill.source_prefix))}
+        style={{ ...secondaryButton, minHeight: 24, padding: "2px 8px", flexShrink: 0 }}
+      >
+        Open
+      </button>
+    </div>
+  );
+}
 
 export function AgentDetail({
   agent,
@@ -39,8 +95,9 @@ export function AgentDetail({
     agentId: string;
     displayName?: string;
     capability?: string;
-    prompt?: string;
     allowedActions?: string[];
+    caps?: ResourceCaps;
+    skills?: SkillRef[];
   }) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -110,7 +167,10 @@ export function AgentDetail({
             >
               <span
                 translate="no"
-                style={{ font: `400 11px ${font.mono}`, color: "rgba(239,239,239,.5)" }}
+                style={{
+                  font: `400 11px ${font.mono}`,
+                  color: filledMix(FILLED_IDENTITY_TEXT_PERCENT),
+                }}
               >
                 {agent.agent_id}
               </span>
@@ -121,12 +181,14 @@ export function AgentDetail({
                   gap: 5,
                   padding: "2px 9px",
                   borderRadius: 999,
-                  background: "rgba(239,239,239,.08)",
-                  border: "1px solid rgba(239,239,239,.16)",
+                  background: filledMix(8),
+                  border: `1px solid ${filledMix(16)}`,
                   font: `700 9px ${font.mono}`,
                   letterSpacing: ".07em",
                   textTransform: "uppercase",
-                  color: active ? color.green : color.amber,
+                  color: active
+                    ? filledForeground(color.green)
+                    : filledForeground(color.amber),
                 }}
               >
                 <span
@@ -153,7 +215,12 @@ export function AgentDetail({
             <button
               type="button"
               onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
-              style={{ ...onDarkButton, color: active ? color.amber : color.green }}
+              style={{
+                ...onDarkButton,
+                color: active
+                  ? filledForeground(color.amber)
+                  : filledForeground(color.green),
+              }}
             >
               {active ? "Pause agent" : "Resume agent"}
             </button>
@@ -186,9 +253,41 @@ export function AgentDetail({
               gap: 8,
             }}
           >
+            {/* a legacy agent has no label-shaped id, so no address it can be
+                reached at — see `agentAddress`. show none, never a false one. */}
+            {agentAddress(agent.agent_id) && (
+              <InfoRow label="address" value={agentAddress(agent.agent_id)} />
+            )}
             <InfoRow label="owner" value={ownerText(agent.owner)} />
-            <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
+            <InfoRow label="skills" value={skillsSummary(agent.skills ?? [])} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
+          </div>
+
+          <div style={{ marginTop: 15 }}>
+            <SectionLabel>SKILLS</SectionLabel>
+            <div
+              style={{
+                marginTop: 4,
+                font: `400 10.5px ${font.sans}`,
+                color: color.muted2,
+                lineHeight: 1.5,
+              }}
+            >
+              Always-loaded documents are pasted into every run — they are this agent's
+              persona. The others are listed by name and opened only when the job calls
+              for one.
+            </div>
+            <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+              {(agent.skills ?? []).length === 0 ? (
+                <span style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+                  No skills curated — this agent runs on the task instructions alone.
+                </span>
+              ) : (
+                (agent.skills ?? []).map((skill) => (
+                  <SkillRow key={`${skill.name}:${skill.source_prefix}`} skill={skill} />
+                ))
+              )}
+            </div>
           </div>
 
           <div style={{ marginTop: 15 }}>
@@ -222,6 +321,52 @@ export function AgentDetail({
         </div>
       </div>
     </section>
+  );
+}
+
+/** The right pane when an EXPLICIT selection names an agent the roster doesn't
+ *  hold — a clicked @mention of an agent that has since been removed. Says so,
+ *  rather than quietly showing the first agent's pane as if it were the one
+ *  asked for. */
+export function MissingAgentPane({ agentId, onBack }: { agentId: string; onBack: () => void }) {
+  return (
+    <GroupCard>
+      <div
+        style={{
+          minHeight: 240,
+          padding: "40px 24px",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          textAlign: "center",
+          gap: 10,
+        }}
+      >
+        <span
+          style={{
+            width: 46,
+            height: 46,
+            borderRadius: radius.md,
+            background: color.sunken,
+            color: color.muted2,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="agent" size={22} color="currentColor" strokeWidth={1.6} />
+        </span>
+        <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Agent not found</div>
+        <div style={{ maxWidth: 340, font: `400 12px ${font.sans}`, color: color.muted2, lineHeight: 1.5 }}>
+          <span style={{ font: `500 12px ${font.mono}`, color: color.muted3 }}>{agentId}</span> isn’t in
+          this workspace’s roster — it may have been removed since it was mentioned.
+        </div>
+        <button type="button" onClick={onBack} style={{ ...primaryButton(true), marginTop: 4 }}>
+          Back to the roster
+        </button>
+      </div>
+    </GroupCard>
   );
 }
 

@@ -54,6 +54,7 @@ impl Module for Caller {
                     dispatch_id: "d1".into(),
                     recipe_id: "summarize".into(),
                     payload: b"the entire input".to_vec(),
+                    demands: Default::default(),
                 }),
             });
         }
@@ -160,6 +161,7 @@ fn results_deliver_exactly_once_and_never_in_their_own_block() {
                 saga_id,
                 attempt: 0,
                 outcome: Ok(br#"{"answer":42}"#.to_vec()),
+                usage: None,
             }),
         },
     );

@@ -25,18 +25,19 @@
 //!    not payloads. two constructors resolve the bytes behind a finalized digest:
 //!    [`SimplexOrderer::spawn`] uses a [`NoopRelay`] over one shared
 //!    [`ContentStore`] (the in-process-sim simplification — one store cloned into
-//!    every validator), while [`SimplexOrderer::spawn_with_relay`] runs a real
+//!    every validator), while [`SimplexOrderer::spawn_with_resolver`] runs a real
 //!    [`ConsensusRelay`] over a PER-PROCESS store: the leader gossips a proposed
 //!    frame's bytes at propose time, peers cache them STORE-ONLY (see
-//!    [`spawn_payload_drain`]), so a non-proposer resolves a digest for an op it
-//!    never originated. either way the ORDER comes purely from finalization; the
-//!    store only resolves an already-agreed digest back to bytes.
+//!    [`spawn_payload_drain`]), and a lazy resolver fetch backstops any miss — so
+//!    a non-proposer resolves a digest for an op it never originated. either way
+//!    the ORDER comes purely from finalization; the store only resolves an
+//!    already-agreed digest back to bytes.
 //!
 //! the whole thing is additive: `node::Orderer` / `OrderedNode` / the frame
 //! codec / `RoundOrderer` are all UNCHANGED — `SimplexOrderer` slots in behind
 //! the identical trait.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use commonware_actor::Feedback;
@@ -56,17 +57,11 @@ use commonware_utils::channel::fallible::OneshotExt;
 use commonware_utils::channel::oneshot;
 
 use bytes::Bytes;
-use commonware_cryptography::Signer as _;
-use commonware_cryptography::bls12381::primitives::variant::MinPk;
-use commonware_cryptography::bls12381::primitives::{ops as bls_ops, variant as bls_variant};
 use commonware_resolver::p2p::{
     Config as ResolverConfig, Engine as ResolverEngine, Mailbox as ResolverMailbox,
     Producer as ResolverProducer,
 };
 use commonware_resolver::{Consumer as ResolverConsumer, Delivery, Resolver as _};
-use commonware_utils::TryCollect as _;
-use commonware_utils::ordered::BiMap;
-use rand_core::SeedableRng as _;
 
 mod valset_orchestrator;
 pub use valset_orchestrator::{
@@ -86,36 +81,18 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 /// every validator must agree on (it domain-separates the simplex scheme + certificates;
 /// a mismatch means engines never agree and the mesh hangs).
 ///
-/// # variants
-/// - [`V1Ed25519`](ConsensusScheme::V1Ed25519) — the DEFAULT. each validator signs with
-///   its own ed25519 key; a certificate is a COLLECTION of ed25519 signatures, so cert
-///   size (and verification cost) grows linearly with the validator set.
-/// - [`V2Bls`](ConsensusScheme::V2Bls) — bls12381 MULTISIG over the MinPk variant
-///   (48-byte bls public keys). quorum votes aggregate into ONE bls signature per
-///   certificate (plus a signer-index bitmap), so cert size stays essentially FLAT as
-///   the set grows — the reason to migrate at scale. still attributable: the signer
-///   indices ride along, so per-validator liveness/fault evidence keeps working. the
-///   scheme is DUAL-KEY: ed25519 remains the transport/p2p IDENTITY everywhere (peer
-///   ordering, discovery, blocking); the bls key ONLY signs votes/certificates.
-///   deliberately NOT the bls threshold schemes — those need DKG/resharing, which
-///   fights the epoch teardown-respawn contract below.
+/// [`V1Ed25519`](ConsensusScheme::V1Ed25519) is the only wired scheme: each validator
+/// signs with its own ed25519 key; a certificate is a COLLECTION of ed25519 signatures,
+/// so cert size (and verification cost) grows linearly with the validator set.
 ///
-/// # rogue-key / proof-of-possession (V2)
-/// naive bls aggregation is rogue-key-attackable: a registrant that can choose its
-/// public key as a function of the others' can forge aggregate signatures. in this
-/// slice the (identity key -> bls key) map fed to the scheme is TRUSTED input from
-/// config/genesis, so no proof-of-possession check is performed here. PoP verification
-/// lands with valset membership authentication — a join must prove knowledge of its bls
-/// secret before its key ever enters the map.
-///
-/// # the rekey / respawn contract (read before wiring V2 or dynamic validators)
+/// # the rekey / respawn contract (read before wiring a new scheme or dynamic validators)
 /// the scheme AND the validator set are fixed at simplex `Engine` construction — neither
 /// can be hot-swapped in a running engine. changing EITHER (a scheme migration, or a
 /// validator join/leave) requires an **epoch transition**: at a height the OLD engine
 /// finalizes, every validator tears down the current engine and RE-SPAWNS a new one with
 /// the new `(scheme, participants)`. finalizing the switch through the old engine FIRST is
 /// what makes every node cut over at the SAME point (else they fork). this one
-/// teardown-and-respawn mechanism backs both BLS migration and dynamic valset. the same
+/// teardown-and-respawn mechanism backs both scheme migration and dynamic valset. the same
 /// epoch boundary is where validator-owned transport membership rotates: bootnodes,
 /// relayers, and control participants must be derived from that epoch's validator set,
 /// not from a static external relay.
@@ -123,86 +100,13 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 /// # implementation note
 /// [`SimplexOrderer`]'s spawn fns are GENERIC over the simplex scheme `S` (with
 /// `S::PublicKey` pinned to ed25519 — the transport identity), and the orderer itself is
-/// scheme-erased. so selecting a variant is purely a construction-time choice: build the
-/// matching scheme value (`simplex::scheme::ed25519::Scheme::signer` for V1,
-/// [`BlsScheme::signer`] / [`bls_dev_scheme`] for V2) and hand it to the same spawn.
+/// scheme-erased. so selecting a scheme is purely a construction-time choice: build the
+/// scheme value (`simplex::scheme::ed25519::Scheme::signer`) and hand it to the spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConsensusScheme {
     /// per-validator ed25519 signatures; certificates are collections of them.
     #[default]
     V1Ed25519,
-    /// dual-key bls12381 multisig (MinPk): ed25519 identity, bls votes, ONE aggregated
-    /// signature (+ signer indices) per certificate.
-    V2Bls,
-}
-
-// ============================================================================
-// the V2Bls scheme surface — dual-key (ed25519 identity, bls12381 signing).
-// ============================================================================
-
-/// the V2 simplex scheme: bls12381 multisig over the MinPk variant, keyed by ed25519
-/// IDENTITY keys — the dual-key shape. participant ORDER (and so signer indices, leader
-/// rotation, and the certificate bitmap) comes from the sorted ed25519 identity keys,
-/// exactly like V1; only the vote/certificate signatures are bls. constructed via
-/// `BlsScheme::signer(namespace, participants, secret)` /
-/// `BlsScheme::verifier(namespace, participants)` where `participants` is the
-/// (identity key -> bls key) [`BiMap`](commonware_utils::ordered::BiMap) — TRUSTED
-/// config/genesis input in this slice (see the rogue-key section on
-/// [`ConsensusScheme`]).
-pub type BlsScheme = commonware_consensus::simplex::scheme::bls12381_multisig::Scheme<
-    commonware_cryptography::ed25519::PublicKey,
-    MinPk,
->;
-
-/// a V2 bls signing (private) key — the scalar behind a validator's vote signatures.
-pub type BlsPrivateKey = commonware_cryptography::bls12381::primitives::group::Private;
-
-/// a V2 bls public key (MinPk: 48 bytes) — the `values` side of the participant BiMap.
-pub type BlsPublicKey = <MinPk as bls_variant::Variant>::Public;
-
-/// a V2 certificate: ONE aggregated bls signature + the signer-index bitmap.
-pub type BlsCertificate =
-    commonware_cryptography::bls12381::certificate::multisig::Certificate<MinPk>;
-
-/// derive a validator's V2 bls signing secret from its DEV seed — the bls analog of
-/// `ed25519::PrivateKey::from_seed` (INSECURE; examples/tests/dev config only). the
-/// chacha seed is sha256-domain-separated from the ed25519 derivation so the two dev
-/// keys never share key material even for the same seed value.
-pub fn bls_dev_secret(seed: u64) -> BlsPrivateKey {
-    let mut hasher = Sha256::default();
-    hasher.update(b"ducktape:consensus:bls12381:dev-seed:v1:");
-    hasher.update(&seed.to_be_bytes());
-    let digest = hasher.finalize();
-    let mut chacha_seed = [0u8; 32];
-    chacha_seed.copy_from_slice(digest.as_ref());
-    let mut rng = rand_chacha::ChaCha20Rng::from_seed(chacha_seed);
-    bls_ops::keypair::<_, MinPk>(&mut rng).0
-}
-
-/// the bls public key for a DEV seed — the counterpart of [`bls_dev_secret`], used to
-/// build the participant BiMap from peer seed lists.
-pub fn bls_dev_public(seed: u64) -> BlsPublicKey {
-    bls_ops::compute_public::<MinPk>(&bls_dev_secret(seed))
-}
-
-/// build a V2 signer over the DEV validator set `seeds` for `my_seed` — the bls analog
-/// of the V1 dev path `simplex_ed25519::Scheme::signer(ns, participants, from_seed(id))`
-/// (bin/node, tests). pairs every seed's ed25519 IDENTITY key with its derived bls
-/// signing key into the participant BiMap; `None` when `my_seed`'s bls key is not in
-/// the set (or `seeds` contains duplicates). the pairs are TRUSTED input here — see the
-/// rogue-key / proof-of-possession section on [`ConsensusScheme`].
-pub fn bls_dev_scheme(namespace: &[u8], seeds: &[u64], my_seed: u64) -> Option<BlsScheme> {
-    let participants: BiMap<commonware_cryptography::ed25519::PublicKey, BlsPublicKey> = seeds
-        .iter()
-        .map(|s| {
-            (
-                commonware_cryptography::ed25519::PrivateKey::from_seed(*s).public_key(),
-                bls_dev_public(*s),
-            )
-        })
-        .try_collect()
-        .ok()?;
-    BlsScheme::signer(namespace, participants, bls_dev_secret(my_seed))
 }
 
 /// hash a frame's bytes into the [`Digest`] simplex will order — the
@@ -792,6 +696,113 @@ impl ResolverConsumer for PayloadConsumer {
     }
 }
 
+/// wire and START the lazy catch-up fetch engine over `store` + `inbox`: the
+/// [`PayloadProducer`] serves local bytes by digest to fetching peers, the
+/// [`PayloadConsumer`] verifies fetched bytes, stores them, and fills the
+/// awaiting gate slot. one construction shared by the validator
+/// ([`SimplexOrderer::spawn_with_resolver`]) and follower
+/// ([`FollowerOrderer::spawn_resolver`]) paths, so the resolver tuning (short
+/// timeouts — a miss retries quickly within the deterministic pump loop) lives
+/// in exactly one place. the returned handle must be aborted on `Drop` (a bare
+/// handle drop leaks the task).
+fn spawn_payload_fetch<E, B, D, FS, FR>(
+    context: &E,
+    blocker: B,
+    provider: D,
+    me: commonware_cryptography::ed25519::PublicKey,
+    store: ContentStore,
+    inbox: FinalizedInbox,
+    fetch: (FS, FR),
+) -> (PayloadMailbox, commonware_runtime::Handle<()>)
+where
+    E: commonware_runtime::Spawner
+        + commonware_runtime::Clock
+        + commonware_runtime::Storage
+        + commonware_runtime::Metrics
+        + commonware_runtime::BufferPooler
+        + rand_core::CryptoRngCore
+        + Send
+        + Sync
+        + 'static,
+    B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+{
+    use commonware_utils::NZUsize;
+    use std::time::Duration;
+
+    let fetch_cfg = ResolverConfig {
+        peer_provider: provider,
+        blocker,
+        consumer: PayloadConsumer {
+            store: store.clone(),
+            inbox,
+        },
+        producer: PayloadProducer { store },
+        mailbox_size: NZUsize!(1024),
+        me: Some(me),
+        initial: Duration::from_millis(100),
+        timeout: Duration::from_millis(400),
+        fetch_retry_timeout: Duration::from_millis(100),
+        priority_requests: false,
+        priority_responses: false,
+    };
+    let (fetch_engine, mailbox) = ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
+    (mailbox, fetch_engine.start(fetch))
+}
+
+/// the fetch-or-defer seam shared by the validator reporter and the follower:
+/// issue payload fetches through the resolver mailbox, parking any the mailbox
+/// did not accept (endpoint closed / rejected) for retry — a silently dropped
+/// fetch would stall its awaiting gate slot (and the whole release prefix
+/// behind it) forever. `deferred` is bounded by the number of outstanding
+/// missing payloads.
+#[derive(Clone)]
+struct PayloadFetcher {
+    /// `None` when no resolver is wired: fetches are disabled, and a
+    /// finalization MISS drops its slot (the eager-only semantics).
+    mailbox: Option<PayloadMailbox>,
+    deferred: VecDeque<Digest>,
+}
+
+impl PayloadFetcher {
+    fn new(mailbox: Option<PayloadMailbox>) -> Self {
+        Self {
+            mailbox,
+            deferred: VecDeque::new(),
+        }
+    }
+
+    /// whether a resolver is wired at all — gates whether a store MISS logs an
+    /// AWAITING slot (fetchable) or drops it (see [`FinalizedInbox::record`]).
+    fn enabled(&self) -> bool {
+        self.mailbox.is_some()
+    }
+
+    /// issue (or re-issue) a payload fetch. an unaccepted submission
+    /// ([`Feedback::accepted`] false) parks the digest for the next
+    /// [`PayloadFetcher::retry_deferred`] instead of silently dropping it.
+    fn fetch_or_defer(&mut self, digest: Digest) {
+        let Some(mailbox) = self.mailbox.as_mut() else {
+            return;
+        };
+        if !mailbox.fetch(digest).accepted() {
+            self.deferred.push_back(digest);
+        }
+    }
+
+    /// re-issue every parked fetch once (each may re-park itself).
+    fn retry_deferred(&mut self) {
+        for _ in 0..self.deferred.len() {
+            let Some(digest) = self.deferred.pop_front() else {
+                break;
+            };
+            self.fetch_or_defer(digest);
+        }
+    }
+}
+
 // ============================================================================
 // the finalized inbox — the sync-reporter -> async-drain buffer (cost 1).
 // ============================================================================
@@ -874,6 +885,12 @@ impl FinalizedInbox {
         if !inner.seen.insert(digest) {
             return false;
         }
+        // views are deliberately NOT asserted ascending here: a mid-epoch
+        // joiner's (or any lagging validator's) engine reports the live tip
+        // finalization FIRST and then backfills the gap views below it, so
+        // `record` legitimately sees descending views. that is safe
+        // downstream — the node's `drain_delivered` skips frames at or below
+        // its applied floor by agreed height, deterministically everywhere.
         if let Some(bytes) = store.get(&digest) {
             inner.log.push_back((view, digest));
             inner.ready.insert(digest, bytes);
@@ -905,6 +922,22 @@ impl FinalizedInbox {
             .expect("finalized inbox poisoned")
             .log
             .len()
+    }
+
+    /// the lowest recorded-but-unreleased view (`None` when fully drained) —
+    /// the RELEASE POINT a floor persistence checks a certificate against: a
+    /// certificate whose view sits strictly below every unreleased slot has
+    /// everything at or below it released. a minimum (not the front) because
+    /// the log is record-ordered, and a backfilling node records descending
+    /// views.
+    pub fn min_unreleased_view(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("finalized inbox poisoned")
+            .log
+            .iter()
+            .map(|(view, _)| *view)
+            .min()
     }
 
     /// release the longest all-ready PREFIX of the log, in finalization
@@ -941,31 +974,64 @@ impl FinalizedInbox {
 /// generic over the certificate scheme `S` so we never name a concrete scheme;
 /// the only `Activity` fields touched are `Finalization::proposal::{payload,
 /// round}`, both scheme-independent.
-/// the newest finalization certificate the reporter has observed, shared with
-/// the orderer: `(engine view, scheme-encoded Finalization bytes)`. a recovery
-/// layer persists this once the app has drained everything at or below its
-/// view; a restart then respawns the engine on it (`Floor::Finalized`), which
-/// suppresses journal-replay re-reports below the floor — without it, a
-/// reopened journal re-reports history into a fresh (empty) content store and
-/// the ordered gate wedges awaiting bytes no peer may hold.
-pub type LatestFinalization = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
+/// the newest finalization certificates observed, retained in a bounded
+/// view-keyed window shared with the orderer: `engine view -> scheme-encoded
+/// Finalization bytes`. a recovery layer persists the newest certificate whose
+/// view has fully drained; a restart then respawns the engine on it
+/// (`Floor::Finalized`), which suppresses journal-replay re-reports below the
+/// floor — without it, a reopened journal re-reports history into a fresh
+/// (empty) content store and the ordered gate wedges awaiting bytes no peer
+/// may hold.
+///
+/// a WINDOW, not a single latest slot, on purpose: on a busy chain the newest
+/// certificate is usually for a block still awaiting release, and a single
+/// slot would have already overwritten the one certificate the recovery layer
+/// may persist — the floor then stops tracking the tip for as long as the
+/// load lasts (and the statesync boundary serve, which requires the floor to
+/// certify exactly the tip, starves every joiner).
+pub type RetainedFinalizations = Arc<Mutex<BTreeMap<u64, Vec<u8>>>>;
+
+/// how many recent finalization certificates the window retains: bounds
+/// memory (a certificate is a few hundred bytes) while comfortably covering
+/// the deepest release backlog a single drain pass works through.
+const RETAINED_FINALIZATIONS: usize = 64;
+
+/// insert `view -> cert` into the retained window, pruning the oldest views
+/// past [`RETAINED_FINALIZATIONS`].
+fn retain_finalization(retained: &RetainedFinalizations, view: u64, cert: Vec<u8>) {
+    let mut window = retained.lock().expect("retained finalizations poisoned");
+    window.insert(view, cert);
+    while window.len() > RETAINED_FINALIZATIONS {
+        window.pop_first();
+    }
+}
+
+/// the newest retained certificate at or below `view` (`None` when the window
+/// holds nothing that old — a fresh epoch, or a backlog deeper than the
+/// retention).
+fn newest_finalization_at_or_below(
+    retained: &RetainedFinalizations,
+    view: u64,
+) -> Option<(u64, Vec<u8>)> {
+    retained
+        .lock()
+        .expect("retained finalizations poisoned")
+        .range(..=view)
+        .next_back()
+        .map(|(v, cert)| (*v, cert.clone()))
+}
 
 #[derive(Clone)]
 pub struct SimplexReporter<S> {
     store: ContentStore,
     pending: Arc<Mutex<VecDeque<Digest>>>,
     inbox: FinalizedInbox,
-    /// the shared latest-finalization slot (see [`LatestFinalization`]).
-    latest_final: LatestFinalization,
-    /// the catch-up fetch mailbox, `Some` only when a resolver engine is wired
-    /// (see [`SimplexOrderer::spawn_with_resolver`]). on a finalization MISS the
+    /// the shared retained-certificate window (see [`RetainedFinalizations`]).
+    retained: RetainedFinalizations,
+    /// the catch-up fetch seam, wired only via
+    /// [`SimplexOrderer::spawn_with_resolver`]. on a finalization MISS the
     /// reporter fetches through this instead of dropping the frame.
-    mailbox: Option<PayloadMailbox>,
-    /// fetches the mailbox did NOT accept (endpoint closed / rejected): the
-    /// awaiting gate slot would stall forever if the request were silently
-    /// dropped, so they are retried at the next `report` call. bounded by the
-    /// number of outstanding missing payloads.
-    deferred_fetches: VecDeque<Digest>,
+    fetcher: PayloadFetcher,
     _marker: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -979,29 +1045,15 @@ impl<S> SimplexReporter<S> {
         pending: Arc<Mutex<VecDeque<Digest>>>,
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
-        latest_final: LatestFinalization,
+        retained: RetainedFinalizations,
     ) -> Self {
         Self {
             store,
             pending,
             inbox,
-            latest_final,
-            mailbox,
-            deferred_fetches: VecDeque::new(),
+            retained,
+            fetcher: PayloadFetcher::new(mailbox),
             _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// issue (or re-issue) a payload fetch. an unaccepted submission
-    /// ([`Feedback::accepted`] false — the resolver endpoint is closed or
-    /// rejected the work) parks the digest for retry on the next `report` call
-    /// instead of silently dropping it and stalling its gate slot forever.
-    fn fetch_or_defer(&mut self, digest: Digest) {
-        let Some(mailbox) = self.mailbox.as_mut() else {
-            return;
-        };
-        if !mailbox.fetch(digest).accepted() {
-            self.deferred_fetches.push_back(digest);
         }
     }
 }
@@ -1016,12 +1068,7 @@ where
         // retry fetches a previous report failed to enqueue — a dropped fetch
         // would stall its awaiting gate slot (and the whole release prefix
         // behind it) forever.
-        for _ in 0..self.deferred_fetches.len() {
-            let Some(digest) = self.deferred_fetches.pop_front() else {
-                break;
-            };
-            self.fetch_or_defer(digest);
-        }
+        self.fetcher.retry_deferred();
         // the ONLY activity we deliver on is a recovered finalization certificate
         // — the BFT-agreed "this frame is committed".
         if let Activity::Finalization(finalization) = activity {
@@ -1044,9 +1091,9 @@ where
             // resolver's `Consumer::deliver`, which fills the slot.
             let need_fetch = self
                 .inbox
-                .record(view, digest, &self.store, self.mailbox.is_some());
+                .record(view, digest, &self.store, self.fetcher.enabled());
             if need_fetch {
-                self.fetch_or_defer(digest);
+                self.fetcher.fetch_or_defer(digest);
             }
             // finalized: this digest can never be re-proposed, so its pin (if it
             // was OUR submission) is released into the bounded cache — recent
@@ -1058,11 +1105,7 @@ where
             // surface the certificate for the recovery layer (the respawn
             // floor). encoded here because only the reporter holds the typed
             // Finalization<S, _>.
-            *self
-                .latest_final
-                .lock()
-                .expect("latest finalization poisoned") =
-                Some((view, finalization.encode().to_vec()));
+            retain_finalization(&self.retained, view, finalization.encode().to_vec());
         }
         Feedback::Ok
     }
@@ -1081,8 +1124,8 @@ where
 pub struct SimplexOrderer {
     handle: ConsensusHandle,
     inbox: FinalizedInbox,
-    /// the shared latest-finalization slot (see [`LatestFinalization`]).
-    latest_final: LatestFinalization,
+    /// the shared retained-certificate window (see [`RetainedFinalizations`]).
+    retained: RetainedFinalizations,
     /// the engine task: ABORTED by this orderer's `Drop`. a
     /// [`commonware_runtime::Handle`] does NOT abort on drop by itself, so
     /// without the explicit abort an epoch cutover (which replaces the
@@ -1116,23 +1159,21 @@ impl Drop for SimplexOrderer {
 }
 
 impl SimplexOrderer {
-    /// the newest finalization certificate the engine reported: `(engine
-    /// view, scheme-encoded bytes)`. see [`LatestFinalization`] for why a
-    /// recovery layer persists this.
-    pub fn latest_finalization(&self) -> Option<(u64, Vec<u8>)> {
-        self.latest_final
-            .lock()
-            .expect("latest finalization poisoned")
-            .clone()
+    /// the newest retained finalization certificate at or below `view`:
+    /// `(engine view, scheme-encoded bytes)`. a recovery layer calls this
+    /// with the last SEALED view and persists the answer once it clears
+    /// [`SimplexOrderer::min_unreleased_view`] — see [`RetainedFinalizations`].
+    pub fn finalization_at_or_below(&self, view: u64) -> Option<(u64, Vec<u8>)> {
+        newest_finalization_at_or_below(&self.retained, view)
     }
 
-    /// count of finalized slots not yet released by `poll_delivered`. a
-    /// recovery layer persists a finalization floor only when this is 0 —
-    /// read the certificate FIRST, then this: releases happen only on the
-    /// caller's own drain thread, so a zero here proves everything reported
-    /// before the certificate read has been released (and applied).
-    pub fn unreleased_len(&self) -> usize {
-        self.inbox.unreleased_len()
+    /// the lowest recorded-but-unreleased view (`None` when fully drained).
+    /// a recovery layer persists a certificate only when its view sits
+    /// strictly below this — read the certificate FIRST, then this: releases
+    /// happen only on the caller's own drain thread, so a certificate below
+    /// every slot still pending at the later read is fully applied.
+    pub fn min_unreleased_view(&self) -> Option<u64> {
+        self.inbox.min_unreleased_view()
     }
 
     /// depth of this node's pending FIFO — delegates to the shared
@@ -1184,6 +1225,12 @@ impl SimplexOrderer {
     /// channel pairs (forwarded to `engine.start`). config is the tuned legacy
     /// default. the engine's handle lives inside the returned orderer, whose
     /// `Drop` explicitly ABORTS it (a bare handle drop would leak the task).
+    ///
+    /// `inbox` is caller-supplied (not minted here) so the resolver path can
+    /// share the ordered gate with its [`PayloadConsumer`] BEFORE building;
+    /// `fetch` carries that path's `(mailbox, engine handle)` — the mailbox
+    /// goes to the reporter (fetch-on-miss), the handle to the orderer's
+    /// `Drop`. `None` on the eager-only paths.
     #[allow(clippy::too_many_arguments)]
     fn build<E, S, B, R, VS, VR, CS, CR, RS, RR>(
         context: E,
@@ -1196,6 +1243,8 @@ impl SimplexOrderer {
         store: ContentStore,
         relay: R,
         payload_drain: Option<commonware_runtime::Handle<()>>,
+        inbox: FinalizedInbox,
+        fetch: Option<(PayloadMailbox, commonware_runtime::Handle<()>)>,
         vote: (VS, VR),
         certificate: (CS, CR),
         resolver: (RS, RR),
@@ -1248,14 +1297,14 @@ impl SimplexOrderer {
             context.child("automaton"),
         );
         let handle = automaton.handle(store.clone());
-        let inbox = FinalizedInbox::new();
-        let latest_final = LatestFinalization::default();
+        let (mailbox, fetch_handle) = fetch.unzip();
+        let retained = RetainedFinalizations::default();
         let reporter = SimplexReporter::<S>::new(
             store.clone(),
             automaton.pending(),
             inbox.clone(),
-            None,
-            latest_final.clone(),
+            mailbox,
+            retained.clone(),
         );
 
         // page cache borrows the pooler context BEFORE we hand a child to Engine.
@@ -1300,9 +1349,9 @@ impl SimplexOrderer {
         SimplexOrderer {
             handle,
             inbox,
-            latest_final,
+            retained,
             engine: engine_handle,
-            resolver_fetch: None,
+            resolver_fetch: fetch_handle,
             payload_drain,
         }
     }
@@ -1358,86 +1407,8 @@ impl SimplexOrderer {
             store,
             relay,
             None,
-            vote,
-            certificate,
-            resolver,
-        )
-    }
-
-    /// stand up a live simplex engine with a real [`ConsensusRelay`] over a
-    /// PER-PROCESS [`ContentStore`] — the real-socket path. `payload` is a
-    /// dedicated p2p channel pair: at propose time the relay gossips the proposed
-    /// frame's bytes to all peers on its sender, and a STORE-ONLY drain
-    /// ([`spawn_payload_drain`]) caches every peer-relayed frame into `store` from
-    /// its receiver. a peer thereby holds the bytes behind a digest it never
-    /// originated, so when that digest finalizes its reporter resolves and delivers
-    /// it — in BFT order, via the SAME finalization arm the proposer uses.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_relay<E, S, B, PS, PR, VS, VR, CS, CR, RS, RR>(
-        context: E,
-        scheme: S,
-        blocker: B,
-        partition: String,
-        epoch: commonware_consensus::types::Epoch,
-        genesis: Digest,
-        store: ContentStore,
-        vote: (VS, VR),
-        certificate: (CS, CR),
-        resolver: (RS, RR),
-        payload: (PS, PR),
-    ) -> Self
-    where
-        E: commonware_runtime::Spawner
-            + commonware_runtime::Clock
-            + commonware_runtime::Storage
-            + commonware_runtime::Metrics
-            + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
-            + Send
-            + Sync
-            + 'static,
-        S: commonware_consensus::simplex::scheme::Scheme<
-                Digest,
-                PublicKey = commonware_cryptography::ed25519::PublicKey,
-            >,
-        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-        PS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        PR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>
-            + Send
-            + 'static,
-        VS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-        VR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-        CS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-        CR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-        RS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-        RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
-    {
-        let (payload_sender, payload_receiver) = payload;
-        // store-ONLY drain: cache peer-relayed frames into THIS process's store.
-        let drain_handle = spawn_payload_drain(
-            context.child("payload_drain"),
-            payload_receiver,
-            store.clone(),
-        );
-        let relay = ConsensusRelay::<PS, commonware_cryptography::ed25519::PublicKey>::new(
-            payload_sender,
-            store.clone(),
-        );
-        Self::build(
-            context,
-            scheme,
-            blocker,
-            partition,
-            epoch,
-            genesis,
+            FinalizedInbox::new(),
             None,
-            store,
-            relay,
-            Some(drain_handle),
             vote,
             certificate,
             resolver,
@@ -1445,9 +1416,12 @@ impl SimplexOrderer {
     }
 
     /// stand up a live simplex engine WITH the lazy [`commonware_resolver`]
-    /// catch-up fetch backstop, over a PER-PROCESS [`ContentStore`]. this is the
-    /// eager relay path of [`spawn_with_relay`] PLUS a second
-    /// [`commonware_resolver::p2p::Engine`] on a dedicated `fetch` channel:
+    /// catch-up fetch backstop, over a PER-PROCESS [`ContentStore`]. this is
+    /// the eager [`ConsensusRelay`] gossip path (`payload` is a dedicated p2p
+    /// channel pair: at propose time the relay gossips the proposed frame's
+    /// bytes to all peers, and a STORE-ONLY drain caches every peer-relayed
+    /// frame) PLUS a second [`commonware_resolver::p2p::Engine`] on a
+    /// dedicated `fetch` channel:
     ///
     /// - [`PayloadProducer`] serves this node's stored bytes by digest to peers
     ///   fetching them, and
@@ -1519,20 +1493,9 @@ impl SimplexOrderer {
         RS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         RR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
-        use commonware_consensus::simplex::{
-            Engine,
-            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
-            elector::RoundRobin,
-        };
-        use commonware_consensus::types::ViewDelta;
-        use commonware_cryptography::{Sha256, ed25519};
-        use commonware_parallel::Sequential;
-        use commonware_runtime::buffer::paged::CacheRef;
-        use commonware_utils::{NZU16, NZUsize};
-        use std::time::Duration;
+        use commonware_cryptography::ed25519;
 
         let (payload_sender, payload_receiver) = payload;
-        let (fetch_sender, fetch_receiver) = fetch;
 
         // eager drain: cache peer-relayed frames store-only — UNLESS starved, in
         // which case receive+discard so the store stays cold and every
@@ -1549,99 +1512,43 @@ impl SimplexOrderer {
 
         let relay = ConsensusRelay::<PS, ed25519::PublicKey>::new(payload_sender, store.clone());
 
-        // the consensus triple; its ordered gate `inbox` is SHARED with the
-        // resolver's consumer so a fetched payload FILLS the exact slot the reporter
-        // logged for that digest.
-        let automaton = ConsensusAutomaton::<ed25519::PublicKey, _>::new(
-            store.clone(),
-            context.child("automaton"),
-        );
-        let handle = automaton.handle(store.clone());
+        // the ordered gate is minted HERE (not in build) so it is SHARED with
+        // the resolver's consumer: a fetched payload FILLS the exact slot the
+        // reporter logged for that digest.
         let inbox = FinalizedInbox::new();
-
-        // the catch-up fetch engine: producer serves our store to peers; consumer
-        // verifies + stores + fills the gate. short timeouts so a miss retries
-        // quickly within the deterministic pump loop.
-        let fetch_cfg = ResolverConfig {
-            peer_provider: provider,
-            blocker: blocker.clone(),
-            consumer: PayloadConsumer {
-                store: store.clone(),
-                inbox: inbox.clone(),
-            },
-            producer: PayloadProducer {
-                store: store.clone(),
-            },
-            mailbox_size: NZUsize!(1024),
-            me: Some(me),
-            initial: Duration::from_millis(100),
-            timeout: Duration::from_millis(400),
-            fetch_retry_timeout: Duration::from_millis(100),
-            priority_requests: false,
-            priority_responses: false,
-        };
-        let (fetch_engine, mailbox) =
-            ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
-        // the orderer owns this handle and ABORTS it in `Drop` (a dropped
-        // handle alone would leak the fetch engine past the epoch).
-        let fetch_handle = fetch_engine.start((fetch_sender, fetch_receiver));
-
-        let latest_final = LatestFinalization::default();
-        let reporter = SimplexReporter::<S>::new(
+        let (mailbox, fetch_handle) = spawn_payload_fetch(
+            &context,
+            blocker.clone(),
+            provider,
+            me,
             store.clone(),
-            automaton.pending(),
             inbox.clone(),
-            Some(mailbox),
-            latest_final.clone(),
+            fetch,
         );
 
-        let page_cache = CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10));
-        let cfg = SimplexConfig {
+        Self::build(
+            context,
             scheme,
-            elector: RoundRobin::<Sha256>::default(),
             blocker,
-            automaton,
-            relay,
-            reporter,
-            strategy: Sequential,
             partition,
-            mailbox_size: NZUsize!(1024),
             epoch,
-            // restart respawn: the persisted floor suppresses journal-replay
-            // re-reports at or below the already-applied boundary.
-            floor: match floor {
-                Some(finalization) => Floor::Finalized(finalization),
-                None => Floor::Genesis(genesis),
-            },
-            leader_timeout: Duration::from_secs(1),
-            certification_timeout: Duration::from_secs(2),
-            timeout_retry: Duration::from_secs(10),
-            fetch_timeout: Duration::from_secs(1),
-            activity_timeout: ViewDelta::new(10),
-            skip_timeout: ViewDelta::new(5),
-            fetch_concurrent: NZUsize!(4),
-            replay_buffer: NZUsize!(1024 * 1024),
-            write_buffer: NZUsize!(1024 * 1024),
-            page_cache,
-            forwarding: ForwardingPolicy::Disabled,
-        };
-        let engine = Engine::new(context.child("engine"), cfg);
-        let engine_handle = engine.start(vote, certificate, resolver);
-
-        SimplexOrderer {
-            handle,
+            genesis,
+            floor,
+            store,
+            relay,
+            Some(drain_handle),
             inbox,
-            latest_final,
-            engine: engine_handle,
-            resolver_fetch: Some(fetch_handle),
-            payload_drain: Some(drain_handle),
-        }
+            Some((mailbox, fetch_handle)),
+            vote,
+            certificate,
+            resolver,
+        )
     }
 }
 
 /// decode a persisted finalization certificate back to the typed
 /// [`Finalization`] a respawn floor needs, under `scheme`'s certificate codec
-/// bounds. the counterpart of [`SimplexOrderer::latest_finalization`]'s
+/// bounds. the counterpart of the retained window's
 /// encoding; a decode failure means the persisted floor is damaged — callers
 /// FAIL rather than silently fall back to a genesis floor, which would
 /// resurrect the journal-replay wedge the floor exists to prevent.
@@ -1736,19 +1643,15 @@ pub struct FollowerOrderer {
     /// normal and the phase-2 driver cross-checks it against its journal
     /// heights, backfilling any missed finalization over the Frames lane.
     last_admitted: Option<u64>,
-    /// the shared latest-finalization slot (see [`LatestFinalization`]) —
-    /// monotonic by view here, unlike the reporter's blind overwrite: the
-    /// engine reports ascending views by construction, but a follower can be
-    /// handed a REPLAYED old certificate, and regressing the slot would
-    /// persist a stale respawn floor.
-    latest_final: LatestFinalization,
-    /// the catch-up fetch mailbox, `Some` only on the [`FollowerOrderer::spawn`]
-    /// path. a finalization MISS without it drops the slot — the eager-only
-    /// semantics of the bare constructor.
-    mailbox: Option<PayloadMailbox>,
-    /// fetches the mailbox did not accept, retried on the next observe —
-    /// same never-silently-drop contract as [`SimplexReporter`].
-    deferred_fetches: VecDeque<Digest>,
+    /// the shared retained-certificate window (see [`RetainedFinalizations`]).
+    /// a REPLAYED old certificate just lands at its own view key — selection
+    /// is always "newest at or below a released view", so a stale re-observe
+    /// can never regress the persisted respawn floor.
+    retained: RetainedFinalizations,
+    /// the catch-up fetch seam, wired only on the [`FollowerOrderer::spawn`] /
+    /// [`FollowerOrderer::spawn_resolver`] paths. a finalization MISS without
+    /// it drops the slot — the eager-only semantics of the bare constructor.
+    fetcher: PayloadFetcher,
     /// the resolver fetch engine — aborted on `Drop` (a bare handle drop
     /// leaks the task, the same trap `SimplexOrderer` documents).
     resolver_fetch: Option<commonware_runtime::Handle<()>>,
@@ -1778,9 +1681,8 @@ impl FollowerOrderer {
             store,
             inbox: FinalizedInbox::new(),
             last_admitted: None,
-            latest_final: LatestFinalization::default(),
-            mailbox: None,
-            deferred_fetches: VecDeque::new(),
+            retained: RetainedFinalizations::default(),
+            fetcher: PayloadFetcher::new(None),
             resolver_fetch: None,
             payload_drain: None,
         }
@@ -1815,39 +1717,16 @@ impl FollowerOrderer {
         FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
-        use commonware_utils::NZUsize;
-        use std::time::Duration;
-
         let inbox = FinalizedInbox::new();
-        let fetch_cfg = ResolverConfig {
-            peer_provider: provider,
-            blocker,
-            consumer: PayloadConsumer {
-                store: store.clone(),
-                inbox: inbox.clone(),
-            },
-            producer: PayloadProducer {
-                store: store.clone(),
-            },
-            mailbox_size: NZUsize!(1024),
-            me: Some(me),
-            initial: Duration::from_millis(100),
-            timeout: Duration::from_millis(400),
-            fetch_retry_timeout: Duration::from_millis(100),
-            priority_requests: false,
-            priority_responses: false,
-        };
-        let (fetch_engine, mailbox) =
-            ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
-        let fetch_handle = fetch_engine.start(fetch);
+        let (mailbox, fetch_handle) =
+            spawn_payload_fetch(&context, blocker, provider, me, store.clone(), inbox.clone(), fetch);
 
         Self {
             store,
             inbox,
             last_admitted: None,
-            latest_final: LatestFinalization::default(),
-            mailbox: Some(mailbox),
-            deferred_fetches: VecDeque::new(),
+            retained: RetainedFinalizations::default(),
+            fetcher: PayloadFetcher::new(Some(mailbox)),
             resolver_fetch: Some(fetch_handle),
             payload_drain: None,
         }
@@ -1915,17 +1794,6 @@ impl FollowerOrderer {
         follower
     }
 
-    /// issue (or re-issue) a payload fetch; an unaccepted submission parks
-    /// for retry on the next observe — same contract as the reporter's.
-    fn fetch_or_defer(&mut self, digest: Digest) {
-        let Some(mailbox) = self.mailbox.as_mut() else {
-            return;
-        };
-        if !mailbox.fetch(digest).accepted() {
-            self.deferred_fetches.push_back(digest);
-        }
-    }
-
     /// verify and admit one externally-received finalization certificate.
     /// `Err` means the certificate itself is bad (damaged bytes, or not the
     /// epoch quorum's signatures) — the SOURCE is lying. `Ok` carries the
@@ -1946,19 +1814,14 @@ impl FollowerOrderer {
     {
         // retry fetches a previous observe failed to enqueue — a dropped
         // fetch would stall its gate slot (and the release prefix) forever.
-        for _ in 0..self.deferred_fetches.len() {
-            let Some(digest) = self.deferred_fetches.pop_front() else {
-                break;
-            };
-            self.fetch_or_defer(digest);
-        }
+        self.fetcher.retry_deferred();
         let finalization = verify_finalization(rng, scheme, cert_bytes)?;
         let digest = finalization.proposal.payload;
         let view = finalization.proposal.round.view().get();
         if self.last_admitted.is_some_and(|last| view <= last) {
             return Ok(Observed::Stale(view));
         }
-        if self.mailbox.is_none() && !self.store.contains(&digest) {
+        if !self.fetcher.enabled() && !self.store.contains(&digest) {
             // no bytes and no way to fetch them: admitting would hand the
             // gate a slot nothing can ever fill (bare path) — refuse instead
             // so the driver backfills over the Frames lane and re-observes.
@@ -1966,35 +1829,33 @@ impl FollowerOrderer {
         }
         let need_fetch = self
             .inbox
-            .record(view, digest, &self.store, self.mailbox.is_some());
+            .record(view, digest, &self.store, self.fetcher.enabled());
         if need_fetch {
-            self.fetch_or_defer(digest);
+            self.fetcher.fetch_or_defer(digest);
         }
         self.last_admitted = Some(view);
-        let mut latest = self
-            .latest_final
-            .lock()
-            .expect("latest finalization poisoned");
-        if latest.as_ref().is_none_or(|(v, _)| view > *v) {
-            *latest = Some((view, cert_bytes.to_vec()));
-        }
+        retain_finalization(&self.retained, view, cert_bytes.to_vec());
         Ok(Observed::Admitted(view))
     }
 
     /// the newest finalization certificate observed: `(view, encoded bytes)`.
-    /// see [`LatestFinalization`] — the recovery layer persists this as the
-    /// respawn floor once everything at or below it has drained.
+    /// see [`RetainedFinalizations`] — the recovery layer persists a floor
+    /// through [`FollowerOrderer::finalization_at_or_below`]; this is the
+    /// unbounded ("at or below anything") read of the same window.
     pub fn latest_finalization(&self) -> Option<(u64, Vec<u8>)> {
-        self.latest_final
-            .lock()
-            .expect("latest finalization poisoned")
-            .clone()
+        newest_finalization_at_or_below(&self.retained, u64::MAX)
     }
 
-    /// count of finalized slots not yet released by `poll_delivered` — the
-    /// same floor-persistence gate [`SimplexOrderer::unreleased_len`] serves.
-    pub fn unreleased_len(&self) -> usize {
-        self.inbox.unreleased_len()
+    /// the newest retained certificate at or below `view` — the follower
+    /// counterpart of [`SimplexOrderer::finalization_at_or_below`].
+    pub fn finalization_at_or_below(&self, view: u64) -> Option<(u64, Vec<u8>)> {
+        newest_finalization_at_or_below(&self.retained, view)
+    }
+
+    /// the lowest recorded-but-unreleased view — the follower counterpart of
+    /// [`SimplexOrderer::min_unreleased_view`].
+    pub fn min_unreleased_view(&self) -> Option<u64> {
+        self.inbox.min_unreleased_view()
     }
 }
 
@@ -2018,6 +1879,78 @@ mod tests {
     #[test]
     fn default_block_time_is_one_second() {
         assert_eq!(BLOCK_TIME, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retained_finalizations_window_prunes_oldest_and_selects_at_or_below() {
+        let retained = RetainedFinalizations::default();
+        for view in 1..=(RETAINED_FINALIZATIONS as u64 + 8) {
+            retain_finalization(&retained, view, format!("cert-{view}").into_bytes());
+        }
+        // the window holds exactly the cap, oldest views pruned first.
+        assert_eq!(
+            newest_finalization_at_or_below(&retained, 8),
+            None,
+            "views below the retention window are gone"
+        );
+        // selection is "newest at or below": an exact hit and a gap probe.
+        let tip = RETAINED_FINALIZATIONS as u64 + 8;
+        assert_eq!(
+            newest_finalization_at_or_below(&retained, tip),
+            Some((tip, format!("cert-{tip}").into_bytes()))
+        );
+        assert_eq!(
+            newest_finalization_at_or_below(&retained, u64::MAX),
+            Some((tip, format!("cert-{tip}").into_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_released_views_certificate_stays_persistable_while_newer_certs_arrive() {
+        // the busy-chain floor-persistence shape: view 1 released (applied),
+        // view 2's certificate already reported but its slot still awaiting
+        // release. a single latest-cert slot + "inbox empty" gate starves
+        // here forever (the exact livelock that froze the statesync floor
+        // under load); the retained window + release-point check persists
+        // view 1's certificate immediately.
+        let store = ContentStore::new();
+        let retained = RetainedFinalizations::default();
+        let inbox = FinalizedInbox::new();
+
+        let one = store.put(b"block one".to_vec());
+        inbox.record(1, one, &store, false);
+        retain_finalization(&retained, 1, b"cert-one".to_vec());
+        assert_eq!(inbox.drain().len(), 1, "view 1 releases");
+
+        // view 2 finalizes (cert observed, bytes still awaited elsewhere)
+        // BEFORE the floor check runs — the always-busy interleaving.
+        let two = digest_of(b"block two, bytes in flight");
+        inbox.record(2, two, &store, true);
+        retain_finalization(&retained, 2, b"cert-two".to_vec());
+
+        // the release point proves view 1 is fully applied...
+        let sealed_tip = 1;
+        let (view, cert) =
+            newest_finalization_at_or_below(&retained, sealed_tip).expect("cert retained");
+        assert_eq!((view, cert), (1, b"cert-one".to_vec()));
+        assert!(
+            inbox.min_unreleased_view().is_none_or(|pending| pending > view),
+            "everything at or below the selected certificate has released"
+        );
+        // ...even though the inbox is NOT empty (the old gate's starvation).
+        assert_eq!(inbox.unreleased_len(), 1);
+    }
+
+    #[test]
+    fn min_unreleased_view_is_a_minimum_not_the_log_front() {
+        // a backfilling node records DESCENDING views; the release point must
+        // report the lowest pending view, not whatever sits at the log front,
+        // or a floor could persist above an unapplied backfilled block.
+        let store = ContentStore::new();
+        let inbox = FinalizedInbox::new();
+        inbox.record(5, digest_of(b"tip first"), &store, true);
+        inbox.record(3, digest_of(b"backfill below it"), &store, true);
+        assert_eq!(inbox.min_unreleased_view(), Some(3));
     }
 
     #[test]
@@ -2257,61 +2190,6 @@ mod tests {
         assert_eq!(handle.pending_len(), 1, "one submit -> depth 1");
         handle.submit(b"second frame".to_vec());
         assert_eq!(handle.pending_len(), 2, "a second submit -> depth 2");
-    }
-
-    #[test]
-    fn bls_dev_keys_are_deterministic_and_domain_separated_per_seed() {
-        // dev key derivation must be a PURE function of the seed — every process
-        // in a mesh derives the same participant map from the same peer seeds.
-        assert_eq!(
-            bls_dev_public(7),
-            bls_dev_public(7),
-            "same seed -> same bls key"
-        );
-        assert_ne!(
-            bls_dev_public(7),
-            bls_dev_public(8),
-            "distinct seeds -> distinct keys"
-        );
-    }
-
-    #[test]
-    fn bls_dev_scheme_orders_participants_by_identity_key() {
-        // the dual-key contract: participant ORDER (signer indices, leader
-        // rotation, the certificate bitmap) comes from the sorted ed25519 IDENTITY
-        // keys — byte-identical to V1's participant Set — regardless of the order
-        // seeds appear in config.
-        use commonware_cryptography::ed25519;
-        use commonware_utils::ordered::Set;
-
-        let seeds = [3u64, 0, 2];
-        let scheme = bls_dev_scheme(b"ns", &seeds, 2).expect("seed 2 is a member");
-        let expected: Set<ed25519::PublicKey> = Set::try_from(
-            seeds
-                .iter()
-                .map(|s| ed25519::PrivateKey::from_seed(*s).public_key())
-                .collect::<Vec<_>>(),
-        )
-        .expect("distinct dev keys");
-        assert_eq!(
-            scheme.participants(),
-            &expected,
-            "identity keys order the set"
-        );
-
-        // and this validator signs as EXACTLY its identity's slot in that order.
-        let me = ed25519::PrivateKey::from_seed(2).public_key();
-        assert_eq!(
-            scheme.me().map(usize::from),
-            expected.position(&me),
-            "signer index == identity position"
-        );
-
-        // a seed outside the set cannot construct a signer.
-        assert!(
-            bls_dev_scheme(b"ns", &seeds, 9).is_none(),
-            "non-member seed -> None"
-        );
     }
 
     #[test]

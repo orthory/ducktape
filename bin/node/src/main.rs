@@ -52,6 +52,7 @@ use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
+mod agent_plane;
 mod blob_fetch;
 mod boot;
 mod cli;
@@ -64,6 +65,7 @@ mod first_contact_join;
 mod gateway_plane;
 mod gateway_routes;
 mod host_reads;
+mod host_resources;
 mod host_state;
 #[cfg(test)]
 mod joiner_mesh_tests;
@@ -71,6 +73,8 @@ mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod oracle_pool;
+mod overlay_book;
+mod plane_metrics;
 mod reachability_plane;
 #[cfg(test)]
 mod reachability_plane_tests;
@@ -81,7 +85,6 @@ mod resident_announce;
 mod resident_dispatch;
 mod resource_limits;
 mod rpc;
-mod statesync_plane;
 mod sync;
 mod userkey;
 mod userkey_cli;
@@ -223,6 +226,15 @@ fn gateway_can_start(
     let api_is_loopback = http_listen
         .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|address| address.ip().is_loopback());
+    // a configured gateway suppressed ONLY by a non-loopback app surface is a
+    // silent degradation — say why, or the operator debugs a dead listener.
+    if !sync_only && gateway_listen.is_some() && !api_is_loopback && http_listen.is_some() {
+        eprintln!(
+            "gateway disabled: http_listen {:?} is not loopback — the browser gateway only \
+             starts when the node API binds a loopback address",
+            http_listen.unwrap_or_default()
+        );
+    }
     !sync_only
         && gateway_listen.is_some()
         && api_is_loopback
@@ -269,6 +281,8 @@ fn run_node(
         dev_demo,
         sync_index,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         promoted,
         joiner,
     } = boot::env::derive(resolved, sync_only);
@@ -333,6 +347,8 @@ fn run_node(
         let boot::mesh::MeshHead {
             context,
             metrics,
+            plane_monitor,
+            plane_metrics,
             mesh_participants,
             status_public_key,
             sync_sources,
@@ -355,10 +371,14 @@ fn run_node(
             wireguard_effect,
             overlay_slot.clone(),
         );
-        // One process-wide bulk budget: state sync and Gateway retain separate
+        // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
-        let bulk_pacer = statesync_plane::shared_bulk_pacer();
+        let bulk_pacer = overlay_book::shared_bulk_pacer();
+        // The `ducktape_dataplane_*` series unregister when this handle
+        // drops — pin it to the whole node future (both role arms await
+        // inside this block).
+        let _plane_metrics = plane_metrics;
 
         if sync_only {
             boot::sync_only::run(
@@ -384,13 +404,17 @@ fn run_node(
         // recovery-aware boot FIRST: the app state (and with it the epoch to
         // respawn) must be known before the mesh wiring below decides which
         // epochs' channels to live on. everything here is local disk io.
-        let recovery = match Recovery::open(context.child("recovery")).await {
+        let mut recovery = match Recovery::open(context.child("recovery")).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[node {label}] FATAL: cannot open the recovery store: {e}");
                 std::process::exit(1);
             }
         };
+        // code-registry swaps realize through the blob plane: replay, catch-up,
+        // and the live drain (which lifts this off the recovery sink) all fetch
+        // committed component bytes from the node's content-addressed store.
+        recovery.set_code_source(std::sync::Arc::new(host_state::BlobCodeSource(blobs.clone())));
         let manifest = match recovery.manifest() {
             Ok(m) => m,
             Err(e) => {
@@ -454,6 +478,8 @@ fn run_node(
                 checkpoint_blocks,
                 sync_index,
                 announce_capabilities,
+                sandbox,
+                sandbox_capacity,
                 rpc_listener,
                 http_cmds,
                 gateway_requests,
@@ -466,6 +492,7 @@ fn run_node(
                 &agent_dirs,
                 overlay_slot,
                 bulk_pacer.clone(),
+                plane_monitor.clone(),
                 storage_for_sync,
                 recovery,
                 &manifest,
@@ -504,6 +531,8 @@ fn run_node(
             promoted,
             dev_demo,
             announce_capabilities,
+            sandbox,
+            sandbox_capacity,
             rpc_listener,
             http_cmds,
             gateway_requests,
@@ -516,6 +545,7 @@ fn run_node(
             agent_dirs,
             overlay_slot,
             bulk_pacer,
+            plane_monitor,
             workspace,
             recovery,
             manifest,

@@ -18,18 +18,17 @@
 //! agree".
 //!
 //! the scenario is SCHEME-PARAMETRIC: `converge` takes a factory producing the
-//! sorted identity participant set + index-aligned per-validator schemes, and the
-//! full path (propose -> finalize -> ordered delivery -> identical app-hash,
-//! qmdb root included) is proven under BOTH genesis-selectable schemes — V1
-//! ed25519 and V2 bls multisig (dual-key: ed25519 identities carry transport,
-//! bls keys sign votes). only scheme construction differs between the twins.
+//! sorted identity participant set + index-aligned per-validator schemes, so
+//! the full path (propose -> finalize -> ordered delivery -> identical
+//! app-hash, qmdb root included) is scheme-independent by construction —
+//! today only V1 ed25519 is wired.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use commonware_consensus::simplex::{mocks, scheme::ed25519 as simplex_ed25519};
 use commonware_consensus::types::Epoch;
-use commonware_cryptography::{Sha256, Signer as _, ed25519};
+use commonware_cryptography::{Sha256, ed25519};
 use commonware_p2p::simulated::{self, Link};
 use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
 use commonware_utils::{NZU32, NZUsize};
@@ -97,34 +96,9 @@ fn ed25519_schemes(
     (fixture.participants, fixture.schemes)
 }
 
-/// V2 factory: dual-key bls multisig built the PRODUCTION way from dev seeds
-/// (the exact path bin/node's "bls-multisig" selector takes) — ed25519 identity
-/// keys carry transport + participant order, bls keys sign votes/certificates.
-fn bls_schemes(
-    _context: &mut deterministic::Context,
-    namespace: &[u8],
-) -> (Vec<ed25519::PublicKey>, Vec<consensus::BlsScheme>) {
-    let seeds: Vec<u64> = (0..N as u64).collect();
-    // sort (identity, seed) pairs by identity key so schemes stay index-aligned
-    // with the sorted participant vec, matching the fixture's contract.
-    let mut pairs: Vec<(ed25519::PublicKey, u64)> = seeds
-        .iter()
-        .map(|s| (ed25519::PrivateKey::from_seed(*s).public_key(), *s))
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    let participants = pairs.iter().map(|(pk, _)| pk.clone()).collect();
-    let schemes = pairs
-        .iter()
-        .map(|(_, seed)| {
-            consensus::bls_dev_scheme(namespace, &seeds, *seed).expect("dev key in the set")
-        })
-        .collect();
-    (participants, schemes)
-}
-
 /// the whole N-validator convergence scenario, parameterized by the runtime
 /// `context` (so it can be driven under multiple deterministic schedules) and by
-/// the scheme factory (so V1 ed25519 and V2 bls run the IDENTICAL scenario).
+/// the scheme factory (so the scenario stays scheme-independent).
 async fn converge<S, F>(mut context: deterministic::Context, make_schemes: F)
 where
     S: commonware_consensus::simplex::scheme::Scheme<Digest, PublicKey = ed25519::PublicKey>,
@@ -300,22 +274,11 @@ fn n_validators_converge_under_real_simplex_including_qmdb_root() {
 }
 
 #[test]
-fn n_validators_converge_under_bls_multisig_including_qmdb_root() {
-    // the V2 twin: the IDENTICAL scenario over the dual-key bls multisig scheme —
-    // propose -> finalize -> ordered delivery -> byte-identical app-hash including
-    // the order-dependent qmdb root, with ONE aggregated signature per certificate.
-    deterministic::Runner::timed(Duration::from_secs(300))
-        .start(|context| converge(context, bls_schemes));
-}
-
-#[test]
 fn convergence_is_robust_across_schedules() {
     // the deterministic runner defaults to a FIXED seed (42), so the headline
     // test proves one schedule. round-robin leaders + perfect links make the
     // result schedule-independent — this pins that down by finalizing under
     // several distinct task-interleaving seeds (each its own 300s liveness bound).
-    // V1-only: schedule-robustness is a property of the orderer machinery, not the
-    // signature scheme, and bls signing makes each extra schedule much slower.
     for seed in [1u64, 7, 99, 2718] {
         let cfg = deterministic::Config::default()
             .with_seed(seed)

@@ -9,7 +9,7 @@
 
 use duckfs_core::objects::object_id;
 use duckfs_core::state::{PinEntry, Refs, Staged, root_bytes};
-use duckfs_core::{Fs, Kind, ObjectStore as _, RefsStore as _};
+use duckfs_core::{Fs, Kind, ObjectStore as _};
 use duckfs_disk::{DiskRefs, DiskStore};
 
 fn a_refs() -> Refs {

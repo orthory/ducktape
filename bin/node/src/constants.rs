@@ -1,10 +1,8 @@
 use std::time::Duration;
 
-use consensus::ConsensusScheme;
-
-/// the consensus signature scheme this build runs — a genesis-wide constant. today only
-/// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
-pub(crate) const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
+// the consensus signature scheme is V1 ed25519, the only wired variant — see
+// `consensus::ConsensusScheme`'s rekey/respawn contract for what a scheme
+// migration would take (an epoch teardown-respawn, not a constant flip).
 /// the highest protocol version THIS binary's dual-path modules can execute — a
 /// per-node BUILD constant, NEVER consensus state (a lying value can only
 /// refuse-to-boot or halt this one node, never fork the network). the
@@ -123,9 +121,15 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
-/// every module in the production genesis set, in status-report order. keep in
-/// sync with [`genesis_host`] — status endpoints report exactly these roots.
-pub(crate) const MODULE_IDS: [&str; 23] = [
+/// every module in the production genesis set, in status-report order. pinned
+/// to the `host_state::ProductionModules` registry by the parity test in
+/// `host_state` — status endpoints report exactly these roots.
+///
+/// A module here is in the app-hash: every node must run it, agree on its root
+/// at every height, and keep doing so forever (the height-gated upgrade path
+/// flips `protocol_version` only — it cannot change the module SET). Experiments
+/// therefore live unwired in `crates/labs` and appear in no genesis set.
+pub(crate) const MODULE_IDS: [&str; 25] = [
     "kv",
     "pages",
     "chat",
@@ -133,6 +137,8 @@ pub(crate) const MODULE_IDS: [&str; 23] = [
     "valset",
     "governance",
     "upgrade",
+    "modreg",
+    "hello",
     "saga",
     "capability",
     "dispatch",
@@ -150,6 +156,44 @@ pub(crate) const MODULE_IDS: [&str; 23] = [
     "agent",
     "runs",
 ];
+
+/// Canonical committed-state revisions for the production module set.
+///
+/// Keep this alphabetically ordered and bump a module's revision in the same
+/// change that alters its canonical snapshot/root encoding. The registry
+/// parity test compares these declarations with the live module trait values.
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
+    ("agent", 1),
+    ("automations", 1),
+    ("capability", 1),
+    ("chat", 1),
+    ("directory", 1),
+    ("dispatch", 1),
+    ("duckdns", 1),
+    ("files", 1),
+    ("forge", 1),
+    ("gateway", 1),
+    ("governance", 1),
+    ("hello", 1),
+    ("identity", 1),
+    ("inbox", 1),
+    ("jobs", 1),
+    ("kv", 1),
+    ("modreg", 1),
+    ("pages", 1),
+    ("runs", 2),
+    ("saga", 1),
+    ("tagging", 1),
+    ("tasks", 1),
+    ("upgrade", 1),
+    ("valset", 1),
+    ("vaults", 1),
+];
+
+pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
+    host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
+}
+
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.

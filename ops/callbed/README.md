@@ -18,8 +18,8 @@ exercise the **real mesh**. This bed does, on two separate
 
 **A single node cannot host a real call**: the hub fans media out by *node key*
 and excludes self, so two webviews on one node produce an empty recipient set.
-You need two peered nodes, one member each. (This is also why `ops/fleet.sh`,
-which seeds a *solo* workspace per worktree, can't do it.)
+You need two peered nodes, one member each. (This is also why Ducktape's
+`tauri-agent-fleet` instance hook, which seeds a *solo* workspace, can't do it.)
 
 ## What's verified
 
@@ -141,7 +141,7 @@ service:
    (via `DUCKTAPE_NODE_BIN` + a seeded workspace registry), it does not attach to
    a remote one. So an app container must `join` this network as its **own**
    member node (extend `bootstrap.sh` to emit a member invite), seed a member
-   workspace pointing at that node (see `ops/fleet.sh:seed_workspace`), then
+   workspace pointing at that node (see `qa/fleet/prepare-instance.sh`), then
    launch the app + `x11vnc` (see `skills/tauri-debug`). Two app containers =
    two members who can huddle.
 

@@ -15,10 +15,10 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 
 - `sdk` defines the module contract and deterministic system API, including the
   `serve_sync` state-sync serve surface.
-- `host` owns registry dispatch, FIFO follow-up drain, and block commit/abort,
-  with a fail-stop boundary contract: a `commit_block`/`abort_block` fault is a
+- `host` owns registry dispatch, FIFO follow-up drain, block commit/abort, and
+  the composition of module roots into an order-independent app-hash, with a
+  fail-stop boundary contract: a `commit_block`/`abort_block` fault is a
   node-local `SubmitError::Fatal`, distinct from a deterministic rejection.
-- `state` composes module roots into an order-independent app-hash.
 - `node` bridges host application to transport and ordered delivery. Op frames
   are ed25519-signed and verified on decode, so an applied op's origin is
   authenticated authorship. `OrderedNode` supports epoch cutover (engine
@@ -36,8 +36,9 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 - `statesync` defines the network state-sync wire protocol (manifest with the
   boundary's consensus coordinates and finalization floor, chunked snapshots,
   remote qmdb resolver) and the p2p transport binding.
-- `reactor` closes the non-deterministic worker boundary by submitting worker
-  results as ordinary messages.
+- `host::worker` closes the non-deterministic worker boundary: workers claim
+  effects and their results re-enter as ordinary messages; each binary drives
+  its own loop.
 
 ## Module State
 
@@ -68,10 +69,9 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 
 - `cargo test --workspace` exercises the Rust workspace.
 - `cargo run -p demo` runs the in-process multi-module walkthrough.
-- `cargo test -p demo --test joiner_rebuilds_global_app_hash` proves a joiner can
-  rebuild every module and match the source app-hash in-process.
 - `cargo test -p demo --test network_joiner_full` proves a joiner rebuilds every
-  module purely over the state-sync wire protocol.
+  module purely over the state-sync wire protocol and matches the source
+  app-hash.
 - `bin/node/examples/demo-invite.sh` drives a human-runnable onboarding ceremony
   over real sockets: founder `init`, invite, friend `join`, founder `admit`, a
   refreshed invite, then both nodes booting one network and converging an
@@ -100,4 +100,5 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
   node already registers `agent`, `runs`, `dispatch`, `saga`, `capability`,
   `jobs`, and `tasks`; the remaining gap is packaged UX and durable workflows,
   not the basic execution seam.
-- Unifying the two parallel mesh type systems and wiring the WireGuard overlay.
+- A privileged e2e that brings up a real WireGuard interface (the mesh contract
+  itself now lives in `crates/system/wireguard`; `valset::mesh` was deleted).

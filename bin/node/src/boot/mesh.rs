@@ -21,6 +21,12 @@ pub(crate) struct MeshHead {
     /// methods) and hands the identical value back rather than consuming it.
     pub(crate) context: commonware_runtime::tokio::Context,
     pub(crate) metrics: noded::NodeMetrics,
+    /// The open-plane registry every per-use plane creator registers into;
+    /// `plane_metrics` reads it at scrape time.
+    pub(crate) plane_monitor: data_plane::PlaneMonitor,
+    /// The registered `ducktape_dataplane_*` series — dropping this
+    /// unregisters them, so it must live as long as the node runs.
+    pub(crate) plane_metrics: crate::plane_metrics::PlaneMetrics,
     pub(crate) mesh_participants: Set<ed25519::PublicKey>,
     pub(crate) status_public_key: String,
     pub(crate) sync_sources: Vec<ed25519::PublicKey>,
@@ -53,6 +59,13 @@ pub(crate) fn build(
     // latency, per-module dispatch counters), so the networked node reports
     // the series the local daemon does and one Grafana board reads both.
     let metrics = noded::NodeMetrics::register(&context);
+
+    // the open-plane registry + its `ducktape_dataplane_*` series, on the
+    // same registry: every per-use plane (gateway, voice/video, agent
+    // telemetry) registers itself here at bring-up, and each scrape reads
+    // the live counters straight off the monitor.
+    let plane_monitor = data_plane::PlaneMonitor::default();
+    let plane_metrics = crate::plane_metrics::PlaneMetrics::register(&context, &plane_monitor);
 
     // the authorized MESH set, SORTED — what discovery tracks. the
     // consensus scheme uses the (possibly smaller) validator set derived
@@ -118,11 +131,11 @@ pub(crate) fn build(
     // wireguard interface), everything else straight to the OS. the p2p
     // dialer never connect()s an overlay ULA on a raw OS socket as an
     // assumption again; the userspace backend lands behind this seam.
-    // the prefix derives from the SAME namespace string statesync_plane's
+    // the prefix derives from the SAME namespace string the per-use planes'
     // OverlayBook and the reachability plane use, so all three agree on
     // what "overlay" means.
     let overlay_router = overlay_net::OverlayRouter::for_prefix48(
-        wireguard_upgrade::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
+        wireguard::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
     );
     // ADR phase 3: the backend follows `wireguard_effect`. socket mode
     // routes overlay dials/binds into the in-process virtual stack (and
@@ -152,6 +165,8 @@ pub(crate) fn build(
     MeshHead {
         context,
         metrics,
+        plane_monitor,
+        plane_metrics,
         mesh_participants,
         status_public_key,
         sync_sources,

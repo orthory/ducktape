@@ -155,7 +155,7 @@ where
 /// huddle webviews intentionally share only their narrow command sets; even if
 /// one is compromised it cannot create/delete a workspace or ask the user key
 /// to sign an account mutation.
-pub(crate) fn require_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) fn require_main_window(window: &crate::rt::WebviewWindow) -> Result<(), String> {
     if window.label() == "main" {
         Ok(())
     } else {
@@ -582,6 +582,37 @@ fn resolve_external_bin(variable: &str, binary: &str) -> Result<PathBuf, String>
     ))
 }
 
+/// Whether a directory with this ownership and mode lets a different OS user
+/// swap entries out from under us. The sticky bit clears write hostility
+/// (`/tmp`: its ownership rule prevents another user replacing our entry).
+/// Group write is hostile unless the group is the caller's own primary group
+/// on a directory the caller owns — or, on macOS, the `admin` group on a
+/// root-owned directory: `/Applications` is root:admin 0775 without a sticky
+/// bit on every macOS install (the OS's own convention for app locations),
+/// and admin members are administrators who could just as well swap the app
+/// bundle calling this check.
+#[cfg(unix)]
+fn dir_replaceable_by_others(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> bool {
+    if mode & 0o1000 != 0 {
+        return false;
+    }
+    if mode & 0o002 != 0 {
+        return true;
+    }
+    if mode & 0o020 == 0 {
+        return false;
+    }
+    let trusted_primary_group = uid == euid && gid == egid;
+    #[cfg(target_os = "macos")]
+    let macos_system_admin_dir = {
+        const MACOS_ADMIN_GID: u32 = 80;
+        uid == 0 && gid == MACOS_ADMIN_GID
+    };
+    #[cfg(not(target_os = "macos"))]
+    let macos_system_admin_dir = false;
+    !(trusted_primary_group || macos_system_admin_dir)
+}
+
 /// Resolve symlinks once and validate the target before execution. In addition
 /// to the historical present/non-empty/executable checks, reject a target that
 /// another OS user can replace in place or swap through a writable ancestor
@@ -626,12 +657,13 @@ fn validate_external_bin(path: &Path) -> Result<PathBuf, String> {
                     ancestor.display()
                 ));
             }
-            let ancestor_mode = ancestor_meta.permissions().mode();
-            let trusted_primary_group =
-                ancestor_meta.uid() == effective_uid && ancestor_meta.gid() == effective_gid;
-            let replaceable = ancestor_mode & 0o002 != 0
-                || (ancestor_mode & 0o020 != 0 && !trusted_primary_group);
-            if replaceable && ancestor_mode & 0o1000 == 0 {
+            if dir_replaceable_by_others(
+                ancestor_meta.uid(),
+                ancestor_meta.gid(),
+                ancestor_meta.permissions().mode(),
+                effective_uid,
+                effective_gid,
+            ) {
                 return Err(format!(
                     "ancestor directory {} is writable by an untrusted group or other users",
                     ancestor.display()
@@ -949,6 +981,29 @@ mod tests {
         let extra = drain_capped(std::io::Cursor::new(vec![b'x'; MAX_VERB_OUTPUT_BYTES + 17]));
         assert_eq!(extra.bytes.len(), MAX_VERB_OUTPUT_BYTES);
         assert!(extra.truncated && !extra.read_failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_hostility_follows_ownership_not_just_mode() {
+        // SAFETY: no preconditions, value-returning.
+        let me = unsafe { libc::geteuid() };
+        // SAFETY: same contract.
+        let my_group = unsafe { libc::getegid() };
+        // A root-owned dir writable by an arbitrary group is swappable…
+        assert!(dir_replaceable_by_others(0, 12345, 0o40775, me, my_group));
+        // …and other-write is always hostile without the sticky bit…
+        assert!(dir_replaceable_by_others(me, my_group, 0o40777, me, my_group));
+        // …but the sticky bit clears it (/tmp's ownership rule).
+        assert!(!dir_replaceable_by_others(0, 0, 0o41777, me, my_group));
+        // Our own dir under our own primary group may be group-writable.
+        assert!(!dir_replaceable_by_others(me, my_group, 0o40775, me, my_group));
+        // root:admin 0775 is the macOS convention for /Applications — trusted
+        // there, hostile elsewhere.
+        #[cfg(target_os = "macos")]
+        assert!(!dir_replaceable_by_others(0, 80, 0o40775, me, my_group));
+        #[cfg(not(target_os = "macos"))]
+        assert!(dir_replaceable_by_others(0, 80, 0o40775, me, my_group));
     }
 
     #[cfg(unix)]

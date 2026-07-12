@@ -1,25 +1,38 @@
-// The composer's @mention typeahead popover — the Pages SlashMenu idiom
-// (role="listbox" / role="option", activeIndex highlight, mousedown-to-pick).
-// Opens UPWARD (bottom: 100%): the composer sits at the bottom of the pane,
-// so a downward menu would render off-screen.
+// The composer's typeahead popovers — the Pages SlashMenu idiom (role="listbox"
+// / role="option", activeIndex highlight, mousedown-to-pick). Both the @mention
+// menu and the `[[` page-ref menu are the same listbox over different rows, so
+// they share one component and differ only in what they list.
+// Opens UPWARD (bottom: 100%): the composer sits at the bottom of the pane, so
+// a downward menu would render off-screen.
 
+import type { PageMeta } from "../../../domain/pages-client";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { mentionCandidateToken, type MentionCandidate } from "./mention";
 
-export function MentionMenu({
-  candidates,
+/** One row: `label` is the human name, `hint` the literal token it inserts. */
+interface Row {
+  key: string;
+  label: string;
+  hint: string;
+  token: string;
+}
+
+function TypeaheadMenu({
+  ariaLabel,
+  rows,
   activeIndex,
   onPick,
 }: {
-  candidates: MentionCandidate[];
+  ariaLabel: string;
+  rows: Row[];
   activeIndex: number;
   onPick: (token: string) => void;
 }) {
-  if (candidates.length === 0) return null;
+  if (rows.length === 0) return null;
   return (
     <div
       role="listbox"
-      aria-label="Mention a person or agent"
+      aria-label={ariaLabel}
       style={{
         position: "absolute",
         zIndex: 20,
@@ -36,62 +49,110 @@ export function MentionMenu({
         padding: 4,
       }}
     >
-      {candidates.map((candidate, i) => {
-        const key = candidate.kind === "user" ? candidate.userKeyHex : candidate.agent.agent_id;
-        const label =
-          candidate.kind === "user"
-            ? candidate.label
-            : candidate.agent.display_name || candidate.agent.agent_id;
-        const token = mentionCandidateToken(candidate);
-        return (
-          <button
-            key={key}
-            type="button"
-            role="option"
-            aria-selected={i === activeIndex}
-            onMouseDown={(event) => {
-              // mousedown, not click: the textarea must not blur first.
-              event.preventDefault();
-              onPick(token);
-            }}
+      {rows.map((row, i) => (
+        <button
+          key={row.key}
+          type="button"
+          role="option"
+          aria-selected={i === activeIndex}
+          onMouseDown={(event) => {
+            // mousedown, not click: the textarea must not blur first.
+            event.preventDefault();
+            onPick(row.token);
+          }}
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            width: "100%",
+            boxSizing: "border-box",
+            padding: "6px 9px",
+            borderRadius: radius.sm,
+            background: i === activeIndex ? color.hover : "transparent",
+          }}
+        >
+          <span
             style={{
-              all: "unset",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              width: "100%",
-              boxSizing: "border-box",
-              padding: "6px 9px",
-              borderRadius: radius.sm,
-              background: i === activeIndex ? color.hover : "transparent",
+              font: `600 12px ${font.sans}`,
+              color: color.ink,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
             }}
           >
-            <span
-              style={{
-                font: `600 12px ${font.sans}`,
-                color: color.ink,
-                minWidth: 0,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {label}
-            </span>
-            <span
-              style={{
-                marginLeft: "auto",
-                font: `400 10.5px ${font.mono}`,
-                color: color.muted2,
-                flexShrink: 0,
-              }}
-            >
-              @{token}
-            </span>
-          </button>
-        );
-      })}
+            {row.label}
+          </span>
+          <span
+            style={{
+              marginLeft: "auto",
+              font: `400 10.5px ${font.mono}`,
+              color: color.muted2,
+              flexShrink: 0,
+            }}
+          >
+            {row.hint}
+          </span>
+        </button>
+      ))}
     </div>
+  );
+}
+
+export function MentionMenu({
+  candidates,
+  activeIndex,
+  onPick,
+}: {
+  candidates: MentionCandidate[];
+  activeIndex: number;
+  onPick: (token: string) => void;
+}) {
+  const rows = candidates.map((candidate): Row => {
+    const token = mentionCandidateToken(candidate);
+    return {
+      key: candidate.kind === "user" ? candidate.userKeyHex : candidate.agent.agent_id,
+      label:
+        candidate.kind === "user"
+          ? candidate.label
+          : candidate.agent.display_name || candidate.agent.agent_id,
+      hint: `@${token}`,
+      token,
+    };
+  });
+  return (
+    <TypeaheadMenu
+      ariaLabel="Mention a person or agent"
+      rows={rows}
+      activeIndex={activeIndex}
+      onPick={onPick}
+    />
+  );
+}
+
+/** The `[[` page-ref menu. The token it picks is the page ID — the composer
+ *  wraps it into `[[page:<id>]]`; the id is what the wire and the runs module
+ *  read, the title is only ever a display. */
+export function PageMenu({
+  pages,
+  activeIndex,
+  onPick,
+}: {
+  pages: PageMeta[];
+  activeIndex: number;
+  onPick: (pageId: string) => void;
+}) {
+  const rows = pages.map(
+    (page): Row => ({
+      key: page.id,
+      label: page.title.trim() || "Untitled",
+      hint: page.id,
+      token: page.id,
+    }),
+  );
+  return (
+    <TypeaheadMenu ariaLabel="Link a page" rows={rows} activeIndex={activeIndex} onPick={onPick} />
   );
 }

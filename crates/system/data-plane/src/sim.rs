@@ -163,10 +163,6 @@ impl SimEndpoint {
 impl DataPlaneTransport for SimEndpoint {
     type Stream = SimStream;
 
-    fn max_datagram(&self) -> usize {
-        crate::wire::MAX_DATAGRAM
-    }
-
     async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
         let link = self.link_to(to)?;
         let deliver_at = {
