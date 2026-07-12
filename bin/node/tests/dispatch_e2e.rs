@@ -199,32 +199,16 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-/// stage the agent's prompt in node `idx`'s blob store ONLY and return the
-/// 32-byte digest the registry pins. the executing node is deliberately a
-/// DIFFERENT validator: resolving this pin exercises the mesh fetch-on-miss
-/// lane (the #298 cross-node gap) end-to-end — a prompt saved via one node's
-/// app must run anywhere the workspace executes.
-fn upload_prompt(cluster: &Cluster, idx: usize) -> Vec<u8> {
-    let (status, body) = cluster.http(
-        idx,
-        "POST",
-        "/v1/files/blob",
-        Some(&serde_json::json!("You are the dispatch e2e duck.")),
-    );
-    assert_eq!(status, 200, "blob upload failed: {body}");
-    let hex = body["digest"].as_str().expect("digest in blob receipt");
-    assert_eq!(hex.len(), 64, "a 32-byte digest in hex");
-    (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digest"))
-        .collect()
-}
-
 /// register `agent_id` on `tag`, watch `channel` under Mention, and post the
 /// mention that engages it — the whole client-side trigger, submitted through
-/// node `idx` (whose key becomes the owner/author). the agent's prompt pin is
-/// staged on `idx` alone (see [`upload_prompt`]). returns the mention's
+/// node `idx` (whose key becomes the owner/author). returns the mention's
 /// message id.
+///
+/// the agent carries NO prompt pin: a persona is a curated `Always` skill now,
+/// and this leg does not need one — it proves the DISPATCH lane (lease →
+/// provider → answer), and a skill-less agent still gets its ambient context
+/// document. the persona-through-the-soul path is proved end to end, across
+/// nodes, in `portable_workspace_e2e`.
 fn register_and_mention(
     cluster: &Cluster,
     idx: usize,
@@ -233,7 +217,6 @@ fn register_and_mention(
     tag: &str,
     message_id: &str,
 ) {
-    let prompt_hash = upload_prompt(cluster, idx);
     cluster.submit(
         idx,
         "agent",
@@ -241,7 +224,6 @@ fn register_and_mention(
             agent_id: agent_id.into(),
             display_name: agent_id.into(),
             capability: tag.into(),
-            prompt_hash,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
             recipe_hash: None,
             caps: None,
@@ -395,6 +377,9 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
+    // serving is opt-in now (default OFF): this test wants the rendezvous
+    // pool, so it opts every node in explicitly.
+    cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();

@@ -89,6 +89,9 @@ afterEach(() => {
   invokeMock.mockReset();
   localStorage.clear();
   actions = null;
+  // jsdom's session history persists across tests in this file — park the
+  // shared top entry on a null state so the next boot starts clean.
+  window.history.replaceState(null, "");
 });
 
 const bootDesktop = (
@@ -187,5 +190,44 @@ describe("goHome", () => {
     // connection flag are left exactly as they were.
     expect(screen.getByTestId("nodeUrl").textContent).toBe(url);
     expect(screen.getByTestId("connected").textContent).toBe(connected);
+
+    invokeMock.mockClear();
+    await act(async () => {
+      actions!.selectWorkspace("team");
+    });
+
+    expect(screen.getByTestId("home").textContent).toBe("false");
+    expect(screen.getByTestId("nodeUrl").textContent).toBe(url);
+    expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
+  });
+
+  it("rail navigation leaves the Home layer (setScreen and the open* hand-offs)", async () => {
+    const team = workspace({});
+    vi.stubGlobal("fetch", nodeFetch());
+    await act(async () => {
+      bootDesktop([team], team, {
+        workspace_select: () => ({ id: "team", httpUrl: "http://127.0.0.1:9001" }),
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId("ws").textContent).toBe("Team"));
+
+    // the sidebar stays navigable at Home — every screen move must drop the
+    // layer, or the shell would change invisibly underneath it.
+    await act(async () => {
+      actions!.goHome();
+    });
+    expect(screen.getByTestId("home").textContent).toBe("true");
+    await act(async () => {
+      actions!.setScreen("settings");
+    });
+    expect(screen.getByTestId("home").textContent).toBe("false");
+
+    await act(async () => {
+      actions!.goHome();
+    });
+    await act(async () => {
+      actions!.openAgent("agent-1");
+    });
+    expect(screen.getByTestId("home").textContent).toBe("false");
   });
 });

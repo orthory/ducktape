@@ -461,34 +461,26 @@ async fn reachability_plane(
                         coord_cap,
                     )
                 });
-            let resolver = match client {
-                Ok(client) => {
-                    reachability::NatResolver::from_client_with_datagram_sink(
-                        client,
-                        reachability::RENDEZVOUS_KEEPALIVE,
-                        invite_intro_tx,
-                    )
-                    .await
-                }
-                Err(err) => Err(err),
-            };
-            match resolver {
-                Ok(resolver) => resolver,
-                // An unreachable coordinator must NOT take down the whole plane.
-                // The WireGuard underlay is already bound, and DIRECT / front
-                // candidates (InstallInvitePeer + this node's own initiations)
-                // need no rendezvous at all. Degrade to the pass-through
-                // resolver so those paths still come up; only COORDINATED
-                // (by-identity) candidates go dark until a coordinator responds.
-                // This keeps a fully-direct / self-hosted join working even when
-                // the ambient default coordinator is firewalled, down, or a
-                // founder disabled coordination outright.
+            match client {
+                // Establishment (reflexive discovery + registration) happens
+                // inside the resolver's own task, retried with backoff — a
+                // coordinator that is dark AT BOOT (machine woke before its
+                // network, coordinator restarting) no longer costs this
+                // process its rendezvous for life.
+                Ok(client) => reachability::NatResolver::from_client_with_datagram_sink(
+                    client,
+                    reachability::RENDEZVOUS_KEEPALIVE,
+                    invite_intro_tx,
+                ),
+                // A LOCAL wiring failure of the shared-socket seam itself —
+                // not a network condition. Rendezvous cannot exist on this
+                // socket, so degrade to pass-through: DIRECT / front
+                // candidates (InstallInvitePeer + this node's own
+                // initiations) need no rendezvous at all.
                 Err(err) => {
                     eprintln!(
-                        "[node {label}] reachability: coordinator rendezvous unavailable \
-                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
-                         work; coordinated-by-identity paths disabled until a coordinator \
-                         responds)"
+                        "[node {label}] reachability: rendezvous socket unusable ({err}) — \
+                         continuing WITHOUT rendezvous (direct/front paths still work)"
                     );
                     reachability::NatResolver::bind(me, Vec::new(), None)
                         .await
@@ -500,14 +492,12 @@ async fn reachability_plane(
             let auth = Some((signer.clone(), coord_cap));
             match reachability::NatResolver::bind(me, coords.clone(), auth).await {
                 Ok(resolver) => resolver,
-                // Same degrade-don't-die rule on the TUN/fake path: a dead
-                // coordinator disables coordinated candidates, never direct ones.
+                // bind can only fail LOCALLY now (its own UDP socket); an
+                // unreachable coordinator is retried inside the resolver.
                 Err(err) => {
                     eprintln!(
-                        "[node {label}] reachability: coordinator rendezvous unavailable \
-                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
-                         work; coordinated-by-identity paths disabled until a coordinator \
-                         responds)"
+                        "[node {label}] reachability: rendezvous socket unusable ({err}) — \
+                         continuing WITHOUT rendezvous (direct/front paths still work)"
                     );
                     reachability::NatResolver::bind(me, Vec::new(), None)
                         .await
@@ -516,8 +506,38 @@ async fn reachability_plane(
             }
         }
     };
-    if let Some(reflexive) = resolver.reflexive() {
-        println!("[node {label}] reachability: coordinator-observed reflexive {reflexive}");
+    // Establishment is asynchronous: narrate its transitions — one loud line
+    // if the coordinator is dark at boot (so a self-healing plane is never
+    // mistaken for a silently degraded one), then the reflexive when it
+    // lands, however late.
+    if let Some(mut status) = resolver.status() {
+        let status_label = label.clone();
+        tokio::spawn(async move {
+            loop {
+                let current = *status.borrow_and_update();
+                match current {
+                    reachability::RendezvousStatus::Ready { reflexive } => {
+                        println!(
+                            "[node {status_label}] reachability: coordinator-observed \
+                             reflexive {reflexive}"
+                        );
+                        return;
+                    }
+                    reachability::RendezvousStatus::Unavailable { attempts: 1 } => {
+                        eprintln!(
+                            "[node {status_label}] reachability: coordinator rendezvous \
+                             unavailable — retrying in the background (direct/front paths \
+                             still work; coordinated-by-identity paths wake once a \
+                             coordinator responds)"
+                        );
+                    }
+                    _ => {}
+                }
+                if status.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
     }
     // a parked standby's gossip arrives under the network's derived lobby
     // identity (its own key is untracked until the grant cutover) — admit

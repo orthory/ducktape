@@ -65,6 +65,7 @@ mod first_contact_join;
 mod gateway_plane;
 mod gateway_routes;
 mod host_reads;
+mod host_resources;
 mod host_state;
 #[cfg(test)]
 mod joiner_mesh_tests;
@@ -73,6 +74,7 @@ mod lobby;
 mod main_tests;
 mod oracle_pool;
 mod overlay_book;
+mod plane_metrics;
 mod reachability_plane;
 #[cfg(test)]
 mod reachability_plane_tests;
@@ -279,6 +281,8 @@ fn run_node(
         dev_demo,
         sync_index,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         promoted,
         joiner,
     } = boot::env::derive(resolved, sync_only);
@@ -343,6 +347,10 @@ fn run_node(
         let boot::mesh::MeshHead {
             context,
             metrics,
+            plane_monitor,
+            plane_metrics,
+            sync_monitor,
+            sync_metrics,
             mesh_participants,
             status_public_key,
             sync_sources,
@@ -369,6 +377,11 @@ fn run_node(
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
         let bulk_pacer = overlay_book::shared_bulk_pacer();
+        // The `ducktape_dataplane_*` / `ducktape_statesync_serve_*` series
+        // unregister when these handles drop — pin them to the whole node
+        // future (both role arms await inside this block).
+        let _plane_metrics = plane_metrics;
+        let _sync_metrics = sync_metrics;
 
         if sync_only {
             boot::sync_only::run(
@@ -412,6 +425,13 @@ fn run_node(
                 std::process::exit(1);
             }
         };
+        // breadcrumb between the surface binds and the mesh/plane wiring: a
+        // long journal replay is silent local disk io, and a boot log that
+        // ends at "rpc listening" is otherwise indistinguishable from a hang.
+        println!(
+            "[node {label}] recovery store open (checkpoint: {})",
+            if manifest.is_some() { "present" } else { "none" }
+        );
         let forge_repo = storage_for_sync.join("forge-repo");
         let duckfs_dir = storage_for_sync.join("duckfs");
         // boot sweep (#219): no sync attempt is in flight yet, so any leftover
@@ -468,6 +488,8 @@ fn run_node(
                 checkpoint_blocks,
                 sync_index,
                 announce_capabilities,
+                sandbox,
+                sandbox_capacity,
                 rpc_listener,
                 http_cmds,
                 gateway_requests,
@@ -480,6 +502,7 @@ fn run_node(
                 &agent_dirs,
                 overlay_slot,
                 bulk_pacer.clone(),
+                plane_monitor.clone(),
                 storage_for_sync,
                 recovery,
                 &manifest,
@@ -518,6 +541,8 @@ fn run_node(
             promoted,
             dev_demo,
             announce_capabilities,
+            sandbox,
+            sandbox_capacity,
             rpc_listener,
             http_cmds,
             gateway_requests,
@@ -530,6 +555,8 @@ fn run_node(
             agent_dirs,
             overlay_slot,
             bulk_pacer,
+            plane_monitor,
+            sync_monitor,
             workspace,
             recovery,
             manifest,

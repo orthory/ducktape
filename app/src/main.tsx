@@ -16,6 +16,7 @@ import { DucktapeConsole } from "./console/DucktapeConsole";
 import { HuddleWindow } from "./console/views/huddle/HuddleWindow";
 import { TrayPopover } from "./console/views/tray/TrayPopover";
 import { ErrorBoundary } from "./console/layout/ErrorBoundary";
+import { installHistoryButtons } from "./console/dom/history-buttons";
 import { installAutocompleteDefault } from "./console/dom/suppress-autocomplete";
 
 // Auxiliary windows pick their surface via `?view=`: the frameless menu-bar
@@ -52,6 +53,11 @@ if (import.meta.env.DEV || import.meta.env.VITE_TAURI_AGENT === "1") {
 // module. Runs before render so the observer is live for every field React
 // mounts. Applies to whichever surface this window is (console / tray / huddle).
 installAutocompleteDefault();
+
+// Mouse back/forward buttons + Alt+Arrow → history traversal. The embedded
+// engines don't wire these browser-chrome inputs themselves; the entries they
+// traverse are the console store's nav slice (see store/nav-history.ts).
+installHistoryButtons();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

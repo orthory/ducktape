@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use dispatch_oracle::{
-    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec,
+    ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
@@ -71,25 +71,40 @@ pub(super) async fn provision(
     .map_err(|e| e.to_string())?;
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
     // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
-    // skill tree beside it can never leak into the output snapshot.
-    let ro_dir = if spec.ro_mounts.is_empty() {
-        None
+    // skill tree beside it can never leak into the output snapshot. the same
+    // step assembles the run's SOUL from those mounts (it is the only place
+    // that holds both the curation and the materialized bodies).
+    let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
+        // nothing to mount — but the document still ships. the tool-plane
+        // instruction is a fact about the world the run wakes up in, not part of
+        // the agent's curation: a skill-less agent that is never told the MCP
+        // plane exists is a blind one. the library pointer rides the agent's own
+        // read cap (`library_readable`), so a skill-less agent WITH the grant is
+        // told where to find skills, and one without it is told nothing it could
+        // not act on.
+        (
+            None,
+            Some(assemble_context_doc(&[], spec.library_readable)?),
+        )
     } else {
         let mount_handle = handle.clone();
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let checkout_rw = dir.clone();
-        tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
-                // W5 again: the run never gets a workspace handle on a
-                // failed provision, so the already-materialized rw checkout
-                // goes too (the mount helper removed its own partial tree).
-                let _ = std::fs::remove_dir_all(&checkout_rw);
-            })
+        // the committed library grant (consensus said it; the assembler obeys).
+        let library_readable = spec.library_readable;
+        let context_doc = tokio::task::spawn_blocking(move || {
+            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
+                .inspect_err(|_| {
+                    // W5 again: the run never gets a workspace handle on a
+                    // failed provision, so the already-materialized rw checkout
+                    // goes too (the mount helper removed its own partial tree).
+                    let _ = std::fs::remove_dir_all(&checkout_rw);
+                })
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
-        Some(ro_root)
+        (Some(ro_root), Some(context_doc))
     };
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
@@ -108,6 +123,7 @@ pub(super) async fn provision(
         ro_dir,
         source: spec.source.clone(),
         env,
+        context_doc,
     }))
 }
 
@@ -121,6 +137,9 @@ struct NodedWorkspace {
     ro_dir: Option<PathBuf>,
     source: WorkspaceSource,
     env: BTreeMap<String, String>,
+    /// the run's assembled soul — its `always` skills inlined, the rest indexed.
+    /// `None` when the agent curated no skills. capability-host delivers it.
+    context_doc: Option<String>,
 }
 
 impl NodedWorkspace {
@@ -134,6 +153,8 @@ impl NodedWorkspace {
             agent_display_name: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
+            // receipts never assemble a document, so the grant is moot here.
+            library_readable: false,
         }
     }
 }
@@ -152,11 +173,20 @@ impl ProvisionedWorkspace for NodedWorkspace {
         super::tool_path_entries()
     }
 
+    fn context_doc(&self) -> Option<String> {
+        self.context_doc.clone()
+    }
+
     async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
         let api = ActorNodeApi::new(self.handle.clone());
         let dir = self.dir.clone();
         let message = message.to_string();
-        let result = tokio::task::spawn_blocking(move || commit(&api, &dir, &message))
+        let result = tokio::task::spawn_blocking(move || {
+            // Provider HOME/auth/temp/build state is reserved runtime debris,
+            // never an agent output facet. Remove it before duckfs scans.
+            let _ = std::fs::remove_dir_all(dir.join(capability_host::RUN_RUNTIME_DIR));
+            commit(&api, &dir, &message)
+        })
             .await
             .map_err(|_| "workspace commit task panicked".to_string())?;
         let spec = self.receipt_spec();

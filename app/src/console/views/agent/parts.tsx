@@ -43,6 +43,47 @@ export const ACTION_HINT: Record<string, string> = {
 export const parsePagesWrite = (text: string): string[] =>
   text.split(/[\s,]+/).filter(Boolean);
 
+/** One permission pill: the checkbox affordance the register and edit forms both
+ *  use for a grant that is NOT one of KNOWN_ACTIONS (a resource cap). Same look
+ *  as the action checkboxes beside it — a grant is a grant, whichever list it
+ *  lands in on the wire. */
+export const CapCheckbox = ({
+  id,
+  label,
+  checked,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) => (
+  <label
+    htmlFor={id}
+    style={{
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 7,
+      border: `1px solid ${checked ? statusTone.agent.border : color.border}`,
+      borderRadius: radius.sm,
+      background: checked ? statusTone.agent.bg : color.paper,
+      padding: "6px 9px",
+      cursor: "pointer",
+      font: `600 10.5px ${font.sans}`,
+      color: checked ? accentVar : color.muted3,
+    }}
+  >
+    <input
+      id={id}
+      type="checkbox"
+      checked={checked}
+      onChange={(event) => onChange(event.target.checked)}
+      style={{ margin: 0 }}
+    />
+    <span>{label}</span>
+  </label>
+);
+
 export type Tone = { text: string; bg: string; border: string };
 
 export const statusTone = {

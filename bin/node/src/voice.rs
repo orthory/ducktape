@@ -94,6 +94,7 @@ pub fn spawn_hub(
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
+    planes: data_plane::PlaneMonitor,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("voice-hub".into())
@@ -103,7 +104,7 @@ pub fn spawn_hub(
                 .enable_all()
                 .build()
                 .expect("voice-hub tokio runtime")
-                .block_on(hub_loop(requests, factory, peers, me));
+                .block_on(hub_loop(requests, factory, peers, me, planes));
         })
         .expect("spawn voice-hub thread")
 }
@@ -152,23 +153,99 @@ impl SessionGuard {
     }
 }
 
-/// Build the two overlay media planes on the hub runtime (blocking until the
-/// overlay is up), then serve sessions over them. One shared active-flow set
-/// answers admission for both planes.
+/// `call-session.ts`'s `CONNECT_TIMEOUT_MS`: how long the webview waits for its
+/// first inbound frame before giving up on its own and reporting a generic
+/// connection failure. A refusal that arrives after this is one nobody sees.
+/// Exists to be asserted against below (tests shrink the grace, so the
+/// assertion — and this — are for the real build).
+#[cfg(not(test))]
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long a join may wait on an overlay that is still coming up before the
+/// hub stops holding it and starts refusing. The bind normally lands in a few
+/// seconds, so this window keeps the "joined the instant the node booted" case
+/// working; past it, the honest answer is a refusal.
+#[cfg(not(test))]
+const OVERLAY_GRACE: Duration = Duration::from_secs(8);
+/// Tests shrink the window so the refusal path runs in milliseconds instead of
+/// sleeping through the real one — the state machine under test is the same.
+#[cfg(test)]
+const OVERLAY_GRACE: Duration = Duration::from_millis(20);
+
+// The refusal is worthless if the client has already given up: the grace window
+// must leave room for the refusal to cross. Checked at COMPILE time, so nobody
+// can raise the grace past the webview's patience without hearing about it.
+// The refusal is worthless if the client has already given up: the grace window
+// must leave room for the refusal to cross. Checked at COMPILE time, so nobody
+// can raise the grace past the webview's patience without hearing about it.
+// (`as_secs`, not `as_millis` — const-evaluating the u128 form segfaults
+// clippy-driver on the pinned toolchain.)
+#[cfg(not(test))]
+const _: () = assert!(
+    OVERLAY_GRACE.as_secs() < CLIENT_CONNECT_TIMEOUT.as_secs(),
+    "OVERLAY_GRACE must stay inside call-session.ts's CONNECT_TIMEOUT_MS, or the client times \
+     out first and the user never sees the reason"
+);
+
+/// Why a join is refused while the overlay is down. Media rides ONLY the
+/// overlay, so with no interface there is no call. Names the log line rather
+/// than a cause: the overlay may simply be slow to come up on a correctly
+/// configured node, and telling that operator to change a setting that is
+/// already right is worse than telling them where to look.
+const OVERLAY_DOWN: &str = "the mesh overlay is not up on this node yet, and huddle media rides \
+                            the overlay — no call can start. retry in a moment; if it keeps \
+                            failing, the node log's [voice-plane] line says why the overlay \
+                            never came up (one common cause: an unprivileged `tun` effect, \
+                            which cannot bring an interface up — use `socket`).";
+
+/// Build the two overlay media planes on the hub runtime, then serve sessions
+/// over them. One shared active-flow set answers admission for both planes.
+///
+/// The bind waits on the overlay `/128`, which usually takes a few seconds but
+/// can take FOREVER (an unprivileged tun, an epoch that never applies). The
+/// request lane is drained throughout: a request left to rot in it is a huddle
+/// that hangs in "connecting" until the client's own timer gives up — with no
+/// reason on the wire and none in the ui. So joins wait out [`OVERLAY_GRACE`],
+/// and past it every join is refused with [`OVERLAY_DOWN`] until the bind lands.
 async fn hub_loop(
-    requests: mpsc::Receiver<noded::CallSessionRequest>,
+    mut requests: mpsc::Receiver<noded::CallSessionRequest>,
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
+    planes: data_plane::PlaneMonitor,
 ) {
     let flows = Arc::new(ActiveFlows::default());
-    let (voice_plane, video_plane) = crate::voice_plane::bind_media_planes(
+    let binding = crate::voice_plane::bind_media_planes(
         factory,
         peers,
         me,
         flows.clone() as Arc<dyn AdmissionPolicy>,
-    )
-    .await;
+    );
+    tokio::pin!(binding);
+    let bound = tokio::select! {
+        bound = &mut binding => Some(bound),
+        () = tokio::time::sleep(OVERLAY_GRACE) => None,
+    };
+    let (voice_plane, video_plane) = match bound {
+        Some(bound) => bound,
+        // The overlay is late (or never coming). Whatever queued during the
+        // grace window is answered here, as is every join until the bind lands.
+        None => loop {
+            tokio::select! {
+                bound = &mut binding => break bound,
+                request = requests.recv() => match request {
+                    Some(request) => {
+                        let _ = request.reply.send(Err(OVERLAY_DOWN.to_string()));
+                    }
+                    // the app surface dropped its lane (shutdown).
+                    None => return,
+                },
+            }
+        },
+    };
+    // huddle media is the chat module's: both planes report under it.
+    planes.register("chat", Service::Voice, voice_plane.watch());
+    planes.register("chat", Service::Video, video_plane.watch());
     serve_sessions(requests, voice_plane, video_plane, flows).await;
 }
 
@@ -652,7 +729,87 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_plane::{PlaneConfig, TransportError};
+    use data_plane::{BoxFuture, DatagramSocket, PlaneConfig, PlaneStream, StreamListener, TransportError};
+    use std::net::{IpAddr, SocketAddr};
+
+    /// A socket factory whose binds NEVER succeed — the overlay interface that
+    /// never arrives (an unprivileged `tun`, an epoch that never applies). The
+    /// hub cannot serve a call over it, and the point of the test below is that
+    /// it must SAY so rather than sit on the request.
+    struct DeadFactory;
+
+    fn no_interface<T>() -> std::io::Result<T> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "overlay interface is not up",
+        ))
+    }
+
+    impl SocketFactory for DeadFactory {
+        fn bind_udp(&self, _addr: SocketAddr) -> BoxFuture<'_, std::io::Result<Box<dyn DatagramSocket>>> {
+            Box::pin(async { no_interface() })
+        }
+
+        fn bind_listener(
+            &self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'_, std::io::Result<Box<dyn StreamListener>>> {
+            Box::pin(async { no_interface() })
+        }
+
+        fn dial_from<'a>(
+            &'a self,
+            _local_ip: IpAddr,
+            _dest: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<PlaneStream>> {
+            Box::pin(async { no_interface() })
+        }
+    }
+
+    /// The regression this whole change exists for: the hub used to await the
+    /// overlay bind BEFORE it ever drained its request lane, so against an
+    /// overlay that never comes up a join rotted in the mpsc unanswered — a
+    /// silent hang that only the webview's own 12 s timer ever ended, leaving
+    /// the user a bare "Voice connection failed." and no reason anywhere. The
+    /// hub must ANSWER a join it cannot serve, and say why.
+    #[tokio::test]
+    async fn a_dead_overlay_refuses_the_join_instead_of_letting_it_rot() {
+        let (requests_tx, requests_rx) = mpsc::channel(4);
+        tokio::spawn(hub_loop(
+            requests_rx,
+            Arc::new(DeadFactory),
+            crate::voice_plane::MediaPeers::new("test-namespace".into()),
+            [7u8; 32],
+            data_plane::PlaneMonitor::default(),
+        ));
+
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        requests_tx
+            .send(noded::CallSessionRequest {
+                channel_id: "general".into(),
+                reply,
+            })
+            .await
+            .expect("hub alive");
+
+        // Bounded so a REGRESSION (the hub going back to binding before it
+        // drains) fails the test instead of hanging it forever.
+        let answer = tokio::time::timeout(Duration::from_secs(30), opened)
+            .await
+            .expect("the hub must ANSWER a join it cannot serve — never leave it to rot")
+            .expect("the hub keeps the reply lane");
+        // `CallSession` is not Debug (it is a bundle of channel ends), so match
+        // rather than expect_err.
+        let refusal = match answer {
+            Ok(_) => panic!("a dead overlay cannot serve a call, yet the hub opened a session"),
+            Err(refusal) => refusal,
+        };
+        assert!(
+            refusal.contains("overlay"),
+            "the refusal must say WHY — it is what the ui shows instead of a bare \
+             'Voice connection failed.': {refusal}"
+        );
+    }
 
     /// Per-hub in-memory single-service transport (test only). Production media
     /// rides two OVERLAY sockets, one per service; tests wire two hubs over a
@@ -1356,7 +1513,13 @@ mod overlay_e2e {
         let (req_tx, req_rx) = mpsc::channel(4);
         let factory: Arc<dyn SocketFactory> =
             Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));
-        spawn_hub(req_rx, factory, peers, node.raw_key);
+        spawn_hub(
+            req_rx,
+            factory,
+            peers,
+            node.raw_key,
+            data_plane::PlaneMonitor::default(),
+        );
         req_tx
     }
 

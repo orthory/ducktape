@@ -157,7 +157,6 @@ const makeFakeNode = () => {
         modules: [{ id: "chat", root: String(state.height).padStart(64, "c") }],
       }),
     ),
-    metrics: vi.fn().mockResolvedValue(""),
     subscribe: vi.fn((_topics: string[], handlers: TopicHandlers) => {
       topicHandlers.add(handlers);
       return () => topicHandlers.delete(handlers);
@@ -296,5 +295,25 @@ describe("huddle lifecycle", () => {
     act(() => stubs[0].onEvent({ kind: "status", status: "live" }));
     act(() => stubs[0].onEvent({ kind: "mediaNote", note: "camera-failed" }));
     expect(capturedState?.voice.mediaNote).toBe("camera-failed");
+  });
+
+  // "Voice connection failed." is the same copy for a node that runs no call
+  // hub, a node whose overlay never came up, and a dead socket. The node names
+  // which one on the wire; dropping that sentence is what made every huddle
+  // failure undiagnosable.
+  it("keeps the node's refusal reason for the failure card", async () => {
+    await joinOnFakeNode();
+    const refusal = "calls are not available on this node (no live call hub)";
+    act(() => stubs[0].onEvent({ kind: "status", status: "error", error: "connection", note: refusal }));
+    await waitFor(() => expect(capturedState?.voice.status).toBe("error"));
+    expect(capturedState?.voice.error).toBe("connection");
+    expect(capturedState?.voice.errorNote).toBe(refusal);
+  });
+
+  it("has no reason to show when the node never sent one", async () => {
+    await joinOnFakeNode();
+    act(() => stubs[0].onEvent({ kind: "status", status: "error", error: "connection" }));
+    await waitFor(() => expect(capturedState?.voice.status).toBe("error"));
+    expect(capturedState?.voice.errorNote).toBeNull();
   });
 });

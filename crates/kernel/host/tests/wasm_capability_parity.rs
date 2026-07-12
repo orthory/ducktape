@@ -91,6 +91,7 @@ fn announce(tags: &[&str]) -> Msg {
         target: "capability".into(),
         payload: encode_msg(&CapabilityMsg::Announce {
             capabilities: tags.iter().map(|t| t.to_string()).collect(),
+            resources: Default::default(),
         }),
     }
 }

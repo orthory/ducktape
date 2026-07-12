@@ -4,9 +4,7 @@
 // roots.
 
 import {
-  useEffect,
   useMemo,
-  useRef,
   useState,
   type CSSProperties,
   type ReactNode,
@@ -22,17 +20,20 @@ import {
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
+import { useMetricsStream } from "../metrics/use-metrics-stream";
 import { HealthBar, HealthLegend } from "./HealthBar";
 import { LogsTab } from "./LogsTab";
 import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
 import { NodeFactsCard } from "./NodeFactsCard";
 import { PeersTab } from "./PeersTab";
+import { SandboxTab } from "./SandboxTab";
 
-type TabId = "overview" | "peers" | "permissions" | "logs";
+type TabId = "overview" | "peers" | "sandbox" | "permissions" | "logs";
 
 const TABS: ReadonlyArray<readonly [TabId, string]> = [
   ["overview", "Overview"],
   ["peers", "Connections"],
+  ["sandbox", "Sandbox"],
   ["permissions", "Permissions"],
   ["logs", "Logs"],
 ];
@@ -696,54 +697,32 @@ function StateCommitment() {
   );
 }
 
-/** How often the Node overview re-scrapes /metrics for its live cadence and
- *  apply-latency readout. Slower than the Metrics dashboard's 2 s — this is a
- *  glance, not a chart. */
-const METRICS_POLL_MS = 2_500;
-
 interface LiveMetrics {
   latest: NodeMetrics | null;
-  /** blocks/sec across the last two scrapes, null until a second read lands. */
+  /** blocks/sec across the last two samples, null until a second one lands. */
   blocksPerSec: number | null;
 }
 
-/** Poll /metrics while mounted + connected, deriving a live block rate from
- *  successive counter reads. Mirrors MetricsView's poller, trimmed to the two
- *  numbers this overview shows. Resets when the node changes. */
+/** The Node overview's live cadence + apply-latency readout, from the SAME
+ *  `metrics` stream topic the Metrics dashboard rides — the transport
+ *  refcounts topics, so both mounted together still cost one subscription on
+ *  the shared node socket. blocks/sec deltas the last two samples' counters
+ *  over their server-side sample instants. Resets when the node changes. */
 function useLiveMetrics(): LiveMetrics {
-  const { state, actions } = useDucktape();
-  const { connected, nodeUrl } = state;
-  const [latest, setLatest] = useState<NodeMetrics | null>(null);
-  const [blocksPerSec, setBlocksPerSec] = useState<number | null>(null);
-  const prev = useRef<{ t: number; blocks: number } | null>(null);
+  const { state, transport } = useDucktape();
+  const { samples } = useMetricsStream(transport, state.connected);
 
-  useEffect(() => {
-    setLatest(null);
-    setBlocksPerSec(null);
-    prev.current = null;
-    if (!connected) return;
-    let cancelled = false;
-    const poll = () => {
-      actions.readMetrics().then((m) => {
-        if (cancelled || !m) return;
-        setLatest(m);
-        if (!m.present) return;
-        const now = Date.now();
-        if (prev.current) {
-          setBlocksPerSec(blocksPerSecond(prev.current.blocks, m.blocksTotal, now - prev.current.t));
-        }
-        prev.current = { t: now, blocks: m.blocksTotal };
-      });
+  return useMemo(() => {
+    const latest = samples.length > 0 ? samples[samples.length - 1] : null;
+    const prev = samples.length > 1 ? samples[samples.length - 2] : null;
+    return {
+      latest: latest?.m ?? null,
+      blocksPerSec:
+        latest?.m.present && prev?.m.present
+          ? blocksPerSecond(prev.m.blocksTotal, latest.m.blocksTotal, latest.t - prev.t)
+          : null,
     };
-    poll();
-    const timer = setInterval(poll, METRICS_POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [connected, nodeUrl, actions]);
-
-  return { latest, blocksPerSec };
+  }, [samples]);
 }
 
 const LIVENESS_DOT: Record<string, string> = {
@@ -1172,6 +1151,8 @@ export function StatusView() {
       >
         {activeTab === "peers" ? (
           <PeersTab />
+        ) : activeTab === "sandbox" ? (
+          <SandboxTab />
         ) : activeTab === "permissions" ? (
           <PermissionsTab />
         ) : activeTab === "logs" ? (

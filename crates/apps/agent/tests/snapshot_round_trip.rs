@@ -70,7 +70,6 @@ fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
         agent_id: agent_id.into(),
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
-        prompt_hash: vec![7u8; 32],
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         recipe_hash: None,
         caps: None,
@@ -245,9 +244,11 @@ fn truncated_or_padded_snapshot_is_rejected() {
 
 /// the canonical bytes of a minimal one-agent state, built through the real
 /// op path. the layout is pinned by the asserted length so the
-/// discriminant-tampering test can index into it:
+/// discriminant-tampering test can index into it (the retired prompt pin cost
+/// another 8+32 bytes here, between the model and the action count — its
+/// removal is the flag day, and every offset below shifted down by 40):
 /// agents: count 8 | id 8+1 | owner disc 1 + key 8+1 | display 8+1
-///         | model 8+1 | prompt 8+32 | action count 8
+///         | model 8+1 | action count 8
 ///         | status 1 | times 16 | runtime tail 80 (recipe 8 + caps 64 + skills 8)
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
@@ -259,7 +260,6 @@ fn minimal_snapshot() -> Vec<u8> {
             agent_id: "a".into(),
             display_name: "A".into(),
             capability: "m".into(),
-            prompt_hash: vec![7u8; 32],
             allowed_actions: Vec::new(),
             recipe_hash: None,
             caps: None,
@@ -268,7 +268,7 @@ fn minimal_snapshot() -> Vec<u8> {
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 190, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 150, "the minimal layout this test indexes into");
     snap
 }
 
@@ -277,11 +277,11 @@ fn unknown_discriminants_and_tags_are_rejected() {
     let empty_root = module().root();
     let snap = minimal_snapshot();
 
-    // the owner origin disc (17) and agent status (94) each admit exactly
+    // the owner origin disc (17) and agent status (53) each admit exactly
     // their known values — a state has ONE valid encoding.
     for (index, what) in [
         (17usize, "owner origin discriminant"),
-        (93, "agent status"),
+        (53, "agent status"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;
@@ -315,7 +315,6 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
                 agent_id: id.into(),
                 display_name: id.to_uppercase(),
                 capability: "m".into(),
-                prompt_hash: vec![7u8; 32],
                 allowed_actions: Vec::new(),
                 recipe_hash: None,
                 caps: None,
@@ -326,18 +325,18 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     commit(&mut m);
     let snap = m.snapshot();
     let good_root = m.root();
-    // agents section: count 8, then two 182-byte bodies (102 core + 80 tail).
-    assert_eq!(snap.len(), 8 + 182 * 2);
-    let body_a = snap[8..190].to_vec();
-    let body_b = snap[190..372].to_vec();
+    // agents section: count 8, then two 142-byte bodies (62 core + 80 tail).
+    assert_eq!(snap.len(), 8 + 142 * 2);
+    let body_a = snap[8..150].to_vec();
+    let body_b = snap[150..292].to_vec();
 
     for (first, second, what) in [
         (&body_b, &body_a, "descending ids"),
         (&body_a, &body_a, "duplicate ids"),
     ] {
         let mut bytes = snap.clone();
-        bytes[8..190].copy_from_slice(first);
-        bytes[190..372].copy_from_slice(second);
+        bytes[8..150].copy_from_slice(first);
+        bytes[150..292].copy_from_slice(second);
         let mut dst = module();
         let err = dst.install(&bytes, StateRoot::ZERO).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{what} must be rejected");

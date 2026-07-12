@@ -8,9 +8,10 @@
 //!
 //! the payload is a run ENVELOPE (marker `ducktape_run`, v3-only — legacy
 //! flat strings and v2 envelopes fail the run loudly), assembled host-side:
-//! the agent's registered prompt resolved from the node's blob store by its
-//! committed content hash, plus the contract and conversation the dispatcher
-//! composed. beyond that
+//! the instructions, contract and conversation the dispatcher composed. the
+//! agent's PERSONA is no longer in there — it is a curated skill, and the
+//! provisioner assembles the agent's `always` skills into the run's context
+//! document ([`assemble_context_doc`], the SOUL). beyond that
 //! assembly the crate stays opinion-free: NO prompt text is authored here,
 //! NO output shape is parsed here (the dispatch module judges the recipe's
 //! output contract in consensus), and NO credentials are touched (BYO CLI
@@ -22,20 +23,28 @@
 //! execution to a spawned background task, and returns immediately — so a
 //! minutes-long CLI call never stalls the host's event loop.
 
+use std::collections::BTreeMap;
+
 use capability_host::{ProviderOutput, ProviderSet};
 use dispatch::{WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Event, Msg};
 
 mod envelope;
+mod ledger;
 mod pool;
 mod provision;
+mod soul;
 mod workspace_source;
-pub use envelope::BlobResolver;
-pub use pool::{DeliverFn, DispatchPool, SpawnFn};
+pub use ledger::{ReservationGuard, ResourceLedger};
+pub use pool::{DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env};
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
     WorkspaceSpec,
+};
+pub use soul::{
+    MAX_ALWAYS_BYTES, MAX_DESCRIPTION_CHARS, MAX_INDEXED_SKILLS, SKILL_LIBRARY_PREFIX, SkillDoc,
+    assemble_context_doc, parse_skill_md,
 };
 pub use workspace_source::WorkspaceSource;
 
@@ -48,6 +57,10 @@ pub(crate) struct ExecJob {
     pub capability: String,
     /// the fully rendered prompt — the WorkSpec payload, verbatim.
     pub input: String,
+    /// numeric resource demands (Task 4's `WorkSpec.demands`), carried
+    /// through so the pool can reserve this run's share of the host-local
+    /// [`ResourceLedger`] before it starts executing.
+    pub demands: BTreeMap<String, u64>,
 }
 
 pub(crate) struct AttemptOutput {
@@ -85,8 +98,15 @@ pub(crate) enum Gated {
     Execute(ExecJob),
 }
 
-/// decode + lease-gate one event against this host's provider surface.
-pub(crate) fn gate(providers: &ProviderSet, node_key: &[u8], event: &Event) -> Gated {
+/// decode + lease-gate one event against this host's provider surface and
+/// its process-local load. `ledger` is the host's [`ResourceLedger`]: an
+/// over-capacity own lease or announcement is a `Skip`, never claimed or run.
+pub(crate) fn gate(
+    providers: &ProviderSet,
+    node_key: &[u8],
+    ledger: &ResourceLedger,
+    event: &Event,
+) -> Gated {
     let request = match decode_worker_request(&event.payload) {
         Ok(request) => request,
         Err(_) => return Gated::NotMine,
@@ -102,12 +122,16 @@ pub(crate) fn gate(providers: &ProviderSet, node_key: &[u8], event: &Event) -> G
         // claimed skip — it IS our effect type, but the assignee submits
         // the result.
         Some(assignee) if *assignee != node_key => Gated::Skip,
-        Some(_) => gate_own_lease(providers, &request, work),
+        Some(_) => gate_own_lease(providers, ledger, &request, work),
         // an UNASSIGNED request is an announcement, not a work order:
         // running it would be one execution per capable node. claim it
-        // with Accept when this host can actually run the capability;
-        // the re-emitted request naming the winner is what executes.
+        // with Accept when this host can actually run the capability AND
+        // fit its demands — never claim what cannot fit; the re-emitted
+        // request naming the winner is what executes.
         None => {
+            if !ledger.fits(&work.demands) {
+                return Gated::Skip;
+            }
             if providers.resolve(&work.capability).is_err() {
                 return Gated::Skip;
             }
@@ -118,7 +142,12 @@ pub(crate) fn gate(providers: &ProviderSet, node_key: &[u8], event: &Event) -> G
 
 /// gate an own-lease request down to an [`ExecJob`] — or the inline error
 /// result for a lease that can never execute.
-fn gate_own_lease(providers: &ProviderSet, request: &WorkerRequest, work: WorkSpec) -> Gated {
+fn gate_own_lease(
+    providers: &ProviderSet,
+    ledger: &ResourceLedger,
+    request: &WorkerRequest,
+    work: WorkSpec,
+) -> Gated {
     // payload shape first: this verdict must not depend on what happens
     // to be installed on this host.
     let input = match String::from_utf8(work.payload) {
@@ -133,6 +162,15 @@ fn gate_own_lease(providers: &ProviderSet, request: &WorkerRequest, work: WorkSp
             ));
         }
     };
+    // ledger fits next, BEFORE provider resolve: an own lease over capacity
+    // is a Skip, deliberately NOT an inline error — the lease expires and
+    // the next attempt rendezvouses to another provider. an error result
+    // would consume the attempt with a lie (this node was never able to run
+    // it). ponytail: costs one lease window; a Decline op for instant
+    // rotation is the upgrade path if that window hurts.
+    if !ledger.fits(&work.demands) {
+        return Gated::Skip;
+    }
     if let Err(e) = providers.resolve(&work.capability) {
         return Gated::Immediate(oracle_result(
             &request.saga_id,
@@ -145,6 +183,7 @@ fn gate_own_lease(providers: &ProviderSet, request: &WorkerRequest, work: WorkSp
         attempt: request.attempt,
         capability: work.capability,
         input,
+        demands: work.demands,
     })
 }
 
@@ -256,6 +295,7 @@ format = "text"
             dispatch_id: "d1".into(),
             capability: "alpha".into(),
             payload: b"the entire input".to_vec(),
+            demands: Default::default(),
         })
     }
 
@@ -265,11 +305,17 @@ format = "text"
 
         // a foreign spec shape (no kind field) is NotMine, never guessed at.
         let foreign = effect_for(br#"{"run_id":"r","agent_id":"a"}"#.to_vec(), None);
-        assert!(matches!(gate(&providers, b"me", &foreign), Gated::NotMine));
+        assert!(matches!(
+            gate(&providers, b"me", &bare_ledger(), &foreign),
+            Gated::NotMine
+        ));
 
         // someone else's lease: claimed but deliberately not run.
         let peer = effect_for(work_spec(), Some(b"peer"));
-        assert!(matches!(gate(&providers, b"me", &peer), Gated::Skip));
+        assert!(matches!(
+            gate(&providers, b"me", &bare_ledger(), &peer),
+            Gated::Skip
+        ));
     }
 
     #[test]
@@ -277,7 +323,12 @@ format = "text"
         // the spec is loaded but no binary installed: the gate answers with
         // the error result by capability name — never an Execute job.
         let providers = mock_specs_only();
-        match gate(&providers, b"me", &effect_for(work_spec(), Some(b"me"))) {
+        match gate(
+            &providers,
+            b"me",
+            &bare_ledger(),
+            &effect_for(work_spec(), Some(b"me")),
+        ) {
             Gated::Immediate(msg) => {
                 let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
@@ -311,6 +362,88 @@ format = "text"
         // an announcement this host CAN serve: the gate answers with an
         // Accept claim, never an execution — the saga's first-accept-wins
         // rule is what turns N capable nodes into one run.
+        let providers = servable_providers();
+        match gate(
+            &providers,
+            b"me",
+            &bare_ledger(),
+            &effect_for(work_spec(), None),
+        ) {
+            Gated::Immediate(msg) => match saga::decode_msg(&msg.payload).unwrap() {
+                SagaMsg::Accept { saga_id, attempt } => {
+                    assert_eq!(saga_id, "s");
+                    assert_eq!(attempt, 0);
+                }
+                other => panic!("expected an Accept claim, got {other:?}"),
+            },
+            _ => panic!("a claimable announcement must produce an op"),
+        }
+
+        // an announcement this host CANNOT serve (spec loaded, nothing
+        // installed): a quiet skip — never a claim it could not honor.
+        let providers = mock_specs_only();
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &bare_ledger(),
+                &effect_for(work_spec(), None)
+            ),
+            Gated::Skip
+        ));
+    }
+
+    #[test]
+    fn non_utf8_payloads_error_cleanly() {
+        let providers = mock_specs_only();
+        let spec = encode_work_spec(&WorkSpec {
+            kind: WORK_SPEC_KIND.into(),
+            dispatch_id: "d1".into(),
+            capability: "alpha".into(),
+            payload: vec![0xff, 0xfe],
+            demands: Default::default(),
+        });
+        match gate(
+            &providers,
+            b"me",
+            &bare_ledger(),
+            &effect_for(spec, Some(b"me")),
+        ) {
+            Gated::Immediate(msg) => {
+                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
+                else {
+                    panic!("expected an oracle result");
+                };
+                assert!(outcome.unwrap_err().contains("not utf-8"));
+            }
+            _ => panic!("expected a submitted error"),
+        }
+    }
+
+    /// a ledger with no announced capacity at all — every test above this
+    /// point uses demandless specs, so an empty ledger fits them trivially.
+    fn bare_ledger() -> ResourceLedger {
+        ResourceLedger::new(Default::default())
+    }
+
+    fn demands(pairs: &[(&str, u64)]) -> std::collections::BTreeMap<String, u64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn work_spec_with_demands(demands: std::collections::BTreeMap<String, u64>) -> Vec<u8> {
+        encode_work_spec(&WorkSpec {
+            kind: WORK_SPEC_KIND.into(),
+            dispatch_id: "d1".into(),
+            capability: "alpha".into(),
+            payload: b"the entire input".to_vec(),
+            demands,
+        })
+    }
+
+    /// a provider surface that can actually run "alpha" — the servable twin
+    /// of `mock_specs_only`, for tests where the capacity check must be what
+    /// produces the Skip (not a missing provider).
+    fn servable_providers() -> ProviderSet {
         let spec = capability_host::CapabilitySpec::parse(
             r#"
 spec = 1
@@ -327,48 +460,54 @@ format = "text"
             "test",
         )
         .expect("mock spec parses");
-        let providers = ProviderSet::assemble(
+        ProviderSet::assemble(
             capability_host::SpecSet::from_specs(vec![spec]),
             vec![Box::new(StubProvider)],
-        );
-        match gate(&providers, b"me", &effect_for(work_spec(), None)) {
-            Gated::Immediate(msg) => match saga::decode_msg(&msg.payload).unwrap() {
-                SagaMsg::Accept { saga_id, attempt } => {
-                    assert_eq!(saga_id, "s");
-                    assert_eq!(attempt, 0);
-                }
-                other => panic!("expected an Accept claim, got {other:?}"),
-            },
-            _ => panic!("a claimable announcement must produce an op"),
-        }
+        )
+    }
 
-        // an announcement this host CANNOT serve (spec loaded, nothing
-        // installed): a quiet skip — never a claim it could not honor.
-        let providers = mock_specs_only();
+    #[test]
+    fn an_own_lease_over_capacity_is_skipped_so_the_lease_can_rotate() {
+        // providers resolve, but ledger capacity {"cores": 4} < demands
+        // {"cores": 8} -> Gated::Skip (NOT an inline error: the saga lease
+        // expires and the next attempt rendezvouses elsewhere; an error
+        // result would consume the attempt with a lie — this node was never
+        // able to run it).
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 4)]));
+        let spec = work_spec_with_demands(demands(&[("cores", 8)]));
         assert!(matches!(
-            gate(&providers, b"me", &effect_for(work_spec(), None)),
+            gate(&providers, b"me", &ledger, &effect_for(spec, Some(b"me"))),
             Gated::Skip
         ));
     }
 
     #[test]
-    fn non_utf8_payloads_error_cleanly() {
-        let providers = mock_specs_only();
-        let spec = encode_work_spec(&WorkSpec {
-            kind: WORK_SPEC_KIND.into(),
-            dispatch_id: "d1".into(),
-            capability: "alpha".into(),
-            payload: vec![0xff, 0xfe],
-        });
-        match gate(&providers, b"me", &effect_for(spec, Some(b"me"))) {
-            Gated::Immediate(msg) => {
-                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
-                else {
-                    panic!("expected an oracle result");
-                };
-                assert!(outcome.unwrap_err().contains("not utf-8"));
-            }
-            _ => panic!("expected a submitted error"),
-        }
+    fn an_announcement_over_capacity_is_not_claimed() {
+        // unassigned request + over-capacity demands -> Gated::Skip, never
+        // Accept.
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 4)]));
+        let spec = work_spec_with_demands(demands(&[("cores", 8)]));
+        assert!(matches!(
+            gate(&providers, b"me", &ledger, &effect_for(spec, None)),
+            Gated::Skip
+        ));
+    }
+
+    #[test]
+    fn demandless_jobs_bypass_capacity_even_on_a_bare_ledger() {
+        // empty demands + empty capacity -> Gated::Execute as today.
+        let providers = servable_providers();
+        let ledger = bare_ledger();
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for(work_spec(), Some(b"me"))
+            ),
+            Gated::Execute(_)
+        ));
     }
 }

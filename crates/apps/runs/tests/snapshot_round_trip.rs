@@ -61,7 +61,6 @@ impl TestCtx {
                 owner: SagaOrigin::External(b"alice".to_vec()),
                 display_name: agent_id.to_uppercase(),
                 capability: "model-1".into(),
-                prompt_hash: vec![7u8; 32],
                 allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
                 status: AgentStatus::Active,
                 created_at: 0,
@@ -252,6 +251,7 @@ fn source() -> RunsModule {
         agent_id: agent.into(),
         channel_id: channel.into(),
         anchor_seq,
+        demands: Default::default(),
     };
     exec(
         &mut m,
@@ -479,6 +479,7 @@ fn minimal_snapshot() -> Vec<u8> {
             agent_id: "a".into(),
             channel_id: "c".into(),
             anchor_seq: 1,
+            demands: Default::default(),
         },
     );
     commit(&mut m);

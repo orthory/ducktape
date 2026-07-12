@@ -4,7 +4,7 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`workspace`/`session` (and `description`) from the parent,
+//! `timeout_secs`/`workspace`/`session`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
 //! with the variant's own FULL argv (and, optionally, its own `[session]`
 //! resume replacement — see [`RawVariant::resume_args`]). there is no
 //! merging, no placeholder, no substitution — the
@@ -118,6 +118,16 @@ pub(crate) fn expand(
             output: base.output,
             workspace: base.workspace,
             session,
+            // HOW the executor authenticates — its broker, its config home, its
+            // auth/state dirs — is a property of the CLI, not of the model or the
+            // effort a variant pins. so both auth sections inherit whole, and the
+            // parent's broker⊕rw_dirs exclusivity (checked once, at parse) holds
+            // for every variant by construction.
+            rw_dirs: base.rw_dirs.clone(),
+            isolation: base.isolation.clone(),
+            // WHERE the CLI auto-loads its ambient instructions is a property of
+            // the CLI, like its auth — not of the model or effort a variant pins.
+            context: base.context.clone(),
         });
     }
     Ok(specs)
@@ -271,6 +281,15 @@ args = ["run", "--model", "m1", "--effort", "high"]
 [workspace]
 mode = "persistent"
 
+[sandbox]
+rw_dirs = ["~/.prov"]
+
+[isolation]
+config_home_env = "PROV_HOME"
+
+[context]
+path = "config-home:AGENTS.md"
+
 [session]
 capture = "jsonl-events"
 resume_args = ["resume", "{session_id}", "--default"]
@@ -288,10 +307,30 @@ resume_args = ["resume", "{session_id}", "--model", "m1", "--hard"]
         let specs = CapabilitySpec::parse_all(&toml, "t").unwrap();
         let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
 
-        // plain variant: workspace and session inherited verbatim.
+        // plain variant: workspace, session, and BOTH auth sections inherited —
+        // how the CLI authenticates is a property of the CLI, not of the
+        // model/effort the variant pins.
         let v = get("prov_m1_low");
         assert_eq!(v.workspace, crate::WorkspaceMode::Persistent);
+        assert_eq!(v.rw_dirs, vec!["~/.prov"], "sandbox rw_dirs inherited");
+        assert_eq!(
+            v.isolation,
+            get("prov").isolation,
+            "the [isolation] block is inherited whole"
+        );
+        assert_eq!(v.isolation.config_home_env.as_deref(), Some("PROV_HOME"));
         assert_eq!(v.session, get("prov").session, "session inherited");
+        // WHERE the soul is delivered is a property of the CLI, not of the model
+        // or effort a variant pins — so it inherits like auth does.
+        assert_eq!(
+            v.context,
+            get("prov").context,
+            "the [context] location is inherited whole"
+        );
+        assert_eq!(
+            v.context,
+            Some(crate::ContextLocation::ConfigHome("AGENTS.md".into()))
+        );
 
         // resume_args variant: capture inherited, resume argv its own.
         let v = get("prov_m1_high");
@@ -471,6 +510,44 @@ resume_args = ["resume", "stale-id"]
             );
             assert!(spec.session.is_some(), "{}: [session] is set", spec.tag);
             assert_eq!(spec.timeout_secs, 600, "{}: agentic timeout", spec.tag);
+            // every shipped executor delivers the assembled soul NATIVELY (a file
+            // its CLI auto-loads), never by inflating the stdin prompt. WHICH file
+            // is spec data — the assertion is that the door exists.
+            assert!(
+                spec.context.is_some(),
+                "{}: an embedded executor names its own context file",
+                spec.tag
+            );
+        }
+
+        // the shipped AUTH posture, per family, inherited by every variant: codex
+        // takes the strong path (broker + fresh CODEX_HOME, so the credential
+        // never enters the child, and therefore NO credential dir mounted);
+        // claude takes the weak one (no broker exists for it yet, so its auth dir
+        // is mounted into the sandbox instead). the parse-time invariant is what
+        // makes "both" unrepresentable — this pins which side each family is on.
+        for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
+            assert_eq!(
+                spec.isolation.broker,
+                Some(crate::spec::BrokerKind::CodexResponses),
+                "{}: codex authenticates through the host broker",
+                spec.tag
+            );
+            assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+            assert!(
+                spec.rw_dirs.is_empty(),
+                "{}: a broker-backed spec mounts no credential dir",
+                spec.tag
+            );
+        }
+        for spec in specs.iter().filter(|s| s.tag.starts_with("claude")) {
+            assert_eq!(spec.isolation.broker, None, "{}: no broker yet", spec.tag);
+            assert_eq!(
+                spec.rw_dirs,
+                vec!["~/.claude", "~/.claude.json"],
+                "{}: claude reads its own dotfiles, so they cross the sandbox",
+                spec.tag
+            );
         }
 
         // the resume shape per family: subcommand-style resume replaces the

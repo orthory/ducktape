@@ -2,13 +2,24 @@ import { describe, expect, it } from "vitest";
 
 import {
   blocksPerSecond,
+  formatAge,
   formatBound,
+  formatBytes,
+  formatBytesRate,
   formatLatency,
+  formatPeer,
   formatRate,
   meanLatency,
   parseMetrics,
   perBucket,
+  planeDropTotal,
+  planeRxBytes,
+  planeTxBytes,
   quantile,
+  ratePerSecond,
+  syncBlocksLeft,
+  syncPhase,
+  syncProgress,
 } from "./metrics";
 
 // A representative /metrics scrape: commonware runtime noise (must be ignored)
@@ -48,6 +59,53 @@ ducktape_blocks_total 2
 # TYPE ducktape_dispatch_total counter
 ducktape_dispatch_total{module="chat",origin="external"} 2
 ducktape_dispatch_total{module="tagging",origin="module"} 1
+# HELP ducktape_dataplane_open an open data plane, by service and creating module (1 = open).
+# TYPE ducktape_dataplane_open gauge
+ducktape_dataplane_open{service="voice",owner="chat"} 1
+ducktape_dataplane_open{service="gateway",owner="gateway"} 1
+# TYPE ducktape_dataplane_halted gauge
+ducktape_dataplane_halted{service="voice",owner="chat"} 0
+ducktape_dataplane_halted{service="gateway",owner="gateway"} 0
+# TYPE ducktape_dataplane_age_seconds gauge
+ducktape_dataplane_age_seconds{service="voice",owner="chat"} 90
+ducktape_dataplane_age_seconds{service="gateway",owner="gateway"} 3725
+# TYPE ducktape_dataplane_bytes gauge
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="tx",class="datagram"} 640000
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="rx",class="datagram"} 320000
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="tx",class="stream"} 0
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="rx",class="stream"} 0
+ducktape_dataplane_bytes{service="gateway",owner="gateway",dir="tx",class="stream"} 150000
+ducktape_dataplane_bytes{service="gateway",owner="gateway",dir="rx",class="stream"} 98000
+# TYPE ducktape_dataplane_datagrams gauge
+ducktape_dataplane_datagrams{service="voice",owner="chat",dir="tx"} 4000
+ducktape_dataplane_datagrams{service="voice",owner="chat",dir="rx"} 2000
+# TYPE ducktape_dataplane_streams gauge
+ducktape_dataplane_streams{service="gateway",owner="gateway",kind="opened"} 12
+ducktape_dataplane_streams{service="gateway",owner="gateway",kind="accepted"} 7
+# TYPE ducktape_dataplane_drops gauge
+ducktape_dataplane_drops{service="voice",owner="chat",kind="shed"} 5
+ducktape_dataplane_drops{service="voice",owner="chat",kind="rogue_datagrams"} 2
+ducktape_dataplane_drops{service="gateway",owner="gateway",kind="refused_sends"} 0
+# TYPE ducktape_statesync_serve_age_seconds gauge
+ducktape_statesync_serve_age_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 75
+ducktape_statesync_serve_age_seconds{peer="0011223344556677"} 3000
+# TYPE ducktape_statesync_serve_idle_seconds gauge
+ducktape_statesync_serve_idle_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1
+ducktape_statesync_serve_idle_seconds{peer="0011223344556677"} 9
+# TYPE ducktape_statesync_serve_bytes gauge
+ducktape_statesync_serve_bytes{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 5250000
+ducktape_statesync_serve_bytes{peer="0011223344556677"} 4200
+# TYPE ducktape_statesync_serve_frames gauge
+ducktape_statesync_serve_frames{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 40
+# TYPE ducktape_statesync_serve_requests gauge
+ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="manifest"} 1
+ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="chunk"} 21
+ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 4
+ducktape_statesync_serve_requests{peer="0011223344556677",kind="tip_coords"} 250
+# TYPE ducktape_statesync_serve_boundary_height gauge
+ducktape_statesync_serve_boundary_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1500
+# TYPE ducktape_statesync_serve_frame_height gauge
+ducktape_statesync_serve_frame_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1540
 `;
 
 describe("parseMetrics", () => {
@@ -71,6 +129,62 @@ describe("parseMetrics", () => {
     ]);
   });
 
+  it("assembles the per-plane families into open planes, sorted", () => {
+    const m = parseMetrics(SCRAPE);
+    expect(m.planes).toHaveLength(2);
+
+    // sorted by service: gateway before voice.
+    const [gateway, voice] = m.planes;
+    expect(gateway.service).toBe("gateway");
+    expect(gateway.owner).toBe("gateway");
+    expect(gateway.ageSeconds).toBe(3725);
+    expect(gateway.halted).toBe(false);
+    expect(gateway.bytesTxStream).toBe(150000);
+    expect(gateway.bytesRxStream).toBe(98000);
+    expect(gateway.streamsOpened).toBe(12);
+    expect(gateway.streamsAccepted).toBe(7);
+    expect(gateway.drops).toEqual({ refused_sends: 0 });
+
+    expect(voice.service).toBe("voice");
+    expect(voice.owner).toBe("chat");
+    expect(voice.bytesTxDatagram).toBe(640000);
+    expect(voice.bytesRxDatagram).toBe(320000);
+    expect(voice.datagramsTx).toBe(4000);
+    expect(voice.datagramsRx).toBe(2000);
+    expect(voice.drops).toEqual({ shed: 5, rogue_datagrams: 2 });
+  });
+
+  it("assembles the statesync serve families into served peers, sorted", () => {
+    const m = parseMetrics(SCRAPE);
+    expect(m.syncPeers).toHaveLength(2);
+
+    // sorted by peer: the tip poller's key sorts first.
+    const [poller, joiner] = m.syncPeers;
+    expect(poller.peer).toBe("0011223344556677");
+    expect(poller.ageSeconds).toBe(3000);
+    expect(poller.idleSeconds).toBe(9);
+    expect(poller.bytesTx).toBe(4200);
+    expect(poller.framesServed).toBe(0);
+    expect(poller.boundaryHeight).toBeNull();
+    expect(poller.servedHeight).toBeNull();
+    expect(poller.requests).toEqual({ tip_coords: 250 });
+
+    expect(joiner.peer).toBe("9f3ab2c1d4e5f607a8b9cadbecfd0e1f");
+    expect(joiner.bytesTx).toBe(5250000);
+    expect(joiner.framesServed).toBe(40);
+    expect(joiner.boundaryHeight).toBe(1500);
+    expect(joiner.servedHeight).toBe(1540);
+    expect(joiner.requests).toEqual({ manifest: 1, chunk: 21, frames: 4 });
+  });
+
+  it("keeps `present` a block-series fact: plane series alone don't set it", () => {
+    const m = parseMetrics(
+      '# TYPE ducktape_dataplane_open gauge\nducktape_dataplane_open{service="voice",owner="chat"} 1\n',
+    );
+    expect(m.present).toBe(false);
+    expect(m.planes).toHaveLength(1);
+  });
+
   it("reads a node with only runtime series as not-present (an older binary)", () => {
     const m = parseMetrics(
       "# TYPE runtime_x counter\nruntime_x_total 3\nchat_commit_calls_total 1\n",
@@ -78,6 +192,7 @@ describe("parseMetrics", () => {
     expect(m.present).toBe(false);
     expect(m.blocksTotal).toBe(0);
     expect(m.dispatches).toEqual([]);
+    expect(m.planes).toEqual([]);
   });
 
   it("survives an empty / whitespace body", () => {
@@ -116,6 +231,46 @@ describe("derivations", () => {
     expect(blocksPerSecond(10, 20, 2000)).toBe(5); // +10 over 2s
     expect(blocksPerSecond(20, 5, 1000)).toBe(0); // counter reset
     expect(blocksPerSecond(10, 20, 0)).toBe(0); // no elapsed time
+    expect(ratePerSecond(0, 500_000, 2000)).toBe(250_000); // bytes ride the same math
+  });
+
+  it("totals a plane's directions and drops", () => {
+    const [gateway, voice] = parseMetrics(SCRAPE).planes;
+    expect(planeTxBytes(gateway)).toBe(150000);
+    expect(planeRxBytes(gateway)).toBe(98000);
+    expect(planeDropTotal(gateway)).toBe(0);
+    expect(planeTxBytes(voice)).toBe(640000);
+    expect(planeRxBytes(voice)).toBe(320000);
+    expect(planeDropTotal(voice)).toBe(7);
+  });
+
+  it("measures a sync peer's progression against the node's own height", () => {
+    const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
+    // the joiner replayed to 1540 of a 2000-block goal: 77%, 460 left.
+    expect(syncProgress(joiner, 2000)).toBeCloseTo(0.77, 6);
+    expect(syncBlocksLeft(joiner, 2000)).toBe(460);
+    // reach never exceeds the goal (a stale scrape's height lags the serve).
+    expect(syncProgress(joiner, 1000)).toBe(1);
+    expect(syncBlocksLeft(joiner, 1000)).toBe(0);
+    // a tip poller has no height-shaped responses — no progression.
+    expect(syncProgress(poller, 2000)).toBeNull();
+    expect(syncBlocksLeft(poller, 2000)).toBeNull();
+    // an unknown goal (height 0) yields no progression either.
+    expect(syncProgress(joiner, 0)).toBeNull();
+  });
+
+  it("phases a sync peer from its request mix", () => {
+    const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
+    expect(syncPhase(joiner)).toBe("replaying frames");
+    expect(syncPhase(poller)).toBe("polling tip");
+    // a snapshot restore in flight: manifest served, chunks moving, no frames.
+    expect(syncPhase({ ...joiner, servedHeight: null })).toBe("restoring snapshot");
+    // manifest served but no payload requested yet.
+    expect(syncPhase({ ...joiner, servedHeight: null, requests: { manifest: 1 } })).toBe(
+      "manifest served",
+    );
+    // nothing height-shaped at all: the blob fetch-on-miss lane.
+    expect(syncPhase({ ...poller, requests: { blob: 3 } })).toBe("fetching blobs");
   });
 });
 
@@ -136,5 +291,28 @@ describe("formatting", () => {
   it("formats a rate", () => {
     expect(formatRate(4.2)).toBe("4.20 /s");
     expect(formatRate(42)).toBe("42.0 /s");
+  });
+
+  it("scales bytes across SI units", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(512)).toBe("512 B");
+    expect(formatBytes(1350)).toBe("1.35 kB");
+    expect(formatBytes(24_000_000)).toBe("24.0 MB");
+    expect(formatBytes(3_200_000_000)).toBe("3.20 GB");
+    expect(formatBytes(-1)).toBe("—");
+    expect(formatBytesRate(1350)).toBe("1.35 kB/s");
+  });
+
+  it("ages in the two most significant units", () => {
+    expect(formatAge(45)).toBe("45s");
+    expect(formatAge(90)).toBe("1m 30s");
+    expect(formatAge(3725)).toBe("1h 2m");
+    expect(formatAge(2 * 86400 + 3 * 3600)).toBe("2d 3h");
+    expect(formatAge(-1)).toBe("—");
+  });
+
+  it("shortens a peer key to its leading hex", () => {
+    expect(formatPeer("9f3ab2c1d4e5f607a8b9cadbecfd0e1f")).toBe("9f3ab2c1…");
+    expect(formatPeer("abcd")).toBe("abcd");
   });
 });

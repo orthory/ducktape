@@ -105,6 +105,7 @@ impl RunsModule {
                 agent_id,
                 channel_id,
                 anchor_seq,
+                demands,
             } => {
                 // an explicit turn claim: same run id, same dedup as the
                 // engagement path — first in consensus order wins, the loser
@@ -144,7 +145,7 @@ impl RunsModule {
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(
-                    ctx, &run_id, agent_id, channel_id, anchor_seq, requester, prepared,
+                    ctx, &run_id, agent_id, channel_id, anchor_seq, requester, prepared, demands,
                 );
                 Ok(())
             }

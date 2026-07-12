@@ -67,11 +67,13 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
             name: "pinned".into(),
             source_prefix: "/shared/skills/pinned".into(),
             source_snapshot: Some("bb".repeat(32)),
+            load: agent::LoadMode::Always,
         },
         agent::SkillRef {
             name: "tracking".into(),
             source_prefix: "/shared/skills/tracking".into(),
             source_snapshot: None,
+            load: agent::LoadMode::OnDemand,
         },
     ];
 
@@ -106,6 +108,10 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
         Some(head.as_str()),
         "a tracking skill pins the same committed head (W2)"
     );
+    // the curated load mode rides through pin resolution untouched — it is what
+    // tells the host which bodies to inline into the agent's context document.
+    assert!(inputs.skills[0].always, "the persona loads always");
+    assert!(!inputs.skills[1].always, "the reference skill is on demand");
 
     // files wired + an unresolved head: a null pin (fresh network).
     let ctx_empty = CaptureCtx::new();
@@ -584,6 +590,7 @@ fn a_request_run_on_a_forge_channel_without_the_cap_rejects_with_the_reason() {
             agent_id: "bot".into(),
             channel_id: "forge:app:7".into(),
             anchor_seq: 2,
+            demands: Default::default(),
         }),
     )
     .unwrap_err();

@@ -227,6 +227,7 @@ pub async fn drive_first_contact(
     label: String,
     window: Duration,
 ) -> FirstContactOutcome {
+    let tried = candidates.len();
     let iters = (window.as_secs() / RETRY_INTERVAL.as_secs()).max(1) as u32;
     let attempt = |candidate: Candidate| {
         let reach = reach.clone();
@@ -242,7 +243,20 @@ pub async fn drive_first_contact(
             }
         }
     };
-    race_first_contact(candidates, attempt).await
+    // The window is a HARD bound, not just loop pacing: an attempt parked on
+    // a reply the plane never sends (its command loop stalled) would
+    // otherwise hang the race forever — no Terminal, no exit, no log line.
+    match tokio::time::timeout(window, race_first_contact(candidates, attempt)).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => FirstContactOutcome::Terminal {
+            tried,
+            reason: format!(
+                "join window ({}s) elapsed with no candidate acked — every path stayed dark \
+                 (reachability plane unresponsive or peers unreachable)",
+                window.as_secs()
+            ),
+        },
+    }
 }
 
 /// trips a stop flag when the owning attempt future is dropped (the attempt
@@ -582,6 +596,53 @@ mod tests {
         assert_eq!(candidates[0].intro.as_deref(), Some("198.51.100.1:7000"));
         // fronts advertise no separate intro listener.
         assert_eq!(candidates[1].intro, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mute_plane_cannot_hang_the_race_past_its_window() {
+        // The field failure: the reachability plane ACCEPTS commands but never
+        // answers them (its command loop never came up). The parked oneshot
+        // reply senders stay alive, so per-attempt awaits never resolve — the
+        // window must still terminate the race honestly instead of letting the
+        // joiner sit dark forever with zero log output.
+        let (reach_tx, mut reach_rx) =
+            tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
+        let parked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = parked.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = reach_rx.recv().await {
+                sink.lock().expect("collector mutex").push(cmd);
+            }
+        });
+
+        let candidates = vec![Candidate {
+            key: key(9),
+            wg: [9; 32],
+            mesh_port: 1,
+            endpoint: None, // coordinated: the path that awaits a plane reply
+            intro: None,
+        }];
+        let window = Duration::from_secs(90);
+        // Paused clock: with the window enforced this resolves at t=90s of
+        // virtual time (milliseconds of wall time); without it nothing ever
+        // wakes and the guard timeout below trips.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            drive_first_contact(
+                reach_tx,
+                candidates,
+                vec![1, 2, 3],
+                vec![9, 9],
+                "mute-plane".into(),
+                window,
+            ),
+        )
+        .await
+        .expect("the race must resolve within its window even when the plane never answers");
+        assert!(
+            matches!(outcome, FirstContactOutcome::Terminal { tried: 1, .. }),
+            "a mute plane is an exhausted path, never a hang: {outcome:?}"
+        );
     }
 
     #[tokio::test]

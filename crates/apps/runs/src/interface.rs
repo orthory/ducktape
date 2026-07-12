@@ -16,6 +16,8 @@
 //! - [`RunsQuery`] -> [`RunsReply`] — reads over watches and the pending
 //!   (not-yet-delivered) runs.
 
+use std::collections::BTreeMap;
+
 use agent::AgentAction;
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
@@ -143,6 +145,12 @@ pub enum RunsMsg {
         agent_id: String,
         channel_id: String,
         anchor_seq: u64,
+        /// numeric resource demands, threaded verbatim onto the emitted
+        /// `DispatchMsg::Dispatch` — the only demand surface in this phase;
+        /// every other intake (chat mention, page comment, jobs) dispatches
+        /// demandless. empty = legacy demandless run.
+        #[serde(default)]
+        demands: BTreeMap<String, u64>,
     },
     /// cancel a PENDING run — only the run-creating origin or the agent's
     /// owner. cancels the underlying dispatch in the same block; the plane's

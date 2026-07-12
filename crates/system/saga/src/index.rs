@@ -337,6 +337,7 @@ mod tests {
                 max_attempts: 3,
                 lease_views: None,
                 capability: capability.map(Into::into),
+                demands: Default::default(),
                 pinned_assignee: None,
             },
         )

@@ -53,7 +53,6 @@ pub(super) struct RuntimeWiring {
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
-    pub(super) blob_fetcher: blob_fetch::BlobFetchFn,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -76,6 +75,8 @@ pub(super) async fn finish(
     wireguard_effect: config::WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
+    sync_monitor: statesync::monitor::ServeMonitor,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
@@ -194,13 +195,6 @@ pub(super) async fn finish(
                 .cloned()
                 .collect(),
         ));
-    let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
-        sync_tx.clone(),
-        blob_pending.clone(),
-        std::sync::Arc::clone(&blob_peers),
-        signer.public_key(),
-    )
-    .into_fetch_fn();
     context.child("sync_ingress").spawn(move |_ctx| {
         let mut receiver = sync_rx;
         let mut bridge_tx = bridge_tx;
@@ -236,6 +230,7 @@ pub(super) async fn finish(
                 me: signer.public_key(),
                 factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 pacer: bulk_pacer,
+                planes,
                 commands: gateway_commands,
                 workspace: gateway_workspace,
             },
@@ -278,6 +273,7 @@ pub(super) async fn finish(
                         | blob_fetch::MeshFrame::Junk => continue,
                         blob_fetch::MeshFrame::Request(req) => req,
                     };
+                    let req_kind = req.kind_name();
                     let resp = match req {
                         // blob fetches are host state — answered from the
                         // node-local store, never routed into SyncServer.
@@ -286,12 +282,17 @@ pub(super) async fn finish(
                         }
                         req => drive_sync_request(&mut server, &state_tx, req).await,
                     };
-                    let resp = statesync::encode_response(&resp);
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
+                    let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
+                    // the serve-lane observation (`ducktape_statesync_serve_*`):
+                    // who pulled what, and the progression the response
+                    // itself proves (served boundary / frame heights).
+                    sync_monitor.record(
+                        &config::hex_bytes(peer.as_ref()),
+                        req_kind,
+                        &resp,
+                        framed.len() as u64,
                     );
+                    let _ = sync_tx.send(Recipients::One(peer), IoBuf::from(framed), false);
                 }
             });
     }
@@ -345,7 +346,6 @@ pub(super) async fn finish(
         channel_bank,
         gateway_book,
         blob_peers,
-        blob_fetcher,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -389,6 +389,7 @@ pub(super) async fn wire(
     coord_cap: Option<nat_traversal::CoordCap>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
+    planes: data_plane::PlaneMonitor,
 ) -> PreWiring {
     // consensus membership comes from the RECOVERY RECORD: the epoch's
     // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
@@ -524,9 +525,17 @@ pub(super) async fn wire(
                 crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
+                planes,
             );
             Some(peers)
         } else {
+            // Say it at boot: an operator whose node can never host a huddle
+            // otherwise learns it one failed join at a time, from the webview.
+            eprintln!(
+                "[node {label}] calls are DISABLED on this node: huddle media rides the mesh \
+                 overlay, and this node has none (wireguard_listen unset, or the fake effect). \
+                 set wireguard_listen + wireguard_effect = \"socket\" to enable huddles."
+            );
             drop(voice_requests);
             None
         }

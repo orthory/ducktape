@@ -22,7 +22,7 @@
 
 use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::NodeKey;
-use reachability::{EndpointResolver as _, NatResolver, Resolution};
+use reachability::{EndpointResolver as _, NatResolver, RendezvousStatus, Resolution};
 use std::net::SocketAddr;
 
 fn usage() -> ! {
@@ -83,12 +83,29 @@ async fn main() {
     let mut resolver = NatResolver::bind(key, vec![coord], Some((signer, None)))
         .await
         .unwrap_or_else(|e| {
-            eprintln!("bind/register against coordinator failed: {e}");
+            eprintln!("binding the rendezvous socket failed: {e}");
             std::process::exit(1);
         });
+    // Establishment runs in the resolver's own task now; a probe wants a
+    // bounded verdict, so wait for Ready here instead of exiting on the
+    // first dark window.
+    let mut status = resolver.status().expect("coordinator set is non-empty");
+    let reflexive = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let RendezvousStatus::Ready { reflexive } = *status.borrow_and_update() {
+                return reflexive;
+            }
+            status.changed().await.expect("establish task alive");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        eprintln!("coordinator did not answer within 15s (register/reflexive never landed)");
+        std::process::exit(1);
+    });
     println!(
         "reflexive:   {} (coordinator-observed public mapping, {}ms)",
-        resolver.reflexive().expect("coordinator set is non-empty"),
+        reflexive,
         started.elapsed().as_millis()
     );
 

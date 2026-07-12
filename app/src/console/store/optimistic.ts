@@ -48,7 +48,11 @@ export const postedMessage = (
      *  networked node, the origin bytes on the embedded daemon — so the
      *  optimistic row's author matches what the refresh confirms. */
     authorBytes: number[];
-    at: number;
+    /** LOCAL wall-clock millis (`Date.now()`) — the same timebase the
+     *  embedded daemon commits, so the refresh confirms rather than moves the
+     *  stamp there. A height-stamping validator replaces it on refresh, and
+     *  the stream builder never day-splits across that timebase seam. */
+    atMs: number;
     /** Root seq when this is a thread reply. */
     thread: number | null;
   },
@@ -65,7 +69,7 @@ export const postedMessage = (
       message_id: params.messageId,
       author: { user: params.authorBytes },
       blocks: params.blocks,
-      created_at: params.at,
+      created_at: params.atMs,
       rev: 0,
       edited_at: null,
       base_rev: null,
@@ -101,11 +105,11 @@ export const editedMessage = (
   channelId: string,
   seq: number,
   blocks: ChatBlock[],
-  at: number,
+  atMs: number,
 ): Partial<ConsoleState> =>
   mapMessage(prev, channelId, seq, (m) => ({
     ...m,
-    head: { ...m.head, blocks, edited_at: at, rev: m.head.rev + 1 },
+    head: { ...m.head, blocks, edited_at: atMs, rev: m.head.rev + 1 },
   }));
 
 export const deletedMessage = (
@@ -154,7 +158,7 @@ export const reactionToggled = (
 
 export const channelCreated = (
   prev: ConsoleState,
-  params: { channelId: string; name: string; postPolicy: PostPolicy; at: number },
+  params: { channelId: string; name: string; postPolicy: PostPolicy; atMs: number },
 ): Partial<ConsoleState> =>
   prev.channels.some((c) => c.id === params.channelId)
     ? {}
@@ -164,7 +168,7 @@ export const channelCreated = (
           {
             id: params.channelId,
             name: params.name,
-            created_at: params.at,
+            created_at: params.atMs,
             head_seq: 0,
             post_policy: params.postPolicy,
             hooks: [],
@@ -178,7 +182,7 @@ export const channelCreated = (
  *  refresh replaces the roster (with the module-assigned join order) after. */
 export const huddleJoined = (
   prev: ConsoleState,
-  params: { channelId: string; node: number[]; authorBytes: number[]; at: number },
+  params: { channelId: string; node: number[]; authorBytes: number[]; atMs: number },
 ): Partial<ConsoleState> => {
   const channel = prev.channels.find((c) => c.id === params.channelId);
   if (!channel) return {};
@@ -188,7 +192,7 @@ export const huddleJoined = (
   const member: HuddleMember = {
     user: params.authorBytes,
     node: params.node,
-    joined_at: params.at,
+    joined_at: params.atMs,
   };
   return {
     channels: prev.channels.map((c) =>
@@ -262,30 +266,86 @@ const afterSubtreeIndex = (blocks: PageBlock[], blockId: string): number => {
   return last + 1;
 };
 
+/** The flat-list index where a block joins `parent` at the `after` anchor:
+ *  a first child sits right after the parent; a sibling anchor puts it past
+ *  that sibling's whole subtree. Null when the parent or anchor is missing
+ *  (a torn snapshot) — the caller defers to the refresh. */
+const preorderIndex = (
+  blocks: PageBlock[],
+  parent: string,
+  after: string | null,
+): number | null => {
+  const parentAt = blocks.findIndex((b) => b.id === parent);
+  if (parentAt === -1) return null;
+  if (after === null) return parentAt + 1;
+  return blocks.some((b) => b.id === after)
+    ? afterSubtreeIndex(blocks, after)
+    : null;
+};
+
+/** `children` with `id` linked in right after `after` (first when null). */
+const linkChild = (children: string[], id: string, after: string | null): string[] => {
+  const at = after === null ? 0 : children.indexOf(after) + 1;
+  return [...children.slice(0, at), id, ...children.slice(at)];
+};
+
 export const pageBlockInserted = (
   prev: ConsoleState,
   params: { parent: string; after: string | null; block: PageBlock },
 ): Partial<ConsoleState> => {
   const blocks = prev.activePageBlocks;
-  const parentAt = blocks.findIndex((b) => b.id === params.parent);
-  if (parentAt === -1) return {}; // torn snapshot — let the refresh place it
-  // preorder position: first child sits right after the parent; a sibling
-  // anchor puts us past that sibling's whole subtree.
-  const at =
-    params.after === null
-      ? parentAt + 1
-      : afterSubtreeIndex(blocks, params.after);
-  const next = [...blocks];
-  next.splice(at, 0, params.block);
+  const at = preorderIndex(blocks, params.parent, params.after);
+  if (at === null) return {}; // torn snapshot — let the refresh place it
+  const linked = blocks.map((b) =>
+    b.id === params.parent
+      ? { ...b, children: linkChild(b.children, params.block.id, params.after) }
+      : b,
+  );
   return {
-    activePageBlocks: next.map((b) => {
-      if (b.id !== params.parent) return b;
-      const children = [...b.children];
-      const childAt =
-        params.after === null ? 0 : children.indexOf(params.after) + 1;
-      children.splice(childAt, 0, params.block.id);
-      return { ...b, children };
-    }),
+    activePageBlocks: [...linked.slice(0, at), params.block, ...linked.slice(at)],
+  };
+};
+
+/** Re-home `blockId`'s whole subtree under `parent` at the `after` anchor —
+ *  the projection behind indent/outdent, alt-arrows, drag-drop, and the
+ *  merge's child adoption. The subtree's flat rows lift out in document order
+ *  and re-splice at the target's preorder position; the old and new parents'
+ *  children links (and the block's own parent) are patched to match. A target
+ *  inside the moving subtree is a cycle the module would reject — never
+ *  render it; a missing block, parent, or anchor is a torn snapshot. All
+ *  defer to the refresh. */
+export const pageBlockMoved = (
+  prev: ConsoleState,
+  params: { blockId: string; parent: string; after: string | null },
+): Partial<ConsoleState> => {
+  const blocks = prev.activePageBlocks;
+  const block = blocks.find((b) => b.id === params.blockId);
+  if (!block) return {};
+  const moving = subtreeIds(blocks, params.blockId);
+  if (moving.has(params.parent)) return {};
+  if (params.after !== null && moving.has(params.after)) return {};
+  // lift the subtree out and unlink it from its old parent, THEN place: the
+  // anchor index and the new children link are both computed against the
+  // lifted list, so a same-parent reorder needs no special case.
+  const rest = blocks
+    .filter((b) => !moving.has(b.id))
+    .map((b) =>
+      b.id === block.parent
+        ? { ...b, children: b.children.filter((c) => c !== params.blockId) }
+        : b,
+    );
+  const at = preorderIndex(rest, params.parent, params.after);
+  if (at === null) return {};
+  const linked = rest.map((b) =>
+    b.id === params.parent
+      ? { ...b, children: linkChild(b.children, params.blockId, params.after) }
+      : b,
+  );
+  const subtree = blocks
+    .filter((b) => moving.has(b.id))
+    .map((b) => (b.id === params.blockId ? { ...b, parent: params.parent } : b));
+  return {
+    activePageBlocks: [...linked.slice(0, at), ...subtree, ...linked.slice(at)],
   };
 };
 

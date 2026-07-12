@@ -10,9 +10,19 @@
 //!   posts the reply -> the committed files state carries the artifact on
 //!   EVERY node -> the NEXT run's checkout materializes it (W2 chaining).
 //!
-//! the agent is registered with a REAL prompt pin whose blob is uploaded to
-//! the executing node's blob lane (`POST /v1/files/blob`) — the strict
-//! no-fallback prompt path, satisfied rather than sidestepped.
+//! the agent carries NO prompt pin — there is no such thing any more. its
+//! PERSONA is a curated `Always` skill: a duckfs document, committed here, that
+//! the provisioner materializes as a ro mount on the EXECUTING node and the
+//! assembler inlines into the run's context document. the provider records the
+//! bytes it was actually handed, so this leg proves the persona reached the
+//! model THROUGH THE SOUL — the replacement for the retired prompt-blob path,
+//! and (since the skill is written on node 0 and the run executes on node 1)
+//! the replacement for its cross-node fetch lane too: consensus replicates the
+//! document, so nothing has to fetch it.
+//!
+//! it also proves the LIBRARY paragraph is cap-gated end to end: the agent is
+//! granted `duckfs_read` over the shared library prefix, and the assembled
+//! document it receives tells it the library is there.
 
 mod common;
 
@@ -41,10 +51,13 @@ const CHANNEL: &str = "portable";
 const ARTIFACT: &str = "agent-artifact.txt";
 const ARTIFACT_BODY: &str = "portable evidence";
 // the W6 skill: a committed duckfs subtree the agent pins, materialized by
-// the provisioner as a READ-ONLY mount beside (never inside) the rw mount.
+// the provisioner as a READ-ONLY mount beside (never inside) the rw mount. it is
+// curated `Always`, which makes it this agent's PERSONA: the assembler inlines
+// its whole body into the run's context document, and capability-host hands that
+// document to a `prompt = "stdin"` provider ahead of the run's input.
 const SKILL_NAME: &str = "quackskill";
 const SKILL_FILE: &str = "SKILL.md";
-const SKILL_BODY: &str = "the way of the quack";
+const SKILL_BODY: &str = "You are the portable duck. The way of the quack is patience.";
 const SKILL_PREFIX: &str = "/shared/skills/quackskill";
 
 /// one script-backed provider that behaves like a coding agent: it records
@@ -59,6 +72,7 @@ struct PortableProvider {
     cwd_log: PathBuf,
     chain_log: PathBuf,
     skills_log: PathBuf,
+    prompt_log: PathBuf,
 }
 
 impl PortableProvider {
@@ -69,17 +83,21 @@ impl PortableProvider {
         let cwd_log = dir.join("cwd.log");
         let chain_log = dir.join("chain.log");
         let skills_log = dir.join("skills.log");
+        // what the MODEL was actually handed: the assembled context document
+        // (the soul) plus the run's input. the old script piped stdin to
+        // /dev/null, which is exactly why a prompt could go missing unnoticed.
+        let prompt_log = dir.join("prompt.log");
         let script = dir.join("provider.sh");
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\n\
-                 # a stand-in coding agent: drain the prompt, record the\n\
-                 # provisioned cwd, prove the prior run's artifact chained in\n\
-                 # (content-checked), prove the skill ro mount materialized\n\
-                 # (content-checked, logging the advertised ro root), write\n\
-                 # this run's artifact, answer.\n\
-                 cat > /dev/null\n\
+                 # a stand-in coding agent: KEEP the prompt it was handed (the\n\
+                 # assembled soul rides it), record the provisioned cwd, prove\n\
+                 # the prior run's artifact chained in (content-checked), prove\n\
+                 # the skill ro mount materialized (content-checked, logging the\n\
+                 # advertised ro root), write this run's artifact, answer.\n\
+                 cat >> {prompt}\n\
                  pwd >> {cwd}\n\
                  if [ -f {artifact} ] && [ \"$(cat {artifact})\" = '{body}' ]; then\n\
                  \techo chained >> {chain}\n\
@@ -92,6 +110,7 @@ impl PortableProvider {
                 cwd = cwd_log.display(),
                 chain = chain_log.display(),
                 skills = skills_log.display(),
+                prompt = prompt_log.display(),
                 artifact = ARTIFACT,
                 body = ARTIFACT_BODY,
                 skill_name = SKILL_NAME,
@@ -134,6 +153,7 @@ impl PortableProvider {
             cwd_log,
             chain_log,
             skills_log,
+            prompt_log,
         }
     }
 
@@ -167,6 +187,12 @@ impl PortableProvider {
         std::fs::read_to_string(&self.skills_log)
             .map(|s| s.lines().map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    /// everything the provider was handed on stdin, across every run — the
+    /// model's own view of the agent.
+    fn prompts(&self) -> String {
+        std::fs::read_to_string(&self.prompt_log).unwrap_or_default()
     }
 }
 
@@ -217,22 +243,6 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
         Ok(CapabilityReply::Providers(p)) => Some(p),
         _ => None,
     }
-}
-
-/// upload the agent's prompt to `idx`'s node-local blob lane and return the
-/// 32-byte digest the registry pins — the REAL prompt path (strict, no
-/// fallback), satisfied on the node that will execute the run.
-fn upload_prompt(cluster: &Cluster, idx: usize) -> Vec<u8> {
-    let (status, body) = cluster.http(
-        idx,
-        "POST",
-        "/v1/files/blob",
-        Some(&serde_json::json!("You are the portable QA duck.")),
-    );
-    assert_eq!(status, 200, "blob upload failed: {body}");
-    let hex = body["digest"].as_str().expect("digest in blob receipt");
-    let digest = duckfs_core::from_hex_32(hex).expect("a 32-byte digest");
-    digest.to_vec()
 }
 
 fn mention(cluster: &Cluster, idx: usize, message_id: &str) {
@@ -329,6 +339,9 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
+    // serving is opt-in now (default OFF): this test needs node 1 in the
+    // rendezvous pool, so every node opts in.
+    cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),
@@ -343,9 +356,6 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     poll_until("the provider to announce", FINALIZE, || {
         (providers(&cluster, 0, &provider.tag)? == vec![Cluster::identity(1)]).then_some(())
     });
-
-    // the strict prompt path: pin a real blob on the executing node.
-    let prompt_hash = upload_prompt(&cluster, 1);
 
     // W6: seed the skill subtree in COMMITTED files state before any run
     // composes — the agent pins it below and every portable run must
@@ -388,16 +398,27 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             agent_id: AGENT_ID.into(),
             display_name: AGENT_ID.into(),
             capability: provider.tag.clone(),
-            prompt_hash,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
             recipe_hash: None,
-            caps: None,
+            // the library grant the app pre-fills on every new agent: an
+            // ordinary duckfs_read cap over the shared skill library. it is what
+            // earns the assembled document its library paragraph (and what the
+            // MCP tool plane would gate a real grep/read on) — ungranted, the
+            // document must never mention a door the tool plane would slam.
+            caps: Some(agent::ResourceCaps {
+                duckfs_read: vec![agent::SKILL_LIBRARY_PREFIX.into()],
+                ..Default::default()
+            }),
             // a TRACKING skill (no pin): the composer resolves it to the
-            // committed head, the provisioner mounts it read-only (W6).
+            // committed head, the provisioner mounts it read-only (W6). curated
+            // `Always`, so it is this agent's PERSONA: the assembler inlines its
+            // body into the run's context document — the lane that replaced the
+            // prompt blob.
             skills: Some(vec![SkillRef {
                 name: SKILL_NAME.into(),
                 source_prefix: SKILL_PREFIX.into(),
                 source_snapshot: None,
+                load: agent::LoadMode::Always,
             }]),
         }),
     );
@@ -429,6 +450,36 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // advertised DUCKTAPE_RUN_SKILLS root before answering.
     let roots = provider.skill_roots();
     assert_eq!(roots.len(), 1, "run 1 saw its skill ro mount: {roots:?}");
+
+    // THE SOUL, as the model saw it. the persona is no longer a blob resolved
+    // from a hash — it is this curated `Always` skill, seeded on node 0,
+    // replicated by consensus, materialized on node 1 (the executor), inlined by
+    // the assembler, and handed to the provider on stdin. every one of those
+    // links is live in this assertion.
+    let prompt = provider.prompts();
+    assert!(
+        prompt.contains(SKILL_BODY),
+        "the persona must reach the model through the assembled context document: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("# {SKILL_NAME}")),
+        "the persona is headed by its CURATED name (never a name read out of the doc): {prompt}"
+    );
+    assert!(
+        prompt.contains("A Ducktape MCP tool server"),
+        "the ambient tool-plane instruction ships with every run: {prompt}"
+    );
+    // GAP 2, end to end: the agent HAS the library read cap, so the document
+    // tells it the library exists and names the tools that open it. an agent
+    // without the cap is never told (proved in dispatch_oracle::soul).
+    assert!(
+        prompt.contains("## The shared skill library"),
+        "a library-granted agent is told the library is there: {prompt}"
+    );
+    assert!(
+        prompt.contains("ducktape_files_grep") && prompt.contains(agent::SKILL_LIBRARY_PREFIX),
+        "…and told, by name, the tool and prefix that open it: {prompt}"
+    );
 
     // the artifact is COMMITTED duckfs state, readable on a node that never
     // executed anything (the whole point of the portable workspace).

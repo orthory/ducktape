@@ -463,7 +463,8 @@ function MemberRow({
   onPromote: () => void;
   onRevoke: () => void;
   /** Show the rename control for this row — the local node's own entry, the
-   *  only account name an origin-gated `SetAccountName` may write. */
+   *  only account name an origin-gated `SetAccountName` may write. Requires a
+   *  bound account: identity rejects the rename of an unbound node outright. */
   canRename: boolean;
   onRename: (name: string) => void;
 }) {
@@ -1304,7 +1305,7 @@ export function MembersView() {
       canGovernResident={canAdmin && member.tier === "resident"}
       onPromote={() => requestPromote(member)}
       onRevoke={() => requestRevoke(member)}
-      canRename={member.isLocal}
+      canRename={member.isLocal && Boolean(nodeUsers[member.keyNorm])}
       onRename={actions.setDisplayName}
     />
   );

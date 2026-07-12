@@ -17,8 +17,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use tokio::time::{Instant, Sleep, sleep_until, timeout};
 
 use crate::Service;
 use crate::flow::{DatagramPolicy, FlowId, StreamPolicy};
+use crate::monitor::{PlaneObservation, PlaneWatch};
 use crate::transport::{DataPlaneTransport, PeerId, TransportError};
 use crate::wire::{self, HELLO_ACK, Hello, WireError};
 
@@ -109,6 +110,76 @@ impl Stats {
             .entry(peer)
             .or_insert(0) += 1;
     }
+
+    fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            rogue_datagrams: self.rogue_datagrams.load(Ordering::Relaxed),
+            rogue_streams: self.rogue_streams.load(Ordering::Relaxed),
+            malformed_datagrams: self.malformed_datagrams.load(Ordering::Relaxed),
+            unregistered_datagrams: self.unregistered_datagrams.load(Ordering::Relaxed),
+            unregistered_streams: self.unregistered_streams.load(Ordering::Relaxed),
+            refused_sends: self.refused_sends.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Successful-traffic accounting, one set per plane. Datagram byte counts are
+/// WIRE frames (header included); stream byte counts are the payload bytes
+/// consumers read/write through their [`PacedStream`]s (the one-frame hello
+/// handshake is not counted). All counters are cumulative for the plane's
+/// life — rates are the reader's derivation.
+#[derive(Default)]
+struct Traffic {
+    datagrams_tx: AtomicU64,
+    datagram_bytes_tx: AtomicU64,
+    datagrams_rx: AtomicU64,
+    datagram_bytes_rx: AtomicU64,
+    /// Datagrams shed by per-flow drop-oldest overflow, summed across all of
+    /// this plane's flows (survives individual flow teardown, unlike
+    /// [`DatagramFlow::dropped`]).
+    datagrams_shed: AtomicU64,
+    stream_bytes_tx: AtomicU64,
+    stream_bytes_rx: AtomicU64,
+    streams_opened: AtomicU64,
+    streams_accepted: AtomicU64,
+    /// Set when a demux/accept pump exits (transport closed): the plane still
+    /// holds its sockets but no longer moves traffic.
+    halted: AtomicBool,
+}
+
+impl Traffic {
+    fn snapshot(&self) -> TrafficSnapshot {
+        TrafficSnapshot {
+            datagrams_tx: self.datagrams_tx.load(Ordering::Relaxed),
+            datagram_bytes_tx: self.datagram_bytes_tx.load(Ordering::Relaxed),
+            datagrams_rx: self.datagrams_rx.load(Ordering::Relaxed),
+            datagram_bytes_rx: self.datagram_bytes_rx.load(Ordering::Relaxed),
+            datagrams_shed: self.datagrams_shed.load(Ordering::Relaxed),
+            stream_bytes_tx: self.stream_bytes_tx.load(Ordering::Relaxed),
+            stream_bytes_rx: self.stream_bytes_rx.load(Ordering::Relaxed),
+            streams_opened: self.streams_opened.load(Ordering::Relaxed),
+            streams_accepted: self.streams_accepted.load(Ordering::Relaxed),
+            halted: self.halted.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time copy of the plane's successful-traffic accounting — see
+/// [`Traffic`] for what each counter measures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrafficSnapshot {
+    pub datagrams_tx: u64,
+    pub datagram_bytes_tx: u64,
+    pub datagrams_rx: u64,
+    pub datagram_bytes_rx: u64,
+    pub datagrams_shed: u64,
+    pub stream_bytes_tx: u64,
+    pub stream_bytes_rx: u64,
+    pub streams_opened: u64,
+    pub streams_accepted: u64,
+    /// A demux/accept pump has exited (transport closed): the plane is bound
+    /// but no longer moves traffic.
+    pub halted: bool,
 }
 
 /// A point-in-time copy of the plane's drop accounting. Rogue traffic is
@@ -140,9 +211,11 @@ impl DatagramQueue {
         }
     }
 
-    fn push(&self, from: PeerId, payload: Vec<u8>) {
+    /// Returns whether an oldest datagram was shed to make room.
+    fn push(&self, from: PeerId, payload: Vec<u8>) -> bool {
         let mut q = self.queue.lock().expect("queue lock");
-        if q.len() == self.max {
+        let shed = q.len() == self.max;
+        if shed {
             // Drop-oldest: for real-time traffic the newest datagram is the
             // valuable one, and the overflow stays inside this flow.
             q.pop_front();
@@ -151,6 +224,7 @@ impl DatagramQueue {
         q.push_back((from, payload));
         drop(q);
         self.notify.notify_one();
+        shed
     }
 
     async fn recv(&self) -> (PeerId, Vec<u8>) {
@@ -173,6 +247,9 @@ struct Shared<T: DataPlaneTransport> {
     datagram_flows: Mutex<HashMap<(Service, FlowId), Arc<DatagramQueue>>>,
     stream_services: Mutex<HashMap<Service, mpsc::Sender<IncomingStream<T::Stream>>>>,
     stats: Stats,
+    /// `Arc` so a [`PacedStream`] (which may outlive every plane handle)
+    /// keeps its byte accounting attached to this plane.
+    traffic: Arc<Traffic>,
 }
 
 /// The plane. Cloneable handle; spawns its demux and acceptor loops on
@@ -228,6 +305,7 @@ impl<T: DataPlaneTransport> DataPlane<T> {
             datagram_flows: Mutex::new(HashMap::new()),
             stream_services: Mutex::new(HashMap::new()),
             stats: Stats::default(),
+            traffic: Arc::new(Traffic::default()),
         });
         tokio::spawn(demux_loop(shared.clone()));
         tokio::spawn(accept_loop(shared.clone()));
@@ -277,15 +355,26 @@ impl<T: DataPlaneTransport> DataPlane<T> {
     }
 
     pub fn stats(&self) -> StatsSnapshot {
-        let s = &self.shared.stats;
-        StatsSnapshot {
-            rogue_datagrams: s.rogue_datagrams.load(Ordering::Relaxed),
-            rogue_streams: s.rogue_streams.load(Ordering::Relaxed),
-            malformed_datagrams: s.malformed_datagrams.load(Ordering::Relaxed),
-            unregistered_datagrams: s.unregistered_datagrams.load(Ordering::Relaxed),
-            unregistered_streams: s.unregistered_streams.load(Ordering::Relaxed),
-            refused_sends: s.refused_sends.load(Ordering::Relaxed),
-        }
+        self.shared.stats.snapshot()
+    }
+
+    /// A point-in-time copy of the plane's successful-traffic accounting.
+    pub fn traffic(&self) -> TrafficSnapshot {
+        self.shared.traffic.snapshot()
+    }
+
+    /// A type-erased weak observer for this plane — the handle a
+    /// [`crate::monitor::PlaneMonitor`] holds. It never keeps the plane
+    /// alive: `observe` yields `None` once every handle is gone and the
+    /// demux/accept pumps have stopped.
+    pub fn watch(&self) -> PlaneWatch {
+        let weak: Weak<Shared<T>> = Arc::downgrade(&self.shared);
+        PlaneWatch::new(move || {
+            weak.upgrade().map(|shared| PlaneObservation {
+                stats: shared.stats.snapshot(),
+                traffic: shared.traffic.snapshot(),
+            })
+        })
     }
 
     /// Rogue traffic attributed to one peer — the transport authenticates
@@ -307,7 +396,10 @@ async fn demux_loop<T: DataPlaneTransport>(shared: Arc<Shared<T>>) {
     loop {
         let (from, frame) = match shared.transport.recv_datagram().await {
             Ok(inbound) => inbound,
-            Err(_) => return,
+            Err(_) => {
+                shared.traffic.halted.store(true, Ordering::Relaxed);
+                return;
+            }
         };
         let (service, flow, payload) = match wire::decode_datagram(&frame) {
             Ok(parts) => parts,
@@ -332,7 +424,19 @@ async fn demux_loop<T: DataPlaneTransport>(shared: Arc<Shared<T>>) {
             .get(&(service, flow))
             .cloned();
         match queue {
-            Some(queue) => queue.push(from, payload.to_vec()),
+            Some(queue) => {
+                shared.traffic.datagrams_rx.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .traffic
+                    .datagram_bytes_rx
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                if queue.push(from, payload.to_vec()) {
+                    shared
+                        .traffic
+                        .datagrams_shed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             None => {
                 shared
                     .stats
@@ -347,7 +451,10 @@ async fn accept_loop<T: DataPlaneTransport>(shared: Arc<Shared<T>>) {
     loop {
         let (peer, stream) = match shared.transport.accept().await {
             Ok(inbound) => inbound,
-            Err(_) => return,
+            Err(_) => {
+                shared.traffic.halted.store(true, Ordering::Relaxed);
+                return;
+            }
         };
         // Per-connection task: a stalled opener must not block the acceptor.
         tokio::spawn(handle_inbound_stream(shared.clone(), peer, stream));
@@ -412,7 +519,16 @@ impl<T: DataPlaneTransport> DatagramFlow<T> {
             return Err(SendError::NotAdmitted);
         }
         let frame = wire::encode_datagram(self.service, self.flow, payload)?;
+        let wire_bytes = frame.len() as u64;
         self.shared.transport.send_datagram(to, frame).await?;
+        self.shared
+            .traffic
+            .datagrams_tx
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .traffic
+            .datagram_bytes_tx
+            .fetch_add(wire_bytes, Ordering::Relaxed);
         Ok(())
     }
 
@@ -476,16 +592,32 @@ impl<T: DataPlaneTransport> StreamService<T> {
             Ok(Ok(_)) if ack[0] == HELLO_ACK => {}
             _ => return Err(OpenError::Refused),
         }
-        Ok(PacedStream::new(stream, self.shared.bucket.clone()))
+        self.shared
+            .traffic
+            .streams_opened
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(PacedStream::new(
+            stream,
+            self.shared.bucket.clone(),
+            self.shared.traffic.clone(),
+        ))
     }
 
     /// Next accepted stream: `None` once the plane shuts down.
     pub async fn accept(&self) -> Option<(PeerId, Hello, PacedStream<T::Stream>)> {
         let (peer, hello, stream) = self.incoming.lock().await.recv().await?;
+        self.shared
+            .traffic
+            .streams_accepted
+            .fetch_add(1, Ordering::Relaxed);
         Some((
             peer,
             hello,
-            PacedStream::new(stream, self.shared.bucket.clone()),
+            PacedStream::new(
+                stream,
+                self.shared.bucket.clone(),
+                self.shared.traffic.clone(),
+            ),
         ))
     }
 }
@@ -562,14 +694,16 @@ impl TokenBucket {
 pub struct PacedStream<S> {
     inner: S,
     bucket: Arc<TokenBucket>,
+    traffic: Arc<Traffic>,
     throttle: Option<Pin<Box<Sleep>>>,
 }
 
 impl<S> PacedStream<S> {
-    fn new(inner: S, bucket: Arc<TokenBucket>) -> Self {
+    fn new(inner: S, bucket: Arc<TokenBucket>, traffic: Arc<Traffic>) -> Self {
         PacedStream {
             inner,
             bucket,
+            traffic,
             throttle: None,
         }
     }
@@ -581,7 +715,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for PacedStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let this = self.as_mut().get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = polled {
+            this.traffic
+                .stream_bytes_rx
+                .fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        polled
     }
 }
 
@@ -611,6 +753,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PacedStream<S> {
                             if written < n {
                                 this.bucket.refund(n - written);
                             }
+                            this.traffic
+                                .stream_bytes_tx
+                                .fetch_add(written as u64, Ordering::Relaxed);
                             Poll::Ready(Ok(written))
                         }
                         Poll::Ready(Err(e)) => {

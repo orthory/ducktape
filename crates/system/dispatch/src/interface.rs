@@ -21,6 +21,7 @@
 
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// the conventional module id dispatch registers under — shared by the host's
 /// delivery injection and node wiring.
@@ -164,6 +165,12 @@ pub struct WorkSpec {
     /// the ENTIRE model/tool input, verbatim. composed by the dispatcher —
     /// never by host code, never from static text.
     pub payload: Vec<u8>,
+    /// numeric resource demands, validated by `capability::validate_resources`
+    /// at dispatch time; empty = demandless legacy job. the same value the
+    /// dispatch handler threads onto the emitted `SagaMsg::Trigger` — the host
+    /// worker reads demands from here, saga stays spec-opaque.
+    #[serde(default)]
+    pub demands: BTreeMap<String, u64>,
 }
 
 /// the delivery envelope a receiver module gets as a follow-up `Msg` from the
@@ -214,6 +221,13 @@ pub enum DispatchMsg {
         dispatch_id: String,
         recipe_id: String,
         payload: Vec<u8>,
+        /// numeric resource demands, validated by
+        /// `capability::validate_resources` at dispatch time; empty =
+        /// demandless legacy job. threaded verbatim onto both the composed
+        /// `WorkSpec` and the emitted `SagaMsg::Trigger` — one source, so the
+        /// two can never drift.
+        #[serde(default)]
+        demands: BTreeMap<String, u64>,
     },
     /// MODULE-ORIGIN ONLY, receiver-scoped: cancel an in-flight dispatch the
     /// emitting module owns. the underlying saga is cancelled in the same
@@ -315,6 +329,7 @@ mod tests {
             dispatch_id: "d1".into(),
             capability: "alpha".into(),
             payload: b"input".to_vec(),
+            demands: BTreeMap::new(),
         };
         let bytes = encode_work_spec(&spec);
         assert_eq!(decode_work_spec(&bytes).unwrap(), spec);

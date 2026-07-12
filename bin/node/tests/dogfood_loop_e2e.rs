@@ -259,20 +259,6 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-/// upload the agent's prompt to the EXECUTING node's blob lane (the strict
-/// no-fallback prompt path) and return the 32-byte digest the registry pins.
-fn upload_prompt(cluster: &Cluster, idx: usize) -> Vec<u8> {
-    let (status, body) = cluster.http(
-        idx,
-        "POST",
-        "/v1/files/blob",
-        Some(&serde_json::json!("You are the dogfooding duck.")),
-    );
-    assert_eq!(status, 200, "blob upload failed: {body}");
-    let hex = body["digest"].as_str().expect("digest in blob receipt");
-    duckfs_core::from_hex_32(hex).expect("a 32-byte digest").to_vec()
-}
-
 /// post a mention of the agent into `channel` under a caller-chosen id.
 fn post_mention(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) {
     cluster.submit(
@@ -495,6 +481,9 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
+    // serving is opt-in now (default OFF): this test needs node 1 in the
+    // rendezvous pool, so every node opts in.
+    cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),
@@ -542,9 +531,9 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     let issue_channel = issue.channel_id.clone();
     assert_eq!(issue_channel, format!("forge:{REPO}:1"));
 
-    // ---- the agent (real prompt pin, forge caps naming the repo LITERALLY)
-    //      and the watch that arms the trigger (atomic tagging subscribe, P2).
-    let prompt_hash = upload_prompt(&cluster, 1);
+    // ---- the agent (no prompt pin — a persona is a curated `Always` skill now,
+    //      and this leg needs none; forge caps naming the repo LITERALLY) and the
+    //      watch that arms the trigger (atomic tagging subscribe, P2).
     cluster.submit(
         0,
         "agent",
@@ -552,7 +541,6 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
             agent_id: AGENT_ID.into(),
             display_name: AGENT_ID.into(),
             capability: provider.tag.clone(),
-            prompt_hash,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
             recipe_hash: None,
             caps: Some(ResourceCaps {

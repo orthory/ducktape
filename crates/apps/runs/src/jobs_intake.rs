@@ -47,7 +47,7 @@ impl RunsModule {
             );
             return Ok(());
         }
-        // the record rides into the envelope below (agent id + prompt pin).
+        // the record rides into the envelope below (agent id + curated skills).
         let agent = match self.active_agent(&*ctx, agent_id).await {
             Ok(Some(agent)) => agent,
             // an unknown or paused agent leaves the job on the board.
@@ -120,6 +120,7 @@ impl RunsModule {
                 dispatch_id: dispatch_id.clone(),
                 recipe_id: recipe_id_for(agent_id),
                 payload,
+                demands: Default::default(),
             }),
         });
         self.pending_overlay.insert(

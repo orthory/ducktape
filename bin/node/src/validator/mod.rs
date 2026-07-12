@@ -48,6 +48,8 @@ pub(crate) async fn run_validator(
     promoted: bool,
     dev_demo: bool,
     announce_capabilities: bool,
+    sandbox: capability_host::SandboxBackend,
+    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
@@ -60,6 +62,8 @@ pub(crate) async fn run_validator(
     agent_dirs: capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
+    sync_monitor: statesync::monitor::ServeMonitor,
     gateway_workspace: std::path::PathBuf,
     mut recovery: Recovery<commonware_runtime::tokio::Context>,
     manifest: Option<Manifest>,
@@ -129,6 +133,7 @@ pub(crate) async fn run_validator(
         coord_cap,
         voice_requests,
         overlay_slot.clone(),
+        planes.clone(),
     )
     .await;
     let (
@@ -175,7 +180,6 @@ pub(crate) async fn run_validator(
         channel_bank,
         gateway_book,
         blob_peers,
-        blob_fetcher,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -194,6 +198,8 @@ pub(crate) async fn run_validator(
         wireguard_effect,
         overlay_slot.clone(),
         bulk_pacer.clone(),
+        planes.clone(),
+        sync_monitor,
         gateway_requests,
         gateway_commands,
         gateway_workspace,
@@ -222,6 +228,7 @@ pub(crate) async fn run_validator(
             std::sync::Arc::clone(peers),
             me,
             bulk_pacer,
+            planes.clone(),
             stream_hub.run_output(),
         );
     }
@@ -265,7 +272,6 @@ pub(crate) async fn run_validator(
         gateway_book,
         media_peers,
         blob_peers,
-        blob_fetcher,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -282,6 +288,8 @@ pub(crate) async fn run_validator(
         dev_demo,
         checkpoint_blocks,
         announce_capabilities,
+        sandbox,
+        sandbox_capacity,
         rpc_listener,
         http_cmds,
         stream_hub,

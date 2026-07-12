@@ -67,8 +67,19 @@ describe("WorkspacesTable", () => {
     expect(spies.selectWorkspace).toHaveBeenCalledWith("b");
   });
 
-  it("does not offer Enter for the already-active workspace", () => {
-    renderTable();
-    expect(screen.queryByRole("button", { name: /enter acme/i })).not.toBeInTheDocument();
+  it("selects active and inactive workspaces when their rows are clicked", () => {
+    const { spies } = renderTable();
+
+    fireEvent.click(screen.getByText("Acme"));
+    fireEvent.click(screen.getByText("Beta"));
+    expect(spies.selectWorkspace).toHaveBeenNthCalledWith(1, "a");
+    expect(spies.selectWorkspace).toHaveBeenNthCalledWith(2, "b");
+  });
+
+  it("offers Enter for the active workspace without double-selecting", () => {
+    const { spies } = renderTable();
+
+    fireEvent.click(screen.getByRole("button", { name: /enter acme/i }));
+    expect(spies.selectWorkspace).toHaveBeenCalledExactlyOnceWith("a");
   });
 });

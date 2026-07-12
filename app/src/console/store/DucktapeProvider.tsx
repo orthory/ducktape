@@ -58,6 +58,14 @@ import {
   buildHuddleContext,
 } from "./huddle-window";
 import type { HuddleWindowCmd } from "./huddle-window";
+import {
+  latchOneShots,
+  navSnapshotOf,
+  navStackAfter,
+  navTransition,
+  readNavEntry,
+  stampNav,
+} from "./nav-history";
 import { reducer } from "./reducer";
 import { normalizeKey } from "../../domain/names";
 import {
@@ -68,6 +76,7 @@ import {
   loadRemoteUrl,
   saveDocTabs,
 } from "./state";
+import type { ConsoleState } from "./state";
 
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
@@ -120,6 +129,18 @@ const parseNavigateTarget = (payload: unknown): NavigateTarget | null => {
     number: typeof raw.number === "number" ? raw.number : undefined,
   };
 };
+
+/** Mirror a history-stack move into state.nav (see navStackAfter). Bails to
+ *  the reducer's same-reference no-op when the position didn't change, so the
+ *  frequent selection replaces never churn a render. */
+const navStackUpdate =
+  (move: "push" | "replace" | "traverse", at: number) =>
+  (prev: ConsoleState): Partial<ConsoleState> => {
+    const nav = navStackAfter(move, at, prev.nav);
+    return nav.index === prev.nav.index && nav.count === prev.nav.count
+      ? {}
+      : { nav };
+  };
 
 export function DucktapeProvider({
   transport,
@@ -740,8 +761,9 @@ export function DucktapeProvider({
             fn: (prev) => {
               const patch: Partial<typeof prev> = {};
               if (height > (prev.lastBlock ?? -1)) patch.lastBlock = height;
-              // Patch only on real movement: an idle chain heartbeats every 3s
-              // and an unconditional new status object would re-render each beat.
+              // Patch only on real movement: heartbeats arrive per block on a
+              // moving chain (nop fillers included) and every 3s on a stalled
+              // one; an unconditional new status object would re-render each beat.
               if (
                 prev.status &&
                 (prev.status.height !== height || prev.status.appHash !== appHash)
@@ -1031,6 +1053,74 @@ export function DucktapeProvider({
       dispatch({ type: "patch", patch: { forgeFocus: null } });
     }
   }, [state.screen, state.forgeFocus]);
+
+  // 5d. filesFocus rides the same idiom: the files browser navigates to it, and
+  //     the provider retires it once the user leaves the files screen.
+  useEffect(() => {
+    if (state.screen !== "files" && state.filesFocus) {
+      dispatch({ type: "patch", patch: { filesFocus: null } });
+    }
+  }, [state.screen, state.filesFocus]);
+
+  // 5d. Browser-history navigation (see nav-history.ts): apply traversal
+  //     (popstate — the webview's back/forward buttons) through the actions
+  //     facade, whose entry points re-fetch the restored target's data from
+  //     the node. The entry is then re-stamped with what was actually honored
+  //     (a vanished channel/page is skipped), so the stack and the store
+  //     converge instead of fighting over a dead target.
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      const entry = readNavEntry(event.state);
+      if (!entry) return;
+      window.history.replaceState(
+        stampNav(actions.applyNavSnapshot(entry.snap), entry.index),
+        "",
+      );
+      dispatch({ type: "update", fn: navStackUpdate("traverse", entry.index) });
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [actions]);
+
+  // 5e. The outbound half: mirror the nav slice into history entries. Surface
+  //     moves push; boot hydration filling an empty selection slot replaces
+  //     (no phantom boot entries); a one-shot focus consumption latches into
+  //     the current entry (see latchOneShots) so traversing back re-issues the
+  //     hand-off. Deps are the nav slice ONLY — data churn (blocks, messages)
+  //     must never touch the history stack.
+  useEffect(() => {
+    const entry = readNavEntry(window.history.state);
+    const next = latchOneShots(navSnapshotOf(state), entry?.snap ?? null);
+    switch (navTransition(next, entry?.snap ?? null)) {
+      case "push": {
+        const at = (entry?.index ?? 0) + 1;
+        window.history.pushState(stampNav(next, at), "");
+        dispatch({ type: "update", fn: navStackUpdate("push", at) });
+        return;
+      }
+      case "replace": {
+        const at = entry?.index ?? 0;
+        window.history.replaceState(stampNav(next, at), "");
+        dispatch({ type: "update", fn: navStackUpdate("replace", at) });
+        return;
+      }
+      case "none":
+        return;
+    }
+  }, [
+    state.atHome,
+    state.screen,
+    state.viewMode,
+    state.activeChannel,
+    state.activePage,
+    state.forgeFocus,
+    state.forgeRepo,
+    state.explorerFocus,
+    state.agentFocus,
+    state.memberFocus,
+    state.workspace,
+    state.nodeUrl,
+  ]);
 
   // 6. Desktop notifier config push: the Rust notifier learns who "me" is (the
   //    identity account behind our node key and EVERY node bound to it), what

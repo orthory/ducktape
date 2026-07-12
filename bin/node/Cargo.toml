@@ -129,6 +129,10 @@ libc = "0.2"
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
 async-trait = { workspace = true }
+# paused-clock unit tests (`#[tokio::test(start_paused = true)]`) — the
+# first-contact window guard proves "a mute plane cannot hang the race"
+# in milliseconds of wall time instead of minutes.
+tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on

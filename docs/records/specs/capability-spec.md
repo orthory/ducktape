@@ -68,9 +68,23 @@ in the same trust class as a shell profile or a systemd unit:
   the spec's argv encodes. Fence flags live in the spec — audit them when you
   audit the spec.
 
-**BYO auth is the point.** The node never reads, writes, or refreshes any
-credential file. If the executor needs a login or an API key in *its* config,
-that is between the operator and the executor.
+**Auth: the operator brings a logged-in CLI; the spec decides where the
+credential ends up.** There are exactly two ways, and a spec may use only one:
+
+- **`[isolation]` — the strong path.** The *host* reads the credential and keeps
+  it in the node process. A run-scoped, loopback-only broker serves the model
+  API, and the child gets only an unrelated opaque run bearer, a localhost base
+  URL, and a **fresh, empty config home** (which is what stops the CLI reading
+  the operator's real one and forces it through the broker). The credential
+  never enters the child's process tree. Codex is here.
+- **`[sandbox] rw_dirs` — the weak path.** For a CLI with no broker: its own auth
+  dir is mounted into the sandbox and the credential **does** enter the child.
+  Claude is here, until an Anthropic-side broker exists.
+
+**Declaring both is a hard load error.** A broker exists so the credential never
+reaches the child; `rw_dirs` would mount it in anyway — and the run would still
+*work*, so the regression would be silent. The load error is what makes it
+impossible: an executor that gains a broker drops its `rw_dirs` in the same edit.
 
 ---
 
@@ -177,6 +191,8 @@ format = "text"
 | `spec` | integer | yes | must be `1` |
 | `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
 | `[session]` | table | no | thread-continuity capture/resume — see [Session](#session--thread-continuity) |
+| `[isolation]` | table | no | host-owned auth broker + fresh executor config home — see [Isolation](#isolation--host-owned-auth) |
+| `[sandbox]` | table | no | the executor's own auth dirs, mounted into a sandbox — see [Isolation](#isolation--host-owned-auth) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
@@ -226,11 +242,80 @@ being silently ignored.
 | `resume_args` | string array | exactly one of the two | FULL replacement resume argv; must carry the `{session_id}` slot |
 | `resume_args_append` | string array | exactly one of the two | appended to the spec's own `args`; must carry the `{session_id}` slot |
 
+### `[isolation]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `config_home_env` | string | no | executor config-home env name such as `CODEX_HOME`; must match `[A-Z_][A-Z0-9_]*` |
+| `broker` | string | no | currently only `"codex-responses"`; credentials remain in the host process |
+
+### `[sandbox]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `rw_dirs` | string array | no (default `[]`) | the executor's own auth/state dirs, mounted read-write into a sandbox. **Home-relative only** — absolute paths and `..` are rejected at load. **Rejected outright if the spec also declares `[isolation] broker`.** |
+
 ### `[tools]`
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `args` | string array | yes (when the section is present) | spliced into every argv the file produces, immediately after `args[0]` |
+
+---
+
+## Isolation — host-owned auth
+
+An executor CLI needs the operator's model credential. The two sections below are
+the two ways to arrange that, and **a spec may declare only one of them** (see
+[Trust model](#trust-model--read-this-first)).
+
+### `[isolation]` — the credential stays in the host
+
+```toml
+[isolation]
+config_home_env = "CODEX_HOME"
+broker = "codex-responses"
+```
+
+The host reads the credential (`OPENAI_API_KEY`, else `~/.codex/auth.json`) and
+keeps it in the node process. The child gets:
+
+- a **loopback base URL** spliced into its argv as a custom model provider, and
+- an **opaque random bearer** minted for this run,
+
+neither of which can recover the credential, and both of which die with the run.
+`config_home_env` is what makes this real rather than decorative: the child's
+`CODEX_HOME` is a **fresh, empty** directory under the run's reserved
+`.ducktape-run/` tree, so the CLI *cannot* fall back to reading the operator's
+`auth.json`. That reserved directory is deleted before DuckFS or Forge scans the
+workspace, so the provider's runtime state can never enter a snapshot or commit.
+
+The broker is deliberately not a generic proxy: it binds an ephemeral loopback
+port, requires the per-run bearer, accepts only Responses POSTs, enforces
+body/response/total-byte, concurrency and request-count budgets, and is torn down
+when the run ends. It substitutes the host credential only on the upstream hop.
+
+**Backends.** Works under `Direct` and `Podman` (whose `--network=host` leaves
+the host's loopback reachable from inside the container). **`Tart` is refused
+loudly**: a VM guest has its own network stack, so the host's `127.0.0.1` is not
+the broker's — every model call would fail as what looks like a broken login.
+Giving the guest a host-gateway address is the upgrade path.
+
+### `[sandbox] rw_dirs` — the credential enters the child
+
+```toml
+[sandbox]
+rw_dirs = ["~/.claude", "~/.claude.json"]
+```
+
+For a CLI with no broker. Under a sandbox backend `HOME` is *set* but not
+*mounted*, so the node's data dir and user key stay outside (D7); these named
+home-relative dirs are the only paths under `HOME` that cross, read-write, at
+their identical container paths — enough for the CLI to find its own login.
+Inert under `Direct` (the child inherits `HOME` whole).
+
+Entries are validated at load: an absolute path or any `..` segment is rejected,
+since either would defeat the boundary the sandbox exists to hold.
 
 ---
 

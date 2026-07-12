@@ -92,6 +92,42 @@ resume_args = [
     "-",
 ]
 
+[isolation]
+# THE STRONG AUTH PATH: the operator's credential never enters the codex
+# process. The HOST reads it (OPENAI_API_KEY, else ~/.codex/auth.json) and holds
+# it in the node; a per-run loopback Responses broker serves the model API, and
+# codex gets only an opaque random bearer plus a 127.0.0.1 base URL, both of
+# which die with the run. Neither can recover the credential.
+#
+# config_home_env is what MAKES that true. Pointed at a fresh, EMPTY CODEX_HOME
+# under the run's workdir, codex cannot read the operator's ~/.codex/auth.json
+# and must use the broker the argv names. Without it the broker would be
+# decorative — codex would just log in from the dotfile as before.
+#
+# Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
+# to have both): mounting ~/.codex would put the credential back in the child
+# and quietly undo all of the above. Applies under the Direct AND Podman
+# backends; Tart is rejected loudly (a VM guest cannot reach host loopback).
+# Inherited by every [[variants]] tag below.
+config_home_env = "CODEX_HOME"
+broker = "codex-responses"
+
+[context]
+# WHERE THE AGENT'S SOUL LANDS. The host assembles the agent's curated skills
+# into one markdown document per run; this names the file THIS CLI already
+# auto-loads it from, so no Rust ever branches on an executor name. codex reads
+# $CODEX_HOME/AGENTS.md as its global instructions (verified live), and
+# [isolation] above already gives every run a fresh, empty CODEX_HOME — so the
+# doc lands in a directory only this run can see.
+#
+# That directory sits under the workdir's reserved .ducktape-run/ dir, which the
+# provisioner deletes before duckfs/forge scan the tree: the soul can never
+# become an agent artifact, and it never collides with a repository's OWN
+# AGENTS.md (which stays inside the checkout and layers on top of this one).
+# Under the Podman sandbox it crosses for free — the workdir is already mounted.
+# Inherited by every [[variants]] tag below.
+path = "config-home:AGENTS.md"
+
 [tools]
 # Wires the Ducktape MCP server into every argv this file produces — the base
 # tag, every [[variants]] tag, and the resume argv — spliced in at load time

@@ -14,7 +14,7 @@ export type StreamOrigin = { kind: StreamOriginKind, id?: string, };
 
 export type StreamOriginKind = "external" | "module" | "system";
 
-export type TailItem = { line: string, } | { height: number, time: number, message: string, baseSnapshot: string | null, paths: Array<string>, } | { stream: RunStream, line: string, };
+export type TailItem = { line: string, } | { height: number, time: number, message: string, baseSnapshot: string | null, paths: Array<string>, } | { stream: RunStream, line: string, } | { timeMs: number, text: string, };
 
 export type RunStream = "stdout" | "stderr";
 

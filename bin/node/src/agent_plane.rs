@@ -67,6 +67,7 @@ pub(crate) fn spawn(
     peers: Arc<MediaPeers>,
     me: [u8; 32],
     pacer: BulkPacer,
+    planes: data_plane::PlaneMonitor,
     registry: RunOutputRegistry,
 ) {
     tokio::spawn(async move {
@@ -89,6 +90,7 @@ pub(crate) fn spawn(
             }
         };
         println!("[node {label}] agent telemetry plane: overlay stream bound on {own}");
+        planes.register("agent", Service::AgentTelemetry, plane.watch());
         run_bound(plane, service, peers, PeerId(me), registry).await;
     });
 }

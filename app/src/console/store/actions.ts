@@ -17,7 +17,6 @@ import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
-import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import { classifyBootError } from "../../domain/boot-error";
 import type { NodeTransport } from "../../domain/transport";
@@ -59,7 +58,9 @@ import {
 } from "./account-ops";
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
-import { autoBindUserIdentity } from "./auto-bind";
+import { autoBindUserIdentity, type AutoBindResult } from "./auto-bind";
+import { navSnapshotOf } from "./nav-history";
+import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -69,6 +70,7 @@ import {
   clearPendingDisplayName,
   clearRemoteUrl,
   docTabsScope,
+  hasNodeContext,
   loadDocTabs,
   loadPendingDisplayName,
   removeTab,
@@ -116,6 +118,9 @@ export interface ConsoleActions {
    *  hand-off (the explorerFocus idiom). Used by the notification bell; the
    *  navigate deep-link listener patches the same fields. */
   openForgeItem(repo: string, number: number | null): void;
+  /** Jump to the files browser opened on `path` — the same one-shot hand-off,
+   *  used by the agent form to open a skill document in Files. */
+  openFiles(path: string): void;
   /** Jump to an agent's detail — a clicked @agent mention (the forgeFocus idiom). */
   openAgent(agentId: string): void;
   /** Jump to a person in Members — a clicked @user mention. Takes the ACCOUNT id
@@ -132,6 +137,12 @@ export interface ConsoleActions {
    *  Jumps to the target rail's default surface when the current screen belongs
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
+  /** Apply a browser-history entry's nav snapshot — the popstate half of
+   *  back/forward (see nav-history.ts). Selections re-apply through the
+   *  rehydrating entry points, so a restored surface re-fetches recent data;
+   *  returns the snapshot actually honored (vanished targets are skipped) for
+   *  the caller to re-stamp onto the entry. */
+  applyNavSnapshot(snap: NavSnapshot): NavSnapshot;
   setAccent(accent: string): void;
   /** Flip the light/dark color theme and persist the choice. */
   toggleTheme(): void;
@@ -155,6 +166,11 @@ export interface ConsoleActions {
   accountRemoveMember(targetKeyHex: string): Promise<void>;
   /** Evict a (lost) node from this account — its first UI consumer. */
   accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Manually re-run the connect-time auto-bind for the active workspace's
+   *  node — the escape hatch when that fire-and-forget pass returned
+   *  locked/deferred/failed and nothing would ever retry. Resolves to the
+   *  same outcome vocabulary so the caller can say WHY a bind didn't land. */
+  accountBindNode(): Promise<AutoBindResult>;
   /** Stand up the LAN QR-enrollment server for this account (fresh nonce);
    *  the card polls enroll-client directly and cancels on unmount. */
   accountPhoneEnrollStart(): Promise<PhoneEnrollment>;
@@ -366,15 +382,15 @@ export interface ConsoleActions {
   resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
-  /** Upload the prompt text to the blob store, then RegisterAgent with the
-   *  resulting 32-byte digest as its prompt_hash. */
+  /** RegisterAgent with the agent's curated skill set — the `always` skills are
+   *  its persona, inlined into every run; nothing is staged in the blob store. */
   registerAgent(params: {
     displayName: string;
     agentId: string;
     capability: string;
-    prompt: string;
     allowedActions: string[];
     caps?: agentClient.ResourceCaps;
+    skills?: agentClient.SkillRef[];
   }): void;
   /** Pause / resume an agent (owner-gated). */
   pauseAgent(agentId: string): void;
@@ -382,23 +398,35 @@ export interface ConsoleActions {
   /** Watch a channel under a turn policy / drop the watch. */
   watchChannel(params: { channelId: string; policy: TurnPolicy }): void;
   unwatchChannel(channelId: string): void;
-  /** Explicitly run an agent against a channel anchor. */
-  requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
+  /** Explicitly run an agent against a channel anchor. Optional `demands` are
+   *  per-run resource requirements (dimension → positive integer); omitted
+   *  from the wire when absent or empty. */
+  requestRun(params: {
+    agentId: string;
+    channelId: string;
+    anchorSeq: number;
+    demands?: Record<string, number>;
+  }): void;
+  /** Post a canned prompt to the active channel, then run an agent anchored on
+   *  it — the one-click "set up with an agent" path used by the sandbox
+   *  onboarding section. No-op without an active channel. */
+  startSetupRun(params: { agentId: string; prompt: string }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
   /** Fence one attempt and move the run to a different provider. */
   reassignRun(runId: string, attempt: number): void;
-  /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
-   *  the blob store and its digest committed as the new prompt_hash; every
-   *  omitted field keeps its current value. */
+  /** Owner-gated edit of a registered agent. Every omitted field keeps its
+   *  current value. */
   updateAgent(params: {
     agentId: string;
     displayName?: string;
     capability?: string;
-    prompt?: string;
     allowedActions?: string[];
     /** REPLACES the whole caps record when present; omit to keep it. */
     caps?: agentClient.ResourceCaps;
+    /** REPLACES the whole curated skill set when present (an empty array clears
+     *  it); omit to keep it. */
+    skills?: agentClient.SkillRef[];
   }): void;
   /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
    *  can process job-backed runs. */
@@ -457,9 +485,6 @@ export interface ConsoleActions {
    *  "Node failed to start" surface). Idempotent — re-runs connectActive
    *  against the existing workspace, never re-minting one. */
   retryConnect(): void;
-  /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
-   *  scrape fails — best-effort, for the poll-driven Metrics view. */
-  readMetrics(): Promise<NodeMetrics | null>;
   /** The active workspace's `daemon.log` path + last 64 KB — polled by the
    *  Node → Logs tab. Null when there is no managed workspace or the read
    *  fails (node stopped mid-view); the viewer keeps its last good frame. */
@@ -708,6 +733,7 @@ export function createActions({
         muted: seedMuted,
         status,
         error: null,
+        errorNote: null,
         mediaNote: null,
         cameraOn: false,
         sharing: false,
@@ -771,6 +797,9 @@ export function createActions({
     }
     const status = event.status;
     const error = event.error;
+    // the node's own reason, when it sent one — kept beside the coded error so
+    // the card can say WHICH connection failure this was.
+    const note = event.note;
     if (status === "closed" || status === "error") {
       const prevVoice = getState().voice;
       const channelId = prevVoice.channelId;
@@ -793,6 +822,7 @@ export function createActions({
           popped: false,
           status: "error",
           error: error ?? "connection",
+          errorNote: note ?? null,
           mediaNote: null,
           cameraOn: false,
           sharing: false,
@@ -863,12 +893,14 @@ export function createActions({
       .then(() => submit(live))
       .then((result) => {
         if (!isCurrentNode(live)) return false;
-        update((prev) => ({ ops: finalizeOp(prev.ops, key, receiptOf(result)) }));
+        update((prev) => ({
+          ops: finalizeOp(prev.ops, key, receiptOf(result), Date.now()),
+        }));
         return refresh().then(() => true);
       })
       .catch((err) => {
         if (!isCurrentNode(live)) return false;
-        update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
+        update((prev) => ({ ops: failOp(prev.ops, key, String(err), Date.now()) }));
         fail(err);
         // resolve false rather than reject: a failed op is already surfaced to
         // the user here, and rejecting would turn every caller that ignores the
@@ -1000,7 +1032,7 @@ export function createActions({
             messageId,
             blocks,
             authorBytes: selfAuthorBytes(prev.status, prev.author),
-            at: Date.now(),
+            atMs: Date.now(),
             thread,
           }),
       ),
@@ -1175,6 +1207,87 @@ export function createActions({
       .catch((err) => {
         if (isCurrentNode(live)) fail(err);
       });
+  };
+
+  // ── Browser-history traversal ──
+  // Apply a history entry's NavSnapshot (see nav-history.ts) — the popstate
+  // half of browser back/forward. Selections route through the same entry
+  // points user clicks take (enterChannel / enterPage / the one-shot focus
+  // hand-offs), so every restored target re-fetches its data from the node
+  // rather than rendering a stale copy. Returns the snapshot actually
+  // honored — a selection whose target vanished from the committed data (or
+  // that another workspace minted) is skipped, and the caller re-stamps the
+  // entry with the honored result so the stack and the store converge.
+  const applyNavSnapshot = (snap: NavSnapshot): NavSnapshot => {
+    const before = getState();
+    // Gated bodies (onboarding, the join waiting room, a boot failure) own
+    // the window — traversal must not fight them.
+    if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
+      return navSnapshotOf(before);
+    }
+    // With no node in context, only same-scope entries may leave the Home
+    // layer (the no-node web shell traversing its own history). A cross-scope
+    // entry minted by a since-forgotten workspace would restore a shell with
+    // nothing behind it.
+    if (
+      !hasNodeContext(before) &&
+      !snap.atHome &&
+      snap.scope !== currentDocTabsScope()
+    ) {
+      return navSnapshotOf(before);
+    }
+
+    // Selections apply only within the scope that minted them, only under the
+    // shell (never through the Home layer), and only when the target still
+    // exists in the recentmost committed data.
+    const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
+    const channel =
+      scopeMatches && snap.channel && before.channels.some((c) => c.id === snap.channel)
+        ? snap.channel
+        : null;
+    const page =
+      scopeMatches && snap.page && before.pages.some((p) => p.id === snap.page)
+        ? snap.page
+        : null;
+    const forge =
+      scopeMatches && snap.screen === "forge" && snap.forgeRepo
+        ? { repo: snap.forgeRepo, number: snap.forgeItem }
+        : null;
+    const explorer =
+      scopeMatches && snap.screen === "explorer" ? snap.explorer : null;
+    const agent = scopeMatches && snap.screen === "agent" ? snap.agent : null;
+    const member = scopeMatches && snap.screen === "members" ? snap.member : null;
+
+    // The entry recorded the LIVE rail, so adopt it verbatim — re-deriving via
+    // sectionForScreen would lose a shell screen's remembered rail.
+    saveViewMode(snap.viewMode);
+    patch({
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      ...(forge ? { forgeFocus: forge } : {}),
+      ...(explorer !== null ? { explorerFocus: explorer } : {}),
+      ...(agent ? { agentFocus: agent } : {}),
+      ...(member ? { memberFocus: member } : {}),
+    });
+    if (channel && channel !== before.activeChannel) enterChannel(channel);
+    if (page && page !== before.activePage) enterPage(page);
+
+    // Built from what was applied, not re-read: the reducer runs on the next
+    // render tick, so getState() here would still see the pre-apply state.
+    return {
+      scope: currentDocTabsScope(),
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      channel: channel ?? before.activeChannel,
+      page: page ?? before.activePage,
+      forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
+      forgeItem: forge ? forge.number : (before.forgeFocus?.number ?? null),
+      explorer: explorer ?? before.explorerFocus,
+      agent: agent ?? before.agentFocus,
+      member: member ?? before.memberFocus,
+    };
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -1363,78 +1476,48 @@ export function createActions({
       });
   };
 
-  return {
-    setScreen: (screen) => {
-      // Navigating adopts the target surface's rail, so the sidebar highlight and
-      // the body never disagree. Shell screens (settings → null section) leave the
-      // current rail untouched.
-      const section = sectionForScreen(screen);
-      if (section) {
-        saveViewMode(section);
-        patch({ screen, viewMode: section });
-      } else {
-        patch({ screen });
-      }
-    },
+  // Land the shell on a screen. Adopts the target surface's rail so the
+  // sidebar highlight and the body never disagree (a mention clicked from
+  // chat moves the rail to OPERATOR with it; shell screens like settings →
+  // null section leave the current rail untouched), and always leaves the
+  // Home layer — with the sidebar navigable at Home, every screen move must
+  // drop the layer or the shell would change invisibly underneath it.
+  const landOn = (screen: string, extra: Partial<ConsoleState> = {}) => {
+    const section = sectionForScreen(screen);
+    if (section) saveViewMode(section);
+    patch({
+      screen,
+      atHome: false,
+      ...(section ? { viewMode: section } : {}),
+      ...extra,
+    });
+  };
 
-    openExplorerAt: (height) => {
-      // Same rail-adoption contract as setScreen — the explorer lives on the
-      // operator rail, so the jump must move the sidebar with it.
-      const section = sectionForScreen("explorer");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "explorer", viewMode: section, explorerFocus: height });
-      } else {
-        patch({ screen: "explorer", explorerFocus: height });
-      }
-    },
+  return {
+    setScreen: (screen) => landOn(screen),
+
+    openExplorerAt: (height) => landOn("explorer", { explorerFocus: height }),
 
     clearExplorerFocus: () => {
       patch({ explorerFocus: null });
     },
 
-    openAgent: (agentId) => {
-      // Same rail-adoption contract as setScreen.
-      const section = sectionForScreen("agent");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "agent", viewMode: section, agentFocus: agentId });
-      } else {
-        patch({ screen: "agent", agentFocus: agentId });
-      }
-    },
+    openAgent: (agentId) => landOn("agent", { agentFocus: agentId }),
 
     clearAgentFocus: () => {
       patch({ agentFocus: null });
     },
 
-    openMember: (accountId) => {
-      // Members lives on the OPERATOR rail — a mention clicked from chat (a user
-      // surface) has to move the rail with it or the sidebar and body disagree.
-      const section = sectionForScreen("members");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "members", viewMode: section, memberFocus: accountId });
-      } else {
-        patch({ screen: "members", memberFocus: accountId });
-      }
-    },
+    openMember: (accountId) => landOn("members", { memberFocus: accountId }),
 
     clearMemberFocus: () => {
       patch({ memberFocus: null });
     },
 
-    openForgeItem: (repo, number) => {
-      // Same rail-adoption contract as setScreen.
-      const section = sectionForScreen("forge");
-      const forgeFocus = { repo, number };
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "forge", viewMode: section, forgeFocus });
-      } else {
-        patch({ screen: "forge", forgeFocus });
-      }
-    },
+    openForgeItem: (repo, number) => landOn("forge", { forgeFocus: { repo, number } }),
+
+    openFiles: (path) => landOn("files", { filesFocus: path }),
+    applyNavSnapshot,
 
     setViewMode: (mode) => {
       saveViewMode(mode);
@@ -1490,6 +1573,22 @@ export function createActions({
       Promise.resolve()
         .then(() => unbindNode(accountDeps(), targetNodeHex))
         .then(() => refresh()),
+    accountBindNode: () =>
+      Promise.resolve()
+        .then(() => {
+          const live = getNode();
+          const { workspace } = getState();
+          if (!live || !workspace) throw new Error("not connected to a workspace node");
+          return autoBindUserIdentity(live, workspace);
+        })
+        .then((outcome) =>
+          // A landed (or already-landed) bind repaints the Owned by row from
+          // the refreshed identity projection; the other outcomes carry the
+          // reason back to the button that asked.
+          outcome === "bound" || outcome === "already"
+            ? refresh().then(() => outcome)
+            : outcome,
+        ),
     accountPhoneEnrollStart: () =>
       Promise.resolve().then(() => startPhoneEnrollment(accountDeps())),
     accountPhoneEnrollApprove: (enrollment, newKeyHex, sigHex, label) =>
@@ -1498,13 +1597,6 @@ export function createActions({
           approvePhoneEnrollment(accountDeps(), enrollment, newKeyHex, sigHex, label),
         )
         .then(() => refresh()),
-
-    readMetrics: () => {
-      const live = getNode();
-      return live
-        ? live.metrics().then(parseMetrics).catch(() => null)
-        : Promise.resolve(null);
-    },
 
     // The Logs tab surfaces the LOCAL daemon.log — a per-workspace file only the
     // desktop shell that spawned the node can read. Both reads are best-effort:
@@ -1523,15 +1615,32 @@ export function createActions({
     },
 
     // Identity is the only durable display-name authority. The module derives
-    // the account from the authenticated node and rejects an unbound origin.
+    // the account from the authenticated node and rejects an unbound origin —
+    // so refuse an unbound node up front (the op could never land; same gate
+    // as setDuckHandle below). `author` is the one optimistic slice the
+    // completion refresh cannot restore (nothing re-derives it from the chain
+    // once it left the boot placeholder), so a failed submit rolls it back
+    // here instead of leaving a phantom name the chain rejected.
     setDisplayName: (name) => {
       const current = getState();
-      const origin = current.author;
-      submitTracked(
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
+      const accountId = nodeKey
+        ? current.nodeUsers[nodeKey]?.accountId
+        : undefined;
+      if (!accountId) {
+        fail("bind this node to an identity account before setting a display name");
+        return;
+      }
+      const previous = current.author;
+      void submitTracked(
         opKey.accountName(),
-        (live) => identityClient.setAccountName(live, { displayName: name, origin }),
+        (live) =>
+          identityClient.setAccountName(live, { displayName: name, origin: previous }),
         () => ({ author: name }),
-      );
+      ).then((landed) => {
+        // un-paint only if no newer write replaced the name mid-flight.
+        if (!landed && getState().author === name) patch({ author: previous });
+      });
     },
 
     setDuckHandle: (handle) => {
@@ -1575,7 +1684,7 @@ export function createActions({
             channelId,
             name,
             postPolicy,
-            at: Date.now(),
+            atMs: Date.now(),
           }),
       ).then((current) => {
         if (current) enterChannel(channelId);
@@ -1722,7 +1831,7 @@ export function createActions({
             channelId,
             node,
             authorBytes: selfAuthorBytes(prev.status, prev.author),
-            at: Math.floor(Date.now() / 1000),
+            atMs: Date.now(),
           }),
       ).then((current) => {
         if (current) return; // the join landed
@@ -1738,8 +1847,20 @@ export function createActions({
         if (getState().voice.channelId !== channelId) return;
         stopVoice();
         // the session is gone — camera/beacon state must not outlive it.
+        // errorNote is cleared, not spread: a consensus refusal has no node
+        // sentence of its own, and the media session may ALREADY have failed
+        // and left one behind (a hub-less node refuses the socket instantly) —
+        // inheriting it would file the mic's reason under the roster's message.
         update((prev) => ({
-          voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
+          voice: {
+            ...prev.voice,
+            status: "error",
+            error: "refused",
+            errorNote: null,
+            cameraOn: false,
+            sharing: false,
+            peers: {},
+          },
         }));
       });
       // start the audio session and reflect "connecting"; push whatever roster
@@ -1765,6 +1886,7 @@ export function createActions({
           muted: true,
           status: "connecting",
           error: null,
+          errorNote: null,
           mediaNote: null,
           cameraOn: false,
           sharing: false,
@@ -1789,6 +1911,7 @@ export function createActions({
           muted: false,
           status: "idle",
           error: null,
+          errorNote: null,
           mediaNote: null,
           popped: false,
           cameraOn: false,
@@ -2151,8 +2274,10 @@ export function createActions({
     },
 
     movePageBlock: ({ blockId, parent, after }) =>
-      submitTracked(opKey.pageBlock(blockId), (live) =>
-        inPageOrder(() => pagesClient.moveBlock(live, { blockId, parent, after })),
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => inPageOrder(() => pagesClient.moveBlock(live, { blockId, parent, after })),
+        (prev) => optimistic.pageBlockMoved(prev, { blockId, parent, after }),
       ),
 
     removePageBlock: (blockId) => {
@@ -2165,28 +2290,23 @@ export function createActions({
     },
 
     // ── Agents ──
-    registerAgent: ({ displayName, agentId, capability, prompt, allowedActions, caps }) => {
+    registerAgent: ({ displayName, agentId, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       const name = displayName.trim();
       const tag = capability.trim();
       if (!id || !name || !tag) return;
+      // No blob upload: the agent's persona is a duckfs document its skill refs
+      // point at, so registration commits pins — never prompt bytes.
       submitTracked(opKey.agent(id), (live) =>
-        // stage the prompt in the node's blob store, then register with its
-        // digest as prompt_hash — the blob is keyed by sha256(bytes), which
-        // IS the hash the oracle worker fetches the prompt by.
-        Promise.resolve()
-          .then(() => live.putBlob(new TextEncoder().encode(prompt)))
-          .then((digest) =>
-            agentClient.registerAgent(live, {
-              agentId: id,
-              displayName: name,
-              capability: tag,
-              promptHash: agentClient.hexToBytes(digest),
-              allowedActions,
-              caps,
-              origin: getState().author,
-            }),
-          ),
+        agentClient.registerAgent(live, {
+          agentId: id,
+          displayName: name,
+          capability: tag,
+          allowedActions,
+          caps,
+          skills,
+          origin: getState().author,
+        }),
       );
     },
 
@@ -2235,16 +2355,40 @@ export function createActions({
       );
     },
 
-    requestRun: ({ agentId, channelId, anchorSeq }) => {
+    requestRun: ({ agentId, channelId, anchorSeq, demands }) => {
       if (!agentId || !channelId) return;
       submitTracked(opKey.runRequest(agentId), (live) =>
         runsClient.requestRun(live, {
           agentId,
           channelId,
           anchorSeq,
+          demands,
           origin: getState().author,
         }),
       );
+    },
+
+    startSetupRun: ({ agentId, prompt }) => {
+      const channelId = getState().activeChannel;
+      if (!agentId || !channelId || !prompt.trim()) return;
+      // Post the canned prompt, then anchor the run on it. postToChannel
+      // resolves after the submit + refresh, so the committed message is in
+      // state; its seq is the newest in the channel (single-writer node).
+      void postToChannel(channelId, prompt, null).then((ok) => {
+        if (!ok) return;
+        const seq = getState()
+          .messages.filter((m) => m.channel_id === channelId)
+          .reduce((max, m) => Math.max(max, m.seq), 0);
+        if (seq <= 0) return;
+        submitTracked(opKey.runRequest(agentId), (live) =>
+          runsClient.requestRun(live, {
+            agentId,
+            channelId,
+            anchorSeq: seq,
+            origin: getState().author,
+          }),
+        );
+      });
     },
 
     cancelRun: (runId) => {
@@ -2267,33 +2411,23 @@ export function createActions({
       );
     },
 
-    updateAgent: ({ agentId, displayName, capability, prompt, allowedActions, caps }) => {
+    updateAgent: ({ agentId, displayName, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       if (!id) return;
       submitTracked(
         opKey.agent(id),
         (live) =>
-        Promise.resolve()
-          // a provided prompt is re-staged in the blob store; its digest becomes
-          // the new prompt_hash. An absent prompt leaves the hash untouched.
-          .then(() =>
-            prompt !== undefined && prompt.length > 0
-              ? live
-                  .putBlob(new TextEncoder().encode(prompt))
-                  .then((digest) => agentClient.hexToBytes(digest))
-              : null,
-          )
-          .then((promptHash) =>
-            agentClient.updateAgent(live, {
-              agentId: id,
-              displayName: displayName?.trim() || null,
-              capability: capability?.trim() || null,
-              promptHash,
-              allowedActions: allowedActions ?? null,
-              caps: caps ?? null,
-              origin: getState().author,
-            }),
-          ),
+          agentClient.updateAgent(live, {
+            agentId: id,
+            displayName: displayName?.trim() || null,
+            capability: capability?.trim() || null,
+            allowedActions: allowedActions ?? null,
+            caps: caps ?? null,
+            // A provided list REPLACES the curated set wholesale (an empty array
+            // clears it); undefined keeps whatever is committed.
+            skills: skills ?? null,
+            origin: getState().author,
+          }),
         (prev) =>
           optimistic.agentPatched(prev, id, {
             ...(displayName?.trim() ? { display_name: displayName.trim() } : {}),
@@ -2538,11 +2672,12 @@ export function createActions({
     selectWorkspace: (id) => {
       const target = getState().workspaces.find((w) => w.id === id);
       if (!target) return;
-      // re-clicking the current MEMBER workspace is a no-op; a current
-      // NON-member one falls through to the admission check below — its honest
-      // "not admitted yet" error beats a silent nothing (and a genuinely
-      // progressing one just re-runs the idempotent connect).
-      if (target.id === getState().workspace?.id && target.member) return;
+      // Home is only a view over the live workspace. Entering that same member
+      // workspace closes Home without needlessly reconnecting its node.
+      if (target.id === getState().workspace?.id && target.member) {
+        patch({ atHome: false });
+        return;
+      }
       const enter = (): void => {
         // connectActive synchronously drops the old transport and clears the
         // complete node projection before its first async workspace call.

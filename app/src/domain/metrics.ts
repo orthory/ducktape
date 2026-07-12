@@ -1,14 +1,40 @@
 // The node's Prometheus/OpenMetrics scrape, parsed into the `ducktape_*` block
-// series the Metrics view charts. See `NodeTransport.metrics()` for the raw
-// text; the wire names are fixed by the node (bin/noded NodeMetrics):
+// series the Metrics view charts. The raw text arrives over the node stream's
+// `metrics` topic (one snapshot per heartbeat tick — the same exposition the
+// node's GET /metrics serves scrapers); the wire names are fixed by the node
+// (bin/noded NodeMetrics):
 //
 //   ducktape_block_height                       <gauge>
 //   ducktape_blocks_total                       <counter>
 //   ducktape_block_apply_latency_seconds_{sum,count,bucket{le="…"}}
 //   ducktape_dispatch_total{module="…",origin="…"}   <counter family>
 //
+// plus the per-plane series (bin/node plane_metrics), every one labeled
+// `{service, owner}` where `owner` is the module that created the plane —
+// a plane that closes stops being scraped, so presence IS openness:
+//
+//   ducktape_dataplane_open / _halted / _age_seconds
+//   ducktape_dataplane_bytes{dir="tx|rx",class="datagram|stream"}   (cumulative)
+//   ducktape_dataplane_datagrams{dir="tx|rx"}                       (cumulative)
+//   ducktape_dataplane_streams{kind="opened|accepted"}              (cumulative)
+//   ducktape_dataplane_drops{kind="…"}                              (cumulative)
+//
+// plus the statesync SERVE lane (bin/node sync metrics) — statesync rides the
+// mesh carrier, never a data plane, so it gets its own `{peer}`-labeled
+// family. A peer that stops requesting ages out of the scrape — presence IS
+// recent utilization:
+//
+//   ducktape_statesync_serve_age_seconds / _idle_seconds
+//   ducktape_statesync_serve_bytes                                  (cumulative)
+//   ducktape_statesync_serve_frames                                 (cumulative)
+//   ducktape_statesync_serve_requests{kind="manifest|chunk|frames|…"} (cumulative)
+//   ducktape_statesync_serve_boundary_height   (absent until a manifest is served)
+//   ducktape_statesync_serve_frame_height      (absent until frames are served)
+//
 // A node serving only commonware's runtime series (an older binary that never
 // records its own blocks) exposes none of these — `present` is then false.
+// A node with no open planes (e.g. the embedded local daemon) simply has an
+// empty `planes` list; a node no peer is syncing from has an empty `syncPeers`.
 
 /** One cumulative histogram bucket: `cumulative` observations were ≤ `le` s. */
 export interface Bucket {
@@ -33,6 +59,51 @@ export interface DispatchCount {
   count: number;
 }
 
+/** One open data plane, identified by `{service, owner}`. All byte/count
+ *  fields are cumulative for the plane's life — derive rates from deltas. */
+export interface DataPlaneMetric {
+  service: string;
+  /** the module that created the plane. */
+  owner: string;
+  ageSeconds: number;
+  /** bound but no longer moving traffic (its pumps exited). */
+  halted: boolean;
+  /** wire bytes by direction and service class. */
+  bytesTxDatagram: number;
+  bytesRxDatagram: number;
+  bytesTxStream: number;
+  bytesRxStream: number;
+  datagramsTx: number;
+  datagramsRx: number;
+  streamsOpened: number;
+  streamsAccepted: number;
+  /** dropped/refused traffic by kind (rogue_datagrams, shed, …). */
+  drops: Record<string, number>;
+}
+
+/** One peer this node recently served state sync to, identified by `{peer}`
+ *  (the requester's mesh key, hex). Byte/frame/request fields are cumulative
+ *  for the peer's current sync conversation — derive rates from deltas. */
+export interface StateSyncPeerMetric {
+  /** the requesting peer's mesh public key, hex. */
+  peer: string;
+  ageSeconds: number;
+  /** seconds since the peer's last answered request. */
+  idleSeconds: number;
+  /** wire bytes served to the peer. */
+  bytesTx: number;
+  /** finalized frames (blocks) served to the peer. */
+  framesServed: number;
+  /** the snapshot boundary height last served — the peer's restore base;
+   *  null until a manifest is served (tip pollers never have one). */
+  boundaryHeight: number | null;
+  /** the highest frame (block) height served — the peer's replay reach;
+   *  null until a frames batch is served. */
+  servedHeight: number | null;
+  /** answered requests by kind (manifest, chunk, frames, tip_coords, …). */
+  requests: Record<string, number>;
+}
+
 export interface NodeMetrics {
   /** whether the node exposed its own `ducktape_*` block series at all. */
   present: boolean;
@@ -40,6 +111,10 @@ export interface NodeMetrics {
   blocksTotal: number;
   latency: LatencyHistogram;
   dispatches: DispatchCount[];
+  /** every open data plane, sorted by service then owner. */
+  planes: DataPlaneMetric[];
+  /** every peer recently served over the statesync lane, sorted by peer. */
+  syncPeers: StateSyncPeerMetric[];
 }
 
 /** One parsed exposition sample: `name{labels} value`. */
@@ -57,6 +132,35 @@ export const emptyMetrics = (): NodeMetrics => ({
   blocksTotal: 0,
   latency: EMPTY_HISTOGRAM,
   dispatches: [],
+  planes: [],
+  syncPeers: [],
+});
+
+const emptyPlane = (service: string, owner: string): DataPlaneMetric => ({
+  service,
+  owner,
+  ageSeconds: 0,
+  halted: false,
+  bytesTxDatagram: 0,
+  bytesRxDatagram: 0,
+  bytesTxStream: 0,
+  bytesRxStream: 0,
+  datagramsTx: 0,
+  datagramsRx: 0,
+  streamsOpened: 0,
+  streamsAccepted: 0,
+  drops: {},
+});
+
+const emptySyncPeer = (peer: string): StateSyncPeerMetric => ({
+  peer,
+  ageSeconds: 0,
+  idleSeconds: 0,
+  bytesTx: 0,
+  framesServed: 0,
+  boundaryHeight: null,
+  servedHeight: null,
+  requests: {},
 });
 
 /** `{module="chat",origin="external"}` → `{ module: "chat", origin: "external" }`. */
@@ -102,6 +206,28 @@ const parseLine = (line: string): Sample | null => {
 export function parseMetrics(text: string): NodeMetrics {
   const m = emptyMetrics();
   const buckets: Bucket[] = [];
+  // planes keyed `{service} {owner}` while samples accumulate.
+  const planes = new Map<string, DataPlaneMetric>();
+  const planeOf = (labels: Record<string, string>): DataPlaneMetric => {
+    const service = labels.service ?? "?";
+    const owner = labels.owner ?? "?";
+    const key = `${service} ${owner}`;
+    const existing = planes.get(key);
+    if (existing) return existing;
+    const fresh = emptyPlane(service, owner);
+    planes.set(key, fresh);
+    return fresh;
+  };
+  // served peers keyed by the `{peer}` label while samples accumulate.
+  const syncPeers = new Map<string, StateSyncPeerMetric>();
+  const syncPeerOf = (labels: Record<string, string>): StateSyncPeerMetric => {
+    const peer = labels.peer ?? "?";
+    const existing = syncPeers.get(peer);
+    if (existing) return existing;
+    const fresh = emptySyncPeer(peer);
+    syncPeers.set(peer, fresh);
+    return fresh;
+  };
   for (const line of text.split("\n")) {
     const s = parseLine(line);
     if (!s) continue;
@@ -138,12 +264,74 @@ export function parseMetrics(text: string): NodeMetrics {
           count: s.value,
         });
         break;
+      case "ducktape_dataplane_open":
+        planeOf(s.labels);
+        break;
+      case "ducktape_dataplane_halted":
+        planeOf(s.labels).halted = s.value > 0;
+        break;
+      case "ducktape_dataplane_age_seconds":
+        planeOf(s.labels).ageSeconds = s.value;
+        break;
+      case "ducktape_dataplane_bytes": {
+        const plane = planeOf(s.labels);
+        const stream = s.labels.class === "stream";
+        if (s.labels.dir === "tx") {
+          if (stream) plane.bytesTxStream = s.value;
+          else plane.bytesTxDatagram = s.value;
+        } else if (stream) {
+          plane.bytesRxStream = s.value;
+        } else {
+          plane.bytesRxDatagram = s.value;
+        }
+        break;
+      }
+      case "ducktape_dataplane_datagrams": {
+        const plane = planeOf(s.labels);
+        if (s.labels.dir === "tx") plane.datagramsTx = s.value;
+        else plane.datagramsRx = s.value;
+        break;
+      }
+      case "ducktape_dataplane_streams": {
+        const plane = planeOf(s.labels);
+        if (s.labels.kind === "opened") plane.streamsOpened = s.value;
+        else plane.streamsAccepted = s.value;
+        break;
+      }
+      case "ducktape_dataplane_drops":
+        planeOf(s.labels).drops[s.labels.kind ?? "?"] = s.value;
+        break;
+      case "ducktape_statesync_serve_age_seconds":
+        syncPeerOf(s.labels).ageSeconds = s.value;
+        break;
+      case "ducktape_statesync_serve_idle_seconds":
+        syncPeerOf(s.labels).idleSeconds = s.value;
+        break;
+      case "ducktape_statesync_serve_bytes":
+        syncPeerOf(s.labels).bytesTx = s.value;
+        break;
+      case "ducktape_statesync_serve_frames":
+        syncPeerOf(s.labels).framesServed = s.value;
+        break;
+      case "ducktape_statesync_serve_requests":
+        syncPeerOf(s.labels).requests[s.labels.kind ?? "?"] = s.value;
+        break;
+      case "ducktape_statesync_serve_boundary_height":
+        syncPeerOf(s.labels).boundaryHeight = s.value;
+        break;
+      case "ducktape_statesync_serve_frame_height":
+        syncPeerOf(s.labels).servedHeight = s.value;
+        break;
       default:
         break; // runtime / other-module series are not charted here
     }
   }
   buckets.sort((a, b) => a.le - b.le);
   m.latency = { ...m.latency, buckets };
+  m.planes = [...planes.values()].sort(
+    (a, b) => a.service.localeCompare(b.service) || a.owner.localeCompare(b.owner),
+  );
+  m.syncPeers = [...syncPeers.values()].sort((a, b) => a.peer.localeCompare(b.peer));
   return m;
 }
 
@@ -191,12 +379,70 @@ export function meanLatency(h: LatencyHistogram): number | null {
 }
 
 /**
- * Blocks/second between two counter reads `dtMs` apart. A counter that went
- * DOWN (a node restart reset it) or a non-positive interval reads as 0.
+ * A cumulative counter's per-second rate between two reads `dtMs` apart. A
+ * counter that went DOWN (a node restart reset it) or a non-positive
+ * interval reads as 0.
  */
-export function blocksPerSecond(prev: number, curr: number, dtMs: number): number {
+export function ratePerSecond(prev: number, curr: number, dtMs: number): number {
   if (dtMs <= 0 || curr < prev) return 0;
   return ((curr - prev) * 1000) / dtMs;
+}
+
+/** Blocks/second between two `blocksTotal` reads — see [`ratePerSecond`]. */
+export function blocksPerSecond(prev: number, curr: number, dtMs: number): number {
+  return ratePerSecond(prev, curr, dtMs);
+}
+
+/** A plane's cumulative egress wire bytes, both service classes. */
+export function planeTxBytes(p: DataPlaneMetric): number {
+  return p.bytesTxDatagram + p.bytesTxStream;
+}
+
+/** A plane's cumulative ingress wire bytes, both service classes. */
+export function planeRxBytes(p: DataPlaneMetric): number {
+  return p.bytesRxDatagram + p.bytesRxStream;
+}
+
+/** A plane's cumulative dropped/refused traffic across every kind. */
+export function planeDropTotal(p: DataPlaneMetric): number {
+  return Object.values(p.drops).reduce((sum, n) => sum + n, 0);
+}
+
+/** The peer's block reach as this node served it: replayed frames if any,
+ *  else the restored snapshot boundary. Null while nothing height-shaped has
+ *  been served (a tip poller or blob fetcher). */
+export function syncPeerReach(p: StateSyncPeerMetric): number | null {
+  return p.servedHeight ?? p.boundaryHeight;
+}
+
+/** Blocks between the peer's reach and this node's own height (the goal
+ *  block a syncing peer converges toward). Null before any reach exists. */
+export function syncBlocksLeft(p: StateSyncPeerMetric, goalHeight: number): number | null {
+  const reach = syncPeerReach(p);
+  return reach === null ? null : Math.max(0, goalHeight - reach);
+}
+
+/** The peer's progression toward the goal block, 0..1. Null before any
+ *  reach exists or while the goal is unknown (height 0). */
+export function syncProgress(p: StateSyncPeerMetric, goalHeight: number): number | null {
+  const reach = syncPeerReach(p);
+  if (reach === null || goalHeight <= 0) return null;
+  return Math.min(1, reach / goalHeight);
+}
+
+/** What the peer is currently doing on the lane, from its request mix —
+ *  the phases of a join in order: manifest → snapshot chunks → frame replay;
+ *  a peer doing none of these is polling coordinates or fetching blobs. */
+export function syncPhase(p: StateSyncPeerMetric): string {
+  const asked = (kind: string) => (p.requests[kind] ?? 0) > 0;
+  // heterogeneous predicates per branch (not one discriminant), so if/else.
+  if (p.servedHeight !== null) return "replaying frames";
+  if (asked("chunk") || asked("module") || asked("index_chunk") || asked("index_modules")) {
+    return "restoring snapshot";
+  }
+  if (p.boundaryHeight !== null) return "manifest served";
+  if (asked("tip_coords")) return "polling tip";
+  return "fetching blobs";
 }
 
 // ── Formatting ──────────────────────────────────────────
@@ -218,4 +464,34 @@ export function formatBound(le: number): string {
 /** A rate as a compact "N.N /s". */
 export function formatRate(perSecond: number): string {
   return `${perSecond.toFixed(perSecond < 10 ? 2 : 1)} /s`;
+}
+
+/** Bytes as a compact SI figure ("512 B", "1.35 kB", "24.0 MB"). */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  const exp = Math.min(units.length - 1, bytes >= 1000 ? Math.floor(Math.log10(bytes) / 3) : 0);
+  const v = bytes / 1000 ** exp;
+  const digits = exp === 0 ? 0 : v < 10 ? 2 : v < 100 ? 1 : 0;
+  return `${v.toFixed(digits)} ${units[exp]}`;
+}
+
+/** A byte rate as "1.35 kB/s". */
+export function formatBytesRate(perSecond: number): string {
+  return `${formatBytes(perSecond)}/s`;
+}
+
+/** A peer key's leading hex as a compact identity ("9f3ab2c1…"). */
+export function formatPeer(peer: string): string {
+  return peer.length > 8 ? `${peer.slice(0, 8)}…` : peer;
+}
+
+/** An age in seconds as the two most significant units ("2h 10m", "45s"). */
+export function formatAge(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 }

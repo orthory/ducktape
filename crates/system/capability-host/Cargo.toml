@@ -10,11 +10,14 @@ version.workspace = true
 # that actually provides it.
 [dependencies]
 async-trait = { workspace = true }
+axum = "0.8"
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
 # session-store file names: sha256(thread_key) makes any thread key
 # filesystem-safe (see src/session.rs).
 sha2 = { workspace = true }

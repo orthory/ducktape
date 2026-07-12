@@ -1,12 +1,13 @@
 // The detail pane for the selected agent: identity header, pause/resume,
-// permissions, and the inline edit toggle. Asking an agent to respond lives
-// on the message in chat now — this pane manages the record only.
+// curated skills, permissions, and the inline edit toggle. Asking an agent to
+// respond lives on the message in chat now — this pane manages the record only.
 
 import { useState } from "react";
 
-import type { AgentRecord } from "../../../domain/agent-client";
+import type { AgentRecord, ResourceCaps, SkillRef } from "../../../domain/agent-client";
 import { agentAddress } from "../../../domain/agent-client";
 import { Icon } from "../../components/Icon";
+import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { AgentEditForm } from "./AgentEditForm";
 import {
@@ -23,10 +24,61 @@ import {
   onDarkButton,
   ownerText,
   primaryButton,
+  secondaryButton,
   SectionLabel,
-  shortHex,
   statusTone,
 } from "./parts";
+import { cleanPrefix, skillDocPath, skillsSummary } from "./skills";
+
+/** One curated skill, read-only: what it is, where it lives, and whether it is
+ *  part of the agent's soul (always loaded) or something it reaches for. */
+function SkillRow({ skill }: { skill: SkillRef }) {
+  const { actions } = useDucktape();
+  const always = skill.load === "always";
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 9,
+        minWidth: 0,
+        padding: "8px 10px",
+        borderRadius: radius.sm,
+        border: `1px solid ${always ? statusTone.agent.border : color.border}`,
+        background: always ? statusTone.agent.bg : color.paper,
+      }}
+    >
+      <Chip
+        text={always ? "ALWAYS" : "ON DEMAND"}
+        tone={always ? statusTone.agent : statusTone.neutral}
+      />
+      <span style={{ font: `600 12px ${font.sans}`, color: color.ink, flexShrink: 0 }}>
+        {skill.name}
+      </span>
+      <span
+        translate="no"
+        style={{
+          flex: 1,
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          font: `400 10.5px ${font.mono}`,
+          color: color.muted2,
+        }}
+      >
+        {skillDocPath(skill.source_prefix)}
+      </span>
+      <button
+        type="button"
+        onClick={() => actions.openFiles(cleanPrefix(skill.source_prefix))}
+        style={{ ...secondaryButton, minHeight: 24, padding: "2px 8px", flexShrink: 0 }}
+      >
+        Open
+      </button>
+    </div>
+  );
+}
 
 export function AgentDetail({
   agent,
@@ -43,8 +95,9 @@ export function AgentDetail({
     agentId: string;
     displayName?: string;
     capability?: string;
-    prompt?: string;
     allowedActions?: string[];
+    caps?: ResourceCaps;
+    skills?: SkillRef[];
   }) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -206,8 +259,35 @@ export function AgentDetail({
               <InfoRow label="address" value={agentAddress(agent.agent_id)} />
             )}
             <InfoRow label="owner" value={ownerText(agent.owner)} />
-            <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
+            <InfoRow label="skills" value={skillsSummary(agent.skills ?? [])} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
+          </div>
+
+          <div style={{ marginTop: 15 }}>
+            <SectionLabel>SKILLS</SectionLabel>
+            <div
+              style={{
+                marginTop: 4,
+                font: `400 10.5px ${font.sans}`,
+                color: color.muted2,
+                lineHeight: 1.5,
+              }}
+            >
+              Always-loaded documents are pasted into every run — they are this agent's
+              persona. The others are listed by name and opened only when the job calls
+              for one.
+            </div>
+            <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+              {(agent.skills ?? []).length === 0 ? (
+                <span style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+                  No skills curated — this agent runs on the task instructions alone.
+                </span>
+              ) : (
+                (agent.skills ?? []).map((skill) => (
+                  <SkillRow key={`${skill.name}:${skill.source_prefix}`} skill={skill} />
+                ))
+              )}
+            </div>
           </div>
 
           <div style={{ marginTop: 15 }}>

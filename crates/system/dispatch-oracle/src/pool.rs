@@ -17,7 +17,7 @@
 //! ([`DeliverFn`]) are the embedding host's business (bin/node's select-loop
 //! mpsc lane, bin/noded's command channel).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,8 +29,8 @@ use tokio::sync::Semaphore;
 
 use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
 use crate::{
-    AttemptOutput, ExecJob, Gated, attempt_output, clean_error, gate, oracle_result_with_usage,
-    renew_lease,
+    AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
+    oracle_result_with_usage, renew_lease,
 };
 
 /// how many provider runs may execute concurrently unless
@@ -94,10 +94,6 @@ pub struct DispatchPool {
     /// process for the same paid call. pruned when the attempt's result has
     /// been handed to the delivery lane.
     inflight: Arc<Mutex<HashSet<AttemptKey>>>,
-    /// blob reads for envelope prompt resolution — injected by the embedding
-    /// binary like spawn/deliver, so the pool stays storage-agnostic. `None`
-    /// fails prompt-pinned envelopes loudly (see [`crate::envelope::prepare`]).
-    resolver: Option<crate::BlobResolver>,
     /// materializes/commits/cleans a per-run workspace — injected by the node
     /// binary, where duckfs-client + the actor lane are reachable. `None`
     /// (the default) keeps the accept-only degrade: the plan is surfaced but
@@ -105,10 +101,18 @@ pub struct DispatchPool {
     /// node binaries wire a real provisioner, so this is LIVE on every
     /// production agent run.
     provisioner: Option<SharedProvisioner>,
+    /// the host-local load ledger: `gate()` checks `fits()` inline on both
+    /// the own-lease and announcement paths; `spawn_exec` reserves a run's
+    /// demands before the semaphore acquire, releasing via RAII guard held
+    /// to the spawned task's end. `Arc`-wrapped so the spawned task can hold
+    /// its own cheap clone alongside `providers`.
+    ledger: Arc<ResourceLedger>,
 }
 
 impl DispatchPool {
-    /// the production constructor: concurrency cap from the environment.
+    /// the production constructor: concurrency cap from the environment, no
+    /// announced capacity (a bare ledger — demandless jobs only) until a
+    /// later task wires the operator's real numbers in.
     pub fn new(
         providers: Arc<ProviderSet>,
         node_key: Vec<u8>,
@@ -121,16 +125,20 @@ impl DispatchPool {
             spawn,
             deliver,
             max_concurrent_runs_from_env(),
+            Default::default(),
         )
     }
 
-    /// an explicit concurrency cap (tests; embedders with their own policy).
+    /// an explicit concurrency cap (tests; embedders with their own policy)
+    /// and announced resource capacity. an empty `capacity` is the direct
+    /// (bare) node: only demandless jobs ever fit its ledger.
     pub fn with_limit(
         providers: Arc<ProviderSet>,
         node_key: Vec<u8>,
         spawn: SpawnFn,
         deliver: DeliverFn,
         limit: usize,
+        capacity: BTreeMap<String, u64>,
     ) -> Self {
         Self {
             providers,
@@ -139,23 +147,17 @@ impl DispatchPool {
             deliver,
             semaphore: Arc::new(Semaphore::new(limit.max(1))),
             inflight: Arc::new(Mutex::new(HashSet::new())),
-            resolver: None,
             provisioner: None,
+            ledger: Arc::new(ResourceLedger::new(capacity)),
         }
     }
 
-    /// wire the node-local blob read path envelope prompts resolve through.
-    /// a builder (not a constructor arm) so existing embedders and tests
-    /// keep compiling; without it, prompt-pinned envelopes fail loudly.
-    pub fn with_resolver(mut self, resolver: crate::BlobResolver) -> Self {
-        self.resolver = Some(resolver);
-        self
-    }
-
-    /// wire the host-side workspace provisioner runs materialize through —
-    /// mirrors [`Self::with_resolver`]. without it the pool takes the dormant
-    /// branch: the provider's raw text is delivered verbatim, no workspace
-    /// exists. the production binaries always wire one.
+    /// wire the host-side workspace provisioner runs materialize through — a
+    /// builder (not a constructor arm) so embedders and tests keep compiling.
+    /// without it the pool takes the dormant branch: the provider's raw text is
+    /// delivered verbatim, no workspace exists — and, since the soul is
+    /// assembled from MATERIALIZED skill mounts, no context document either.
+    /// the production binaries always wire one.
     pub fn with_provisioner(mut self, provisioner: SharedProvisioner) -> Self {
         self.provisioner = Some(provisioner);
         self
@@ -174,9 +176,18 @@ impl DispatchPool {
         let deliver = self.deliver.clone();
         let semaphore = self.semaphore.clone();
         let inflight = self.inflight.clone();
-        let resolver = self.resolver.clone();
         let provisioner = self.provisioner.clone();
+        let ledger = self.ledger.clone();
         (self.spawn)(Box::pin(async move {
+            // reserve BEFORE the semaphore acquire: capacity was already
+            // promised at gate time, so a run queued behind the cap still
+            // holds its share while it waits. held to the end of THIS task
+            // (the whole async block) via the guard's Drop — every exit path
+            // (ok, error, panic-unwind) releases. demandless jobs (empty
+            // `job.demands`) reserve nothing: `reserve` is a no-op on the
+            // legacy path.
+            let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
+            let _reservation = ledger.reserve(&reservation_key, &job.demands);
             let run = async {
                 // over-cap runs queue HERE, on their own task. the heartbeat
                 // below already runs while they wait, so a healthy local
@@ -190,17 +201,20 @@ impl DispatchPool {
                 // immutable for the process lifetime — this is just how the
                 // borrow crosses.
                 match providers.resolve(&job.capability) {
-                    // the envelope step runs on the spawned task too — prompt
-                    // resolution is a blob read, not host-loop work. its errors
+                    // the envelope step runs on the spawned task too. its errors
                     // are the run's result: a saga Err, never a silent fallback.
                     Ok(provider) => {
-                        match crate::envelope::prepare(&job.input, resolver.as_ref()).await {
+                        match crate::envelope::prepare(&job.input).await {
                             Ok(mut prepared) => {
                                 // the live-output registry key: the dispatch_id half of
                                 // the saga id, exactly what the app's PendingRun rows
                                 // expose — set before execute so BOTH the dormant and
                                 // provisioned paths carry it into provider.run.
                                 prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
+                                // the run's numeric demands ride into RunContext so a
+                                // Podman-backed provider can enforce them as container
+                                // limits; a Direct backend ignores them.
+                                prepared.ctx.limits = job.demands.clone();
                                 execute(&job, prepared, provider, provisioner.as_ref())
                                     .await
                                     .map_err(clean_error)
@@ -303,6 +317,8 @@ async fn execute(
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
+        // the committed library grant, straight through to the assembler.
+        library_readable: plan.library_readable,
     };
     // (a)+(b) materialize OUTSIDE storage — bounded: a stalled actor lane
     // fails this attempt instead of pinning a pool permit to the saga
@@ -387,7 +403,7 @@ async fn execute(
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchPool {
     async fn run(&self, event: &Event) -> Result<WorkOutcome, host::worker::Error> {
-        match gate(&self.providers, &self.node_key, event) {
+        match gate(&self.providers, &self.node_key, &self.ledger, event) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
             Gated::Skip => Ok(WorkOutcome::Handled(None)),
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
@@ -550,7 +566,14 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                limit,
+                Default::default(),
+            ),
             rx,
         )
     }
@@ -571,6 +594,7 @@ format = "text"
                     dispatch_id: "d1".into(),
                     capability: "alpha".into(),
                     payload: payload.to_vec(),
+                    demands: Default::default(),
                 }),
                 deadline: None,
                 assignee: assignee.map(|a| a.to_vec()),
@@ -579,7 +603,7 @@ format = "text"
     }
 
     fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Event {
-        effect_with_payload(saga_id, attempt, assignee, &envelope_payload(None))
+        effect_with_payload(saga_id, attempt, assignee, &envelope_payload())
     }
 
     /// what an unprovisioned pool delivers for [`envelope_payload`]: the raw
@@ -789,12 +813,11 @@ format = "text"
     }
 
     /// a v3 duckfs run envelope — the shape the composer emits for every run.
-    fn envelope_payload(prompt_hash: Option<&str>) -> Vec<u8> {
+    fn envelope_payload() -> Vec<u8> {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
             "agent_display_name": "BOT",
-            "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
@@ -805,6 +828,7 @@ format = "text"
                 "source_snapshot": "aa".repeat(32)
             },
             "skills": [
+                {"name":"persona","source_prefix":"/shared/skills/persona","always": true},
                 {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
             ],
             "result_contract": {"ducktape_runner_result": 1}
@@ -818,7 +842,7 @@ format = "text"
         let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (pool, mut rx) = pool_with(providers, 4);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None));
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload());
         pool.run(&eff).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
         assert_eq!(
@@ -850,67 +874,11 @@ format = "text"
         assert_eq!(ctx.run_key.as_deref(), Some("d1"));
     }
 
-    #[tokio::test]
-    async fn a_wired_resolver_feeds_the_agents_real_prompt() {
-        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let spawn: SpawnFn = Box::new(|fut| {
-            tokio::spawn(fut);
-        });
-        let deliver: DeliverFn = Arc::new(move |msg| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                let _ = tx.unbounded_send(msg);
-            })
-        });
-        let resolver: crate::BlobResolver = Arc::new(|digest: &[u8; 32]| {
-            let hit = (*digest == [7u8; 32]).then(|| b"You are Bot.".to_vec());
-            Box::pin(async move { hit })
-        });
-        let pool = DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, 4)
-            .with_resolver(resolver);
-
-        let hex = "07".repeat(32);
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(Some(&hex)));
-        pool.run(&eff).await.unwrap();
-        let (_, _, outcome) = next_result(&mut rx).await;
-        assert_eq!(
-            outcome.unwrap(),
-            b"answer to: You are Bot.\n\nCONTRACT\n\nCONVERSATION".to_vec(),
-            "the registered prompt replaces the generic instructions"
-        );
-        let (input, _) = probes.last_run.lock().unwrap().clone().unwrap();
-        assert!(
-            !input.contains("GENERIC"),
-            "no silent generic fallback: {input:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_prompt_pinned_envelope_without_a_resolver_fails_the_saga_loudly() {
-        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
-        let (pool, mut rx) = pool_with(providers, 4); // no with_resolver
-
-        let hex = "07".repeat(32);
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(Some(&hex)));
-        pool.run(&eff).await.unwrap();
-        let (saga_id, attempt, outcome) = next_result(&mut rx).await;
-        assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
-        let err = outcome.unwrap_err();
-        assert!(err.contains("no blob resolver"), "got: {err}");
-        assert!(err.contains("bot"), "names the agent: {err}");
-        assert_eq!(
-            probes.executions.load(Ordering::SeqCst),
-            0,
-            "the provider is never invoked on a failed resolution"
-        );
-    }
-
     // ---- the portable (v3) provisioning bracket -----------------------------
 
     /// the same v3 duckfs envelope, named for the provisioning-bracket tests.
     fn v3_envelope_payload() -> Vec<u8> {
-        envelope_payload(None)
+        envelope_payload()
     }
 
     /// a forge-sourced v3 run envelope — the EXACT byte shapes task 1's
@@ -921,7 +889,6 @@ format = "text"
             "ducktape_run": 3,
             "agent_id": "bot",
             "agent_display_name": "BOT",
-            "prompt_hash": null,
             "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
@@ -971,6 +938,7 @@ format = "text"
             let (src, snap) = spec.source.receipt_coords();
             Ok(Box::new(MockWs {
                 dir,
+                context_doc: Some("# persona\nYou are Bot.".into()),
                 src,
                 snap,
                 env,
@@ -983,6 +951,9 @@ format = "text"
 
     struct MockWs {
         dir: PathBuf,
+        /// the assembled soul the real provisioner hands back — the pool must
+        /// carry it onto the RunContext, or the agent runs without its persona.
+        context_doc: Option<String>,
         src: String,
         snap: Option<String>,
         env: BTreeMap<String, String>,
@@ -1003,6 +974,9 @@ format = "text"
         }
         fn path_entries(&self) -> Vec<PathBuf> {
             Vec::new()
+        }
+        fn context_doc(&self) -> Option<String> {
+            self.context_doc.clone()
         }
         async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
             self.committed.store(true, Ordering::SeqCst);
@@ -1049,8 +1023,15 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, 4)
-                .with_provisioner(provisioner),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                4,
+                Default::default(),
+            )
+            .with_provisioner(provisioner),
             rx,
         )
     }
@@ -1109,6 +1090,16 @@ format = "text"
             "the run-scoped workspace env was applied"
         );
         assert!(ctx.portable, "a v3 run is portable");
+        // the SOUL crosses provisioner → RunContext. it is assembled from the
+        // MATERIALIZED skill mounts (only the provisioner can read them), so
+        // this hop is the only way the persona ever reaches the model —
+        // capability-host then picks the door (the CLI's auto-load file, or a
+        // prepend to the stdin prompt).
+        assert_eq!(
+            ctx.context_doc.as_deref(),
+            Some("# persona\nYou are Bot."),
+            "the provisioned context doc must ride into the run"
+        );
     }
 
     /// a probe provisioner that captures the [`WorkspaceSpec::ro_mounts`] it is
@@ -1171,12 +1162,19 @@ format = "text"
         pool.run(&eff).await.unwrap();
         let _ = next_result(&mut rx).await;
 
+        // both composed skills become ro mounts, IN CURATION ORDER, each
+        // carrying its load mode: the provisioner assembles the run's soul from
+        // exactly this — inline the `always` bodies, index the rest — so an
+        // order or a mode dropped here is a different agent.
         let mounts = captured.lock().unwrap().clone();
-        assert_eq!(mounts.len(), 1, "the one composed skill became a ro mount");
-        assert_eq!(mounts[0].mount_subpath, "release");
-        assert_eq!(mounts[0].source_prefix, "/shared/skills/release");
+        assert_eq!(mounts.len(), 2, "both composed skills became ro mounts");
+        assert_eq!(mounts[0].mount_subpath, "persona");
+        assert!(mounts[0].always, "the persona skill inlines");
+        assert_eq!(mounts[1].mount_subpath, "release");
+        assert_eq!(mounts[1].source_prefix, "/shared/skills/release");
+        assert!(!mounts[1].always, "an unmarked skill is on-demand");
         assert_eq!(
-            mounts[0].source_snapshot.as_deref(),
+            mounts[1].source_snapshot.as_deref(),
             Some("bb".repeat(32).as_str())
         );
     }
@@ -1643,7 +1641,7 @@ format = "text"
         assert!(err.contains("no ducktape_run envelope marker"), "got {err}");
 
         let mut v2: serde_json::Value =
-            serde_json::from_slice(&envelope_payload(None)).unwrap();
+            serde_json::from_slice(&envelope_payload()).unwrap();
         v2["ducktape_run"] = serde_json::json!(2);
         pool.run(&effect_with_payload(
             "s2",
@@ -1971,8 +1969,14 @@ format = "text"
                 let _ = tx.unbounded_send(msg);
             })
         });
-        let pool =
-            DispatchPool::with_limit(providers, b"me".to_vec(), Box::new(|_fut| {}), deliver, 0);
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            Box::new(|_fut| {}),
+            deliver,
+            0,
+            Default::default(),
+        );
         // a zero cap would deadlock every run; the pool clamps to 1.
         assert_eq!(pool.semaphore.available_permits(), 1);
     }

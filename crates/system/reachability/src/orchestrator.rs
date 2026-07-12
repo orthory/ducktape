@@ -424,10 +424,39 @@ pub type CoordinatorAuth = Option<(
 /// of busy resolves can never starve the keepalive past the coordinator's
 /// registration TTL. With NO coordinators configured every resolution is
 /// `Advertised` and no task is spawned.
+///
+/// Establishment (reflexive discovery + registration) happens IN the task,
+/// not at construction: a coordinator that is unreachable at boot — the
+/// machine woke before its network, the coordinator restarted — must not
+/// cost the process its rendezvous for life. Until establishment lands,
+/// `resolve()` answers with a prompt, honest error and the task retries
+/// with backoff; [`Self::status`] observes the transitions.
 pub struct NatResolver {
     commands: Option<tokio::sync::mpsc::Sender<ResolveCmd>>,
-    reflexive: Option<SocketAddr>,
+    status: Option<tokio::sync::watch::Receiver<RendezvousStatus>>,
 }
+
+/// Where rendezvous establishment currently stands, observable via
+/// [`NatResolver::status`]. Terminal state is `Ready`; `Unavailable` means
+/// the establish task is between backoff retries, still self-healing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendezvousStatus {
+    /// The first discovery attempt has not concluded yet.
+    Establishing,
+    /// `attempts` establishment rounds have failed; the next retry is
+    /// scheduled (backoff doubles up to [`ESTABLISH_RETRY_MAX`]).
+    Unavailable { attempts: u32 },
+    /// Registered — the coordinator observed this node at `reflexive`.
+    Ready { reflexive: SocketAddr },
+}
+
+/// Backoff bounds for rendezvous establishment retries. The first attempt
+/// fires immediately at spawn (a healthy boot is Ready within milliseconds);
+/// failures then retry at 3 s doubling to 30 s — fast enough that "the
+/// laptop's Wi-Fi came up ten seconds after the node" heals promptly, slow
+/// enough that a long outage never floods a dead route.
+const ESTABLISH_RETRY_MIN: Duration = Duration::from_secs(3);
+const ESTABLISH_RETRY_MAX: Duration = Duration::from_secs(30);
 
 enum ResolveCmd {
     Resolve {
@@ -470,7 +499,7 @@ impl NatResolver {
         if coordinators.is_empty() {
             return Ok(Self {
                 commands: None,
-                reflexive: None,
+                status: None,
             });
         }
         let client = match auth {
@@ -479,54 +508,193 @@ impl NatResolver {
             }
             None => NatClient::bind_multi(key, coordinators).await?,
         };
-        Self::from_client(client, keepalive).await
+        Ok(Self::from_client(client, keepalive))
     }
 
     /// Stand the resolver up over an ALREADY-CONSTRUCTED client — socket
     /// mode's path, where the client rides the WireGuard underlay socket
     /// (`nat_traversal::NatSocket::Shared`) so the punch originates from the
-    /// tunnel's own 5-tuple. Discovers the reflexive, registers, and spawns
-    /// the pump exactly like [`Self::bind`].
-    pub async fn from_client(client: NatClient, keepalive: Duration) -> std::io::Result<Self> {
-        Self::from_client_with_datagram_sink(client, keepalive, None).await
+    /// tunnel's own 5-tuple. Establishment happens in the spawned task,
+    /// exactly like [`Self::bind`].
+    pub fn from_client(client: NatClient, keepalive: Duration) -> Self {
+        Self::from_client_with_datagram_sink(client, keepalive, None)
     }
 
     /// [`Self::from_client`] plus an explicit datagram sink. Non-rendezvous
     /// datagrams received on the socket are forwarded to `datagrams`, which
     /// lets invite-intro bootstrap share the WireGuard underlay socket without
     /// changing the default rendezvous-only event stream.
-    pub async fn from_client_with_datagram_sink(
-        mut client: NatClient,
+    ///
+    /// Infallible: reflexive discovery and registration are the spawned
+    /// task's job, retried with backoff until a coordinator answers — a
+    /// coordinator that is dark AT BOOT must not disable rendezvous for the
+    /// life of the process (it used to: the one-shot construction failure
+    /// degraded the caller to a permanent pass-through resolver).
+    pub fn from_client_with_datagram_sink(
+        client: NatClient,
         keepalive: Duration,
         datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
-    ) -> std::io::Result<Self> {
-        let (_idx, reflexive) = client
-            .discover_reflexive_failover(COORD_STEP_TIMEOUT)
-            .await?;
-        client.register().await?;
-        let client = std::sync::Arc::new(client);
-        // The keepalive is SEND-ONLY (readvertise never touches the recv
-        // side), so it runs as its own task on the shared socket: the same
-        // socket keeps the same NAT pinhole and coordinator mapping, while a
-        // resolve() that runs for its full budget can no longer delay the
-        // keepalive past the registration TTL. It holds a Weak handle and
-        // exits within one interval of the pump dropping the client.
-        tokio::spawn(rendezvous_keepalive(
-            std::sync::Arc::downgrade(&client),
-            keepalive,
-        ));
+    ) -> Self {
+        let (status_tx, status_rx) = tokio::sync::watch::channel(RendezvousStatus::Establishing);
         let (commands, rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(rendezvous_pump(client, rx, datagrams));
-        Ok(Self {
+        tokio::spawn(establish_then_pump(
+            client, rx, datagrams, status_tx, keepalive,
+        ));
+        Self {
             commands: Some(commands),
-            reflexive: Some(reflexive),
+            status: Some(status_rx),
+        }
+    }
+
+    /// The coordinator-observed reflexive address, once establishment landed —
+    /// what a NATed node should advertise as its WireGuard endpoint. `None`
+    /// while establishment is still retrying (and always, for the
+    /// pass-through resolver).
+    pub fn reflexive(&self) -> Option<SocketAddr> {
+        self.status.as_ref().and_then(|s| match *s.borrow() {
+            RendezvousStatus::Ready { reflexive } => Some(reflexive),
+            _ => None,
         })
     }
 
-    /// The coordinator-observed reflexive address, when one was discovered —
-    /// what a NATed node should advertise as its WireGuard endpoint.
-    pub fn reflexive(&self) -> Option<SocketAddr> {
-        self.reflexive
+    /// Watch rendezvous establishment transitions (`Establishing` →
+    /// `Unavailable{attempts}`* → `Ready`). `None` for the pass-through
+    /// resolver (no coordinators configured).
+    pub fn status(&self) -> Option<tokio::sync::watch::Receiver<RendezvousStatus>> {
+        self.status.clone()
+    }
+}
+
+/// Reply to a command that arrived before rendezvous establishment landed:
+/// a prompt, honest error. A caller parked forever on one of these replies
+/// is exactly the silent stall the establish task exists to prevent.
+fn reply_not_established(cmd: ResolveCmd, attempts: u32) {
+    let err = format!(
+        "rendezvous not established yet (no coordinator answered, {attempts} attempt(s)) — \
+         retrying in the background"
+    );
+    match cmd {
+        ResolveCmd::Resolve { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        ResolveCmd::SendDatagram { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        ResolveCmd::SendDatagramAndRecv { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+    }
+}
+
+/// Establish rendezvous (reflexive discovery + registration, retried with
+/// backoff), then run the pump. Commands arriving during establishment are
+/// answered with an honest not-ready error instead of queueing unanswered;
+/// between attempts the socket stays served (punch-backs, datagram
+/// forwarding) so the shared-underlay paths that need no coordinator keep
+/// working while the coordinator is dark.
+async fn establish_then_pump(
+    mut client: NatClient,
+    mut commands: tokio::sync::mpsc::Receiver<ResolveCmd>,
+    datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    status: tokio::sync::watch::Sender<RendezvousStatus>,
+    keepalive: Duration,
+) {
+    let mut attempts = 0u32;
+    let mut backoff = ESTABLISH_RETRY_MIN;
+    let reflexive = loop {
+        // Scoped so the attempt future (and its &mut borrow of the client)
+        // is dropped before the backoff arm below serves the socket.
+        let outcome = {
+            let attempt = async {
+                let (_idx, reflexive) =
+                    client.discover_reflexive_failover(COORD_STEP_TIMEOUT).await?;
+                client.register().await?;
+                Ok::<SocketAddr, std::io::Error>(reflexive)
+            };
+            tokio::pin!(attempt);
+            loop {
+                tokio::select! {
+                    res = &mut attempt => break res,
+                    cmd = commands.recv() => match cmd {
+                        Some(cmd) => reply_not_established(cmd, attempts),
+                        // Resolver dropped — nothing left to establish for.
+                        None => return,
+                    },
+                }
+            }
+        };
+        match outcome {
+            Ok(reflexive) => break reflexive,
+            Err(_unreachable) => {
+                attempts += 1;
+                let _ = status.send(RendezvousStatus::Unavailable { attempts });
+                let wait = tokio::time::sleep(backoff);
+                tokio::pin!(wait);
+                loop {
+                    tokio::select! {
+                        _ = &mut wait => break,
+                        cmd = commands.recv() => match cmd {
+                            Some(cmd) => reply_not_established(cmd, attempts),
+                            None => return,
+                        },
+                        ev = client.recv_socket_event() => {
+                            handle_idle_socket_event(&client, ev, datagrams.as_ref()).await;
+                        }
+                    }
+                }
+                backoff = (backoff * 2).min(ESTABLISH_RETRY_MAX);
+            }
+        }
+    };
+    let _ = status.send(RendezvousStatus::Ready { reflexive });
+    let client = std::sync::Arc::new(client);
+    // The keepalive is SEND-ONLY (readvertise never touches the recv
+    // side), so it runs as its own task on the shared socket: the same
+    // socket keeps the same NAT pinhole and coordinator mapping, while a
+    // resolve() that runs for its full budget can no longer delay the
+    // keepalive past the registration TTL. It holds a Weak handle and
+    // exits within one interval of the pump dropping the client. Spawned
+    // only now — readvertising before the first registration would be
+    // datagrams at a coordinator that never observed us.
+    tokio::spawn(rendezvous_keepalive(
+        std::sync::Arc::downgrade(&client),
+        keepalive,
+    ));
+    rendezvous_pump(client, commands, datagrams).await
+}
+
+/// The pump's idle-arm socket handling, shared with the establishment
+/// backoff wait: answer punch-backs, forward non-rendezvous datagrams, and
+/// pace transient recv errors so a broken socket cannot spin the loop hot.
+async fn handle_idle_socket_event(
+    client: &NatClient,
+    ev: std::io::Result<SocketEvent>,
+    datagrams: Option<&tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+) {
+    match ev {
+        Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. })) => {
+            // The passive half of a peer's rendezvous: open our pinhole
+            // toward the address the coordinator vouched for. Bounded — one
+            // punch per coordinator-sourced PunchSync (the active side's
+            // per-try re-Lookup drives repeats).
+            let _ = client.send_punch_to(peer_reflexive).await;
+        }
+        Ok(SocketEvent::Datagram { src, bytes }) => {
+            if let Some(datagrams) = datagrams {
+                let _ = datagrams.try_send((src, bytes));
+            }
+        }
+        Ok(_) => {}
+        Err(_) => {
+            // A transient recv error (interface flap, ENOBUFS) must not kill
+            // rendezvous for the rest of the process — the old per-call
+            // clients isolated failures to one resolve, and this loop must
+            // not be weaker. Back off briefly so a persistently-broken
+            // socket cannot spin hot; if it IS permanently dead, every
+            // resolve() surfaces its own error exactly like the pre-pump
+            // code did.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -655,40 +823,10 @@ async fn rendezvous_pump(
                     }
                 }
             }
-            ev = client.recv_socket_event() => match ev {
-                Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. })) => {
-                    // The passive half of a peer's rendezvous: open our
-                    // pinhole toward the address the coordinator vouched for.
-                    // Bounded — one punch per coordinator-sourced PunchSync
-                    // (the active side's per-try re-Lookup drives repeats).
-                    let _ = client.send_punch_to(peer_reflexive).await;
-                }
-                Ok(SocketEvent::Datagram { src, bytes }) => {
-                    forward_datagram(&datagrams, src, bytes);
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    // A transient recv error (interface flap, ENOBUFS) must
-                    // not kill rendezvous for the rest of the process — the
-                    // old per-call clients isolated failures to one resolve,
-                    // and the pump must not be weaker. Back off briefly so a
-                    // persistently-broken socket cannot spin the loop hot;
-                    // if it IS permanently dead, every resolve() surfaces
-                    // its own error exactly like the pre-pump code did.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            },
+            ev = client.recv_socket_event() => {
+                handle_idle_socket_event(&client, ev, datagrams.as_ref()).await;
+            }
         }
-    }
-}
-
-fn forward_datagram(
-    datagrams: &Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
-    src: SocketAddr,
-    bytes: Vec<u8>,
-) {
-    if let Some(datagrams) = datagrams {
-        let _ = datagrams.try_send((src, bytes));
     }
 }
 
@@ -1396,14 +1534,30 @@ where
         let mut applied = peers.clone();
         self.merge_invite_layer(&mut applied);
         let parts: Vec<PeerTunnelConfig> = applied.values().cloned().collect();
-        match apply_peer_tunnels(
-            &mut self.effect,
-            self.interface.clone(),
-            self.keypair.private_key_base64(),
-            self.config.wireguard_port,
-            &local_interface_ips,
-            &parts,
-        ) {
+        // the invite bootstrap may have brought the interface up before the
+        // first epoch event (a NATed member re-running first contact at
+        // boot) — reconfigure it rather than re-create it, so the restore
+        // neither dies on `AlreadyCreated` nor drops the live join tunnel.
+        let outcome = if self.interface_live {
+            update_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_port,
+                &local_interface_ips,
+                &parts,
+            )
+        } else {
+            apply_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_port,
+                &local_interface_ips,
+                &parts,
+            )
+        };
+        match outcome {
             Ok(()) => {
                 self.interface_live = true;
                 // the restored mesh is the interface's base — the pre-warm
@@ -2474,10 +2628,35 @@ where
     /// Merge the join-window invite layer into an assembled peer map: an
     /// invite peer never overrides an entry the stronger layers (validated
     /// plans, restored mesh, pre-warm records) already carry — and once one
-    /// exists for the same identity, the invite entry has served its purpose
-    /// and dissolves.
+    /// with a CONCRETE endpoint exists for the same identity, the invite
+    /// entry has served its purpose and dissolves.
+    ///
+    /// An endpoint-less stronger entry (a NATed peer's record advertises
+    /// nothing) instead has the invite entry's endpoint grafted in: the
+    /// invite endpoint is OBSERVED — the intro datagram's source, or the
+    /// rendezvous-resolved path — and dropping it for `None` on an
+    /// endpoint-less pair leaves BOTH sides unable to initiate, killing the
+    /// live tunnel the join rode (and with it a fresh resident's only
+    /// statesync source, right as its standing lands). The retained endpoint
+    /// is what carries the cutover: a reconfigure-in-place apply keeps the
+    /// tunnel's live sessions outright (same key + same endpoint = unchanged
+    /// config), and the epoch apply's full interface rebuild can re-initiate
+    /// immediately instead of deadlocking endpoint-less.
     fn merge_invite_layer(&mut self, merged: &mut BTreeMap<ValidatorIdentity, PeerTunnelConfig>) {
-        self.invite_peers.retain(|id, _| !merged.contains_key(id));
+        self.invite_peers.retain(|id, invite| match merged.get_mut(id) {
+            Some(entry) => {
+                let graft = entry.endpoint.is_none()
+                    && entry.wireguard_public_key == invite.wireguard_public_key;
+                if graft {
+                    entry.endpoint = invite.endpoint;
+                }
+                // grafting keeps the invite entry (later re-merges rebuild
+                // `merged` from the still-endpoint-less records); a concrete
+                // or re-keyed stronger entry retires it.
+                graft
+            }
+            None => true,
+        });
         for (id, cfg) in &self.invite_peers {
             merged.entry(*id).or_insert_with(|| cfg.clone());
         }
@@ -3063,6 +3242,20 @@ mod tests {
         use super::super::*;
         use tokio::net::UdpSocket;
 
+        /// Wait (bounded) until a resolver's rendezvous establishment lands —
+        /// construction returns before discovery now, so tests that need a
+        /// live registration wait here first.
+        async fn ready(resolver: &NatResolver) {
+            let mut status = resolver.status().expect("resolver has coordinators");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !matches!(*status.borrow_and_update(), RendezvousStatus::Ready { .. }) {
+                    status.changed().await.expect("establish task alive");
+                }
+            })
+            .await
+            .expect("rendezvous must establish against a live coordinator");
+        }
+
         #[tokio::test]
         async fn passive_resolver_punches_back_while_idle() {
             // A real coordinator, open policy.
@@ -3078,9 +3271,11 @@ mod tests {
             let mut a = NatResolver::bind(a_key, vec![coord_addr], None)
                 .await
                 .unwrap();
-            let _b = NatResolver::bind(b_key, vec![coord_addr], None)
+            let b = NatResolver::bind(b_key, vec![coord_addr], None)
                 .await
                 .unwrap();
+            ready(&a).await;
+            ready(&b).await;
 
             // B NEVER calls resolve. Under the pre-pump code its socket sat
             // deaf outside resolve() windows: the coordinator's PunchSync
@@ -3113,7 +3308,7 @@ mod tests {
             // goes silent.
             let a_key = binding::node_key(ValidatorIdentity([0x0a; 32]));
             let x_key = binding::node_key(ValidatorIdentity([0x0f; 32]));
-            let _a = NatResolver::bind_with_keepalive(
+            let a = NatResolver::bind_with_keepalive(
                 a_key,
                 vec![coord_addr],
                 None,
@@ -3121,6 +3316,7 @@ mod tests {
             )
             .await
             .unwrap();
+            ready(&a).await;
             let x = nat_traversal::NatClient::bind(x_key, coord_addr)
                 .await
                 .unwrap();
@@ -3176,6 +3372,7 @@ mod tests {
             )
             .await
             .unwrap();
+            ready(&a).await;
             // X: a raw client (answers nothing) kept registered by a test task.
             let x = std::sync::Arc::new(
                 nat_traversal::NatClient::bind(x_key, coord_addr)
@@ -3213,6 +3410,72 @@ mod tests {
                 .await
                 .expect("bounded")
                 .expect("keepalives must survive a busy resolve");
+        }
+
+        #[tokio::test]
+        async fn rendezvous_establishes_in_background_when_the_coordinator_comes_up_late() {
+            // The boot-4 shape from the field: a node boots while its
+            // coordinator is unreachable (machine woke before Wi-Fi, or the
+            // coordinator restarted). Reserve an address, then leave it DARK.
+            let placeholder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let coord_addr = placeholder.local_addr().unwrap();
+            drop(placeholder);
+
+            let a_key = binding::node_key(ValidatorIdentity([0x2a; 32]));
+            let b_key = binding::node_key(ValidatorIdentity([0x2b; 32]));
+            let mut a = NatResolver::bind_with_keepalive(
+                a_key,
+                vec![coord_addr],
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .expect("a dark coordinator must not fail resolver construction");
+
+            // While establishment retries, a resolve is an HONEST, PROMPT
+            // error — never a hang (a caller parked on this reply is exactly
+            // the silent forever-stall this path used to produce).
+            let advertised: SocketAddr = "203.0.113.9:1".parse().unwrap();
+            let early = tokio::time::timeout(
+                Duration::from_secs(1),
+                a.resolve(b_key, advertised),
+            )
+            .await
+            .expect("resolve during establishment must answer promptly, not hang");
+            assert!(
+                early.is_err(),
+                "rendezvous cannot resolve before the coordinator ever answered"
+            );
+
+            // The coordinator comes up LATE, on the same address...
+            let coord_sock = UdpSocket::bind(coord_addr).await.unwrap();
+            tokio::spawn(nat_traversal::run_coordinator(
+                coord_sock,
+                nat_traversal::AuthPolicy::Open { require_pop: false },
+            ));
+
+            // ...and the resolver heals on its own: reflexive discovery and
+            // registration land without any caller re-driving construction.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while a.reflexive().is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the resolver must establish rendezvous once the coordinator answers"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Registration is live at the coordinator: a probe can look A up.
+            let probe = nat_traversal::NatClient::bind(
+                binding::node_key(ValidatorIdentity([0x2c; 32])),
+                coord_addr,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
+                .await
+                .expect("bounded")
+                .expect("the late-established registration must be resolvable");
         }
 
         #[tokio::test]

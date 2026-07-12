@@ -2,15 +2,19 @@
 #
 # `make install` builds the networked node and the desktop app, installs
 # ducktape-node into ~/.cargo/bin, and installs the app — on macOS
-# Ducktape.app into /Applications, on Linux the plain `ducktape` binary
-# into ~/.cargo/bin (next to ducktape-node, which the app resolves as a
-# sibling of its own executable). individual targets below for the pieces.
+# Ducktape.app into /Applications, on Linux the self-contained app dir
+# (binary + ducktape-node sidecar + pinned CEF runtime, resolved via the
+# binary's DT_RPATH of $ORIGIN) into ~/.ducktape/app with a `ducktape`
+# launcher symlink in ~/.cargo/bin. individual targets below for the pieces.
 
 CARGO ?= cargo
 BUN ?= bun
 BUILD_WITH ?= $(CURDIR)/ops/build-with.sh
 APP_DEST ?= /Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
+# Linux: the app's payload directory lives inside ducktape's own home so the
+# installed app is self-contained and launcher-spawnable (no LD_LIBRARY_PATH).
+DUCKTAPE_HOME ?= $(HOME)/.ducktape
 
 # The desktop shell runs on the standalone tauri-runtime-cef crate
 # (github.com/byeongsu-hong/tauri-runtime-cef) against published crates.io
@@ -100,11 +104,12 @@ web: app/node_modules
 	cd app && $(BUN) run build
 
 ## desktop build — stages the sidecar itself via beforeBuildCommand. on macOS
-## a bundle (.app + .dmg under target/release/bundle); on Linux the plain
-## binary at target/release/ducktape-desktop (--no-bundle: install-app wants
-## only the binary, and no deb/rpm/appimage packagers are needed). the dmg
-## post-fix hides .VolumeIcon.icns, which macOS 26 Finder would otherwise
-## show overlapping the app icon — see ops/fix-dmg.sh.
+## a bundle (.app + .dmg under target/release/bundle); on Linux a relocatable
+## self-contained dir + release tarball under target/release/bundle/linux
+## (ops/stage-linux-app.sh; --no-bundle because tauri's deb/rpm/appimage
+## packagers know nothing about the CEF payload — the staging script is the
+## Linux bundler). the dmg post-fix hides .VolumeIcon.icns, which macOS 26
+## Finder would otherwise show overlapping the app icon — see ops/fix-dmg.sh.
 ## on macOS the bundle MUST be built with the feat/cef tauri CLI: it copies
 ## "Chromium Embedded Framework.framework" and the CEF helper apps into the
 ## .app — the released npm @tauri-apps/cli knows nothing about CEF and
@@ -122,6 +127,7 @@ app: cef-env app/node_modules
 else
 app: cef-env app/node_modules
 	cd app && $(BUILD_WITH) $(BUN) run tauri build --no-bundle
+	bash ops/stage-linux-app.sh
 endif
 
 # re-run bun install whenever the manifest or lockfile changes, not just when
@@ -143,9 +149,14 @@ install-coordinator: cef-env
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
-## macOS: Ducktape.app -> $(APP_DEST); Linux: ducktape -> $(BIN_DEST),
-## alongside install-node's ducktape-node so the app's sidecar resolution
-## (a `ducktape-node` sibling of its own executable) finds it.
+## macOS: Ducktape.app -> $(APP_DEST); Linux: the staged self-contained dir
+## -> $(DUCKTAPE_HOME)/app (binary + ducktape-node sidecar + pinned CEF
+## runtime in ONE directory, so sidecar sibling-resolution and the DT_RPATH
+## $ORIGIN lookup both land beside the executable), plus a launcher symlink
+## in $(BIN_DEST) — a symlink, NOT a copy: ld.so resolves $ORIGIN through
+## symlinks to the real file's directory, while a copied binary would sit
+## beside no runtime and fall back to LD_LIBRARY_PATH, which is how a system
+## CEF of the wrong major version silently breaks IME.
 ifeq ($(UNAME_S),Darwin)
 install-app: app
 	mkdir -p "$(APP_DEST)"
@@ -155,10 +166,13 @@ install-app: app
 	@echo "installed $(APP_DEST)/Ducktape.app"
 else
 install-app: app
+	mkdir -p "$(DUCKTAPE_HOME)"
+	rm -rf "$(DUCKTAPE_HOME)/app"
+	cp -a target/release/bundle/linux/ducktape "$(DUCKTAPE_HOME)/app"
 	mkdir -p "$(BIN_DEST)"
-	install -m 755 target/release/ducktape-desktop "$(BIN_DEST)/ducktape"
-	@echo "installed $(BIN_DEST)/ducktape"
-	bash ops/install-desktop-entry.sh "$(BIN_DEST)/ducktape"
+	ln -sfn "$(DUCKTAPE_HOME)/app/ducktape" "$(BIN_DEST)/ducktape"
+	@echo "installed $(DUCKTAPE_HOME)/app ($(BIN_DEST)/ducktape -> app/ducktape)"
+	bash ops/install-desktop-entry.sh "$(DUCKTAPE_HOME)/app/ducktape"
 endif
 
 ## regenerate app/src/domain/stream.gen.ts from the stream contract

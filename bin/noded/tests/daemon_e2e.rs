@@ -529,6 +529,63 @@ fn full_surface_blocks_authorship_and_ws() {
     daemon.status(); // still alive, still answering.
 }
 
+/// read frames until block `height`'s module event and require a heartbeat
+/// carrying that height to have arrived FIRST — the per-block tip push, not
+/// the interval beat (which the loop tolerates at other heights).
+fn assert_tip_precedes_event(ws: &mut BufReader<TcpStream>, height: u64) {
+    let mut tip_seen = false;
+    loop {
+        let frame = Daemon::ws_read_json(ws);
+        if frame["type"] == "heartbeat" && frame["height"] == height {
+            tip_seen = true;
+            continue;
+        }
+        if frame["type"] == "event" {
+            assert_eq!(frame["op"]["height"], height, "event for block {height}");
+            assert!(
+                tip_seen,
+                "no tip heartbeat at height {height} arrived before its event"
+            );
+            return;
+        }
+    }
+}
+
+/// the tip rides the block wake itself: every committed block pushes a
+/// heartbeat frame with the new height BEFORE that block's module events, so
+/// a console's height ticks per block instead of waiting out the 3s timer
+/// beat. asserting the ordering on TWO consecutive blocks makes a
+/// coincidental timer beat unable to false-pass the test — two timer beats
+/// are 3s apart and cannot both land inside one test's submit window.
+#[test]
+fn block_commits_push_tip_heartbeats_before_their_events() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut ws = daemon.ws_connect();
+    let heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
+    assert_eq!(heartbeat["height"], 0);
+
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let _subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+    assert_eq!(block["height"], 1);
+    assert_tip_precedes_event(&mut ws, 1);
+
+    let (code, block) = daemon.submit("chat", post_message("general", "m1", "tick"), None);
+    assert_eq!(code, 200, "post failed: {block}");
+    assert_eq!(block["height"], 2);
+    assert_tip_precedes_event(&mut ws, 2);
+}
+
 #[test]
 fn agent_run_drains_oracle_effect_and_posts_reply() {
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -543,7 +600,6 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
 
-    let prompt_hash = vec![7u8; 32];
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
@@ -551,7 +607,6 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
                 "capability": "echo-model",
-                "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }
         }),
@@ -1249,6 +1304,49 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
     );
 }
 
+#[test]
+fn metrics_stream_topic_pushes_the_scrape_over_ws() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // commit one block so the ducktape series carry observed values.
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["metrics"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert_eq!(subscribed["topics"]["metrics"], "0", "fresh snapshot cursor");
+
+    // the subscribe replay pushes the first sample immediately — no wait for
+    // the next heartbeat tick — carrying the SAME exposition GET /metrics
+    // serves, stamped with the server-side sample instant as its cursor.
+    let tail = Daemon::ws_read_type(&mut ws, "tail");
+    assert_eq!(tail["topic"], "metrics");
+    let text = tail["item"]["text"].as_str().expect("scrape text");
+    assert!(
+        text.contains("ducktape_blocks_total"),
+        "stream sample carries the block series: {text}"
+    );
+    assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
+    let time_ms = tail["item"]["timeMs"].as_u64().expect("sample instant");
+    assert_eq!(tail["cursor"], time_ms.to_string());
+
+    // the next sample arrives on the heartbeat tick without any block moving.
+    let tail2 = Daemon::ws_read_type(&mut ws, "tail");
+    assert_eq!(tail2["topic"], "metrics");
+    assert!(
+        tail2["item"]["timeMs"].as_u64().expect("second instant") >= time_ms,
+        "tick samples advance monotonically"
+    );
+}
+
 // ============================================================================
 // off-loop oracle execution: REAL script-backed providers through the full
 // capability-host path, proving the daemon's command loop no longer awaits
@@ -1309,31 +1407,9 @@ fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, Str
     ]
 }
 
-/// upload `prompt` through the node-local blob lane and return its digest
-/// bytes — the pin `register_agent` commits. the run envelope carries this
-/// pin and the host REFUSES to run an agent whose prompt blob is not in the
-/// store (never a silent fallback to the generic instructions), so arming an
-/// agent uploads its prompt first — exactly what the app's save-agent flow
-/// does.
-fn put_prompt_blob(daemon: &Daemon, prompt: &str) -> Vec<u8> {
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", prompt.as_bytes());
-    assert_eq!(
-        code,
-        200,
-        "prompt blob upload failed: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let reply: serde_json::Value = serde_json::from_slice(&body).expect("blob reply json");
-    let digest = reply["digest"].as_str().expect("digest hex");
-    assert_eq!(digest.len(), 64, "sha256 hex digest: {digest}");
-    (0..digest.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&digest[i..i + 2], 16).expect("hex digest"))
-        .collect()
-}
-
-/// channel + uploaded prompt blob + registered agent + mention watch: the
-/// client-side trigger stack for one agent run in `channel`.
+/// channel + registered agent + mention watch: the client-side trigger stack
+/// for one agent run in `channel`. no prompt blob — an agent is its curated
+/// skills, and one that curates none still runs (it simply has no persona).
 fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
     let (code, block) = daemon.submit(
         "chat",
@@ -1343,10 +1419,6 @@ fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
         Some("owner"),
     );
     assert_eq!(code, 200, "create channel failed: {block}");
-    let prompt_hash = put_prompt_blob(
-        daemon,
-        &format!("You are {agent_id}, a daemon e2e test agent."),
-    );
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
@@ -1354,7 +1426,6 @@ fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
                 "agent_id": agent_id,
                 "display_name": agent_id,
                 "capability": tag,
-                "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }
         }),

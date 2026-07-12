@@ -18,6 +18,7 @@ import {
 } from "../../domain/transport";
 import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
+import { DEFAULT_AUTHOR } from "./state";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import { makeTransportStub } from "../../test/transport-stub";
@@ -82,7 +83,6 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
     filesRead: vi.fn(),
     filesHistory: vi.fn(),
     status: vi.fn().mockRejectedValue(new Error("empty test node")),
-    metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
     subscribe: vi.fn(() => () => {}),
     onStream: vi.fn(() => () => {}),
@@ -140,7 +140,6 @@ const QUACKBOT: AgentRecord = {
   owner: { external: [1] },
   display_name: "Quackbot",
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status: "active",
   created_at: 1,
@@ -286,7 +285,6 @@ const makeFakeNode = ({
         ...(publicKey ? { publicKey } : {}),
       }),
     ),
-    metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
     subscribe: vi.fn((topics: string[], handlers: TopicHandlers) => {
       for (const topic of topics) {
@@ -1587,6 +1585,64 @@ describe("submitTracked lifecycle", () => {
   });
 });
 
+// ── Rename: rejected op must not leave a phantom author ─
+//
+// `author` is the one optimistically-patched slice that is NOT chain-derived:
+// the completion/rollback refresh re-reads identity into `authorNames`, but
+// nothing re-derives `author` from it once it left the boot placeholder. A
+// rejected SetAccountName therefore needs its own rollback, and an unbound
+// node (whose rename the identity module rejects unconditionally) must be
+// refused up front instead of painting a name that can never land.
+
+describe("setDisplayName on the identity module", () => {
+  it("rolls the optimistic author back when the rename op is rejected", async () => {
+    // JESS_USER binds node key "aa" — the fake node reports it as self.
+    const { transport } = makeFakeNode({ users: [JESS_USER], publicKey: "aa" });
+    let reject!: (err: Error) => void;
+    vi.mocked(transport.submit).mockImplementation(
+      () => new Promise((_resolve, rej) => (reject = rej)),
+    );
+    renderConsole(transport);
+    // hydration adopted the chain's committed name for our own node.
+    await waitFor(() => expect(capturedState!.author).toBe("Jess K"));
+
+    await act(async () => {
+      capturedActions!.setDisplayName("오소리");
+    });
+
+    // preconfirmed render: the new name paints before the node answers.
+    expect(capturedState!.author).toBe("오소리");
+    expect(capturedState!.ops["account/name/self"].phase).toBe("pending");
+
+    await act(async () => {
+      reject(new Error("identity: origin node is not bound to an account"));
+    });
+
+    // the rejection un-paints the phantom name and keeps the why.
+    await waitFor(() => {
+      expect(capturedState!.ops["account/name/self"].phase).toBe("failed");
+      expect(capturedState!.author).toBe("Jess K");
+    });
+  });
+
+  it("refuses the rename up front while this node is unbound", async () => {
+    const { transport } = makeFakeNode(); // no accounts, no publicKey → unbound
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("connected").textContent).toBe("true"),
+    );
+
+    await act(async () => {
+      capturedActions!.setDisplayName("오소리");
+    });
+
+    expect(capturedState!.author).toBe(DEFAULT_AUTHOR);
+    expect(capturedState!.error).toContain("bind this node");
+    expect(capturedState!.ops["account/name/self"]).toBeUndefined();
+    expect(transport.submit).not.toHaveBeenCalled();
+  });
+});
+
 // ── Pages: snapshots vs in-flight ops ───────────────────
 
 describe("pages snapshot refresh vs in-flight ops", () => {
@@ -1740,6 +1796,64 @@ describe("pages snapshot refresh vs in-flight ops", () => {
       expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]);
       expect(capturedState!.activePageBlocks[1].text).toBe("hello world");
     });
+  });
+
+  // Tab/Shift+Tab, the alt-arrows, and drag-drop are all ONE MoveBlock op.
+  // Like every other page-block write it must paint at submit time — the
+  // projection re-nests the row instantly, and the consensus round-trip only
+  // finalizes the ledger record behind it.
+  it("renders a block move preconfirmed, before the node confirms", async () => {
+    const { transport } = makeFakeNode();
+    const pageBlock = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
+      parent: "p1",
+      page: "p1",
+      kind: "paragraph",
+      text: "",
+      checked: false,
+      children: [],
+      ...patch,
+    });
+    const tree = [
+      pageBlock({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a", "b"] }),
+      pageBlock({ id: "a", text: "first" }),
+      pageBlock({ id: "b", text: "second" }),
+    ];
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target !== "pages") return baseQuery(target, query);
+      if (query === "list_pages") {
+        return Promise.resolve({
+          page_list: [{ id: "p1", title: "Plan", parent: null }],
+        });
+      }
+      if ((query as { get_page?: unknown }).get_page) {
+        return Promise.resolve({ page: [...tree] });
+      }
+      return Promise.resolve({ comment_threads: [] });
+    });
+    // the submit never resolves: everything asserted below is the
+    // preconfirmed render alone, no refresh ever lands.
+    vi.mocked(transport.submit).mockImplementation(() => new Promise(() => {}));
+
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    await act(async () => {
+      capturedActions!.openPage("p1");
+    });
+    await waitFor(() =>
+      expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]),
+    );
+
+    // the Tab indent: b re-homes under its previous sibling a.
+    await act(async () => {
+      capturedActions!.movePageBlock({ blockId: "b", parent: "a", after: null });
+    });
+    const byId = new Map(capturedState!.activePageBlocks.map((b) => [b.id, b]));
+    expect(byId.get("p1")!.children).toEqual(["a"]);
+    expect(byId.get("a")!.children).toEqual(["b"]);
+    expect(byId.get("b")!.parent).toBe("a");
   });
 });
 

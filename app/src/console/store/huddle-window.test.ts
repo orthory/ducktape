@@ -20,6 +20,7 @@ const voice = (over: Partial<VoiceSlice> = {}): VoiceSlice => ({
   muted: true,
   status: "live",
   error: null,
+  errorNote: null,
   mediaNote: null,
   popped: true,
   cameraOn: false,

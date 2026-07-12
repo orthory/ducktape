@@ -27,10 +27,54 @@ mod menu;
 mod notify;
 mod permissions;
 mod rt;
+mod sandbox;
 mod touchid;
 mod tray;
 mod user_identity;
 mod workspaces;
+
+/// Refuse to run against a libcef other than the pinned distribution.
+///
+/// CEF's API-versioning lets a binary built for one CEF boot on another major
+/// version, with whole features silently absent instead of an error — a
+/// system cef-vaapi-bin 150 loads fine but has no GTK input-method
+/// integration, so fcitx/IME just goes dead. The DT_RPATH set in build.rs
+/// makes the binary prefer the runtime staged beside it, but if those files
+/// are missing ld.so falls back to LD_LIBRARY_PATH; turn that silent
+/// degradation into an actionable abort, in the browser process and every
+/// re-exec'd CEF subprocess alike.
+#[cfg(all(target_os = "linux", any(feature = "cef", feature = "dev-cef")))]
+fn assert_pinned_libcef() {
+    unsafe extern "C" {
+        // cef-dll-sys does not bind cef_version_info; libcef.so is already a
+        // link-time dependency, so declare the one entry point directly.
+        fn cef_version_info(entry: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    // SAFETY: cef_version_info reads static version data; no preconditions.
+    let loaded = unsafe {
+        (
+            cef_version_info(0),
+            cef_version_info(1),
+            cef_version_info(2),
+        )
+    };
+    let pinned = (
+        cef::sys::CEF_VERSION_MAJOR,
+        cef::sys::CEF_VERSION_MINOR,
+        cef::sys::CEF_VERSION_PATCH,
+    );
+    if loaded != pinned {
+        eprintln!(
+            "ducktape-desktop: loaded libcef.so is CEF {}.{}.{}, but this binary is built \
+             for CEF {}.{}.{}. A mismatched CEF boots but silently loses features (IME, \
+             input methods). Run the binary installed by `make install-app` (which stages \
+             the pinned CEF runtime beside it), and do not point LD_LIBRARY_PATH at a \
+             system CEF such as /usr/lib/cef.",
+            loaded.0, loaded.1, loaded.2, pinned.0, pinned.1, pinned.2,
+        );
+        std::process::exit(70);
+    }
+}
 
 /// Point the `duck://` scheme handler at the active node's browser-gateway
 /// base (from `/v1/gateway/browser`). The frontend calls this when a workspace
@@ -61,6 +105,9 @@ fn cef_command_line_args() -> Vec<(String, Option<String>)> {
 }
 
 fn main() {
+    #[cfg(all(target_os = "linux", any(feature = "cef", feature = "dev-cef")))]
+    assert_pinned_libcef();
+
     // Must precede the helper dispatch below AND tauri boot: CEF subprocesses
     // re-exec this binary and need the same custom-scheme registration, and
     // the browser process reads the switches/cache identifier at runtime init.
@@ -187,6 +234,7 @@ fn main() {
             notify::notify_recent,
             permissions::permission_prompt_state,
             permissions::permission_prompt_decide,
+            sandbox::sandbox_preflight,
         ]);
     builder = builder.plugin(tauri_plugin_notification::init());
     builder = builder

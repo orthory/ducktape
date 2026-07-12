@@ -119,7 +119,16 @@ export const enableJobWorker = (
 
 export const requestRun = (
   transport: NodeTransport,
-  params: { agentId: string; channelId: string; anchorSeq: number; origin: string },
+  params: {
+    agentId: string;
+    channelId: string;
+    anchorSeq: number;
+    origin: string;
+    /** Per-run resource demands (`RequestRun.demands`), dimension → positive
+     *  integer. Omitted from the wire when absent or empty — a missing key is
+     *  legacy-valid, but consensus rejects an empty map and zero values. */
+    demands?: Record<string, number>;
+  },
 ): Promise<BlockEvent> =>
   transport.submit(
     TARGET,
@@ -128,6 +137,9 @@ export const requestRun = (
         agent_id: params.agentId,
         channel_id: params.channelId,
         anchor_seq: params.anchorSeq,
+        ...(params.demands && Object.keys(params.demands).length > 0
+          ? { demands: params.demands }
+          : {}),
       },
     },
     params.origin,

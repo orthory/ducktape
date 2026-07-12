@@ -40,7 +40,7 @@ pub use interface::*;
 
 use std::collections::BTreeMap;
 
-use capability::validate_tag;
+use capability::{validate_resources, validate_tag};
 use saga::{
     SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, SagaQuery, SagaReply, decode_callback,
     decode_reply as saga_decode_reply, encode_msg as saga_encode_msg,
@@ -527,6 +527,7 @@ impl DispatchModule {
         dispatch_id: String,
         recipe_id: String,
         payload: Vec<u8>,
+        demands: BTreeMap<String, u64>,
     ) -> Result<(), Error> {
         // module-origin only: the dispatching module IS the receiver, so
         // results always have somewhere to land. an external submitter has
@@ -545,6 +546,10 @@ impl DispatchModule {
                 payload.len()
             )));
         }
+        // the same validate_resources invariant saga holds at trigger time —
+        // checked here too so a malformed demand set is attributed to THIS
+        // dispatch, not a downstream saga message.
+        validate_resources(&demands).map_err(Error::Module)?;
         let recipe = self
             .recipe(&recipe_id)
             .ok_or_else(|| Error::Module(format!("unknown recipe {recipe_id:?}")))?
@@ -571,6 +576,7 @@ impl DispatchModule {
                     dispatch_id: dispatch_id.clone(),
                     capability: recipe.capability.clone(),
                     payload,
+                    demands: demands.clone(),
                 }),
                 reply_to: Some(self.id.clone()),
                 reply_payload: key.clone().into_bytes(),
@@ -578,6 +584,10 @@ impl DispatchModule {
                 max_attempts: recipe.max_attempts,
                 lease_views: recipe.lease_views,
                 capability,
+                // the ONE source: the same `demands` value just cloned into
+                // the WorkSpec above, so the trigger and the spec can never
+                // drift apart.
+                demands,
                 pinned_assignee,
             }),
         });
@@ -788,7 +798,8 @@ impl DispatchModule {
                 dispatch_id,
                 recipe_id,
                 payload,
-            } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload),
+                demands,
+            } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload, demands),
             DispatchMsg::CancelDispatch { dispatch_id } => self.on_cancel(ctx, dispatch_id),
             DispatchMsg::ReassignDispatch {
                 dispatch_id,
@@ -1088,6 +1099,7 @@ mod tests {
             dispatch_id: id.into(),
             recipe_id: "summarize".into(),
             payload: payload.to_vec(),
+            demands: BTreeMap::new(),
         }
     }
     /// run register (as the external owner) + dispatch (as module "caller"),
@@ -1284,6 +1296,7 @@ mod tests {
                 dispatch_id: "d1".into(),
                 recipe_id: "nope".into(),
                 payload: b"x".to_vec(),
+                demands: BTreeMap::new(),
             },
         )
         .unwrap_err();
@@ -1340,6 +1353,54 @@ mod tests {
         commit(&mut m);
         assert!(get_dispatch(&m, &key).is_some());
         assert!(get_dispatch(&m, &dispatch_key("other", "d1")).is_some());
+    }
+
+    #[test]
+    fn dispatch_demands_reach_both_the_trigger_and_the_work_spec() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().with_origin(owner());
+        exec(
+            &mut m,
+            &mut ctx,
+            &register(OutputContract::Text, Routing::Rendezvous),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let demands = BTreeMap::from([("cores".to_string(), 4u64)]);
+        let mut caller = CaptureCtx::new()
+            .at(5)
+            .with_origin(Origin::Module("caller".into()));
+        exec(
+            &mut m,
+            &mut caller,
+            &DispatchMsg::Dispatch {
+                dispatch_id: "d1".into(),
+                recipe_id: "summarize".into(),
+                payload: b"input".to_vec(),
+                demands: demands.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(caller.msgs.len(), 1);
+        let SagaMsg::Trigger {
+            spec,
+            demands: trigger_demands,
+            ..
+        } = saga_decode_msg(&caller.msgs[0].payload).unwrap()
+        else {
+            panic!("expected a trigger");
+        };
+        // ONE source: the trigger's demands and the work spec's demands agree
+        // exactly with what was dispatched — no drift possible.
+        assert_eq!(trigger_demands, demands);
+        assert_eq!(crate::decode_work_spec(&spec).unwrap().demands, demands);
+    }
+
+    #[test]
+    fn work_spec_without_demands_field_still_decodes() {
+        let old = br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
+        assert!(crate::decode_work_spec(old).unwrap().demands.is_empty());
     }
 
     #[test]

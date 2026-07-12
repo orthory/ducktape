@@ -13,7 +13,8 @@ import { FinalizationMark } from "../../components/FinalizationMark";
 import { ConsoleContext } from "../../store/context";
 import type { OpRecord } from "../../store/finalization";
 import { AskAgentButton } from "./AskAgentButton";
-import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
+import { wallClockMillisOf } from "../../../domain/wire";
+import { authorKey, hasReacted, isAgentAuthor } from "./chat-helpers";
 import { blocksToInput } from "./chat-input";
 import { EmojiPicker } from "./EmojiPicker";
 import { HoverButton } from "./HoverButton";
@@ -30,14 +31,13 @@ const QUICK_REACTS = ["👍", "✅", "👀"];
 // complaint was the highlight stopping short of the edge, not the text measure.
 const CONTENT_MAX = 880;
 
-// `created_at` is UNIX SECONDS (the node's consensus_time) — multiply by 1000
-// to get a JS `Date`, or every message renders as "Jan 1, 1970".
-// Empty when the timestamp isn't real wall-clock (the node's consensus_time is
-// genesis-relative today) — better to show no time than a fake "09:21 AM".
-const timeOf = (createdAtSeconds: number): string =>
-  isWallClock(createdAtSeconds)
-    ? new Date(createdAtSeconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : "";
+// `created_at` is the node's consensus_time — millis, legacy seconds, or a
+// height counter depending on the lane (see domain/wire.ts). Empty when the
+// stamp isn't real wall-clock — better to show no time than a fake "09:21 AM".
+const timeOf = (createdAt: number): string => {
+  const ms = wallClockMillisOf(createdAt);
+  return ms === null ? "" : new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+};
 
 // ── Tiny local glyphs (Icon.tsx isn't ours to extend in this task) ─────
 
@@ -758,13 +758,13 @@ export function MessageItem({
   // A message we authored can be edited/deleted — the module rejects the write
   // from anyone else, so the affordances are hidden rather than shown-and-failing.
   const canModify = !deleted && authorKey(message.head.author) === selfKey;
-  // A committed chat message needs no per-row "confirmed" badge — every message
-  // is on-chain by definition, so a persistent checkmark is pure noise. Show the
-  // mark ONLY while a write is in flight (the pulsing dot) or if it FAILED (the
-  // cross); the settled state falls through to the plain gutter/header. The
-  // explorer deep-link moves to the overflow menu instead of a tiny clickable ✓.
+  // A message this session wrote keeps its mark through the WHOLE lifecycle —
+  // single check at send (preconfirmed), double check once the receipt lands —
+  // so delivery reads at a glance, like the pages blocks. Only rows in the
+  // session ledger carry one; history from elsewhere stays unbadged. The
+  // overflow menu keeps its explorer deep-link (the mark's popover has one
+  // too) for rows whose mark has pruned out of the capped ledger.
   const store = useContext(ConsoleContext);
-  const liveOp = op && op.phase !== "finalized" ? op : undefined;
   const explorerHeight =
     store && op?.phase === "finalized" && op.height !== undefined ? op.height : null;
   const openInExplorer =
@@ -809,11 +809,11 @@ export function MessageItem({
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
         {groupStart ? (
           <Avatar author={message.head.author} name={author} size={30} />
-        ) : liveOp ? (
-          // a grouped row has no meta line — an in-flight/failed mark takes the
-          // time gutter (and must stay hoverable, so it outranks the hover time)
+        ) : op ? (
+          // a grouped row has no meta line — the mark takes the time gutter
+          // (and must stay hoverable, so it outranks the hover time)
           <span style={{ marginTop: 4 }}>
-            <FinalizationMark op={liveOp} />
+            <FinalizationMark op={op} />
           </span>
         ) : hovered ? (
           <span style={{ font: `400 10px ${font.mono}`, color: color.muted2, marginTop: 4 }}>
@@ -845,7 +845,7 @@ export function MessageItem({
             {message.head.edited_at !== null && (
               <span style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>(edited)</span>
             )}
-            <FinalizationMark op={liveOp} />
+            <FinalizationMark op={op} />
           </div>
         )}
         <div

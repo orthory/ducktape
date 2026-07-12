@@ -257,6 +257,7 @@ function HuddleDockCard() {
             channelName={channel?.name ?? channelId}
             status={voice.status}
             error={voice.error}
+            errorNote={voice.errorNote}
             mediaNote={voice.mediaNote}
             participants={participants}
             ring={color.paper}

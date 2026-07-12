@@ -23,15 +23,35 @@ function BotGlyph({ size = 14 }: { size?: number }) {
   );
 }
 
+/** A resource-demand field's raw text → a positive integer, or null when it
+ *  should be omitted (blank, zero, negative, or non-numeric — consensus
+ *  rejects zero/empty, so those never go on the wire). */
+const dimValue = (raw: string): number | null => {
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
 function AskAgentPopover({
   agents,
   onPick,
   onClose,
 }: {
   agents: AgentRecord[];
-  onPick: (agentId: string) => void;
+  onPick: (agentId: string, demands?: Record<string, number>) => void;
   onClose: () => void;
 }) {
+  const [cores, setCores] = useState("");
+  const [memGb, setMemGb] = useState("");
+
+  const buildDemands = (): Record<string, number> | undefined => {
+    const demands: Record<string, number> = {};
+    const c = dimValue(cores);
+    const m = dimValue(memGb);
+    if (c !== null) demands.cores = c;
+    if (m !== null) demands.mem_gb = m;
+    return Object.keys(demands).length > 0 ? demands : undefined;
+  };
+
   // Escape + outside-click dismiss, attached one tick late so the click that
   // OPENED the popover doesn't immediately close it (mirrors EmojiPicker).
   useEffect(() => {
@@ -73,13 +93,50 @@ function AskAgentPopover({
       >
         ASK TO RESPOND
       </div>
+      <div style={{ display: "flex", gap: 6, padding: "0 6px 6px" }}>
+        {[
+          { label: "Cores", value: cores, set: setCores },
+          { label: "Memory (GB)", value: memGb, set: setMemGb },
+        ].map((field) => (
+          <label key={field.label} style={{ flex: 1, minWidth: 0, display: "grid", gap: 3 }}>
+            <span
+              style={{
+                font: `600 9px ${font.mono}`,
+                letterSpacing: ".06em",
+                color: color.muted2,
+              }}
+            >
+              {field.label.toUpperCase()}
+            </span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              inputMode="numeric"
+              placeholder="auto"
+              value={field.value}
+              onChange={(event) => field.set(event.target.value)}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "5px 7px",
+                borderRadius: radius.sm,
+                border: `1px solid ${color.borderSoft}`,
+                background: color.paper,
+                font: `400 11.5px ${font.sans}`,
+                color: color.ink,
+              }}
+            />
+          </label>
+        ))}
+      </div>
       <div style={{ maxHeight: 208, overflowY: "auto" }}>
         {agents.map((agent) => (
           <HoverButton
             key={agent.agent_id}
             onClick={(event) => {
               event.stopPropagation();
-              onPick(agent.agent_id);
+              onPick(agent.agent_id, buildDemands());
             }}
             style={{
               display: "flex",
@@ -152,8 +209,8 @@ export function AskAgentButton({
       {open && (
         <AskAgentPopover
           agents={active}
-          onPick={(agentId) => {
-            store.actions.requestRun({ agentId, channelId, anchorSeq: seq });
+          onPick={(agentId, demands) => {
+            store.actions.requestRun({ agentId, channelId, anchorSeq: seq, demands });
             setOpen(false);
           }}
           onClose={() => setOpen(false)}

@@ -113,6 +113,7 @@ fn trigger(id: &str, reply_to: Option<&str>) -> Msg {
             max_attempts: 1,
             lease_views: None,
             capability: None,
+            demands: Default::default(),
         }),
     }
 }

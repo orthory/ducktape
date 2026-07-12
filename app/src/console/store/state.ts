@@ -30,6 +30,9 @@ import type { VideoCapability } from "../../domain/video-capability";
 import { loadDevicePrefs } from "../../domain/media-devices";
 import type { DevicePrefs, HuddleDevices } from "../../domain/media-devices";
 import type { OpLedger } from "./finalization";
+// type-only: nav-history value-imports from this module, so the reverse edge
+// must stay erased at runtime.
+import type { NavStack } from "./nav-history";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 /** The two sidebar partitions the view-mode toggle switches between: the
@@ -50,6 +53,10 @@ export interface VoiceSlice {
   status: "idle" | "connecting" | "reconnecting" | "live" | "error";
   /** Why `status` is "error" — picks the dock's message. Null otherwise. */
   error: VoiceError | null;
+  /** The node's own refusal sentence, when it sent one (no call hub, overlay
+   *  down). Shown UNDER the message `error` picks: only the node knows which of
+   *  the several ways a huddle can fail actually happened. Null otherwise. */
+  errorNote: string | null;
   /** A transient media failure note (camera/screen acquire failed) — shown for a
    *  few seconds by the card surfaces, then auto-cleared. Never fatal. */
   mediaNote: "camera-failed" | "screen-failed" | null;
@@ -300,6 +307,11 @@ export interface ConsoleState {
    *  a repo-only focus. Null when nothing is pending. */
   forgeFocus: { repo: string; number: number | null } | null;
 
+  /** The duckfs path the files browser should open on next render — the same
+   *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an
+   *  operator at a skill document. Null when nothing is pending. */
+  filesFocus: string | null;
+
   /** The agent the agent view should select on next render — a clicked @agent
    *  mention's hand-off (the explorerFocus idiom: the mention sets it, AgentView
    *  consumes it and clears it). Null when nothing is pending. */
@@ -334,9 +346,14 @@ export interface ConsoleState {
   workspace: Workspace | null;
   /** Desktop with no active workspace → show the onboarding gate. */
   needsOnboarding: boolean;
-  /** The account-centric Home layer is showing (the workspace shell is hidden).
-   *  Not a disconnect — the node connection is kept alive underneath. */
+  /** The account-centric Home layer is showing (the workspace shell's routed
+   *  screen is hidden). Not a disconnect — the node connection is kept alive
+   *  underneath. */
   atHome: boolean;
+  /** Where the session sits in the webview's history stack — drives the title
+   *  bar's back/forward enablement. Owned by the provider's history effects
+   *  (see nav-history.ts). */
+  nav: NavStack;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
   /** The last guarded forget couldn't confirm the node left its valset (node
@@ -535,6 +552,14 @@ export const docTabsScope = (
 ): string =>
   workspaceId ? `workspace:${workspaceId}` : nodeUrl ? `remote:${nodeUrl}` : "session";
 
+/** A workspace or remote node is in context — the shell has surfaces to show
+ *  behind the Home layer. Nothing connected (smart boot, or after leaving a
+ *  workspace) means Home owns the whole window: no sidebar, no search, no
+ *  history traversal to fight it. */
+export const hasNodeContext = (
+  state: Pick<ConsoleState, "workspace" | "nodeUrl">,
+): boolean => state.workspace !== null || state.nodeUrl !== null;
+
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};
   const parsed: unknown = JSON.parse(raw);
@@ -709,6 +734,7 @@ export const createInitialState = (): ConsoleState => {
       muted: false,
       status: "idle",
       error: null,
+      errorNote: null,
       mediaNote: null,
       popped: false,
       cameraOn: false,
@@ -750,6 +776,8 @@ export const createInitialState = (): ConsoleState => {
     blocks: [],
     explorerFocus: null,
     forgeFocus: null,
+    filesFocus: null,
+
     agentFocus: null,
     memberFocus: null,
     ops: {},
@@ -760,6 +788,8 @@ export const createInitialState = (): ConsoleState => {
     workspace: null,
     needsOnboarding: false,
     atHome: false,
+    // the boot document is the stack's only entry until the sync effect stamps it
+    nav: { index: 0, count: 1 },
     onboardingBusy: false,
     forgetNeedsForce: false,
     deleteNeedsForce: null,
@@ -814,6 +844,8 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   blocks: [],
   explorerFocus: null,
   forgeFocus: null,
+  filesFocus: null,
+
   agentFocus: null,
   memberFocus: null,
   ops: {},

@@ -16,6 +16,7 @@ import { normalizeKey } from "../../../domain/names";
 import { identityState } from "../../../domain/user-identity-client";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import { isDesktop } from "../../../domain/workspace-client";
+import { hasNodeContext } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { CustodyCard } from "./CustodyCard";
@@ -51,7 +52,7 @@ export function HomeView() {
   const bound = nodeKeyNorm ? state.nodeUsers[nodeKeyNorm] : undefined;
   const accountId = bound?.accountId;
 
-  const disconnected = !state.workspace && !state.nodeUrl;
+  const disconnected = !hasNodeContext(state);
 
   return (
     <div

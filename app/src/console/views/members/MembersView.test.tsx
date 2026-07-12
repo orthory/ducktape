@@ -219,8 +219,15 @@ describe("MembersView", () => {
     ).not.toBeInTheDocument();
   });
 
+  // The row's rename writes an origin-gated SetAccountName, which identity
+  // rejects unless the submitting node is bound — so the affordance requires
+  // a nodeUsers binding, the same gate the Home profile card uses.
+  const boundLocalNode = {
+    nodeUsers: { [localKey]: { accountId: "1".repeat(64), name: "Founder Rae" } },
+  };
+
   it("lets this node rename itself inline, but offers no rename for peers", () => {
-    const { spies } = renderMembers();
+    const { spies } = renderMembers(boundLocalNode);
 
     // Exactly one rename control — the local node's own row.
     const renameButtons = screen.getAllByRole("button", { name: /rename yourself/i });
@@ -237,8 +244,15 @@ describe("MembersView", () => {
     expect(spies.setDisplayName).toHaveBeenCalledWith("Rae the Founder");
   });
 
+  it("offers no self-rename while this node is unbound to an account", () => {
+    renderMembers(); // no nodeUsers — identity would reject the rename op
+    expect(
+      screen.queryByRole("button", { name: /rename yourself/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("discards an inline rename on Escape without writing", () => {
-    const { spies } = renderMembers();
+    const { spies } = renderMembers(boundLocalNode);
 
     fireEvent.click(screen.getByRole("button", { name: /rename yourself/i }));
     const input = screen.getByLabelText("Edit your display name");
