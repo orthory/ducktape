@@ -30,6 +30,9 @@ import type { VideoCapability } from "../../domain/video-capability";
 import { loadDevicePrefs } from "../../domain/media-devices";
 import type { DevicePrefs, HuddleDevices } from "../../domain/media-devices";
 import type { OpLedger } from "./finalization";
+// type-only: nav-history value-imports from this module, so the reverse edge
+// must stay erased at runtime.
+import type { NavStack } from "./nav-history";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
 /** The two sidebar partitions the view-mode toggle switches between: the
@@ -343,9 +346,14 @@ export interface ConsoleState {
   workspace: Workspace | null;
   /** Desktop with no active workspace → show the onboarding gate. */
   needsOnboarding: boolean;
-  /** The account-centric Home layer is showing (the workspace shell is hidden).
-   *  Not a disconnect — the node connection is kept alive underneath. */
+  /** The account-centric Home layer is showing (the workspace shell's routed
+   *  screen is hidden). Not a disconnect — the node connection is kept alive
+   *  underneath. */
   atHome: boolean;
+  /** Where the session sits in the webview's history stack — drives the title
+   *  bar's back/forward enablement. Owned by the provider's history effects
+   *  (see nav-history.ts). */
+  nav: NavStack;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
   /** The last guarded forget couldn't confirm the node left its valset (node
@@ -543,6 +551,14 @@ export const docTabsScope = (
   nodeUrl: string | null,
 ): string =>
   workspaceId ? `workspace:${workspaceId}` : nodeUrl ? `remote:${nodeUrl}` : "session";
+
+/** A workspace or remote node is in context — the shell has surfaces to show
+ *  behind the Home layer. Nothing connected (smart boot, or after leaving a
+ *  workspace) means Home owns the whole window: no sidebar, no search, no
+ *  history traversal to fight it. */
+export const hasNodeContext = (
+  state: Pick<ConsoleState, "workspace" | "nodeUrl">,
+): boolean => state.workspace !== null || state.nodeUrl !== null;
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};
@@ -772,6 +788,8 @@ export const createInitialState = (): ConsoleState => {
     workspace: null,
     needsOnboarding: false,
     atHome: false,
+    // the boot document is the stack's only entry until the sync effect stamps it
+    nav: { index: 0, count: 1 },
     onboardingBusy: false,
     forgetNeedsForce: false,
     deleteNeedsForce: null,

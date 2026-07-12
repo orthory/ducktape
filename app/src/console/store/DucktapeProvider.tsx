@@ -61,6 +61,7 @@ import type { HuddleWindowCmd } from "./huddle-window";
 import {
   latchOneShots,
   navSnapshotOf,
+  navStackAfter,
   navTransition,
   readNavEntry,
   stampNav,
@@ -75,6 +76,7 @@ import {
   loadRemoteUrl,
   saveDocTabs,
 } from "./state";
+import type { ConsoleState } from "./state";
 
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
@@ -127,6 +129,18 @@ const parseNavigateTarget = (payload: unknown): NavigateTarget | null => {
     number: typeof raw.number === "number" ? raw.number : undefined,
   };
 };
+
+/** Mirror a history-stack move into state.nav (see navStackAfter). Bails to
+ *  the reducer's same-reference no-op when the position didn't change, so the
+ *  frequent selection replaces never churn a render. */
+const navStackUpdate =
+  (move: "push" | "replace" | "traverse", at: number) =>
+  (prev: ConsoleState): Partial<ConsoleState> => {
+    const nav = navStackAfter(move, at, prev.nav);
+    return nav.index === prev.nav.index && nav.count === prev.nav.count
+      ? {}
+      : { nav };
+  };
 
 export function DucktapeProvider({
   transport,
@@ -1058,7 +1072,11 @@ export function DucktapeProvider({
     const onPopState = (event: PopStateEvent) => {
       const entry = readNavEntry(event.state);
       if (!entry) return;
-      window.history.replaceState(stampNav(actions.applyNavSnapshot(entry)), "");
+      window.history.replaceState(
+        stampNav(actions.applyNavSnapshot(entry.snap), entry.index),
+        "",
+      );
+      dispatch({ type: "update", fn: navStackUpdate("traverse", entry.index) });
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -1072,14 +1090,20 @@ export function DucktapeProvider({
   //     must never touch the history stack.
   useEffect(() => {
     const entry = readNavEntry(window.history.state);
-    const next = latchOneShots(navSnapshotOf(state), entry);
-    switch (navTransition(next, entry)) {
-      case "push":
-        window.history.pushState(stampNav(next), "");
+    const next = latchOneShots(navSnapshotOf(state), entry?.snap ?? null);
+    switch (navTransition(next, entry?.snap ?? null)) {
+      case "push": {
+        const at = (entry?.index ?? 0) + 1;
+        window.history.pushState(stampNav(next, at), "");
+        dispatch({ type: "update", fn: navStackUpdate("push", at) });
         return;
-      case "replace":
-        window.history.replaceState(stampNav(next), "");
+      }
+      case "replace": {
+        const at = entry?.index ?? 0;
+        window.history.replaceState(stampNav(next, at), "");
+        dispatch({ type: "update", fn: navStackUpdate("replace", at) });
         return;
+      }
       case "none":
         return;
     }

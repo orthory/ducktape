@@ -12,7 +12,8 @@
 // recentmost committed data, never a stale copy.
 //
 // Only pure pieces live here (state → snapshot projection, entry
-// (de)serialization, the push/replace/none transition decision) so they are
+// (de)serialization, the push/replace/none transition decision, the stack
+// position the title bar's back/forward buttons enable from) so they are
 // unit-testable without React. The provider owns the two side-effect wirings
 // (nav-slice → history sync effect, the popstate listener); applying a
 // snapshot lives in actions.ts (applyNavSnapshot) beside the rehydrating
@@ -125,18 +126,52 @@ export const navTransition = (
     : "replace";
 };
 
+// ── Stack position ──────────────────────────────────────
+
+/** The store's picture of where the session sits in the webview's history
+ *  stack — drives the title bar's back/forward enablement. `count` covers our
+ *  own entries only (each carries its position, see NavEntry.i): a push
+ *  truncates the forward tail, while a replace or a traversal can only ever
+ *  reveal a deeper stack (e.g. a reload restoring a mid-stack entry). */
+export interface NavStack {
+  index: number;
+  count: number;
+}
+
+/** The stack after a move that lands on position `at` (a push's `at` is one
+ *  past the entry it left; a replace stays on the current one; a traversal
+ *  lands wherever popstate says). Pure so the provider's history effects stay
+ *  thin wiring. */
+export const navStackAfter = (
+  move: "push" | "replace" | "traverse",
+  at: number,
+  prev: NavStack,
+): NavStack => {
+  switch (move) {
+    case "push":
+      // pushing discards everything the webview held beyond the new entry
+      return { index: at, count: at + 1 };
+    case "replace":
+    case "traverse":
+      return { index: at, count: Math.max(prev.count, at + 1) };
+  }
+};
+
 // ── history.state entries ───────────────────────────────
 
 // Versioned marker: entries outlive reloads (and dev HMR), so anything read
 // back is data from an arbitrary past build — never trust its shape unchecked.
-const NAV_MARKER = "ducktape-nav@1";
+// @2 added `i`, the entry's stack position.
+const NAV_MARKER = "ducktape-nav@2";
 
 interface NavEntry extends NavSnapshot {
   k: typeof NAV_MARKER;
+  i: number;
 }
 
-export const stampNav = (snap: NavSnapshot): NavEntry => ({
+export const stampNav = (snap: NavSnapshot, index: number): NavEntry => ({
   k: NAV_MARKER,
+  i: index,
   ...snap,
 });
 
@@ -146,11 +181,14 @@ const isStringOrNull = (v: unknown): v is string | null =>
 const isNumberOrNull = (v: unknown): v is number | null =>
   v === null || typeof v === "number";
 
-export const readNavEntry = (raw: unknown): NavSnapshot | null => {
+export const readNavEntry = (
+  raw: unknown,
+): { snap: NavSnapshot; index: number } | null => {
   if (!raw || typeof raw !== "object") return null;
   const e = raw as Record<string, unknown>;
   const valid =
     e.k === NAV_MARKER &&
+    typeof e.i === "number" &&
     typeof e.scope === "string" &&
     typeof e.atHome === "boolean" &&
     typeof e.screen === "string" &&
@@ -164,16 +202,19 @@ export const readNavEntry = (raw: unknown): NavSnapshot | null => {
     isStringOrNull(e.member);
   if (!valid) return null;
   return {
-    scope: e.scope as string,
-    atHome: e.atHome as boolean,
-    screen: e.screen as string,
-    viewMode: e.viewMode as ViewMode,
-    channel: e.channel as string | null,
-    page: e.page as string | null,
-    forgeRepo: e.forgeRepo as string | null,
-    forgeItem: e.forgeItem as number | null,
-    explorer: e.explorer as number | null,
-    agent: e.agent as string | null,
-    member: e.member as string | null,
+    index: e.i as number,
+    snap: {
+      scope: e.scope as string,
+      atHome: e.atHome as boolean,
+      screen: e.screen as string,
+      viewMode: e.viewMode as ViewMode,
+      channel: e.channel as string | null,
+      page: e.page as string | null,
+      forgeRepo: e.forgeRepo as string | null,
+      forgeItem: e.forgeItem as number | null,
+      explorer: e.explorer as number | null,
+      agent: e.agent as string | null,
+      member: e.member as string | null,
+    },
   };
 };

@@ -99,6 +99,7 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M17 9h4v7h-6v-5.2A5 5 0 0 1 19.8 6" />
     </>
   ),
+  chevronLeft: <path d="M15 6l-6 6 6 6" />,
   chevronRight: <path d="M9 6l6 6-6 6" />,
   hash: <path d="M9 4L7 20M17 4l-2 16M5 9h15M4 15h15" />,
   metrics: <path d="M6 20v-7M12 20V6M18 20v-4M4 20h16" />,

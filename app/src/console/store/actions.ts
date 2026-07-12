@@ -70,6 +70,7 @@ import {
   clearPendingDisplayName,
   clearRemoteUrl,
   docTabsScope,
+  hasNodeContext,
   loadDocTabs,
   loadPendingDisplayName,
   removeTab,
@@ -1224,6 +1225,17 @@ export function createActions({
     if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
       return navSnapshotOf(before);
     }
+    // With no node in context, only same-scope entries may leave the Home
+    // layer (the no-node web shell traversing its own history). A cross-scope
+    // entry minted by a since-forgotten workspace would restore a shell with
+    // nothing behind it.
+    if (
+      !hasNodeContext(before) &&
+      !snap.atHome &&
+      snap.scope !== currentDocTabsScope()
+    ) {
+      return navSnapshotOf(before);
+    }
 
     // Selections apply only within the scope that minted them, only under the
     // shell (never through the Home layer), and only when the target still
@@ -1464,88 +1476,47 @@ export function createActions({
       });
   };
 
-  return {
-    setScreen: (screen) => {
-      // Navigating adopts the target surface's rail, so the sidebar highlight and
-      // the body never disagree. Shell screens (settings → null section) leave the
-      // current rail untouched.
-      const section = sectionForScreen(screen);
-      if (section) {
-        saveViewMode(section);
-        patch({ screen, viewMode: section });
-      } else {
-        patch({ screen });
-      }
-    },
+  // Land the shell on a screen. Adopts the target surface's rail so the
+  // sidebar highlight and the body never disagree (a mention clicked from
+  // chat moves the rail to OPERATOR with it; shell screens like settings →
+  // null section leave the current rail untouched), and always leaves the
+  // Home layer — with the sidebar navigable at Home, every screen move must
+  // drop the layer or the shell would change invisibly underneath it.
+  const landOn = (screen: string, extra: Partial<ConsoleState> = {}) => {
+    const section = sectionForScreen(screen);
+    if (section) saveViewMode(section);
+    patch({
+      screen,
+      atHome: false,
+      ...(section ? { viewMode: section } : {}),
+      ...extra,
+    });
+  };
 
-    openExplorerAt: (height) => {
-      // Same rail-adoption contract as setScreen — the explorer lives on the
-      // operator rail, so the jump must move the sidebar with it.
-      const section = sectionForScreen("explorer");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "explorer", viewMode: section, explorerFocus: height });
-      } else {
-        patch({ screen: "explorer", explorerFocus: height });
-      }
-    },
+  return {
+    setScreen: (screen) => landOn(screen),
+
+    openExplorerAt: (height) => landOn("explorer", { explorerFocus: height }),
 
     clearExplorerFocus: () => {
       patch({ explorerFocus: null });
     },
 
-    openAgent: (agentId) => {
-      // Same rail-adoption contract as setScreen.
-      const section = sectionForScreen("agent");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "agent", viewMode: section, agentFocus: agentId });
-      } else {
-        patch({ screen: "agent", agentFocus: agentId });
-      }
-    },
+    openAgent: (agentId) => landOn("agent", { agentFocus: agentId }),
 
     clearAgentFocus: () => {
       patch({ agentFocus: null });
     },
 
-    openMember: (accountId) => {
-      // Members lives on the OPERATOR rail — a mention clicked from chat (a user
-      // surface) has to move the rail with it or the sidebar and body disagree.
-      const section = sectionForScreen("members");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "members", viewMode: section, memberFocus: accountId });
-      } else {
-        patch({ screen: "members", memberFocus: accountId });
-      }
-    },
+    openMember: (accountId) => landOn("members", { memberFocus: accountId }),
 
     clearMemberFocus: () => {
       patch({ memberFocus: null });
     },
 
-    openForgeItem: (repo, number) => {
-      // Same rail-adoption contract as setScreen.
-      const section = sectionForScreen("forge");
-      const forgeFocus = { repo, number };
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "forge", viewMode: section, forgeFocus });
-      } else {
-        patch({ screen: "forge", forgeFocus });
-      }
-    },
+    openForgeItem: (repo, number) => landOn("forge", { forgeFocus: { repo, number } }),
 
-    openFiles: (path) => {
-      const section = sectionForScreen("files");
-      if (section) {
-        saveViewMode(section);
-        patch({ screen: "files", viewMode: section, filesFocus: path });
-      } else {
-        patch({ screen: "files", filesFocus: path });
-      }
-    },
+    openFiles: (path) => landOn("files", { filesFocus: path }),
     applyNavSnapshot,
 
     setViewMode: (mode) => {

@@ -5,12 +5,15 @@
 //
 // The bar's left slot names the window: the active workspace's name when one
 // is connected, the "ducktape" brand wherever none exists (web build, remote
-// node, the gate).
+// node, the gate) — with the global back/forward pair ahead of it, enabled
+// from state.nav (the store's picture of the history-stack position).
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DucktapeProvider } from "../store/DucktapeProvider";
+import type { ConsoleActions } from "../store/DucktapeProvider";
+import { useDucktape } from "../store/use-ducktape";
 import type { Workspace } from "../../domain/workspace-client";
 import { WindowFrame } from "./WindowFrame";
 
@@ -26,6 +29,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
   invokeMock.mockReset();
   localStorage.clear();
+  // jsdom's session history persists across tests in this file — park the
+  // shared top entry on a null state so the next boot starts clean.
+  window.history.replaceState(null, "");
 });
 
 describe("window frame search affordance", () => {
@@ -155,5 +161,69 @@ describe("title bar workspace name", () => {
 
     await waitFor(() => expect(screen.getByLabelText("Search")).toBeTruthy());
     expect(screen.getByText("ducktape")).toBeTruthy();
+  });
+});
+
+describe("title bar back/forward", () => {
+  const jsonResponse = (body: unknown): Response =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+
+  let actions: ConsoleActions | null = null;
+
+  function Grab() {
+    actions = useDucktape().actions;
+    return null;
+  }
+
+  const button = (label: string) => screen.getByLabelText(label) as HTMLButtonElement;
+
+  /** jsdom performs back()/forward() traversal (and its popstate dispatch) on
+   *  a queued task — flush it inside act so the store update lands. */
+  const traverse = async (go: () => void) => {
+    await act(async () => {
+      go();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  };
+
+  it("walks the console's own entries and disables at the stack edges", async () => {
+    // web build with an answering node: the connected shell, no gate.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse({ channels: [] }))),
+    );
+
+    render(
+      <DucktapeProvider>
+        <WindowFrame>
+          <Grab />
+        </WindowFrame>
+      </DucktapeProvider>,
+    );
+
+    // boot holds the single stamped entry — nowhere to go either way.
+    await waitFor(() => expect(screen.getByLabelText("Back")).toBeTruthy());
+    expect(button("Back").disabled).toBe(true);
+    expect(button("Forward").disabled).toBe(true);
+
+    // a screen switch pushes an entry: back opens up.
+    await act(async () => {
+      actions!.setScreen("members");
+    });
+    await waitFor(() => expect(button("Back").disabled).toBe(false));
+    expect(button("Forward").disabled).toBe(true);
+
+    // clicking Back traverses to the boot entry and flips the pair.
+    await traverse(() => fireEvent.click(button("Back")));
+    await waitFor(() => expect(button("Forward").disabled).toBe(false));
+    expect(button("Back").disabled).toBe(true);
+
+    // and Forward returns to the pushed entry.
+    await traverse(() => fireEvent.click(button("Forward")));
+    await waitFor(() => expect(button("Back").disabled).toBe(false));
+    expect(button("Forward").disabled).toBe(true);
   });
 });
