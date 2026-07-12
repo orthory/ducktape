@@ -14,6 +14,7 @@ export type { ComposerTarget } from "./CommentThread";
 export function CommentsPanel({
   threads,
   authorNames,
+  selfKey,
   composer,
   onClose,
   onSubmitNew,
@@ -25,6 +26,8 @@ export function CommentsPanel({
 }: {
   threads: TargetThreads[];
   authorNames: AuthorNames;
+  /** The local author's key — Edit/Delete render only on our own comments. */
+  selfKey: string;
   composer: ComposerTarget | null;
   onClose: () => void;
   onSubmitNew: (target: string, text: string) => void;
@@ -112,6 +115,7 @@ export function CommentsPanel({
               key={view.thread.id}
               view={view}
               authorNames={authorNames}
+              selfKey={selfKey}
               onReply={onReply}
               onResolve={onResolve}
               onEdit={onEdit}

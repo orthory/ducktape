@@ -100,6 +100,15 @@ textarea {
   background: none;
 }
 
+/* Placeholders follow the theme instead of the engine's default grey — the
+   pages editor now names an empty block AT REST ("Heading 1", "To-do"), so this
+   text is document furniture, not a stray hint. */
+input::placeholder,
+textarea::placeholder {
+  color: var(--c-muted2, #a1a1a1);
+  opacity: 1;
+}
+
 /* Safari / WKWebView (the macOS app's engine) ignore autocomplete="off" for
    AutoFill: they inject a Contacts / Passwords AutoFill button — and its
    dropdown — into inputs from name/placeholder/label heuristics, regardless of
