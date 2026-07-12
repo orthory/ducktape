@@ -596,7 +596,7 @@ fn commit_message_normalization_strips_supplied_identity_trailers_and_owns_attri
     assert_eq!(message.matches("via Ducktape").count(), 1);
     let local = attribution_email_local_part("quack/bot@example");
     assert!(message.ends_with(&format!(
-        "Co-Authored-By: QuackAgent unsafe via Ducktape <{local}@agents.ducktape.network>"
+        "Co-Authored-By: QuackAgent unsafe via Ducktape <{local}@agents.duck>"
     )));
     assert!(!message.contains('\r'));
 }
@@ -669,7 +669,7 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     let body = git_stdout(&ws.workdir(), &["log", "-1", "--format=%B"]);
     assert!(!body.contains("s1:0"));
     assert!(body.ends_with(&format!(
-        "Co-Authored-By: Quack Agent via Ducktape <{}@agents.ducktape.network>",
+        "Co-Authored-By: Quack Agent via Ducktape <{}@agents.duck>",
         attribution_email_local_part(AGENT)
     )));
     ws.cleanup().await;
@@ -690,7 +690,7 @@ async fn the_commit_carries_agent_author_and_node_committer() {
     assert_eq!(
         git_stdout(&ws.workdir(), &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
         format!(
-            "{AGENT_DISPLAY_NAME}|{}@agents.ducktape.network|{NODE_IDENT}|node@ducktape.local",
+            "{AGENT_DISPLAY_NAME}|{}@agents.duck|{NODE_IDENT}|node@ducktape.local",
             attribution_email_local_part(AGENT)
         )
     );
@@ -838,7 +838,7 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     assert_eq!(
         git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
         format!(
-            "{AGENT_DISPLAY_NAME}|{}@agents.ducktape.network|{NODE_IDENT}|node@ducktape.local",
+            "{AGENT_DISPLAY_NAME}|{}@agents.duck|{NODE_IDENT}|node@ducktape.local",
             attribution_email_local_part(AGENT)
         )
     );
@@ -876,7 +876,7 @@ async fn an_identical_concurrent_patch_keeps_a_normalized_attribution_commit() {
     assert_eq!(
         git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%s"]),
         format!(
-            "{AGENT_DISPLAY_NAME}|{}@agents.ducktape.network|Apply agent changes",
+            "{AGENT_DISPLAY_NAME}|{}@agents.duck|Apply agent changes",
             attribution_email_local_part(AGENT)
         )
     );
