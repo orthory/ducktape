@@ -140,7 +140,11 @@ export function SelfCheck({
                     padding: "7px 14px",
                     borderRadius: radius.md,
                     background: accentVar,
-                    color: color.onDark,
+                    // The accent does NOT invert with the theme, so its text must
+                    // not either: `color.onDark` is --c-on-filled, which flips to
+                    // near-black in dark mode (3.33:1 on the accent — below AA).
+                    // Literal white, as everywhere else we paint on the accent.
+                    color: "#fff",
                     font: `600 12px ${font.sans}`,
                   }}
                   hoverStyle={{ filter: "brightness(1.06)" }}

@@ -94,7 +94,10 @@ export function HuddleHeaderButton({ channel }: { channel: Channel }) {
   };
 
   const resting: CSSProperties = inThis
-    ? { ...base, background: accentVar, color: color.onDark }
+    // The accent fill does NOT invert with the theme, so its text must not either:
+    // `color.onDark` (--c-on-filled) flips to near-black in dark mode — 3.33:1 on
+    // the accent, below AA. Literal white, as everywhere else we paint on accent.
+    ? { ...base, background: accentVar, color: "#fff" }
     : count > 0
       ? { ...base, background: color.sunken, border: `1px solid ${color.borderSoft}`, color: color.inkSoft }
       : { ...base, color: color.muted };

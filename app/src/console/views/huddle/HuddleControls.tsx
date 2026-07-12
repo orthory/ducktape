@@ -159,7 +159,11 @@ export function HuddleControls({
               onClick={onToggleCamera}
               title={cameraDisabledReason ?? (cameraOn ? "Turn camera off" : "Turn camera on")}
               disabled={!live || !!cameraDisabledReason}
-              style={btn(cameraOn ? { background: accentVar, color: color.onDark, border: "1px solid transparent" } : {})}
+              // Active fill = the accent, which does NOT invert with the theme — so
+              // its text must not either. `color.onDark` (--c-on-filled) flips to
+              // near-black in dark mode: 3.33:1 on the accent, below AA. Literal
+              // white, like `leaveBtn` above and every other on-accent text we paint.
+              style={btn(cameraOn ? { background: accentVar, color: "#fff", border: "1px solid transparent" } : {})}
               hoverStyle={{ filter: "brightness(1.05)" }}
             >
               <CameraGlyph size={comfortable ? 16 : 15} off={!cameraOn} />
@@ -172,7 +176,7 @@ export function HuddleControls({
               onClick={onToggleScreen}
               title={sharing ? "Stop screen share" : "Share screen"}
               disabled={!live}
-              style={btn(sharing ? { background: accentVar, color: color.onDark, border: "1px solid transparent" } : {})}
+              style={btn(sharing ? { background: accentVar, color: "#fff", border: "1px solid transparent" } : {})}
               hoverStyle={{ filter: "brightness(1.05)" }}
             >
               <ScreenGlyph size={comfortable ? 16 : 15} on={sharing} />
