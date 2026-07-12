@@ -30,7 +30,7 @@ mod phase;
 mod ports;
 mod registry;
 
-pub(crate) use lifecycle::{app_exit_node_action, AppExitNodeAction, port_listening};
+pub(crate) use lifecycle::port_listening;
 pub(crate) use phase::read_tail;
 pub(crate) use registry::root;
 

@@ -248,13 +248,9 @@ fn main() {
                 notify.stream.shutdown();
             }
             // The workspace node is a durable execution host, not a Tauri
-            // child. Providers can still be running when a dev rebuild or
-            // ordinary shell quit reaches this event. Keep the detached node
-            // alive so the next shell can adopt it; explicit Stop/Forget owns
-            // verified teardown.
-            match workspaces::app_exit_node_action() {
-                workspaces::AppExitNodeAction::Preserve => {}
-            }
+            // child: it is deliberately left running so the next shell adopts
+            // it, and so a dev rebuild or an ordinary quit never kills a live
+            // agent provider. Verified teardown belongs to Stop/Forget alone.
         }
         _ => {}
     });

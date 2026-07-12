@@ -9,19 +9,6 @@ use std::time::Duration;
 
 use super::registry::Ports;
 
-/// What a generic desktop-shell exit is allowed to do to the detached active
-/// workspace node. The node is the durable execution host and must remain
-/// adoptable across app quits, crashes, and dev hot reloads. Verified teardown
-/// belongs exclusively to explicit workspace Stop/Forget actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AppExitNodeAction {
-    Preserve,
-}
-
-pub(crate) const fn app_exit_node_action() -> AppExitNodeAction {
-    AppExitNodeAction::Preserve
-}
-
 /// is something accepting connections on this localhost port right now? used as
 /// a liveness probe for an already-running workspace node.
 pub(crate) fn port_listening(port: u16) -> bool {
@@ -428,38 +415,6 @@ mod tests {
             .expect_err("a held port must refuse the teardown");
         assert!(err.contains("still running"), "{err}");
         drop(listener);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn app_exit_preserves_the_node_and_explicit_teardown_still_stops_it() {
-        let dir = scratch_dir("app-exit-preserve");
-        let ports = closed_ports();
-        let mut child = spawn_fake_node(&dir);
-        fs::write(pidfile(&dir), child.id().to_string()).unwrap();
-
-        assert_eq!(app_exit_node_action(), AppExitNodeAction::Preserve);
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "a generic app exit must leave the detached node adoptable"
-        );
-        assert!(
-            pidfile(&dir).exists(),
-            "preserving the node must preserve its adoption pidfile"
-        );
-
-        // Forget/Stop owns this verified primitive and must retain its old
-        // destructive semantics even though generic app exit no longer does.
-        stop_workspace_node(&dir, &ports, Duration::from_millis(600)).unwrap();
-
-        assert!(
-            died(&mut child, Duration::from_secs(2)),
-            "explicit workspace teardown must stop the node"
-        );
-        assert!(
-            !pidfile(&dir).exists(),
-            "explicit workspace teardown must clear the pidfile"
-        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
