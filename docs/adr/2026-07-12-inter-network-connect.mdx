@@ -1,0 +1,274 @@
+# ADR: Inter-Network Communication — the `connect` module (diplomacy model)
+
+Date: 2026-07-12 · Status: **Accepted as direction, build phased** — Phase 0
+needs no protocol change; the final authentication layer depends on the
+network-threshold-vault work hardening
+(`docs/records/research/2026-07-11-network-threshold-vault.md`, FROST signing
+phase). Recorded now so the trust-model and hiding-model decisions are not
+re-litigated per phase.
+
+## Context
+
+A Ducktape network is a sovereign consensus domain, and one node process
+belongs to exactly one of them by construction:
+
+- The genesis namespace domain-separates discovery, the simplex scheme, and
+  the epoch floor (`bin/node/src/config.rs:259-282`); a node of network A
+  cannot even complete a handshake with network B.
+- Every node-bind/member certificate folds in `chain_id`
+  (`crates/system/identity/src/lib.rs:100-102`), so no credential issued in A
+  has effect in B.
+- Overlay meshes are disjoint — the WireGuard ULA prefix and member addresses
+  derive from `chain_id` (`crates/system/wireguard-upgrade/src/lib.rs:569,584`).
+- Multi-network per machine is already the product: one workspace = one
+  network = one node process (`app/src-tauri/src/workspaces.rs`), one user key
+  shared across all of them (`app/src-tauri/src/user_identity.rs:1-4`).
+
+The requirement this ADR answers: **Slack-Connect-style federation.** Two
+networks connect so that members of one can converse with — and specifically
+*invoke agents of* — the other, while everything except the shared surface
+stays invisible: agent prompts, tool configs, run transcripts, rosters,
+internal channels.
+
+The key observation that shapes everything: **hiding is free, by
+construction.** Cross-network is outside the single-network consensus model —
+there is no state replication, no mesh reachability, no honored credentials.
+A peer network sees exactly what is deliberately exported and nothing else,
+not because of filtering or ACLs but because no reach path exists. (Contrast
+*intra*-network privacy, which is real deferred work —
+`docs/adr/2026-07-06-private-team-messaging.mdx`. The network boundary is
+today the only true read barrier in the system.)
+
+What already exists and the build leans on:
+
+- **Public ingress.** Gateway v2 gives every network a stateless public HTTP
+  surface (`duck://` routes, DuckDNS handles); networks can already serve
+  outsiders without admitting them.
+- **The agent pipeline is fully in-network.** `chat PostMessage` →
+  `tagging Tag` → `EngagementEvent` (`crates/system/tagging/src/interface.rs`)
+  → `runs on_engagement` (`crates/apps/runs/src/engagement.rs:59`) →
+  `DispatchMsg::Dispatch` → NodedProvisioner executes → reply
+  `PostMessage(as_agent)`. Nothing in it needs to know where the triggering
+  message came from.
+- **Module-reserved channel namespaces.** Ids containing `:` are mintable
+  only by the owning module (`crates/apps/chat/src/lib.rs:432-455`); the
+  `forge:<repo>:<n>` precedent shows a module owning a channel family.
+- **Host-side effect loop.** The dispatch-oracle pool is the standing pattern
+  for "ordered module state drives non-deterministic host I/O whose outcome is
+  settled back as ops" (`crates/system/dispatch-oracle/src/pool.rs`).
+- **A future network-level signer.** The threshold-vault research recommends
+  a governance-seated custody committee whose FROST-ed25519 collective key
+  produces *standard* ed25519 signatures and whose resharing **preserves the
+  collective public key** across committee churn.
+
+## Options considered
+
+1. **Peer the overlays.** Rejected outright: the chain-scoped ULA/namespace
+   isolation is a security invariant, not an accident. Bridging meshes would
+   re-open every cross-network reach path this design gets privacy from.
+2. **Full IBC (light clients + commitment proofs).** Each network verifies
+   the other's consensus certificates against a tracked validator set.
+   Trust-minimized, but Ducktape rotates membership by engine
+   teardown-respawn (`crates/kernel/consensus/src/valset_orchestrator.rs`), so
+   the peer must consume a valset-diff stream forever — IBC-grade weight with
+   no current use case (no cross-network assets or consensus-critical state).
+3. **Dual-membership relayer only.** A party holding membership in both
+   networks relays by re-signing. Works today with zero protocol change, but
+   the relayer is a permanent trusted third party and a liveness single point.
+   Kept as Phase 0 scaffolding, rejected as the end state.
+4. **`connect` module: sovereign networks, signed envelopes, outbox/inbox,
+   self-delivery.** Chosen; the rest of this ADR.
+
+The IBC relationship, precisely — this is IBC topology with its two expensive
+parts substituted:
+
+| IBC piece | Here | Why it gets cheaper |
+|---|---|---|
+| Light client + header/valset tracking | One governance-registered collective public key per peer | FROST resharing preserves the group key, so peer membership churn is invisible; verification is one ed25519 check under existing verifiers |
+| External relayer infrastructure | Outbox workers on the network's own member nodes | Ducktape nodes are real processes with outbound HTTP; a passive-state-machine third party is unnecessary |
+| Sequence numbers, replay protection, channel abstraction, acks | Taken as-is | They are the cheap, load-bearing parts |
+| ICS-20 transfers, ordered channels, timeout settlement | Dropped | Chat/agent-invoke semantics need at-least-once + idempotent dedup, not head-of-line-blocking ordered delivery |
+
+## Decision
+
+One sentence: **a network is a principal with a collective public key;
+a message is a signed envelope; transport is the existing gateway ingress;
+admission is each network writing verified envelopes into its own log.**
+Networks interact the way states do — signed notes between foreign
+ministries; internal deliberation stays domestic.
+
+### Link plane (LNK)
+
+- **LNK1 — links are governance acts.** A link is established by a
+  `LinkInvite`/`LinkAccept` handshake, each side's half approved through its
+  own governance (same shape as member invites,
+  `crates/system/governance/src/invite.rs`). The link record holds: peer
+  `chain_id`, peer collective public key (or, in Phase 0/1, the bridge
+  member's key), the exported-agent list, and the channel set.
+- **LNK2 — peer registry is one static key.** The foreign-network registry
+  maps `chain_id` → collective public key. No valset tracking, no header
+  stream: reshare preserves the key, so the entry is written once and only
+  changes on the peer's explicit re-key (which arrives as a signed
+  `LinkUpdate`).
+- **LNK3 — revocation is unilateral.** Either side's governance can
+  `LinkRevoke`; its inbox stops admitting the peer's envelopes at the next
+  committed op. No cooperation required.
+
+### Envelopes and transport (ENV)
+
+- **ENV1 — the envelope.** `{link_id, seq, channel, payload, sig}` where
+  `sig` is the sending network's collective signature over the rest. `seq` is
+  strictly monotonic per link; the receiving inbox rejects replays and records
+  the high-water mark in module state. Delivery semantics are at-least-once
+  with idempotent dedup on `(link_id, seq)` — not ordered channels.
+- **ENV2 — the outbox is the official record.** Outbound messages are ops:
+  they went through consensus, so an envelope is "the network said it," not
+  "a member said it." What may enter the outbox (and therefore leave the
+  network) is exactly what governance-approved link/export policy allows.
+- **ENV3 — the network delivers its own mail.** A host-side outbox worker on
+  member nodes (dispatch-oracle pattern,
+  `crates/system/dispatch-oracle/src/pool.rs`) watches committed outbox state
+  and POSTs envelopes to the peer's public gateway inbox route
+  (`/v1/connect/inbox`). Delivery is idempotent, so any number of member nodes
+  may race; the delivery ack is settled back as an op. No external relayer
+  exists in the final form.
+- **ENV4 — auth layer is swappable, semantics are not.** Phase 0/1 signs
+  envelopes with a dual-membership bridge key (trusted-party model); Phase 4
+  swaps in the threshold collective signature. LNK/CHN/AGT/CAP semantics are
+  identical under both, which is what makes the interim honest.
+
+### Shared channels (CHN)
+
+- **CHN1 — one channel, two copies, envelope relay.** A shared channel is a
+  `connect:<link>:<n>` channel minted by the connect module under the
+  module-namespace rule (`crates/apps/chat/src/lib.rs:432-455`) in **each**
+  network's own log. Messages posted locally are enveloped to the peer;
+  inbound envelopes are posted into the local copy. There is no shared state —
+  only mirrored messages.
+- **CHN2 — foreign authorship is first-class.** New
+  `AuthorRef::Foreign { network, principal }`, stampable only by the connect
+  module — same privilege shape as `as_agent`, which only a module origin may
+  set (`crates/apps/chat/src/lib.rs:1234-1252`). The UI renders provenance
+  honestly; nothing masquerades as a local member.
+- **CHN3 — the loop rule extends across the border.** Today only
+  `Author::User` content fires engagement
+  (`crates/system/tagging/src/interface.rs:49-65`). Extension:
+  foreign-*user*-authored content fires; foreign-*agent*-authored content does
+  not. Without this, two networks' exported agents mentioning each other
+  produce an unbounded cross-network loop that no single network's log can
+  see in full.
+
+### Agent exposure (AGT)
+
+- **AGT1 — exports are enumerated.** A link exposes only the agents named in
+  its export list. Only exported agents are mentionable through the link's
+  channels.
+- **AGT2 — execution never leaves home.** A foreign mention arrives as a
+  channel message, enters the home tagging plane, and runs through the
+  ordinary pipeline on home infrastructure. Everything that defines the agent
+  — `AgentRecord` (prompt_hash, caps, skills, recipe —
+  `crates/apps/agent/src/interface.rs:200-228`), prompt blobs in the home
+  blob store, `RunRecord`/dispatch results — is structurally unreachable to
+  the peer: not replicated, not fetchable (disjoint mesh), not queryable.
+- **AGT3 — the peer sees three things.** The agent card (display name +
+  capability description, published on the link), the shared-channel
+  conversation, and the agent's reply text. Nothing else exists from the
+  peer's vantage point.
+
+### Capability diet for foreign-fired runs (CAP) — load-bearing
+
+Hiding-by-construction does not cover the one moving part that crosses the
+boundary on purpose: **the agent's own output.** Foreign input is untrusted
+prompt text; an injected exported agent running with its full home
+capabilities (forge/duckfs/pages reads) can read internal state and carry it
+out in its reply. The border is only as tight as the runs it fires.
+
+- **CAP1 — per-invocation cap overlay, net-new plumbing.** Today capability
+  sets are agent-global (`AgentRecord.caps`,
+  `crates/apps/agent/src/interface.rs:109-111`) and the per-run plumbing
+  carries no toolset (`WorkspaceSpec`,
+  `crates/system/dispatch-oracle/src/provision.rs:42-52`). Connect requires an
+  overlay cap set threaded through
+  `EngagementEvent → stage_dispatch_run → WorkspaceSpec`, enforced as the
+  **intersection** with the agent's record caps.
+- **CAP2 — default diet is near-zero.** A foreign-fired run gets: read/write
+  on the triggering shared channel, its own prompt/skills, and nothing else —
+  no forge, no duckfs beyond declared ro skills, no pages, no secrets — unless
+  the export entry explicitly widens it, which is a governance-visible act.
+- **CAP3 — sequencing constraint.** Agent export stays disabled until the
+  overlay exists (see Plan). Channel federation without agents is safe
+  earlier; agents without the diet are not.
+
+### Privacy model (PRV)
+
+- **PRV1 — the peer-visible surface, exhaustively:** signed envelopes (what
+  was chosen to be said), public gateway routes (already public), exported
+  agent cards and their replies, and traffic metadata at the ingress (that
+  envelopes flow, when, how often — embassy cars are visible even when the
+  cables are sealed). Everything else has no reach path.
+- **PRV2 — the boundary stays structural.** No feature under this ADR may
+  introduce cross-network state replication, cross-network queries, or
+  cross-network credential honoring. If a future need looks like "peer reads
+  our state," the answer is an exported envelope, not a widened boundary.
+
+## Consequences
+
+- **No trusted third party in the final form.** The interim bridge (Phase
+  0–1) is a real trusted party and a liveness single point; the ADR's shape
+  makes it deletable rather than load-bearing.
+- **The auth swap is a dependency, not a blocker.** Everything except
+  envelope signature verification is buildable and shippable before FROST
+  exists; the vault work slots in underneath without semantic change.
+- **The cap overlay is prerequisite security work** touching
+  runs/dispatch-oracle — the one place this design pays real plumbing cost
+  inside existing crates.
+- **Chat's admin-gating debt is inherited.** `SetMembership`/`RegisterHook`
+  accept any origin today (`crates/apps/chat/src/interface.rs:240-256`);
+  connect channels ride that until the known TODO lands. Not made worse, not
+  fixed here.
+- **Metadata is visible.** Ingress traffic analysis is out of scope; content
+  hiding is the guarantee.
+- **Two networks can still be one machine.** Nothing here assumes the peer is
+  remote; two local workspaces can link through their own gateways, which is
+  also the QA story.
+
+## Plan
+
+- **Phase 0 — bridge daemon, zero protocol change.** A dual-membership member
+  relays between two ordinary channels and re-posts under its own key
+  (mentions included, so runs fire as `Author::User` today). Proves the UX;
+  all foreign messages visibly attributed to the bridge member. Throwaway.
+- **Phase 1 — the `connect` module, channels only.** Link records +
+  handshake ops, outbox/inbox with `(link_id, seq)` dedup, envelope codec,
+  gateway `/v1/connect/inbox` route, outbox delivery worker,
+  `AuthorRef::Foreign` + CHN3 loop rule, `connect:` channel namespace.
+  Envelope auth = bridge/member key (ENV4 interim). Agent export **off**.
+- **Phase 2 — capability overlay, then agent export.** Per-invocation cap
+  intersection through the dispatch path (CAP1/CAP2), export lists on link
+  records, agent cards. This is the milestone that delivers the product ask.
+- **Phase 3 — hardening.** Replay/backpressure limits on the inbox route,
+  link-scoped rate limits, revocation drills, metadata-minimizing batching if
+  it matters.
+- **Phase 4 — threshold auth swap.** Replace bridge-key envelope signatures
+  with the custody committee's FROST collective signature; delete the bridge.
+  Depends on the vault build reaching its signing phase; nothing else in this
+  ADR moves.
+
+## References
+
+- Threshold custody research (collective key, FROST, reshare-preserves-key):
+  `docs/records/research/2026-07-11-network-threshold-vault.md`
+- Intra-network privacy ADR (why the network boundary is the only read
+  barrier today): `docs/adr/2026-07-06-private-team-messaging.mdx`
+- Agent runtime contract (dispatch, caps, requirement codes):
+  `docs/adr/2026-07-09-deterministic-agent-runtime.mdx`
+- Pipeline seams cited: `crates/apps/chat/src/lib.rs` (namespace rule,
+  `as_agent`), `crates/system/tagging/src/interface.rs` (engagement + loop
+  rule), `crates/apps/runs/src/engagement.rs` +
+  `crates/system/dispatch-oracle/src/{pool.rs,provision.rs}` (dispatch path),
+  `crates/apps/agent/src/interface.rs` (`AgentRecord`),
+  `crates/system/governance/src/invite.rs` (handshake shape)
+- IBC (the topology this substitutes into): light clients / relayers /
+  ICS-20 per the Cosmos IBC spec — adopted: sequences, replay protection,
+  channel abstraction, acks; substituted: light client → static group key,
+  relayer → member-node outbox workers
