@@ -92,14 +92,25 @@ resume_args = [
     "-",
 ]
 
-[sandbox]
-# Under the Podman sandbox backend, HOME is set but NOT mounted — only this
-# home-relative auth/state dir crosses the boundary read-write, so the CLI can
-# authenticate while the node's data dir and user key stay outside (D7).
-# ~/.codex holds codex's login/session/config state. Inert under the Direct
-# backend (the child inherits HOME whole). Home-relative ONLY: absolute paths
-# and ".." are rejected at load. Inherited by every [[variants]] tag below.
-rw_dirs = ["~/.codex"]
+[isolation]
+# THE STRONG AUTH PATH: the operator's credential never enters the codex
+# process. The HOST reads it (OPENAI_API_KEY, else ~/.codex/auth.json) and holds
+# it in the node; a per-run loopback Responses broker serves the model API, and
+# codex gets only an opaque random bearer plus a 127.0.0.1 base URL, both of
+# which die with the run. Neither can recover the credential.
+#
+# config_home_env is what MAKES that true. Pointed at a fresh, EMPTY CODEX_HOME
+# under the run's workdir, codex cannot read the operator's ~/.codex/auth.json
+# and must use the broker the argv names. Without it the broker would be
+# decorative — codex would just log in from the dotfile as before.
+#
+# Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
+# to have both): mounting ~/.codex would put the credential back in the child
+# and quietly undo all of the above. Applies under the Direct AND Podman
+# backends; Tart is rejected loudly (a VM guest cannot reach host loopback).
+# Inherited by every [[variants]] tag below.
+config_home_env = "CODEX_HOME"
+broker = "codex-responses"
 
 [tools]
 # Wires the Ducktape MCP server into every argv this file produces — the base

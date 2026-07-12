@@ -306,6 +306,9 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             spawn,
             deliver,
             1,
+            // no announced capacity: this bed is about the session boundary, and
+            // a bare node's ledger fits the demandless jobs it dispatches.
+            Default::default(),
         )
         .with_resolver(Arc::new(|_| {
             Box::pin(async { Some(b"You are Quackbot.".to_vec()) })

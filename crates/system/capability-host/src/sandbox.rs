@@ -42,7 +42,8 @@ pub enum SandboxBackend {
 /// translate a provider invocation into a `podman run` argv — PURE, no I/O, so
 /// it unit-tests without podman installed. mounts every path at its IDENTICAL
 /// container path (nothing upstream translates paths): the workdir rw, the
-/// executor bin ro, each `ro_paths` entry ro (PATH-entry dirs), each `rw_dirs`
+/// executor bin ro, each `ro_paths` entry ro (the run's PATH-entry dirs and its
+/// W6 skills tree — see `CliProvider::sandbox_ro_paths`), each `rw_dirs`
 /// entry rw (the spec's CLI auth/state dirs). only the limit dimensions this
 /// backend knows how to enforce (`cores` → `--cpus`, `mem_gb` → `--memory`)
 /// become flags; an unknown dimension (e.g. `gpu`) is silently ignored — the

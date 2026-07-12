@@ -156,7 +156,12 @@ impl ProvisionedWorkspace for NodedWorkspace {
         let api = ActorNodeApi::new(self.handle.clone());
         let dir = self.dir.clone();
         let message = message.to_string();
-        let result = tokio::task::spawn_blocking(move || commit(&api, &dir, &message))
+        let result = tokio::task::spawn_blocking(move || {
+            // Provider HOME/auth/temp/build state is reserved runtime debris,
+            // never an agent output facet. Remove it before duckfs scans.
+            let _ = std::fs::remove_dir_all(dir.join(capability_host::RUN_RUNTIME_DIR));
+            commit(&api, &dir, &message)
+        })
             .await
             .map_err(|_| "workspace commit task panicked".to_string())?;
         let spec = self.receipt_spec();

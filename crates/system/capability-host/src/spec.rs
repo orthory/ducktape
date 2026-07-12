@@ -42,6 +42,29 @@
 //! non-deterministic input; the consensus capability module sees only the
 //! announced TAGS, never the specs behind them).
 //!
+//! ## how an executor authenticates — two paths, never both
+//!
+//! a provider child needs the operator's model credential, and there are
+//! exactly two ways a spec can arrange that:
+//!
+//! ```toml
+//! [isolation]                     # the STRONG path: the credential never
+//! config_home_env = "CODEX_HOME"  # enters the child. the host reads it and
+//! broker = "codex-responses"      # the child gets an opaque per-run bearer
+//!                                 # aimed at a loopback endpoint. the fresh
+//!                                 # config home is what FORCES that: without
+//!                                 # it the CLI would just read ~/.codex.
+//!
+//! [sandbox]                       # the WEAK path: the CLI's own auth dir is
+//! rw_dirs = ["~/.claude"]         # mounted into the sandbox, so the
+//!                                 # credential DOES enter the child. for a BYO
+//!                                 # CLI that only knows how to read dotfiles.
+//! ```
+//!
+//! declaring BOTH is a HARD LOAD ERROR ([`parse_raw`]): an executor that HAS a
+//! broker must never be able to silently regress to shipping its credential
+//! dir into the child. the day an executor gains a broker, its `rw_dirs` go.
+//!
 //! ## override precedence
 //!
 //! embedded specs load first; operator specs load second and REPLACE an
@@ -108,7 +131,41 @@ pub struct CapabilitySpec {
     /// expanded against the real `$HOME` at spawn. empty for the historical
     /// posture — under the Direct backend it is inert (the child inherits
     /// HOME whole), under Podman these are the ONLY paths under HOME mounted.
+    /// the WEAK auth path: the credential DOES enter the child. mutually
+    /// exclusive with `isolation.broker` (see this module's doc).
     pub rw_dirs: Vec<String>,
+    /// optional `[isolation]` — the STRONG auth path: a host-owned broker
+    /// holding the credential, and the fresh executor config home that forces
+    /// the CLI through it (see [`IsolationSpec`]).
+    pub isolation: IsolationSpec,
+}
+
+/// how an executor authenticates WITHOUT its credential entering the child.
+/// isolation is data-described, but credentials never are: `broker` names
+/// host-owned Rust, not a URL or a command a spec could point anywhere.
+///
+/// the two fields are one mechanism, not two features. `broker` holds the
+/// operator's credential in THIS process and hands the child only an opaque
+/// per-run bearer; `config_home_env` names the executor's config-home variable
+/// (e.g. `CODEX_HOME`) so the child gets a FRESH, empty one — which is what
+/// stops the CLI reading `~/.codex/auth.json` and forces it through the broker.
+/// a broker without the fresh config home would be decorative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IsolationSpec {
+    /// the executor's config-home env var (e.g. `CODEX_HOME`). the child gets a
+    /// fresh run-local directory there instead of the operator's.
+    pub config_home_env: Option<String>,
+    /// the host-owned credential broker this executor speaks to, if any.
+    pub broker: Option<BrokerKind>,
+}
+
+/// the brokers this build knows how to BE. a CLOSED set, like [`OutputFormat`]:
+/// each name is host code that holds a real credential, so adding one is a code
+/// change with tests — never a string an operator can invent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerKind {
+    /// the OpenAI Responses API, as `codex exec` speaks it (see [`crate::broker`]).
+    CodexResponses,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -147,6 +204,10 @@ struct RawSpec {
     /// optional `[sandbox]` — the Podman-backend auth/state mounts.
     #[serde(default)]
     sandbox: Option<RawSandbox>,
+    /// optional `[isolation]` — the host-owned credential broker + fresh
+    /// executor config home.
+    #[serde(default)]
+    isolation: Option<RawIsolation>,
     /// optional `[tools]` — argv injected into EVERY argv this file produces
     /// (see [`inject_tool_args`]).
     #[serde(default)]
@@ -181,6 +242,57 @@ fn validate_rw_dirs(raw: &RawSandbox, origin: &str) -> Result<Vec<String>, Strin
         }
     }
     Ok(raw.rw_dirs.clone())
+}
+
+/// the on-disk `[isolation]` shape — a dumb serde mirror; unknown fields fail
+/// loud like everywhere else in the spec format.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawIsolation {
+    #[serde(default)]
+    config_home_env: Option<String>,
+    #[serde(default)]
+    broker: Option<String>,
+}
+
+/// an env var name the child will actually see: `[A-Z_][A-Z0-9_]*`. a spec that
+/// misspells `CODEX-HOME` would otherwise silently set nothing and the CLI would
+/// quietly fall back to reading the operator's real config home — the exact leak
+/// the fresh config home exists to prevent.
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
+}
+
+/// validate `[isolation]`: the config-home env name is a real env name, and the
+/// broker is one this build actually implements (a broker is host CODE, not a
+/// URL — an unknown name must never degrade to "no broker", which would silently
+/// hand the child the operator's credential instead).
+fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationSpec, String> {
+    let raw = raw.unwrap_or_default();
+    if let Some(name) = &raw.config_home_env
+        && !valid_env_name(name)
+    {
+        return Err(format!(
+            "{origin}: isolation.config_home_env {name:?} must match [A-Z_][A-Z0-9_]*"
+        ));
+    }
+    let broker = raw
+        .broker
+        .map(|broker| match broker.as_str() {
+            "codex-responses" => Ok(BrokerKind::CodexResponses),
+            other => Err(format!(
+                "{origin}: isolation.broker {other:?} is unsupported (want codex-responses)"
+            )),
+        })
+        .transpose()?;
+    Ok(IsolationSpec {
+        config_home_env: raw.config_home_env,
+        broker,
+    })
 }
 
 #[derive(Deserialize)]
@@ -366,6 +478,20 @@ impl CapabilitySpec {
             .map(|s| validate_rw_dirs(&s, origin))
             .transpose()?
             .unwrap_or_default();
+        let isolation = parse_isolation(raw.isolation, origin)?;
+        // THE credential invariant. a broker exists so the operator's credential
+        // never enters the child; rw_dirs exist to mount that credential INTO the
+        // child. a spec with both would authenticate through whichever the CLI
+        // happened to prefer — and the leak would be silent, because the run would
+        // still work. so it is a load error, not a warning: an executor that HAS a
+        // broker can never regress to shipping its credential dir.
+        if isolation.broker.is_some() && !rw_dirs.is_empty() {
+            return Err(format!(
+                "{origin}: a spec declaring [isolation] broker may not also declare \
+                 [sandbox] rw_dirs — the broker exists so the credential never enters \
+                 the child, and rw_dirs would mount it in anyway. drop the rw_dirs."
+            ));
+        }
         Ok((
             Self {
                 tag,
@@ -378,6 +504,7 @@ impl CapabilitySpec {
                 workspace,
                 session,
                 rw_dirs,
+                isolation,
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),
@@ -645,6 +772,64 @@ resume_args_append = ["--resume", "{{session_id}}"]
         let typo = format!("{}\n[sandbox]\nrw_dir = [\"~/.claude\"]\n", spec_toml("ok"));
         let err = CapabilitySpec::parse(&typo, "t").unwrap_err();
         assert!(err.contains("not a valid spec"), "got {err:?}");
+    }
+
+    #[test]
+    fn isolation_parses_and_refuses_unknown_brokers_or_env_names() {
+        // absent [isolation] = no broker, no config home (the BYO posture).
+        let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
+        assert_eq!(plain.isolation, IsolationSpec::default());
+
+        let valid = format!(
+            "{}\n[isolation]\nconfig_home_env = \"CODEX_HOME\"\nbroker = \"codex-responses\"\n",
+            spec_toml("ok")
+        );
+        let spec = CapabilitySpec::parse(&valid, "t").unwrap();
+        assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(spec.isolation.broker, Some(BrokerKind::CodexResponses));
+
+        // a broker is host CODE: an unknown name must never degrade to "no
+        // broker" (that would hand the child the operator's credential), and a
+        // malformed env name must never degrade to "no config home" (same leak,
+        // via the CLI's real config dir).
+        for (needle, replacement) in [
+            ("CODEX_HOME", "CODEX-HOME"),
+            ("codex-responses", "generic-forwarder"),
+        ] {
+            let err = CapabilitySpec::parse(&valid.replace(needle, replacement), "t").unwrap_err();
+            assert!(err.contains("isolation"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_broker_spec_may_not_also_mount_its_credential_dir() {
+        // THE credential invariant: the broker exists so the credential never
+        // enters the child; rw_dirs would mount it in anyway, and the run would
+        // still WORK — so the regression would be silent. hence a load error.
+        let both = format!(
+            "{}\n[isolation]\nbroker = \"codex-responses\"\n\n[sandbox]\nrw_dirs = [\"~/.codex\"]\n",
+            spec_toml("ok")
+        );
+        let err = CapabilitySpec::parse(&both, "t").unwrap_err();
+        assert!(err.contains("may not also declare"), "got {err:?}");
+        assert!(err.contains("rw_dirs"), "the error names the offender: {err:?}");
+
+        // either one ALONE is fine — they are the two legitimate auth paths.
+        let broker_only = format!(
+            "{}\n[isolation]\nbroker = \"codex-responses\"\n",
+            spec_toml("ok")
+        );
+        assert!(CapabilitySpec::parse(&broker_only, "t").is_ok());
+        let dirs_only = format!("{}\n[sandbox]\nrw_dirs = [\"~/.claude\"]\n", spec_toml("ok"));
+        assert!(CapabilitySpec::parse(&dirs_only, "t").is_ok());
+
+        // and a config home WITHOUT a broker is still compatible with rw_dirs:
+        // only the broker makes the credential dir a contradiction.
+        let config_home_and_dirs = format!(
+            "{}\n[isolation]\nconfig_home_env = \"CLI_HOME\"\n\n[sandbox]\nrw_dirs = [\"~/.cli\"]\n",
+            spec_toml("ok")
+        );
+        assert!(CapabilitySpec::parse(&config_home_and_dirs, "t").is_ok());
     }
 
     #[test]
