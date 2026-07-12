@@ -130,12 +130,20 @@ export function PageRefChip({ pageId }: { pageId: string }) {
 }
 
 /** A pages COMMENT body: plain text on the wire, so every reference is
- *  re-derived at render — `[[page:<id>]]` refs chip (as everywhere), and
- *  @tokens resolve through the SAME resolver + grammar the submit path used
- *  (`splitMentions` over `mentionResolverOf`), so a handle renders as a live
- *  mention exactly when the module was told about it. An @word the resolver
- *  doesn't know stays tinted-inert via LiteralRun — an address nobody claimed.
- *  Without a store (bare component tests) nothing resolves, everything tints. */
+ *  re-derived at render — @tokens resolve through the SAME resolver + grammar
+ *  the submit path used (`splitMentions` over `mentionResolverOf`), then
+ *  `[[page:<id>]]` refs chip inside the non-mention runs. Mentions split
+ *  FIRST, over the RAW text: that keeps the whitespace boundary identical to
+ *  what the submit path saw, so "[[page:p1]]@bot" stays a literal on both
+ *  ends of the wire (the '@' is glued to ']') instead of chipping a mention
+ *  the module was never told about. An @word the resolver doesn't know stays
+ *  tinted-inert via LiteralRun — an address nobody claimed. Without a store
+ *  (bare component tests) nothing resolves, everything tints.
+ *
+ *  ponytail: markdown-adjacent tokens can still disagree — the submit path
+ *  parses bold marks and fences that comments render raw, so "**hi**@bot"
+ *  invokes without a chip. Reconciling that means changing the WIRE's grammar
+ *  for plain-text comments, not this renderer. */
 export function CommentText({ text, names }: { text: string; names: AuthorNames }) {
   const store = useContext(ConsoleContext);
   const agents = store?.state.agents;
@@ -149,22 +157,19 @@ export function CommentText({ text, names }: { text: string; names: AuthorNames 
   );
   return (
     <>
-      {splitPageRefs(text).map((segment, i) =>
-        isPageRef(segment) ? (
-          <PageRefChip key={i} pageId={segment.pageId} />
-        ) : (
-          splitMentions({ text: segment.text, marks: [] }, resolver).map((span, j) => {
-            const mark = span.marks.find(
-              (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
-            );
-            return mark ? (
-              <MentionToken key={`${i}:${j}`} mention={mark.mention} names={names} />
-            ) : (
-              <LiteralRun key={`${i}:${j}`} text={span.text} />
-            );
-          })
-        ),
-      )}
+      {splitMentions({ text, marks: [] }, resolver).map((span, i) => {
+        const mark = span.marks.find(
+          (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
+        );
+        if (mark) return <MentionToken key={i} mention={mark.mention} names={names} />;
+        return splitPageRefs(span.text).map((segment, j) =>
+          isPageRef(segment) ? (
+            <PageRefChip key={`${i}:${j}`} pageId={segment.pageId} />
+          ) : (
+            <LiteralRun key={`${i}:${j}`} text={segment.text} />
+          ),
+        );
+      })}
     </>
   );
 }

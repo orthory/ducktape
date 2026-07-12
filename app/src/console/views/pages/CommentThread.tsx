@@ -93,9 +93,14 @@ export function NewThreadComposer({
         value={text}
         onChange={mention.onTextChange}
         onSelect={mention.onSelect}
+        onFocus={mention.onFocus}
+        onBlur={mention.onBlur}
         onKeyDown={(e) => {
           if (mention.onKeyDown(e)) return;
-          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+          // IME guards: Enter committing a candidate must not submit, and the
+          // Escape that CANCELS a composition must not cancel the composer.
+          if (e.nativeEvent.isComposing) return;
+          if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
             submit();
           }
@@ -125,6 +130,7 @@ function CommentRow({
   authorNames,
   selfKey,
   ops,
+  threadPending,
   onEdit,
   onDelete,
 }: {
@@ -132,13 +138,18 @@ function CommentRow({
   authorNames: AuthorNames;
   selfKey: string;
   ops: OpLedger;
+  /** True while the THREAD's op (add/reply/resolve) is in flight — an
+   *  optimistic row's Edit/Delete would race the create it depends on (the
+   *  transport gives no ordering), so own-comment actions hide until the
+   *  thread settles. */
+  threadPending: boolean;
   onEdit: (commentId: string, text: string) => void;
   onDelete: (commentId: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState("");
   const name = authorName(comment.author, authorNames);
-  const own = authorKey(comment.author) === selfKey;
+  const own = authorKey(comment.author) === selfKey && !threadPending;
   return (
     <div style={{ marginBottom: 10 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
@@ -258,6 +269,8 @@ export function ThreadCard({
   onDelete: (commentId: string) => void;
 }) {
   const { thread, comments } = view;
+  const threadOp = ops[opKey.commentThread(thread.id)];
+  const threadPending = threadOp?.phase === "pending";
   const [reply, setReply] = useState("");
   const replyRef = useRef<HTMLTextAreaElement | null>(null);
   const mention = useMentionMenu(reply, setReply, replyRef);
@@ -309,6 +322,7 @@ export function ThreadCard({
             authorNames={authorNames}
             selfKey={selfKey}
             ops={ops}
+            threadPending={threadPending}
             onEdit={onEdit}
             onDelete={onDelete}
           />
@@ -333,19 +347,22 @@ export function ThreadCard({
           value={reply}
           onChange={mention.onTextChange}
           onSelect={mention.onSelect}
+          onFocus={mention.onFocus}
+          onBlur={mention.onBlur}
           onKeyDown={onReplyKeyDown}
           rows={1}
           placeholder="Reply… (@ to mention)"
           style={{ ...composerStyle, flex: 1 }}
         />
         {mention.menu}
-        <FinalizationMark op={ops[opKey.commentThread(thread.id)]} />
+        <FinalizationMark op={threadOp} />
         <button
           type="button"
           title={thread.resolved ? "Reopen thread" : "Resolve thread"}
           aria-label={thread.resolved ? "Reopen thread" : "Resolve thread"}
-          onClick={() => onResolve(thread.id, !thread.resolved)}
-          style={iconBtn}
+          aria-disabled={threadPending}
+          onClick={() => !threadPending && onResolve(thread.id, !thread.resolved)}
+          style={threadPending ? { ...iconBtn, cursor: "default", opacity: 0.4 } : iconBtn}
         >
           <Icon name={thread.resolved ? "refresh" : "check"} size={13} strokeWidth={1.9} />
         </button>

@@ -22,11 +22,15 @@ function TypeaheadMenu({
   rows,
   activeIndex,
   onPick,
+  drop = "up",
 }: {
   ariaLabel: string;
   rows: Row[];
   activeIndex: number;
   onPick: (token: string) => void;
+  /** "up" (default — the chat composer sits at the pane bottom) opens above
+   *  the anchor; "down" below it (a comment composer near the window top). */
+  drop?: "up" | "down";
 }) {
   if (rows.length === 0) return null;
   return (
@@ -36,9 +40,10 @@ function TypeaheadMenu({
       style={{
         position: "absolute",
         zIndex: 20,
-        bottom: "100%",
+        ...(drop === "up"
+          ? { bottom: "100%", marginBottom: 6 }
+          : { top: "100%", marginTop: 6 }),
         left: 0,
-        marginBottom: 6,
         width: 260,
         maxHeight: 240,
         overflowY: "auto",
@@ -105,10 +110,12 @@ export function MentionMenu({
   candidates,
   activeIndex,
   onPick,
+  drop,
 }: {
   candidates: MentionCandidate[];
   activeIndex: number;
   onPick: (token: string) => void;
+  drop?: "up" | "down";
 }) {
   const rows = candidates.map((candidate): Row => {
     const token = mentionCandidateToken(candidate);
@@ -128,6 +135,7 @@ export function MentionMenu({
       rows={rows}
       activeIndex={activeIndex}
       onPick={onPick}
+      drop={drop}
     />
   );
 }

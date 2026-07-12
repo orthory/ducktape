@@ -226,6 +226,16 @@ describe("CommentText (plain-text comment bodies)", () => {
     expect(screen.getByText("@nobody")).toBeTruthy();
   });
 
+  it("keeps an @token glued to a page ref literal — submit never resolved it", () => {
+    withStore(<CommentText text="[[page:p1]]@quackbot ping" names={{}} />, {
+      agents: [ROSTERED],
+      pages: [page("p1", "Launch plan")],
+    });
+
+    expect(screen.getByRole("button", { name: "Open page Launch plan" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Open agent quackbot/ })).toBeNull();
+  });
+
   it("ignores a mid-word @ (emails are not mentions)", () => {
     withStore(<CommentText text="mail quackbot@example.com" names={{}} />, {
       agents: [ROSTERED],

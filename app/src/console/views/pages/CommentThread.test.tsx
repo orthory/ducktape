@@ -74,6 +74,7 @@ describe("comment composer @mention typeahead", () => {
       />,
     );
     const input = screen.getByLabelText("New comment text") as HTMLTextAreaElement;
+    fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "@qu" } });
 
     // the menu portals to document.body (the card/panel clip overflow)
@@ -96,6 +97,7 @@ describe("comment composer @mention typeahead", () => {
       />,
     );
     const input = screen.getByLabelText("New comment text");
+    fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "@qu" } });
     fireEvent.keyDown(input, { key: "Escape" });
 
@@ -120,6 +122,7 @@ describe("comment composer @mention typeahead", () => {
       />,
     );
     const input = screen.getByLabelText("Reply to thread") as HTMLTextAreaElement;
+    fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "@qu" } });
     fireEvent.keyDown(input, { key: "Enter" });
 
@@ -130,6 +133,23 @@ describe("comment composer @mention typeahead", () => {
     expect(onReply).toHaveBeenCalledWith("t1", "@quackbot ");
   });
 
+  it("closes when the textarea loses focus — no orphaned menu over other composers", () => {
+    withStore(
+      <NewThreadComposer
+        composer={{ target: "b1", label: "this block" }}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    const input = screen.getByLabelText("New comment text");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "@qu" } });
+    expect(screen.getByRole("listbox", { name: /mention/i })).toBeTruthy();
+
+    fireEvent.blur(input);
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
   it("degrades to a plain textarea without a store (no menu, no crash)", () => {
     render(
       <NewThreadComposer
@@ -138,9 +158,9 @@ describe("comment composer @mention typeahead", () => {
         onCancel={vi.fn()}
       />,
     );
-    fireEvent.change(screen.getByLabelText("New comment text"), {
-      target: { value: "@qu" },
-    });
+    const bare = screen.getByLabelText("New comment text");
+    fireEvent.focus(bare);
+    fireEvent.change(bare, { target: { value: "@qu" } });
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 });
@@ -148,6 +168,7 @@ describe("comment composer @mention typeahead", () => {
 describe("thread card texture", () => {
   it("stamps a wall-clock comment time, and stays silent pre-wall-clock", () => {
     const at = new Date("2026-03-05T12:00:00Z").getTime();
+    const expected = new Date(at).toLocaleDateString([], { month: "short", day: "numeric" });
     const { container, unmount } = render(
       <ThreadCard
         view={view({}, at)}
@@ -159,7 +180,7 @@ describe("thread card texture", () => {
         onDelete={vi.fn()}
       />,
     );
-    expect(container.textContent).toContain("Mar 5");
+    expect(container.textContent).toContain(expected);
     unmount();
 
     // created_at 1 is genesis-relative — no fake "Jan 1, 1970"

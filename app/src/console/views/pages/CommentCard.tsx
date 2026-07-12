@@ -63,6 +63,10 @@ export function CommentCard({
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // an IME's Escape cancels the COMPOSITION, not the card — closing here
+      // would throw away the draft mid-composition (isComposing, or the 229
+      // keyCode some engines report during IME handling).
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") onClose();
     };
     const onPress = (event: MouseEvent) => {
