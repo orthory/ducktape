@@ -1032,6 +1032,14 @@ export function DucktapeProvider({
     }
   }, [state.screen, state.forgeFocus]);
 
+  // 5d. filesFocus rides the same idiom: the files browser navigates to it, and
+  //     the provider retires it once the user leaves the files screen.
+  useEffect(() => {
+    if (state.screen !== "files" && state.filesFocus) {
+      dispatch({ type: "patch", patch: { filesFocus: null } });
+    }
+  }, [state.screen, state.filesFocus]);
+
   // 6. Desktop notifier config push: the Rust notifier learns who "me" is (the
   //    identity account behind our node key and EVERY node bound to it), what
   //    is focused, and which categories are enabled — all from this webview.

@@ -1,10 +1,14 @@
 // The focused Add-agent pane. The agent id is derived from the display name
 // by default; the Advanced disclosure reveals the override.
+//
+// There is no prompt textarea: an agent's persona is a duckfs document it
+// curates as an always-loaded skill (see SkillsField), so this form commits
+// pins, never prompt text.
 
 import { useState } from "react";
 import type { FormEvent } from "react";
 
-import type { ResourceCaps } from "../../../domain/agent-client";
+import type { ResourceCaps, SkillRef } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import {
@@ -24,6 +28,8 @@ import {
   StatusPill,
 } from "./parts";
 import { RunsOnPicker } from "./RunsOnPicker";
+import { cleanSkills } from "./skills";
+import { SkillsField } from "./SkillsField";
 
 export function RegisterAgentForm({
   capabilities,
@@ -35,9 +41,9 @@ export function RegisterAgentForm({
     displayName: string;
     agentId: string;
     capability: string;
-    prompt: string;
     allowedActions: string[];
     caps?: ResourceCaps;
+    skills?: SkillRef[];
   }) => void;
   /** Called after a successful submit (and by Cancel) so the host can close
    *  the create pane. */
@@ -46,7 +52,7 @@ export function RegisterAgentForm({
   const [displayName, setDisplayName] = useState("");
   const [agentIdInput, setAgentIdInput] = useState("");
   const [capability, setCapability] = useState("");
-  const [prompt, setPrompt] = useState("");
+  const [skills, setSkills] = useState<SkillRef[]>([]);
   const [allowedActions, setAllowedActions] = useState<string[]>(["chat.post"]);
   // The pages_write cap field: page ids (or "*") the agent may write.
   const [pagesWrite, setPagesWrite] = useState("");
@@ -58,7 +64,6 @@ export function RegisterAgentForm({
     displayName.trim() !== "" &&
     agentId !== "" &&
     capability.trim() !== "" &&
-    prompt.trim() !== "" &&
     allowedActions.length > 0;
 
   const toggle = (name: string) =>
@@ -70,18 +75,19 @@ export function RegisterAgentForm({
     event.preventDefault();
     if (!ready) return;
     const pages = parsePagesWrite(pagesWrite);
+    const curated = cleanSkills(skills);
     onRegister({
       displayName: displayName.trim(),
       agentId,
       capability: capability.trim(),
-      prompt,
       allowedActions,
       ...(pages.length ? { caps: { pages_write: pages } } : {}),
+      ...(curated.length ? { skills: curated } : {}),
     });
     setDisplayName("");
     setAgentIdInput("");
     setCapability("");
-    setPrompt("");
+    setSkills([]);
     setAllowedActions(["chat.post"]);
     setPagesWrite("");
     setShowAdvanced(false);
@@ -107,7 +113,7 @@ export function RegisterAgentForm({
                   lineHeight: 1.45,
                 }}
               >
-                Give it a name, pick what it runs on, and describe its job.
+                Give it a name, pick what it runs on, and curate the documents it carries.
               </div>
             </div>
             <StatusPill label="AGENT" tone={statusTone.agent} />
@@ -144,23 +150,13 @@ export function RegisterAgentForm({
             </div>
           </div>
 
-          <div style={{ marginTop: 10 }}>
-            <FieldLabel htmlFor="agent-system-prompt">System prompt</FieldLabel>
-            <textarea
-              id="agent-system-prompt"
-              name="agent-system-prompt"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={5}
-              placeholder="Describe what this agent may do…"
-              style={{
-                ...inputStyle,
-                resize: "vertical",
-                minHeight: 96,
-                lineHeight: 1.45,
-              }}
-            />
-          </div>
+          <SkillsField
+            idPrefix="agent"
+            agentId={agentId}
+            displayName={displayName}
+            skills={skills}
+            onChange={setSkills}
+          />
 
           <fieldset
             style={{

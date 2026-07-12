@@ -298,6 +298,11 @@ export interface ConsoleState {
    *  a repo-only focus. Null when nothing is pending. */
   forgeFocus: { repo: string; number: number | null } | null;
 
+  /** The duckfs path the files browser should open on next render — the same
+   *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an
+   *  operator at a skill document. Null when nothing is pending. */
+  filesFocus: string | null;
+
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
    *  inclusion height + addressable op hash from the submit receipt. Client
@@ -737,6 +742,7 @@ export const createInitialState = (): ConsoleState => {
     blocks: [],
     explorerFocus: null,
     forgeFocus: null,
+    filesFocus: null,
     ops: {},
     error: null,
     bootError: null,
@@ -799,6 +805,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   blocks: [],
   explorerFocus: null,
   forgeFocus: null,
+  filesFocus: null,
   ops: {},
   connectionDown: null,
 });

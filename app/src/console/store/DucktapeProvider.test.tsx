@@ -140,7 +140,6 @@ const QUACKBOT: AgentRecord = {
   owner: { external: [1] },
   display_name: "Quackbot",
   capability: "echo",
-  prompt_hash: Array(32).fill(7),
   allowed_actions: ["chat.post"],
   status: "active",
   created_at: 1,

@@ -1,9 +1,9 @@
 // The agent client mirrors agent-interface: AgentMsg encoding (ownership from
 // the block origin, never in a payload; snake_case fields) + AgentReply
 // decoding for the Agents / Agent queries, including the null (absent agent)
-// case. The prompt-upload flow itself lives in the store; here we only prove
-// the wire shapes and the hex→bytes hash helper. The acting half (watches,
-// runs) is runs-client — see runs-client.test.
+// case. An agent's soul is its curated skills, so the wire carries SkillRefs
+// with their load mode and NO prompt/prompt_hash at all — both asserted here.
+// The acting half (watches, runs) is runs-client — see runs-client.test.
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,7 +16,7 @@ import {
   resumeAgent,
   updateAgent,
 } from "./agent-client";
-import type { AgentRecord } from "./agent-client";
+import type { AgentRecord, SkillRef } from "./agent-client";
 import { makeTransportStub } from "../test/transport-stub";
 
 const stubTransport = (reply?: unknown) =>
@@ -36,15 +36,51 @@ describe("hexToBytes", () => {
 });
 
 describe("agent msgs", () => {
+  const persona: SkillRef = {
+    name: "persona",
+    source_prefix: "/shared/agents/helper/persona",
+    load: "always",
+  };
+  const runbook: SkillRef = {
+    name: "runbook",
+    source_prefix: "/shared/skills/runbook",
+    source_snapshot: "cafe",
+    load: "on_demand",
+  };
+
   it("encodes RegisterAgent, passing the origin for owner-gating", async () => {
     const transport = stubTransport();
-    const promptHash = hexToBytes("cd".repeat(32));
     await registerAgent(transport, {
       agentId: "helper",
       displayName: "Helper",
       capability: "alpha",
-      promptHash,
       allowedActions: ["chat.post"],
+      origin: "operator",
+    });
+    // Exact match: no prompt / prompt_hash key is ever sent, and an empty skill
+    // set is omitted rather than sent as [].
+    expect(transport.submit).toHaveBeenCalledWith(
+      "agent",
+      {
+        register_agent: {
+          agent_id: "helper",
+          display_name: "Helper",
+          capability: "alpha",
+          allowed_actions: ["chat.post"],
+        },
+      },
+      "operator",
+    );
+  });
+
+  it("carries the curated skills — each with its load mode — in order", async () => {
+    const transport = stubTransport();
+    await registerAgent(transport, {
+      agentId: "helper",
+      displayName: "Helper",
+      capability: "alpha",
+      allowedActions: ["chat.post"],
+      skills: [persona, runbook],
       origin: "operator",
     });
     expect(transport.submit).toHaveBeenCalledWith(
@@ -54,8 +90,8 @@ describe("agent msgs", () => {
           agent_id: "helper",
           display_name: "Helper",
           capability: "alpha",
-          prompt_hash: promptHash,
           allowed_actions: ["chat.post"],
+          skills: [persona, runbook],
         },
       },
       "operator",
@@ -76,9 +112,28 @@ describe("agent msgs", () => {
           agent_id: "helper",
           display_name: "Helper 2",
           capability: null,
-          prompt_hash: null,
           allowed_actions: null,
           caps: null,
+          skills: null,
+        },
+      },
+      "operator",
+    );
+  });
+
+  it("UpdateAgent replaces the curated set wholesale — [] clears it", async () => {
+    const transport = stubTransport();
+    await updateAgent(transport, { agentId: "helper", skills: [], origin: "operator" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "agent",
+      {
+        update_agent: {
+          agent_id: "helper",
+          display_name: null,
+          capability: null,
+          allowed_actions: null,
+          caps: null,
+          skills: [],
         },
       },
       "operator",
@@ -110,11 +165,13 @@ describe("agent queries", () => {
     owner: { external: [1, 2, 3] },
     display_name: "Helper",
     capability: "alpha",
-    prompt_hash: hexToBytes("cd".repeat(32)),
     allowed_actions: ["chat.post"],
     status: "active",
     created_at: 1,
     updated_at: 2,
+    skills: [
+      { name: "persona", source_prefix: "/shared/agents/helper/persona", load: "always" },
+    ],
   };
 
   it("sends the bare string Agents and decodes the roster", async () => {
