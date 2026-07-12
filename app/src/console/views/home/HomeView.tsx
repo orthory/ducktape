@@ -20,6 +20,7 @@ import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { CustodyCard } from "./CustodyCard";
 import { DevicesCard } from "./DevicesCard";
+import { NetworkNodesCard } from "./NetworkNodesCard";
 import { ProfileCard } from "./ProfileCard";
 import { WorkspacesTable } from "./WorkspacesTable";
 
@@ -91,6 +92,8 @@ export function HomeView() {
             always works.
           </div>
         )}
+
+        <NetworkNodesCard accountId={accountId} />
 
         <DevicesCard accountId={accountId} identity={identity} />
 
