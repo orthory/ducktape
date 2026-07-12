@@ -27,6 +27,12 @@ pub(crate) struct MeshHead {
     /// The registered `ducktape_dataplane_*` series — dropping this
     /// unregisters them, so it must live as long as the node runs.
     pub(crate) plane_metrics: crate::plane_metrics::PlaneMetrics,
+    /// The statesync serve-lane registry the validator's serve task records
+    /// every answered request into; `sync_metrics` reads it at scrape time.
+    pub(crate) sync_monitor: statesync::monitor::ServeMonitor,
+    /// The registered `ducktape_statesync_serve_*` series — same lifetime
+    /// contract as `plane_metrics`.
+    pub(crate) sync_metrics: crate::sync::metrics::SyncServeMetrics,
     pub(crate) mesh_participants: Set<ed25519::PublicKey>,
     pub(crate) status_public_key: String,
     pub(crate) sync_sources: Vec<ed25519::PublicKey>,
@@ -66,6 +72,13 @@ pub(crate) fn build(
     // the live counters straight off the monitor.
     let plane_monitor = data_plane::PlaneMonitor::default();
     let plane_metrics = crate::plane_metrics::PlaneMetrics::register(&context, &plane_monitor);
+
+    // the statesync serve-lane registry + its `ducktape_statesync_serve_*`
+    // series: statesync rides the mesh carrier (never a data plane), so the
+    // monitor above can't see it — the validator's serve task records every
+    // answered request here instead, per requesting peer.
+    let sync_monitor = statesync::monitor::ServeMonitor::default();
+    let sync_metrics = crate::sync::metrics::SyncServeMetrics::register(&context, &sync_monitor);
 
     // the authorized MESH set, SORTED — what discovery tracks. the
     // consensus scheme uses the (possibly smaller) validator set derived
@@ -167,6 +180,8 @@ pub(crate) fn build(
         metrics,
         plane_monitor,
         plane_metrics,
+        sync_monitor,
+        sync_metrics,
         mesh_participants,
         status_public_key,
         sync_sources,

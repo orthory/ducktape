@@ -57,6 +57,29 @@ const withPlanesText = [
   "",
 ].join("\n");
 
+const withSyncPeersText = [
+  withDataText
+    .replace("ducktape_block_height 42", "ducktape_block_height 2000")
+    .replace("# EOF\n", ""),
+  'ducktape_statesync_serve_age_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 75',
+  'ducktape_statesync_serve_idle_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1',
+  'ducktape_statesync_serve_bytes{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 5250000',
+  'ducktape_statesync_serve_frames{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 40',
+  'ducktape_statesync_serve_boundary_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1500',
+  'ducktape_statesync_serve_frame_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1540',
+  'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="manifest"} 1',
+  'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="chunk"} 21',
+  'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 4',
+  // a tip poller: no manifest/frames served yet, so no height-shaped series.
+  'ducktape_statesync_serve_age_seconds{peer="0011223344556677"} 3000',
+  'ducktape_statesync_serve_idle_seconds{peer="0011223344556677"} 9',
+  'ducktape_statesync_serve_bytes{peer="0011223344556677"} 4200',
+  'ducktape_statesync_serve_frames{peer="0011223344556677"} 0',
+  'ducktape_statesync_serve_requests{peer="0011223344556677",kind="tip_coords"} 250',
+  "# EOF",
+  "",
+].join("\n");
+
 // ── Harness: a stub transport whose stream the test drives ──
 
 const streamHarness = () => {
@@ -158,6 +181,10 @@ describe("MetricsView charts", () => {
     // no open planes: the Data planes panel says so honestly.
     expect(screen.getByText("Data planes")).toBeInTheDocument();
     expect(screen.getByText(/No open data planes/)).toBeInTheDocument();
+
+    // no served sync peers: the State sync panel says so honestly.
+    expect(screen.getByText("State sync")).toBeInTheDocument();
+    expect(screen.getByText(/state-sync lane is idle/)).toBeInTheDocument();
   });
 
   it("lists every open data plane with its creator and drop accounting", () => {
@@ -184,5 +211,24 @@ describe("MetricsView charts", () => {
     // +4 blocks over 2 s of server time → 2.00 blocks/sec in the Rate tile.
     push(withDataText.replace("ducktape_blocks_total 100", "ducktape_blocks_total 104"), 3_000);
     expect(screen.getAllByText("2.00 /s").length).toBeGreaterThan(0);
+  });
+
+  it("lists every served sync peer with its phase and block progression", () => {
+    const { push } = renderMetrics();
+    push(withSyncPeersText);
+
+    expect(screen.getByText("serving 2")).toBeInTheDocument();
+    // peers are identified by their leading hex, with the phase under each.
+    expect(screen.getByText("9f3ab2c1…")).toBeInTheDocument();
+    expect(screen.getByText(/replaying frames · 1m 15s/)).toBeInTheDocument();
+    expect(screen.getByText("00112233…")).toBeInTheDocument();
+    expect(screen.getByText(/polling tip · 50m 0s/)).toBeInTheDocument();
+    // the joiner replayed to 1540 of 2000: 77%, 460 blocks left.
+    expect(screen.getByText(/77% · 460 blocks left/)).toBeInTheDocument();
+    // the tip poller has no height-shaped responses — an honest placeholder.
+    expect(screen.getByText(/no block progression yet/)).toBeInTheDocument();
+    // cumulative serve totals per peer.
+    expect(screen.getByText(/5.25 MB · 40 frames/)).toBeInTheDocument();
+    expect(screen.queryByText(/state-sync lane is idle/)).toBeNull();
   });
 });

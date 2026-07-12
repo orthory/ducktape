@@ -1396,14 +1396,30 @@ where
         let mut applied = peers.clone();
         self.merge_invite_layer(&mut applied);
         let parts: Vec<PeerTunnelConfig> = applied.values().cloned().collect();
-        match apply_peer_tunnels(
-            &mut self.effect,
-            self.interface.clone(),
-            self.keypair.private_key_base64(),
-            self.config.wireguard_port,
-            &local_interface_ips,
-            &parts,
-        ) {
+        // the invite bootstrap may have brought the interface up before the
+        // first epoch event (a NATed member re-running first contact at
+        // boot) — reconfigure it rather than re-create it, so the restore
+        // neither dies on `AlreadyCreated` nor drops the live join tunnel.
+        let outcome = if self.interface_live {
+            update_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_port,
+                &local_interface_ips,
+                &parts,
+            )
+        } else {
+            apply_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_port,
+                &local_interface_ips,
+                &parts,
+            )
+        };
+        match outcome {
             Ok(()) => {
                 self.interface_live = true;
                 // the restored mesh is the interface's base — the pre-warm

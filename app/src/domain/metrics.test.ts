@@ -7,6 +7,7 @@ import {
   formatBytes,
   formatBytesRate,
   formatLatency,
+  formatPeer,
   formatRate,
   meanLatency,
   parseMetrics,
@@ -16,6 +17,9 @@ import {
   planeTxBytes,
   quantile,
   ratePerSecond,
+  syncBlocksLeft,
+  syncPhase,
+  syncProgress,
 } from "./metrics";
 
 // A representative /metrics scrape: commonware runtime noise (must be ignored)
@@ -82,6 +86,26 @@ ducktape_dataplane_streams{service="gateway",owner="gateway",kind="accepted"} 7
 ducktape_dataplane_drops{service="voice",owner="chat",kind="shed"} 5
 ducktape_dataplane_drops{service="voice",owner="chat",kind="rogue_datagrams"} 2
 ducktape_dataplane_drops{service="gateway",owner="gateway",kind="refused_sends"} 0
+# TYPE ducktape_statesync_serve_age_seconds gauge
+ducktape_statesync_serve_age_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 75
+ducktape_statesync_serve_age_seconds{peer="0011223344556677"} 3000
+# TYPE ducktape_statesync_serve_idle_seconds gauge
+ducktape_statesync_serve_idle_seconds{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1
+ducktape_statesync_serve_idle_seconds{peer="0011223344556677"} 9
+# TYPE ducktape_statesync_serve_bytes gauge
+ducktape_statesync_serve_bytes{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 5250000
+ducktape_statesync_serve_bytes{peer="0011223344556677"} 4200
+# TYPE ducktape_statesync_serve_frames gauge
+ducktape_statesync_serve_frames{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 40
+# TYPE ducktape_statesync_serve_requests gauge
+ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="manifest"} 1
+ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="chunk"} 21
+ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 4
+ducktape_statesync_serve_requests{peer="0011223344556677",kind="tip_coords"} 250
+# TYPE ducktape_statesync_serve_boundary_height gauge
+ducktape_statesync_serve_boundary_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1500
+# TYPE ducktape_statesync_serve_frame_height gauge
+ducktape_statesync_serve_frame_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1540
 `;
 
 describe("parseMetrics", () => {
@@ -128,6 +152,29 @@ describe("parseMetrics", () => {
     expect(voice.datagramsTx).toBe(4000);
     expect(voice.datagramsRx).toBe(2000);
     expect(voice.drops).toEqual({ shed: 5, rogue_datagrams: 2 });
+  });
+
+  it("assembles the statesync serve families into served peers, sorted", () => {
+    const m = parseMetrics(SCRAPE);
+    expect(m.syncPeers).toHaveLength(2);
+
+    // sorted by peer: the tip poller's key sorts first.
+    const [poller, joiner] = m.syncPeers;
+    expect(poller.peer).toBe("0011223344556677");
+    expect(poller.ageSeconds).toBe(3000);
+    expect(poller.idleSeconds).toBe(9);
+    expect(poller.bytesTx).toBe(4200);
+    expect(poller.framesServed).toBe(0);
+    expect(poller.boundaryHeight).toBeNull();
+    expect(poller.servedHeight).toBeNull();
+    expect(poller.requests).toEqual({ tip_coords: 250 });
+
+    expect(joiner.peer).toBe("9f3ab2c1d4e5f607a8b9cadbecfd0e1f");
+    expect(joiner.bytesTx).toBe(5250000);
+    expect(joiner.framesServed).toBe(40);
+    expect(joiner.boundaryHeight).toBe(1500);
+    expect(joiner.servedHeight).toBe(1540);
+    expect(joiner.requests).toEqual({ manifest: 1, chunk: 21, frames: 4 });
   });
 
   it("keeps `present` a block-series fact: plane series alone don't set it", () => {
@@ -196,6 +243,35 @@ describe("derivations", () => {
     expect(planeRxBytes(voice)).toBe(320000);
     expect(planeDropTotal(voice)).toBe(7);
   });
+
+  it("measures a sync peer's progression against the node's own height", () => {
+    const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
+    // the joiner replayed to 1540 of a 2000-block goal: 77%, 460 left.
+    expect(syncProgress(joiner, 2000)).toBeCloseTo(0.77, 6);
+    expect(syncBlocksLeft(joiner, 2000)).toBe(460);
+    // reach never exceeds the goal (a stale scrape's height lags the serve).
+    expect(syncProgress(joiner, 1000)).toBe(1);
+    expect(syncBlocksLeft(joiner, 1000)).toBe(0);
+    // a tip poller has no height-shaped responses — no progression.
+    expect(syncProgress(poller, 2000)).toBeNull();
+    expect(syncBlocksLeft(poller, 2000)).toBeNull();
+    // an unknown goal (height 0) yields no progression either.
+    expect(syncProgress(joiner, 0)).toBeNull();
+  });
+
+  it("phases a sync peer from its request mix", () => {
+    const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
+    expect(syncPhase(joiner)).toBe("replaying frames");
+    expect(syncPhase(poller)).toBe("polling tip");
+    // a snapshot restore in flight: manifest served, chunks moving, no frames.
+    expect(syncPhase({ ...joiner, servedHeight: null })).toBe("restoring snapshot");
+    // manifest served but no payload requested yet.
+    expect(syncPhase({ ...joiner, servedHeight: null, requests: { manifest: 1 } })).toBe(
+      "manifest served",
+    );
+    // nothing height-shaped at all: the blob fetch-on-miss lane.
+    expect(syncPhase({ ...poller, requests: { blob: 3 } })).toBe("fetching blobs");
+  });
 });
 
 describe("formatting", () => {
@@ -233,5 +309,10 @@ describe("formatting", () => {
     expect(formatAge(3725)).toBe("1h 2m");
     expect(formatAge(2 * 86400 + 3 * 3600)).toBe("2d 3h");
     expect(formatAge(-1)).toBe("—");
+  });
+
+  it("shortens a peer key to its leading hex", () => {
+    expect(formatPeer("9f3ab2c1d4e5f607a8b9cadbecfd0e1f")).toBe("9f3ab2c1…");
+    expect(formatPeer("abcd")).toBe("abcd");
   });
 });

@@ -76,6 +76,7 @@ pub(super) async fn finish(
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
+    sync_monitor: statesync::monitor::ServeMonitor,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
@@ -272,6 +273,7 @@ pub(super) async fn finish(
                         | blob_fetch::MeshFrame::Junk => continue,
                         blob_fetch::MeshFrame::Request(req) => req,
                     };
+                    let req_kind = req.kind_name();
                     let resp = match req {
                         // blob fetches are host state — answered from the
                         // node-local store, never routed into SyncServer.
@@ -280,12 +282,17 @@ pub(super) async fn finish(
                         }
                         req => drive_sync_request(&mut server, &state_tx, req).await,
                     };
-                    let resp = statesync::encode_response(&resp);
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
+                    let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
+                    // the serve-lane observation (`ducktape_statesync_serve_*`):
+                    // who pulled what, and the progression the response
+                    // itself proves (served boundary / frame heights).
+                    sync_monitor.record(
+                        &config::hex_bytes(peer.as_ref()),
+                        req_kind,
+                        &resp,
+                        framed.len() as u64,
                     );
+                    let _ = sync_tx.send(Recipients::One(peer), IoBuf::from(framed), false);
                 }
             });
     }

@@ -2,15 +2,19 @@
 #
 # `make install` builds the networked node and the desktop app, installs
 # ducktape-node into ~/.cargo/bin, and installs the app — on macOS
-# Ducktape.app into /Applications, on Linux the plain `ducktape` binary
-# into ~/.cargo/bin (next to ducktape-node, which the app resolves as a
-# sibling of its own executable). individual targets below for the pieces.
+# Ducktape.app into /Applications, on Linux the app binary plus its pinned
+# CEF runtime into ~/.local/opt/ducktape with a `ducktape` symlink in
+# ~/.cargo/bin (the binary's DT_RPATH of $ORIGIN resolves the runtime beside
+# the real file, and a ducktape-node symlink keeps the app's sidecar
+# sibling-resolution working). individual targets below for the pieces.
 
 CARGO ?= cargo
 BUN ?= bun
 BUILD_WITH ?= $(CURDIR)/ops/build-with.sh
 APP_DEST ?= /Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
+# Linux: where install-app stages the app binary + CEF runtime files.
+OPT_DEST ?= $(HOME)/.local/opt/ducktape
 
 # The desktop shell runs on the standalone tauri-runtime-cef crate
 # (github.com/byeongsu-hong/tauri-runtime-cef) against published crates.io
@@ -143,9 +147,14 @@ install-coordinator: cef-env
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
-## macOS: Ducktape.app -> $(APP_DEST); Linux: ducktape -> $(BIN_DEST),
-## alongside install-node's ducktape-node so the app's sidecar resolution
-## (a `ducktape-node` sibling of its own executable) finds it.
+## macOS: Ducktape.app -> $(APP_DEST); Linux: binary + pinned CEF runtime ->
+## $(OPT_DEST), with $(BIN_DEST)/ducktape as a symlink (NOT a copy: the
+## binary's DT_RPATH is $ORIGIN, and ld.so resolves $ORIGIN through symlinks
+## to the real file's directory — a copied binary would sit beside no runtime
+## and fall back to LD_LIBRARY_PATH, which is how a system CEF of the wrong
+## major version silently breaks IME). The ducktape-node symlink beside the
+## real binary keeps the app's sidecar resolution (a `ducktape-node` sibling
+## of its own executable) pointed at install-node's artifact.
 ifeq ($(UNAME_S),Darwin)
 install-app: app
 	mkdir -p "$(APP_DEST)"
@@ -155,9 +164,17 @@ install-app: app
 	@echo "installed $(APP_DEST)/Ducktape.app"
 else
 install-app: app
-	mkdir -p "$(BIN_DEST)"
-	install -m 755 target/release/ducktape-desktop "$(BIN_DEST)/ducktape"
-	@echo "installed $(BIN_DEST)/ducktape"
+	mkdir -p "$(OPT_DEST)" "$(BIN_DEST)"
+	install -m 755 target/release/ducktape-desktop "$(OPT_DEST)/ducktape-desktop"
+	for f in libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
+	  chrome-sandbox chrome_100_percent.pak chrome_200_percent.pak icudtl.dat \
+	  resources.pak v8_context_snapshot.bin vk_swiftshader_icd.json; do \
+	  install -m 755 "target/release/$$f" "$(OPT_DEST)/$$f" || exit 1; done
+	rm -rf "$(OPT_DEST)/locales"
+	cp -a target/release/locales "$(OPT_DEST)/locales"
+	ln -sfn "$(BIN_DEST)/ducktape-node" "$(OPT_DEST)/ducktape-node"
+	ln -sfn "$(OPT_DEST)/ducktape-desktop" "$(BIN_DEST)/ducktape"
+	@echo "installed $(OPT_DEST) (launcher $(BIN_DEST)/ducktape)"
 	bash ops/install-desktop-entry.sh "$(BIN_DEST)/ducktape"
 endif
 

@@ -349,6 +349,8 @@ fn run_node(
             metrics,
             plane_monitor,
             plane_metrics,
+            sync_monitor,
+            sync_metrics,
             mesh_participants,
             status_public_key,
             sync_sources,
@@ -375,10 +377,11 @@ fn run_node(
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
         let bulk_pacer = overlay_book::shared_bulk_pacer();
-        // The `ducktape_dataplane_*` series unregister when this handle
-        // drops — pin it to the whole node future (both role arms await
-        // inside this block).
+        // The `ducktape_dataplane_*` / `ducktape_statesync_serve_*` series
+        // unregister when these handles drop — pin them to the whole node
+        // future (both role arms await inside this block).
         let _plane_metrics = plane_metrics;
+        let _sync_metrics = sync_metrics;
 
         if sync_only {
             boot::sync_only::run(
@@ -546,6 +549,7 @@ fn run_node(
             overlay_slot,
             bulk_pacer,
             plane_monitor,
+            sync_monitor,
             workspace,
             recovery,
             manifest,
