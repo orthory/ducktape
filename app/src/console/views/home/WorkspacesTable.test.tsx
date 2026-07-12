@@ -71,4 +71,22 @@ describe("WorkspacesTable", () => {
     renderTable();
     expect(screen.queryByRole("button", { name: /enter acme/i })).not.toBeInTheDocument();
   });
+
+  it("selects the workspace when its row is clicked", () => {
+    const { spies } = renderTable();
+
+    fireEvent.click(screen.getByText("Beta"));
+    expect(spies.selectWorkspace).toHaveBeenCalledExactlyOnceWith("b");
+  });
+
+  it("clicking the active row, or the Enter button, does not double-select", () => {
+    const { spies } = renderTable();
+
+    // The active row is inert, and the Enter button's click must not ALSO fire
+    // the row handler: connectActive drops the transport, so a second call
+    // would reconnect mid-connect. Two clicks, exactly one selection.
+    fireEvent.click(screen.getByText("Acme"));
+    fireEvent.click(screen.getByRole("button", { name: /enter beta/i }));
+    expect(spies.selectWorkspace).toHaveBeenCalledExactlyOnceWith("b");
+  });
 });
