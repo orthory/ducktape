@@ -78,6 +78,12 @@ pub struct RoMount {
     pub source_prefix: String,
     pub source_snapshot: Option<String>,
     pub mount_subpath: String,
+    /// the committed LOAD MODE (`SkillRef.load`): this skill's full body is
+    /// inlined into the run's context document ([`crate::assemble_context_doc`])
+    /// rather than merely indexed there. plain data crossing the reachability
+    /// wall — the provisioner reads the materialized `SKILL.md` and assembles;
+    /// this crate never touches duckfs.
+    pub always: bool,
 }
 
 /// the host-assembled receipt embedded in the `RunnerResult`. field-for-field
@@ -206,6 +212,14 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn env(&self) -> BTreeMap<String, String>;
     /// tool bin dirs prepended to `PATH` (populated in phase 4).
     fn path_entries(&self) -> Vec<PathBuf>;
+    /// the run's SOUL: its curated skills assembled into one document
+    /// ([`crate::assemble_context_doc`]) by whoever materialized the ro mounts
+    /// — the only layer that can read them. `None` = the agent curated no
+    /// skills. defaulted for embedders whose workspace has no skill plane; the
+    /// production provisioner always answers.
+    fn context_doc(&self) -> Option<String> {
+        None
+    }
     /// commit ONLY the rw source; a clean working copy → a `no_changes`
     /// receipt (never an error).
     async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String>;
@@ -217,12 +231,14 @@ pub trait ProvisionedWorkspace: Send + Sync {
 pub type SharedProvisioner = Arc<dyn WorkspaceProvisioner>;
 
 /// the ONE place a materialized workspace is bound onto the run context: the
-/// mount becomes the child's cwd, its env is layered additively, and its tool
-/// bin dirs feed `PATH`.
+/// mount becomes the child's cwd, its env is layered additively, its tool bin
+/// dirs feed `PATH`, and its assembled soul rides into the run — capability-host
+/// decides the door (the executor's auto-load path, or the stdin prompt).
 pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.workdir_override = Some(ws.workdir());
     ctx.env.extend(ws.env());
     ctx.path_entries = ws.path_entries();
+    ctx.context_doc = ws.context_doc();
 }
 
 // ---- faceted runner result (v1 wire) --------------------------------------------

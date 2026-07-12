@@ -321,7 +321,6 @@ fn run_node(
             &context,
             oracle_cmds,
             node_handle,
-            blobs.clone(),
             agent_dirs,
             &storage_for_runs,
             forge_push_base,

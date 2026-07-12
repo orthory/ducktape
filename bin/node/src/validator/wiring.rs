@@ -53,7 +53,6 @@ pub(super) struct RuntimeWiring {
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
-    pub(super) blob_fetcher: blob_fetch::BlobFetchFn,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -194,13 +193,6 @@ pub(super) async fn finish(
                 .cloned()
                 .collect(),
         ));
-    let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
-        sync_tx.clone(),
-        blob_pending.clone(),
-        std::sync::Arc::clone(&blob_peers),
-        signer.public_key(),
-    )
-    .into_fetch_fn();
     context.child("sync_ingress").spawn(move |_ctx| {
         let mut receiver = sync_rx;
         let mut bridge_tx = bridge_tx;
@@ -345,7 +337,6 @@ pub(super) async fn finish(
         channel_bank,
         gateway_book,
         blob_peers,
-        blob_fetcher,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,

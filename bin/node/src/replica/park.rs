@@ -163,13 +163,6 @@ pub(super) async fn park(
     let blob_pending: blob_fetch::PendingMap = Default::default();
     let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
         std::sync::Arc::new(std::sync::RwLock::new(peers.clone()));
-    let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
-        sync_tx.clone(),
-        blob_pending.clone(),
-        std::sync::Arc::clone(&blob_peers),
-        signer.public_key(),
-    )
-    .into_fetch_fn();
     // the joiner's sync client: the mesh path, ROTATING across every
     // validator that can serve.
     let client = P2pSyncClient::with_sources(
@@ -489,11 +482,7 @@ pub(super) async fn park(
         &context,
         resident_provider_set,
         me_bytes.clone(),
-        blobs.clone(),
         agent_provisioner.clone(),
-        // the mesh fetch-on-miss lane (#298, resident side): demuxed
-        // through the park loop's sync client's unmatched-frame hook.
-        Some(blob_fetcher),
         // the announced capacity IS the pool's ledger (one source), same as
         // the validator path.
         sandbox_capacity,

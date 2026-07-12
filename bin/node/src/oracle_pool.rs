@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
 use dispatch_oracle::{
-    BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, max_concurrent_runs_from_env,
+    DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, max_concurrent_runs_from_env,
 };
 use futures::SinkExt as _;
 use sdk::Msg;
@@ -30,22 +30,16 @@ const ORACLE_RESULT_LANE: usize = 64;
 /// over the returned receiver. the caller owns the receiver as a select-loop
 /// ingress arm and submits each `Msg` through the normal signed submit path.
 ///
-/// `blobs` is the node-local content-addressed store the app surface's
-/// putBlob lane feeds — the read path run-envelope prompt pins resolve
-/// through (an agent's registered prompt lives there under its sha256).
-///
-/// `blob_fetch` is the mesh fetch-on-miss lane (the #298 cross-node gap): a
-/// pin whose bytes were staged on ANOTHER node's store resolves by asking
-/// current peers, verifying by content hash, and writing the copy through
-/// this node's own store. Validators and residents both wire it; `None`
-/// (an embedder without a mesh) keeps strict local-only resolution.
+/// no blob lane is wired any more: an agent's persona used to be an opaque
+/// `prompt_hash` blob this pool resolved (locally, then over the mesh). the
+/// persona is a curated SKILL now — content-addressed in duckfs, mounted
+/// read-only by the provisioner, and assembled into the run's context document
+/// there. one content-addressed plane instead of two.
 pub(crate) fn build<C>(
     context: &C,
     providers: capability_host::ProviderSet,
     node_key: Vec<u8>,
-    blobs: blobstore::BlobHandle,
     provisioner: Option<SharedProvisioner>,
-    blob_fetch: Option<crate::blob_fetch::BlobFetchFn>,
     // the announced sandbox capacity — the pool's `ResourceLedger`. EMPTY for
     // a direct-spawn node (demandless jobs only), the probed host totals for a
     // Podman one. SAME map the capability announce carries, so the ledger and
@@ -79,28 +73,6 @@ where
         })
     });
 
-    // prompt resolution: the local store first, then (when a mesh lane is
-    // wired) fetch-on-miss from current peers. a verified fetch writes
-    // through the local store, so the mesh round-trip happens once — not
-    // per run — and survives a restart. a miss everywhere still fails the
-    // run loudly in the worker — never a silent fallback to the generic
-    // instructions.
-    let resolver: BlobResolver = Arc::new(move |digest: &[u8; 32]| {
-        let blobs = blobs.clone();
-        let blob_fetch = blob_fetch.clone();
-        let digest = *digest;
-        Box::pin(async move {
-            if let Some(bytes) = blobs.get_chunk(&digest) {
-                return Some(bytes);
-            }
-            let fetched = blob_fetch.as_ref()?(digest).await?;
-            // the fetcher verified the content hash; put_chunk re-keys by
-            // sha256 anyway, so the store can never learn a wrong mapping.
-            blobs.put_chunk(fetched.clone());
-            Some(fetched)
-        })
-    });
-
     let mut pool = DispatchPool::with_limit(
         Arc::new(providers),
         node_key,
@@ -108,8 +80,7 @@ where
         deliver,
         max_concurrent_runs_from_env(),
         capacity,
-    )
-    .with_resolver(resolver);
+    );
     // portable (v3) runs materialize a per-run duckfs workspace through this,
     // over the SAME NodeHandle actor lane the /v1/fs/workspaces RPC uses. LIVE:
     // the composer emits v3 for every run (files module wired unconditionally),
