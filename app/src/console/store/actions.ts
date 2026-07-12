@@ -2642,11 +2642,12 @@ export function createActions({
     selectWorkspace: (id) => {
       const target = getState().workspaces.find((w) => w.id === id);
       if (!target) return;
-      // re-clicking the current MEMBER workspace is a no-op; a current
-      // NON-member one falls through to the admission check below — its honest
-      // "not admitted yet" error beats a silent nothing (and a genuinely
-      // progressing one just re-runs the idempotent connect).
-      if (target.id === getState().workspace?.id && target.member) return;
+      // Home is only a view over the live workspace. Entering that same member
+      // workspace closes Home without needlessly reconnecting its node.
+      if (target.id === getState().workspace?.id && target.member) {
+        patch({ atHome: false });
+        return;
+      }
       const enter = (): void => {
         // connectActive synchronously drops the old transport and clears the
         // complete node projection before its first async workspace call.
