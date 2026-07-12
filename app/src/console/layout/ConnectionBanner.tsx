@@ -24,6 +24,7 @@ export function ConnectionBanner() {
   const { state, actions } = useDucktape();
   const down = state.connectionDown;
   if (!down) return null;
+  const busy = state.connected && !down.impostor;
 
   return (
     <div
@@ -51,10 +52,11 @@ export function ConnectionBanner() {
         }}
         title={down.reason}
       >
-        {down.impostor ? "Connection lost — " : "Lost connection to the node — reconnecting… "}
-        {down.reason}
+        {busy
+          ? down.reason
+          : `${down.impostor ? "Connection lost — " : "Lost connection to the node — reconnecting… "}${down.reason}`}
       </span>
-      {state.managed && !down.impostor && (
+      {state.managed && !state.connected && !down.impostor && (
         <button onClick={() => actions.startNode()} style={restartBtn}>
           Restart node
         </button>
