@@ -137,8 +137,12 @@ pub struct Resolved {
 /// anything else is a loud config error.
 fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
     // podman and tart share the capacity derivation: probed totals with the
-    // operator's per-key overrides winning.
-    let probed = |raw: &NodeToml| {
+    // operator's per-key overrides winning. the map is validated through THE
+    // consensus rule (capability::validate_resources) before it leaves this
+    // boundary: a zero override would otherwise pass boot, get announced,
+    // and be rejected by the module — wedging the announcer's in-flight
+    // latch with a false success log instead of erroring here, loudly.
+    let probed = |raw: &NodeToml| -> Result<BTreeMap<String, u64>, String> {
         let mut capacity = crate::host_resources::probe();
         if let Some(cores) = raw.sandbox_cores {
             capacity.insert("cores".into(), cores);
@@ -146,7 +150,9 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
         if let Some(mem_gb) = raw.sandbox_mem_gb {
             capacity.insert("mem_gb".into(), mem_gb);
         }
-        capacity
+        capability::validate_resources(&capacity)
+            .map_err(|e| format!("sandbox capacity: {e}"))?;
+        Ok(capacity)
     };
     match raw.sandbox.as_deref() {
         None | Some("direct") => Ok((SandboxBackend::Direct, BTreeMap::new())),
@@ -155,14 +161,14 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
                 .sandbox_image
                 .clone()
                 .unwrap_or_else(|| "docker.io/library/node:22-slim".into());
-            Ok((SandboxBackend::Podman { image }, probed(raw)))
+            Ok((SandboxBackend::Podman { image }, probed(raw)?))
         }
         Some("tart") => {
             let image = raw
                 .sandbox_image
                 .clone()
                 .unwrap_or_else(|| "ghcr.io/cirruslabs/macos-sonoma-base:latest".into());
-            Ok((SandboxBackend::Tart { image }, probed(raw)))
+            Ok((SandboxBackend::Tart { image }, probed(raw)?))
         }
         Some(other) => Err(format!(
             "sandbox: {other:?} is not \"direct\", \"podman\", or \"tart\""
@@ -911,6 +917,20 @@ mod tests {
             tart.sandbox_capacity.contains_key("cores"),
             "probed capacity rides tart too"
         );
+
+        // a zero capacity override is a loud BOOT error, not an announce-time
+        // module reject: the consensus rule (validate_resources) runs at this
+        // trust boundary too, so the announcer can never latch an unannouncable
+        // set (the silent-wedge failure the review found).
+        for zero in ["sandbox_cores = 0", "sandbox_mem_gb = 0"] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}sandbox = \"podman\"\n{zero}\n"),
+            )
+            .expect("write");
+            let err = resolve(&dir.join("node.toml")).expect_err("zero capacity refused");
+            assert!(err.contains("sandbox capacity"), "{err}");
+        }
 
         // any other value is a loud config error.
         std::fs::write(dir.join("node.toml"), format!("{base}sandbox = \"gvisor\"\n")).expect("write");
