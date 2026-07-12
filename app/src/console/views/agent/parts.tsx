@@ -92,12 +92,26 @@ export const primaryButton = (enabled: boolean): CSSProperties => ({
   boxShadow: enabled ? "0 1px 2px rgba(160,90,60,.30)" : undefined,
 });
 
+/** Mix the filled control's foreground and background so overlays follow the
+ * filled surface when the theme flips its polarity. */
+export const filledMix = (onFilledPercent: number): string =>
+  `color-mix(in srgb, ${color.onDark} ${onFilledPercent}%, ${color.dark})`;
+
+export const FILLED_IDENTITY_TEXT_PERCENT = 70;
+export const FILLED_SEMANTIC_TEXT_PERCENT = 35;
+
+/** Keep semantic foregrounds readable on the filled identity band. The
+ * status hue stays visible, but the on-filled token supplies the contrast when
+ * dark mode turns that band light. */
+export const filledForeground = (base: string): string =>
+  `color-mix(in srgb, ${base} ${FILLED_SEMANTIC_TEXT_PERCENT}%, ${color.onDark})`;
+
 // A control styled to sit on the agent card's dark identity band.
 export const onDarkButton: CSSProperties = {
   ...secondaryButton,
   minHeight: 30,
-  border: "1px solid rgba(239,239,239,.22)",
-  background: "rgba(239,239,239,.07)",
+  border: `1px solid ${filledMix(22)}`,
+  background: filledMix(7),
   color: color.onDark,
 };
 
