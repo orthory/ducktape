@@ -1,0 +1,29 @@
+{
+  "protocol": "tauri-agent-suite/v1",
+  "id": "notification-bell",
+  "runtime": "cef",
+  "objective": "Click the 'Notifications' bell button in the title bar so its recent-notifications dropdown opens.",
+  "pass": [
+    {
+      "expect": {
+        "role": "button",
+        "name": "Notifications",
+        "present": true
+      }
+    },
+    {
+      "state": {
+        "key": "probes",
+        "equals": {
+          "notifyDropdownOpen": true
+        }
+      }
+    }
+  ],
+  "budget": {
+    "steps": 5,
+    "seconds": 90,
+    "tokens": 30000,
+    "repetitions": 2
+  }
+}

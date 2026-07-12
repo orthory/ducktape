@@ -34,7 +34,8 @@ desktop so its recorded detached workspace-node group cannot survive teardown.
 ## Deterministic suites
 
 ```bash
-"$FLEET" test cef-smoke --jobs 1
+export FLEET_MODEL_PROVIDER=claude   # CLAUDE_MODEL defaults to haiku
+"$FLEET" test cef-smoke notification-bell --jobs 1
 ```
 
 Suites let the model choose only typed UI actions. `expect`, state, and IPC pass
@@ -44,6 +45,60 @@ network, IPC, screenshot, and replay artifacts outside the model context.
 
 Ducktape is CEF-only on `dev`; use `runtime: cef`. The plugin endpoint is a
 debug-build seam and is intentionally absent from release builds.
+
+### Action model: local binary execution, not an API key
+
+Fleet ≥ `17b2b40` runs the suite's action-chooser through a LOCAL binary; no
+`OPENAI_API_KEY` is needed (that requirement only exists on older fleet pins
+whose sole provider was the OpenAI Responses API — `app/package.json` pins the
+fleet revision; if `test` demands a key, the pin predates the binary runner).
+
+Two providers, both verified green on the `notification-bell` suite:
+
+- `FLEET_MODEL_PROVIDER=claude` — uses the `claude` CLI and its existing
+  Claude Code login, which every dev in this repo already has. `CLAUDE_MODEL`
+  defaults to `haiku` — the right tier for choosing one typed UI action per
+  step; don't reach for a bigger model unless a suite's objective genuinely
+  needs multi-step reasoning.
+- `FLEET_MODEL_PROVIDER=codex` (fleet's default) — uses the `codex` CLI
+  (`CODEX_MODEL` defaults to `gpt-5.3-codex-spark`). Requires a ChatGPT/Codex
+  subscription, which not every dev has — prefer `claude` in shared docs and
+  CI recipes.
+
+### Writing pass conditions — what each kind can and cannot see
+
+- **`expect` conditions are evaluated from step 0 and THROW on an absent
+  element** (`BRIDGE_UNAVAILABLE` → the whole run dies as
+  `infrastructure_failure` before the model acts). Only use `expect` for
+  elements that exist at app boot. Never gate on something the objective is
+  supposed to create.
+- **`ipc` conditions currently see nothing under CEF** — the captured invoke
+  ledger is empty (`tauri-agent ipc` returns `[]` even after real commands
+  run), so an `ipc: {command, ok}` condition can never pass. Don't use them
+  until IPC capture works in the CEF runtime.
+- **`state` probes are the reliable post-action assertion.** Register a
+  DOM-derived probe in `app/src/main.tsx`'s `WebviewAgentInstrumentation`
+  install (`state: { probeName: () => … }`), then assert it. `state.key`
+  resolves TOP-LEVEL only (`url` | `title` | `values` | `probes`) — a probe is
+  matched by deep-equalling the whole `probes` map:
+
+  ```json
+  { "state": { "key": "probes", "equals": { "notifyDropdownOpen": true } } }
+  ```
+
+  (Deep-equal over the full map means every registered probe appears in
+  `equals` — revisit if the probe set grows.)
+- **Budget for the binary runner is much larger than the old API runner**: the
+  semantic-tree observation rides through the model each step. `tokens: 30000`
+  passes; 1–2k dies at step 0 with `token limit exceeded`. `repetitions` counts
+  identical consecutive actions — a correct click that fails a broken pass
+  condition burns one repetition per retry, so a too-strict budget converts a
+  pass-condition bug into `repeated action limit exceeded`.
+
+Worked example: `.tauri-agent/suites/notification-bell.json` (boot-safe button
+`expect` + the `notifyDropdownOpen` probe). Diagnose failures from the run
+artifacts under the instance directory: `run.json` (failure + message),
+`actions.jsonl` (what the model actually did), `ipc.jsonl`, `failure.png`.
 
 ## Several worktrees or same-artifact instances
 
