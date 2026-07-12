@@ -216,6 +216,10 @@ pub struct WasmModule {
     committed: BTreeMap<Vec<u8>, Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     fuel: u64,
+    /// the canonical committed-state revision this tenant declares (see
+    /// [`Module::state_schema_revision`]). a byte-compatible port keeps the
+    /// native module's revision; a port that changes the state layout bumps it.
+    state_schema_revision: u32,
 }
 
 impl WasmModule {
@@ -235,7 +239,17 @@ impl WasmModule {
             committed: BTreeMap::new(),
             staged: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
+            state_schema_revision: 1,
         })
+    }
+
+    /// declare a non-default canonical-state revision (the recovery/state-sync
+    /// schema fence). a ported module that KEPT its native predecessor's byte
+    /// encoding keeps its revision (directory: 1); a port that changed the
+    /// layout must bump it in the same change, exactly like a native module.
+    pub fn with_state_schema_revision(mut self, revision: u32) -> Self {
+        self.state_schema_revision = revision;
+        self
     }
 
     /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
@@ -369,15 +383,32 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, SdkError> {
     Ok(committed)
 }
 
-/// The determinism envelope for module execution. Fuel-metered termination, no
-/// SIMD nondeterminism, no ambient imports. (Feature-trimming and NaN
-/// canonicalization are tracked determinism-hardening follow-ups.)
+/// The determinism envelope for module execution: fuel-metered termination, no
+/// ambient imports, canonical NaNs, and every wasm proposal the integer/bytes
+/// component ABI does not need switched OFF — the envelope is identical on
+/// every validator, so the same guest bytes behave identically everywhere.
+///
+/// Kept ON (the componentized-Rust baseline): bulk-memory, multi-value,
+/// reference-types (LLVM output uses funcref tables), and multi-memory
+/// (component adapters). All are deterministic.
 fn deterministic_config() -> Config {
     let mut c = Config::new();
     c.wasm_component_model(true);
     c.consume_fuel(true);
+    // float ops emit ONE canonical NaN bit pattern: a guest computing floats
+    // can never leak host-hardware NaN payloads into state or the app-hash.
+    c.cranelift_nan_canonicalization(true);
     c.wasm_simd(false);
     c.wasm_relaxed_simd(false);
+    c.wasm_threads(false);
+    c.wasm_shared_everything_threads(false);
+    c.wasm_gc(false);
+    c.wasm_function_references(false);
+    c.wasm_memory64(false);
+    c.wasm_tail_call(false);
+    c.wasm_stack_switching(false);
+    c.wasm_custom_page_sizes(false);
+    c.wasm_wide_arithmetic(false);
     c
 }
 
@@ -420,6 +451,10 @@ impl Module for WasmModule {
 
     fn root(&self) -> StateRoot {
         Self::root_of(&self.committed)
+    }
+
+    fn state_schema_revision(&self) -> u32 {
+        self.state_schema_revision
     }
 
     fn code_hash(&self) -> Option<Vec<u8>> {

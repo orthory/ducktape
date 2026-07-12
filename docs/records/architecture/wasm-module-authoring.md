@@ -28,6 +28,10 @@ boundary. Consequences you design around:
   termination, no clock / rng / net / ambient imports (the WIT surface simply
   has none). A trap (including out-of-fuel) is a deterministic rejection — the
   same on every validator — and the host rolls the op back.
+- The runtime envelope canonicalizes NaNs and trims every wasm proposal the
+  integer/bytes ABI doesn't need (no SIMD/threads/GC/…): float math in a guest
+  is defined, identical-everywhere behavior, and the surface can't grow by
+  accident.
 
 ## The contract
 
