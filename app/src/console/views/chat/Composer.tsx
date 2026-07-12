@@ -340,7 +340,13 @@ export function Composer({
             rows={1}
             value={value}
             onChange={(event) => handleChange(event.target.value, event.target.selectionStart)}
-            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onSelect={(event) => {
+              // React's select plugin re-fires during a pick's own keydown with
+              // the pre-insert caret; while a programmatic restore is pending,
+              // selection reports describe the past (see use-mention-menu).
+              if (pendingSelection.current) return;
+              setCaret(event.currentTarget.selectionStart);
+            }}
             onKeyDown={handleKeyDown}
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}

@@ -119,7 +119,8 @@ function AddReactGlyph({ size = 15 }: { size?: number }) {
 
 // ── Avatar ───────────────────────────────────────────────
 
-function Avatar({ author, name, size }: { author: AuthorRef; name: string; size: number }) {
+// Exported: the pages comment cards render the same author identity dot.
+export function Avatar({ author, name, size }: { author: AuthorRef; name: string; size: number }) {
   const agent = isAgentAuthor(author);
   return (
     <span

@@ -9,13 +9,14 @@
 // rather than through props: the renderer is used from three views and the
 // context is optional, so a bare component test just gets inert affordances.
 
-import { useContext } from "react";
+import { useContext, useMemo } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
-import { mentionLabel, mentionTarget } from "./mention";
+import { splitMentions } from "./chat-input";
+import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from "./mention";
 import { isPageRef, splitPageRefs } from "./page-ref";
 
 // The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
@@ -128,20 +129,47 @@ export function PageRefChip({ pageId }: { pageId: string }) {
   );
 }
 
-/** Plain text with its `[[page:<id>]]` refs chipped. Pages comments store plain
- *  text on the wire (no marks), so this is all they can carry. */
-export function PageRefText({ text }: { text: string }) {
-  const segments = splitPageRefs(text);
-  if (segments.length === 1 && !isPageRef(segments[0]!)) return <>{text}</>;
+/** A pages COMMENT body: plain text on the wire, so every reference is
+ *  re-derived at render — @tokens resolve through the SAME resolver + grammar
+ *  the submit path used (`splitMentions` over `mentionResolverOf`), then
+ *  `[[page:<id>]]` refs chip inside the non-mention runs. Mentions split
+ *  FIRST, over the RAW text: that keeps the whitespace boundary identical to
+ *  what the submit path saw, so "[[page:p1]]@bot" stays a literal on both
+ *  ends of the wire (the '@' is glued to ']') instead of chipping a mention
+ *  the module was never told about. An @word the resolver doesn't know stays
+ *  tinted-inert via LiteralRun — an address nobody claimed. Without a store
+ *  (bare component tests) nothing resolves, everything tints.
+ *
+ *  ponytail: markdown-adjacent tokens can still disagree — the submit path
+ *  parses bold marks and fences that comments render raw, so "**hi**@bot"
+ *  invokes without a chip. Reconciling that means changing the WIRE's grammar
+ *  for plain-text comments, not this renderer. */
+export function CommentText({ text, names }: { text: string; names: AuthorNames }) {
+  const store = useContext(ConsoleContext);
+  const agents = store?.state.agents;
+  const nodeUsers = store?.state.nodeUsers;
+  const resolver = useMemo(
+    () =>
+      agents && nodeUsers
+        ? mentionResolverOf(agents, mentionableUsers(nodeUsers, agents))
+        : new Map<string, AuthorRef>(),
+    [agents, nodeUsers],
+  );
   return (
     <>
-      {segments.map((segment, i) =>
-        isPageRef(segment) ? (
-          <PageRefChip key={i} pageId={segment.pageId} />
-        ) : (
-          <span key={i}>{segment.text}</span>
-        ),
-      )}
+      {splitMentions({ text, marks: [] }, resolver).map((span, i) => {
+        const mark = span.marks.find(
+          (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
+        );
+        if (mark) return <MentionToken key={i} mention={mark.mention} names={names} />;
+        return splitPageRefs(span.text).map((segment, j) =>
+          isPageRef(segment) ? (
+            <PageRefChip key={`${i}:${j}`} pageId={segment.pageId} />
+          ) : (
+            <LiteralRun key={`${i}:${j}`} text={segment.text} />
+          ),
+        );
+      })}
     </>
   );
 }

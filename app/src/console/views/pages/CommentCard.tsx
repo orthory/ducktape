@@ -11,6 +11,8 @@ import { useEffect, useRef, useState } from "react";
 import type { AuthorNames } from "../../../domain/chat-client";
 import type { ThreadView } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
+import type { OpLedger } from "../../store/finalization";
+import { inMentionMenu } from "../chat/use-mention-menu";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { NewThreadComposer, ThreadCard } from "./CommentThread";
 
@@ -29,6 +31,7 @@ export function CommentCard({
   threads,
   authorNames,
   selfKey,
+  ops,
   onClose,
   onSubmitNew,
   onReply,
@@ -45,6 +48,8 @@ export function CommentCard({
   authorNames: AuthorNames;
   /** The local author's key — Edit/Delete render only on our own comments. */
   selfKey: string;
+  /** Finalization ledger, handed through to each thread's marks. */
+  ops?: OpLedger;
   onClose: () => void;
   onSubmitNew: (target: string, text: string) => void;
   onReply: (threadId: string, text: string) => void;
@@ -58,10 +63,15 @@ export function CommentCard({
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // an IME's Escape cancels the COMPOSITION, not the card — closing here
+      // would throw away the draft mid-composition (isComposing, or the 229
+      // keyCode some engines report during IME handling).
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") onClose();
     };
     const onPress = (event: MouseEvent) => {
       const card = cardRef.current;
+      if (inMentionMenu(event.target)) return; // portaled, but ours
       if (card && event.target instanceof Node && !card.contains(event.target)) {
         onClose();
       }
@@ -71,6 +81,7 @@ export function CommentCard({
     const onScroll = (event: Event) => {
       const card = cardRef.current;
       if (card && event.target instanceof Node && card.contains(event.target)) return;
+      if (inMentionMenu(event.target)) return; // scrolling the typeahead list
       onClose();
     };
     document.addEventListener("keydown", onKey);
@@ -150,6 +161,7 @@ export function CommentCard({
             view={view}
             authorNames={authorNames}
             selfKey={selfKey}
+            ops={ops}
             onReply={onReply}
             onResolve={onResolve}
             onEdit={onEdit}

@@ -59,6 +59,57 @@ describe("CommentsPanel", () => {
     expect(onResolve).toHaveBeenCalledWith("t1", true);
   });
 
+  it("sinks resolved threads below open ones", () => {
+    const two: TargetThreads[] = [
+      {
+        target: "b1",
+        threads: [
+          {
+            thread: {
+              id: "t-done",
+              target: "b1",
+              opener: alice,
+              created_at: 1,
+              resolved: true,
+              resolved_by: alice,
+              comment_ids: ["c-done"],
+            },
+            comments: [
+              {
+                id: "c-done",
+                thread_id: "t-done",
+                author: alice,
+                text: "settled thing",
+                created_at: 1,
+                edited_at: null,
+                deleted: false,
+              },
+            ],
+          },
+          ...threads[0].threads,
+        ],
+      },
+    ];
+    const { container } = render(
+      <CommentsPanel
+        threads={two}
+        authorNames={{}}
+        selfKey="user:1"
+        composer={null}
+        onClose={vi.fn()}
+        onSubmitNew={vi.fn()}
+        onCancelNew={vi.fn()}
+        onReply={vi.fn()}
+        onResolve={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    const text = container.textContent ?? "";
+    expect(text.indexOf("hello world")).toBeGreaterThan(-1);
+    expect(text.indexOf("hello world")).toBeLessThan(text.indexOf("settled thing"));
+  });
+
   it("shows an empty state with no threads", () => {
     const { getByText } = render(
       <CommentsPanel

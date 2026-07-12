@@ -1,6 +1,7 @@
 import type { AuthorNames } from "../../../domain/chat-client";
 import type { TargetThreads } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
+import type { OpLedger } from "../../store/finalization";
 import { color, font, radius } from "../../theme/tokens";
 import { NewThreadComposer, ThreadCard } from "./CommentThread";
 import type { ComposerTarget } from "./CommentThread";
@@ -15,6 +16,7 @@ export function CommentsPanel({
   threads,
   authorNames,
   selfKey,
+  ops,
   composer,
   onClose,
   onSubmitNew,
@@ -28,6 +30,8 @@ export function CommentsPanel({
   authorNames: AuthorNames;
   /** The local author's key — Edit/Delete render only on our own comments. */
   selfKey: string;
+  /** Finalization ledger, handed through to each thread's marks. */
+  ops?: OpLedger;
   composer: ComposerTarget | null;
   onClose: () => void;
   onSubmitNew: (target: string, text: string) => void;
@@ -37,7 +41,10 @@ export function CommentsPanel({
   onEdit: (commentId: string, text: string) => void;
   onDelete: (commentId: string) => void;
 }) {
-  const flat = threads.flatMap((g) => g.threads);
+  // open threads first; resolved sink to the bottom (stable within each half).
+  const flat = threads
+    .flatMap((g) => g.threads)
+    .sort((a, b) => Number(a.thread.resolved) - Number(b.thread.resolved));
   return (
     <aside
       aria-label="Comments"
@@ -116,6 +123,7 @@ export function CommentsPanel({
               view={view}
               authorNames={authorNames}
               selfKey={selfKey}
+              ops={ops}
               onReply={onReply}
               onResolve={onResolve}
               onEdit={onEdit}

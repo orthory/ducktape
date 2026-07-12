@@ -1070,10 +1070,18 @@ export function createActions({
 
   // load the comment threads for the open page (the page id + every visible
   // block id) in one batch; refreshed on open and after any comment op.
+  //
+  // The responses carry no ordering of their own: two comment ops settling
+  // close together each fire a reload, and the transport can deliver the
+  // EARLIER op's (staler) response last — which would overwrite the fresher
+  // snapshot and visibly un-render a committed comment. `pageThreadsToken`
+  // supersedes: only the latest issued reload may apply its result.
+  let pageThreadsToken = 0;
   const loadPageThreads = (
     blocksOverride?: PageBlock[],
     source?: { live: NodeTransport; page: string },
   ): Promise<void> => {
+    const token = ++pageThreadsToken;
     // `blocks` is passed by callers that JUST fetched the tree, because
     // getState().activePageBlocks lags a dispatch (stateRef updates on render);
     // reading it here would ship only the page target and miss every block.
@@ -1097,7 +1105,7 @@ export function createActions({
     return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
       .then((results) =>
         update((prev) =>
-          isCurrentNode(live) && prev.activePage === page
+          token === pageThreadsToken && isCurrentNode(live) && prev.activePage === page
             ? { pageThreads: results.flat() }
             : {},
         ),
@@ -2181,49 +2189,80 @@ export function createActions({
       void loadPageThreads();
     },
 
+    // Comment projections stamp LOCAL wall-clock millis (`Date.now()`) — the
+    // embedded daemon's consensus_time timebase, so the refresh confirms the
+    // stamp rather than moving it; a height-stamping validator replaces it on
+    // refresh and the counter renders as no time label (domain/wire.ts).
+    //
+    // Every comment op reloads threads UNCONDITIONALLY after settling: the
+    // generic refresh() never writes `pageThreads`, so a failed submit's
+    // rollback only happens here — gating the reload on success would leave
+    // the failed op's projection ghost-rendered. loadPageThreads self-guards
+    // on the current node and page.
+    //
+    // ponytail: if the node dies mid-op, the rollback reload fails too and the
+    // projection outlives its failed submit (the FinalizationMark shows the
+    // failure; the next successful reload converges). A local undo snapshot in
+    // submitTracked would close that window if dead-node UX ever matters.
     addComment: ({ threadId, target, text }) => {
       const clean = text.trim();
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
       const mentions = agentMentions(parseMessageInput(clean, mentionResolver()));
-      submitTracked(opKey.commentThread(tid), (live) =>
-        pagesClient.addComment(live, {
-          threadId: tid,
-          commentId,
-          target,
-          text: clean,
-          mentions,
-        }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.commentThread(tid),
+        (live) =>
+          pagesClient.addComment(live, {
+            threadId: tid,
+            commentId,
+            target,
+            text: clean,
+            mentions,
+          }),
+        (prev) =>
+          optimistic.commentAdded(prev, {
+            threadId: tid,
+            commentId,
+            target,
+            text: clean,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
+            at: Date.now(),
+          }),
+      ).then(() => loadPageThreads());
     },
 
     editComment: ({ commentId, text }) => {
       const clean = text.trim();
       if (!clean) return;
-      submitTracked(opKey.comment(commentId), (live) =>
-        pagesClient.editComment(live, { commentId, text: clean }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.comment(commentId),
+        (live) => pagesClient.editComment(live, { commentId, text: clean }),
+        (prev) =>
+          optimistic.commentEdited(prev, commentId, clean, Date.now()),
+      ).then(() => loadPageThreads());
     },
 
     deleteComment: (commentId) => {
-      submitTracked(opKey.comment(commentId), (live) =>
-        pagesClient.deleteComment(live, commentId),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.comment(commentId),
+        (live) => pagesClient.deleteComment(live, commentId),
+        (prev) => optimistic.commentDeleted(prev, commentId),
+      ).then(() => loadPageThreads());
     },
 
     resolveThread: ({ threadId, resolved }) => {
-      submitTracked(opKey.commentThread(threadId), (live) =>
-        pagesClient.resolveThread(live, { threadId, resolved }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.commentThread(threadId),
+        (live) => pagesClient.resolveThread(live, { threadId, resolved }),
+        (prev) =>
+          optimistic.threadResolved(
+            prev,
+            threadId,
+            resolved,
+            selfAuthorBytes(prev.status, prev.author),
+          ),
+      ).then(() => loadPageThreads());
     },
 
     // Every page-block write goes out through `inPageOrder` — the editor's ops

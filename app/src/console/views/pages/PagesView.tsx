@@ -445,6 +445,7 @@ export function PagesView() {
               threads={state.pageThreads}
               authorNames={state.authorNames}
               selfKey={selfKey}
+              ops={state.ops}
               composer={null}
               onClose={() => setPanelOpen(false)}
               onSubmitNew={(target, text) => actions.addComment({ target, text })}
@@ -467,6 +468,7 @@ export function PagesView() {
           }
           authorNames={state.authorNames}
           selfKey={selfKey}
+          ops={state.ops}
           onClose={() => setCommentCard(null)}
           onSubmitNew={(target, text) => actions.addComment({ target, text })}
           onReply={replyToThread}
