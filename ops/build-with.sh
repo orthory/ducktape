@@ -25,6 +25,9 @@ host_target="$($rustc_bin -vV 2>/dev/null | sed -n 's/^host: //p' | head -1)"
 sccache_state="unavailable"
 sccache_path="$(command -v sccache 2>/dev/null || true)"
 if [ "${DUCKTAPE_DISABLE_SCCACHE:-0}" = "1" ]; then
+  # An explicit empty RUSTC_WRAPPER also overrides a user-global Cargo
+  # `[build] rustc-wrapper`; merely declining to set it leaves that wrapper on.
+  export RUSTC_WRAPPER=
   sccache_state="disabled by DUCKTAPE_DISABLE_SCCACHE"
 elif [ -n "${RUSTC_WRAPPER:-}" ]; then
   sccache_state="preserving RUSTC_WRAPPER=${RUSTC_WRAPPER}"

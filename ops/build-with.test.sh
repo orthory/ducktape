@@ -88,9 +88,10 @@ grep -Fq "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=m
 disabled="$TMP/disabled"
 make_case "$disabled" Linux x86_64-unknown-linux-gnu
 PATH="$disabled/bin:/usr/bin:/bin" BUILD_WITH_TEST_LOG="$disabled/log" \
+  RUSTC_WRAPPER=/global/sccache \
   DUCKTAPE_DISABLE_SCCACHE=1 DUCKTAPE_DISABLE_MOLD=1 \
   "$HELPER" cargo check >/dev/null 2>&1
-grep -Fq "RUSTC_WRAPPER=" "$disabled/log" || fail "disabled sccache still set a wrapper"
+grep -Fxq "RUSTC_WRAPPER=" "$disabled/log" || fail "disabled sccache preserved a wrapper"
 if grep -Eq '^CARGO_TARGET_.*_(LINKER|RUSTFLAGS)=' "$disabled/log"; then
   fail "disabled mold still configured the target"
 fi
