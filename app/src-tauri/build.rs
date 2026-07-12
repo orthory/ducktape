@@ -34,6 +34,7 @@ fn main() {
         "gateway_inline_place",
         "gateway_inline_close",
         "gateway_inline_hide_all",
+        "duck_set_gateway_base",
         "workspace_create",
         "workspace_join",
         "workspace_invite_blob",
@@ -104,9 +105,10 @@ fn main() {
     let registered: std::collections::BTreeSet<&str> = handler
         .lines()
         .filter_map(|line| {
-            line.trim()
-                .strip_suffix(',')
-                .and_then(|line| line.rsplit_once("::").map(|(_, command)| command))
+            // Commands register as `module::command` or as a bare `command`;
+            // both forms must land in the ACL or the drift assert is vacuous.
+            let line = line.trim().strip_suffix(',')?;
+            Some(line.rsplit_once("::").map_or(line, |(_, command)| command))
         })
         .collect();
     let declared: std::collections::BTreeSet<&str> = commands.iter().copied().collect();

@@ -113,7 +113,13 @@ function render(state){
 }
 document.getElementById("new").onsubmit=ev=>{ev.preventDefault();const t=document.getElementById("title");api("/cards",{kind:"create",title:t.value});t.value="";};
 async function boot(){const s=await api("/board");me=s.me||"?";document.getElementById("me").textContent=me;render(s);
- try{const ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/.duck/ws");
+ try{
+  // Gateway browsers can't open a socket on their own scheme (spec D6): fetch
+  // the synthetic same-origin /.duck/ws for a tokened loopback URL, falling
+  // back to a direct same-host socket when served outside the gateway.
+  let wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/.duck/ws";
+  if(location.protocol==="duck:"){wsUrl=(await api("/.duck/ws")).url;}
+  const ws=new WebSocket(wsUrl);
   ws.onopen=()=>document.getElementById("live").textContent="● live";
   ws.onmessage=async()=>render(await api("/board"));
  }catch{}}
@@ -122,7 +128,11 @@ boot();
 
 function handle(request, server) {
   const url = new URL(request.url);
-  if (url.pathname === "/.duck/ws") {
+  // The gateway's WS door dials the upstream at "/" with an Upgrade header;
+  // the /.duck/ws path form serves direct (non-gateway) browsers.
+  const wantsUpgrade =
+    (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+  if (url.pathname === "/.duck/ws" || (url.pathname === "/" && wantsUpgrade)) {
     if (server.upgrade(request)) return undefined;
     return new Response("expected a websocket", { status: 426 });
   }

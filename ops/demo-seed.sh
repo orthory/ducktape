@@ -44,11 +44,11 @@ fi
 # ── 2. fresh demo workspace (idempotent) ───────────────────────
 log "creating a fresh '$ID' workspace at $WSDIR"
 rm -rf "$WSDIR"; mkdir -p "$WSDIR"
-read -r P1 P2 P3 < <(bun "$SCRIPT_DIR/fleet.mjs" ports 3)
+read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));console.log(l.map(x=>x.port).join(" "));l.forEach(x=>x.stop())')
 # A free UDP port for the overlay's WireGuard socket. This MUST be concrete: the
 # reachability plane refuses to start on port 0 ("wireguard_listen needs a
 # concrete UDP port — plane not started"), which leaves the overlay down.
-WGP="$(bun "$SCRIPT_DIR/fleet.mjs" udp-port)"
+WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close()')"
 # Gateway serving needs the app's workspace_create posture:
 #   --gateway            binds the isolated browser plane that serves the routes
 #   --wireguard-effect   the userspace (TUN-less) overlay — no /dev/net/tun, no

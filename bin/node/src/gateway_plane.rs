@@ -590,6 +590,23 @@ async fn proxy_loopback(
     }
     let mut headers = Vec::new();
     for name in gateway::ALLOWED_RESPONSE_HEADERS {
+        if *name == "set-cookie" {
+            // The one legitimately repeatable response header. Each cookie is
+            // scrubbed to host-only: a publisher must not plant a Domain=.duck
+            // (or Domain=<other-handle>.duck) cookie readable across accounts.
+            for value in response.headers().get_all(*name) {
+                let value = value.to_str().map_err(|_| {
+                    GatewayFailure::Unavailable(format!(
+                        "loopback returned non-ASCII {name} header"
+                    ))
+                })?;
+                headers.push(gateway::ProxyHeader {
+                    name: (*name).to_string(),
+                    value: scrub_cookie_domain(value),
+                });
+            }
+            continue;
+        }
         let values = response.headers().get_all(*name);
         let mut values = values.iter();
         let Some(value) = values.next() else {
@@ -1109,6 +1126,26 @@ async fn caller_ws_pump<S>(
 
 /// Map a typed failure onto a wire frame, redacting `Unavailable` detail
 /// (which may carry a workspace path / loopback port / library diagnostic).
+/// Drop any `Domain=` attribute from a Set-Cookie value so gateway cookies
+/// stay host-only. Chromium's handling of the synthetic `.duck` TLD is not a
+/// boundary we rely on: without this, a publisher could try `Domain=.duck` to
+/// plant a cookie visible on every account's origins.
+fn scrub_cookie_domain(value: &str) -> String {
+    value
+        .split(';')
+        .enumerate()
+        .filter(|(index, attribute)| {
+            *index == 0
+                || !attribute
+                    .trim_start()
+                    .get(..7)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("domain="))
+        })
+        .map(|(_, attribute)| attribute)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
     use gateway::FailureKind;
     let (kind, mut detail) = match failure {
@@ -1254,6 +1291,27 @@ use duckfs_core::to_hex as hex_bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_cookie_domain_is_scrubbed_to_host_only() {
+        // A publisher must not be able to plant a cookie readable on another
+        // account's duck origins.
+        assert_eq!(
+            scrub_cookie_domain("s=1; Path=/; Domain=.duck; HttpOnly"),
+            "s=1; Path=/; HttpOnly"
+        );
+        assert_eq!(
+            scrub_cookie_domain("s=1; domain=other.duck"),
+            "s=1"
+        );
+        // Everything else survives untouched, and the cookie's own value —
+        // which may legitimately contain "domain=" — is never treated as an
+        // attribute.
+        assert_eq!(
+            scrub_cookie_domain("s=domain=x; Path=/; Secure; SameSite=Lax"),
+            "s=domain=x; Path=/; Secure; SameSite=Lax"
+        );
+    }
 
     #[tokio::test]
     async fn response_codec_is_bounded_and_preserves_safe_metadata() {

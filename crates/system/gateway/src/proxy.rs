@@ -236,9 +236,19 @@ pub fn validate_headers(headers: &[ProxyHeader], kind: &str) -> Result<(), Strin
                 header.name
             ));
         }
-        if previous.is_some_and(|old| old >= header.name.as_str()) {
+        // Sorted, and unique except for `set-cookie` — the one header HTTP
+        // genuinely repeats (each cookie needs its own line; folding them into
+        // one value is illegal). Repeats must still be adjacent, so the list
+        // stays canonical and a receiver can group by name in one pass.
+        let repeatable = kind == "response" && header.name == "set-cookie";
+        let out_of_order = previous.is_some_and(|old| match old.cmp(header.name.as_str()) {
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => !repeatable,
+            std::cmp::Ordering::Greater => true,
+        });
+        if out_of_order {
             return Err(format!(
-                "gateway proxy: {kind} headers must be strictly sorted and unique"
+                "gateway proxy: {kind} headers must be sorted, and unique except set-cookie"
             ));
         }
         previous = Some(&header.name);

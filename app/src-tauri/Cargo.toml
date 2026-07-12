@@ -51,7 +51,7 @@ tauri = { version = "2", default-features = false, features = [
 # forwards it to tauri-runtime-wry, so an out-of-tree runtime has to be synced
 # by hand or macOS builds fail E0046 (WindowBuilder::transparent required by
 # the trait but cfg'd out of the impl).
-tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "8ddc1ed48e8650432424bd51d98edf0a024dc2a4", features = [
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "9282dbe41e151ecffce5c4f140869427788e00a8", features = [
   "macos-private-api",
 ] }
 # See the default feature above. This resolves to the same package/version the
