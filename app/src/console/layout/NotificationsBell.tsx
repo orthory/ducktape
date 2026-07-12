@@ -1,10 +1,12 @@
 // The in-app notification surface: a bell in the title bar with the unread
-// count, and a dropdown of the engine's recent ring. Opening the dropdown is
-// what marks notifications seen (window focus deliberately does not — see
+// count, and a dropdown of the engine's recent ring, STACKED by target — items
+// sharing a channel (or, when channel-less, a category) collapse into one row
+// that expands. Opening the dropdown is what marks notifications seen (window
+// focus deliberately does not — see
 // docs/superpowers/specs/2026-07-12-notification-bell-design.md). Desktop-only:
 // web builds have no notifier and render nothing.
 
-import { useEffect, useRef, useState } from "react";
+import { type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
 
 import { isTauri } from "../../domain/node-bootstrap";
 import * as notifyClient from "../../domain/notify-client";
@@ -34,11 +36,62 @@ const FALLBACK_SCREEN: Record<NotifyItem["category"], string> = {
 // near-unique; the title breaks the same-millisecond tie.
 const itemKey = (item: NotifyItem): string => `${item.at}:${item.title}`;
 
+// Channel-less items (runs, forge, governance) stack under their category.
+const CATEGORY_LABEL: Record<NotifyItem["category"], string> = {
+  mention: "Mentions",
+  reply: "Replies",
+  huddle: "Huddles",
+  run: "Agent runs",
+  forge: "Forge",
+  governance: "Governance",
+};
+
+/** A stack of notifications sharing one target: a channel, or a category when
+ *  the items carry no channel. */
+interface Group {
+  key: string;
+  label: string;
+  items: NotifyItem[];
+}
+
+const groupLabel = (item: NotifyItem, channelName: (id: string) => string): string => {
+  if (!item.channelId) return CATEGORY_LABEL[item.category];
+  const forgeItem = parseItemChannelId(item.channelId);
+  if (forgeItem) return `${forgeItem.repo} #${forgeItem.number}`;
+  return `#${channelName(item.channelId)}`;
+};
+
+// `items` is newest-first, so first-seen order sorts the groups by their newest
+// item — the same order the flat list had.
+const groupItems = (
+  items: NotifyItem[],
+  channelName: (id: string) => string,
+): Group[] => {
+  const groups = new Map<string, Group>();
+  for (const item of items) {
+    const key = item.channelId ?? `category:${item.category}`;
+    const group = groups.get(key);
+    if (group) group.items.push(item);
+    else groups.set(key, { key, label: groupLabel(item, channelName), items: [item] });
+  }
+  return [...groups.values()];
+};
+
+const stackSummary = (group: Group): string => {
+  const noun =
+    group.items[0].category === "mention" || group.items[0].category === "reply"
+      ? "messages"
+      : "updates";
+  return `${group.items.length} new ${noun}`;
+};
+
 export function NotificationsBell() {
-  const { actions } = useDucktape();
+  const { state, actions } = useDucktape();
   const [items, setItems] = useState<NotifyItem[]>([]);
   const [unread, setUnread] = useState(0);
   const [open, setOpen] = useState(false);
+  // One stack expanded at a time — the dropdown is 320px wide and 400px tall.
+  const [expanded, setExpanded] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -96,8 +149,13 @@ export function NotificationsBell() {
   const toggle = () => {
     const next = !open;
     setOpen(next);
+    setExpanded(null);
     if (next) void notifyClient.markSeen();
   };
+
+  const channelName = (id: string): string =>
+    state.channels.find((channel) => channel.id === id)?.name ?? id;
+  const groups = groupItems(items, channelName);
 
   const openItem = (item: NotifyItem) => {
     setOpen(false);
@@ -172,7 +230,7 @@ export function NotificationsBell() {
             padding: 4,
           }}
         >
-          {items.length === 0 ? (
+          {groups.length === 0 ? (
             <div
               style={{
                 padding: "18px 12px",
@@ -184,72 +242,162 @@ export function NotificationsBell() {
               No notifications
             </div>
           ) : (
-            items.map((item, index) => (
-              <button
-                key={`${item.at}-${index}`}
-                onClick={() => openItem(item)}
-                style={{
-                  all: "unset",
-                  boxSizing: "border-box",
-                  cursor: "pointer",
-                  display: "block",
-                  width: "100%",
-                  padding: "7px 9px",
-                  borderRadius: radius.sm,
-                }}
-                onMouseEnter={(event) => {
-                  event.currentTarget.style.background = color.sunken;
-                }}
-                onMouseLeave={(event) => {
-                  event.currentTarget.style.background = "transparent";
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 8,
-                    font: `600 11px ${font.sans}`,
-                    color: color.ink,
-                  }}
-                >
-                  <span
-                    style={{
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {item.title}
-                  </span>
-                  <span
-                    style={{
-                      font: `500 9.5px ${font.mono}`,
-                      color: color.muted2,
-                      flexShrink: 0,
-                    }}
-                  >
-                    {relTime(item.at / 1000)}
-                  </span>
+            groups.map((group) =>
+              group.items.length === 1 ? (
+                <ItemRow
+                  key={group.key}
+                  item={group.items[0]}
+                  onClick={() => openItem(group.items[0])}
+                />
+              ) : (
+                <div key={group.key}>
+                  <StackRow
+                    group={group}
+                    expanded={expanded === group.key}
+                    onClick={() =>
+                      setExpanded((current) => (current === group.key ? null : group.key))
+                    }
+                  />
+                  {expanded === group.key && (
+                    <div style={{ paddingLeft: 12 }}>
+                      {group.items.map((item, index) => (
+                        <ItemRow
+                          key={`${item.at}-${index}`}
+                          item={item}
+                          onClick={() => openItem(item)}
+                        />
+                      ))}
+                    </div>
+                  )}
                 </div>
-                <div
-                  style={{
-                    marginTop: 2,
-                    font: `400 10.5px ${font.sans}`,
-                    color: color.muted,
-                    display: "-webkit-box",
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }}
-                >
-                  {item.body}
-                </div>
-              </button>
-            ))
+              ),
+            )
           )}
         </div>
       )}
     </div>
+  );
+}
+
+const ROW_STYLE = {
+  all: "unset",
+  boxSizing: "border-box",
+  cursor: "pointer",
+  display: "block",
+  width: "100%",
+  padding: "7px 9px",
+  borderRadius: radius.sm,
+} as const;
+
+const hover = {
+  onMouseEnter: (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.currentTarget.style.background = color.sunken;
+  },
+  onMouseLeave: (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.currentTarget.style.background = "transparent";
+  },
+};
+
+/** Title + relative time on one line, clamped body under it. */
+function ItemRow({ item, onClick }: { item: NotifyItem; onClick: () => void }) {
+  return (
+    <button onClick={onClick} style={ROW_STYLE} {...hover}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 8,
+          font: `600 11px ${font.sans}`,
+          color: color.ink,
+        }}
+      >
+        <span
+          style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+        >
+          {item.title}
+        </span>
+        <span
+          style={{ font: `500 9.5px ${font.mono}`, color: color.muted2, flexShrink: 0 }}
+        >
+          {relTime(item.at / 1000)}
+        </span>
+      </div>
+      <div
+        style={{
+          marginTop: 2,
+          font: `400 10.5px ${font.sans}`,
+          color: color.muted,
+          display: "-webkit-box",
+          WebkitLineClamp: 2,
+          WebkitBoxOrient: "vertical",
+          overflow: "hidden",
+        }}
+      >
+        {item.body}
+      </div>
+    </button>
+  );
+}
+
+/** The collapsed head of a stack: target, newest time, and how many are behind it. */
+function StackRow({
+  group,
+  expanded,
+  onClick,
+}: {
+  group: Group;
+  expanded: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      aria-expanded={expanded}
+      style={ROW_STYLE}
+      {...hover}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          font: `600 11px ${font.sans}`,
+          color: color.ink,
+        }}
+      >
+        <span
+          style={{
+            display: "flex",
+            color: color.muted2,
+            transform: expanded ? "rotate(90deg)" : "none",
+          }}
+        >
+          <Icon name="chevronRight" size={11} />
+        </span>
+        <span
+          style={{
+            flex: 1,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {group.label}
+        </span>
+        <span style={{ font: `500 9.5px ${font.mono}`, color: color.muted2 }}>
+          {relTime(group.items[0].at / 1000)}
+        </span>
+      </div>
+      <div
+        style={{
+          marginTop: 2,
+          marginLeft: 17,
+          font: `400 10.5px ${font.sans}`,
+          color: color.muted,
+        }}
+      >
+        {stackSummary(group)}
+      </div>
+    </button>
   );
 }
