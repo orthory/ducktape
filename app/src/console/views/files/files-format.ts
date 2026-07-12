@@ -2,6 +2,8 @@
 // their own module so FilesView / FilePreview / HistoryPanel don't import each
 // other just to reuse a helper (which would be a cycle).
 
+import { wallClockMillisOf } from "../../../domain/wire";
+
 /** A byte count as a short human string (B/KB/MB/GB). */
 export const humanBytes = (n: number): string => {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
@@ -25,10 +27,12 @@ export const errMsg = (err: unknown): string =>
 export const shortHash = (hash: string): string =>
   hash.length > 12 ? `${hash.slice(0, 10)}…` : hash || "—";
 
-/** Consensus-time seconds → a compact local timestamp. */
-export const formatTime = (seconds: number): string => {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
-  return new Date(seconds * 1000).toLocaleString(undefined, {
+/** A consensus_time stamp → a compact local timestamp, or "—" when the stamp
+ *  isn't wall-clock (a validator height counter — see domain/wire.ts). */
+export const formatTime = (stamp: number): string => {
+  const ms = wallClockMillisOf(stamp);
+  if (ms === null) return "—";
+  return new Date(ms).toLocaleString(undefined, {
     month: "short",
     day: "numeric",
     hour: "2-digit",

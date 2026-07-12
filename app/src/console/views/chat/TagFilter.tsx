@@ -9,21 +9,23 @@ import { useEffect, useState } from "react";
 import type { ChatSearchHit } from "../../../domain/chat-client";
 import { useDucktape } from "../../store/use-ducktape";
 import { resolveHitAuthor } from "../search/SearchModal";
-import { isWallClock } from "./chat-helpers";
+import { wallClockMillisOf } from "../../../domain/wire";
 import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 // Tag hits can be days old, so the row shows a date, unlike the stream's
 // time-only gutter. Empty when the node's consensus_time isn't wall-clock.
-const dateTimeOf = (seconds: number): string =>
-  isWallClock(seconds)
-    ? new Date(seconds * 1000).toLocaleString([], {
+const dateTimeOf = (stamp: number): string => {
+  const ms = wallClockMillisOf(stamp);
+  return ms === null
+    ? ""
+    : new Date(ms).toLocaleString([], {
         month: "short",
         day: "numeric",
         hour: "2-digit",
         minute: "2-digit",
-      })
-    : "";
+      });
+};
 
 function HashGlyph({ size = 12 }: { size?: number }) {
   return (

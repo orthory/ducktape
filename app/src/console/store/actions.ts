@@ -1019,7 +1019,7 @@ export function createActions({
             messageId,
             blocks,
             authorBytes: selfAuthorBytes(prev.status, prev.author),
-            at: Date.now(),
+            atMs: Date.now(),
             thread,
           }),
       ),
@@ -1668,7 +1668,7 @@ export function createActions({
             channelId,
             name,
             postPolicy,
-            at: Date.now(),
+            atMs: Date.now(),
           }),
       ).then((current) => {
         if (current) enterChannel(channelId);
@@ -1815,7 +1815,7 @@ export function createActions({
             channelId,
             node,
             authorBytes: selfAuthorBytes(prev.status, prev.author),
-            at: Math.floor(Date.now() / 1000),
+            atMs: Date.now(),
           }),
       ).then((current) => {
         if (current) return; // the join landed

@@ -320,7 +320,7 @@ function ItemRow({ item, onClick }: { item: NotifyItem; onClick: () => void }) {
         <span
           style={{ font: `500 9.5px ${font.mono}`, color: color.muted2, flexShrink: 0 }}
         >
-          {relTime(item.at / 1000)}
+          {relTime(item.at)}
         </span>
       </div>
       <div
@@ -386,7 +386,7 @@ function StackRow({
           {group.label}
         </span>
         <span style={{ font: `500 9.5px ${font.mono}`, color: color.muted2 }}>
-          {relTime(group.items[0].at / 1000)}
+          {relTime(group.items[0].at)}
         </span>
       </div>
       <div
