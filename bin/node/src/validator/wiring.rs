@@ -621,6 +621,8 @@ pub(super) async fn wire(
                     coordinators,
                     // members serve the invite intro: a fresh joiner's
                     // tunnel comes up against this listener before any p2p.
+                    // None when this config mints no direct intro endpoint —
+                    // coordinated intros ride the plane's shared socket.
                     invite_listen,
                     coord_cap.clone(),
                     reach_p2p_tx,

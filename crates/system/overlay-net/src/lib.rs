@@ -87,12 +87,22 @@ pub enum OverlayBackend {
     /// WireGuard interface, so overlay connections ride ordinary OS sockets.
     Tun,
     /// userspace: overlay connections terminate in the in-process virtual
-    /// stack. the slot is published by `UserspaceWireGuardEffect` when its
-    /// backend stands up and read here per dial/bind, so an interface
-    /// replace (epoch cutover) needs no context rewiring; while it is empty
-    /// the tunnel is down and overlay dials/binds fail, exactly as they
-    /// would on a downed TUN interface.
-    Userspace(StackSlot),
+    /// stack.
+    Userspace {
+        /// published by `UserspaceWireGuardEffect` when its backend stands
+        /// up and read here per dial/bind, so an interface replace (epoch
+        /// cutover) needs no context rewiring; while it is empty the tunnel
+        /// is down and overlay dials/binds fail, exactly as they would on a
+        /// downed TUN interface.
+        slot: StackSlot,
+        /// whether a wildcard (unspecified-address) bind keeps its OS leg.
+        /// `false` for a node whose only advertised ingress is its overlay
+        /// ULA: no peer can ever learn an underlay address for it, so a
+        /// kernel wildcard listener could never receive a legitimate dial —
+        /// it would only sit unreachable while tripping host firewall
+        /// prompts (macOS asks about every wildcard listener).
+        underlay_ingress: bool,
+    },
 }
 
 // ── The wrapper context ─────────────────────────────────
@@ -279,22 +289,28 @@ impl<E: Network> Network for OverlayContext<E> {
         // can never see. so the wildcard bind carries BOTH: the OS socket
         // for the underlay, plus a lazy virtual leg at the node's own ULA
         // on the same port (lazy: the stack exists only while a tunnel is
-        // applied, and is replaced on interface rebuilds).
-        if let OverlayBackend::Userspace(slot) = &self.backend
+        // applied, and is replaced on interface rebuilds). a node with no
+        // underlay ingress at all keeps only the virtual leg — no kernel
+        // socket exists to receive (or to alarm the host firewall about).
+        if let OverlayBackend::Userspace {
+            slot,
+            underlay_ingress,
+        } = &self.backend
             && socket.ip().is_unspecified()
         {
+            let virt = userspace::seam::LazyVirtualListener::new(slot.clone(), socket.port());
+            if !underlay_ingress {
+                return Ok(OverlayListener::OverlayOnly(virt, socket));
+            }
             let os = self.inner.bind(socket).await?;
-            return Ok(OverlayListener::Dual(
-                os,
-                userspace::seam::LazyVirtualListener::new(slot.clone(), socket.port()),
-            ));
+            return Ok(OverlayListener::Dual(os, virt));
         }
         if !self.router.is_overlay(&socket) {
             return Ok(OverlayListener::Os(self.inner.bind(socket).await?));
         }
         match &self.backend {
             OverlayBackend::Tun => Ok(OverlayListener::Os(tun::bind(&self.inner, socket).await?)),
-            OverlayBackend::Userspace(slot) => Ok(OverlayListener::Virtual(
+            OverlayBackend::Userspace { slot, .. } => Ok(OverlayListener::Virtual(
                 userspace::seam::bind(slot, socket).await?,
             )),
         }
@@ -310,7 +326,7 @@ impl<E: Network> Network for OverlayContext<E> {
                 let (sink, stream) = tun::dial(&self.inner, socket).await?;
                 Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)))
             }
-            OverlayBackend::Userspace(slot) => {
+            OverlayBackend::Userspace { slot, .. } => {
                 let (sink, stream) = userspace::seam::dial(slot, socket).await?;
                 Ok((OverlaySink::Virtual(sink), OverlayStream::Virtual(stream)))
             }
@@ -332,6 +348,10 @@ pub enum OverlayListener<L> {
     /// socket mode's wildcard bind: the OS listener for the underlay AND the
     /// lazy virtual leg at the node's own ULA (see [`Network::bind`] above).
     Dual(L, userspace::seam::LazyVirtualListener),
+    /// socket mode's wildcard bind on a node WITHOUT underlay ingress: the
+    /// lazy virtual leg alone — no kernel socket. carries the requested bind
+    /// address so `local_addr` answers what the OS wildcard listener would.
+    OverlayOnly(userspace::seam::LazyVirtualListener, SocketAddr),
 }
 
 impl<L: Listener> Listener for OverlayListener<L> {
@@ -365,6 +385,14 @@ impl<L: Listener> Listener for OverlayListener<L> {
                     OverlayStream::Virtual(stream),
                 )),
             },
+            Self::OverlayOnly(virt, _) => {
+                let (addr, sink, stream) = virt.accept().await;
+                Ok((
+                    addr,
+                    OverlaySink::Virtual(sink),
+                    OverlayStream::Virtual(stream),
+                ))
+            }
         }
     }
 
@@ -373,6 +401,7 @@ impl<L: Listener> Listener for OverlayListener<L> {
             Self::Os(listener) => listener.local_addr(),
             Self::Virtual(listener) => listener.local_addr(),
             Self::Dual(os, _) => os.local_addr(),
+            Self::OverlayOnly(_, requested) => Ok(*requested),
         }
     }
 }
