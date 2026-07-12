@@ -33,6 +33,23 @@ describe("ConnectionBanner", () => {
     expect(startNode).toHaveBeenCalledTimes(1);
   });
 
+  it("shows a busy established node without claiming the connection was lost", () => {
+    const state = {
+      ...createInitialState(),
+      connected: true,
+      managed: true,
+      connectionDown: { reason: "Node is busy — retrying…" },
+    };
+    render(
+      <ConsoleContext.Provider value={{ state, actions: {} as ConsoleActions }}>
+        <ConnectionBanner />
+      </ConsoleContext.Provider>,
+    );
+    expect(screen.getByText("Node is busy — retrying…")).toBeTruthy();
+    expect(screen.queryByText(/Lost connection/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Restart node" })).toBeNull();
+  });
+
   it("offers no Restart when a different node grabbed the port (impostor)", () => {
     renderWith({ reason: "a different node is now answering", impostor: true });
     expect(screen.getByText(/a different node is now answering/)).toBeTruthy();
