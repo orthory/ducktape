@@ -399,6 +399,15 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       expect(watchCommit.committed?.target).toBe("runs");
 
       await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      // while the post is still parked, the preconf echo is on screen — and
+      // it must be stamped in LOCAL WALL-CLOCK MILLIS (the wire timebase; see
+      // domain/wire.ts). A relapse to unix seconds here is the bug that once
+      // flashed a bogus day divider over every just-sent message.
+      const echo = capturedState!.messages.find(
+        (m) => blocksText(m.head.blocks) === "hey @quackbot can you handle this?",
+      )!;
+      expect(echo.head.created_at).toBeGreaterThan(978_307_200_000);
+      expect(Math.abs(echo.head.created_at - Date.now())).toBeLessThan(5 * 60_000);
       const postCommit = await sim.step();
       expect(postCommit.committed?.target).toBe("chat");
 

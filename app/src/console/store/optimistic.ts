@@ -48,7 +48,11 @@ export const postedMessage = (
      *  networked node, the origin bytes on the embedded daemon — so the
      *  optimistic row's author matches what the refresh confirms. */
     authorBytes: number[];
-    at: number;
+    /** LOCAL wall-clock millis (`Date.now()`) — the same timebase the
+     *  embedded daemon commits, so the refresh confirms rather than moves the
+     *  stamp there. A height-stamping validator replaces it on refresh, and
+     *  the stream builder never day-splits across that timebase seam. */
+    atMs: number;
     /** Root seq when this is a thread reply. */
     thread: number | null;
   },
@@ -65,7 +69,7 @@ export const postedMessage = (
       message_id: params.messageId,
       author: { user: params.authorBytes },
       blocks: params.blocks,
-      created_at: params.at,
+      created_at: params.atMs,
       rev: 0,
       edited_at: null,
       base_rev: null,
@@ -101,11 +105,11 @@ export const editedMessage = (
   channelId: string,
   seq: number,
   blocks: ChatBlock[],
-  at: number,
+  atMs: number,
 ): Partial<ConsoleState> =>
   mapMessage(prev, channelId, seq, (m) => ({
     ...m,
-    head: { ...m.head, blocks, edited_at: at, rev: m.head.rev + 1 },
+    head: { ...m.head, blocks, edited_at: atMs, rev: m.head.rev + 1 },
   }));
 
 export const deletedMessage = (
@@ -154,7 +158,7 @@ export const reactionToggled = (
 
 export const channelCreated = (
   prev: ConsoleState,
-  params: { channelId: string; name: string; postPolicy: PostPolicy; at: number },
+  params: { channelId: string; name: string; postPolicy: PostPolicy; atMs: number },
 ): Partial<ConsoleState> =>
   prev.channels.some((c) => c.id === params.channelId)
     ? {}
@@ -164,7 +168,7 @@ export const channelCreated = (
           {
             id: params.channelId,
             name: params.name,
-            created_at: params.at,
+            created_at: params.atMs,
             head_seq: 0,
             post_policy: params.postPolicy,
             hooks: [],
@@ -178,7 +182,7 @@ export const channelCreated = (
  *  refresh replaces the roster (with the module-assigned join order) after. */
 export const huddleJoined = (
   prev: ConsoleState,
-  params: { channelId: string; node: number[]; authorBytes: number[]; at: number },
+  params: { channelId: string; node: number[]; authorBytes: number[]; atMs: number },
 ): Partial<ConsoleState> => {
   const channel = prev.channels.find((c) => c.id === params.channelId);
   if (!channel) return {};
@@ -188,7 +192,7 @@ export const huddleJoined = (
   const member: HuddleMember = {
     user: params.authorBytes,
     node: params.node,
-    joined_at: params.at,
+    joined_at: params.atMs,
   };
   return {
     channels: prev.channels.map((c) =>

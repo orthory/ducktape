@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { keyHex } from "../../domain/chat-client";
 import type { Channel } from "../../domain/chat-client";
 import type { PageBlock } from "../../domain/pages-client";
+import { buildStreamRows } from "../views/chat/chat-helpers";
 import * as optimistic from "./optimistic";
 import { createInitialState } from "./state";
 import type { ConsoleState } from "./state";
@@ -20,7 +21,7 @@ describe("postedMessage", () => {
       messageId: "m-1",
       blocks: [{ paragraph: [{ text: "hi", marks: [] }] }],
       authorBytes: Array.from(new TextEncoder().encode("jess")),
-      at: 123,
+      atMs: 123,
       thread: null,
     });
     expect(out.messages).toHaveLength(1);
@@ -40,7 +41,7 @@ describe("postedMessage", () => {
         messageId: "m-1",
         blocks: [],
         authorBytes: Array.from(new TextEncoder().encode("jess")),
-        at: 0,
+        atMs: 0,
         thread: null,
       }),
     ).toEqual({});
@@ -49,7 +50,7 @@ describe("postedMessage", () => {
   it("threads a reply into the open panel and bumps the root's counts", () => {
     const root = optimistic.postedMessage(
       base({ activeChannel: "general" }),
-      { channelId: "general", messageId: "r", blocks: [], authorBytes: Array.from(new TextEncoder().encode("a")), at: 0, thread: null },
+      { channelId: "general", messageId: "r", blocks: [], authorBytes: Array.from(new TextEncoder().encode("a")), atMs: 0, thread: null },
     ).messages![0];
     const prev = base({
       activeChannel: "general",
@@ -61,7 +62,7 @@ describe("postedMessage", () => {
       messageId: "m-2",
       blocks: [],
       authorBytes: Array.from(new TextEncoder().encode("jess")),
-      at: 5,
+      atMs: 5,
       thread: root.seq,
     });
     expect(out.activeThread!.replies).toHaveLength(1);
@@ -218,7 +219,7 @@ describe("huddle projections", () => {
       channelId: "general",
       node: selfNode,
       authorBytes: Array.from(new TextEncoder().encode("jess")),
-      at: 42,
+      atMs: 42,
     });
     expect(out.channels![0].huddle).toEqual([
       { user: Array.from(new TextEncoder().encode("jess")), node: selfNode, joined_at: 42 },
@@ -229,7 +230,7 @@ describe("huddle projections", () => {
       channelId: "general",
       node: selfNode,
       authorBytes: Array.from(new TextEncoder().encode("jess")),
-      at: 99,
+      atMs: 99,
     });
     expect(again).toEqual({});
   });
@@ -266,12 +267,87 @@ describe("huddle projections", () => {
   });
 });
 
+// The preconf ↔ committed timestamp seam: a just-sent echo must never
+// day-split a same-day stream, whatever timebase the node stamps (noded:
+// unix ms; the networked validator: a height counter). Crosses into the
+// chat view's row builder on purpose — the bug lives in the interplay.
+describe("preconf rows and day dividers", () => {
+  const jess = Array.from(new TextEncoder().encode("jess"));
+  // local-tz constructor: both stamps are the same LOCAL calendar day in any
+  // timezone the test runs in (a fixed epoch value would not be).
+  const morning = new Date(2026, 6, 13, 9, 0).getTime();
+  const midday = new Date(2026, 6, 13, 11, 0).getTime();
+
+  const committed = (seq: number, createdAt: number) => ({
+    channel_id: "general",
+    seq,
+    head: {
+      message_id: `m-${seq}`,
+      author: { user: jess },
+      blocks: [],
+      created_at: createdAt,
+      rev: 0,
+      edited_at: null,
+      base_rev: null,
+      deleted: false,
+      thread: null,
+      reply_count: 0,
+      last_reply_seq: null,
+    },
+    reactions: [],
+    channel_head_seq: seq,
+  });
+
+  it("no divider between a committed ms row and a same-day preconf echo", () => {
+    const prev = base({ activeChannel: "general", messages: [committed(1, morning)] });
+    const out = optimistic.postedMessage(prev, {
+      channelId: "general",
+      messageId: "m-echo",
+      blocks: [],
+      authorBytes: jess,
+      atMs: midday,
+      thread: null,
+    });
+    const rows = buildStreamRows(out.messages!);
+    expect(rows[1].dayDivider).toBeNull();
+  });
+
+  it("no divider when committed history is counter-stamped (mixed timebases never divide)", () => {
+    const prev = base({ activeChannel: "general", messages: [committed(1, 4242)] });
+    const out = optimistic.postedMessage(prev, {
+      channelId: "general",
+      messageId: "m-echo",
+      blocks: [],
+      authorBytes: jess,
+      atMs: midday,
+      thread: null,
+    });
+    const rows = buildStreamRows(out.messages!);
+    expect(rows[1].dayDivider).toBeNull();
+  });
+
+  it("same-author ms rows two minutes apart compact into one group", () => {
+    const rows = buildStreamRows([
+      committed(1, morning),
+      committed(2, morning + 2 * 60_000),
+    ]);
+    expect(rows[1].groupStart).toBe(false);
+    expect(rows[1].dayDivider).toBeNull();
+  });
+
+  it("a real day boundary between two ms rows still divides", () => {
+    const nextDay = new Date(2026, 6, 14, 9, 0).getTime();
+    const rows = buildStreamRows([committed(1, morning), committed(2, nextDay)]);
+    expect(rows[1].dayDivider).not.toBeNull();
+  });
+});
+
 describe("reaction projections", () => {
   it("adds then removes the local member's reaction", () => {
     const self = Array.from(new TextEncoder().encode("jess"));
     const seeded = optimistic.postedMessage(
       base({ activeChannel: "general" }),
-      { channelId: "general", messageId: "m", blocks: [], authorBytes: Array.from(new TextEncoder().encode("a")), at: 0, thread: null },
+      { channelId: "general", messageId: "m", blocks: [], authorBytes: Array.from(new TextEncoder().encode("a")), atMs: 0, thread: null },
     ).messages![0];
     const prev = base({ activeChannel: "general", messages: [seeded] });
 

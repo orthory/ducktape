@@ -4,6 +4,7 @@
 // everything here is a function of data already in `ConsoleState`.
 
 import type { AuthorRef, MessageView } from "../../../domain/chat-client";
+import { wallClockMillisOf } from "../../../domain/wire";
 
 /** Consecutive messages from the same author within this window (and the same
  *  calendar day) compact into one visual group. Mirrors Slack's ~5 minute
@@ -34,32 +35,36 @@ export const hasReacted = (message: MessageView, emoji: string, selfKey: string)
     (reaction) => reaction.emoji === emoji && reaction.reactors.some((a) => authorKey(a) === selfKey),
   );
 
-// Wire timestamps (`MessageHead.created_at` / `edited_at`) are UNIX SECONDS —
-// they come straight from the node's consensus_time. Every Date built from one
-// MUST multiply by 1000 to get JS milliseconds, or every message renders as
-// "Jan 1, 1970".
-const toMillis = (unixSeconds: number): number => unixSeconds * 1000;
+// Wire timestamps (`MessageHead.created_at` / `edited_at`) are the node's
+// `consensus_time` verbatim — wall-clock unix MILLIS on the embedded daemon
+// and simnode, a block-height counter on the networked validator (see
+// domain/wire.ts). Everything here renders through `wallClockMillisOf`: a
+// counter never gets a date/time label, and stamps from DIFFERENT timebases
+// are never compared — that comparison is exactly what flashed a bogus day
+// divider over a just-sent (locally stamped) preconf echo.
 
-/** True when a timestamp is a plausible real wall-clock time (after 2001-01-01),
- *  vs a genesis-relative counter. The node's `consensus_time` is currently a
- *  chain-relative value (small: seconds since genesis), so rendering it as an
- *  absolute clock/date yields nonsense like "Jan 1, 1970" / "20637d ago".
- *  Display code guards on this and simply omits the time when it isn't real —
- *  honest, and self-adjusting: the moment the node stamps real wall-clock time
- *  (values > 2001), timestamps light up on their own. Relative ORDERING and
- *  grouping stay correct either way (they use time DIFFERENCES, not the label). */
-export const isWallClock = (unixSeconds: number): boolean => unixSeconds > 978_307_200;
-
-const dayKeyOf = (unixSeconds: number): string => new Date(toMillis(unixSeconds)).toDateString();
+const dayKeyOf = (ms: number): string => new Date(ms).toDateString();
 
 /** "Today" / "Yesterday" / a short locale date — the day-divider label.
- *  `unixSeconds` is a `created_at`-shaped UNIX-seconds timestamp. */
-export const dayLabelOf = (unixSeconds: number): string => {
-  const nowSeconds = Date.now() / 1000;
-  const oneDaySeconds = 24 * 60 * 60;
-  if (dayKeyOf(unixSeconds) === dayKeyOf(nowSeconds)) return "Today";
-  if (dayKeyOf(unixSeconds) === dayKeyOf(nowSeconds - oneDaySeconds)) return "Yesterday";
-  return new Date(toMillis(unixSeconds)).toLocaleDateString([], { month: "short", day: "numeric" });
+ *  `ms` is a wall-clock stamp already normalized to JS millis. */
+export const dayLabelOf = (ms: number): string => {
+  const now = Date.now();
+  const oneDayMs = 24 * 60 * 60 * 1000;
+  if (dayKeyOf(ms) === dayKeyOf(now)) return "Today";
+  if (dayKeyOf(ms) === dayKeyOf(now - oneDayMs)) return "Yesterday";
+  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
+};
+
+/** The grouping gap between two stamps, in millis. Two wall-clock stamps
+ *  compare as real time; two counters keep the legacy `×1000` reading (a
+ *  validator ticks ~1 block/s, so the window still spans ~5 min of chain
+ *  time); mixed timebases are incomparable — infinite gap, new group. */
+const gapMsOf = (a: number, b: number): number => {
+  const aMs = wallClockMillisOf(a);
+  const bMs = wallClockMillisOf(b);
+  if (aMs !== null && bMs !== null) return bMs - aMs;
+  if (aMs === null && bMs === null) return (b - a) * 1000;
+  return Number.POSITIVE_INFINITY;
 };
 
 export interface StreamRow {
@@ -78,18 +83,19 @@ export const buildStreamRows = (roots: MessageView[]): StreamRow[] => {
   const rows: StreamRow[] = [];
   let prev: MessageView | null = null;
   for (const message of roots) {
-    const dayChanged = prev !== null && dayKeyOf(prev.head.created_at) !== dayKeyOf(message.head.created_at);
-    // Only render a day divider when the timestamp is real wall-clock — a
-    // genesis-relative counter would label every divider "Jan 1, 1970".
-    const dayDivider =
-      (prev === null || dayChanged) && isWallClock(message.head.created_at)
-        ? dayLabelOf(message.head.created_at)
-        : null;
+    const ms = wallClockMillisOf(message.head.created_at);
+    const prevMs = prev === null ? null : wallClockMillisOf(prev.head.created_at);
+    // A day boundary exists only between two REAL wall-clock stamps. Mixed
+    // timebases never divide: a locally stamped preconf echo above
+    // height-stamped history is the same day until committed truth says
+    // otherwise. (A wall-clock FIRST row still gets its top-of-stream label.)
+    const dayChanged = prevMs !== null && ms !== null && dayKeyOf(prevMs) !== dayKeyOf(ms);
+    const dayDivider = (prev === null || dayChanged) && ms !== null ? dayLabelOf(ms) : null;
     const groupStart =
       prev === null ||
       dayChanged ||
       authorKey(prev.head.author) !== authorKey(message.head.author) ||
-      toMillis(message.head.created_at) - toMillis(prev.head.created_at) >= GROUP_WINDOW_MS;
+      gapMsOf(prev.head.created_at, message.head.created_at) >= GROUP_WINDOW_MS;
     rows.push({ message, groupStart, dayDivider });
     prev = message;
   }

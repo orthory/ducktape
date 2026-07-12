@@ -5,6 +5,7 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 
 import { forgeDiff, type CommitInfo, type FileDiff } from "../../../domain/forge-git-client";
+import { wallClockMillisOf } from "../../../domain/wire";
 import { Icon } from "../../components/Icon";
 import { color, font, radius, tint } from "../../theme/tokens";
 
@@ -41,13 +42,13 @@ export function shortHash(value: string | null | undefined): string {
   return value ? `${value.slice(0, 10)}...` : "unborn";
 }
 
-export function relTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "";
-  // The node's commit time is genesis-relative today (not wall-clock), so a
-  // small value would render an absurd "20637d ago". Omit it until the node
-  // stamps real time (> 2001); ordering/history are unaffected.
-  if (seconds <= 978_307_200) return "";
-  const diff = Math.max(0, Date.now() - seconds * 1000);
+export function relTime(stamp: number): string {
+  // consensus_time is millis, legacy seconds, or a height counter depending
+  // on the lane (see domain/wire.ts) — a counter would render an absurd
+  // "20637d ago", so it renders as nothing until the node stamps real time.
+  const ms = wallClockMillisOf(stamp);
+  if (ms === null) return "";
+  const diff = Math.max(0, Date.now() - ms);
   const minute = 60 * 1000;
   const hour = 60 * minute;
   const day = 24 * hour;

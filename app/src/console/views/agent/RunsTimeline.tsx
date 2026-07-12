@@ -21,7 +21,7 @@ import { opKey } from "../../store/finalization";
 import type { OpLedger, OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, shadow } from "../../theme/tokens";
-import { isWallClock } from "../chat/chat-helpers";
+import { wallClockMillisOf } from "../../../domain/wire";
 import { relTime } from "../forge/ui";
 import {
   agentLabel,
@@ -46,21 +46,16 @@ import {
 
 // ── Consensus-counter rendering ──────────────────────────
 // `created_at`/`delivered_at` are whatever the lane stamps: the embedded
-// daemon writes unix MILLIS, chat-style lanes unix seconds, a validator its
-// block height. Raw values must never render as clock time (the chat-helpers
-// isWallClock rule); only wall-clock stamps get absolute labels, and
-// durations always come from the created→delivered DIFF.
-
-/** 2001-01-01 in unix MILLIS — chat-helpers' isWallClock threshold shifted
- *  three decimal places, telling the millis lane from the seconds lane. */
-const WALL_CLOCK_MILLIS_FLOOR = 978_307_200_000;
+// daemon writes unix MILLIS, legacy rows unix seconds, a validator its block
+// height. Raw values must never render as clock time; `wallClockMillisOf`
+// (domain/wire.ts) owns the lane sniffing, and durations always come from
+// the created→delivered DIFF.
 
 /** The counter as unix seconds when it is a real wall-clock stamp, else null
  *  (a height counter — not renderable as time). */
 const wallClockSecs = (counter: number): number | null => {
-  if (counter > WALL_CLOCK_MILLIS_FLOOR) return counter / 1000; // millis lane
-  if (isWallClock(counter)) return counter; // seconds lane
-  return null;
+  const ms = wallClockMillisOf(counter);
+  return ms === null ? null : ms / 1000;
 };
 
 const formatSeconds = (secs: number): string => {
