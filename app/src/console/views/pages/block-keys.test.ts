@@ -156,6 +156,15 @@ describe("resolveKey — structure", () => {
     expect(typeOf({ key: "Tab", shiftKey: true })).toBe("outdent");
   });
 
+  it("inserts a tab into code without moving the block", () => {
+    expect(
+      resolveKey(
+        ctx({ key: "Tab", kind: "code", value: "abcd", caretStart: 1, caretEnd: 3 }),
+      ),
+    ).toEqual({ type: "insert-tab", value: "a\td", caret: 2 });
+    expect(typeOf({ key: "Tab", kind: "code", shiftKey: true })).toBe("none");
+  });
+
   it("moves the block with Alt+Arrow", () => {
     expect(typeOf({ key: "ArrowUp", altKey: true })).toBe("move-up");
     expect(typeOf({ key: "ArrowDown", altKey: true })).toBe("move-down");

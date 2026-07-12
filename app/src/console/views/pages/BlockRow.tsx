@@ -5,7 +5,8 @@
 //   Mod+Enter      check a to-do / collapse a toggle — never splits
 //   Backspace      at offset 0: merge into the block above (or delete a divider
 //                  above); on an empty block: remove it
-//   Tab / S-Tab    indent under the previous sibling / outdent to grandparent
+//   Tab / S-Tab    indent under the previous sibling / outdent to grandparent;
+//                  in code, Tab inserts a tab character instead
 //   Alt+Up/Down    move among siblings
 //   Up/Left        at the start: hop to the previous block, caret at its END
 //   Down/Right     at the end: hop to the next block, caret at its START
@@ -135,6 +136,7 @@ function BlockRowInner({
   const [focused, setFocused] = useState(false);
   const [hover, setHover] = useState(false);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  const localCaretRef = useRef<number | null>(null);
   // focus mirrored into a ref so the draft-sync effect below reads the live
   // value without re-running on focus flips.
   const focusedRef = useRef(false);
@@ -162,6 +164,13 @@ function BlockRowInner({
     el.setSelectionRange(at, at);
     handlers.focusApplied(block.id);
   }, [caret, draft, block.text, block.id, handlers]);
+
+  useLayoutEffect(() => {
+    const at = localCaretRef.current;
+    if (at == null) return;
+    areaRef.current?.setSelectionRange(at, at);
+    localCaretRef.current = null;
+  }, [draft]);
 
   // auto-grow: the textarea is exactly as tall as its content.
   useEffect(() => {
@@ -312,6 +321,10 @@ function BlockRowInner({
         return;
       case "toggle-collapse":
         handlers.toggleCollapse(block.id);
+        return;
+      case "insert-tab":
+        localCaretRef.current = intent.caret;
+        setDraft(intent.value);
         return;
       case "indent":
         maybeCommit();

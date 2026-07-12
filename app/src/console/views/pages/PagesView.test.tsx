@@ -213,6 +213,21 @@ describe("PagesView", () => {
     });
   });
 
+  it("types Tab inside code instead of moving the block", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["code"] }),
+        blockOf({ id: "code", kind: "code", text: "let x = 1" }),
+      ],
+    });
+    const area = screen.getByLabelText("Edit code block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(3, 3);
+    fireEvent.keyDown(area, { key: "Tab" });
+    expect(area).toHaveValue("let\t x = 1");
+    expect(area.selectionStart).toBe(4);
+    expect(spies.movePageBlock).toBeUndefined();
+  });
+
   it("removes an empty block on Backspace", () => {
     const { spies } = renderPagesView({
       activePageBlocks: [
