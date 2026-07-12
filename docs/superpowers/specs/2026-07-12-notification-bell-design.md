@@ -25,7 +25,10 @@ a dropdown listing recent notifications.
   `NotifyHandles` so the command below can read it without actor plumbing.
 - `state.json` becomes `{ unread, recent }` (`serde(default)` — old files
   load). The list persists so the dropdown matches the badge after a restart.
-- New command `notify_recent() -> Vec<StoredNotification>`.
+- New command `notify_recent() -> { unread, items: Vec<StoredNotification> }`.
+  The unread count rides along because the engine's boot-time badge event
+  fires before the webview subscribes — after a restart with persisted unread
+  the bell would otherwise show zero until the next live event.
 - `AppSink::present` additionally emits each item as `ducktape://notify-item`
   so an open webview updates live.
 
