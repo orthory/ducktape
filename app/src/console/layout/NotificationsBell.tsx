@@ -10,6 +10,7 @@ import { isTauri } from "../../domain/node-bootstrap";
 import * as notifyClient from "../../domain/notify-client";
 import type { NotifyItem } from "../../domain/notify-client";
 import { parseItemChannelId } from "../../domain/forge-client";
+import { relTime } from "../views/forge/ui";
 import { Icon } from "../components/Icon";
 import { accentVar, color, font, radius } from "../theme/tokens";
 import { useDucktape } from "../store/use-ducktape";
@@ -29,13 +30,9 @@ const FALLBACK_SCREEN: Record<NotifyItem["category"], string> = {
   governance: "governance",
 };
 
-const agoLabel = (at: number): string => {
-  const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
-  if (seconds < 60) return "now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}d`;
-};
+// One item's identity for the boot merge: `at` is engine-stamped epoch millis,
+// near-unique; the title breaks the same-millisecond tie.
+const itemKey = (item: NotifyItem): string => `${item.at}:${item.title}`;
 
 export function NotificationsBell() {
   const { actions } = useDucktape();
@@ -47,20 +44,30 @@ export function NotificationsBell() {
   useEffect(() => {
     if (!isTauri()) return;
     let cancelled = false;
+    let sawLiveUnread = false;
     const unlistens: Array<() => void> = [];
-    // The snapshot carries unread too: the engine's boot-time badge event
-    // fires before this listener attaches, so events alone would miss it.
-    void notifyClient.recent().then((snapshot) => {
-      if (cancelled) return;
-      setItems(snapshot.items);
-      setUnread(snapshot.unread);
-    });
     void notifyClient
       .onItem((item) => setItems((previous) => [item, ...previous].slice(0, RECENT_CAP)))
       .then((unlisten) => (cancelled ? unlisten() : unlistens.push(unlisten)));
     void notifyClient
-      .onUnread(setUnread)
+      .onUnread((unread) => {
+        sawLiveUnread = true;
+        setUnread(unread);
+      })
       .then((unlisten) => (cancelled ? unlisten() : unlistens.push(unlisten)));
+    // The snapshot is the boot BASELINE — it carries the unread the engine
+    // badged before this webview mounted. Live events can land before its IPC
+    // resolves, so it merges UNDER any prepends (never overwrites them), and
+    // it never clobbers an unread a live event (or mark-seen) already set.
+    void notifyClient.recent().then((snapshot) => {
+      if (cancelled) return;
+      setItems((previous) => {
+        const known = new Set(snapshot.items.map(itemKey));
+        const fresh = previous.filter((item) => !known.has(itemKey(item)));
+        return [...fresh, ...snapshot.items].slice(0, RECENT_CAP);
+      });
+      if (!sawLiveUnread) setUnread(snapshot.unread);
+    });
     return () => {
       cancelled = true;
       unlistens.forEach((unlisten) => unlisten());
@@ -95,10 +102,12 @@ export function NotificationsBell() {
   const openItem = (item: NotifyItem) => {
     setOpen(false);
     if (item.channelId) {
-      // A hidden forge-item channel is unroutable on the chat surface — the
-      // provider's navigate listener makes the same detour.
-      if (parseItemChannelId(item.channelId)) {
-        actions.setScreen("forge");
+      // A hidden forge-item channel is unroutable on the chat surface — jump
+      // to the item itself (the provider's navigate listener makes the same
+      // detour for toast deep-links).
+      const forgeItem = parseItemChannelId(item.channelId);
+      if (forgeItem) {
+        actions.openForgeItem(forgeItem.repo, forgeItem.number);
         return;
       }
       actions.setScreen("chat");
@@ -220,7 +229,7 @@ export function NotificationsBell() {
                       flexShrink: 0,
                     }}
                   >
-                    {agoLabel(item.at)}
+                    {relTime(item.at / 1000)}
                   </span>
                 </div>
                 <div

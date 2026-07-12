@@ -148,6 +148,11 @@ impl<S: Sink> Engine<S> {
     }
 
     pub fn mark_seen(&mut self) {
+        // The bell marks seen on every dropdown open; when nothing is unread
+        // there is nothing to change — skip the badge and the full-ring write.
+        if self.unread == 0 {
+            return;
+        }
         self.unread = 0;
         self.bell
             .lock()
@@ -668,6 +673,11 @@ mod tests {
         engine.mark_seen();
         assert_eq!(bell.lock().unwrap().unread, 0);
         assert_eq!(bell.lock().unwrap().items.len(), RECENT_CAP);
+
+        // A second open is a no-op: no extra badge event, no state rewrite.
+        let badge_events = badges(&engine).len();
+        engine.mark_seen();
+        assert_eq!(badges(&engine).len(), badge_events);
 
         // A fresh engine over the same state file reloads the whole snapshot.
         let reloaded = Arc::new(Mutex::new(BellState::default()));

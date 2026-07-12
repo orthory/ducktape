@@ -34,13 +34,14 @@ const item = (patch: Partial<NotifyItem> = {}): NotifyItem => ({
 const renderBell = () => {
   const setScreen = vi.fn();
   const selectChannel = vi.fn();
-  const actions = { setScreen, selectChannel } as unknown as ConsoleActions;
+  const openForgeItem = vi.fn();
+  const actions = { setScreen, selectChannel, openForgeItem } as unknown as ConsoleActions;
   render(
     <ConsoleContext.Provider value={{ state: createInitialState(), actions }}>
       <NotificationsBell />
     </ConsoleContext.Provider>,
   );
-  return { setScreen, selectChannel };
+  return { setScreen, selectChannel, openForgeItem };
 };
 
 afterEach(() => {
@@ -89,7 +90,7 @@ describe("NotificationsBell", () => {
       ],
     });
 
-    const { setScreen, selectChannel } = renderBell();
+    const { setScreen, selectChannel, openForgeItem } = renderBell();
     // The boot snapshot carries unread — the badge must show it even though
     // no unread event ever fired (the engine badges before the webview mounts).
     await waitFor(() =>
@@ -103,8 +104,38 @@ describe("NotificationsBell", () => {
 
     fireEvent.click(screen.getByLabelText("Notifications"));
     fireEvent.click(await screen.findByText("PR reply"));
-    expect(setScreen).toHaveBeenCalledWith("forge");
+    // A forge-item channel jumps to the ITEM, not the repo list.
+    expect(openForgeItem).toHaveBeenCalledWith("repo", 4);
     expect(selectChannel).not.toHaveBeenCalled();
+  });
+
+  it("keeps a live item that lands before the boot snapshot resolves", async () => {
+    markTauri();
+    let resolveSnapshot: (value: unknown) => void = () => {};
+    notifyMocks.recent.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveSnapshot = resolve)),
+    );
+    let pushItem: (entry: NotifyItem) => void = () => {};
+    notifyMocks.onItem.mockImplementation(async (cb: (entry: NotifyItem) => void) => {
+      pushItem = cb;
+      return () => {};
+    });
+
+    renderBell();
+    await waitFor(() => expect(notifyMocks.onItem).toHaveBeenCalled());
+
+    // A notification arrives while recent()'s IPC is still in flight...
+    const live = item({ title: "Landed live", at: 2000 });
+    await act(async () => pushItem(live));
+    // ...then the stale snapshot (captured before it existed) resolves.
+    await act(async () =>
+      resolveSnapshot({ unread: 1, items: [item({ title: "From boot", at: 1000 })] }),
+    );
+
+    fireEvent.click(screen.getByLabelText("Notifications"));
+    // Both survive — the merge keeps the live prepend above the boot items.
+    expect(await screen.findByText("Landed live")).toBeInTheDocument();
+    expect(screen.getByText("From boot")).toBeInTheDocument();
   });
 
   it("prepends live items and shows the empty state before any arrive", async () => {
