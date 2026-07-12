@@ -68,11 +68,17 @@ fi
 
 # Repo-tracked fixes to the pinned checkout, applied idempotently on every
 # run (cef-env precedes every make target, and the clone may predate a new
-# patch). Today's only patch makes the bundler's CEF helper .apps re-exec
-# the app binary instead of a generic embedded stub: CEF requires every
-# process to register the same custom schemes, and the stub registered
-# none, so `tauri://localhost` origins failed Mojo validation in helper
-# processes and the packaged app rendered a permanently blank window.
+# patch).
+#   0001 makes the bundler's CEF helper .apps re-exec the app binary instead
+#     of a generic embedded stub: CEF requires every process to register the
+#     same custom schemes, and the stub registered none, so
+#     `tauri://localhost` origins failed Mojo validation in helper processes
+#     and the packaged app rendered a permanently blank window.
+#   0002 makes the CLI's CEF packaging probe see `cef` when it is enabled
+#     through `default`, so the bundler actually copies the framework and
+#     helpers. Without it the .app builds "successfully" with no CEF payload
+#     at all and panics in cef::library_loader at launch.
+# Both are gated by ops/check-macos-cef-bundle.sh, which `make app` runs.
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)/patches"
 for patch in "$PATCH_DIR"/*.patch; do
   [ -e "$patch" ] || continue
