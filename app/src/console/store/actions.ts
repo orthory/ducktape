@@ -2151,8 +2151,10 @@ export function createActions({
     },
 
     movePageBlock: ({ blockId, parent, after }) =>
-      submitTracked(opKey.pageBlock(blockId), (live) =>
-        inPageOrder(() => pagesClient.moveBlock(live, { blockId, parent, after })),
+      submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => inPageOrder(() => pagesClient.moveBlock(live, { blockId, parent, after })),
+        (prev) => optimistic.pageBlockMoved(prev, { blockId, parent, after }),
       ),
 
     removePageBlock: (blockId) => {

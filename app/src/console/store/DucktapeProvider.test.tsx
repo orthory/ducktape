@@ -1741,6 +1741,64 @@ describe("pages snapshot refresh vs in-flight ops", () => {
       expect(capturedState!.activePageBlocks[1].text).toBe("hello world");
     });
   });
+
+  // Tab/Shift+Tab, the alt-arrows, and drag-drop are all ONE MoveBlock op.
+  // Like every other page-block write it must paint at submit time — the
+  // projection re-nests the row instantly, and the consensus round-trip only
+  // finalizes the ledger record behind it.
+  it("renders a block move preconfirmed, before the node confirms", async () => {
+    const { transport } = makeFakeNode();
+    const pageBlock = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
+      parent: "p1",
+      page: "p1",
+      kind: "paragraph",
+      text: "",
+      checked: false,
+      children: [],
+      ...patch,
+    });
+    const tree = [
+      pageBlock({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a", "b"] }),
+      pageBlock({ id: "a", text: "first" }),
+      pageBlock({ id: "b", text: "second" }),
+    ];
+    const baseQuery = vi.mocked(transport.query).getMockImplementation()!;
+    vi.mocked(transport.query).mockImplementation((target, query) => {
+      if (target !== "pages") return baseQuery(target, query);
+      if (query === "list_pages") {
+        return Promise.resolve({
+          page_list: [{ id: "p1", title: "Plan", parent: null }],
+        });
+      }
+      if ((query as { get_page?: unknown }).get_page) {
+        return Promise.resolve({ page: [...tree] });
+      }
+      return Promise.resolve({ comment_threads: [] });
+    });
+    // the submit never resolves: everything asserted below is the
+    // preconfirmed render alone, no refresh ever lands.
+    vi.mocked(transport.submit).mockImplementation(() => new Promise(() => {}));
+
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    await act(async () => {
+      capturedActions!.openPage("p1");
+    });
+    await waitFor(() =>
+      expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]),
+    );
+
+    // the Tab indent: b re-homes under its previous sibling a.
+    await act(async () => {
+      capturedActions!.movePageBlock({ blockId: "b", parent: "a", after: null });
+    });
+    const byId = new Map(capturedState!.activePageBlocks.map((b) => [b.id, b]));
+    expect(byId.get("p1")!.children).toEqual(["a"]);
+    expect(byId.get("a")!.children).toEqual(["b"]);
+    expect(byId.get("b")!.parent).toBe("a");
+  });
 });
 
 // ── Desktop notifier: config push + deep-link navigation ─
