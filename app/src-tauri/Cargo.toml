@@ -88,5 +88,10 @@ tauri-agent-plugin = { version = "0.0.2", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Touch ID custody (src/touchid.rs): the vault passphrase behind a biometric
+# Keychain ACL. macOS-target-scoped so the Linux/wasm build is untouched.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [dev-dependencies]
 tempfile = { workspace = true }
