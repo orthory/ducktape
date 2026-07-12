@@ -18,7 +18,7 @@ use duckfs_core::{
     SnapshotInfo, decode_reply, encode_msg, encode_putblob, encode_query,
 };
 use files::Files;
-use sdk::{Ctx, Effect, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
 
 // ---- a deterministic Ctx (copied from the files harness) --------------------
 
@@ -57,7 +57,6 @@ impl Ctx for TestCtx {
         self.emitted.push_back(msg);
     }
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 // ---- the mock node ----------------------------------------------------------

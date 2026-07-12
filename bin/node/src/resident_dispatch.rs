@@ -1,6 +1,6 @@
 //! the RESIDENT-tier dispatch worker pump.
 //!
-//! a validator's dispatch worker is fed by the reactor seam: effects of
+//! a validator's dispatch worker is fed by the reactor seam: events of
 //! finalized blocks it EXECUTED. a synced resident never executes blocks — it
 //! installs boundary snapshots — so no effect ever reaches it, yet the saga
 //! module (now assigning over validators ∪ residents' announced providers)
@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use host::Host;
 use host::worker::{WorkOutcome, Worker};
 use saga::{SagaMsg, SagaQuery, SagaReply, WorkerRequest};
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 
 /// how long a relayed result may await its consensus fate before it is
 /// re-sent (comfortably above the relay's 10s SUBMIT_HOLD). re-sends are
@@ -189,7 +189,10 @@ impl ResidentDispatch {
                     // arrives later via `completed`.
                     let stage = match self
                         .pool
-                        .run(&Effect(saga::encode_worker_request(&request)))
+                        .run(&Event {
+                            source: "saga".into(),
+                            payload: saga::encode_worker_request(&request),
+                        })
                         .await
                     {
                         // an inline verdict WITH an op (unresolvable

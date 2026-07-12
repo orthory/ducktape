@@ -519,7 +519,6 @@ mod tests {
             self.msgs.push(msg);
         }
         fn emit_event(&mut self, _ev: Event) {}
-        fn request_effect(&mut self, _eff: sdk::Effect) {}
     }
 
     fn module() -> TaggingModule {

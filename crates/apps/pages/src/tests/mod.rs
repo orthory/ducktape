@@ -56,7 +56,6 @@ impl Ctx for TestCtx {
         self.msgs.push(m);
     }
     fn emit_event(&mut self, _e: sdk::Event) {}
-    fn request_effect(&mut self, _e: sdk::Effect) {}
 }
 
 // drive one op through execute + commit_block (one op per block-height).

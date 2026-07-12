@@ -64,7 +64,6 @@ impl Ctx for TestCtx {
         self.emitted.push(msg);
     }
     fn emit_event(&mut self, _ev: sdk::Event) {}
-    fn request_effect(&mut self, _eff: sdk::Effect) {}
 }
 
 fn user(byte: u8) -> Origin {

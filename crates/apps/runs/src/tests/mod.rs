@@ -18,7 +18,7 @@ use futures::executor::block_on;
 use jobs::{
     Claim as JobClaim, Job, encode_event as jobs_encode_event, encode_reply as jobs_encode_reply,
 };
-use sdk::{Effect, Env};
+use sdk::Env;
 use tagging::{Author, encode_event as tagging_encode_event};
 use tasks::{Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply};
 
@@ -75,7 +75,6 @@ struct CaptureCtx {
     files_head: Option<String>,
     msgs: Vec<Msg>,
     #[allow(dead_code)]
-    effects: Vec<Effect>,
     events: Vec<Event>,
 }
 impl CaptureCtx {
@@ -103,7 +102,6 @@ impl CaptureCtx {
             page_target_threads: BTreeMap::new(),
             files_head: None,
             msgs: Vec::new(),
-            effects: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -553,9 +551,7 @@ impl Ctx for CaptureCtx {
     fn emit_event(&mut self, ev: Event) {
         self.events.push(ev);
     }
-    fn request_effect(&mut self, eff: Effect) {
-        self.effects.push(eff);
-    }
+
 }
 
 // ---- fixtures -----------------------------------------------------------

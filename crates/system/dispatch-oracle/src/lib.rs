@@ -25,7 +25,7 @@
 use capability_host::{ProviderOutput, ProviderSet};
 use dispatch::{WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 
 mod envelope;
 mod pool;
@@ -85,9 +85,9 @@ pub(crate) enum Gated {
     Execute(ExecJob),
 }
 
-/// decode + lease-gate one effect against this host's provider surface.
-pub(crate) fn gate(providers: &ProviderSet, node_key: &[u8], effect: &Effect) -> Gated {
-    let request = match decode_worker_request(&effect.0) {
+/// decode + lease-gate one event against this host's provider surface.
+pub(crate) fn gate(providers: &ProviderSet, node_key: &[u8], event: &Event) -> Gated {
+    let request = match decode_worker_request(&event.payload) {
         Ok(request) => request,
         Err(_) => return Gated::NotMine,
     };
@@ -237,14 +237,17 @@ format = "text"
         ProviderSet::assemble(capability_host::SpecSet::from_specs(vec![spec]), Vec::new())
     }
 
-    fn effect_for(spec: Vec<u8>, assignee: Option<&[u8]>) -> Effect {
-        Effect(encode_worker_request(&WorkerRequest {
-            saga_id: "s".into(),
-            attempt: 0,
-            spec,
-            deadline: None,
-            assignee: assignee.map(|a| a.to_vec()),
-        }))
+    fn effect_for(spec: Vec<u8>, assignee: Option<&[u8]>) -> Event {
+        Event {
+            source: "saga".into(),
+            payload: encode_worker_request(&WorkerRequest {
+                saga_id: "s".into(),
+                attempt: 0,
+                spec,
+                deadline: None,
+                assignee: assignee.map(|a| a.to_vec()),
+            }),
+        }
     }
 
     fn work_spec() -> Vec<u8> {

@@ -50,7 +50,7 @@ use noded::{
 use pages::Pages;
 use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
 use tracing_subscriber::prelude::*;
 
@@ -480,7 +480,7 @@ async fn submit_and_drain(
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (included, effects) =
+    let (included, events) =
         match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await
     {
         Ok(out) => out,
@@ -492,7 +492,7 @@ async fn submit_and_drain(
         };
 
     let mut queue = VecDeque::new();
-    offer_effects(workers, effects, &mut queue).await;
+    offer_effects(workers, events, &mut queue).await;
     let mut rounds = 1u32;
 
     loop {
@@ -525,8 +525,8 @@ async fn submit_and_drain(
         )
         .await
         {
-            Ok((_block, effects)) => {
-                offer_effects(workers, effects, &mut queue).await;
+            Ok((_block, events)) => {
+                offer_effects(workers, events, &mut queue).await;
             }
             Err(SubmitError::Fatal(err)) => {
                 eprintln!("[noded] FATAL: {err} — halting");
@@ -551,7 +551,7 @@ async fn submit_one(
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
-) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
+) -> Result<(BlockSummary, Vec<Event>), SubmitError> {
     let consensus_time = unix_millis();
     // the explorer row's identity: capture the root op's coordinates before
     // ctx/msg consume them. this lane frames and signs nothing, so the
@@ -630,7 +630,7 @@ async fn submit_one(
     // materialize rows. no subscribers is fine.
     stream_hub.publish_block(block.height, block.app_hash.clone());
 
-    Ok((block, out.effects))
+    Ok((block, out.events))
 }
 
 /// map a deterministic dispatch record to its explorer wire twin (the block
@@ -656,10 +656,10 @@ fn origin_tag(origin: &Origin) -> String {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
-    effects: Vec<Effect>,
+    events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
-    for eff in effects {
+    for eff in events {
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
@@ -676,10 +676,12 @@ async fn offer_effects(
                 }
             }
         }
-        if !claimed {
+        // an unclaimed event is normally plain observability; one that
+        // DECODES as a worker request means a saga is stuck Pending.
+        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
             println!(
-                "[noded] effect with no worker ({} bytes) — dropped",
-                eff.0.len()
+                "[noded] WorkerRequest with no worker ({} bytes) — dropped",
+                eff.payload.len()
             );
         }
     }

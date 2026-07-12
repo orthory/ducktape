@@ -24,7 +24,7 @@ use duckfs_core::{
     encode_putblob, encode_query, to_hex,
 };
 use files::Files;
-use sdk::{Ctx, Effect, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
 use statesync::{ModuleLane, ObjectFetch, SyncError, sync_object_possession};
 
 // ---- drivers ----------------------------------------------------------------
@@ -73,7 +73,6 @@ impl Ctx for TestCtx {
         self.emitted.push_back(msg);
     }
     fn emit_event(&mut self, _ev: Event) {}
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 fn exec(f: &mut Files, origin: Origin, h: u64, op: FilesMsg) -> Result<(), Error> {

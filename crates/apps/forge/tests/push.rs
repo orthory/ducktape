@@ -54,7 +54,6 @@ impl Ctx for TestCtx {
     }
     fn emit_msg(&mut self, _m: Msg) {}
     fn emit_event(&mut self, _e: sdk::Event) {}
-    fn request_effect(&mut self, _e: sdk::Effect) {}
 }
 
 fn tmp_repo(tag: &str) -> PathBuf {

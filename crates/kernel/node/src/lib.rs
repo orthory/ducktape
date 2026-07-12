@@ -9,7 +9,7 @@
 //! orderer is the drop-in behind the same [`Orderer`] trait.
 
 use host::{BlockContext, Host, MemberOutcome};
-use sdk::{Effect, Msg, StateRoot};
+use sdk::{Event, Msg, StateRoot};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -531,7 +531,7 @@ impl Orderer for ArrivalOrderer {
 /// agreed ceiling — so dispositions are identical on every honest validator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposition {
-    /// applied via `host.submit_at`; its effects are in the effect queue.
+    /// applied via `host.submit_at`; its events are in the event queue.
     Applied,
     /// a deterministic no-op: the frame failed to decode or a module rejected
     /// the op (host-lent rolled the block back).
@@ -717,11 +717,12 @@ impl BlockSink for NullSink {
 pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     host: Host,
     orderer: O,
-    /// effects surfaced by every block APPLIED via `drain_delivered` and not yet
-    /// taken. the host itself ignores its effect sink; on the ordered lane this is
-    /// where the reactor's worker driver reads finalized `WorkerRequest`s from
-    /// (via `take_effects`). accumulates in agreed-delivery order.
-    effects: Vec<Effect>,
+    /// events surfaced by every block APPLIED via `drain_delivered` and not yet
+    /// taken. on the ordered lane this is where the reactor's worker driver
+    /// reads finalized worker requests from (via `take_events`; try-decode
+    /// routing skips the purely observability events). accumulates in
+    /// agreed-delivery order.
+    events: Vec<Event>,
     /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
     /// (`view_base + engine view`) plus the app-hash after that drain settled.
     /// this is what a state-sync service serves from
@@ -743,7 +744,7 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// observes and compares cutover views against). reset on epoch respawn.
     last_engine_view: Option<u64>,
     /// per-frame outcomes recorded by `drain_delivered` and not yet taken via
-    /// [`OrderedNode::take_drained`]. like `effects`, long-lived callers take
+    /// [`OrderedNode::take_drained`]. like `events`, long-lived callers take
     /// these every drain tick; the queue accumulates until taken.
     drained: Vec<DrainedFrame>,
     /// per-BLOCK once-per-block System-injection dispatch traces (upgrade
@@ -827,7 +828,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         Self {
             host,
             orderer,
-            effects: Vec::new(),
+            events: Vec::new(),
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized: None,
@@ -860,7 +861,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         Self {
             host,
             orderer,
-            effects: Vec::new(),
+            events: Vec::new(),
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized,
@@ -934,7 +935,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // first sealed block.
         self.finalized_view = None;
         self.view_ceiling = None;
-        // effects of pre-cutover blocks remain takeable. deferred frames
+        // events of pre-cutover blocks remain takeable. deferred frames
         // carry OLD-epoch views — stamping them under the new base would
         // corrupt heights, and a caller only cuts over after draining under
         // the ceiling, so any leftover here was past the ceiling (a discard);
@@ -1315,7 +1316,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             };
             // N DrainedFrames per batch, all sharing the ONE post-batch app-hash.
             let batch_hash = outcome.app_hash;
-            self.effects.extend(outcome.effects);
+            self.events.extend(outcome.events);
             // the block-level seal disposition is DRAIN-based, not app-hash-based:
             // a block is Applied iff it ran real work — any member applied, or a
             // once-per-block System injection dispatched. this is identical live,
@@ -1452,17 +1453,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.host.app_hash()
     }
 
-    /// take the effects accumulated by applied blocks since the last call. the
-    /// host-owned reactor drains these, runs the assigned worker on each
-    /// `WorkerRequest`, and submits the resulting `OracleResult` op back through
-    /// the ordered lane (the oracle-as-op over consensus).
-    pub fn take_effects(&mut self) -> Vec<Effect> {
-        std::mem::take(&mut self.effects)
+    /// take the events accumulated by applied blocks since the last call. the
+    /// host-owned reactor drains these, offers each to its workers (try-decode
+    /// routing — a `WorkerRequest` is claimed, anything else falls through as
+    /// observability), and submits each resulting `OracleResult` op back
+    /// through the ordered lane (the oracle-as-op over consensus).
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
     }
 
     /// take the per-frame outcomes recorded by [`OrderedNode::drain_delivered`]
     /// since the last call, in agreed order. the drop-in counterpart of
-    /// [`OrderedNode::take_effects`] for callers holding replies open on their
+    /// [`OrderedNode::take_events`] for callers holding replies open on their
     /// own submitted [`FrameId`]s.
     pub fn take_drained(&mut self) -> Vec<DrainedFrame> {
         std::mem::take(&mut self.drained)

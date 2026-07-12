@@ -44,7 +44,6 @@ impl Ctx for TestCtx {
 
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _ev: sdk::Event) {}
-    fn request_effect(&mut self, _eff: sdk::Effect) {}
 }
 
 fn module_msg(payload: ChatMsg) -> Msg {

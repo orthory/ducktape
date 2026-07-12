@@ -8,7 +8,7 @@ use gateway::{
     RouteTarget, decode_reply, encode_msg, encode_query, route_signing_preimage,
 };
 use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView};
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use valset::{ValsetQuery, ValsetReply};
 
 struct TestCtx {
@@ -50,7 +50,6 @@ impl Ctx for TestCtx {
 
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {

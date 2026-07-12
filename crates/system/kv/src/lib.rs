@@ -511,7 +511,6 @@ mod tests {
         }
         fn emit_msg(&mut self, _m: Msg) {}
         fn emit_event(&mut self, _e: sdk::Event) {}
-        fn request_effect(&mut self, _e: sdk::Effect) {}
     }
 
     // the poison-pill guard: an over-cap set is rejected at WRITE time — never

@@ -14,7 +14,7 @@ use saga::{
     SagaMsg, SagaOrigin, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, encode_msg,
     encode_query,
 };
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use valset::{ValsetReply, encode_reply as valset_encode_reply};
 
 /// a minimal `Ctx`: drives `execute` with a controllable env, resolves a
@@ -54,7 +54,6 @@ impl Ctx for TestCtx {
     }
     fn emit_msg(&mut self, _m: Msg) {}
     fn emit_event(&mut self, _e: Event) {}
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 fn exec(m: &mut SagaModule, height: u64, origin: Origin, op: &SagaMsg) {

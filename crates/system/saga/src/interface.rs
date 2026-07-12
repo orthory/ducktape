@@ -212,7 +212,7 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: u64,
 }
 
-/// the payload of the [`sdk::Effect`] a trigger (or retry) emits: the
+/// the payload of the [`sdk::Event`] a trigger (or retry) emits: the
 /// host-owned worker's work order. `(saga_id, attempt)` is the idempotency key
 /// the worker echoes back in its `OracleResult`; `assignee` is the lease
 /// holder that should execute (advisory under the open policy, enforced under

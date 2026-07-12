@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sdk::{
-    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
     StateSyncHandle,
 };
 use sha2::{Digest, Sha256};
@@ -218,10 +218,9 @@ pub struct DispatchRecord {
 pub struct BlockOutcome {
     /// the app-hash over the registry after the drain settled.
     pub app_hash: StateRoot,
-    /// observability events emitted during the block, in dispatch order.
+    /// events emitted during the block, in dispatch order — observability, and
+    /// the lane the host-owned worker seam claims off-consensus work from.
     pub events: Vec<Event>,
-    /// effect intents emitted during the block — stub sink this slice.
-    pub effects: Vec<Effect>,
     /// the deterministic dispatch trace: one entry per module dispatched this
     /// block, in drain order. the "what happened" spine the node layer tags with
     /// node-local timing for its metrics.
@@ -242,11 +241,9 @@ pub struct BatchOutcome {
     pub app_hash: StateRoot,
     /// one outcome per input op, in input order.
     pub members: Vec<MemberOutcome>,
-    /// aggregate observability events, in drain order: every applied member's
-    /// trace in input order, then the once-per-block injections.
+    /// aggregate events, in drain order: every applied member's trace in input
+    /// order, then the once-per-block injections.
     pub events: Vec<Event>,
-    /// aggregate effect intents, in the same order.
-    pub effects: Vec<Effect>,
     /// the dispatch trace from the once-per-block System injections
     /// (`pending_advance` / `pending_modreg_advance` / `pending_deliveries`),
     /// drained once after the members.
@@ -923,7 +920,7 @@ impl Host {
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
 
         match self.drain(ctx, msg, &mut touched).await {
-            Ok((events, effects, dispatches)) => {
+            Ok((events, dispatches)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
                 // app-hash AFTER. a commit failure is FATAL, not a rejection: the
@@ -943,7 +940,6 @@ impl Host {
                 Ok(BlockOutcome {
                     app_hash: self.app_hash(),
                     events,
-                    effects,
                     dispatches,
                 })
             }
@@ -1058,13 +1054,12 @@ impl Host {
         // accepted members and their authoritative traces, parallel arrays in
         // input order; `acc_pos[k]` is the input index of accepted member `k`.
         let mut accepted: Vec<(Origin, Msg)> = Vec::new();
-        let mut acc_traces: Vec<(Vec<Event>, Vec<Effect>, Vec<DispatchRecord>)> = Vec::new();
+        let mut acc_traces: Vec<(Vec<Event>, Vec<DispatchRecord>)> = Vec::new();
         let mut acc_pos: Vec<usize> = Vec::new();
         let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
 
         for (i, (origin, msg)) in ops.into_iter().enumerate() {
             let mut ev: Vec<Event> = Vec::new();
-            let mut ef: Vec<Effect> = Vec::new();
             let mut di: Vec<DispatchRecord> = Vec::new();
             let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
             match self
@@ -1075,14 +1070,13 @@ impl Host {
                     queue,
                     &mut touched,
                     &mut ev,
-                    &mut ef,
                     &mut di,
                 )
                 .await
             {
                 Ok(()) => {
                     accepted.push((origin, msg));
-                    acc_traces.push((ev, ef, di));
+                    acc_traces.push((ev, di));
                     acc_pos.push(i);
                     // authoritative trace is written after the loop (step 3);
                     // this placeholder is overwritten there.
@@ -1098,7 +1092,6 @@ impl Host {
                     self.abort_all(&mut touched).await?;
                     for (k, (o, m)) in accepted.iter().enumerate() {
                         let mut rev: Vec<Event> = Vec::new();
-                        let mut ref_: Vec<Effect> = Vec::new();
                         let mut rdi: Vec<DispatchRecord> = Vec::new();
                         let rq: VecDeque<(Origin, Msg)> = VecDeque::from([(o.clone(), m.clone())]);
                         // an accepted member drained Ok in this same context
@@ -1110,7 +1103,6 @@ impl Host {
                             rq,
                             &mut touched,
                             &mut rev,
-                            &mut ref_,
                             &mut rdi,
                         )
                         .await
@@ -1124,7 +1116,7 @@ impl Host {
                                 )),
                             })
                         })?;
-                        acc_traces[k] = (rev, ref_, rdi);
+                        acc_traces[k] = (rev, rdi);
                     }
                     results[i] = Some(MemberOutcome::Rejected {
                         reason: reason.to_string(),
@@ -1134,13 +1126,11 @@ impl Host {
         }
 
         // 3. write each accepted member's authoritative trace and accumulate the
-        // aggregate events/effects in input order (accepted / acc_traces / acc_pos
-        // are all in input order).
+        // aggregate events in input order (accepted / acc_traces / acc_pos are
+        // all in input order).
         let mut events: Vec<Event> = Vec::new();
-        let mut effects: Vec<Effect> = Vec::new();
-        for ((ev, ef, di), pos) in acc_traces.into_iter().zip(acc_pos.iter()) {
+        for ((ev, di), pos) in acc_traces.into_iter().zip(acc_pos.iter()) {
             events.extend(ev);
-            effects.extend(ef);
             results[*pos] = Some(MemberOutcome::Applied { dispatches: di });
         }
 
@@ -1150,7 +1140,6 @@ impl Host {
         // abort fault, else the deterministic rejection.
         let mut system_dispatches: Vec<DispatchRecord> = Vec::new();
         let mut sys_events: Vec<Event> = Vec::new();
-        let mut sys_effects: Vec<Effect> = Vec::new();
         if let Err(reason) = self
             .drain_queue(
                 height,
@@ -1159,7 +1148,6 @@ impl Host {
                 injections,
                 &mut touched,
                 &mut sys_events,
-                &mut sys_effects,
                 &mut system_dispatches,
             )
             .await
@@ -1168,7 +1156,6 @@ impl Host {
             return Err(SubmitError::Rejected(reason));
         }
         events.extend(sys_events);
-        effects.extend(sys_effects);
 
         // 5. COMMIT once — the single boundary for the whole batch. the live path
         // commits every touched module; recovery partitions on `commit_only`
@@ -1217,7 +1204,6 @@ impl Host {
             app_hash: self.app_hash(),
             members: results.into_iter().map(Option::unwrap).collect(),
             events,
-            effects,
             system_dispatches,
         })
     }
@@ -1257,7 +1243,7 @@ impl Host {
         ctx: BlockContext,
         msg: Msg,
         touched: &mut BTreeSet<ModuleId>,
-    ) -> Result<(Vec<Event>, Vec<Effect>, Vec<DispatchRecord>), Error> {
+    ) -> Result<(Vec<Event>, Vec<DispatchRecord>), Error> {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
@@ -1306,7 +1292,6 @@ impl Host {
         // drain into fresh trace vecs. the extracted queue-runner is what
         // submit_block reuses — once per member, then once for the injections.
         let mut events: Vec<Event> = Vec::new();
-        let mut effects: Vec<Effect> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();
         self.drain_queue(
             height,
@@ -1315,11 +1300,10 @@ impl Host {
             queue,
             touched,
             &mut events,
-            &mut effects,
             &mut dispatches,
         )
         .await?;
-        Ok((events, effects, dispatches))
+        Ok((events, dispatches))
     }
 
     /// the extracted dispatch-loop queue-runner: pop `(origin, msg)` FIFO, run
@@ -1328,10 +1312,10 @@ impl Host {
     /// ops until the queue empties or [`MAX_DISPATCHES`] is hit. modules only
     /// STAGE; the caller owns the commit/abort boundary. staged writes and
     /// `touched` accumulate across calls, so `submit_block` can drain members one
-    /// at a time on top of one another. `events` / `effects` / `dispatches` are
-    /// appended to (never cleared), so a caller can thread one set of sinks across
-    /// several calls or hand in fresh ones per call. the dispatch budget is
-    /// per-call: each queue-run gets a fresh [`MAX_DISPATCHES`].
+    /// at a time on top of one another. `events` / `dispatches` are appended to
+    /// (never cleared), so a caller can thread one set of sinks across several
+    /// calls or hand in fresh ones per call. the dispatch budget is per-call:
+    /// each queue-run gets a fresh [`MAX_DISPATCHES`].
     #[allow(clippy::too_many_arguments)]
     async fn drain_queue(
         &mut self,
@@ -1341,7 +1325,6 @@ impl Host {
         mut queue: VecDeque<(Origin, Msg)>,
         touched: &mut BTreeSet<ModuleId>,
         events: &mut Vec<Event>,
-        effects: &mut Vec<Effect>,
         dispatches: &mut Vec<DispatchRecord>,
     ) -> Result<(), Error> {
         let mut n: u32 = 0;
@@ -1384,7 +1367,6 @@ impl Host {
                 registry: &self.registry, // the rest — for query routing
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
-                out_effects: Vec::new(),
             };
 
             // owned `me` (&mut) and `ctx` (holding &rest) are disjoint borrows,
@@ -1395,7 +1377,6 @@ impl Host {
             let HostCtx {
                 out_msgs,
                 out_events,
-                out_effects,
                 ..
             } = ctx;
 
@@ -1416,12 +1397,11 @@ impl Host {
             });
 
             // local-only re-entry: emitted msgs become follow-up ops, never
-            // re-broadcast. events/effects leave the state machine.
+            // re-broadcast. events leave the state machine.
             for m in out_msgs {
                 queue.push_back((Origin::Module(msg.target.clone()), m));
             }
             events.extend(out_events);
-            effects.extend(out_effects);
         }
 
         Ok(())
@@ -1437,7 +1417,6 @@ struct HostCtx<'a> {
     registry: &'a BTreeMap<ModuleId, Box<dyn Module>>,
     out_msgs: Vec<Msg>,
     out_events: Vec<Event>,
-    out_effects: Vec<Effect>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1481,10 +1460,6 @@ impl Ctx for HostCtx<'_> {
 
     fn emit_event(&mut self, ev: Event) {
         self.out_events.push(ev);
-    }
-
-    fn request_effect(&mut self, eff: Effect) {
-        self.out_effects.push(eff);
     }
 }
 
@@ -1540,8 +1515,6 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
     fn emit_msg(&mut self, _msg: Msg) {}
 
     fn emit_event(&mut self, _ev: Event) {}
-
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 #[cfg(test)]

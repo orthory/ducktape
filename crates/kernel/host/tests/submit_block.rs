@@ -192,7 +192,6 @@ fn submit_block_empty_is_empty_block() {
 
         assert!(out.members.is_empty(), "no ops -> no members");
         assert!(out.events.is_empty());
-        assert!(out.effects.is_empty());
         assert!(
             out.system_dispatches.is_empty(),
             "no upgrade/dispatch modules -> nothing injected"

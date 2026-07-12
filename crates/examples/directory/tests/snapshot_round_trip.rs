@@ -40,7 +40,6 @@ impl Ctx for TestCtx {
     }
     fn emit_msg(&mut self, _m: Msg) {}
     fn emit_event(&mut self, _e: Event) {}
-    fn request_effect(&mut self, _e: sdk::Effect) {}
 }
 
 fn set(key: &str, value: &str) -> Msg {

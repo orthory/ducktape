@@ -172,9 +172,9 @@ struct EchoWorker;
 impl host::worker::Worker for EchoWorker {
     async fn run(
         &self,
-        effect: &sdk::Effect,
+        event: &sdk::Event,
     ) -> Result<host::worker::WorkOutcome, host::worker::Error> {
-        let request = match saga::decode_worker_request(&effect.0) {
+        let request = match saga::decode_worker_request(&event.payload) {
             Ok(request) => request,
             Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
         };

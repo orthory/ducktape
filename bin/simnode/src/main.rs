@@ -84,7 +84,7 @@ use noded::{
 use pages::Pages;
 use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
 
@@ -707,7 +707,7 @@ impl Sim {
         self.stream_hub
             .publish_block(block.height, block.app_hash.clone());
 
-        offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
+        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
         Ok(Committed {
             block,
             op_hash,
@@ -787,10 +787,10 @@ fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
-    effects: Vec<Effect>,
+    events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
-    for eff in effects {
+    for eff in events {
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
@@ -807,10 +807,12 @@ async fn offer_effects(
                 }
             }
         }
-        if !claimed {
+        // an unclaimed event is normally plain observability; one that
+        // DECODES as a worker request means a saga is stuck Pending.
+        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
             println!(
-                "[simnode] effect with no worker ({} bytes) — dropped",
-                eff.0.len()
+                "[simnode] WorkerRequest with no worker ({} bytes) — dropped",
+                eff.payload.len()
             );
         }
     }
@@ -822,8 +824,8 @@ struct EchoWorker;
 
 #[async_trait::async_trait(?Send)]
 impl host::worker::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<host::worker::WorkOutcome, host::worker::Error> {
-        let request = match saga::decode_worker_request(&effect.0) {
+    async fn run(&self, event: &Event) -> Result<host::worker::WorkOutcome, host::worker::Error> {
+        let request = match saga::decode_worker_request(&event.payload) {
             Ok(request) => request,
             Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
         };

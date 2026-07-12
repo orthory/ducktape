@@ -1,7 +1,7 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use sdk::{
-    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
+    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
 };
 use tasks::Tasks;
 use tasks::{
@@ -90,7 +90,6 @@ impl Ctx for TestCtx {
 
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 #[test]

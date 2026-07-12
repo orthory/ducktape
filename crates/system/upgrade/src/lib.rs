@@ -523,7 +523,6 @@ mod tests {
         }
         fn emit_msg(&mut self, _m: Msg) {}
         fn emit_event(&mut self, _e: sdk::Event) {}
-        fn request_effect(&mut self, _e: sdk::Effect) {}
     }
 
     // a deterministic, VALID 32-byte ed25519 public key (like valset's tests).

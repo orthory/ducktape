@@ -5,7 +5,7 @@
 //! The fixture is a GENERATED artifact (built from `crates/examples/hello-wasm`
 //! by the module build target); it is committed so this proof is self-contained.
 
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
 const HELLO: &[u8] = include_bytes!("fixtures/hello.component.wasm");
@@ -49,7 +49,6 @@ impl Ctx for MockCtx {
     fn emit_event(&mut self, ev: Event) {
         self.events.push(ev);
     }
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 async fn inc(m: &mut WasmModule, ctx: &mut MockCtx) {

@@ -14,7 +14,7 @@ use agent::{
 };
 use futures::executor::block_on;
 use saga::SagaOrigin;
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 
 /// a minimal `Ctx`: drives `execute` with a controllable env; the registry
 /// queries nothing.
@@ -47,7 +47,6 @@ impl Ctx for TestCtx {
     }
     fn emit_msg(&mut self, _m: Msg) {}
     fn emit_event(&mut self, _e: Event) {}
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 fn module() -> AgentModule {

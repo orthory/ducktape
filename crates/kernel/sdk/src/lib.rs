@@ -15,9 +15,10 @@
 //! this crate also carries the deterministic *system api*: the [`Ctx`] a module
 //! touches during state-machine application (own-state r/w lives in `self`;
 //! read-only cross-module [`Ctx::query`]/[`Ctx::module_root`]; the deterministic
-//! [`Env`]; and intent emission via [`Ctx::emit_msg`]/[`Ctx::emit_event`]/
-//! [`Ctx::request_effect`]). the effectful node surface (real network/IO) is a
-//! separate layer and out of scope here.
+//! [`Env`]; and intent emission via [`Ctx::emit_msg`]/[`Ctx::emit_event`] — an
+//! event is ALSO the lane a host-side worker claims off-consensus work from).
+//! the effectful node surface (real network/IO) is a separate layer and out of
+//! scope here.
 //!
 //! keep this crate types + traits with no domain deps (async-trait is the one
 //! greenlit exception): everything here is a shared surface for every module.
@@ -186,19 +187,17 @@ pub struct Msg {
     pub payload: Vec<u8>,
 }
 
-/// an observability record a module emits via [`Ctx::emit_event`]. it LEAVES the
-/// state machine (handed to the effectful node layer) and never re-enters as a
-/// follow-up.
+/// a record a module emits via [`Ctx::emit_event`]. it LEAVES the state machine
+/// (handed to the effectful node layer) and never re-enters as a follow-up. one
+/// lane, two consumer classes: observability readers, and the host-owned worker
+/// seam, which try-decodes each event and claims the ones that request
+/// off-consensus work (a worker's result returns as an ORDINARY submitted op —
+/// the oracle-as-op pattern).
 #[derive(Clone, Debug)]
 pub struct Event {
     pub source: ModuleId,
     pub payload: Vec<u8>,
 }
-
-/// a request for an effectful, non-deterministic side effect (data channel,
-/// tunnel, transport upgrade). STUB this slice: the host only collects it.
-#[derive(Clone, Debug)]
-pub struct Effect(pub Vec<u8>);
 
 /// who triggered the current dispatch. varies across follow-ups: the root op is
 /// `External`/`System`; an emitted follow-up is `Module(emitter_id)`.
@@ -344,11 +343,9 @@ pub trait Ctx {
     /// executed reentrantly.
     fn emit_msg(&mut self, msg: Msg);
 
-    /// emit an observability event — leaves the state machine.
+    /// emit an event — leaves the state machine (observability, and the lane
+    /// the host-side worker seam claims off-consensus work from).
     fn emit_event(&mut self, ev: Event);
-
-    /// request an effectful side effect — STUB this slice (collected only).
-    fn request_effect(&mut self, eff: Effect);
 }
 
 /// the host-facing surface of a feature module: identity, authenticated root, the

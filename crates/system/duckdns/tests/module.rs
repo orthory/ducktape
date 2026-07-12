@@ -6,7 +6,7 @@ use duckdns::{
 };
 use futures::executor::block_on;
 use identity::{AccountView, IdentityQuery, IdentityReply, decode_query as identity_decode_query};
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use valset::{ValsetQuery, ValsetReply, decode_query as valset_decode_query};
 
 fn node(byte: u8) -> Vec<u8> {
@@ -91,7 +91,6 @@ impl Ctx for TestCtx {
 
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 fn execute(module: &mut DuckDns, ctx: &mut TestCtx, message: DuckDnsMsg) -> Result<(), Error> {

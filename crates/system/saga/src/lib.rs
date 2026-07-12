@@ -80,7 +80,7 @@ use capability::{
     encode_query as capability_encode_query,
 };
 use sdk::codec;
-use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -568,13 +568,18 @@ impl SagaModule {
         saga.assignee = assignee;
         saga.lease_expires_at =
             bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
-        ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
-            saga_id: saga_id.clone(),
-            attempt: saga.attempt,
-            spec: saga.spec.clone(),
-            deadline: saga.deadline,
-            assignee: saga.assignee.clone(),
-        })));
+        // the work order leaves as an EVENT — the host-side worker seam
+        // try-decodes and claims it; unclaimed events are plain observability.
+        ctx.emit_event(Event {
+            source: self.id.clone(),
+            payload: encode_worker_request(&WorkerRequest {
+                saga_id: saga_id.clone(),
+                attempt: saga.attempt,
+                spec: saga.spec.clone(),
+                deadline: saga.deadline,
+                assignee: saga.assignee.clone(),
+            }),
+        });
         self.stage(saga_id, saga);
     }
 
@@ -935,13 +940,16 @@ impl Module for SagaModule {
                 saga.updated_at = ctx.env().consensus_time;
                 // the actual work order: the announcement's request, re-emitted
                 // naming the winner — every other node's worker skips it.
-                ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
-                    saga_id: saga_id.clone(),
-                    attempt: saga.attempt,
-                    spec: saga.spec.clone(),
-                    deadline: saga.deadline,
-                    assignee: saga.assignee.clone(),
-                })));
+                ctx.emit_event(Event {
+                    source: self.id.clone(),
+                    payload: encode_worker_request(&WorkerRequest {
+                        saga_id: saga_id.clone(),
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: saga.assignee.clone(),
+                    }),
+                });
                 self.stage(saga_id, saga);
             }
             SagaMsg::Crank {} => {
@@ -1113,7 +1121,7 @@ mod tests {
         /// canned capability providers served for a "capability" query.
         providers: Option<Vec<Vec<u8>>>,
         msgs: Vec<Msg>,
-        effects: Vec<Effect>,
+        events: Vec<Event>,
     }
     impl CaptureCtx {
         fn new() -> Self {
@@ -1129,7 +1137,7 @@ mod tests {
                 validators: None,
                 providers: None,
                 msgs: Vec::new(),
-                effects: Vec::new(),
+                events: Vec::new(),
             }
         }
         fn at(mut self, height: u64) -> Self {
@@ -1160,9 +1168,9 @@ mod tests {
                 .collect()
         }
         fn worker_requests(&self) -> Vec<WorkerRequest> {
-            self.effects
+            self.events
                 .iter()
-                .map(|e| decode_worker_request(&e.0).expect("worker request payload"))
+                .map(|e| decode_worker_request(&e.payload).expect("worker request payload"))
                 .collect()
         }
     }
@@ -1194,9 +1202,8 @@ mod tests {
         fn emit_msg(&mut self, msg: Msg) {
             self.msgs.push(msg);
         }
-        fn emit_event(&mut self, _ev: Event) {}
-        fn request_effect(&mut self, eff: Effect) {
-            self.effects.push(eff);
+        fn emit_event(&mut self, ev: Event) {
+            self.events.push(ev);
         }
     }
 
@@ -1326,7 +1333,7 @@ mod tests {
         // a STAGED duplicate in the same block: no reset, no second effect.
         exec(&mut m, &mut ctx, &trigger("s1", b"second")).unwrap();
         assert_eq!(
-            ctx.effects.len(),
+            ctx.events.len(),
             1,
             "a staged duplicate re-fires no worker"
         );
@@ -1338,7 +1345,7 @@ mod tests {
         let mut ctx2 = CaptureCtx::new().at(7);
         exec(&mut m, &mut ctx2, &trigger("s1", b"third")).unwrap();
         assert!(
-            ctx2.effects.is_empty(),
+            ctx2.events.is_empty(),
             "a committed duplicate re-fires no worker"
         );
         commit(&mut m);
@@ -1375,7 +1382,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
-        assert!(ctx.effects.is_empty(), "a rejected trigger fires no worker");
+        assert!(ctx.events.is_empty(), "a rejected trigger fires no worker");
         assert_eq!(get(&m, "s1"), None);
     }
 
@@ -1588,7 +1595,7 @@ mod tests {
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some("boom".to_string()));
         assert!(
-            ctx.effects.is_empty(),
+            ctx.events.is_empty(),
             "no attempts remain -> no retry effect"
         );
         assert_eq!(
@@ -1693,7 +1700,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Module(_)), "oversized spec errs");
         assert!(
-            ctx.effects.is_empty(),
+            ctx.events.is_empty(),
             "no WorkerRequest for a rejected trigger"
         );
 
@@ -1819,7 +1826,7 @@ mod tests {
             before,
             "an unexpired crank leaves the root byte-identical"
         );
-        assert!(ctx.msgs.is_empty() && ctx.effects.is_empty());
+        assert!(ctx.msgs.is_empty() && ctx.events.is_empty());
 
         // at the deadline: TimedOut, callback fired, no retry despite the
         // spare attempts and the (also expired) lease.
@@ -1833,7 +1840,7 @@ mod tests {
             "deadline dominates the lease"
         );
         assert_eq!(v.attempt, 0, "a timeout consumes no attempt");
-        assert!(ctx.effects.is_empty(), "no retry past the deadline");
+        assert!(ctx.events.is_empty(), "no retry past the deadline");
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
@@ -1891,7 +1898,7 @@ mod tests {
         let v = get(&m, "s1").unwrap();
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some("lease attempts exhausted".to_string()));
-        assert!(ctx.effects.is_empty());
+        assert!(ctx.events.is_empty());
     }
 
     #[test]
@@ -2193,7 +2200,7 @@ mod tests {
         // a pruned id may be re-triggered: GC really removed it.
         let mut ctx = CaptureCtx::new();
         exec(&mut m, &mut ctx, &trigger("done", b"again")).unwrap();
-        assert_eq!(ctx.effects.len(), 1, "a pruned id triggers as new work");
+        assert_eq!(ctx.events.len(), 1, "a pruned id triggers as new work");
     }
 
     #[test]
@@ -2642,7 +2649,7 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
         }
-        assert!(ctx.effects.is_empty(), "rejected triggers fire no worker");
+        assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
         assert_eq!(get(&m, "s1"), None, "nothing was staged");
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use sdk::{Ctx, Effect, Env, Error, Event, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
 #[derive(Debug)]
@@ -48,7 +48,6 @@ impl Ctx for TestCtx {
         self.emitted.push_back(msg);
     }
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 pub fn open_files(dir: &tempfile::TempDir) -> files::Files {

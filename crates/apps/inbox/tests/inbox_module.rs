@@ -6,7 +6,7 @@ use inbox::{
     MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
 };
 use sdk::{
-    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
+    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
 };
 
 const INBOX: &str = "inbox";
@@ -132,7 +132,6 @@ impl Ctx for TestCtx {
 
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 #[test]

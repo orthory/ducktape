@@ -914,7 +914,7 @@ mod tests {
         encode_query,
     };
     use futures::executor::block_on;
-    use sdk::{Effect, Env};
+    use sdk::Env;
 
     /// a minimal `Ctx` that captures emitted msgs/effects/events — enough to
     /// unit-test `execute` in isolation (the host provides the real routing
@@ -923,7 +923,6 @@ mod tests {
         env: Env,
         msgs: Vec<Msg>,
         #[allow(dead_code)]
-        effects: Vec<Effect>,
         events: Vec<Event>,
     }
     impl CaptureCtx {
@@ -937,7 +936,6 @@ mod tests {
                     me: "agent".into(),
                 },
                 msgs: Vec::new(),
-                effects: Vec::new(),
                 events: Vec::new(),
             }
         }
@@ -976,9 +974,7 @@ mod tests {
         fn emit_event(&mut self, ev: Event) {
             self.events.push(ev);
         }
-        fn request_effect(&mut self, eff: Effect) {
-            self.effects.push(eff);
-        }
+
     }
 
     // ---- fixtures -----------------------------------------------------------

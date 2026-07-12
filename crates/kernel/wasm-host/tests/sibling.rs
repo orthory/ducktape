@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use wasm_host::{MAX_SIBLING_READS, WasmModule};
 
 const SIBLING: &[u8] = include_bytes!("fixtures/sibling.component.wasm");
@@ -64,7 +64,6 @@ impl Ctx for MockCtx {
     fn emit_event(&mut self, ev: Event) {
         self.events.push(ev);
     }
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 fn module() -> WasmModule {

@@ -47,7 +47,8 @@ use inbox::{
 use jobs::Jobs;
 use saga::SagaModule;
 use saga::{
-    SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
+    SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
+    encode_query as saga_encode_query,
 };
 use sdk::{Msg, Origin};
 use tasks::Tasks;
@@ -474,8 +475,11 @@ fn main() {
             "\n[block 7] agent <- Register; runs <- EnableJobWorker(true); runs <- Watch(Mention); chat <- PostMessage(@quackbot)"
         );
         println!(
-            "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
-            out.effects.len()
+            "  work orders    : {} WorkerRequest (the off-consensus LLM seam)",
+            out.events
+                .iter()
+                .filter(|e| decode_worker_request(&e.payload).is_ok())
+                .count()
         );
         let run_id = run_id_for("general", 3, "quackbot");
         let reply = host
