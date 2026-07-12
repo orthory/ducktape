@@ -40,10 +40,10 @@ fn check_password_len(password: &str) -> Result<(), String> {
 /// A string whose allocation is overwritten before release. Deliberately does
 /// not implement `Debug` or `Display`, so the actor/command layer cannot log a
 /// password or recovery phrase by accident.
-struct SecretString(String);
+pub(crate) struct SecretString(String);
 
 impl SecretString {
-    fn new(value: String) -> Self {
+    pub(crate) fn new(value: String) -> Self {
         Self(value)
     }
 }
@@ -352,8 +352,14 @@ pub async fn user_identity_unlock(
         .await
 }
 
-fn user_identity_unlock_blocking(
-    app: crate::rt::AppHandle,
+/// unlock the vault with an already-materialized secret and cache it on
+/// success — the shared body of the password `user_identity_unlock` command
+/// AND the Touch ID `touchid_unlock` path (which sources the same passphrase
+/// from the biometric Keychain item instead of the UI). Behavior-preserving
+/// extraction: `user-key unlock` is pure verification, so a wrong secret errors
+/// and the cache is left untouched.
+pub(crate) fn unlock_with_secret(
+    app: &crate::rt::AppHandle,
     password: SecretString,
 ) -> Result<IdentityPubkey, String> {
     let out = run_verb_with_stdin(
@@ -361,13 +367,20 @@ fn user_identity_unlock_blocking(
             "user-key",
             "unlock",
             "--key",
-            &user_key_path(&app)?.to_string_lossy(),
+            &user_key_path(app)?.to_string_lossy(),
         ],
         &[&password],
     )?;
     let pubkey = last_line(&out);
     cache_store(&password);
     Ok(IdentityPubkey { pubkey })
+}
+
+fn user_identity_unlock_blocking(
+    app: crate::rt::AppHandle,
+    password: SecretString,
+) -> Result<IdentityPubkey, String> {
+    unlock_with_secret(&app, password)
 }
 
 /// reveal the 24-word mnemonic. ALWAYS uses the password the caller just
