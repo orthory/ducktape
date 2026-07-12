@@ -72,6 +72,9 @@ pub enum Service {
     /// Gateway reverse-proxy requests. The overlay authenticates both
     /// nodes; signed routes bind account authority, target, and access policy.
     Gateway = 6,
+    /// Live agent run output between member nodes. Observability only: final
+    /// run state and usage remain consensus facts.
+    AgentTelemetry = 7,
 }
 
 impl Service {
@@ -87,6 +90,7 @@ impl Service {
             Service::Voice => 45802,
             Service::Video => 45803,
             Service::Gateway => 45806,
+            Service::AgentTelemetry => 45807,
         }
     }
 
@@ -98,6 +102,7 @@ impl Service {
             Service::Voice => 45902,
             Service::Video => 45903,
             Service::Gateway => 45906,
+            Service::AgentTelemetry => 45907,
         }
     }
 }
@@ -111,6 +116,7 @@ impl TryFrom<u8> for Service {
             2 => Ok(Service::Voice),
             3 => Ok(Service::Video),
             6 => Ok(Service::Gateway),
+            7 => Ok(Service::AgentTelemetry),
             other => Err(other),
         }
     }

@@ -54,13 +54,13 @@ export interface ProviderGroup {
   /** The provider key — the tag text before the first `_`, or the whole tag
    *  when it has none. `claude`, `claude_opus_high`, and `claude_fable_low` all
    *  collapse to `claude`; `codex`, `codex_gpt-5.5_high`, and
-   *  `codex_gpt-5.3-codex-spark_xhigh` all collapse to `codex`. */
+   *  `codex_gpt-5.6-sol_xhigh` all collapse to `codex`. */
   provider: string;
   /** Title-cased provider name for display ("claude" → "Claude"). */
   label: string;
   /** Distinct models under the provider, in first-seen order, with the effort
    *  suffix dropped: `claude_opus_high` → `opus`, `codex_gpt-5.5_low` →
-   *  `gpt-5.5`, `codex_gpt-5.3-codex-spark_xhigh` → `gpt-5.3-codex-spark`.
+   *  `gpt-5.5`, `codex_gpt-5.6-sol_xhigh` → `gpt-5.6-sol`.
    *  Empty when the node announced only the provider's bare default tag. This
    *  is what a member/peer surface shows — a node runs "Claude: opus, sonnet",
    *  not every effort permutation. */

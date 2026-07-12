@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "permission-prompt",
+  "description": "The native permission consent window. It holds ONLY the two commands that read and answer the pending request — never the console's application surface — because it renders on behalf of content that is asking for a device.",
+  "windows": [
+    "permission-prompt"
+  ],
+  "permissions": [
+    "core:default",
+    "permission-prompt"
+  ]
+}

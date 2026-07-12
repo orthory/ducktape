@@ -41,7 +41,7 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
     assert_eq!(*recipe_id, recipe_id_for("duck"));
     let envelope: serde_json::Value =
         serde_json::from_slice(payload).expect("the payload is a JSON envelope");
-    assert_eq!(envelope["ducktape_run"], RUN_ENVELOPE_VERSION);
+    assert_eq!(envelope["ducktape_run"], crate::envelope::RUN_ENVELOPE_VERSION);
     assert_eq!(envelope["agent_id"], "duck", "the claiming agent");
     assert_eq!(
         envelope["prompt_hash"],
@@ -157,6 +157,13 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
             title: "complete job".into(),
         }],
     );
+    let inner = response_json(
+        &[],
+        vec![AgentAction::CreateTask {
+            task_id: "job-task".into(),
+            title: "complete job".into(),
+        }],
+    );
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -195,7 +202,7 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
         "no data facet on a message-only result"
     );
     assert!(v.get("output_ref").is_none(), "no artifact facet");
-    let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let expected: serde_json::Value = serde_json::from_slice(&inner).unwrap();
     assert_eq!(
         v["response"], expected,
         "response is the normalized AgentResponse"

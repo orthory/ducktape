@@ -53,6 +53,7 @@ describe("GatewayView route editor", () => {
             max_request_bytes: 0,
             max_response_bytes: 4096,
             allow_authorization: false,
+            allow_upgrade: false,
           },
         },
       },

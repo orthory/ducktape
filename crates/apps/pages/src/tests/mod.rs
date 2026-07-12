@@ -1,7 +1,7 @@
 use super::*;
 use crate::{NewBlock, decode_reply, encode_msg, encode_query};
 use commonware_runtime::{Runner as _, deterministic};
-use state::global_root;
+use host::global_root;
 
 fn nb(id: &str, kind: BlockKind, text: &str) -> NewBlock {
     NewBlock {
@@ -25,6 +25,7 @@ fn msg(m: &PageMsg) -> Msg {
 // a minimal Ctx so execute can be driven without a full host.
 struct TestCtx {
     env: sdk::Env,
+    msgs: Vec<Msg>,
 }
 impl TestCtx {
     fn new() -> Self {
@@ -36,6 +37,7 @@ impl TestCtx {
                 origin: sdk::Origin::System,
                 me: "pages".into(),
             },
+            msgs: Vec::new(),
         }
     }
 }
@@ -50,7 +52,9 @@ impl Ctx for TestCtx {
     async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
     }
-    fn emit_msg(&mut self, _m: Msg) {}
+    fn emit_msg(&mut self, m: Msg) {
+        self.msgs.push(m);
+    }
     fn emit_event(&mut self, _e: sdk::Event) {}
     fn request_effect(&mut self, _e: sdk::Effect) {}
 }
@@ -126,6 +130,7 @@ fn ctx_as(origin: sdk::Origin) -> TestCtx {
             origin,
             me: "pages".into(),
         },
+        msgs: Vec::new(),
     }
 }
 async fn apply_commit_as<E: Context + BufferPooler>(
@@ -174,6 +179,18 @@ async fn query_thread<E: Context + BufferPooler>(
     match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
         PageReply::CommentThread(v) => v,
         _ => panic!("expected CommentThread"),
+    }
+}
+async fn query_comment<E: Context + BufferPooler>(
+    p: &Pages<E>,
+    comment_id: &str,
+) -> Option<Comment> {
+    let q = PageQuery::GetComment {
+        comment_id: comment_id.into(),
+    };
+    match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
+        PageReply::Comment(c) => c,
+        _ => panic!("expected Comment"),
     }
 }
 

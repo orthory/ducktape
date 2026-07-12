@@ -24,8 +24,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use nat_traversal::{
-    Coordinator, NatClient, NodeKey, PunchError, SimNat, drive_rebind_reconnect, drive_simulated,
-    run_coordinator,
+    ClientEvent, Coordinator, NatClient, NodeKey, PunchError, SimNat, SocketEvent,
+    drive_rebind_reconnect, drive_simulated, run_coordinator,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -162,7 +162,19 @@ async fn punched_path_survives_coordinator_death() {
     let mut got = None;
     for _ in 0..50 {
         a.send_punch_to(b_addr).await.unwrap();
-        if let Ok(r) = timeout(Duration::from_millis(100), b.recv_punch_from(a_addr)).await {
+        // Dispatch socket events and accept a Punch only from A's
+        // rendezvous-resolved address (the consumer-side source check).
+        let recv = async {
+            loop {
+                if let SocketEvent::Rendezvous(ClientEvent::Punch { from, src }) =
+                    b.recv_socket_event().await?
+                    && src == a_addr
+                {
+                    return Ok::<_, std::io::Error>(nat_traversal::Msg::Punch { from });
+                }
+            }
+        };
+        if let Ok(r) = timeout(Duration::from_millis(100), recv).await {
             got = Some(r.expect("recv"));
             break;
         }

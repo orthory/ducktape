@@ -1,0 +1,30 @@
+[package]
+name = "labs"
+edition.workspace = true
+version.workspace = true
+
+# Consensus modules that are NOT in any shipping network's genesis set. Nothing
+# in this repo registers them (see src/lib.rs for why that matters), and their
+# heavy dependencies -- revm, alloy, k256 -- are quarantined here so the
+# shipping node never builds them.
+[dependencies]
+sdk = { workspace = true }
+kv = { workspace = true }
+valset = { workspace = true }
+indexer = { workspace = true }
+revm = { workspace = true }
+alloy-primitives = { workspace = true, features = ["k256"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+zeroize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-storage = { workspace = true }
+
+[dev-dependencies]
+host = { workspace = true }
+tempfile = { workspace = true }
+futures = "0.3"
+hex = "0.4"

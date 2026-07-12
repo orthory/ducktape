@@ -124,6 +124,8 @@ impl Inodes {
         };
         let old_key = (node.parent, node.name.clone());
         // drop a clobbered destination entry (overwrite rename) from the name map.
+        // the clobbered node's `nodes` entry is deliberately left behind (a stale
+        // ino the kernel may still hold); it leaks one map slot until unmount.
         if let Some(&clobbered) = self.by_name.get(&(new_parent, new_name.to_string()))
             && clobbered != ino
         {

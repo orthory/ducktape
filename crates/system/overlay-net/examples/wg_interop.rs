@@ -40,7 +40,7 @@ use data_plane::{OsSocketFactory, SocketFactory};
 use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
 use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wireguard_effect::{DefguardWireGuardEffect, WireGuardEffect};
+use wireguard::effect::{DefguardWireGuardEffect, WireGuardEffect};
 
 const TCP_ECHO_PORT: u16 = 7000;
 const UDP_ECHO_PORT: u16 = 7002;
@@ -149,7 +149,7 @@ fn interface_config(args: &ServeArgs) -> InterfaceConfiguration {
         // `None` leaves the TUN at 1500, and every full-size inner packet
         // then rides a FRAGMENTED outer UDP datagram (and overruns the
         // userspace stack's 1420 device MTU on mixed pairs).
-        mtu: Some(wireguard_effect::TUNNEL_MTU),
+        mtu: Some(wireguard::effect::TUNNEL_MTU),
         fwmark: None,
     }
 }

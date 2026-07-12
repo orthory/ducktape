@@ -1,13 +1,22 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import { color } from "../../theme/tokens";
 import type { Channel } from "../../../domain/chat-client";
 import type { Workspace } from "../../../domain/workspace-client";
+import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
+import { makeTransportStub } from "../../../test/transport-stub";
 import { AgentView, runIsMine } from "./AgentView";
+import {
+  FILLED_IDENTITY_TEXT_PERCENT,
+  FILLED_SEMANTIC_TEXT_PERCENT,
+  filledForeground,
+  filledMix,
+} from "./parts";
 import type { PendingRun } from "../../../domain/runs-client";
 
 const bytes = (value: number) => Array.from({ length: 32 }, () => value);
@@ -33,7 +42,10 @@ const channels: Channel[] = [
   },
 ];
 
-const renderAgents = (patch: Partial<ConsoleState> = {}) => {
+const renderAgents = (
+  patch: Partial<ConsoleState> = {},
+  transport?: NodeTransport,
+) => {
   const initialState = {
     ...createInitialState(),
     connected: true,
@@ -96,7 +108,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
     ) as ConsoleActions;
 
     return (
-      <ConsoleContext.Provider value={{ state, actions }}>
+      <ConsoleContext.Provider value={{ state, actions, transport }}>
         <AgentView />
       </ConsoleContext.Provider>
     );
@@ -120,7 +132,10 @@ describe("AgentView", () => {
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
     expect(within(detail).getByText("summarizer")).toBeInTheDocument();
     expect(within(detail).getByText("Alpha")).toBeInTheDocument();
-    expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
+    // "chat.post" is the REPLY grant — it only lets an agent answer where it was
+    // engaged. Posting into arbitrary channels is the separate chat.post_message
+    // grant, so the two must never read as the same permission.
+    expect(within(detail).getByText("Reply in chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
 
     fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));
@@ -143,6 +158,128 @@ describe("AgentView", () => {
     expect(screen.getByRole("tab", { name: /agents/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /auto-reply/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /activity/i })).toBeInTheDocument();
+  });
+
+  it("keeps the Agents title on an ink token for light and dark headers", () => {
+    document.documentElement.dataset.theme = "dark";
+    renderAgents();
+
+    const heading = screen.getByRole("heading", { name: "Agents" });
+    expect(heading).toHaveStyle({ color: color.ink, letterSpacing: "0" });
+
+    document.documentElement.dataset.theme = "light";
+  });
+
+  it("derives identity-band overlays from filled tokens in both themes", () => {
+    document.documentElement.dataset.theme = "dark";
+    renderAgents();
+
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    const agentId = within(detail).getByText("summarizer");
+    const status = within(detail).getByText("Active", { exact: true });
+    const edit = within(detail).getByRole("button", { name: /^edit$/i });
+    const pause = within(detail).getByRole("button", { name: /pause agent/i });
+
+    const styleText = (element: HTMLElement) => element.getAttribute("style") ?? "";
+    expect(styleText(agentId)).toContain(`color: ${filledMix(FILLED_IDENTITY_TEXT_PERCENT)}`);
+    expect(styleText(status)).toContain(`background: ${filledMix(8)}`);
+    expect(styleText(status)).toContain(`border: 1px solid ${filledMix(16)}`);
+    for (const button of [edit, pause]) {
+      expect(styleText(button)).toContain(`background: ${filledMix(7)}`);
+      expect(styleText(button)).toContain(`border: 1px solid ${filledMix(22)}`);
+    }
+    expect(styleText(edit)).toContain(`color: ${color.onDark}`);
+    expect(styleText(status)).toContain(`color: ${filledForeground(color.green)}`);
+    expect(styleText(pause)).toContain(`color: ${filledForeground(color.amber)}`);
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for qa agent/i }));
+    const pausedDetail = screen.getByRole("region", { name: /agent detail/i });
+    const pausedStatus = within(pausedDetail).getByText("Paused", { exact: true });
+    const resume = within(pausedDetail).getByRole("button", { name: /resume agent/i });
+    expect(styleText(pausedStatus)).toContain(`color: ${filledForeground(color.amber)}`);
+    expect(styleText(resume)).toContain(`color: ${filledForeground(color.green)}`);
+
+    // The inline styles keep referring to live theme variables after the
+    // filled surface changes polarity, rather than baking in light overlays.
+    document.documentElement.dataset.theme = "light";
+    expect(styleText(agentId)).toContain(`color: ${filledMix(FILLED_IDENTITY_TEXT_PERCENT)}`);
+    expect(styleText(pausedStatus)).toContain(`color: ${filledForeground(color.amber)}`);
+    expect(styleText(resume)).toContain(`color: ${filledForeground(color.green)}`);
+    expect(styleText(status)).toContain(`background: ${filledMix(8)}`);
+    document.documentElement.dataset.theme = "light";
+  });
+
+  it("keeps every identity-band label at 4.5:1 in both committed palettes", () => {
+    const palettes = [
+      {
+        name: "light",
+        filled: "#26251f",
+        onFilled: "#efefef",
+        green: "#5cb45f",
+        amber: "#c08a3e",
+      },
+      {
+        name: "dark",
+        filled: "#ecebe5",
+        onFilled: "#1b1a17",
+        green: "#6cc06f",
+        amber: "#d3a25c",
+      },
+    ] as const;
+
+    const channels = (hex: string): [number, number, number] => [
+      parseInt(hex.slice(1, 3), 16) / 255,
+      parseInt(hex.slice(3, 5), 16) / 255,
+      parseInt(hex.slice(5, 7), 16) / 255,
+    ];
+    const mix = (foreground: string, percent: number, background: string) => {
+      const fg = channels(foreground);
+      const bg = channels(background);
+      const weight = percent / 100;
+      return fg.map((value, index) => value * weight + bg[index] * (1 - weight));
+    };
+    const luminance = (rgb: number[]) => {
+      const linear = rgb.map((value) =>
+        value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4,
+      );
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const contrast = (foreground: number[], background: number[]) => {
+      const foregroundLuminance = luminance(foreground);
+      const backgroundLuminance = luminance(background);
+      return (
+        (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
+        (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
+      );
+    };
+
+    for (const palette of palettes) {
+      const band = channels(palette.filled);
+      const chip = mix(palette.onFilled, 8, palette.filled);
+      const control = mix(palette.onFilled, 7, palette.filled);
+      const identityText = mix(
+        palette.onFilled,
+        FILLED_IDENTITY_TEXT_PERCENT,
+        palette.filled,
+      );
+
+      expect(contrast(identityText, band), `${palette.name} agent id`).toBeGreaterThanOrEqual(4.5);
+      for (const [label, hue] of [
+        ["green", palette.green],
+        ["amber", palette.amber],
+      ] as const) {
+        const semanticText = mix(hue, FILLED_SEMANTIC_TEXT_PERCENT, palette.onFilled);
+        expect(contrast(semanticText, chip), `${palette.name} ${label} status`).toBeGreaterThanOrEqual(
+          4.5,
+        );
+        expect(contrast(semanticText, control), `${palette.name} ${label} action`).toBeGreaterThanOrEqual(
+          4.5,
+        );
+      }
+      expect(contrast(channels(palette.onFilled), control), `${palette.name} edit action`).toBeGreaterThanOrEqual(
+        4.5,
+      );
+    }
   });
 
   it("adds an agent through the focused Add-agent pane", () => {
@@ -192,10 +329,30 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
-  it("cancels an in-progress run and toggles the jobs worker on the Activity tab", () => {
-    const { spies } = renderAgents();
+  it("reassigns or cancels an in-progress run and toggles the jobs worker", () => {
+    const { spies } = renderAgents({
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: "cd".repeat(32),
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
+    });
 
     openTab(/activity/i);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /force reassign run general\/42\/summarizer/i }),
+    );
+    expect(spies.reassignRun).toHaveBeenCalledWith("general/42/summarizer", 0);
 
     fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
@@ -286,18 +443,61 @@ describe("AgentView", () => {
       displayName: "Renamed Agent",
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
+      // the caps record rides every save (untouched field -> empty list).
+      caps: { pages_write: [] },
     });
   });
 
   it("shows which node is executing an in-flight run", () => {
     const nodeKey = "cd".repeat(32);
     renderAgents({
-      runAssignee: new Map([["general/42/summarizer", nodeKey]]),
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: nodeKey,
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
       authorNames: { [nodeKey]: "Node Bob" },
     });
 
     openTab(/activity/i);
     expect(screen.getByText("on Node Bob")).toBeInTheDocument();
+  });
+
+  it("opens a running session and tails its live output", () => {
+    let handlers: TopicHandlers | undefined;
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe: vi.fn((_topics, next) => {
+        handlers = next;
+        return () => {};
+      }),
+    });
+    renderAgents({}, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(screen.getByRole("button", { name: /show live log for run/i }));
+    act(() => {
+      const frame = {
+        type: "tail",
+        topic: `run-output:${"ef".repeat(32)}`,
+        cursor: "1",
+        item: { stream: "stdout", line: "[node cafe1234] working" },
+      } as const;
+      handlers?.onTail?.(frame);
+      handlers?.onTail?.(frame); // StrictMode can race a subscribe replay.
+    });
+
+    expect(screen.getAllByText("[node cafe1234] working")).toHaveLength(1);
   });
 
   it("filters the timeline to the runs I requested", () => {
@@ -392,7 +592,7 @@ describe("RunsOnPicker", () => {
         "codex",
         "codex_gpt-5.5_low",
         "codex_gpt-5.5_xhigh",
-        "codex_gpt-5.4-mini_high",
+        "codex_gpt-5.6-terra_high",
         "claude_opus_max",
       ],
     });
@@ -408,7 +608,7 @@ describe("RunsOnPicker", () => {
     const model = screen.getByLabelText("Model");
     expect(within(model).getByRole("option", { name: "Default" })).toBeInTheDocument();
     expect(within(model).getByRole("option", { name: "gpt-5.5" })).toBeInTheDocument();
-    expect(within(model).getByRole("option", { name: "gpt-5.4-mini" })).toBeInTheDocument();
+    expect(within(model).getByRole("option", { name: "gpt-5.6-terra" })).toBeInTheDocument();
 
     // Picking a model adopts its first announced effort; the composed tag
     // is shown verbatim under the picker.
@@ -420,7 +620,7 @@ describe("RunsOnPicker", () => {
     expect(screen.getByText("codex_gpt-5.5_xhigh")).toBeInTheDocument();
 
     // Switching model narrows efforts to what that model announced.
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4-mini" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.6-terra" } });
     expect(screen.getByLabelText("Effort")).toHaveValue("high");
 
     // A provider with no base tag composes its first variant.

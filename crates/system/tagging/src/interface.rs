@@ -2,14 +2,14 @@
 //!
 //! the tagging plane is the network's cross-module engagement router: content
 //! in module A names an entity of module B, and B gets an engagement event.
-//! a subscriber module registers interest in a source scope
-//! ([`TaggingMsg::Subscribe`]); a content module reports each content item as
-//! a [`TagEvent`]; the plane fans one [`EngagementEvent`] out to every
-//! subscriber of that scope as a follow-up `Msg`.
+//! a content module reports each content item as a [`TagEvent`]; the plane
+//! routes it to every explicitly named, genesis-configured entity-owner
+//! module. A subscriber may also register interest in a source scope ([`TaggingMsg::Subscribe`]) to
+//! receive untagged content for assignment/all/round-robin policies.
 //!
 //! the plane is a ROUTER ONLY. it holds no engagement policy — whether and
 //! how a delivered event engages an entity (mention-gating, assignment,
-//! round-robin) is the subscriber module's business. and it is 100%
+//! round-robin) is the recipient module's business. and it is 100%
 //! module-agnostic: content modules translate their own author and mention
 //! shapes into this crate's vocabulary at their edge; the plane never decodes
 //! a content module's event payloads.
@@ -21,22 +21,19 @@
 
 use serde::{Deserialize, Serialize};
 
-/// the conventional module id the tagging plane registers under.
-pub const DEFAULT_TAGGING_TARGET: &str = "tagging";
-
 // ---- consensus constants ----------------------------------------------------
 
 /// hard cap on a container or entity id.
-pub const MAX_ID_BYTES: usize = 128;
+pub(crate) const MAX_ID_BYTES: usize = 128;
 
 /// hard cap on the entity tags one content item may carry; a longer list is
 /// truncated deterministically (first wins), never rejected — the tag intake
 /// is a no-fail arm.
-pub const MAX_TAGS_PER_EVENT: usize = 16;
+pub(crate) const MAX_TAGS_PER_EVENT: usize = 16;
 
 /// hard cap on subscriber modules per (source, container) scope — the bound
 /// on the engagement fan-out one content item can cause.
-pub const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
+pub(crate) const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
 
 // ---- the universal entity reference ------------------------------------------
 
@@ -101,8 +98,8 @@ pub enum TaggingMsg {
     Tag(TagEvent),
 }
 
-/// the delivery a subscriber module receives as a follow-up `Msg` from the
-/// plane, in the same block as the content. `source` is the content module
+/// the delivery a tag-owner or scope-subscriber receives as a follow-up `Msg`
+/// from the plane, in the same block as the content. `source` is the content module
 /// the plane verified by origin; the rest is the [`TagEvent`] verbatim.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EngagementEvent {
@@ -111,32 +108,6 @@ pub struct EngagementEvent {
     pub content_seq: u64,
     pub author: Author,
     pub tags: Vec<EntityRef>,
-}
-
-// ---- queries --------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaggingQuery {
-    /// every subscription scope with its subscriber set.
-    Subscriptions,
-    /// one scope's subscriber set (empty == no subscription).
-    Subscribers { source: String, container: String },
-}
-
-/// one subscription scope's observable state.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SubscriptionView {
-    pub source: String,
-    pub container: String,
-    pub subscribers: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaggingReply {
-    Subscriptions(Vec<SubscriptionView>),
-    Subscribers(Vec<String>),
 }
 
 // ---- codecs ---------------------------------------------------------------------
@@ -151,17 +122,5 @@ pub fn encode_event(e: &EngagementEvent) -> Vec<u8> {
     serde_json::to_vec(e).expect("serializable")
 }
 pub fn decode_event(b: &[u8]) -> Result<EngagementEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
-}
-pub fn encode_query(q: &TaggingQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
-}
-pub fn decode_query(b: &[u8]) -> Result<TaggingQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
-}
-pub fn encode_reply(r: &TaggingReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
-}
-pub fn decode_reply(b: &[u8]) -> Result<TaggingReply, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }

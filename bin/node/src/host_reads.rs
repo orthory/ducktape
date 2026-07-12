@@ -136,23 +136,6 @@ pub(crate) async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk
     (status.current_version, pending)
 }
 
-/// the CURRENT member set from the valset module's committed+staged projection
-/// (host-routed read, between drains). an unreadable reply degrades to empty —
-/// callers treat that as "can't authorize anything right now", never a panic.
-pub(crate) async fn read_members_from_host(host: &Host) -> Vec<Vec<u8>> {
-    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
-    let Ok(raw) = host
-        .query("valset", &encode_query(&ValsetQuery::Validators))
-        .await
-    else {
-        return Vec::new();
-    };
-    match decode_reply(&raw) {
-        Ok(ValsetReply::Validators(v)) => v,
-        Ok(_) | Err(_) => Vec::new(),
-    }
-}
-
 /// read the upgrade module's raw committed [`UpgradeStatus`] (committed state,
 /// between drains). `None` when the module is absent (pre-retrofit) or the reply
 /// is unreadable — so the transition-marker latches degrade to silent on a

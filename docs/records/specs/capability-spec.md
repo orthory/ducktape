@@ -5,7 +5,7 @@ one executor — an installed CLI that can turn a prompt into text. Everything
 the node needs is in the file: how to detect the binary, the exact argv to
 invoke it, and how to parse its output. **Adding an executor is a config
 change, never a code change** — the embedded built-ins are themselves spec
-files globbed out of `crates/kernel/capability-host/specs/` at build time; no
+files globbed out of `crates/system/capability-host/specs/` at build time; no
 Rust source names an executor.
 
 Specs are the data half of the capability system:
@@ -13,7 +13,7 @@ Specs are the data half of the capability system:
 | Layer | Owns | Code |
 |---|---|---|
 | Consensus (`crates/system/capability`) | *who provides what*, network-wide: node key → announced tag set | never reads specs |
-| Host (`crates/kernel/capability-host`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
+| Host (`crates/system/capability-host`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
 
 The consensus registry only ever sees **tags**. The spec behind a tag is
 private to each host — two nodes can announce the same tag with differently
@@ -53,7 +53,7 @@ in the same trust class as a shell profile or a systemd unit:
 
 - They load from exactly two places, both local and operator-controlled:
   1. the specs **embedded in the node binary** at compile time
-     (`crates/kernel/capability-host/specs/*.toml`);
+     (`crates/system/capability-host/specs/*.toml`);
   2. the **operator spec directory** (see [Spec sources](#spec-sources)).
 - They are **never fetched from the network**, and no consensus code path can
   read one (host-local files are non-deterministic input).
@@ -177,6 +177,7 @@ format = "text"
 | `spec` | integer | yes | must be `1` |
 | `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
 | `[session]` | table | no | thread-continuity capture/resume — see [Session](#session--thread-continuity) |
+| `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
 Unknown fields **anywhere** in the file are rejected — a typo (or a field
@@ -203,7 +204,7 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | no (default `[]`) | passed verbatim to exec; fully literal, no placeholders |
 | `prompt` | string | yes | must be `"stdin"` in v1 |
-| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 6x regardless |
+| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 36x regardless |
 
 ### `[output]`
 
@@ -224,6 +225,12 @@ being silently ignored.
 | `capture` | string | yes | `"jsonl-events"` \| `"json-result-field:<field>"` |
 | `resume_args` | string array | exactly one of the two | FULL replacement resume argv; must carry the `{session_id}` slot |
 | `resume_args_append` | string array | exactly one of the two | appended to the spec's own `args`; must carry the `{session_id}` slot |
+
+### `[tools]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `args` | string array | yes (when the section is present) | spliced into every argv the file produces, immediately after `args[0]` |
 
 ---
 
@@ -295,6 +302,60 @@ Mechanics (all host-local):
 - Sessions are **assignee-local by design**: another node executing the same
   thread's next run finds no session file and starts cold — correct, because
   the run envelope carries the full transcript either way.
+
+---
+
+## Tools — argv injected into every argv the file produces
+
+An agentic executor is only as useful as the tools it can reach. `[tools]`
+names the flags that wire one in — in the built-ins, the Ducktape MCP server —
+without making every argv in the file repeat them:
+
+```toml
+[tools]
+args = ["-c", 'mcp_servers.ducktape.command="ducktape-mcp"']
+```
+
+**The insertion rule: immediately after `args[0]`, never at the end.** An argv
+like codex's ends in a bare `-` (the stdin marker) that must stay LAST, so
+appending is not an option; `args[0]` is always the mode/subcommand selector
+(`exec`, `-p`), so the position right after it is the one slot that is legal
+for every executor and stable across variants.
+
+It applies to **every argv the file produces**:
+
+- the `[invoke] args`;
+- **every** `[[variants]]` `args` list (variants inherit `[tools]` like they
+  inherit everything else — they never repeat it);
+- the `[session]` `resume_args` replacement argv (and a variant's own
+  replacement), spliced after ITS `args[0]` the same way.
+
+`resume_args_append` is deliberately **not** spliced: that list is a *suffix*
+glued onto the spec's own `args`, not an argv of its own — splicing would land
+tool flags between a flag and its value. It needs nothing: the args it is
+appended to were already injected, so the composed resume argv carries the
+tools anyway.
+
+Everything else is the format's usual posture:
+
+- **injection happens once, at load time.** Nothing downstream knows tools
+  exist — a spec in hand already has them, and one tag still means one fixed,
+  fully literal argv.
+- **no `[tools]` section, or an argv with fewer than 1 arg, means no
+  insertion** — an older spec is byte-for-byte what it was.
+- **override is still wholesale, by tag.** An operator spec that replaces a
+  built-in replaces its `[tools]` too: to run an executor without the MCP
+  server (or with a different one), copy the embedded spec, edit `[tools]`,
+  drop it in the operator dir. There is no field-level merging here either.
+- a `[tools]` section with no `args` is a **hard error**, like every other
+  section that would do nothing.
+
+The binary a `[tools]` argv names (`ducktape-mcp` in the built-ins) is resolved
+from the **run's `PATH`** — the provisioner puts its directory there — so specs
+name no absolute path and stay portable across hosts. Claude's built-in also
+passes `--allowedTools mcp__ducktape`: in `-p` print mode there is no human to
+approve a tool call, so an unapproved MCP call is a denial and a merely
+*configured* server would be dead weight.
 
 ---
 
@@ -377,9 +438,10 @@ anywhere in the invoke path.
 
 The embedded built-ins use this to ship a curated model/effort matrix:
 `codex` (base) plus
-`codex_{gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex-spark}_{low,medium,high,xhigh}`,
-and `claude` (base) plus
-`claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
+`codex_{gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna}_{low,medium,high,xhigh,max}`
+and `codex_gpt-5.5_{low,medium,high,xhigh}` (the effort set follows what each
+model actually supports, so the codex side is not a rectangle), and `claude`
+(base) plus `claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
 
 ---
 
@@ -456,6 +518,7 @@ removed within v1 as a pre-release flag day: files that still carry them fail
 loudly at boot with an unknown-field error, never a silent behavior change.
 `[[variants]]` was likewise added within v1 pre-release — a build older than
 it rejects a file carrying variants loudly as an unknown field, never
-misreading it as a single-tag spec. `[workspace]` and `[session]` follow the
-same pre-release precedent: an older build rejects a file carrying them as
-unknown fields rather than silently running scratch-and-cold.)
+misreading it as a single-tag spec. `[workspace]`, `[session]` and `[tools]`
+follow the same pre-release precedent: an older build rejects a file carrying
+them as unknown fields rather than silently running scratch-and-cold, or
+tool-less.)

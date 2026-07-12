@@ -4,4 +4,4 @@
 //! module and forge (which cannot depend on this binary) share the exact type;
 //! re-exported here as the daemon's own name for it.
 
-pub use blobstore::{BlobHandle, BlobStore};
+pub use blobstore::BlobHandle;

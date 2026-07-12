@@ -28,7 +28,7 @@ const nodes: DiagramNode[] = [
   card('modules', 40, 0, 'Product modules', 'app', 'chat · pages · forge · agent', { bottom: 'source' }),
   card('system', 360, 0, 'System modules', 'system', 'valset · governance · identity', { bottom: 'source' }),
   card('sdk', 205, 96, 'sdk — contract', 'kernel', 'Module · Msg · Effect · root', { top: 'target', bottom: 'source' }),
-  card('reactor', 0, 200, 'reactor', 'kernel', 'effects, off hot path', { right: 'source' }),
+  card('worker', 0, 200, 'host::worker', 'kernel', 'effects, off hot path', { right: 'source' }),
   card('host', 205, 200, 'host', 'kernel', 'routes ops · folds roots', {
     top: 'target',
     bottom: 'source',
@@ -62,7 +62,7 @@ const edges: DiagramEdge[] = [
   edge('s-sdk', 'system', 'sdk', 'depends on'),
   edge('sdk-host', 'sdk', 'host', 'contract'),
   edge('host-state', 'host', 'state', 'read / stage'),
-  edge('reactor-host', 'reactor', 'host', 'follow-ups'),
+  edge('worker-host', 'worker', 'host', 'follow-ups'),
   edge('host-node', 'host', 'node', 'app-hash', true),
   edge('node-consensus', 'node', 'consensus', 'order', true),
   edge('node-sync', 'node', 'statesync', 'serve'),

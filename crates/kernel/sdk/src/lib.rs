@@ -8,7 +8,7 @@
 //! wrapper's [`StateRoot`], commit/abort, and sync boundary. in facade mode, the
 //! storage implementation is an explicitly registered backing module and durable
 //! state belongs to that backing module's root. the host composes each module's
-//! [`StateRoot`] into the global app-hash (see the `state` crate); how a module
+//! [`StateRoot`] into the global app-hash (see `host::global_root`); how a module
 //! *computes* that root — a qmdb merkle root, a git HEAD oid — is private to the
 //! module. the host only ever sees `root() -> StateRoot`.
 //!
@@ -21,6 +21,10 @@
 //!
 //! keep this crate types + traits with no domain deps (async-trait is the one
 //! greenlit exception): everything here is a shared surface for every module.
+//! [`codec`] carries the shared zero-dep snapshot-codec primitives on the same
+//! everyone-needs-it grounds.
+
+pub mod codec;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module
@@ -206,6 +210,40 @@ pub enum Origin {
     Module(ModuleId),
     /// genesis / system-internal.
     System,
+}
+
+impl Origin {
+    /// the cross-module ACTOR STRING convention (inbox source, jobs
+    /// submitter/worker, files owner): a module id verbatim, `"ext:"` +
+    /// lowercase hex of an external submitter's id bytes, or the literal
+    /// `"system"`. the `ext:` prefix is actor DOMAIN SEPARATION — a module
+    /// whose id happens to be pure hex can never collide with an external
+    /// key's hex. empty external bytes render as `"ext:"`; callers that must
+    /// reject an unauthenticated empty submitter check before calling.
+    pub fn actor_string(&self) -> String {
+        use core::fmt::Write as _;
+        match self {
+            Origin::Module(id) => id.clone(),
+            Origin::External(bytes) => {
+                let mut out = String::with_capacity(4 + bytes.len() * 2);
+                out.push_str("ext:");
+                for b in bytes {
+                    let _ = write!(out, "{b:02x}");
+                }
+                out
+            }
+            Origin::System => "system".to_owned(),
+        }
+    }
+}
+
+/// reject an empty required string field with the uniform module error
+/// message — the op-validation guard shared by tasks/automations/vaults.
+pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::Module(format!("{field} must not be empty")));
+    }
+    Ok(())
 }
 
 /// the deterministic environment handed to `execute`. block-constant fields
@@ -481,6 +519,24 @@ mod tests {
         assert_eq!(err.max_supported, 3);
         assert!(err.to_string().contains("v4"));
         assert!(err.to_string().contains("v3"));
+    }
+
+    #[test]
+    fn origin_actor_string_convention() {
+        assert_eq!(Origin::Module("chat".into()).actor_string(), "chat");
+        assert_eq!(
+            Origin::External(vec![0xAB, 0x01, 0xFF]).actor_string(),
+            "ext:ab01ff"
+        );
+        assert_eq!(Origin::External(Vec::new()).actor_string(), "ext:");
+        assert_eq!(Origin::System.actor_string(), "system");
+    }
+
+    #[test]
+    fn require_non_empty_guard() {
+        assert!(require_non_empty("id", "x").is_ok());
+        let err = require_non_empty("id", "").unwrap_err().to_string();
+        assert!(err.contains("id must not be empty"), "{err}");
     }
 
     #[test]

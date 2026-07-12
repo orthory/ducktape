@@ -6,7 +6,7 @@
 //! re-dispatched as LOCAL-ONLY follow-up ops (never re-broadcast); emitted
 //! [`Event`]s/[`Effect`]s are collected and handed back for the effectful node
 //! layer (out of scope this slice). after the drain, the app-hash is recomposed
-//! over the registry via [`state::global_root`].
+//! over the registry via [`global_root`].
 //!
 //! ## determinism
 //!
@@ -34,6 +34,38 @@ use sdk::{
     Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
     StateSyncHandle,
 };
+use sha2::{Digest, Sha256};
+
+pub mod worker;
+
+/// compute the global app-hash over `modules` — the composition consensus
+/// commits to: a deterministic hash over every module's `(id, root)`. because
+/// a module's own [`StateRoot`] already commits to its children (a qmdb merkle
+/// root commits to its keys; a git HEAD oid commits to the whole repo tree),
+/// this one level on top yields the full two-level authentication tree.
+///
+/// determinism is the whole job: every validator must produce a byte-identical
+/// global root or the chain forks — so modules are sorted by id, and each id is
+/// length-prefixed before hashing (otherwise ("ab", r) and ("a", "b"||r) would
+/// collide). deliberately a plain sorted hash, NOT a qmdb-of-heads: qmdb's root
+/// is an order-dependent HISTORY commitment, while an app-hash must be
+/// `f(current state)` — order-independent + idempotent — so a state-synced node
+/// computes the same root. upgrade to a small merkle tree only when a light
+/// client needs log-n membership proofs.
+pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
+    let mut pairs: Vec<(ModuleId, StateRoot)> =
+        modules.iter().map(|m| (m.id(), m.root())).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut h = Sha256::new();
+    h.update((pairs.len() as u64).to_le_bytes());
+    for (id, root) in &pairs {
+        h.update((id.len() as u64).to_le_bytes());
+        h.update(id.as_bytes());
+        h.update(root.0);
+    }
+    StateRoot(h.finalize().into())
+}
 
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
 /// consensus/genesis constant — identical on every node — so the local re-entry
@@ -49,7 +81,7 @@ pub const UPGRADE_MODULE_ID: &str = "upgrade";
 /// the genesis-constant module id the `dispatch` module registers under. read
 /// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
 /// a net without the module, in which case nothing is ever injected.
-pub const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
+const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
 
 /// the genesis-constant module id the `modreg` code registry registers under.
 /// read by the boundary code-swap realization ([`Host::realize_module_swaps`])
@@ -120,7 +152,7 @@ pub struct BlockContext {
 
 /// the baseline protocol version — the version every node runs before any upgrade
 /// activates, and the graceful fallback when the `upgrade` module is not yet
-/// registered (pre-retrofit nets). Matches the `upgrade` module's uninitialized
+/// registered (a host without the module, e.g. a test registry). Matches the `upgrade` module's uninitialized
 /// `current_version == 0`, so a fresh module and a module-absent host agree.
 pub const BASELINE_VERSION: u32 = 0;
 
@@ -487,20 +519,22 @@ impl Host {
                     // module's Advance arm check computes (both route through
                     // upgrade::effective_version), so dispatch and hashing
                     // can never diverge at the boundary (risk R4).
-                    let ready: std::collections::BTreeMap<Vec<u8>, ()> =
-                        s.ready.iter().map(|k| (k.clone(), ())).collect();
                     upgrade::effective_version(
                         height,
                         s.current_version,
                         s.pending.as_ref(),
                         &s.members,
-                        &ready,
+                        |member| {
+                            s.ready
+                                .binary_search_by(|ready| ready.as_slice().cmp(member))
+                                .is_ok()
+                        },
                     )
                 }
                 // module present but reply unreadable — never fork on a decode slip.
                 Err(_) => BASELINE_VERSION,
             },
-            // module absent (pre-retrofit) or unreadable — baseline, never error.
+            // module absent or unreadable — baseline, never error.
             Err(_) => BASELINE_VERSION,
         }
     }
@@ -510,7 +544,7 @@ impl Host {
     /// frozen boundary state (the orchestrator's `RespawnPlan::boundary_version`),
     /// identical on every honest node, so this is a deterministic self-transition —
     /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
-    /// [`Module::set_active_version`] (only dual-path modules like forge do), and
+    /// [`Module::set_active_version`] (only dual-path modules do), and
     /// `version` is a NON-hashed branch selector — it never enters any `root()`
     /// preimage, so `app_hash()` is unmoved by this call alone (the app-hashed
     /// reconciliation of the upgrade module's own `current_version` rides the
@@ -534,7 +568,7 @@ impl Host {
     /// `activation_height` has been reached. idempotent — the first block at/after
     /// `H` clears the pending, so later blocks inject nothing. ABSENT until the
     /// module is registered (the `Status` query errors → `None`), so the drain is
-    /// byte-identical on a pre-retrofit net.
+    /// byte-identical on a net without the module.
     async fn pending_advance(&self, height: u64) -> Option<Msg> {
         let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
         let bytes = self.query(UPGRADE_MODULE_ID, &req).await.ok()?;
@@ -710,10 +744,10 @@ impl Host {
         Ok(())
     }
 
-    /// the current app-hash: [`state::global_root`] over the registered modules.
+    /// the current app-hash: [`global_root`] over the registered modules.
     pub fn app_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
-        state::global_root(&mods)
+        global_root(&mods)
     }
 
     /// the live root of a single registered module (test/inspection accessor).

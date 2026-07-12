@@ -3,13 +3,12 @@ use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor;
 use commonware_utils::ordered::Set;
-use consensus::ConsensusScheme;
 use host::Host;
 use recovery::{Manifest, Recovery};
 use sdk::StateRoot;
 use statesync::{SyncServer, fetch_frames};
 
-use crate::constants::{CONSENSUS_SCHEME, CUTOVER_DELAY};
+use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::read_upgrade_version_fields;
 use crate::util::{diag_log, hex};
 
@@ -60,29 +59,18 @@ pub(crate) fn verify_manifest_floor(
     }
     let participants =
         Set::try_from(keys).map_err(|_| "served participant set has duplicates".to_string())?;
-    // a VERIFIER-only scheme: no signing key, no our-key-is-a-participant
-    // requirement — any node (a not-yet-seated joiner included) can check a
-    // served floor. and the check is now CRYPTOGRAPHIC (the quorum's
-    // signatures), not the former structural decode: a server cannot mint a
-    // floor its quorum never signed.
-    let finalization = match CONSENSUS_SCHEME {
-        ConsensusScheme::V1Ed25519 => {
-            let scheme = simplex_ed25519::Scheme::verifier(namespace, participants);
-            consensus::verify_finalization(&mut rand::rngs::OsRng, &scheme, &cert)
-        }
-        ConsensusScheme::V2Bls => {
-            unimplemented!(
-                "V2Bls joiner wiring lands with valset bls key registration — the manifest \
-                 carries ed25519 transport identities only, and a bls verifier needs the \
-                 committed (ed25519 -> bls) participant map"
+    // a VERIFIER-only scheme (V1 ed25519, the only wired one): no signing key,
+    // no our-key-is-a-participant requirement — any node (a not-yet-seated
+    // joiner included) can check a served floor. and the check is now
+    // CRYPTOGRAPHIC (the quorum's signatures), not the former structural
+    // decode: a server cannot mint a floor its quorum never signed.
+    let scheme = simplex_ed25519::Scheme::verifier(namespace, participants);
+    let finalization = consensus::verify_finalization(&mut rand::rngs::OsRng, &scheme, &cert)
+        .map_err(|e| {
+            format!(
+                "served finalization floor does not verify against the epoch's participant set: {e}"
             )
-        }
-    }
-    .map_err(|e| {
-        format!(
-            "served finalization floor does not verify against the epoch's participant set: {e}"
-        )
-    })?;
+        })?;
     assert_floor_binds_view(
         boundary.view_base,
         boundary.height,
@@ -177,10 +165,9 @@ where
 
 /// the verifier-only scheme for a boundary's epoch: what the replica fold
 /// driver checks every observed finalization certificate against. mirrors
-/// [`verify_manifest_floor`]'s construction (and shares its V2 gap: a bls
-/// verifier needs the committed ed25519 -> bls participant map valset does
-/// not carry yet). FATAL on undecodable participants — the boundary already
-/// passed the floor verify, so garbage here is our own bug, not the wire's.
+/// [`verify_manifest_floor`]'s construction. FATAL on undecodable
+/// participants — the boundary already passed the floor verify, so garbage
+/// here is our own bug, not the wire's.
 pub(crate) fn replica_verifier(namespace: &[u8], participant_keys: &[Vec<u8>]) -> simplex_ed25519::Scheme {
     let mut keys = Vec::with_capacity(participant_keys.len());
     for k in participant_keys {
@@ -190,12 +177,7 @@ pub(crate) fn replica_verifier(namespace: &[u8], participant_keys: &[Vec<u8>]) -
     }
     let participants =
         Set::try_from(keys).expect("participant set already deduplicated for the floor verify");
-    match CONSENSUS_SCHEME {
-        ConsensusScheme::V1Ed25519 => simplex_ed25519::Scheme::verifier(namespace, participants),
-        ConsensusScheme::V2Bls => {
-            unimplemented!("V2Bls replica wiring lands with valset bls key registration")
-        }
-    }
+    simplex_ed25519::Scheme::verifier(namespace, participants)
 }
 
 /// the replica's valset orchestrator at (epoch, base): the same

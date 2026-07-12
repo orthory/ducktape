@@ -17,19 +17,14 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use data_plane::{BoxFuture, DatagramSocket, PlaneStream, SocketFactory, StreamListener};
 use tokio::time::{sleep, timeout};
 
 use super::sockets::{VirtualTcpListener, VirtualUdpSocket};
-use super::stack::{LISTEN_BACKLOG, StackSlot, VirtualStack};
-
-/// Bound data-plane sockets outlive one reachability epoch. Socket-mode
-/// retargeting deliberately removes and recreates the virtual interface, so
-/// listeners/datagram sockets must notice the new stack and rebind just like
-/// the commonware mesh seam's lazy listener does.
-const REBIND_POLL: Duration = Duration::from_secs(1);
+use super::stack::{
+    LISTEN_BACKLOG, REBIND_POLL, StackSlot, VirtualStack, accept_via_slot, require_local,
+};
 
 /// mints the plane's sockets on the userspace backend's virtual host.
 pub struct VirtualSocketFactory {
@@ -45,19 +40,6 @@ impl VirtualSocketFactory {
         self.slot
             .get()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "overlay interface is not up"))
-    }
-}
-
-/// the one-address invariant: the virtual host answers only at the node's
-/// own overlay `/128`.
-fn require_local(stack: &VirtualStack, ip: IpAddr) -> io::Result<()> {
-    if ip == IpAddr::V6(stack.local_ip()) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            format!("{ip} is not this node's overlay /128"),
-        ))
     }
 }
 
@@ -200,39 +182,17 @@ struct RebindingVirtualStreamListener {
 impl StreamListener for RebindingVirtualStreamListener {
     fn accept(&self) -> BoxFuture<'_, io::Result<(PlaneStream, SocketAddr)>> {
         Box::pin(async {
-            loop {
-                let Some(stack) = self.slot.get() else {
-                    *self.inner.lock().await = None;
-                    sleep(REBIND_POLL).await;
-                    continue;
-                };
-                require_local(&stack, self.local.ip())?;
-                let mut inner = self.inner.lock().await;
-                let stale = inner
-                    .as_ref()
-                    .is_none_or(|(bound_on, _)| !Arc::ptr_eq(bound_on, &stack));
-                if stale {
-                    match stack.listen_tcp(self.local.port(), LISTEN_BACKLOG) {
-                        Ok(listener) => *inner = Some((Arc::clone(&stack), listener)),
-                        Err(_) => {
-                            *inner = None;
-                            drop(inner);
-                            sleep(REBIND_POLL).await;
-                            continue;
-                        }
-                    }
-                }
-                let Some((_, listener)) = inner.as_mut() else {
-                    continue;
-                };
-                match timeout(REBIND_POLL, listener.accept()).await {
-                    Ok(Ok((stream, addr))) => {
-                        return Ok((Box::new(stream) as PlaneStream, addr));
-                    }
-                    Ok(Err(_)) => *inner = None,
-                    Err(_) => {}
-                }
-            }
+            // held across the shared loop's waits: one accept at a time IS
+            // the plane's usage (see above).
+            let mut inner = self.inner.lock().await;
+            let (stream, addr) = accept_via_slot(
+                &self.slot,
+                Some(self.local.ip()),
+                self.local.port(),
+                &mut inner,
+            )
+            .await?;
+            Ok((Box::new(stream) as PlaneStream, addr))
         })
     }
 

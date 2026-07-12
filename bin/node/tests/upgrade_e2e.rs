@@ -1,17 +1,19 @@
-//! real-socket end-to-end proof of the height-gated, no-downtime node upgrade —
-//! the CULMINATION of the upgrade module + forge v2 dual-path work (plan Phase 9).
+//! real-socket end-to-end proof of the height-gated, no-downtime node upgrade.
 //!
 //! `cluster_upgrade` (the headline) drives REAL `ducktape-node` OS processes
 //! through the WHOLE mechanism on one cluster, over the same json-lines rpc + the
 //! greppable transition markers the runtime emits. The sequence:
-//! seed committed FORGE state so the v2 root flip is OBSERVABLE; drive governance
-//! `ScheduleUpgrade { to_version: 2, activation_height: H }` to passing; watch every
-//! validator's `ReadinessSignaller` auto-emit `SignalReady`; watch readiness reach
-//! `R == n` (the pre-boundary `upgrade armed …` marker); cross `H` (the `upgrade
-//! activated … version=2 …` marker on EVERY node). Then it asserts the properties:
+//! seed committed FORGE state (a stable per-module witness across the boundary);
+//! drive governance `ScheduleUpgrade { to_version: 2, activation_height: H }` to
+//! passing; watch every validator's `ReadinessSignaller` auto-emit `SignalReady`;
+//! watch readiness reach `R == n` (the pre-boundary `upgrade armed …` marker);
+//! cross `H` (the `upgrade activated … version=2 …` marker on EVERY node). Then
+//! it asserts the properties:
 //!
 //! - (a) every honest node AGREES on the app-hash at/after `H` (no fork).
-//! - (b) the FORGE module root CHANGED at `H` (the v2 layout actually took effect).
+//! - (b) module state RODE THROUGH the boundary untouched: every module is
+//!   version-invariant (no dual-path module remains), so the seeded forge root is
+//!   IDENTICAL across `H` — the flip's observable is `current_version`, (d.i).
 //! - (c) no honest node halted (statuses keep answering; height advances past `H`).
 //! - (d) the pending slot CLEARED (Advance reconciliation) so a SECOND upgrade is
 //!   schedulable.
@@ -24,12 +26,10 @@
 //!
 //! NOTE on the mixed-old/new-binary leg: a single `cargo test` links ONE node
 //! binary (`CARGO_BIN_EXE_ducktape-node`, `MAX_PROTOCOL_VERSION = 3`), so a true
-//! mixed v1/v2 handshake cannot be spawned here. The structurally-load-bearing
+//! mixed old/new handshake cannot be spawned here. The structurally-load-bearing
 //! property it would assert — version gating rides the app/consensus payload, not
 //! the p2p handshake namespace `sha256(scheme ‖ validators)` — is covered by the
-//! design doc (`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`)
-//! and by the below-`H` byte-identical
-//! inertness the forge unit tests prove.
+//! design doc (`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`).
 
 mod common;
 
@@ -63,7 +63,7 @@ fn height(cluster: &Cluster, idx: usize) -> Option<u64> {
 }
 
 /// the forge module's committed root hex from the status projection — the clean
-/// per-module witness that the v2 layout recomputed the root at `H`.
+/// per-module witness that state rides through the boundary untouched.
 fn forge_root(cluster: &Cluster, idx: usize) -> Option<String> {
     cluster.status(idx)["modules"]["forge"]
         .as_str()
@@ -395,9 +395,8 @@ fn cluster_upgrade() {
     }
     settled_app_hash(&cluster, 3);
 
-    // 1. seed committed FORGE state so the module root is NON-ZERO — only then is
-    //    the v2 recomposition at H observable (an empty forge namespace roots to
-    //    ZERO under both layouts).
+    // 1. seed committed FORGE state so the module root is NON-ZERO — a stable
+    //    per-module witness to assert (b) against across the boundary.
     cluster.submit(
         0,
         "forge",
@@ -411,7 +410,7 @@ fn cluster_upgrade() {
     poll_until("forge seed commit to finalize on node 1", FINALIZE, || {
         forge_head(&cluster, 1, "demo")
     });
-    // quiesce so nothing is mid-drain, then capture the BASELINE forge root (v1).
+    // quiesce so nothing is mid-drain, then capture the BASELINE forge root.
     std::thread::sleep(Duration::from_secs(2));
     let forge_root_pre = forge_root(&cluster, 0).expect("forge root pre-H");
     assert_eq!(
@@ -422,17 +421,17 @@ fn cluster_upgrade() {
 
     // 2. schedule the upgrade to protocol v2 at a future height H (self-correcting
     //    against the fast, load-variable block rate — see `schedule_upgrade`).
-    let activation_height = schedule_upgrade(&cluster, "forge-v2", 2, UPGRADE_LEAD);
+    let activation_height = schedule_upgrade(&cluster, "proto-v2", 2, UPGRADE_LEAD);
 
     // 3. every validator's ReadinessSignaller auto-emits SignalReady (this binary
     //    is MAX_PROTOCOL_VERSION=3, so the signal is truthful).
     for i in 0..3 {
-        cluster.wait_marker(i, "signaled ready name=forge-v2", CONVERGE);
+        cluster.wait_marker(i, "signaled ready name=proto-v2", CONVERGE);
     }
 
     // 4. readiness reaches R == n -> the pre-boundary ARM marker on every node.
     for i in 0..3 {
-        cluster.wait_marker(i, "upgrade armed name=forge-v2 to_version=2", CONVERGE);
+        cluster.wait_marker(i, "upgrade armed name=proto-v2 to_version=2", CONVERGE);
     }
 
     // upgrade-status CLI leg: a live read against the scheduled net reports the
@@ -442,7 +441,7 @@ fn cluster_upgrade() {
     let (ok, out) = cluster.run_verb(&["upgrade-status", "--config", cfg0s]);
     assert!(ok, "upgrade-status CLI failed:\n{out}");
     assert!(
-        out.contains("pending: name=forge-v2") && out.contains("to_version=2"),
+        out.contains("pending: name=proto-v2") && out.contains("to_version=2"),
         "upgrade-status must report the pending upgrade:\n{out}"
     );
     assert!(
@@ -457,12 +456,12 @@ fn cluster_upgrade() {
     let acked = push_tracked_until(&cluster, "the upgrade to activate on every validator", || {
         (0..3).all(|i| {
             cluster
-                .marker(i, "upgrade activated name=forge-v2 version=2")
+                .marker(i, "upgrade activated name=proto-v2 version=2")
                 .is_some()
         })
     });
     let activated: Vec<String> = (0..3)
-        .map(|i| cluster.wait_marker(i, "upgrade activated name=forge-v2 version=2 at height", CONVERGE))
+        .map(|i| cluster.wait_marker(i, "upgrade activated name=proto-v2 version=2 at height", CONVERGE))
         .collect();
     // the activation height agrees across nodes (one deterministic boundary).
     assert_eq!(activated[0], activated[1], "activation height fork 0 vs 1");
@@ -522,24 +521,24 @@ fn cluster_upgrade() {
     );
     println!("accept contract held: all {total} acked crossing fillers present post-H");
 
-    // (b) THE UPGRADE DID SOMETHING: the forge module root recomputed under v2, so
-    //     it differs from the byte-identical baseline captured before H (forge state
-    //     is otherwise unchanged since the seed commit — the ONLY mover is the flip).
+    // (b) MODULE STATE RODE THROUGH: every module is version-invariant (no
+    //     dual-path module remains), so the seeded forge root — untouched since
+    //     the seed commit — must be IDENTICAL across H on every node. the flip's
+    //     observable is current_version, asserted at (d.i).
     let forge_root_post = forge_root(&cluster, 0).expect("forge root post-H");
-    assert_ne!(
+    assert_eq!(
         forge_root_post, forge_root_pre,
-        "forge module root did NOT change at H — the v2 layout never took effect"
+        "forge module root moved at H — the version flip must not touch module state"
     );
     assert_eq!(
         forge_root(&cluster, 2),
         Some(forge_root_post.clone()),
-        "forge v2 root must agree cross-node"
+        "forge root must agree cross-node after H"
     );
-    // forge content survived the layout flip (v2 is a root/wire change, not a
-    // data migration): the seed commit is still readable.
+    // forge content survived the boundary: the seed commit is still readable.
     assert!(
         forge_head(&cluster, 1, "demo").is_some(),
-        "forge repo head must survive the v2 activation"
+        "forge repo head must survive the activation"
     );
 
     // (d.i) the pending slot CLEARED via the boundary Advance reconciliation, and
@@ -553,7 +552,7 @@ fn cluster_upgrade() {
     assert_eq!(st.current_version, 2, "current_version must be 2 after arming");
     // every node observed the clear (the greppable one-shot).
     for i in 0..3 {
-        cluster.wait_marker(i, "upgrade cleared name=forge-v2", FINALIZE);
+        cluster.wait_marker(i, "upgrade cleared name=proto-v2", FINALIZE);
     }
 
     // (e) RESTART ACROSS H: kill a validator whose last committed height >= H, then
@@ -562,8 +561,7 @@ fn cluster_upgrade() {
     //     fork across the restart-over-a-boundary).
     cluster.kill(1);
     cluster.spawn(1);
-    // the version-aware recovery replay ran (the manifest carried current_version=2,
-    // so the forge branch is v2 on replay).
+    // the version-aware recovery replay ran (the manifest carried current_version=2).
     cluster.wait_marker(1, "recovered app_hash=", CONVERGE);
     poll_until("restarted node 1 to re-converge with the live peers", CONVERGE, || {
         let a = app_hash(&cluster, 1);
@@ -572,7 +570,7 @@ fn cluster_upgrade() {
 
     // (f) STATE-SYNC ACROSS H: a fresh joiner rebuilds the served boundary (past H)
     //     over the statesync channel and must compose the IDENTICAL app-hash —
-    //     proving the served v2 snapshot installs and roots under the v2 layout.
+    //     proving the served snapshots install and root at a post-H boundary.
     std::thread::sleep(Duration::from_secs(2));
     let served = app_hash(&cluster, 0);
     assert_eq!(app_hash(&cluster, 2), served, "server nodes disagree before sync");

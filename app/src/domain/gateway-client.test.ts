@@ -27,6 +27,7 @@ const loopbackRecord = (methods: Array<"get" | "head" | "post"> = ["get", "head"
         max_request_bytes: methods.includes("post") ? 1024 : 0,
         max_response_bytes: 4096,
         allow_authorization: false,
+        allow_upgrade: false,
       },
     },
   },
@@ -50,10 +51,35 @@ describe("gateway wire contract", () => {
           max_request_bytes: 1024,
           max_response_bytes: 4096,
           allow_authorization: false,
+          allow_upgrade: true,
         },
       },
     }))).toBe(
-      "010400000000000000746573740200000000000000010201030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020300000000000000010203000400000000000000100000000000000002",
+      "01040000000000000074657374020000000000000001020103000000000000006170692000000000000000030303030303030303030303030303030303030303030303030303030303030307000000000000000102030000000000000001020300040000000000000010000000000000000102",
+    );
+  });
+
+  it("binds only the manifest hash for content routes (matches Rust vector)", () => {
+    expect(bytesToHex(routeSigningPreimage({
+      version: ROUTE_FORMAT_VERSION,
+      chain_id: "test",
+      account_id: [1, 2],
+      name: { label: "api" },
+      publisher_node: new Array(32).fill(3),
+      revision: 7,
+      route: {
+        target: { kind: "duck_fs", manifest_sha256: "b".repeat(64) },
+        policy: {
+          audience: { kind: "network" },
+          methods: ["get", "head"],
+          max_request_bytes: 0,
+          max_response_bytes: 4096,
+          allow_authorization: false,
+          allow_upgrade: false,
+        },
+      },
+    }))).toBe(
+      "010400000000000000746573740200000000000000010201030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020200000000000000010200000000000000000010000000000000000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     );
   });
 
@@ -66,24 +92,14 @@ describe("gateway wire contract", () => {
       publisher_node: new Array(32).fill(2),
       revision: 1,
       route: {
-        target: {
-          kind: "duck_fs",
-          content: {
-            default_path: "index.html",
-            files: [{
-              path: "index.html",
-              mime: "text/html",
-              size: 1,
-              sha256: "00".repeat(32),
-            }],
-          },
-        },
+        target: { kind: "duck_fs", manifest_sha256: "0".repeat(64) },
         policy: {
           audience: { kind: "network" },
           methods: ["get", "head", "post"],
           max_request_bytes: 1,
           max_response_bytes: 1024,
           allow_authorization: true,
+          allow_upgrade: false,
         },
       },
     })).toThrow(/DuckFS routes require GET\+HEAD/);

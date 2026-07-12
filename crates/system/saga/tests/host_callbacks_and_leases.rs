@@ -124,6 +124,7 @@ fn oracle(id: &str, attempt: u32, outcome: Result<Vec<u8>, String>) -> Msg {
             saga_id: id.into(),
             attempt,
             outcome,
+            usage: None,
         }),
     }
 }
@@ -296,9 +297,12 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
             valset.insert(key.clone());
         }
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::with_valset(
+            // no capability module is registered: these triggers are untagged,
+            // so assignment stays on the valset path.
+            Box::new(SagaModule::with_assignment(
                 "saga",
                 "valset",
+                "capability",
                 LeasePolicy::Strict,
             )) as Box<dyn Module>,
             Box::new(valset),

@@ -1,3 +1,5 @@
+<!-- LATTICE_LANE: 98cbfdac-a5d9-4ec5-bb26-75a001f3f7bf -->
+
 # Repository Instructions
 
 ## Internal Skills
@@ -17,9 +19,38 @@
 - Default feature/fix/doc work happens in an isolated git worktree rather than
   directly in the primary checkout. Use the current checkout only when the user
   explicitly asks for in-place work or the task is limited to repo-state repair.
+- Put every task worktree under `<primary-checkout>/.worktree/<branch-slug>`.
+  Never create one as a sibling checkout, under `/tmp`, or in assistant-specific
+  `.claude/worktrees` or `.codex/worktrees` directories. Keep Cargo targets and
+  other large build outputs in the disk-backed worktree too: `/tmp` may be a
+  memory-backed filesystem, so building there consumes RAM and swap.
 - After the worktree change is implemented and verified, submit it as a PR
   against `dev`. Do not treat local completion as done when the requested flow
   is delivery.
+
+## Worktree Cleanup (a merged worktree is garbage — remove it)
+
+- **A worktree's life ends when its PR merges.** Once merged, remove the
+  worktree and delete its branch. Leaving it costs ~20 GB of Cargo target each
+  and nothing else; twelve of them once ate 250 GB and had to be swept by hand.
+- **Stop the QA fleet BEFORE removing the worktree — this order is not optional.**
+  `.tauri-agent/fleet.json` points `cleanupInstance` at
+  `qa/fleet/cleanup-instance.ts`, a path *inside the worktree*, while the
+  instance's workspace, pidfile and detached `ducktape-node` live *outside* it
+  under `FLEET_HOME`. Delete the worktree first and you delete the only thing
+  that could ever stop its node: it then runs forever, unreachable by
+  `fleet down`. That is not hypothetical — a node was found still up 40 hours
+  after its worktree was gone, beside 9.2 GB of instance homes whose worktrees
+  no longer existed. So: `"$FLEET" down <instance-id>`, *then* remove the tree.
+- **`ops/worktree-clean.sh` does the whole sequence safely.** Dry-run by
+  default; `--yes` to act. It reaps orphaned fleet instances (killing only a pid
+  it has verified is that workspace's own `ducktape-node`, by exe and
+  `--config` — never `pkill -f`), then removes worktrees whose branch is fully
+  merged into `origin/dev`. It REFUSES a worktree that is dirty or carries a
+  commit not in `dev`; unmerged work is never its to throw away.
+- Never stop desktop/QA processes with `pkill -f` — a pattern match will
+  cheerfully kill an editor, a grep, or this script. Find them by process cwd or
+  let Fleet's own teardown do it.
 - Review the PR from a clean context before merging: re-read the diff against
   `dev`, check for scope creep and missing verification, and address actionable
   feedback before deciding mergeability.
@@ -29,15 +60,28 @@
   open with the risks, failed checks, or follow-up review needed instead of
   merging by default.
 
+## Rust Build Helpers
+
+- Makefile build entry points already run through `ops/build-with.sh`; use the
+  normal `make` targets so installed accelerators are picked up automatically.
+- For direct Cargo commands, use `ops/build-with.sh cargo ...`. It enables
+  `sccache` when installed and native-Linux `mold` through `clang`, while
+  falling back cleanly when they are unavailable. Run `make build-tools` to see
+  what is active on the current host.
+- Do not force mold on macOS or replace an operator's existing Rust wrapper,
+  linker, or flags. Use `DUCKTAPE_DISABLE_SCCACHE=1` or
+  `DUCKTAPE_DISABLE_MOLD=1` only when diagnosing a helper-specific problem.
+
 ## Rust Gates
 
-- Per-crate lint gate: `cargo clippy -p <crate> --tests --no-deps` — the
+- Per-crate lint gate:
+  `ops/build-with.sh cargo clippy -p <crate> --tests --no-deps` — the
   `--no-deps` is deliberate. Without it, a crate whose dev-deps pull
   host/dispatch/saga inherits ~a dozen pre-existing version-drift lints from
   those crates; a task is accountable only for lints in the crates it touched.
 - Don't run `cargo fmt --all`: large bin files carry pre-existing fmt debt,
   and a tree-wide reformat forces painful rebases on in-flight branches. Only
   format code you touched; the mechanical whole-tree sweep is a dedicated PR.
-- The files crate's wasm-readiness gate: `cargo check -p files
-  --no-default-features` must stay green (no `std::fs`/sdk leaks into the
-  pure core).
+- The files crate's wasm-readiness gate:
+  `ops/build-with.sh cargo check -p files --no-default-features` must stay green
+  (no `std::fs`/sdk leaks into the pure core).

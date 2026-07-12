@@ -4,6 +4,7 @@ import type { AgentRecord } from "../../../domain/agent-client";
 import { keyBytes, type ChatBlock } from "../../../domain/chat-client";
 import { parseMessageInput } from "./chat-input";
 import {
+  agentMentions,
   hasAgentMention,
   insertMention,
   mentionCandidates,
@@ -249,6 +250,23 @@ describe("hasAgentMention", () => {
     ];
 
     expect(hasAgentMention(blocks)).toBe(false);
+  });
+});
+
+describe("agentMentions", () => {
+  it("returns distinct structured agent refs and ignores plain/user mentions", () => {
+    const ref = { agent: { module: "runs", agent_id: "quackbot" } };
+    const blocks: ChatBlock[] = [
+      {
+        paragraph: [
+          { text: "@quackbot", marks: [{ mention: ref }] },
+          { text: " again", marks: [{ mention: ref }] },
+          { text: " @eddy", marks: [{ mention: { user: [1, 2] } }] },
+        ],
+      },
+      { code: { lang: null, text: "@quackbot" } },
+    ];
+    expect(agentMentions(blocks)).toEqual([ref]);
   });
 });
 

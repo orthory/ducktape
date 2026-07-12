@@ -15,7 +15,8 @@ pub mod index;
 
 use std::collections::BTreeMap;
 
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+use sdk::codec::{self, Cursor};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, require_non_empty};
 use sha2::{Digest, Sha256};
 
 pub struct Tasks {
@@ -31,13 +32,6 @@ impl Tasks {
             tasks: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
-    }
-
-    fn validate_non_empty(field: &str, value: &str) -> Result<(), Error> {
-        if value.is_empty() {
-            return Err(Error::Module(format!("{field} must not be empty")));
-        }
-        Ok(())
     }
 
     fn get(&self, task_id: &str) -> Option<&Task> {
@@ -60,8 +54,8 @@ impl Tasks {
         title: String,
         consensus_time: u64,
     ) -> Result<(), Error> {
-        Self::validate_non_empty("task_id", &task_id)?;
-        Self::validate_non_empty("title", &title)?;
+        require_non_empty("task_id", &task_id)?;
+        require_non_empty("title", &title)?;
         if self.get(&task_id).is_some() {
             return Err(Error::Module(format!("task already exists: {task_id}")));
         }
@@ -85,7 +79,7 @@ impl Tasks {
         status: TaskStatus,
         consensus_time: u64,
     ) -> Result<(), Error> {
-        Self::validate_non_empty("task_id", &task_id)?;
+        require_non_empty("task_id", &task_id)?;
         let mut task = self
             .get(&task_id)
             .cloned()
@@ -110,8 +104,8 @@ impl Tasks {
         let mut out = Vec::new();
         out.extend_from_slice(&(tasks.len() as u64).to_le_bytes());
         for task in tasks.values() {
-            push_string(&mut out, &task.id);
-            push_string(&mut out, &task.title);
+            codec::push_str(&mut out, &task.id);
+            codec::push_str(&mut out, &task.title);
             out.push(status_byte(&task.status));
             out.extend_from_slice(&task.created_at.to_le_bytes());
             out.extend_from_slice(&task.updated_at.to_le_bytes());
@@ -134,11 +128,6 @@ impl Tasks {
     }
 }
 
-fn push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
-}
-
 fn status_byte(status: &TaskStatus) -> u8 {
     match status {
         TaskStatus::Open => 0,
@@ -157,22 +146,22 @@ fn status_from_byte(value: u8) -> Result<TaskStatus, Error> {
 }
 
 fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Task>, Error> {
-    let mut off = 0usize;
-    let count = read_u64(bytes, &mut off)?;
-    if count > ((bytes.len() - off) / 33) as u64 {
-        return Err(Error::Module("snapshot truncated".into()));
-    }
+    let mut c = Cursor::new(bytes);
+    let count = c.u64("snapshot task count")?;
+    // each task costs at least 33 bytes (two length prefixes, the status byte,
+    // two u64 stamps), bounding a forged count before the loop.
+    c.bound(count, 33, "snapshot task count")?;
 
     let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
     for _ in 0..count {
-        let id = read_string(bytes, &mut off)?;
-        let title = read_string(bytes, &mut off)?;
-        let status = status_from_byte(read_u8(bytes, &mut off)?)?;
-        let created_at = read_u64(bytes, &mut off)?;
-        let updated_at = read_u64(bytes, &mut off)?;
+        let id = c.string("snapshot task_id")?;
+        let title = c.string("snapshot title")?;
+        let status = status_from_byte(c.byte("snapshot status")?)?;
+        let created_at = c.u64("snapshot created_at")?;
+        let updated_at = c.u64("snapshot updated_at")?;
 
-        Tasks::validate_non_empty("task_id", &id)?;
-        Tasks::validate_non_empty("title", &title)?;
+        require_non_empty("task_id", &id)?;
+        require_non_empty("title", &title)?;
         // no updated_at >= created_at check: `stage_status` stamps updated_at
         // with the block's consensus_time unconditionally and NOTHING guarantees
         // cross-block monotonicity, so a legitimately committed state can hold
@@ -198,43 +187,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Task>, Error> {
             },
         );
     }
-    if off != bytes.len() {
-        return Err(Error::Module("snapshot has trailing bytes".into()));
-    }
+    c.finish("tasks snapshot")?;
     Ok(tasks)
-}
-
-fn read_u8(bytes: &[u8], off: &mut usize) -> Result<u8, Error> {
-    let end = off
-        .checked_add(1)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
-    let value = bytes[*off];
-    *off = end;
-    Ok(value)
-}
-
-fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, Error> {
-    let end = off
-        .checked_add(8)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| Error::Module("snapshot truncated".into()))?;
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[*off..end]);
-    *off = end;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
-    let len = read_u64(bytes, off)?;
-    let len = usize::try_from(len).map_err(|_| Error::Module("snapshot truncated".into()))?;
-    if len > bytes.len() - *off {
-        return Err(Error::Module("snapshot truncated".into()));
-    }
-    let value = std::str::from_utf8(&bytes[*off..*off + len])
-        .map_err(|_| Error::Module("snapshot string is not utf-8".into()))?;
-    *off += len;
-    Ok(value.to_owned())
 }
 
 #[async_trait::async_trait(?Send)]

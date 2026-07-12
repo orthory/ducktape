@@ -4,7 +4,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { assigneeHex, dispatch, type DispatchView } from "./dispatch-client";
+import { assigneeHex, dispatch, runLease, type DispatchView } from "./dispatch-client";
 import { makeTransportStub } from "../test/transport-stub";
 
 const stubTransport = (reply?: unknown) =>
@@ -34,5 +34,27 @@ describe("assigneeHex", () => {
   it("is null with no assignee or no view", () => {
     expect(assigneeHex({ assignee: null } as DispatchView)).toBeNull();
     expect(assigneeHex(null)).toBeNull();
+  });
+});
+
+it("projects the attempt fencing and lease metadata", () => {
+  expect(
+    runLease({
+      assignee: [1, 2],
+      attempt: 3,
+      max_attempts: 5,
+      lease_expires_at: 80,
+      deadline: 100,
+      lease_updated_at: 40,
+      reassignable: true,
+    } as DispatchView),
+  ).toEqual({
+    assigneeHex: "0102",
+    attempt: 3,
+    maxAttempts: 5,
+    expiresAt: 80,
+    deadline: 100,
+    updatedAt: 40,
+    reassignable: true,
   });
 });

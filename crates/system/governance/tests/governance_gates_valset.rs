@@ -40,7 +40,12 @@ fn gov_host() -> Host {
     valset.insert(member_key(2));
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "upgrade")),
+        Box::new(Governance::new(
+            "governance",
+            "valset",
+            "upgrade",
+            "identity",
+        )),
     ])
     .expect("genesis")
 }
@@ -459,7 +464,12 @@ fn a_single_member_ballot_is_a_deciding_majority() {
         valset.insert(founder.clone());
         let mut host = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "upgrade")),
+            Box::new(Governance::new(
+                "governance",
+                "valset",
+                "upgrade",
+                "identity",
+            )),
         ])
         .expect("genesis");
 
@@ -545,7 +555,12 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
         valset.insert(founder.clone());
         let mut host = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "upgrade")),
+            Box::new(Governance::new(
+                "governance",
+                "valset",
+                "upgrade",
+                "identity",
+            )),
         ])
         .expect("genesis");
         assert_eq!(validators(&host).await.len(), 1, "a solo network of one");
@@ -878,7 +893,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
             panic!("governance must advertise snapshot bytes");
         };
 
-        let mut rebuilt = Governance::new("governance", "valset", "upgrade");
+        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(
             rebuilt.root(),
@@ -890,7 +905,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
         let mut tampered = bytes.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        let mut fresh = Governance::new("governance", "valset", "upgrade");
+        let mut fresh = Governance::new("governance", "valset", "upgrade", "identity");
         assert!(
             fresh.install(&tampered, root).is_err(),
             "tampered snapshot refused"

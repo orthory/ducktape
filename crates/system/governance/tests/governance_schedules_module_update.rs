@@ -44,7 +44,7 @@ async fn gov_host_with_modreg() -> Host {
     valset.insert(member_key(2));
     let mut host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "upgrade").with_modreg("modreg")),
+        Box::new(Governance::new("governance", "valset", "upgrade", "identity").with_modreg("modreg")),
         Box::new(Modreg::new("modreg")),
     ])
     .expect("genesis");
@@ -321,7 +321,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         valset.insert(member_key(1));
         let mut unwired = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "upgrade")),
+            Box::new(Governance::new("governance", "valset", "upgrade", "identity")),
         ])
         .expect("genesis");
         let err = submit_as(
@@ -404,7 +404,7 @@ fn snapshot_install_round_trips_module_update_proposals() {
         };
 
         let mut rebuilt =
-            Governance::new("governance", "valset", "upgrade").with_modreg("modreg");
+            Governance::new("governance", "valset", "upgrade", "identity").with_modreg("modreg");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(rebuilt.root(), root, "installed root equals the source root");
 

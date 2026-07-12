@@ -80,6 +80,7 @@ export function GatewayView() {
   const [requestKiB, setRequestKiB] = useState("256");
   const [responseKiB, setResponseKiB] = useState("4096");
   const [allowAuthorization, setAllowAuthorization] = useState(false);
+  const [allowUpgrade, setAllowUpgrade] = useState(false);
   const [record, setRecord] = useState<RouteRecord | null>(null);
   const [records, setRecords] = useState<RouteSummary[]>([]);
   const [localRoutes, setLocalRoutes] = useState<workspaces.GatewayLocalRoute[]>([]);
@@ -104,6 +105,7 @@ export function GatewayView() {
     setRequestKiB("256");
     setResponseKiB("4096");
     setAllowAuthorization(false);
+    setAllowUpgrade(false);
   }, []);
 
   const hydrateEditor = useCallback((next: RouteRecord | null, routes: workspaces.GatewayLocalRoute[]) => {
@@ -118,8 +120,10 @@ export function GatewayView() {
     setRequestKiB(String(definition.policy.max_request_bytes / 1024));
     setResponseKiB(String(definition.policy.max_response_bytes / 1024));
     setAllowAuthorization(definition.policy.allow_authorization);
+    setAllowUpgrade(definition.policy.allow_upgrade);
     if (definition.target.kind === "duck_fs") {
-      setDefaultPath(definition.target.content.default_path ?? "index.html");
+      // The default path lives in the off-consensus manifest, not the record.
+      setDefaultPath("index.html");
     } else {
       const bound = routes.find((route) => route.name.label === next.statement.name.label);
       setPort(String(bound?.port ?? 3000));
@@ -226,26 +230,27 @@ export function GatewayView() {
     gateway.validateRouteName(name);
     const maxResponse = numericCap(
       responseKiB,
-      gateway.MAX_RESPONSE_BODY_BYTES,
+      gateway.MAX_FILE_BYTES,
       "Response cap",
     );
     let definition: gateway.RouteDefinition;
     const previousPort = local?.port ?? null;
     if (target === "duck_fs") {
-      const content = await browser.buildContentDefinition(
+      const manifest_sha256 = await browser.buildContentManifest(
         transport,
         publisherNode,
         name,
         defaultPath,
       );
       definition = {
-        target: { kind: "duck_fs", content },
+        target: { kind: "duck_fs", manifest_sha256 },
         policy: {
           audience: { kind: audience },
           methods: ["get", "head"],
           max_request_bytes: 0,
           max_response_bytes: maxResponse,
           allow_authorization: false,
+          allow_upgrade: false,
         },
       };
       // A content-backed route has no loopback half. Remove an older binding
@@ -272,6 +277,7 @@ export function GatewayView() {
           max_request_bytes: maxRequest,
           max_response_bytes: maxResponse,
           allow_authorization: allowAuthorization,
+          allow_upgrade: allowUpgrade,
         },
       };
       gateway.validateStatement(statement(definition));
@@ -483,6 +489,9 @@ export function GatewayView() {
               </div>
               <label style={{ display: "block", marginTop: 9, color: color.inkSoft, font: `500 9.5px ${font.sans}` }}>
                 <input type="checkbox" checked={allowAuthorization} onChange={(event) => setAllowAuthorization(event.target.checked)} /> Allow explicit Authorization forwarding
+              </label>
+              <label style={{ display: "block", marginTop: 6, color: color.inkSoft, font: `500 9.5px ${font.sans}` }}>
+                <input type="checkbox" checked={allowUpgrade} onChange={(event) => setAllowUpgrade(event.target.checked)} /> Allow WebSocket upgrade
               </label>
               <div style={{ marginTop: 7, color: color.muted, font: `500 9.5px ${font.mono}` }}>
                 local port {local?.port ?? "—"} · never published in consensus

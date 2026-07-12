@@ -1,23 +1,23 @@
 // Sidebar + the routed screen body, plus the error strip. Routing is the
-// registry lookup: state.screen is a module id or one of the shell-owned
-// screens ("settings", "account"). Cross-module search is not a route — it's
-// the ⌘K palette the shell overlays.
+// registry lookup: state.screen is a module id or the shell-owned "settings"
+// screen. The account Home is NOT a routed screen — it's a full-window layer
+// gated by state.atHome, one level up in DucktapeConsole. Cross-module search
+// is not a route either — it's the ⌘K palette the shell overlays.
 
 import { useEffect } from "react";
 
 import { moduleById } from "../modules/registry";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font } from "../theme/tokens";
-import { AccountView } from "../views/account/AccountView";
 import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
 import { CHANNEL_RAIL_WIDTH } from "../views/chat/ChatView";
+import { BrowserView } from "../views/browser/BrowserView";
 import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
 
 function resolveScreen(screen: string) {
   if (screen === "settings") return SettingsView;
-  if (screen === "account") return AccountView;
   return moduleById(screen)?.Screen ?? SettingsView;
 }
 
@@ -71,6 +71,8 @@ function ErrorStrip() {
 export function ConsoleShell() {
   const { state, actions } = useDucktape();
   const Screen = resolveScreen(state.screen);
+  const browserVisible = state.screen === "browser";
+  const browserSurfaceVisible = browserVisible && !state.searchOpen;
 
   // ⌘K / Ctrl-K opens the command palette from anywhere. Escape and backdrop
   // clicks close it from within the modal.
@@ -89,7 +91,10 @@ export function ConsoleShell() {
     <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative" }}>
       <Sidebar />
       <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
-        <Screen />
+        <div style={{ flex: 1, minWidth: 0, display: browserVisible ? "flex" : "none" }}>
+          <BrowserView visible={browserSurfaceVisible} />
+        </div>
+        {!browserVisible && <Screen />}
       </div>
       {/* the live-huddle session card floats above EVERY screen — a hot mic
           must never lose its mute/leave controls to navigation. Sized to sit

@@ -13,8 +13,8 @@
 //!
 //! ## activation is a pure derivation, never a stored flip
 //!
-//! `effective_version(height, boundary_members)` is a pure, total function of the
-//! COMMITTED state — the ONE shared predicate at the crate root (`effective_version`). the module's
+//! `effective_version` (the ONE shared predicate at the crate root) is a pure,
+//! total function of the COMMITTED state. the module's
 //! `Advance` handler re-evaluates the byte-identical predicate against the FROZEN
 //! COMMITTED end-of-(H-1) state (NOT staged-over-committed) — the SAME snapshot the
 //! orchestrator `arm_verdict` and the host `effective_version(H)` stamp read — so a
@@ -35,23 +35,18 @@
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
-use crate::ScheduledUpgrade as UpgradeCoords;
 pub use interface::*;
 
 use std::collections::BTreeMap;
 
+use sdk::codec::{Cursor, push_bytes};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use valset::{
-    ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
-    encode_query as valset_encode_query,
-};
 
 /// the minimum lead (in blocks) between the scheduling block and a pending
 /// upgrade's `activation_height`, so `H` is strictly in every node's future and
 /// never lands inside an armed epoch-cutover window. this is at least the
-/// orchestrator's `cutover_delay` (=3, `bin/node/src/main.rs`); it is revisited
-/// against that constant in Phase 6.
+/// orchestrator's `cutover_delay` (=3, `bin/node/src/main.rs`).
 pub const MIN_UPGRADE_LEAD: u64 = 3;
 
 /// one validator's readiness signal for the pending upgrade. idempotent per
@@ -69,7 +64,7 @@ struct UpgradeState {
     /// monotonic agreed protocol version.
     current_version: u32,
     /// the single pending upgrade — AT MOST ONE ever exists.
-    pending: Option<UpgradeCoords>,
+    pending: Option<ScheduledUpgrade>,
     /// readiness signals for the pending upgrade, keyed by 32-byte member pubkey.
     readiness: BTreeMap<Vec<u8>, ReadySignal>,
 }
@@ -112,20 +107,9 @@ impl Upgrade {
     }
 
     /// the CURRENT boundary member set: the valset module's staged-over-committed
-    /// projection, via the host-routed read lane (exactly like governance).
+    /// projection, via the shared `valset::members` read (exactly like governance).
     async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
-        let reply = ctx
-            .query(
-                &self.valset_id,
-                &valset_encode_query(&ValsetQuery::Validators),
-            )
-            .await?;
-        match valset_decode_reply(&reply).map_err(Error::Module)? {
-            ValsetReply::Validators(members) => Ok(members),
-            other => Err(Error::Module(format!(
-                "valset answered a Validators query with {other:?}"
-            ))),
-        }
+        valset::members(ctx, &self.valset_id).await
     }
 
     /// schedule/cancel are governance/system-authored, never external.
@@ -148,28 +132,9 @@ impl Upgrade {
         }
     }
 
-    /// the pure derivation over COMMITTED state — the version the node layer
-    /// stamps. byte-identical to the `Advance` arm check via the ONE shared
-    /// `crate::effective_version` predicate.
-    pub fn effective_version(&self, height: u64, boundary_members: &[Vec<u8>]) -> u32 {
-        let ready: BTreeMap<Vec<u8>, ()> = self
-            .committed
-            .readiness
-            .keys()
-            .map(|k| (k.clone(), ()))
-            .collect();
-        crate::effective_version(
-            height,
-            self.committed.current_version,
-            self.committed.pending.as_ref(),
-            boundary_members,
-            &ready,
-        )
-    }
-
     // ---- the op handlers ----------------------------------------------------
 
-    async fn handle_schedule(
+    fn handle_schedule(
         &mut self,
         ctx: &mut dyn Ctx,
         name: String,
@@ -198,7 +163,7 @@ impl Upgrade {
                 "an upgrade is already pending (cancel it first)".into(),
             ));
         }
-        next.pending = Some(UpgradeCoords {
+        next.pending = Some(ScheduledUpgrade {
             name,
             activation_height,
             to_version,
@@ -209,7 +174,7 @@ impl Upgrade {
         Ok(())
     }
 
-    async fn handle_cancel(&mut self, ctx: &mut dyn Ctx, name: String) -> Result<(), Error> {
+    fn handle_cancel(&mut self, ctx: &mut dyn Ctx, name: String) -> Result<(), Error> {
         Self::require_module_or_system(ctx)?;
         let height = ctx.env().height;
         let mut next = self.read().clone();
@@ -295,19 +260,13 @@ impl Upgrade {
             let members = self.members(ctx).await?;
             // the shared predicate over FROZEN committed readiness (plan R4): armed
             // iff every boundary member had signaled by end-of-(H-1).
-            let ready: BTreeMap<Vec<u8>, ()> = self
-                .committed
-                .readiness
-                .keys()
-                .map(|k| (k.clone(), ()))
-                .collect();
             let armed = up.to_version
                 == crate::effective_version(
                     height,
                     self.committed.current_version,
                     Some(&up),
                     &members,
-                    &ready,
+                    |member| self.committed.readiness.contains_key(member),
                 );
             // apply the reconciliation over staged-over-committed (published at
             // commit_block): ARM flips current_version + clears the slot; ABORT
@@ -401,11 +360,8 @@ impl Module for Upgrade {
                 name,
                 activation_height,
                 to_version,
-            } => {
-                self.handle_schedule(ctx, name, activation_height, to_version)
-                    .await
-            }
-            UpgradeMsg::Cancel { name } => self.handle_cancel(ctx, name).await,
+            } => self.handle_schedule(ctx, name, activation_height, to_version),
+            UpgradeMsg::Cancel { name } => self.handle_cancel(ctx, name),
             UpgradeMsg::SignalReady {
                 name,
                 to_version,
@@ -426,8 +382,6 @@ impl Module for Upgrade {
                 let members = self.members(ctx).await?;
                 let state = self.read();
                 let ready: Vec<Vec<u8>> = state.readiness.keys().cloned().collect();
-                let ready_map: BTreeMap<Vec<u8>, ()> =
-                    state.readiness.keys().map(|k| (k.clone(), ())).collect();
                 // `armed` (readiness complete) is derived from the ONE shared
                 // predicate evaluated AT the activation height (where the height
                 // gate always passes), so it can never drift from the arm check
@@ -440,7 +394,7 @@ impl Module for Upgrade {
                                 state.current_version,
                                 Some(up),
                                 &members,
-                                &ready_map,
+                                |member| state.readiness.contains_key(member),
                             )
                     }
                     None => false,
@@ -471,62 +425,18 @@ impl Module for Upgrade {
     }
 }
 
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 // ---- strict snapshot decode (untrusted bytes) -------------------------------
 
-fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
-    let Some((head, rest)) = buf.split_first_chunk::<8>() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    *buf = rest;
-    Ok(u64::from_le_bytes(*head))
-}
-
-fn take_u32(buf: &mut &[u8]) -> Result<u32, Error> {
-    let Some((head, rest)) = buf.split_first_chunk::<4>() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    *buf = rest;
-    Ok(u32::from_le_bytes(*head))
-}
-
-fn take_u8(buf: &mut &[u8]) -> Result<u8, Error> {
-    let Some((head, rest)) = buf.split_first() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    let v = *head;
-    *buf = rest;
-    Ok(v)
-}
-
-fn take_vec(buf: &mut &[u8]) -> Result<Vec<u8>, Error> {
-    let len = take_u64(buf)?;
-    if len > buf.len() as u64 {
-        return Err(Error::Module("snapshot length exceeds buffer".into()));
-    }
-    let (head, rest) = buf.split_at(len as usize);
-    *buf = rest;
-    Ok(head.to_vec())
-}
-
-fn take_string(buf: &mut &[u8]) -> Result<String, Error> {
-    String::from_utf8(take_vec(buf)?).map_err(|_| Error::Module("snapshot: bad utf-8".into()))
-}
-
 fn decode_state(bytes: &[u8]) -> Result<UpgradeState, Error> {
-    let mut buf = bytes;
-    let current_version = take_u32(&mut buf)?;
-    let pending = match take_u8(&mut buf)? {
+    let mut cur = Cursor::new(bytes);
+    let current_version = cur.u32("snapshot current_version")?;
+    let pending = match cur.byte("snapshot pending tag")? {
         0 => None,
         1 => {
-            let name = take_string(&mut buf)?;
-            let activation_height = take_u64(&mut buf)?;
-            let to_version = take_u32(&mut buf)?;
-            Some(UpgradeCoords {
+            let name = cur.string("snapshot upgrade name")?;
+            let activation_height = cur.u64("snapshot activation height")?;
+            let to_version = cur.u32("snapshot to_version")?;
+            Some(ScheduledUpgrade {
                 name,
                 activation_height,
                 to_version,
@@ -534,27 +444,23 @@ fn decode_state(bytes: &[u8]) -> Result<UpgradeState, Error> {
         }
         other => return Err(Error::Module(format!("snapshot: bad pending tag {other}"))),
     };
-    let count = take_u64(&mut buf)?;
+    let count = cur.u64("snapshot readiness count")?;
     // each readiness entry costs at least an 8-byte key-length prefix + a 1-byte
     // commitment tag — a forged count can never drive allocation past the buffer.
-    if count > (buf.len() / 9) as u64 {
-        return Err(Error::Module(
-            "snapshot readiness count exceeds buffer".into(),
-        ));
-    }
+    cur.bound(count, 9, "snapshot readiness")?;
     let mut readiness = BTreeMap::new();
     let mut prev: Option<Vec<u8>> = None;
     for _ in 0..count {
-        let key = take_vec(&mut buf)?;
+        let key = cur.bytes("snapshot readiness key")?.to_vec();
         // strictly increasing keys: one state has exactly one encoding.
         if prev.as_deref().is_some_and(|p| p >= key.as_slice()) {
             return Err(Error::Module(
                 "snapshot readiness keys must be strictly increasing".into(),
             ));
         }
-        let commitment = match take_u8(&mut buf)? {
+        let commitment = match cur.byte("snapshot commitment tag")? {
             0 => None,
-            1 => Some(take_vec(&mut buf)?),
+            1 => Some(cur.bytes("snapshot commitment")?.to_vec()),
             other => {
                 return Err(Error::Module(format!(
                     "snapshot: bad commitment tag {other}"
@@ -564,9 +470,7 @@ fn decode_state(bytes: &[u8]) -> Result<UpgradeState, Error> {
         prev = Some(key.clone());
         readiness.insert(key, ReadySignal { commitment });
     }
-    if !buf.is_empty() {
-        return Err(Error::Module("snapshot carries trailing bytes".into()));
-    }
+    cur.finish("snapshot")?;
     Ok(UpgradeState {
         current_version,
         pending,
@@ -581,6 +485,7 @@ mod tests {
     use commonware_codec::DecodeExt as _;
     use commonware_cryptography::Signer as _;
     use commonware_cryptography::ed25519::PrivateKey;
+    use valset::ValsetReply;
 
     // a Ctx that answers the valset Validators query with a configurable member
     // set (upgrade's only host-routed read) and carries a settable origin/height.
@@ -1023,24 +928,26 @@ mod tests {
     #[test]
     fn effective_version_only_when_armed() {
         let members = vec![valid_key(1), valid_key(2)];
-        // committed pending + full readiness, NOT yet advanced.
+        // committed pending + full readiness, NOT yet advanced. derive through
+        // the ONE shared crate-root predicate over committed state.
         let u = schedule_and_ready_all("a", 10, 2, &members);
-        assert_eq!(
-            u.effective_version(10, &members),
-            2,
-            "armed at/after H -> to_version"
-        );
-        assert_eq!(u.effective_version(9, &members), 0, "below H -> current");
+        let ev = |height: u64, boundary: &[Vec<u8>]| {
+            crate::effective_version(
+                height,
+                u.committed.current_version,
+                u.committed.pending.as_ref(),
+                boundary,
+                |member| u.committed.readiness.contains_key(member),
+            )
+        };
+        assert_eq!(ev(10, &members), 2, "armed at/after H -> to_version");
+        assert_eq!(ev(9, &members), 0, "below H -> current");
         // a boundary member not ready -> current.
         let mut plus = members.clone();
         plus.push(valid_key(3));
-        assert_eq!(
-            u.effective_version(10, &plus),
-            0,
-            "missing member -> current"
-        );
+        assert_eq!(ev(10, &plus), 0, "missing member -> current");
         // empty boundary -> current.
-        assert_eq!(u.effective_version(10, &[]), 0);
+        assert_eq!(ev(10, &[]), 0);
     }
 
     // ---- root discipline + snapshot/install ---------------------------------

@@ -16,13 +16,14 @@ const actions = new Proxy({}, { get: () => vi.fn() }) as ConsoleActions;
 const renderBrowser = (
   patch: Partial<ConsoleState> = {},
   transport: NodeTransport = makeTransportStub(),
+  visible = true,
 ) => render(
   <ConsoleContext.Provider value={{
     state: { ...createInitialState(), connected: true, ...patch },
     actions,
     transport,
   }}>
-    <BrowserView />
+    <BrowserView visible={visible} />
   </ConsoleContext.Provider>,
 );
 
@@ -53,53 +54,15 @@ describe("BrowserView security boundary", () => {
     expect(frame.getAttribute("sandbox")).toBe("");
     expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(frame.getAttribute("srcdoc")).toContain("script-src 'none'");
-    expect(screen.getByText("NETWORK SNAPSHOT")).toBeInTheDocument();
+    expect(screen.getByText("SNAPSHOT")).toBeInTheDocument();
   });
 
-  it("opens every account target in a capability-free gateway window", async () => {
-    const openWindow = vi.spyOn(gateway, "openWindow").mockResolvedValue();
-    vi.spyOn(duckBrowser, "loadDuckPage").mockResolvedValue({
-      address: {
-        kind: "account",
-        handle: "alice",
-        name: { label: "api" },
-        hostname: "api.alice.duck",
-        pathAndQuery: "/v1",
-        canonical: "api.alice.duck/v1",
-      },
-      hosting: "gateway",
-      target: "loopback_http",
-      accountId: "11".repeat(32),
-      publisherNode: "22".repeat(32),
-      signer: "33".repeat(32),
-      revision: 3,
-      title: "api.alice.duck",
-      srcUrl: "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
-      fileCount: 0,
-      totalBytes: 0,
-    });
-    renderBrowser();
-    const address = screen.getByRole("textbox", { name: "Duck address" });
-    fireEvent.change(address, { target: { value: "api.alice.duck/v1" } });
-    fireEvent.submit(address.closest("form")!);
-
-    await waitFor(() => expect(openWindow).toHaveBeenCalledWith(
-      "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
-      "api.alice.duck",
-    ));
-    expect(screen.queryByTestId("duck-browser-frame")).toBeNull();
-    expect(screen.getByText("SIGNED GATEWAY ROUTE")).toBeInTheDocument();
-    expect(screen.getByText("Opened in an isolated gateway window")).toBeInTheDocument();
-  });
-
-  it("embeds the gateway session inline on shells that support it", async () => {
+  it("embeds every account target in the capability-free inline gateway view", async () => {
     // jsdom has no ResizeObserver; the inline effect needs one.
     vi.stubGlobal("ResizeObserver", class {
       observe() {}
       disconnect() {}
     });
-    vi.spyOn(gateway, "inlineSupported").mockResolvedValue(true);
-    const openWindow = vi.spyOn(gateway, "openWindow").mockResolvedValue();
     const openInline = vi.spyOn(gateway, "openInline").mockResolvedValue();
     const closeInline = vi.spyOn(gateway, "closeInline").mockResolvedValue();
     vi.spyOn(duckBrowser, "loadDuckPage").mockResolvedValue({
@@ -118,7 +81,7 @@ describe("BrowserView security boundary", () => {
       signer: "33".repeat(32),
       revision: 3,
       title: "api.alice.duck",
-      srcUrl: "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
+      srcUrl: "duck://api.alice.duck/v1",
       fileCount: 0,
       totalBytes: 0,
     });
@@ -129,13 +92,59 @@ describe("BrowserView security boundary", () => {
 
     await screen.findByTestId("gateway-inline-pane");
     await waitFor(() => expect(openInline).toHaveBeenCalledWith(
-      "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
+      "duck://api.alice.duck/v1",
+      // the .duck route names the site in a permission prompt (same as its
+      // stable duck:// origin now)
+      "api.alice.duck",
+      "tab-1",
       expect.objectContaining({ width: expect.any(Number), height: expect.any(Number) }),
     ));
-    expect(openWindow).not.toHaveBeenCalled();
-    expect(screen.queryByText("Opened in an isolated gateway window")).toBeNull();
+    expect(screen.queryByTestId("duck-browser-frame")).toBeNull();
+    expect(screen.getByText("SIGNED")).toBeInTheDocument();
 
     view.unmount();
     expect(closeInline).toHaveBeenCalled();
+  });
+
+  it("keeps independent addresses across browser tabs", () => {
+    renderBrowser();
+    const first = screen.getByRole("textbox", { name: "Duck address" });
+    fireEvent.change(first, { target: { value: "site.demo.duck" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "New tab" }));
+    expect(screen.getByRole("textbox", { name: "Duck address" })).toHaveValue("net.duck");
+    fireEvent.change(screen.getByRole("textbox", { name: "Duck address" }), {
+      target: { value: "app.demo.duck" },
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "site.demo.duck" }));
+    expect(screen.getByRole("textbox", { name: "Duck address" })).toHaveValue("site.demo.duck");
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+  });
+
+  it("hides gateway children without disposing tabs when another screen is shown", async () => {
+    const hideAll = vi.spyOn(gateway, "hideAllInline").mockResolvedValue();
+    const closeInline = vi.spyOn(gateway, "closeInline").mockResolvedValue();
+    const view = renderBrowser({}, makeTransportStub(), true);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Duck address" }), {
+      target: { value: "site.demo.duck" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "New tab" }));
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+
+    view.rerender(
+      <ConsoleContext.Provider value={{
+        state: { ...createInitialState(), connected: true },
+        actions,
+        transport: makeTransportStub(),
+      }}>
+        <BrowserView visible={false} />
+      </ConsoleContext.Provider>,
+    );
+
+    await waitFor(() => expect(hideAll).toHaveBeenCalled());
+    expect(closeInline).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
   });
 });

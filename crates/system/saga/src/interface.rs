@@ -29,6 +29,7 @@
 //! the requester in the SAME block — requesters depend only on this crate to
 //! decode it. reads go via [`SagaQuery`] -> [`SagaReply`].
 
+use sdk::codec;
 use serde::{Deserialize, Serialize};
 
 /// a saga's stable id, chosen by the trigger.
@@ -80,6 +81,39 @@ pub enum SagaOrigin {
     System,
 }
 
+/// append a [`SagaOrigin`] in its canonical byte form: a single-byte
+/// discriminant, plus the length-prefixed key/module id for the carrying
+/// variants. shared with every module that folds a `SagaOrigin` into its own
+/// root preimage (dispatch's recipe owner), so the byte form exists once.
+pub fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
+    match origin {
+        SagaOrigin::External(key) => {
+            out.push(0);
+            codec::push_bytes(out, key);
+        }
+        SagaOrigin::Module(module) => {
+            out.push(1);
+            codec::push_str(out, module);
+        }
+        SagaOrigin::System => out.push(2),
+    }
+}
+
+/// decode a [`put_origin`] encoding off the cursor; unknown discriminants
+/// reject, so a state has exactly one valid encoding.
+pub fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, sdk::Error> {
+    Ok(match cur.byte("origin discriminant")? {
+        0 => SagaOrigin::External(cur.bytes("origin key")?.to_vec()),
+        1 => SagaOrigin::Module(cur.string("origin module")?),
+        2 => SagaOrigin::System,
+        d => {
+            return Err(sdk::Error::Module(format!(
+                "unknown origin discriminant {d}"
+            )));
+        }
+    })
+}
+
 /// ops targeting the saga module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -119,8 +153,7 @@ pub enum SagaMsg {
         /// set) is recorded but does not influence assignment. a dark pinned
         /// node burns attempts through lease expiry until the saga fails or
         /// times out — that is what static binding means. must be non-empty
-        /// when set. defaults to `None` so pre-existing encodings decode.
-        #[serde(default)]
+        /// when set.
         pinned_assignee: Option<Vec<u8>>,
     },
     /// worker completion for one attempt, submitted as an op. `outcome` is
@@ -132,7 +165,18 @@ pub enum SagaMsg {
         /// [`WorkerRequest`]; a stale attempt is a deterministic no-op.
         attempt: u32,
         outcome: Result<Vec<u8>, String>,
+        /// executor-reported model usage. observability only: the assignee
+        /// controls this value, so it is never proof for billing or rewards.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
+    /// renew the current attempt's lease. only the current external assignee
+    /// may renew, only before expiry, and never beyond the saga deadline.
+    RenewLease { saga_id: SagaId, attempt: u32 },
+    /// revoke the current attempt and assign a different provider. only the
+    /// trigger origin may request this; the incremented attempt fences every
+    /// late heartbeat/result from the old holder.
+    Reassign { saga_id: SagaId, attempt: u32 },
     /// claim an UNASSIGNED attempt: the first accept in consensus order
     /// becomes the attempt's assignee (its lease starts) and the saga
     /// re-emits the [`WorkerRequest`] effect naming the winner — only the
@@ -154,6 +198,18 @@ pub enum SagaMsg {
     /// remove TERMINAL sagas — only the recorded trigger origin per id;
     /// non-terminal, foreign, and unknown ids are skipped as no-ops.
     Prune { saga_ids: Vec<SagaId> },
+}
+
+/// executor-reported token counters normalized across provider CLIs. cached
+/// and reasoning tokens are subsets of input/output respectively; totals are
+/// therefore `input_tokens + output_tokens`, never the sum of every field.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
 }
 
 /// the payload of the [`sdk::Effect`] a trigger (or retry) emits: the
@@ -267,7 +323,6 @@ pub struct SagaView {
     pub max_attempts: u32,
     pub assignee: Option<Vec<u8>>,
     /// the trigger's static binding, echoed onto every attempt's lease.
-    #[serde(default)]
     pub pinned_assignee: Option<Vec<u8>>,
     pub lease_views: Option<u64>,
     pub lease_expires_at: Option<u64>,

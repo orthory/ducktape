@@ -113,16 +113,15 @@ pub use interface::*;
 
 // dispatch payload composition: the structured run envelope.
 mod envelope;
-pub use envelope::RUN_ENVELOPE_VERSION;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
-    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES,
-    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    decode_event as agent_decode_event, decode_reply as agent_decode_reply,
-    encode_query as agent_encode_query,
+    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED,
+    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery,
+    AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
+    MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
+    decode_reply as agent_decode_reply, encode_query as agent_encode_query,
 };
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
@@ -157,17 +156,22 @@ use tasks::{
 
 /// how many transcript messages (newest-first, ending at the anchor) one run
 /// embeds into its composed payload — the bounded prompt window (P4).
-pub const CONTEXT_WINDOW: u64 = 64;
+pub(crate) const CONTEXT_WINDOW: u64 = 64;
 
 /// whole-dispatch deadline granted to a run's LLM work, in views past the
-/// dispatching block.
-pub const RUN_DEADLINE_VIEWS: u64 = 1024;
+/// dispatching block. leases renew independently; this hard ceiling only
+/// bounds a malicious/chatty holder and leaves multi-hour work ample room.
+pub const RUN_DEADLINE_VIEWS: u64 = 6 * 60 * 60;
 
-/// oracle attempts per run: one retry after a failed or expired attempt.
+/// one renewable agent-attempt lease. Saga's 64-view default is sized for
+/// short workers; the host heartbeats this wider window while the CLI lives.
+pub const RUN_LEASE_VIEWS: u64 = 1024;
+
+/// oracle attempts per run: one retry after an explicit provider failure.
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
 /// jobs-board claims created by the runs worker use a view-denominated lease.
-pub const JOB_RUN_LEASE_VIEWS: u64 = 1000;
+pub(crate) const JOB_RUN_LEASE_VIEWS: u64 = 1000;
 
 /// jobs finalization payloads must fit the jobs module's 64 KiB cap.
 const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -183,6 +187,26 @@ const RUN_KEY_SEPARATOR: char = RESERVED_ID_SEPARATOR;
 pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
     format!(
         "chat{RUN_KEY_SEPARATOR}{channel_id}{RUN_KEY_SEPARATOR}{anchor_seq}{RUN_KEY_SEPARATOR}{agent_id}"
+    )
+}
+
+/// Internal pending-state coordinate for a Pages comment thread. The `runs:`
+/// chat namespace is reserved to this module, and Runs never mints chat
+/// channels below this sub-prefix, so the existing snapshot shape can carry
+/// the source discriminator without colliding with a real chat run.
+const PAGE_CHANNEL_PREFIX: &str = "runs:pages:";
+
+fn page_channel_id(thread_id: &str) -> String {
+    format!("{PAGE_CHANNEL_PREFIX}{thread_id}")
+}
+
+fn page_thread_id(channel_id: &str) -> Option<&str> {
+    channel_id.strip_prefix(PAGE_CHANNEL_PREFIX)
+}
+
+pub fn page_run_id_for(thread_id: &str, ordinal: u64, agent_id: &str) -> String {
+    format!(
+        "page{RUN_KEY_SEPARATOR}{thread_id}{RUN_KEY_SEPARATOR}{ordinal}{RUN_KEY_SEPARATOR}{agent_id}"
     )
 }
 
@@ -203,9 +227,48 @@ pub fn reply_message_id(run_id: &str) -> String {
     format!("agent/{run_id}")
 }
 
+/// which lane an agent action is being applied from — and therefore how its
+/// minted ids are NUMBERED. every id an action mints (a chat message id, a
+/// pages thread/comment id) is derived from `(run_id, slot)` and nothing else:
+/// no host randomness, no wall clock, so every replaying validator derives
+/// byte-identical ids (X2).
+///
+/// the two lanes must never SHARE a slot: the settle path numbers actions by
+/// their index in the delivered response, and the session lane by its committed
+/// action counter — both count from 0, so an `s` prefix keeps the session's id
+/// space disjoint. without it a mid-run write would squat exactly the id the
+/// final response's nth action mints, and that action would silently degrade
+/// (pages) on the id it was owed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Lane {
+    /// the settle path: the nth action of the run's delivered response.
+    Settle,
+    /// the session lane: the nth action of the run's open agent session.
+    Session(u32),
+}
+
+impl Lane {
+    /// the id salt of the action at `index` in this lane's action list.
+    fn slot(self, index: usize) -> String {
+        match self {
+            Lane::Settle => index.to_string(),
+            Lane::Session(actions) => format!("s{actions}"),
+        }
+    }
+}
+
+/// the chat message id of an agent's `chat.post_message` — distinct from
+/// [`reply_message_id`] (the run's ONE reply) and per-slot unique, so the id is
+/// free by construction unless a submitter squatted it (which the emit probe
+/// catches). the slot is the action's [`Lane`] slot: its index in the delivered
+/// response, or `s{n}` for the nth action of the run's session.
+pub fn post_message_id(run_id: &str, slot: &str) -> String {
+    format!("agent/{run_id}/post/{slot}")
+}
+
 /// the dispatch-plane recipe an agent's runs execute under — registered
 /// (module-owned) by the registry hook in the same block as the agent itself.
-pub fn recipe_id_for(agent_id: &str) -> String {
+pub(crate) fn recipe_id_for(agent_id: &str) -> String {
     format!("agent/{agent_id}")
 }
 
@@ -221,6 +284,21 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// THE char-boundary truncator (one home for what was four hand-rolled
+/// loops): `s` within `budget` bytes is returned untouched; otherwise it is
+/// cut at the largest char boundary that leaves room for `suffix`, and the
+/// suffix is appended — the result never exceeds `budget` bytes.
+pub(crate) fn truncate_on_boundary(s: &str, budget: usize, suffix: &str) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    let mut keep = budget.saturating_sub(suffix.len());
+    while keep > 0 && !s.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{suffix}", &s[..keep])
+}
+
 mod admin;
 mod agent_intake;
 mod dispatch_flow;
@@ -234,18 +312,18 @@ mod forge_source;
 mod inject;
 mod jobs_intake;
 mod module_impl;
+// the pages effects lane (M2): pages.comment / pages.set_checked applied at
+// the run boundary — probe-guarded, cap-gated, per-action degrade.
+mod pages_effects;
 mod response;
+// the agent session lane: the mid-run write path — an ephemeral key bound to a
+// live run, and the actions it signs, validated against the SAME grant the
+// settle path validates.
+mod sessions;
 // the delivery sink (O1/O2): the forge PR sink applied at the result intake —
 // gates, duplicate-PR guard, and message-facet title/body derivation.
 mod sink;
 mod state;
-
-// crate-root aliases for the pre-split names the forge modules were written
-// against (they cross module boundaries: the wire mirrors live in facets, the
-// reply rendering in response, the ListRefs mirror in sink).
-pub(crate) use facets::{WireSink, WorkspaceReceipt};
-pub(crate) use response::{REPLY_KIND_CODE, truncate_utf8};
-pub(crate) use sink::ForgeSinkQuery;
 
 use response::canonical_origin;
 use state::{
@@ -280,7 +358,10 @@ impl PendingState {
     fn run_id(&self) -> String {
         match &self.job_id {
             Some(job_id) => job_run_id_for(job_id, &self.agent_id, self.job_claim_height),
-            None => run_id_for(&self.channel_id, self.anchor_seq, &self.agent_id),
+            None => match page_thread_id(&self.channel_id) {
+                Some(thread_id) => page_run_id_for(thread_id, self.anchor_seq, &self.agent_id),
+                None => run_id_for(&self.channel_id, self.anchor_seq, &self.agent_id),
+            },
         }
     }
 }
@@ -318,23 +399,36 @@ pub struct RunsModule {
     /// surface. `None` on nodes not wired for the sink; the sink then degrades
     /// to a breadcrumb.
     forge: Option<ModuleId>,
-    /// the duckfs/files module id — queried for the committed head that a
-    /// portable (v3) envelope pins as `source_snapshot` (W2). genesis config,
-    /// NOT committed state (never in `root()`), so it adds no consensus surface.
-    /// its PRESENCE is what selects the portable v3 composer: `Some` composes v3
-    /// (pins the committed head), `None` composes the v2 wire.
+    /// the duckfs/files module id — queried for the committed head every
+    /// envelope pins as `source_snapshot` (W2). genesis config, NOT committed
+    /// state (never in `root()`), so it adds no consensus surface. every
+    /// production composer wires it; unwired (dev tools/tests) the envelope
+    /// still composes v3, with a null pin.
     files: Option<ModuleId>,
+    /// the pages module id — queried for `[[page:<id>]]` refs so a run's
+    /// context can carry referenced page subtrees (M2). genesis config, NOT
+    /// committed state (never in `root()`). `None` on nodes not wired for
+    /// pages; page refs then compose no page section (a silent skip, never
+    /// a failure).
+    pages: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
     /// delivery; the dispatch module owns lifecycle and history.
     pending: BTreeMap<String, PendingState>,
+    /// the LIVE agent sessions keyed by run id — the ephemeral key each
+    /// executing node bound to its run, plus the budget it has spent. committed
+    /// state (in `root()`): the ACL every validator enforces mid-run, so it must
+    /// be the same on all of them. bounded by the pending runs — a session is
+    /// pruned in the same block as its run's entry and can never outlive it.
+    sessions: BTreeMap<String, AgentSession>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
     /// `commit_block`. a watch stages `None` for removal (unwatch); a pending
-    /// entry stages `None` for its prune.
+    /// entry stages `None` for its prune; a session stages `None` for its prune.
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
+    pending_sessions: BTreeMap<String, Option<AgentSession>>,
     /// the delivered-runs ring (last [`RUN_HISTORY_CAP`], oldest first —
     /// queries serve it reversed). DERIVED state: recorded at delivery,
     /// rebuilt by replay, never in `root()`/snapshot, empty after a
@@ -395,10 +489,13 @@ impl RunsModule {
             jobs,
             forge: None,
             files: None,
+            pages: None,
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
+            pending_sessions: BTreeMap::new(),
             history: VecDeque::new(),
             pending_history: Vec::new(),
         }
@@ -426,11 +523,11 @@ impl RunsModule {
         self
     }
 
-    /// wire the duckfs/files module so a portable (v3) envelope can pin the
-    /// committed head as `source_snapshot` (W2), after construction — mirrors
-    /// the injected `Option<ModuleId>` collaborators so `new` and every existing
-    /// call site stay untouched. wiring it is what makes the composer emit the
-    /// portable v3 wire; unwired, the composer emits the v2 wire.
+    /// wire the duckfs/files module so the envelope pins the committed head
+    /// as `source_snapshot` (W2), after construction — mirrors the injected
+    /// `Option<ModuleId>` collaborators so `new` and every existing call site
+    /// stay untouched. every production composer wires it; unwired, the
+    /// envelope composes with a null pin.
     pub fn with_files_module(mut self, files: impl Into<ModuleId>) -> Self {
         let files = files.into();
         assert!(
@@ -438,6 +535,21 @@ impl RunsModule {
             "files module id must be distinct from the runs module id"
         );
         self.files = Some(files);
+        self
+    }
+
+    /// wire the pages module so `[[page:<id>]]` refs in a run's trigger
+    /// message or injected item body render referenced page subtrees into the
+    /// composed context (M2), after construction — mirrors the injected
+    /// `Option<ModuleId>` collaborators so `new` and every existing call site
+    /// stay untouched. unwired, page refs compose no page section.
+    pub fn with_pages_module(mut self, pages: impl Into<ModuleId>) -> Self {
+        let pages = pages.into();
+        assert!(
+            pages != self.id,
+            "pages module id must be distinct from the runs module id"
+        );
+        self.pages = Some(pages);
         self
     }
 
@@ -454,6 +566,13 @@ impl RunsModule {
         match self.pending_overlay.get(dispatch_id) {
             Some(staged) => staged.as_ref(),
             None => self.pending.get(dispatch_id),
+        }
+    }
+
+    fn session(&self, run_id: &str) -> Option<&AgentSession> {
+        match self.pending_sessions.get(run_id) {
+            Some(staged) => staged.as_ref(),
+            None => self.sessions.get(run_id),
         }
     }
 
@@ -528,7 +647,7 @@ impl RunsModule {
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
     pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.watches, &self.pending)
+        encode_committed(&self.watches, &self.pending, &self.sessions)
     }
 
     /// adopt a peer's snapshot as own committed state — but only after the
@@ -539,16 +658,18 @@ impl RunsModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (watches, pending) = decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&watches, &pending) != expected {
+        let (watches, pending, sessions) = decode_committed(bytes).map_err(Error::Module)?;
+        if committed_root(&watches, &pending, &sessions) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
             ));
         }
         self.watches = watches;
         self.pending = pending;
+        self.sessions = sessions;
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        self.pending_sessions.clear();
         // the ring is derived per-node state: a snapshot describes a block
         // boundary this node never executed, so its history starts empty.
         self.history.clear();

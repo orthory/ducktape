@@ -38,7 +38,6 @@ use crate::replica;
 use crate::resident_announce;
 use crate::resident_dispatch;
 use crate::rpc::{RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
-use crate::statesync_plane;
 use crate::sync::catchup::{catch_up_post_reboot_frames, PostRebootCatchupError};
 use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
@@ -104,6 +103,28 @@ pub(super) async fn park(
         relay_rx,
         mut lobby_tx,
     } = channels;
+    let agent_peers = (wireguard_listen.is_some()
+        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake))
+    .then(|| {
+        let tracked = crate::voice_plane::MediaPeers::new(
+            String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+        );
+        tracked.set_peers(peers.iter());
+        let me: [u8; 32] = signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 keys are 32 bytes");
+        crate::agent_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(&tracked),
+            me,
+            bulk_pacer.clone(),
+            stream_hub.run_output(),
+        );
+        tracked
+    });
     let gateway_book = gateway_requests.map(|requests| {
         let book = crate::gateway_plane::OverlayBook::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -114,7 +135,7 @@ pub(super) async fn park(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 pacer: bulk_pacer.clone(),
                 commands: gateway_commands,
                 workspace,
@@ -123,13 +144,13 @@ pub(super) async fn park(
         );
         book
     });
-    let Some(server_peer) = sync_source else {
+    if sync_source.is_none() {
         eprintln!(
             "[node {label}] no statesync source: no validator other than this node \
              is available to serve (only validators answer the statesync channel)"
         );
         std::process::exit(1);
-    };
+    }
     // the resident's mesh blob fetch-on-miss lane (the #298 cross-node
     // gap, resident side): the oracle pool's resolver asks current peers
     // for a digest its own store lacks, over this same statesync channel.
@@ -148,13 +169,9 @@ pub(super) async fn park(
         signer.public_key(),
     )
     .into_fetch_fn();
-    // the joiner's sync client: the mesh path always works and
-    // ROTATES across every validator that can serve; with the
-    // statesync plane enabled, requests PREFER an overlay stream to
-    // the primary source and fall back on transport failure — the
-    // plane binds lazily once the invite tunnel brings the interface
-    // up.
-    let mesh_client = P2pSyncClient::with_sources(
+    // the joiner's sync client: the mesh path, ROTATING across every
+    // validator that can serve.
+    let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
@@ -166,31 +183,6 @@ pub(super) async fn park(
             let _ = blob_fetch::classify_mesh_frame(&blob_pending, id, body);
         })),
     );
-    let client = {
-        let plane_slot: statesync_plane::PlaneSlot =
-            std::sync::Arc::new(std::sync::OnceLock::new());
-        if statesync_plane::enabled() && wireguard_listen.is_some() {
-            let book = statesync_plane::OverlayBook::new(
-                String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-            );
-            book.set_peers(peers.iter());
-            statesync_plane::spawn_bring_up(
-                label.clone(),
-                book,
-                signer.public_key(),
-                std::sync::Arc::clone(&plane_slot),
-                statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
-                bulk_pacer.clone(),
-                None,
-            );
-        }
-        statesync_plane::PlaneFallbackClient::new(
-            plane_slot,
-            &server_peer,
-            mesh_client,
-            label.clone(),
-        )
-    };
 
     // the announce, built once: this key + the invite token + the
     // proof-of-possession binding them. re-sent (round-robin over the
@@ -328,7 +320,7 @@ pub(super) async fn park(
             eprintln!(
                 "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
                  protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                ckpt.required_min_version()
+                ckpt.required_min_version
             );
             std::process::exit(1);
         }
@@ -486,9 +478,9 @@ pub(super) async fn park(
     // drained by the park loop's pump pass, so a minutes-long run
     // never stalls the serve window, boundary follow, or promotion
     // detection.
-    let resident_provider_set = capability_host::discover_with_dirs_and_output_sink(
+    let resident_provider_set = capability_host::discover(
         agent_dirs.clone(),
-        run_output_sink(stream_hub.run_output()),
+        Some(run_output_sink(stream_hub.run_output())),
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let resident_capabilities = resident_provider_set.capabilities();
@@ -652,6 +644,30 @@ pub(super) async fn park(
                                         &mut relay_tx,
                                         target,
                                         payload,
+                                        relay_runtime::ResidentHold::Http(reply),
+                                    ) {
+                                        Ok(_) => {}
+                                        Err((hold, e)) => hold.fail(e),
+                                    }
+                                }
+                            }
+                            // an ALREADY-SIGNED frame (an agent's session key,
+                            // not this node's): relayed VERBATIM — the resident
+                            // is the courier, never the author, so it neither
+                            // re-signs nor spends its own seq. the custodian
+                            // validator verifies the signature before it pins,
+                            // exactly as it does for a frame the resident signed
+                            // itself. same standing rule as above: no standing,
+                            // no boundary, no relay.
+                            noded::NodeCommand::SubmitFrame { frame, reply } => {
+                                if !resident_standing || serving.is_none() {
+                                    let _ =
+                                        reply.send(Err(not_serving(resident_standing)));
+                                } else {
+                                    match resident_relay.submit_frame(
+                                        frame,
+                                        &announce_targets,
+                                        &mut relay_tx,
                                         relay_runtime::ResidentHold::Http(reply),
                                     ) {
                                         Ok(_) => {}
@@ -1006,6 +1022,9 @@ pub(super) async fn park(
                     if let Some(book) = &gateway_book {
                         book.set_peers(plan.valset().transport_members().iter());
                     }
+                    if let Some(peers) = &agent_peers {
+                        peers.set_peers(plan.valset().transport_members().iter());
+                    }
                     last_tracked = plan.epoch();
                     // the follower swap: same OrderedNode, fresh
                     // orderer, cutover journaled — the epoch-local
@@ -1186,14 +1205,19 @@ pub(super) async fn park(
             // set — follow the re-track.
             *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
             oracle.track(tip.epoch, mesh);
-            if let Some(book) = &gateway_book {
+            if gateway_book.is_some() || agent_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip
                     .participants
                     .iter()
                     .chain(tip.residents.iter())
                     .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
                     .collect();
-                book.set_peers(transport.iter());
+                if let Some(book) = &gateway_book {
+                    book.set_peers(transport.iter());
+                }
+                if let Some(peers) = &agent_peers {
+                    peers.set_peers(transport.iter());
+                }
             }
             last_tracked = tip.epoch;
         }

@@ -21,6 +21,7 @@ import { primaryButton, runIsMine, secondaryButton, statusTone } from "./parts";
 import { RegisterAgentForm } from "./RegisterAgentForm";
 import { RosterList } from "./RosterList";
 import { JobsWorkerRow, RunsTimeline } from "./RunsTimeline";
+import { UsageCard } from "./UsageCard";
 import { WatchesPanel } from "./WatchesPanel";
 
 export { runIsMine };
@@ -150,8 +151,8 @@ export function AgentView() {
           style={{
             margin: 0,
             font: `650 18px ${font.sans}`,
-            letterSpacing: "-.01em",
-            color: color.dark,
+            letterSpacing: "0",
+            color: color.ink,
           }}
         >
           Agents
@@ -248,6 +249,7 @@ export function AgentView() {
               op={state.ops[opKey.jobWorker()]}
               onToggle={toggleJobWorker}
             />
+            <UsageCard refreshKey={state.pendingRuns.map((run) => run.run_id).join("\n")} />
             <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
               {(["all", "mine"] as const).map((f) => (
                 <button
@@ -278,7 +280,9 @@ export function AgentView() {
               channels={state.channels}
               ops={state.ops}
               onCancel={actions.cancelRun}
-              runAssignee={state.runAssignee}
+              onReassign={actions.reassignRun}
+              runLease={state.runLease}
+              currentHeight={state.status?.height ?? state.lastBlock ?? 0}
               authorNames={state.authorNames}
               workspacePubkey={state.workspace?.pubkey ?? null}
             />

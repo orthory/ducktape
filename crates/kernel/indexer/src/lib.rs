@@ -225,7 +225,7 @@ pub fn user_handle(bytes: &[u8]) -> String {
     {
         return text.to_string();
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex(bytes)
 }
 
 /// one dispatch a finalized block applied: the target module, the trigger, and

@@ -1,0 +1,168 @@
+// Your workspaces, as a table — the account Home's replacement for hunting
+// through Settings to switch networks. One row per workspace on this machine:
+// its name, its network id, and (for the CONNECTED one only, since standing is
+// chain-scoped) whether this device's node is a validator, a resident, or has
+// no seat. Enter routes through selectWorkspace, exactly the switch the old
+// NodesCard "Open" button did. "+ Add workspace" opens the onboarding gate.
+
+import { normalizeKey } from "../../../domain/names";
+import { useDucktape } from "../../store/use-ducktape";
+import { color, font, radius, tint } from "../../theme/tokens";
+import { HoverButton, outlineButton, SectionLabel } from "../settings/parts";
+
+type Standing = "Validator" | "Resident" | "No seat";
+
+function standingChip(standing: Standing) {
+  const palette =
+    standing === "Validator"
+      ? { fg: color.onDark, bg: color.dark, bd: color.dark }
+      : standing === "Resident"
+        ? { fg: tint(color.green).text, bg: tint(color.green).bg, bd: tint(color.green).border }
+        : { fg: color.muted2, bg: color.sunken, bd: color.border };
+  return (
+    <span
+      style={{
+        font: `600 9px ${font.mono}`,
+        color: palette.fg,
+        background: palette.bg,
+        border: `1px solid ${palette.bd}`,
+        borderRadius: 4,
+        padding: "2px 6px",
+        letterSpacing: ".04em",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {standing}
+    </span>
+  );
+}
+
+const cell: React.CSSProperties = {
+  padding: "9px 12px",
+  borderBottom: `1px solid ${color.borderSoft}`,
+  font: `500 12px ${font.sans}`,
+  color: color.ink,
+  textAlign: "left",
+  verticalAlign: "middle",
+};
+
+const headCell: React.CSSProperties = {
+  ...cell,
+  font: `600 9.5px ${font.mono}`,
+  letterSpacing: ".06em",
+  color: color.muted,
+};
+
+export function WorkspacesTable() {
+  const { state, actions } = useDucktape();
+
+  const validators = new Set(state.members.map(normalizeKey));
+  const residents = new Set(state.residents.map(normalizeKey));
+  const standingOf = (nodeHex: string): Standing =>
+    validators.has(normalizeKey(nodeHex))
+      ? "Validator"
+      : residents.has(normalizeKey(nodeHex))
+        ? "Resident"
+        : "No seat";
+
+  return (
+    <>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginTop: 18,
+        }}
+      >
+        <SectionLabel>YOUR WORKSPACES</SectionLabel>
+        <HoverButton
+          ariaLabel="Add workspace"
+          onClick={() => actions.newWorkspace()}
+          hoverBg={color.titlebar}
+          style={outlineButton}
+        >
+          + Add workspace
+        </HoverButton>
+      </div>
+
+      <div
+        style={{
+          border: `1px solid ${color.border}`,
+          borderRadius: radius.lg,
+          overflow: "hidden",
+          background: color.paper,
+        }}
+      >
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={headCell}>Workspace</th>
+              <th style={headCell}>Network</th>
+              <th style={headCell}>Your standing</th>
+              <th style={headCell}>Active</th>
+              <th style={{ ...headCell, textAlign: "right" }} />
+            </tr>
+          </thead>
+          <tbody>
+            {state.workspaces.map((w, i) => {
+              const active = state.workspace?.id === w.id;
+              const last = i === state.workspaces.length - 1;
+              const rowCell = last ? { ...cell, borderBottom: undefined } : cell;
+              return (
+                <tr key={w.id}>
+                  <td style={rowCell}>{w.name}</td>
+                  <td style={{ ...rowCell, font: `500 11px ${font.mono}`, color: color.muted }}>
+                    {w.chainId}
+                  </td>
+                  <td style={rowCell}>
+                    {active ? standingChip(standingOf(w.pubkey)) : <span style={{ color: color.muted3 }}>—</span>}
+                  </td>
+                  <td style={rowCell}>
+                    {active ? (
+                      <span
+                        aria-label="Active workspace"
+                        style={{
+                          font: `600 9px ${font.mono}`,
+                          color: tint(color.green).text,
+                          background: tint(color.green).bg,
+                          border: `1px solid ${tint(color.green).border}`,
+                          borderRadius: 4,
+                          padding: "2px 6px",
+                          letterSpacing: ".04em",
+                        }}
+                      >
+                        ACTIVE
+                      </span>
+                    ) : (
+                      <span style={{ color: color.muted3 }}>—</span>
+                    )}
+                  </td>
+                  <td style={{ ...rowCell, textAlign: "right" }}>
+                    {!active && (
+                      <HoverButton
+                        ariaLabel={`Enter ${w.name}`}
+                        onClick={() => actions.selectWorkspace(w.id)}
+                        hoverBg={color.titlebar}
+                        style={outlineButton}
+                      >
+                        Enter
+                      </HoverButton>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {state.workspaces.length === 0 && (
+              <tr>
+                <td style={{ ...cell, borderBottom: undefined, color: color.muted }} colSpan={5}>
+                  No workspaces yet — add one to get started.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}

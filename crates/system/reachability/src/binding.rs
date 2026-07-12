@@ -1,5 +1,5 @@
 //! Deterministic (chain_id, epoch, members) commitments. The node has no
-//! consensus-state admission-root concept, so the `wireguard-upgrade`
+//! consensus-state admission-root concept, so the `wireguard`
 //! `ActiveValidatorSet` binding is DERIVED: domain-separated hashes over the
 //! chain id, the epoch, and the sorted member identities. Every node computes
 //! the same binding from the same cutover event — no state lookup, no
@@ -7,7 +7,7 @@
 //! the mesh (its roots differ), which is the binding's whole job.
 
 use sha2::{Digest as _, Sha256};
-use wireguard_upgrade::{
+use wireguard::{
     ActiveValidatorSet, AdmissionRoot, PortPolicy, Root, UpgradeError, ValidatorIdentity,
 };
 
@@ -85,7 +85,7 @@ pub fn node_key(identity: ValidatorIdentity) -> NodeKey {
     NodeKey(identity.0)
 }
 
-/// Map a commonware ed25519 public key to the `wireguard-upgrade` identity
+/// Map a commonware ed25519 public key to the `wireguard` identity
 /// type (both are the raw 32 public-key bytes).
 pub fn identity_of(pk: &commonware_cryptography::ed25519::PublicKey) -> ValidatorIdentity {
     let mut raw = [0u8; 32];
@@ -115,7 +115,7 @@ fn members_commitment(
 }
 
 // length-prefixed so no two (domain, chain_id) pairs can collide by
-// concatenation — the same discipline as wireguard-upgrade's preimages.
+// concatenation — the same discipline as the wireguard crate's preimages.
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u64).to_be_bytes());
     out.extend_from_slice(s.as_bytes());

@@ -26,9 +26,8 @@
 //! schemes are built the PRODUCTION way (`Scheme::signer`, as bin/node does), not
 //! the mocks fixture, so the 4-subset and 5-superset share identical keys. the
 //! scenario is SCHEME-PARAMETRIC: `scenario` takes a `(namespace, subset, member)
-//! -> scheme` factory, so the same join-by-respawn proof runs under BOTH V1
-//! ed25519 and V2 bls multisig (only scheme construction differs — the respawn
-//! contract itself is scheme-independent, which is exactly the point).
+//! -> scheme` factory — the respawn contract itself is scheme-independent, which
+//! is exactly the point; today only V1 ed25519 is wired.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -60,18 +59,6 @@ fn ed25519_scheme_for(
     let sk = ed25519::PrivateKey::from_seed(seed_of(v));
     simplex_ed25519::Scheme::signer(namespace, participants.clone(), sk)
         .expect("member is in the set")
-}
-
-/// V2 factory: the dual-key bls signer over the epoch's subset — the (identity ->
-/// bls) map is derived from the SAME dev seeds, so the 4-set and 5-superset stay
-/// key-identical exactly like V1 (the respawn only swaps the participant map).
-fn bls_scheme_for(
-    namespace: &[u8],
-    participants: &Set<ed25519::PublicKey>,
-    v: &ed25519::PublicKey,
-) -> consensus::BlsScheme {
-    let seeds: Vec<u64> = participants.iter().map(seed_of).collect();
-    consensus::bls_dev_scheme(namespace, &seeds, seed_of(v)).expect("member is in the set")
 }
 
 /// drive the whole join-by-respawn scenario under one deterministic schedule,
@@ -269,13 +256,4 @@ fn a_joined_validator_is_incorporated_after_epoch_respawn() {
     // panics (rather than hanging) — the simplex analog of a non-incorporation.
     deterministic::Runner::timed(Duration::from_secs(300))
         .start(|context| scenario(context, ed25519_scheme_for));
-}
-
-#[test]
-fn a_joined_validator_is_incorporated_after_epoch_respawn_under_bls_multisig() {
-    // the V2 twin: the same teardown-and-respawn join, but every engine runs the
-    // dual-key bls multisig scheme — proving the epoch-transition rekey mechanism
-    // the ConsensusScheme contract leans on works for the scheme V2 actually uses.
-    deterministic::Runner::timed(Duration::from_secs(300))
-        .start(|context| scenario(context, bls_scheme_for));
 }

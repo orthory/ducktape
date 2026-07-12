@@ -16,7 +16,6 @@ import javascript from "@shikijs/langs/javascript";
 import json from "@shikijs/langs/json";
 import jsx from "@shikijs/langs/jsx";
 import markdown from "@shikijs/langs/markdown";
-import python from "@shikijs/langs/python";
 import rust from "@shikijs/langs/rust";
 import toml from "@shikijs/langs/toml";
 import tsx from "@shikijs/langs/tsx";
@@ -55,7 +54,6 @@ const LANG_BY_EXT: Record<string, string> = {
   htm: "html",
   yaml: "yaml",
   yml: "yaml",
-  py: "python",
   go: "go",
 };
 
@@ -78,7 +76,6 @@ function highlighter(): Promise<HighlighterCore> {
         css,
         html,
         yaml,
-        python,
         go,
       ],
       // forgiving: a grammar regex the JS engine can't compile degrades to a

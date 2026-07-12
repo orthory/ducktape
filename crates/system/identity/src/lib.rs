@@ -42,11 +42,7 @@
 //! record with no nodes but surviving members/name/nonce); an account with an
 //! EMPTY member set is NOT (every live account keeps at least one key).
 //!
-//! MIGRATION NOTE: this is the v2 account format. the wire shape of the ops and
-//! the canonical state encoding both changed from the v1 single-user-key
-//! registry, so it is a coordinated consensus change -- a mixed old/new network
-//! would fork. dev networks re-establish binds automatically (auto-bind runs on
-//! every desktop connect); a versioned rollout uses the node upgrade path.
+//! this is the v2 account format; a mixed v1/v2 network would fork.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -60,6 +56,7 @@ pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_challenge, web
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sdk::codec::{Cursor, push_bytes, push_opt_str};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
@@ -367,16 +364,16 @@ impl Identity {
     /// accounts (states the execute path can never commit).
     fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, AccountRecord>, Error> {
         let mut cur = Cursor::new(bytes);
-        let count = cur.u64()?;
+        let count = cur.u64("snapshot account count")?;
         // per-account minimum: id-len(8) + name flag(1) + nonce(8) + member
         // count(8) + node count(8) + updated_at(8) = 41 bytes.
         const MIN_ACCOUNT_BYTES: u64 = 41;
-        cur.bound(count, MIN_ACCOUNT_BYTES, "account")?;
+        cur.bound(count, MIN_ACCOUNT_BYTES, "snapshot account")?;
 
         let mut accounts = BTreeMap::new();
         let mut prev_account: Option<Vec<u8>> = None;
         for _ in 0..count {
-            let account_id = cur.bytes()?.to_vec();
+            let account_id = cur.bytes("snapshot account id")?.to_vec();
             if prev_account
                 .as_deref()
                 .is_some_and(|p| p >= account_id.as_slice())
@@ -387,12 +384,12 @@ impl Identity {
             }
             prev_account = Some(account_id.clone());
 
-            let display_name = cur.opt_str(MAX_NAME_LEN, "account name")?;
-            let nonce = cur.u64()?;
+            let display_name = cur.opt_str(MAX_NAME_LEN, "snapshot account name")?;
+            let nonce = cur.u64("snapshot account nonce")?;
 
             let member_keys = Self::decode_members(&mut cur)?;
             let nodes = Self::decode_nodes(&mut cur)?;
-            let updated_at = cur.u64()?;
+            let updated_at = cur.u64("snapshot account updated_at")?;
 
             accounts.insert(
                 account_id,
@@ -405,7 +402,7 @@ impl Identity {
                 },
             );
         }
-        cur.finish()?;
+        cur.finish("snapshot")?;
 
         // no node and no member key may be claimed by two accounts: the execute
         // path enforces single-ownership, so a snapshot claiming otherwise is a
@@ -429,11 +426,11 @@ impl Identity {
     }
 
     fn decode_members(cur: &mut Cursor) -> Result<BTreeMap<Vec<u8>, MemberMeta>, Error> {
-        let count = cur.u64()?;
+        let count = cur.u64("snapshot member count")?;
         // per-member minimum: pubkey-len(8) + kind(1) + label flag(1) + rp
         // flag(1) + added_at(8) = 19 bytes.
         const MIN_MEMBER_BYTES: u64 = 19;
-        cur.bound(count, MIN_MEMBER_BYTES, "member")?;
+        cur.bound(count, MIN_MEMBER_BYTES, "snapshot member")?;
         if count == 0 {
             return Err(Error::Module(
                 "snapshot account has no member keys (every live account keeps one)".into(),
@@ -442,7 +439,7 @@ impl Identity {
         let mut members = BTreeMap::new();
         let mut prev: Option<Vec<u8>> = None;
         for _ in 0..count {
-            let pubkey = cur.bytes()?.to_vec();
+            let pubkey = cur.bytes("snapshot member key")?.to_vec();
             if prev.as_deref().is_some_and(|p| p >= pubkey.as_slice()) {
                 return Err(Error::Module(
                     "snapshot member keys must be strictly increasing within an account".into(),
@@ -450,12 +447,12 @@ impl Identity {
             }
             prev = Some(pubkey.clone());
 
-            let kind = KeyKind::from_tag(cur.byte()?)
+            let kind = KeyKind::from_tag(cur.byte("snapshot member kind")?)
                 .ok_or_else(|| Error::Module("snapshot member has an unknown key kind".into()))?;
-            let label = cur.opt_str(MAX_LABEL_LEN, "member label")?;
-            let rp_id_hash = match cur.byte()? {
+            let label = cur.opt_str(MAX_LABEL_LEN, "snapshot member label")?;
+            let rp_id_hash = match cur.byte("snapshot rp-hash flag")? {
                 0 => None,
-                1 => Some(cur.array::<32>()?),
+                1 => Some(cur.array::<32>("snapshot rp-hash")?),
                 other => {
                     return Err(Error::Module(format!(
                         "snapshot rp-hash flag must be 0 or 1, got {other}"
@@ -468,7 +465,7 @@ impl Identity {
                     "snapshot rp-hash presence does not match the member kind".into(),
                 ));
             }
-            let added_at = cur.u64()?;
+            let added_at = cur.u64("snapshot member added_at")?;
             members.insert(
                 pubkey,
                 MemberMeta {
@@ -483,12 +480,12 @@ impl Identity {
     }
 
     fn decode_nodes(cur: &mut Cursor) -> Result<BTreeSet<Vec<u8>>, Error> {
-        let count = cur.u64()?;
-        cur.bound(count, 8, "node")?;
+        let count = cur.u64("snapshot node count")?;
+        cur.bound(count, 8, "snapshot node")?;
         let mut nodes = BTreeSet::new();
         let mut prev: Option<Vec<u8>> = None;
         for _ in 0..count {
-            let node = cur.bytes()?.to_vec();
+            let node = cur.bytes("snapshot node key")?.to_vec();
             if prev.as_deref().is_some_and(|p| p >= node.as_slice()) {
                 return Err(Error::Module(
                     "snapshot node keys must be strictly increasing within an account".into(),
@@ -498,121 +495,6 @@ impl Identity {
             nodes.insert(node);
         }
         Ok(nodes)
-    }
-}
-
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-/// encode an optional string as a `0` flag, or `1` + length-prefixed bytes.
-fn push_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
-    match s {
-        Some(s) => {
-            out.push(1u8);
-            push_bytes(out, s.as_bytes());
-        }
-        None => out.push(0u8),
-    }
-}
-
-/// a forward-only reader over untrusted snapshot bytes: every accessor checks
-/// the remaining buffer before it reads, so a forged length can never
-/// over-read or drive an allocation the bytes could not back.
-struct Cursor<'a> {
-    buf: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf }
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        let Some((head, rest)) = self.buf.split_first_chunk::<8>() else {
-            return Err(Error::Module("snapshot truncated".into()));
-        };
-        self.buf = rest;
-        Ok(u64::from_le_bytes(*head))
-    }
-
-    fn byte(&mut self) -> Result<u8, Error> {
-        let Some((&b, rest)) = self.buf.split_first() else {
-            return Err(Error::Module("snapshot truncated".into()));
-        };
-        self.buf = rest;
-        Ok(b)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        let Some((head, rest)) = self.buf.split_first_chunk::<N>() else {
-            return Err(Error::Module("snapshot truncated".into()));
-        };
-        self.buf = rest;
-        Ok(*head)
-    }
-
-    /// a `u64`-length-prefixed byte slice, length-checked before the split.
-    fn bytes(&mut self) -> Result<&'a [u8], Error> {
-        let len = self.u64()?;
-        if len > self.buf.len() as u64 {
-            return Err(Error::Module(format!(
-                "snapshot length {len} exceeds the {} remaining bytes",
-                self.buf.len()
-            )));
-        }
-        let (head, rest) = self.buf.split_at(len as usize);
-        self.buf = rest;
-        Ok(head)
-    }
-
-    /// an optional utf-8 string: flag byte `0` (absent) or `1` + a non-empty,
-    /// `max`-bounded, valid-utf8 length-prefixed slice.
-    fn opt_str(&mut self, max: usize, what: &str) -> Result<Option<String>, Error> {
-        match self.byte()? {
-            0 => Ok(None),
-            1 => {
-                let raw = self.bytes()?;
-                if raw.is_empty() {
-                    return Err(Error::Module(format!("snapshot {what} flag set but empty")));
-                }
-                if raw.len() > max {
-                    return Err(Error::Module(format!(
-                        "snapshot {what} exceeds the {max}-byte limit"
-                    )));
-                }
-                let s = std::str::from_utf8(raw)
-                    .map_err(|e| Error::Module(format!("snapshot {what} is not utf-8: {e}")))?;
-                Ok(Some(s.to_string()))
-            }
-            other => Err(Error::Module(format!(
-                "snapshot {what} flag must be 0 or 1, got {other}"
-            ))),
-        }
-    }
-
-    /// reject a forged count that the remaining bytes could not possibly hold,
-    /// before looping -- `count * min_each` must fit.
-    fn bound(&self, count: u64, min_each: u64, what: &str) -> Result<(), Error> {
-        if count > (self.buf.len() as u64) / min_each {
-            return Err(Error::Module(format!(
-                "snapshot {what} count {count} exceeds the {} remaining bytes",
-                self.buf.len()
-            )));
-        }
-        Ok(())
-    }
-
-    fn finish(&self) -> Result<(), Error> {
-        if self.buf.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::Module(format!(
-                "snapshot carries {} trailing bytes",
-                self.buf.len()
-            )))
-        }
     }
 }
 

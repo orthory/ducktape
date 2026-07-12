@@ -66,13 +66,11 @@ pub struct MsgRow {
     pub text: String,
     pub deleted: bool,
     pub edited: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<u64>,
     /// the head's normalized tag labels (appearance order, ≤ 16) — stored so
     /// an edit/delete can diff/clear exactly what this head indexed (the flat
     /// `text` can't re-derive them: it folds code blocks in). tombstones
     /// carry none, like their empty text.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
 

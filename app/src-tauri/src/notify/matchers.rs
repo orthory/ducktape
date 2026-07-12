@@ -7,31 +7,8 @@ use super::{
 
 pub use super::huddle::MatchState;
 
-/// dispatch_id -> (channel, thread seq), captured from the runs module's
-/// Dispatch ops so the run-finished notification can deep-link the thread it
-/// answers. Bounded: an entry evicts when its result delivers, and a hard
-/// size cap guards against dispatches whose delivery this app never sees
-/// (cap overflow drops an arbitrary entry — ids are hashes — which only
-/// costs that run its deep-link, falling back to the agent screen).
-#[derive(Debug, Default)]
-pub struct RunThreadTracker(BTreeMap<String, (String, u64)>);
-
-const RUN_THREADS_MAX: usize = 256;
-
-impl RunThreadTracker {
-    fn insert(&mut self, dispatch_id: String, channel: String, seq: u64) {
-        self.0.insert(dispatch_id, (channel, seq));
-        if self.0.len() > RUN_THREADS_MAX {
-            self.0.pop_first();
-        }
-    }
-
-    fn remove(&mut self, dispatch_id: &str) -> Option<(String, u64)> {
-        self.0.remove(dispatch_id)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Category {
     Mention,
     Reply,
@@ -41,27 +18,14 @@ pub enum Category {
     Governance,
 }
 
-/// Structured deep-link target — serializes to the ducktape://navigate payload.
-#[derive(Debug, Clone, serde::Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct NavigateTarget {
-    pub screen: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channel_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_root: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub number: Option<u64>,
-}
-
+/// A matched desktop notification: title + body for the OS toast, plus the
+/// channel for mute/focus filtering. There is deliberately no deep-link
+/// target — see the note in [`super::present`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Notification {
     pub category: Category,
     pub title: String,
     pub body: String,
-    pub target: NavigateTarget,
     /// Channel used for focus suppression and mute filtering. Runs, forge, and
     /// governance notifications have no channel and use `None`.
     pub channel_id: Option<String>,
@@ -75,7 +39,7 @@ pub struct MatcherCtx<'a> {
     /// Known display names keyed by lowercase author key hex.
     pub author_names: &'a BTreeMap<String, String>,
     /// Looks up the author of a thread root. Tests inject a closure here; the
-    /// stream module will wire the real lookup.
+    /// stream module wires the real lookup.
     pub root_author: &'a dyn Fn(&str, u64) -> Option<String>,
 }
 
@@ -87,47 +51,11 @@ pub fn match_topic(
 ) -> Option<Notification> {
     match topic {
         "module:chat" => match_chat(op, ctx, state),
-        "module:runs" => match_run(op, &mut state.run_threads),
-        "module:dispatch" => {
-            track_dispatch(op, &mut state.run_threads);
-            None
-        }
+        "module:runs" => match_run(op),
         "module:forge" => match_forge(op),
         "module:governance" => match_governance(op),
         _ => None,
     }
-}
-
-/// Record a runs-emitted `DispatchMsg::Dispatch` op's dispatch_id -> chat
-/// thread. The op's inner `payload` is the run envelope as JSON bytes; its
-/// `thread_key` is `"<channel_id>#<seq>"` (absent for job-backed runs — those
-/// keep the agent-screen fallback). Malformed rows are skipped, never fatal.
-fn track_dispatch(op: &OpRow, tracker: &mut RunThreadTracker) {
-    if op.origin.kind != OriginKind::Module || op.origin.id.as_deref() != Some("runs") {
-        return;
-    }
-    let Some((dispatch_id, channel, seq)) = dispatch_thread(op) else {
-        return;
-    };
-    tracker.insert(dispatch_id, channel, seq);
-}
-
-fn dispatch_thread(op: &OpRow) -> Option<(String, String, u64)> {
-    let dispatch = decode::variant(op.payload.as_ref()?, "dispatch")?;
-    let dispatch_id = dispatch.get("dispatch_id")?.as_str()?;
-    let bytes: Vec<u8> = dispatch
-        .get("payload")?
-        .as_array()?
-        .iter()
-        .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
-        .collect::<Option<_>>()?;
-    let envelope: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    // rsplit: the seq is after the LAST '#', whatever the channel id carries.
-    let (channel, seq) = envelope.get("thread_key")?.as_str()?.rsplit_once('#')?;
-    if channel.is_empty() {
-        return None;
-    }
-    Some((dispatch_id.to_string(), channel.to_string(), seq.parse().ok()?))
 }
 
 fn match_chat(op: &OpRow, ctx: &MatcherCtx<'_>, state: &mut MatchState) -> Option<Notification> {
@@ -181,7 +109,6 @@ fn match_message(
             format!("{name} mentioned you in #{channel}"),
             decode::blocks_preview(blocks, 140),
             channel,
-            thread,
         ));
     }
 
@@ -196,11 +123,10 @@ fn match_message(
         format!("{name} replied to your thread in #{channel}"),
         decode::blocks_preview(blocks, 140),
         channel,
-        Some(root),
     ))
 }
 
-fn match_run(op: &OpRow, run_threads: &mut RunThreadTracker) -> Option<Notification> {
+fn match_run(op: &OpRow) -> Option<Notification> {
     if op.origin.kind != OriginKind::Module || op.origin.id.as_deref() != Some("dispatch") {
         return None;
     }
@@ -220,24 +146,10 @@ fn match_run(op: &OpRow, run_threads: &mut RunThreadTracker) -> Option<Notificat
         )
     };
 
-    // Deep-link the thread the run answered, when its Dispatch op was seen
-    // (evicting the entry — delivery is terminal). Otherwise the honest
-    // fallback stays the agent activity screen.
-    let destination = match run_threads.remove(dispatch_id) {
-        Some((channel, seq)) => {
-            let mut destination = target("chat");
-            destination.channel_id = Some(channel);
-            destination.thread_root = Some(seq);
-            destination
-        }
-        None => target("agent"),
-    };
-
     Some(Notification {
         category: Category::Run,
         title: title.to_string(),
         body,
-        target: destination,
         channel_id: None,
     })
 }
@@ -249,15 +161,11 @@ fn match_forge(op: &OpRow) -> Option<Notification> {
         repo => repo,
     };
     let number = merged.get("number")?.as_u64()?;
-    let mut destination = target("forge");
-    destination.repo = Some(repo.to_string());
-    destination.number = Some(number);
 
     Some(Notification {
         category: Category::Forge,
         title: format!("PR #{number} merged in {repo}"),
         body: String::new(),
-        target: destination,
         channel_id: None,
     })
 }
@@ -277,7 +185,6 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
             category: Category::Governance,
             title: "New admission proposal".to_string(),
             body: format!("proposal {proposal_id}"),
-            target: target("members"),
             channel_id: None,
         });
     }
@@ -288,7 +195,6 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
         category: Category::Governance,
         title: "New member admitted".to_string(),
         body: format!("{} joined via invite", short_hex(&joiner)),
-        target: target("members"),
         channel_id: None,
     })
 }
@@ -314,31 +220,16 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
-fn target(screen: &str) -> NavigateTarget {
-    NavigateTarget {
-        screen: screen.to_string(),
-        channel_id: None,
-        thread_root: None,
-        repo: None,
-        number: None,
-    }
-}
-
 pub(super) fn chat_notification(
     category: Category,
     title: String,
     body: String,
     channel: &str,
-    thread_root: Option<u64>,
 ) -> Notification {
-    let mut destination = target("chat");
-    destination.channel_id = Some(channel.to_string());
-    destination.thread_root = thread_root;
     Notification {
         category,
         title,
         body,
-        target: destination,
         channel_id: Some(channel.to_string()),
     }
 }
@@ -363,9 +254,6 @@ mod tests {
 
     fn op(origin_kind: OriginKind, origin_id: &str, payload: Value) -> OpRow {
         OpRow {
-            height: 1,
-            seq: 1,
-            time: 1,
             origin: Origin {
                 kind: origin_kind,
                 id: Some(origin_id.to_string()),
@@ -474,7 +362,6 @@ mod tests {
             notification.title,
             "Casey replied to your thread in #general"
         );
-        assert_eq!(notification.target.thread_root, Some(7));
         assert!(with_root(&reply, Some("cccc")).is_none());
         assert!(with_root(&reply, None).is_none());
 
@@ -567,84 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn run_finished_deep_links_the_dispatching_thread_and_evicts_the_entry() {
-        let ctx = ctx(&no_root);
-        let mut state = MatchState::default();
-
-        // the runs module's Dispatch op: the inner payload is the run
-        // envelope as JSON bytes, thread_key = "<channel>#<seq>".
-        let envelope = serde_json::to_vec(&json!({
-            "version": 3,
-            "thread_key": "forge:app:12#7",
-        }))
-        .unwrap();
-        let dispatch = op(
-            OriginKind::Module,
-            "runs",
-            json!({ "dispatch": { "dispatch_id": "d9", "recipe_id": "agent/bot", "payload": envelope } }),
-        );
-        assert!(
-            match_topic("module:dispatch", &dispatch, &ctx, &mut state).is_none(),
-            "tracking a dispatch notifies nothing"
-        );
-
-        let finished = op(
-            OriginKind::Module,
-            "dispatch",
-            json!({ "dispatch_id": "d9", "recipe_id": "agent/bot", "outcome": { "Ok": [1] } }),
-        );
-        let notification = match_topic("module:runs", &finished, &ctx, &mut state).unwrap();
-        assert_eq!(notification.category, Category::Run);
-        assert_eq!(notification.target.screen, "chat");
-        assert_eq!(notification.target.channel_id.as_deref(), Some("forge:app:12"));
-        assert_eq!(notification.target.thread_root, Some(7));
-        assert_eq!(notification.channel_id, None, "mute/focus semantics unchanged");
-
-        // delivery evicted the entry: a redelivered result falls back to the
-        // agent screen instead of resolving a stale thread.
-        let redelivered = match_topic("module:runs", &finished, &ctx, &mut state).unwrap();
-        assert_eq!(redelivered.target.screen, "agent");
-        assert_eq!(redelivered.target.channel_id, None);
-
-        // a job-run envelope has no thread_key — nothing tracked, agent
-        // fallback preserved.
-        let job_envelope = serde_json::to_vec(&json!({ "version": 3, "job_id": "j1" })).unwrap();
-        let job_dispatch = op(
-            OriginKind::Module,
-            "runs",
-            json!({ "dispatch": { "dispatch_id": "dj", "recipe_id": "agent/bot", "payload": job_envelope } }),
-        );
-        assert!(match_topic("module:dispatch", &job_dispatch, &ctx, &mut state).is_none());
-        let job_finished = op(
-            OriginKind::Module,
-            "dispatch",
-            json!({ "dispatch_id": "dj", "recipe_id": "agent/bot", "outcome": { "Ok": [1] } }),
-        );
-        let notification = match_topic("module:runs", &job_finished, &ctx, &mut state).unwrap();
-        assert_eq!(notification.target.screen, "agent");
-
-        // only the runs module's dispatch ops are tracked.
-        let foreign = op(
-            OriginKind::Module,
-            "jobs",
-            json!({ "dispatch": { "dispatch_id": "df", "recipe_id": "r", "payload": [] } }),
-        );
-        assert!(match_topic("module:dispatch", &foreign, &ctx, &mut state).is_none());
-    }
-
-    #[test]
-    fn run_thread_tracker_hard_caps_at_256_entries() {
-        let mut tracker = RunThreadTracker::default();
-        for i in 0..300u64 {
-            tracker.insert(format!("d{i:03}"), "general".to_string(), i);
-        }
-        assert_eq!(tracker.0.len(), 256, "the cap holds under overflow");
-        // pop_first evicted the smallest keys; the newest entries survive.
-        assert!(tracker.remove("d299").is_some());
-        assert!(tracker.remove("d000").is_none());
-    }
-
-    #[test]
     fn matches_merged_pull_requests_and_normalizes_default_repo() {
         let ctx = ctx(&no_root);
         let merged = op(
@@ -655,7 +464,6 @@ mod tests {
         let notification = once("module:forge", &merged, &ctx).unwrap();
         assert_eq!(notification.category, Category::Forge);
         assert_eq!(notification.title, "PR #7 merged in default");
-        assert_eq!(notification.target.repo.as_deref(), Some("default"));
 
         let opened = op(
             OriginKind::External,

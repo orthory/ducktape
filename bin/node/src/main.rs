@@ -52,6 +52,7 @@ use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
+mod agent_plane;
 mod blob_fetch;
 mod boot;
 mod cli;
@@ -71,6 +72,7 @@ mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod oracle_pool;
+mod overlay_book;
 mod reachability_plane;
 #[cfg(test)]
 mod reachability_plane_tests;
@@ -81,7 +83,6 @@ mod resident_announce;
 mod resident_dispatch;
 mod resource_limits;
 mod rpc;
-mod statesync_plane;
 mod sync;
 mod userkey;
 mod userkey_cli;
@@ -223,6 +224,15 @@ fn gateway_can_start(
     let api_is_loopback = http_listen
         .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|address| address.ip().is_loopback());
+    // a configured gateway suppressed ONLY by a non-loopback app surface is a
+    // silent degradation — say why, or the operator debugs a dead listener.
+    if !sync_only && gateway_listen.is_some() && !api_is_loopback && http_listen.is_some() {
+        eprintln!(
+            "gateway disabled: http_listen {:?} is not loopback — the browser gateway only \
+             starts when the node API binds a loopback address",
+            http_listen.unwrap_or_default()
+        );
+    }
     !sync_only
         && gateway_listen.is_some()
         && api_is_loopback
@@ -355,10 +365,10 @@ fn run_node(
             wireguard_effect,
             overlay_slot.clone(),
         );
-        // One process-wide bulk budget: state sync and Gateway retain separate
+        // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
-        let bulk_pacer = statesync_plane::shared_bulk_pacer();
+        let bulk_pacer = overlay_book::shared_bulk_pacer();
 
         if sync_only {
             boot::sync_only::run(

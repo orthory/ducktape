@@ -92,7 +92,8 @@ fn trigger(id: &str, reply_to: Option<&str>, max_attempts: u32, deadline: Option
 /// execute path — never by poking internals. leases and assignees are live
 /// (the ctx serves a two-validator set).
 fn source() -> SagaModule {
-    let mut m = SagaModule::with_valset("saga", "valset", saga::LeasePolicy::Open);
+    let mut m =
+        SagaModule::with_assignment("saga", "valset", "capability", saga::LeasePolicy::Open);
     let alice = Origin::External(b"alice".to_vec());
 
     exec(
@@ -126,8 +127,9 @@ fn source() -> SagaModule {
         &trigger("s-timedout", None, 1, Some(2)),
     );
     // a capability-tagged saga: the tag is committed state and must survive
-    // the round trip (with_valset has no capability registry, so it simply
-    // assigns nobody — the tag itself is what's under test here).
+    // the round trip (the ctx serves no capability-registry reply, so the
+    // attempt simply assigns nobody — the tag itself is what's under test
+    // here).
     exec(
         &mut m,
         1,
@@ -154,6 +156,7 @@ fn source() -> SagaModule {
             saga_id: "s-done".into(),
             attempt: 0,
             outcome: Ok(b"agreed-answer".to_vec()),
+            usage: None,
         },
     );
     exec(
@@ -164,6 +167,7 @@ fn source() -> SagaModule {
             saga_id: "s-failed".into(),
             attempt: 0,
             outcome: Err("first worker crashed".into()),
+            usage: None,
         },
     );
     exec(
@@ -186,6 +190,7 @@ fn source() -> SagaModule {
             saga_id: "s-failed".into(),
             attempt: 1,
             outcome: Err("second worker crashed".into()),
+            usage: None,
         },
     );
     block_on(m.commit_block()).unwrap();

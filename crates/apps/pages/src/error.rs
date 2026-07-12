@@ -44,6 +44,11 @@ pub(super) enum PageError {
     // ── comments ──
     /// a comment op arrived with an empty (pre-consensus) origin.
     EmptyOrigin,
+    /// an AddComment carried an empty `as_agent` id.
+    EmptyAgent,
+    /// an AddComment carried `as_agent` under a non-module origin — only
+    /// genesis-trusted module code may attribute a comment to an agent.
+    AgentNeedsModuleOrigin,
     /// resolve/append named a thread id not in the store.
     ThreadNotFound,
     /// edit/delete named a comment id not in the store (or a tombstone).
@@ -56,6 +61,10 @@ pub(super) enum PageError {
     NotAuthor,
     /// comment text over [`MAX_COMMENT_TEXT_BYTES`].
     TextTooLarge,
+    /// an AddComment thread_id/comment_id/target over its length cap —
+    /// bounded so the derived index/thread blocks can never exceed
+    /// [`MAX_BLOCK_LEN`] and abort a block.
+    IdTooLarge,
     /// a thread already holds [`MAX_COMMENTS_PER_THREAD`] comments.
     TooManyComments,
     /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
@@ -83,12 +92,15 @@ impl core::fmt::Display for PageError {
             PageError::NotAPage => "not a page",
             PageError::PageCycle => "page cycle",
             PageError::EmptyOrigin => "empty origin",
+            PageError::EmptyAgent => "empty as_agent",
+            PageError::AgentNeedsModuleOrigin => "as_agent requires a module origin",
             PageError::ThreadNotFound => "thread not found",
             PageError::CommentNotFound => "comment not found",
             PageError::DuplicateComment => "duplicate comment id",
             PageError::TargetMismatch => "target mismatch",
             PageError::NotAuthor => "not the comment author",
             PageError::TextTooLarge => "comment text too large",
+            PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
             PageError::TooManyTargets => "too many query targets",

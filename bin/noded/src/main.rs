@@ -44,11 +44,11 @@ use indexer::IndexStore;
 use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
-    payload_preview,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
+    hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
-use reactor::MAX_WORKER_ROUNDS;
+use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
 use tasks::Tasks;
@@ -74,7 +74,6 @@ const MODULE_IDS: [&str; 16] = [
     "duckdns",
     "gateway",
 ];
-const ORACLE_ORIGIN: &[u8] = b"oracle";
 
 mod oracle_pool;
 
@@ -102,6 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // daemon's own http surface at loopback (a wildcard bind is rewritten to
     // 127.0.0.1), where receive-pack submits the ref move to the actor.
     let forge_push_base = noded::agent_provision::forge_push_base(Some(&listen.to_string()));
+    // the same surface, bare (no /forge): the base an agent run's tool plane
+    // dials back as DUCKTAPE_NODE.
+    let node_http_base = noded::agent_provision::node_http_base(Some(&listen.to_string()));
 
     // the per-module derived index: one fluent31 database per module under
     // <storage>/index/<module>/, with each module's view mapper registered.
@@ -145,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_storage,
                 actor_forge_repo,
                 forge_push_base,
+                node_http_base,
                 actor_index,
                 blobs,
                 oracle_cmds,
@@ -195,6 +198,7 @@ fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
     forge_push_base: Option<String>,
+    node_http_base: Option<String>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
@@ -231,7 +235,7 @@ fn run_node(
         // next-block result delivery.
         let dispatch = DispatchModule::new("dispatch", "saga");
         // the engagement plane: tag reports in, engagement events out.
-        let tagging = TaggingModule::new("tagging");
+        let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
@@ -254,8 +258,14 @@ fn run_node(
         // the forge module the composer resolves forge:<repo>:<n> channels
         // against and the PR sink queries; unwired, forge-channel mentions
         // skip at compose.
-        .with_sink_forge("forge");
-        let pages = Pages::init(context.child("pages"), "pages").await;
+        .with_sink_forge("forge")
+        // the pages module the composer renders [[page:<id>]] refs from and
+        // the pages effects lane (pages.comment / pages.set_checked) writes
+        // to; unwired, both degrade to breadcrumbs.
+        .with_pages_module("pages");
+        let pages = Pages::init(context.child("pages"), "pages")
+            .await
+            .with_tagging("tagging");
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).
@@ -315,6 +325,7 @@ fn run_node(
             agent_dirs,
             &storage_for_runs,
             forge_push_base,
+            node_http_base,
         );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
@@ -374,6 +385,38 @@ fn run_node(
                     .await;
                     let _ = reply.send(result); // caller may have hung up
                 }
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    // the frame lane is FAITHFUL to the real node here, and that
+                    // is the whole point of it: the origin is the frame's
+                    // VERIFIED signer, never the caller's claim. the frameless
+                    // arm above trusts a client string — a convention a local
+                    // daemon can afford — and `bin/node` discards that string
+                    // outright, so an embedded daemon that also stamped a claimed
+                    // origin HERE would let an e2e pass on attribution production
+                    // would never produce. it decodes exactly as the validator's
+                    // ordered drain does instead.
+                    let result = match node::decode_frame(&frame) {
+                        Ok((origin, msg)) => {
+                            submit_and_drain(
+                                &mut host,
+                                &workers,
+                                &mut height,
+                                &index,
+                                &op_blobs,
+                                &stream_hub,
+                                &metrics,
+                                origin,
+                                msg,
+                            )
+                            .await
+                        }
+                        // junk never reaches the store: the http gate already
+                        // refused it, and this is the second wall for any
+                        // embedder-side producer on the command lane.
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = reply.send(result);
+                }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host
                         .query(&target, &req)
@@ -428,7 +471,7 @@ fn unix_millis() -> u64 {
 #[allow(clippy::too_many_arguments)]
 async fn submit_and_drain(
     host: &mut Host,
-    workers: &[Box<dyn reactor::Worker>],
+    workers: &[Box<dyn host::worker::Worker>],
     height: &mut u64,
     index: &IndexStore,
     blobs: &noded::blobs::BlobHandle,
@@ -612,7 +655,7 @@ fn origin_tag(origin: &Origin) -> String {
 }
 
 async fn offer_effects(
-    workers: &[Box<dyn reactor::Worker>],
+    workers: &[Box<dyn host::worker::Worker>],
     effects: Vec<Effect>,
     queue: &mut VecDeque<Msg>,
 ) {
@@ -620,12 +663,12 @@ async fn offer_effects(
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
-                Ok(reactor::WorkOutcome::Handled(follow)) => {
+                Ok(host::worker::WorkOutcome::Handled(follow)) => {
                     queue.extend(follow);
                     claimed = true;
                     break;
                 }
-                Ok(reactor::WorkOutcome::NotMine) => {}
+                Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
                     eprintln!("[noded] worker error: {err}");
                     claimed = true;

@@ -28,7 +28,7 @@ locates crates.
 - `StateRoot` is the 32-byte authenticated commitment exposed to the host.
 - `Msg` is a write intent targeted at a module.
 - `Event` leaves the state machine for observability.
-- `Effect` asks the host-owned reactor to perform non-deterministic work.
+- `Effect` asks the host-owned worker seam to perform non-deterministic work.
 - `Env` carries agreed height, agreed time, origin, and the active module id.
 - `Ctx` exposes host-routed reads and intent emission.
 - `Module` provides `id`, `root`, `execute`, read projections, `commit_block`,

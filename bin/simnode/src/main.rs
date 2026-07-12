@@ -82,7 +82,7 @@ use noded::{
     payload_preview,
 };
 use pages::Pages;
-use reactor::MAX_WORKER_ROUNDS;
+use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
 use serde::{Deserialize, Serialize};
@@ -345,7 +345,7 @@ struct Sim {
     /// held submit — noded drains a submit's follow-ups to completion before
     /// touching the next command, and step order mirrors that.
     oracle_queue: VecDeque<Msg>,
-    workers: Vec<Box<dyn reactor::Worker>>,
+    workers: Vec<Box<dyn host::worker::Worker>>,
     blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
@@ -376,7 +376,7 @@ fn run_sim(
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
-        let tagging = TaggingModule::new("tagging");
+        let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
@@ -391,8 +391,16 @@ fn run_sim(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        );
-        let pages = Pages::init(context.child("pages"), "pages").await;
+        )
+        // the duckfs/files module the portable (v3) composer pins its source
+        // head from (W2) — mandatory for envelope composition.
+        .with_files_module("files")
+        // the pages module the composer renders [[page:<id>]] refs from and
+        // the pages effects lane writes to; unwired, both degrade.
+        .with_pages_module("pages");
+        let pages = Pages::init(context.child("pages"), "pages")
+            .await
+            .with_tagging("tagging");
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")
             .with_chat("chat");
@@ -457,6 +465,17 @@ fn run_sim(
                 cmd = cmds.next() => match cmd {
                     Some(NodeCommand::Submit { target, payload, origin, reply }) => {
                         sim.handle_submit(origin, Msg { target, payload }, reply).await;
+                    }
+                    // the signed-frame lane needs an authorship the sim does not
+                    // have: it fabricates state for the UI, runs no agent (no
+                    // dispatch pool, no provisioner), and mints no session keys,
+                    // so nothing here could ever hold a key worth verifying. an
+                    // honest refusal beats a lane that pretends — the same call
+                    // /v1/call/ws makes where there is no mesh.
+                    Some(NodeCommand::SubmitFrame { reply, .. }) => {
+                        let _ = reply.send(Err(
+                            "the simulator serves no signed-frame lane — use /v1/submit".into(),
+                        ));
                     }
                     Some(NodeCommand::Query { target, req, reply }) => {
                         let result = sim.host.query(&target, &req).await.map_err(|err| err.to_string());
@@ -767,7 +786,7 @@ fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
 }
 
 async fn offer_effects(
-    workers: &[Box<dyn reactor::Worker>],
+    workers: &[Box<dyn host::worker::Worker>],
     effects: Vec<Effect>,
     queue: &mut VecDeque<Msg>,
 ) {
@@ -775,12 +794,12 @@ async fn offer_effects(
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
-                Ok(reactor::WorkOutcome::Handled(follow)) => {
+                Ok(host::worker::WorkOutcome::Handled(follow)) => {
                     queue.extend(follow);
                     claimed = true;
                     break;
                 }
-                Ok(reactor::WorkOutcome::NotMine) => {}
+                Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
                     eprintln!("[simnode] worker error: {err}");
                     claimed = true;
@@ -802,23 +821,24 @@ async fn offer_effects(
 struct EchoWorker;
 
 #[async_trait::async_trait(?Send)]
-impl reactor::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
+impl host::worker::Worker for EchoWorker {
+    async fn run(&self, effect: &Effect) -> Result<host::worker::WorkOutcome, host::worker::Error> {
         let request = match saga::decode_worker_request(&effect.0) {
             Ok(request) => request,
-            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
+            Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
         let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
-            return Ok(reactor::WorkOutcome::NotMine);
+            return Ok(host::worker::WorkOutcome::NotMine);
         };
-        Ok(reactor::WorkOutcome::Handled(Some(Msg {
+        Ok(host::worker::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
                 outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
+                usage: None,
             }),
         })))
     }

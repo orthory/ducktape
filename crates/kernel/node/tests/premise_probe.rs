@@ -13,11 +13,11 @@ fn qmdb_root_is_order_dependent() {
         let mut fwd = Kv::init(context.child("fwd"), "kv").await;
         let mut rev = Kv::init(context.child("rev"), "kv").await;
 
-        fwd.set(b"k1".to_vec(), b"v1".to_vec()).await;
-        fwd.set(b"k2".to_vec(), b"v2".to_vec()).await;
+        fwd.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        fwd.set(b"k2".to_vec(), b"v2".to_vec()).await.expect("set");
 
-        rev.set(b"k2".to_vec(), b"v2".to_vec()).await;
-        rev.set(b"k1".to_vec(), b"v1".to_vec()).await;
+        rev.set(b"k2".to_vec(), b"v2".to_vec()).await.expect("set");
+        rev.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
 
         // identical final key-set, opposite log order -> roots MUST differ.
         assert_ne!(
@@ -40,8 +40,8 @@ fn qmdb_root_is_context_independent() {
         let mut b = Kv::init(context.child("vb"), "kv").await;
 
         for kv in [&mut a, &mut b] {
-            kv.set(b"k1".to_vec(), b"v1".to_vec()).await;
-            kv.set(b"k2".to_vec(), b"v2".to_vec()).await;
+            kv.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+            kv.set(b"k2".to_vec(), b"v2".to_vec()).await.expect("set");
         }
 
         assert_eq!(

@@ -30,6 +30,21 @@ export type SagaOrigin = { external: number[] } | { module: string } | "system";
 /** Whether an agent may engage new runs. */
 export type AgentStatus = "active" | "paused";
 
+/** The D3 resource-capability grant (agent-interface's ResourceCaps). Every
+ *  list is canonical sorted+deduped on the node; the wire omits empty lists.
+ *  `pages_write` is page-id scoped with the literal `"*"` granting every
+ *  page (exact match — no prefixes). */
+export interface ResourceCaps {
+  forge_read?: string[];
+  forge_push?: string[];
+  duckfs_read?: string[];
+  duckfs_write?: string[];
+  tools?: string[];
+  secrets?: string[];
+  pages_write?: string[];
+  subagent_budget?: number;
+}
+
 export interface AgentRecord {
   agent_id: string;
   /** The registration origin — gates every mutation of the record. */
@@ -44,16 +59,26 @@ export interface AgentRecord {
   status: AgentStatus;
   created_at: number;
   updated_at: number;
+  /** D3 resource caps — absent on the wire when default-empty. */
+  caps?: ResourceCaps;
 }
 
 const TARGET = "agent";
 
 /** Every action name an agent can be granted (KNOWN_ACTIONS). A RegisterAgent /
- *  UpdateAgent rejects an `allowed_actions` entry outside this set. */
+ *  UpdateAgent rejects an `allowed_actions` entry outside this set.
+ *
+ *  Mirrors `agent::KNOWN_ACTIONS`. The node is the authority — an entry missing
+ *  here is simply ungrantable from the UI (the checkbox never renders), which is
+ *  a silent loss of a permission rather than an error, so the two lists have to
+ *  be kept in step by hand. */
 export const KNOWN_ACTIONS = [
   "chat.post",
+  "chat.post_message",
   "tasks.create",
   "tasks.update_status",
+  "pages.comment",
+  "pages.set_checked",
 ] as const;
 
 // ── Prompt hashing helper ───────────────────────────────
@@ -77,6 +102,8 @@ export const registerAgent = (
     /** Exactly 32 bytes — see hexToBytes / the prompt-upload flow. */
     promptHash: number[];
     allowedActions: string[];
+    /** D3 resource caps; omit to register with the empty default. */
+    caps?: ResourceCaps;
     origin: string;
   },
 ): Promise<BlockEvent> =>
@@ -89,6 +116,7 @@ export const registerAgent = (
         capability: params.capability,
         prompt_hash: params.promptHash,
         allowed_actions: params.allowedActions,
+        ...(params.caps ? { caps: params.caps } : {}),
       },
     },
     params.origin,
@@ -103,6 +131,9 @@ export const updateAgent = (
     capability?: string | null;
     promptHash?: number[] | null;
     allowedActions?: string[] | null;
+    /** A provided value REPLACES the whole caps record (send the full caps,
+     *  not a patch); null/omitted keeps the current one. */
+    caps?: ResourceCaps | null;
     origin: string;
   },
 ): Promise<BlockEvent> =>
@@ -115,6 +146,7 @@ export const updateAgent = (
         capability: params.capability ?? null,
         prompt_hash: params.promptHash ?? null,
         allowed_actions: params.allowedActions ?? null,
+        caps: params.caps ?? null,
       },
     },
     params.origin,

@@ -17,6 +17,7 @@ upgrade = { workspace = true }
 # types-only, same shape as upgrade: a passing UpdateModule/CancelModuleUpdate
 # emits the modreg op as a follow-up; governance never registers the module.
 modreg = { workspace = true }
+identity = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

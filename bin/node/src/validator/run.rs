@@ -20,7 +20,7 @@ use crate::host_state::run_output_sink;
 use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{blob_fetch, oracle_pool, relay_runtime, statesync_plane, voice_plane};
+use crate::{blob_fetch, oracle_pool, relay_runtime, voice_plane};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -39,7 +39,6 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) last_cert_height: Option<u64>,
     pub(super) latest_floor: Option<recovery::FloorCert>,
     pub(super) mesh_oracle: commonware_p2p::authenticated::discovery::Oracle<ed25519::PublicKey>,
-    pub(super) sync_plane_book: Option<std::sync::Arc<statesync_plane::OverlayBook>>,
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
@@ -80,7 +79,6 @@ struct ValidatorRuntime<'a> {
     last_cert_height: Option<u64>,
     latest_floor: Option<recovery::FloorCert>,
     mesh_oracle: commonware_p2p::authenticated::discovery::Oracle<ed25519::PublicKey>,
-    sync_plane_book: Option<std::sync::Arc<statesync_plane::OverlayBook>>,
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
@@ -125,7 +123,7 @@ struct ValidatorRuntime<'a> {
     heartbeat_disabled: bool,
     last_crank: std::time::Instant,
     last_nudge: std::time::Instant,
-    workers: Vec<Box<dyn reactor::Worker>>,
+    workers: Vec<Box<dyn host::worker::Worker>>,
     signaller: ReadinessSignaller,
     announcer: CapabilityAnnouncer,
     upgrade_armed_latch: Option<(String, u32)>,
@@ -142,7 +140,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_cert_height,
         latest_floor,
         mesh_oracle,
-        sync_plane_book,
         gateway_book,
         media_peers,
         blob_peers,
@@ -269,9 +266,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // announced set to nothing — never the reverse). routing and
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
-    let providers = capability_host::discover_with_dirs_and_output_sink(
+    let providers = capability_host::discover(
         agent_dirs.clone(),
-        run_output_sink(stream_hub.run_output()),
+        Some(run_output_sink(stream_hub.run_output())),
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let my_capabilities = providers.capabilities();
@@ -292,7 +289,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // node's blob store resolves here instead of failing the run.
         Some(blob_fetcher),
     );
-    let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
+    let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
     // the readiness self-signaller: polls COMMITTED upgrade state between drains
     // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
     // this binary can execute. survives restart/late-join (state-driven, not a
@@ -355,7 +352,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_cert_height,
         latest_floor,
         mesh_oracle,
-        sync_plane_book,
         gateway_book,
         media_peers,
         blob_peers,

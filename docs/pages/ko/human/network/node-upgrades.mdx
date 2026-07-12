@@ -167,12 +167,16 @@ state root를 구성하는 방식을 — 단일 committed head에서 per-repo he
 sorted hash로 — 바꿨는데, 이는 순진한 rolling restart라면 fork했을 바로 그런 종류의
 consensus-breaking 변경이다.
 
-이 mechanism과 함께라면 깔끔하게 rollout된다. `H` 아래에서는 old single-head root를
-계산하고 `H`부터는 new multi-repo root를 계산하는 dual-path forge를 pre-ship하고,
+이 mechanism과 함께라면 이런 변경은 깔끔하게 rollout된다. `H` 아래에서는 old single-head
+root를 계산하고 `H`부터는 new multi-repo root를 계산하는 dual-path forge를 pre-ship하고,
 governance를 통해 upgrade를 schedule하고, 각 node가 ready를 signal하며 binary를 node마다
 rollout하고, `H`에서 준비된 모든 node가 teardown-respawn boundary를 넘어 함께 전환한다.
-disk 상의 어떤 것도 움직이지 않는다 — 오직 in-memory head encoding만 바뀐다 — 는 점이
-forge를 이 policy가 실제로 작동하는 안전한 첫 사례로 만든다.
+disk 상의 어떤 것도 움직이지 않는다 — 오직 in-memory head encoding만 바뀐다.
+
+실제로는 Ducktape이 forge의 root 변경을 flag day로 출하했다. 유지해야 할 production
+network가 없었으므로 in-tree dual-path forge demonstrator는 retire되었고 new layout이
+유일한 layout이 되었다. 이 예시는 live network가 생긴 뒤 root를 바꾸는 module upgrade가
+취하게 될 형태로서 남는다.
 
 ## 이 policy가 다루지 않는 것
 

@@ -246,16 +246,6 @@ export interface GatewayProxyReply {
   body: Uint8Array<ArrayBuffer>;
 }
 
-export interface GatewaySessionRequest {
-  accountId: number[];
-  name: GatewayRouteName;
-  revision: number;
-}
-
-export interface GatewaySessionReply {
-  url: string;
-}
-
 export interface NodeTransport {
   /**
    * Submit one module msg — one block. Resolves once the block is committed.
@@ -347,9 +337,10 @@ export interface NodeTransport {
   /** Invoke one finalized, policy-bounded route over the authenticated
    * gateway plane. Optional because the embedded daemon has no mesh. */
   gatewayProxy?(request: GatewayProxyRequest): Promise<GatewayProxyReply>;
-  /** Mint a short-lived, route-scoped origin on the dedicated browser
-   * listener. That listener exposes no node API or cross-route primitive. */
-  gatewaySession?(request: GatewaySessionRequest): Promise<GatewaySessionReply>;
+  /** Report the dedicated browser-gateway listener's loopback base
+   * (`http://127.0.0.1:<port>`) so the `duck://` scheme handler can reach it.
+   * That listener exposes no node API or cross-route primitive. */
+  gatewayBrowserBase?(): Promise<{ base: string }>;
 
   status(): Promise<NodeStatus>;
   /**
@@ -790,8 +781,7 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       }
       return { head: wire.head, body };
     },
-    gatewaySession: (request) =>
-      postJson<GatewaySessionReply>(`${base}/v1/gateway/session`, request),
+    gatewayBrowserBase: () => getJson<{ base: string }>(`${base}/v1/gateway/browser`),
     status: async () => {
       const res = await fetchDeadline(`${base}/v1/status`, undefined, STATUS_TIMEOUT_MS);
       if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);

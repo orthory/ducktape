@@ -16,16 +16,13 @@ is the built/tested checklist.
 
 ## WireGuard Tunnel Runtime
 
-`crates/system/wireguard-upgrade` remains a protocol leaf: no `bin/node` or
-`bin/noded` consumer applies its validated `TunnelInstallPlan` through defguard
-`WGApi`. The next slice is a mesh module that emits upgrade effects, a reactor
-worker that drives `WGApi`, an `admission_root` producer that fails closed until
-the finalized admission commitment exists, and a responder-side install-plan
-constructor.
-
-The two mesh contracts (`valset::mesh` and `wireguard-upgrade`) should
-collapse onto one shape. A privileged Linux netns e2e that creates a real
-WireGuard interface is still deliberately descoped.
+`crates/system/wireguard` (validation at the crate root, the apply layer at
+`wireguard::effect`; the former `wireguard-upgrade` and `wireguard-effect`
+crates, merged) is no longer a protocol leaf: the node's reachability plane
+applies validated `TunnelInstallPlan`s through a configured `WireGuardEffect`,
+and the parallel `valset::mesh` contract was deleted rather than unified. A
+privileged Linux netns e2e that creates a real WireGuard interface is still
+deliberately descoped.
 
 ## Demotion And Promotion Edges
 
@@ -53,7 +50,7 @@ storage directory: if local state exists without a recovery checkpoint, boot
 fails loudly and tells the operator to wipe/re-sync rather than migrating in
 place.
 
-## Agent/Reactor Product Path
+## Agent Product Path
 
 The live node now includes `agent`, `runs`, `jobs`, `dispatch`, `saga`,
 `capability`, and `tagging` in its module set. It discovers local capability

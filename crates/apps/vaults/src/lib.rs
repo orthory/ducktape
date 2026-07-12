@@ -85,14 +85,6 @@ impl Vaults {
         }
     }
 
-    fn non_empty(field: &str, v: &str) -> Result<(), Error> {
-        if v.is_empty() {
-            Err(Error::Module(format!("{field} must not be empty")))
-        } else {
-            Ok(())
-        }
-    }
-
     fn view_of(id: &str, v: &Vault) -> VaultView {
         VaultView {
             vault_id: id.to_string(),
@@ -172,8 +164,8 @@ impl Module for Vaults {
         let now = ctx.env().consensus_time;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             VaultMsg::CreateVault { vault_id, name } => {
-                Self::non_empty("vault_id", &vault_id)?;
-                Self::non_empty("name", &name)?;
+                sdk::require_non_empty("vault_id", &vault_id)?;
+                sdk::require_non_empty("name", &name)?;
                 if self.get(&vault_id).is_some() {
                     return Err(Error::Module(format!("vault already exists: {vault_id}")));
                 }
@@ -230,7 +222,7 @@ impl Module for Vaults {
                 name,
                 ciphertext,
             } => {
-                Self::non_empty("secret name", &name)?;
+                sdk::require_non_empty("secret name", &name)?;
                 if ciphertext.is_empty() {
                     return Err(Error::Module("ciphertext must not be empty".into()));
                 }

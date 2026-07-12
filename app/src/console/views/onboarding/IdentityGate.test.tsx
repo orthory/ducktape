@@ -5,7 +5,7 @@
 // to that module's typed surface, never IPC itself).
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BIP39_ENGLISH_WORDLIST } from "../../../domain/bip39-wordlist";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
@@ -33,12 +33,35 @@ vi.mock("../../../domain/user-identity-client", () => ({
   lockIdentity: vi.fn(),
 }));
 
+// Touch ID lives behind a native shim (Stream B's touchid-client). The gate
+// only ever calls that typed surface, so tests drive it through this mock —
+// availability defaults to false (the Linux/web reality) so every pre-existing
+// test is untouched; the Touch ID tests flip it to true per-case.
+const touchidAvailableMock = vi.hoisted(() => vi.fn());
+const touchidEnrollMock = vi.hoisted(() => vi.fn());
+const touchidUnlockMock = vi.hoisted(() => vi.fn());
+vi.mock("../../../domain/touchid-client", () => ({
+  touchidAvailable: touchidAvailableMock,
+  touchidEnroll: touchidEnrollMock,
+  touchidUnlock: touchidUnlockMock,
+  touchidDisable: vi.fn(),
+  randomPassphrase: () => "RANDOMPASS",
+}));
+
 const markTauri = () => {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
 };
 
 const TEST_MNEMONIC = BIP39_ENGLISH_WORDLIST.slice(0, 24).join(" ");
 const TEST_WORDS = TEST_MNEMONIC.split(" ");
+
+beforeEach(() => {
+  // Off macOS Touch ID is unavailable; the enroll/unlock defaults keep the
+  // async probes from rejecting when a test doesn't exercise them.
+  touchidAvailableMock.mockResolvedValue(false);
+  touchidEnrollMock.mockResolvedValue(undefined);
+  touchidUnlockMock.mockResolvedValue({ pubkey: "ab12" });
+});
 
 afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
@@ -798,6 +821,124 @@ describe("identity gate — link-device flow", () => {
     expect(await screen.findByTestId("console")).toBeInTheDocument();
   });
 
+  // The QR address exactly as the other device's relay mints it (link_relay.rs).
+  const ADDRESS = "http://192.168.1.23:40000/link#0123456789abcdef0123456789abcdef";
+
+  /** Walk the gate to the link wizard and type `input` into the challenge box. */
+  const reachWizardWith = async (input: string) => {
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+    await screen.findByText("Create your account");
+    fireEvent.click(screen.getByText("Link device"));
+    await screen.findByText("Link this device");
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create this device's key"));
+    });
+    await screen.findByText("Approve from your other device");
+    fireEvent.change(screen.getByLabelText("Link challenge code"), {
+      target: { value: input },
+    });
+  };
+
+  it("links over the LAN when the input is the QR address", async () => {
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    const sent: Array<Record<string, unknown>> = [];
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "link_fetch_challenge":
+          return Promise.resolve(CHALLENGE);
+        case "user_sign_possession":
+          return Promise.resolve('{"signature":{"sig":[7,7]}}');
+        case "link_send_response":
+          sent.push(args ?? {});
+          return Promise.resolve(null);
+        default:
+          throw new Error(`unexpected invoke ${cmd}`);
+      }
+    });
+
+    await reachWizardWith(`  ${ADDRESS} `);
+    // The button re-labels once the input reads as an address — the exchange
+    // runs whole from one click: fetch → sign → post back.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Link over the network"));
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("link_fetch_challenge", { url: ADDRESS });
+    expect(invokeMock).toHaveBeenCalledWith("user_sign_possession", {
+      chainId: "team#abcd",
+      accountId: "ab01".repeat(16),
+      nonce: 4,
+    });
+    await screen.findByText(/Reply sent to Eddy's account/);
+    // The verify-before-approve fingerprint: this device's key, for the human
+    // cross-check against what the inviter's approve step shows.
+    expect(screen.getByText(/Seed key · cd34/)).toBeInTheDocument();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].url).toBe(ADDRESS);
+    const blob = String(sent[0].response);
+    expect(blob.startsWith("ducktape-link-response-v1:")).toBe(true);
+    expect(JSON.parse(atob(blob.replace("ducktape-link-response-v1:", "")))).toEqual({
+      pubkey: "cd34",
+      kind: "ed25519",
+      possession: '{"signature":{"sig":[7,7]}}',
+      label: null,
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Continue"));
+    });
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("falls back to the response code when the LAN reply can't be delivered", async () => {
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "link_fetch_challenge":
+          return Promise.resolve(CHALLENGE);
+        case "user_sign_possession":
+          return Promise.resolve('{"signature":{"sig":[7,7]}}');
+        case "link_send_response":
+          return Promise.reject(new Error("timed out reaching the other device"));
+        default:
+          throw new Error(`unexpected invoke ${cmd}`);
+      }
+    });
+
+    await reachWizardWith(ADDRESS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Link over the network"));
+    });
+
+    // The signed reply is not lost: the manual paste screen shows it with the
+    // delivery failure inline.
+    const response = (await screen.findByLabelText("Link response code")) as HTMLTextAreaElement;
+    expect(response.value.startsWith("ducktape-link-response-v1:")).toBe(true);
+    expect(
+      screen.getByText(/couldn't send the reply back automatically/i),
+    ).toBeInTheDocument();
+  });
+
   it("proceeds past the wizard WITHOUT a challenge — linking must never trap onboarding", async () => {
     // Spec §1: linking and joining are independent. A user who started on the
     // new device before fetching the code from their other device continues
@@ -872,9 +1013,182 @@ describe("identity gate — link-device flow", () => {
     });
     fireEvent.click(screen.getByText("Generate link code"));
 
+    // The validation error lands a microtask later — generate is one async
+    // pipeline for both input paths (pasted blob / typed relay address).
     expect(
-      screen.getByText(/doesn't look like a link code/i),
+      await screen.findByText(/doesn't look like a link code/i),
     ).toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("identity gate — Touch ID create flow", () => {
+  it("hides the Touch ID tab when the shim reports unavailable", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(false);
+    identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    await waitFor(() => expect(touchidAvailableMock).toHaveBeenCalled());
+    expect(screen.queryByText("Use Touch ID")).toBeNull();
+  });
+
+  it("Touch ID create: no password step, shows the phrase, enrolls after confirm", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    touchidEnrollMock.mockResolvedValue(undefined);
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    // the Touch ID tab appears only once the availability probe resolves true.
+    fireEvent.click(await screen.findByText("Use Touch ID"));
+
+    // the Touch ID create screen drops the password step entirely.
+    await screen.findByText("Continue with Touch ID");
+    expect(screen.queryByPlaceholderText("Password (min 8 characters)")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Continue with Touch ID"));
+    });
+    // it feeds createIdentity the machine-generated passphrase, never a typed one.
+    expect(createIdentityMock).toHaveBeenCalledWith("RANDOMPASS");
+
+    // the 24-word grid + confirm ceremony is kept, reframed as recovery.
+    await screen.findByText("Save your recovery phrase");
+    expect(screen.getByText("abandon")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("I've saved it — continue"));
+    await screen.findByText("Confirm your recovery phrase");
+
+    await fillConfirmWords(TEST_WORDS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Confirm"));
+    });
+
+    // enroll runs AFTER the phrase is confirmed (a failed enroll can't strand
+    // the user — the account already exists once confirmMnemonic resolves).
+    expect(confirmMnemonicMock).toHaveBeenCalledTimes(1);
+    expect(touchidEnrollMock).toHaveBeenCalledWith("RANDOMPASS");
+    expect(touchidEnrollMock.mock.invocationCallOrder[0]).toBeGreaterThan(
+      confirmMnemonicMock.mock.invocationCallOrder[0],
+    );
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("a failed enroll is non-fatal — the account still lands in the console", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    touchidEnrollMock.mockRejectedValue(new Error("keychain add failed"));
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.click(await screen.findByText("Use Touch ID"));
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Continue with Touch ID"));
+    });
+    fireEvent.click(await screen.findByText("I've saved it — continue"));
+    await screen.findByText("Confirm your recovery phrase");
+    await fillConfirmWords(TEST_WORDS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Confirm"));
+    });
+
+    expect(touchidEnrollMock).toHaveBeenCalledTimes(1);
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+});
+
+describe("identity gate — unlock with Touch ID", () => {
+  it("offers Touch ID on the locked screen and unlocks with it", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock
+      .mockResolvedValueOnce({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true });
+    touchidUnlockMock.mockResolvedValue({ pubkey: "ab12" });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Unlock with Touch ID"));
+    });
+
+    expect(touchidUnlockMock).toHaveBeenCalledTimes(1);
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("the touchid-unavailable sentinel points the user at the recovery phrase", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock.mockResolvedValue({
+      state: "locked",
+      pubkey: "ab12",
+      mnemonicConfirmed: true,
+    });
+    touchidUnlockMock.mockRejectedValue(new Error("touchid-unavailable"));
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Unlock with Touch ID"));
+    });
+
+    expect(await screen.findByText(/recovery phrase/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("console")).toBeNull();
+  });
+
+  it("no Touch ID button when the shim reports unavailable", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(false);
+    identityStateMock.mockResolvedValue({
+      state: "locked",
+      pubkey: "ab12",
+      mnemonicConfirmed: true,
+    });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await waitFor(() => expect(touchidAvailableMock).toHaveBeenCalled());
+    expect(screen.queryByText("Unlock with Touch ID")).toBeNull();
   });
 });

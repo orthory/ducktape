@@ -77,8 +77,9 @@ also **hardcoded** the single repo's identity as `"ducktape"`
 
 ### 2. Dev-mode dogfood trigger — a static `ducktape-dev` remote
 
-Rather than boot-time magic, register a real git remote so dogfooding is
-git-native: `git push ducktape-dev main`.
+Rather than boot-time magic, register a real git remote and make the dogfood
+target the freshness gate. Raw pushes are not the supported refresh path
+because they skip the canonical fetch and equality check.
 
 **`ops/dogfood-forge.sh`** (invoked by `make dogfood-forge`):
 
@@ -92,7 +93,9 @@ git-native: `git push ducktape-dev main`.
    - fall back to `127.0.0.1:8844` (the web/legacy default).
 2. `FORGE_REPO` (default `ducktape`) → remote URL `http://<addr>/forge/<repo>`.
 3. Idempotently set the remote: add `ducktape-dev`, or `set-url` if it exists.
-4. `git push ducktape-dev main`.
+4. Fetch canonical `origin/dev` and freeze this fetch's `FETCH_HEAD` OID.
+5. Push that exact OID to Forge `main`, read the remote ref back, and require
+   equality before agent work may start.
 
 Re-running the target updates the forge repo (a fast-forward push of new
 commits). CAS/non-fast-forward semantics are git's own — the endpoint reports
@@ -113,9 +116,9 @@ them faithfully.
   (no logic change to forge; the reader change is in the tauri crate).
   `cd app && bun run typecheck` for the tauri Rust + TS.
 - **End-to-end (the real thing):** with a dev node running, `make dogfood-forge`,
-  then confirm `git ls-remote ducktape-dev` shows `refs/heads/main` at the
-  current ducktape HEAD, and the desktop Forge view (via `tauri-debug` /
-  `forge_head`) reports that HEAD with real commit history and file tree.
+  then confirm `git ls-remote ducktape-dev` shows `refs/heads/main` at the exact
+  fetched `origin/dev` OID, and the desktop Forge view (via `tauri-debug` /
+  `forge_head`) reports that OID with real commit history and file tree.
 - **Reader unit-ish:** point `open_forge_repo` at a temp base containing a
   `<base>/<name>/.git` repo and assert it opens (guards the descend fix).
 
@@ -128,7 +131,8 @@ them faithfully.
   every read; drop the hardcoded `"ducktape"` label.
 - `app/src/console/views/forge/ForgeView.tsx` — thread the selected repo's real
   name into the reads (`activeRepoRef`).
-- `ops/dogfood-forge.sh` — new; resolve URL, register `ducktape-dev`, push
-  `SRC_REF` (default `HEAD`, not stale `main`); warn on cross-worktree repoint.
+- `ops/dogfood-forge.sh` — new; resolve URL, register `ducktape-dev`, fetch
+  canonical `origin/dev` (or honor an explicit `SRC_REF`), push the frozen OID,
+  verify Forge `main`, and warn on cross-worktree repoint.
 - `Makefile` — new `dogfood-forge` target.
 - `docs/superpowers/specs/2026-07-07-forge-dev-dogfooding-design.md` — this doc.

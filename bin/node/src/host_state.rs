@@ -26,10 +26,9 @@ use kv::Kv;
 use modreg::Modreg;
 use pages::Pages;
 use recovery::Manifest;
-use sha2::Digest as _;
-use wasm_host::WasmModule;
 use runs::RunsModule;
 use saga::{LeasePolicy, SagaModule};
+use sha2::Digest as _;
 use sdk::StateRoot;
 use statesync::{fetch_snapshot, qmdb::RemoteQmdbResolver};
 use tagging::TaggingModule;
@@ -37,6 +36,7 @@ use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
 use vaults::Vaults;
+use wasm_host::WasmModule;
 
 use crate::util::hex;
 
@@ -113,6 +113,74 @@ pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_
     })
 }
 
+/// the production module registry: ONE named field per module, so genesis,
+/// restore, and state sync compose the SAME set by construction — adding a
+/// module means adding a field here, and every lifecycle fails to compile
+/// until it builds one. `constants::MODULE_IDS` mirrors this set for the
+/// status surfaces; the parity test below pins the two together.
+struct ProductionModules {
+    kv: Kv<commonware_runtime::tokio::Context>,
+    pages: Pages<commonware_runtime::tokio::Context>,
+    chat: Chat<commonware_runtime::tokio::Context>,
+    forge: Forge,
+    valset: Valset,
+    governance: Governance,
+    upgrade: Upgrade,
+    modreg: Modreg,
+    hello_wasm: WasmModule,
+    saga: SagaModule,
+    capability: CapabilityRegistry,
+    dispatch: DispatchModule,
+    tagging: TaggingModule,
+    tasks: Tasks,
+    vaults: Vaults,
+    identity: Identity,
+    duckdns: DuckDns,
+    gateway: Gateway,
+    inbox: Inbox,
+    files: Files,
+    jobs: Jobs,
+    agent: AgentModule,
+    runs: RunsModule,
+    directory: Directory,
+    automations: Automations,
+}
+
+impl ProductionModules {
+    /// compose the registry into a [`Host`]. registration order is NOT
+    /// consensus-relevant (the host keys modules in a `BTreeMap`) — only the
+    /// module set and each module's constructed state compose the app-hash.
+    fn compose(self) -> Result<Host, sdk::Error> {
+        Host::genesis(vec![
+            Box::new(self.kv),
+            Box::new(self.pages),
+            Box::new(self.chat),
+            Box::new(self.forge),
+            Box::new(self.valset),
+            Box::new(self.governance),
+            Box::new(self.upgrade),
+            Box::new(self.modreg),
+            Box::new(self.hello_wasm),
+            Box::new(self.saga),
+            Box::new(self.capability),
+            Box::new(self.dispatch),
+            Box::new(self.tagging),
+            Box::new(self.tasks),
+            Box::new(self.vaults),
+            Box::new(self.identity),
+            Box::new(self.duckdns),
+            Box::new(self.gateway),
+            Box::new(self.inbox),
+            Box::new(self.files),
+            Box::new(self.jobs),
+            Box::new(self.agent),
+            Box::new(self.runs),
+            Box::new(self.directory),
+            Box::new(self.automations),
+        ])
+    }
+}
+
 /// the PRODUCTION module set — genesis state, identical on every node (a
 /// different set composes a different app-hash and the network forks at
 /// genesis). system infrastructure (kv, valset seeded with the genesis
@@ -127,7 +195,9 @@ pub(super) async fn genesis_host(
     blobs: blobstore::BlobHandle,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let pages = Pages::init(context.child("pages"), "pages").await;
+    let pages = Pages::init(context.child("pages"), "pages")
+        .await
+        .with_tagging("tagging");
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
@@ -146,110 +216,101 @@ pub(super) async fn genesis_host(
     for v in genesis_validators {
         valset.insert(v.as_ref().to_vec());
     }
-    Host::genesis(vec![
-        Box::new(kv),
-        Box::new(pages),
-        Box::new(chat),
-        Box::new(forge),
-        Box::new(valset),
+    ProductionModules {
+        kv,
+        pages,
+        chat,
+        forge,
+        valset,
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
-        Box::new(
-            Governance::new("governance", "valset", "upgrade")
-                .with_invite_binding(bindings.invite)
-                .with_modreg(host::MODREG_MODULE_ID),
-        ),
+        governance: Governance::new("governance", "valset", "upgrade", "identity")
+            .with_invite_binding(bindings.invite)
+            .with_modreg(host::MODREG_MODULE_ID),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
-        Box::new(Upgrade::new("upgrade", "valset")),
+        upgrade: Upgrade::new("upgrade", "valset"),
         // the module code registry: the consensus commitment to WHICH component
         // each hot-swappable wasm module runs, seeded with the genesis hashes.
         // governance schedules height-gated swaps into it; the host realizes
         // them at the boundary through the blobstore-backed CodeSource.
-        Box::new(seeded_modreg()),
+        modreg: seeded_modreg(),
         // the reference wasm module — the live-update machinery's first tenant.
-        Box::new(genesis_hello_wasm()),
+        hello_wasm: genesis_hello_wasm(),
         // capability-aware strict leases: a saga whose trigger names a
         // capability is assigned over that tag's announced providers, and
         // only the assignee's result lands. an UNASSIGNED attempt (empty
         // provider pool) accepts no result at all: its WorkerRequest is an
         // announcement a capable node must first claim via `SagaMsg::Accept`.
-        Box::new(SagaModule::with_assignment(
-            "saga",
-            "valset",
-            "capability",
-            LeasePolicy::Strict,
-        )),
+        saga: SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict),
         // the network-wide registry of node host capabilities ("codex",
         // "claude", ...): member-gated self-announcements, so every node holds
         // an identical view of who can run what. its genesis contribution is an
         // empty registry (ZERO root) until nodes announce.
-        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        capability: CapabilityRegistry::new("capability", Some("valset".into())),
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
-        Box::new(DispatchModule::new("dispatch", "saga")),
+        dispatch: DispatchModule::new("dispatch", "saga"),
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
-        Box::new(TaggingModule::new("tagging")),
-        Box::new(Tasks::new("tasks")),
-        Box::new(Vaults::new("vaults")),
+        tagging: TaggingModule::new("tagging").with_direct_owner("runs"),
+        tasks: Tasks::new("tasks"),
+        vaults: Vaults::new("vaults"),
         // the deterministic user->nodes binding registry: certificates are
         // chain-scoped (this network's chain id), member-gated binds via valset,
         // and account display names have this single canonical owner.
-        Box::new(Identity::new(
+        identity: Identity::new(
             "identity",
             Some("valset".into()),
             bindings.identity_chain_id.to_string(),
-        )),
-        Box::new(DuckDns::new(
-            "duckdns",
-            "identity",
-            Some("valset".into()),
-        )),
+        ),
+        duckdns: DuckDns::new("duckdns", "identity", Some("valset".into())),
         // Identity-signed, monotonic gateway routes. DuckDNS owns optional
         // human names, Files owns DuckFS bytes, and loopback ports stay local.
-        Box::new(Gateway::new(
+        gateway: Gateway::new(
             "gateway",
             "identity",
             Some("valset".into()),
             bindings.identity_chain_id,
-        )),
+        ),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
-        Box::new(Inbox::new("inbox")),
-        Box::new(Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open")),
-        Box::new(Jobs::new("jobs")),
+        inbox: Inbox::new("inbox"),
+        files: Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open"),
+        jobs: Jobs::new("jobs"),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
-        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        agent: AgentModule::new("agent", "saga", Some("runs".into())),
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
-        Box::new(
-            RunsModule::new(
-                "runs",
-                "chat",
-                "saga",
-                "tagging",
-                "dispatch",
-                "agent",
-                Some("tasks".into()),
-                Some("jobs".into()),
-            )
-            // the duckfs/files module the portable (v3) composer pins its source
-            // head from (W2). its presence is what selects the v3 composer;
-            // unwired, the composer emits the v2 wire.
-            .with_files_module("files")
-            // the forge module the composer resolves forge:<repo>:<n> channels
-            // against and the PR sink queries; unwired, forge-channel mentions
-            // skip at compose.
-            .with_sink_forge("forge"),
-        ),
-        Box::new(Directory::new("directory")),
+        runs: RunsModule::new(
+            "runs",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            "agent",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        )
+        // the duckfs/files module the portable (v3) composer pins its source
+        // head from (W2). its presence is what selects the v3 composer;
+        // unwired, the composer emits the v2 wire.
+        .with_files_module("files")
+        // the forge module the composer resolves forge:<repo>:<n> channels
+        // against and the PR sink queries; unwired, forge-channel mentions
+        // skip at compose.
+        .with_sink_forge("forge")
+        // the pages module the composer renders [[page:<id>]] refs from
+        // and the pages effects lane writes to; unwired, both degrade.
+        .with_pages_module("pages"),
+        directory: Directory::new("directory"),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
-        Box::new(Automations::new("automations", "chat", "tasks", "inbox")),
-    ])
+        automations: Automations::new("automations", "chat", "tasks", "inbox"),
+    }
+    .compose()
     .expect("genesis host")
 }
 
@@ -266,21 +327,16 @@ pub(super) async fn restore_host(
     blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let pages = Pages::init(context.child("pages"), "pages").await;
+    let pages = Pages::init(context.child("pages"), "pages")
+        .await
+        .with_tagging("tagging");
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
     // forge shares the blob plane (see genesis_host) for Push materialization.
-    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?
         .with_chat("chat");
-    // establish the checkpoint boundary's dual-path branch selector so the
-    // restored forge `root()` matches at any block the replay SKIPS (disk already
-    // held it) before the first replayed block re-derives it per height. the
-    // checkpoint is a settled boundary, so `current_version` IS its effective
-    // version. baseline no-op before Phase 9.
-    forge.set_active_version(manifest.current_version);
-
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
             .snapshot(id)
@@ -297,7 +353,7 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance = Governance::new("governance", "valset", "upgrade")
+    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
         .with_invite_binding(bindings.invite)
         .with_modreg(host::MODREG_MODULE_ID);
     let (bytes, root) = snapshot_of("governance")?;
@@ -345,7 +401,7 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
-    let mut tagging = TaggingModule::new("tagging");
+    let mut tagging = TaggingModule::new("tagging").with_direct_owner("runs");
     let (bytes, root) = snapshot_of("tagging")?;
     tagging
         .install(bytes, root)
@@ -427,7 +483,8 @@ pub(super) async fn restore_host(
         Some("jobs".into()),
     )
     .with_files_module("files")
-    .with_sink_forge("forge");
+    .with_sink_forge("forge")
+    .with_pages_module("pages");
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -444,33 +501,34 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("automations install: {e}"))?;
 
-    Host::genesis(vec![
-        Box::new(kv),
-        Box::new(pages),
-        Box::new(chat),
-        Box::new(forge),
-        Box::new(valset),
-        Box::new(governance),
-        Box::new(upgrade),
-        Box::new(modreg),
-        Box::new(hello_wasm),
-        Box::new(saga),
-        Box::new(capability),
-        Box::new(dispatch),
-        Box::new(tagging),
-        Box::new(tasks),
-        Box::new(vaults),
-        Box::new(identity),
-        Box::new(duckdns),
-        Box::new(gateway),
-        Box::new(inbox),
-        Box::new(files),
-        Box::new(jobs),
-        Box::new(agent),
-        Box::new(runs),
-        Box::new(directory),
-        Box::new(automations),
-    ])
+    ProductionModules {
+        kv,
+        pages,
+        chat,
+        forge,
+        valset,
+        governance,
+        upgrade,
+        modreg,
+        hello_wasm,
+        saga,
+        capability,
+        dispatch,
+        tagging,
+        tasks,
+        vaults,
+        identity,
+        duckdns,
+        gateway,
+        inbox,
+        files,
+        jobs,
+        agent,
+        runs,
+        directory,
+        automations,
+    }
+    .compose()
     .map_err(|e| format!("restore host: {e}"))
 }
 
@@ -608,6 +666,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     .await?
     .with_tagging("tagging");
 
+
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -653,13 +712,13 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("dispatch install: {e}"))?;
 
     let (bytes, root) = snapshot_of("tagging").await?;
-    let mut tagging = TaggingModule::new("tagging");
+    let mut tagging = TaggingModule::new("tagging").with_direct_owner("runs");
     tagging
         .install(&bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance = Governance::new("governance", "valset", "upgrade")
+    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
         .with_invite_binding(bindings.invite)
         .with_modreg(host::MODREG_MODULE_ID);
     governance
@@ -783,7 +842,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Some("jobs".into()),
     )
     .with_files_module("files")
-    .with_sink_forge("forge");
+    .with_sink_forge("forge")
+    .with_pages_module("pages");
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
@@ -798,47 +858,42 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("forge init: {e}"))?
         .with_chat("chat");
     // set the dual-path branch selector to the SERVED boundary version BEFORE
-    // install: `Forge::install` (and `root()`) branch on `active_version`, so a
-    // joiner installing a post-H snapshot must select the boundary's format or the
-    // install/root would mismatch. `manifest.current_version` IS the effective
-    // version at any settled boundary (the in-block `Advance` reconciles it before
-    // the boundary is captured, so a post-H manifest carries `to_version` with no
-    // pending). baseline/no-op before the forge v2 dual path lands (Phase 9).
-    forge.set_active_version(manifest.current_version);
     forge
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;
 
     // compose and check THE property: the rebuilt app-hash IS the manifest's.
-    // keep this registry in sync with [`genesis_host`] — a missing module
-    // composes a different app-hash and the join fails its final check.
-    let host = Host::genesis(vec![
-        Box::new(kv),
-        Box::new(pages),
-        Box::new(chat),
-        Box::new(forge),
-        Box::new(valset),
-        Box::new(governance),
-        Box::new(upgrade),
-        Box::new(modreg),
-        Box::new(hello_wasm),
-        Box::new(saga),
-        Box::new(capability),
-        Box::new(dispatch),
-        Box::new(tagging),
-        Box::new(tasks),
-        Box::new(vaults),
-        Box::new(identity),
-        Box::new(duckdns),
-        Box::new(gateway),
-        Box::new(inbox),
-        Box::new(files),
-        Box::new(jobs),
-        Box::new(agent),
-        Box::new(runs),
-        Box::new(automations),
-        Box::new(directory),
-    ])
+    // [`ProductionModules`] keeps this registry in lockstep with
+    // [`genesis_host`] by construction — a missing module composes a
+    // different app-hash and the join fails its final check.
+    let host = ProductionModules {
+        kv,
+        pages,
+        chat,
+        forge,
+        valset,
+        governance,
+        upgrade,
+        modreg,
+        hello_wasm,
+        saga,
+        capability,
+        dispatch,
+        tagging,
+        tasks,
+        vaults,
+        identity,
+        duckdns,
+        gateway,
+        inbox,
+        files,
+        jobs,
+        agent,
+        runs,
+        directory,
+        automations,
+    }
+    .compose()
     .map_err(|e| format!("compose synced host: {e}"))?;
     // realize the served boundary version into EVERY dual-path module's branch
     // selector so `root()` (and with it the app-hash check below) recomputes over
@@ -880,4 +935,46 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         ));
     }
     Ok(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use commonware_runtime::Runner as _;
+
+    use super::*;
+    use crate::constants::MODULE_IDS;
+
+    /// the registry ↔ `MODULE_IDS` parity pin. [`ProductionModules`] already
+    /// forces genesis, restore, and state sync onto one module set at compile
+    /// time; this test pins that set to the `constants::MODULE_IDS` copy the
+    /// status/index surfaces iterate, so adding a module to one but not the
+    /// other fails here instead of silently misreporting.
+    #[test]
+    fn genesis_registry_matches_module_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let forge_repo = dir.path().join("forge");
+        let duckfs_dir = dir.path().join("duckfs");
+        let cfg = commonware_runtime::tokio::Config::default()
+            .with_storage_directory(dir.path().join("storage"));
+        let executor = commonware_runtime::tokio::Runner::new(cfg);
+        executor.start(|context| async move {
+            let host = genesis_host(
+                &context,
+                &forge_repo,
+                &duckfs_dir,
+                &[],
+                NetworkBindings {
+                    invite: b"parity-test",
+                    identity_chain_id: "parity-test",
+                },
+                blobstore::BlobHandle::default(),
+            )
+            .await;
+            // module_roots iterates the host's BTreeMap — sorted by id.
+            let got: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
+            want.sort_unstable();
+            assert_eq!(got, want);
+        });
+    }
 }

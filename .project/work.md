@@ -8,6 +8,10 @@
 - Default feature/fix/doc work happens in an isolated git worktree. Use the
   primary checkout only when the user explicitly asks for in-place work or the
   task is limited to repo-state repair.
+- Create task worktrees only at `<primary-checkout>/.worktree/<branch-slug>`.
+  Do not use sibling directories, `/tmp`, `.claude/worktrees`, or
+  `.codex/worktrees`. Large build outputs must remain on the same disk-backed
+  filesystem; a tmpfs target consumes RAM and swap instead of disk.
 - After implementation and verification, submit a PR against `dev`.
 - Review the PR from a clean context before merge: inspect the diff against
   `dev`, look for scope creep and missing verification, and resolve actionable

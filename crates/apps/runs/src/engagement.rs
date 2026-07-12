@@ -1,6 +1,6 @@
 use super::{
     Ctx, EngagementEvent, EntityRef, Error, RunsModule, TurnPolicy, canonical_origin,
-    dispatch_id_for, run_id_for, tagging_decode_event,
+    dispatch_id_for, page_channel_id, page_run_id_for, run_id_for, tagging_decode_event,
 };
 
 impl RunsModule {
@@ -67,36 +67,42 @@ impl RunsModule {
         };
         let EngagementEvent {
             source,
-            container: channel_id,
+            container,
             content_seq: seq,
             author: _,
             tags,
         } = event;
-        if source != self.chat {
-            // this module only understands chat containers; a subscription
-            // to another source would be a config bug, not a block abort.
+        let is_page = self.pages.as_deref() == Some(source.as_str());
+        if source != self.chat && !is_page {
             self.note(ctx, format!("dropped engagement from source {source}"));
             return Ok(());
         }
-        let Some(policy) = self.watch(&channel_id).cloned() else {
-            // an engagement for a channel we no longer watch (subscription
-            // and watch drift within a block): a no-op, never an error.
-            return Ok(());
+        let policy = if is_page {
+            // A structured page mention is itself the opt-in. Tagging routes
+            // it directly to this entity-owning module, so a fresh comment
+            // thread needs no pre-existing channel watch.
+            TurnPolicy::Mention
+        } else {
+            let Some(policy) = self.watch(&container).cloned() else {
+                return Ok(());
+            };
+            policy
         };
 
         let engaged = match self.engaged_agents(&*ctx, &policy, &tags, seq).await {
             Ok(engaged) => engaged,
             Err(reason) => {
-                self.note(
-                    ctx,
-                    format!("engagement skipped for {channel_id}: {reason}"),
-                );
+                self.note(ctx, format!("engagement skipped for {container}: {reason}"));
                 return Ok(());
             }
         };
         let requester = canonical_origin(&ctx.env().origin);
         for agent_id in engaged {
-            let run_id = run_id_for(&channel_id, seq, &agent_id);
+            let run_id = if is_page {
+                page_run_id_for(&container, seq, &agent_id)
+            } else {
+                run_id_for(&container, seq, &agent_id)
+            };
             let dispatch_id = dispatch_id_for(&run_id);
             match self.turn_taken(&*ctx, &dispatch_id).await {
                 // the turn claim: the first creation in consensus order won.
@@ -115,12 +121,23 @@ impl RunsModule {
                     continue;
                 }
             };
-            match self.prepare_dispatch(&*ctx, &agent, &channel_id, seq).await {
+            let prepared = if is_page {
+                self.prepare_page_dispatch(&*ctx, &agent, &run_id, &container, seq)
+                    .await
+            } else {
+                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq)
+                    .await
+            };
+            match prepared {
                 Ok(prepared) => self.stage_dispatch_run(
                     ctx,
                     &run_id,
                     agent_id,
-                    channel_id.clone(),
+                    if is_page {
+                        page_channel_id(&container)
+                    } else {
+                        container.clone()
+                    },
                     seq,
                     requester.clone(),
                     prepared,

@@ -72,7 +72,7 @@ Two wins matter most for *our* stack:
 - `skills/tauri-debug/SKILL.md` — single running app
 - `skills/qa/SKILL.md` — per-worktree fleet instances
 - `ops/fleet.sh` — spawns each worktree app with `DUCKTAPE_TAURI_MCP_SOCKET`;
-  the dashboard "up" gate is `os.path.exists("/tmp/tauri-mcp-<id>.sock")`;
+  the dashboard "up" gate is `existsSync("/tmp/tauri-mcp-<id>.sock")`;
   teardown does `pkill -f tauri-mcp-$id.sock` + `rm -f /tmp/tauri-mcp-$id.sock`
 - `docs/superpowers/specs/2026-07-07-tauri-dev-error-handling-design.md` — one
   passing mention
@@ -185,7 +185,7 @@ the registry, and the app and its driver must share the same value.
     `XDG_RUNTIME_DIR="$STATE/$id"` (drop the `/tmp/tauri-mcp-$id.sock`
     variable). Ensure `$STATE/$id` exists and is `0700` before launch (XDG
     runtime dirs are expected to be user-private).
-  - dashboard "up" gate: `os.path.exists("$STATE/$id/tauri-agent/com.ducktape.app/endpoint.json")`.
+  - dashboard "up" gate: `existsSync("$STATE/$id/tauri-agent/com.ducktape.app/endpoint.json")`.
   - teardown: drop `pkill -f tauri-mcp-$id.sock` and `rm -f /tmp/tauri-mcp-$id.sock`;
     the registry lives under the per-instance state dir and is removed with it.
 - `skills/tauri-debug/SKILL.md`: rewrite around the `tauri-agent` CLI + the MCP

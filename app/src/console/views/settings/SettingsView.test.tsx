@@ -97,7 +97,7 @@ describe("SettingsView", () => {
     ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /open account/i }));
-    expect(spies.setScreen).toHaveBeenCalledWith("account");
+    expect(spies.goHome).toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /set accent #3d63b8/i }));
     expect(spies.setAccent).toHaveBeenCalledWith("#3d63b8");

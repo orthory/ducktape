@@ -6,18 +6,19 @@
 //! thread-continuity key, generic fallback instructions, the strict output
 //! contract, and the rendered conversation. the host resolves the pin to the
 //! real prompt bytes through an injected [`BlobResolver`] and assembles
-//! `<prompt-or-instructions>\n\n<contract>\n\n<conversation>` — so agents
+//! `<prompt-or-instructions>\n\n[<runtime>\n\n][<context>\n\n]<contract>\n\n<conversation>`
+//! (the bracketed sections ride only when the envelope carries them) — so agents
 //! finally run on their REGISTERED prompt, while consensus stays
 //! deterministic (it committed the hash, and the blob is content-addressed,
 //! so the exact bytes stay verifiable).
 //!
-//! payloads WITHOUT the marker are legacy flat strings and pass through
-//! byte-identical — mixed in-flight ops across an upgrade keep working. a
-//! payload that CLAIMS the marker but cannot be honored (unknown version,
-//! malformed fields, unresolvable prompt) fails the run loudly: feeding a
-//! half-understood envelope — or silently swapping an agent's registered
-//! prompt for the generic instructions — is exactly the quiet corruption
-//! this format exists to kill.
+//! a payload that is not a run envelope — or one that cannot be honored
+//! (unknown version, malformed fields, unresolvable prompt) — fails the run
+//! loudly: feeding a half-understood payload — or silently swapping an
+//! agent's registered prompt for the generic instructions — is exactly the
+//! quiet corruption this format exists to kill. the flat-string passthrough
+//! and the v2 tolerance are gone (flag day — in-flight legacy runs are
+//! unsupported).
 
 use std::sync::Arc;
 
@@ -26,13 +27,12 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::provision::{BaseTool, PortablePlan, RoMount, Sink};
+use crate::provision::{PortablePlan, RoMount, Sink};
 use crate::workspace_source::WireWorkspace;
 
-/// the newest envelope version this worker assembles. v2 remains accepted for
-/// in-flight legacy runs; v3 is the portable duckfs-workspace runner contract.
+/// the ONLY envelope version this worker assembles: the portable
+/// duckfs/forge-workspace runner contract.
 pub const RUN_ENVELOPE_VERSION: u64 = 3;
-const LEGACY_RUN_ENVELOPE_VERSION: u64 = 2;
 /// the runner-result wrapper version — the SINGLE owner across this crate. the
 /// provisioning wrapper's [`crate::provision::assemble_runner_result`] stamps
 /// it, the v3 accept slice validates the envelope requests it, and `runs`
@@ -54,6 +54,18 @@ pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u
 #[derive(Deserialize)]
 struct WireEnvelope {
     agent_id: String,
+    /// the run's CONSENSUS id — what `runs` resolves the run by (the id its
+    /// pending map is keyed on, and the one its agent session lane binds). the
+    /// host has no way to derive it: the pool's own `WorkspaceSpec.run_id` is
+    /// `{saga_id}:{attempt}`, a host-local workspace-dir key that names no run
+    /// in consensus. `Option` because it is an ADDITIVE field — an envelope
+    /// composed before it existed carries no key, and such a run must still
+    /// execute (it simply opens no session: the read-only tool plane).
+    run_id: Option<String>,
+    /// additive for v3: old in-flight envelopes fall back to `agent_id`, while
+    /// newly composed runs carry the committed registry display name.
+    #[serde(default)]
+    agent_display_name: Option<String>,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
     /// carries none (the generic `instructions` apply).
     prompt_hash: Option<String>,
@@ -66,17 +78,15 @@ struct WireEnvelope {
     /// input between the instructions and the contract; None-case assembly
     /// stays byte-identical.
     context: Option<String>,
+    /// the deterministic runtime section: the ducktape tool plane plus the
+    /// run's skill mounts, composed in consensus. `Option` because it is an
+    /// ADDITIVE v3 field — an envelope composed before it existed carries no
+    /// key and must still run (it simply assembles without the section, exactly
+    /// as this worker did before).
+    runtime: Option<String>,
     workspace: Option<WireWorkspace>,
-    base_tools: Option<Vec<WireBaseTool>>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
-}
-
-#[derive(Deserialize)]
-struct WireBaseTool {
-    name: String,
-    version: String,
-    exposure: String,
 }
 
 /// a C4 skill ref: a read-only duckfs source subtree the wrapper mounts for the
@@ -100,38 +110,31 @@ struct WireResultContract {
     sink: Sink,
 }
 
-/// the assembled provider input plus the per-run context, and — for a v3
-/// (portable) envelope — the pinned workspace plan. the pool acts on
-/// `workspace` iff a provisioner is wired; otherwise the run stays accept-only
-/// (dormant), so surfacing the plan here never activates a mount.
+/// the assembled provider input plus the per-run context and the pinned
+/// workspace plan. the pool acts on `workspace` iff a provisioner is wired;
+/// otherwise the run stays accept-only (dormant), so surfacing the plan here
+/// never activates a mount.
 #[derive(Debug)]
 pub struct Prepared {
     pub input: String,
     pub ctx: RunContext,
-    /// `Some` only for a v3 envelope; `None` for v2/legacy.
-    pub workspace: Option<PortablePlan>,
+    pub workspace: PortablePlan,
 }
 
 /// turn one dispatch payload into the provider's input and per-run context.
-///
-/// - no `ducktape_run` marker → legacy passthrough: the input IS the payload,
-///   byte-identical, with a default context and no workspace plan.
-/// - marker present → full envelope handling; every failure is a loud `Err`
-///   that becomes the saga result (NEVER a silent fallback to the generic
-///   instructions — the agent's registered prompt is the whole point).
+/// every payload MUST be a v3 run envelope; anything else — flat strings, v2
+/// envelopes, unknown versions, malformed fields, unresolvable prompts — is a
+/// loud `Err` that becomes the saga result (NEVER a silent fallback: the
+/// agent's registered prompt and the pinned workspace are the whole point).
 pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Prepared, String> {
-    // marker detection is deliberately strict about what counts as a claim:
-    // the payload must be a whole JSON object carrying the key. a flat
-    // prompt that merely STARTS with '{' (or embeds the marker in prose)
-    // fails the parse and passes through untouched.
     let claimed = match serde_json::from_str::<Value>(input) {
         Ok(Value::Object(map)) if map.contains_key("ducktape_run") => Value::Object(map),
         _ => {
-            return Ok(Prepared {
-                input: input.to_string(),
-                ctx: RunContext::default(),
-                workspace: None,
-            });
+            return Err(
+                "dispatch payload carries no ducktape_run envelope marker; legacy flat \
+                 payloads are unsupported (flag day) — recompose the run"
+                    .to_string(),
+            );
         }
     };
 
@@ -139,11 +142,11 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
         .get("ducktape_run")
         .and_then(Value::as_u64)
         .ok_or_else(|| "run envelope's ducktape_run marker is not an integer".to_string())?;
-    if !matches!(version, LEGACY_RUN_ENVELOPE_VERSION | RUN_ENVELOPE_VERSION) {
+    if version != RUN_ENVELOPE_VERSION {
         return Err(format!(
             "run envelope version {version} is not supported by this worker \
-             (understands {LEGACY_RUN_ENVELOPE_VERSION} and {RUN_ENVELOPE_VERSION}); \
-             upgrade the executing node"
+             (understands {RUN_ENVELOPE_VERSION} only; v2/legacy envelopes are \
+             unsupported); upgrade or recompose"
         ));
     }
     let envelope: WireEnvelope =
@@ -184,37 +187,40 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
         }
     };
 
+    let agent_display_name = envelope
+        .agent_display_name
+        .unwrap_or_else(|| envelope.agent_id.clone());
     let mut ctx = RunContext {
         agent_id: Some(envelope.agent_id),
         thread_key: envelope.thread_key,
         ..RunContext::default()
     };
-    let workspace = if version == RUN_ENVELOPE_VERSION {
-        accept_portable_envelope(
-            &mut ctx,
-            envelope.workspace,
-            envelope.base_tools,
-            envelope.skills,
-            envelope.result_contract,
-        )?
-    } else {
-        None
-    };
-    // reading order (coordinator-decided M1 follow-up): system instructions →
-    // item context (forge runs only) → output contract → conversation. the
-    // context section is byte-exact from the envelope field, joined with the
-    // same "\n\n" delimiter as every other section; a context-less envelope
-    // assembles byte-identically to the pre-context worker.
-    let input = match &envelope.context {
-        Some(context) => format!(
-            "{prompt}\n\n{context}\n\n{}\n\n{}",
-            envelope.contract, envelope.conversation
-        ),
-        None => format!(
-            "{prompt}\n\n{}\n\n{}",
-            envelope.contract, envelope.conversation
-        ),
-    };
+    let workspace = accept_portable_envelope(
+        &mut ctx,
+        envelope.run_id,
+        envelope.workspace,
+        envelope.skills,
+        envelope.result_contract,
+        agent_display_name,
+    )?;
+    // reading order: system instructions → runtime (the tool plane and the
+    // run's skill mounts: what this session CAN do) → item context (forge runs
+    // only: what it is working ON) → output contract → conversation. every
+    // section is byte-exact from its envelope field, joined with the same
+    // "\n\n" delimiter; an OPTIONAL section that is absent contributes no
+    // delimiter either, so an envelope missing one assembles byte-identically
+    // to the worker that predates it.
+    let input = [
+        Some(prompt.as_str()),
+        envelope.runtime.as_deref(),
+        envelope.context.as_deref(),
+        Some(envelope.contract.as_str()),
+        Some(envelope.conversation.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
     Ok(Prepared {
         input,
         ctx,
@@ -222,7 +228,7 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
     })
 }
 
-/// ACCEPT a v3 (portable) envelope and surface its pinned plan, without
+/// ACCEPT a portable envelope and surface its pinned plan, without
 /// ACTIVATING portable execution HERE.
 ///
 /// this worker validates the portable shape and marks the run portable so no
@@ -239,11 +245,12 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
 /// `capability-host::workdir_for`).
 fn accept_portable_envelope(
     ctx: &mut RunContext,
+    consensus_run_id: Option<String>,
     workspace: Option<WireWorkspace>,
-    base_tools: Option<Vec<WireBaseTool>>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
-) -> Result<Option<PortablePlan>, String> {
+    agent_display_name: String,
+) -> Result<PortablePlan, String> {
     let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
     // non-empty-prefix rule; forge requires repo/commit/branch) with loud,
@@ -256,11 +263,6 @@ fn accept_portable_envelope(
             "v3 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
             result_contract.ducktape_runner_result
         ));
-    }
-    let base_tools =
-        base_tools.ok_or_else(|| "v3 run envelope is missing base_tools".to_string())?;
-    if base_tools.is_empty() {
-        return Err("v3 run envelope base_tools must not be empty".into());
     }
     // skills are optional, but each present entry must name a source (the
     // wrapper checks it out as a ro mount).
@@ -276,19 +278,16 @@ fn accept_portable_envelope(
     // workdir_override/env here (W1/M2) — the plan is data the pool decides
     // whether to act on.
     ctx.portable = true;
-    Ok(Some(PortablePlan {
+    Ok(PortablePlan {
         source,
+        // the id CONSENSUS knows this run by — carried through to the
+        // provisioner, which is the only thing that can name the run back to
+        // `runs`. absent on a pre-field envelope: no session, never a failure.
+        consensus_run_id,
+        agent_display_name,
         // the requested sink rides the plan so the pool can echo it on the
         // assembled RunnerResult; Chain (the default) when the key is absent.
         sink: result_contract.sink,
-        base_tools: base_tools
-            .into_iter()
-            .map(|t| BaseTool {
-                name: t.name,
-                version: t.version,
-                exposure: t.exposure,
-            })
-            .collect(),
         // each skill becomes a ro mount: its name is the mount subpath the
         // wrapper materializes it under.
         skills: skills
@@ -299,7 +298,7 @@ fn accept_portable_envelope(
                 mount_subpath: s.name,
             })
             .collect(),
-    }))
+    })
 }
 
 /// 64 lowercase-or-uppercase hex chars → 32 bytes. strict charset first:
@@ -326,27 +325,44 @@ mod tests {
         })
     }
 
+    /// the CONSENSUS run id the composer stamps — see
+    /// [`crate::provision::WorkspaceSpec::consensus_run_id`].
+    const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}7\u{1f}bot";
+
+    /// a duckfs-sourced v3 envelope — the byte shape the runs composer emits
+    /// for every non-forge run.
     fn envelope_json(prompt_hash: Option<&str>) -> String {
         serde_json::json!({
-            "ducktape_run": 2,
+            "ducktape_run": 3,
             "agent_id": "bot",
+            "run_id": CONSENSUS_RUN_ID,
+            "agent_display_name": "BOT",
             "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
+            "workspace": {
+                "kind": "duckfs",
+                "source_prefix": "/shared/agent-workspaces/bot",
+                "source_snapshot": "aa".repeat(32)
+            },
+            "skills": [
+                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
+            ],
+            "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
     }
 
-    /// a forge-sourced v3 envelope — the EXACT byte shapes task 1's composer
-    /// emits (task-1 report §"Exact final serde shapes"): tagged forge
-    /// workspace, `context` after `conversation`, requested-Pr sink WITHOUT
-    /// title/body keys.
+    /// a forge-sourced envelope — tagged forge workspace, `context` after
+    /// `conversation`, requested-Pr sink WITHOUT title/body keys.
     fn forge_envelope_json() -> String {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
+            "agent_display_name": "BOT",
             "prompt_hash": null,
             "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
@@ -360,9 +376,6 @@ mod tests {
                 "branch": "agent/item-7",
                 "branch_born": false
             },
-            "base_tools": [
-                {"name":"ducktape-files","version":"1","exposure":"cli"}
-            ],
             "skills": [],
             "result_contract": {
                 "ducktape_runner_result": 1,
@@ -372,64 +385,47 @@ mod tests {
         .to_string()
     }
 
-    fn v3_envelope_json(prompt_hash: Option<&str>) -> String {
-        serde_json::json!({
-            "ducktape_run": 3,
-            "agent_id": "bot",
-            "prompt_hash": prompt_hash,
-            "thread_key": "general#7",
-            "instructions": "GENERIC",
-            "contract": "CONTRACT",
-            "conversation": "CONVERSATION",
-            "workspace": {
-                "kind": "duckfs",
-                "source_prefix": "/shared/agent-workspaces/bot",
-                "source_snapshot": "aa".repeat(32)
-            },
-            "base_tools": [
-                {"name":"ducktape-files","version":"1","exposure":"cli"},
-                {"name":"ducktape-index","version":"1","exposure":"cli"},
-                {"name":"ducktape-chain","version":"1","exposure":"cli"}
-            ],
-            "skills": [
-                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
-            ],
-            "result_contract": {"ducktape_runner_result": 1}
-        })
-        .to_string()
-    }
-
     #[tokio::test]
-    async fn legacy_flat_payloads_pass_through_byte_identical() {
+    async fn non_envelope_payloads_are_loud_errors_never_passthrough() {
+        // FLAG DAY: the legacy flat-string passthrough is gone — anything
+        // that is not a marker-carrying JSON object fails the run.
         for legacy in [
             "a plain rendered prompt",
             "",
-            // starts with '{' but is not JSON: must not be mangled.
             "{not json at all",
-            // valid JSON but not an object: not a claim.
             "[1,2,3]",
             "\"just a string\"",
-            // a JSON object WITHOUT the marker: not a claim either.
             r#"{"run_id":"r","agent_id":"a"}"#,
-            // the marker as PROSE inside a flat prompt, not a JSON key.
             "the ducktape_run marker is discussed here",
         ] {
-            let Prepared {
-                input,
-                ctx,
-                workspace,
-            } = prepare(legacy, None).await.unwrap();
-            assert_eq!(input.as_bytes(), legacy.as_bytes(), "verbatim: {legacy:?}");
-            assert_eq!(ctx, RunContext::default());
-            assert!(workspace.is_none(), "legacy payloads carry no plan");
+            let err = prepare(legacy, None).await.unwrap_err();
+            assert!(
+                err.contains("no ducktape_run envelope marker"),
+                "{legacy:?} must be rejected loudly, got {err:?}"
+            );
         }
     }
 
     #[tokio::test]
+    async fn v2_envelopes_are_rejected() {
+        // the second half of the flag day: the v2 tolerance is gone.
+        let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        v["ducktape_run"] = serde_json::json!(2);
+        let err = prepare(&v.to_string(), None).await.unwrap_err();
+        assert!(err.contains("version 2"), "got {err:?}");
+        assert!(err.contains("understands 3"), "got {err:?}");
+    }
+
+    #[tokio::test]
     async fn a_null_hash_envelope_assembles_instructions_contract_conversation() {
-        let Prepared { input, ctx, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared {
+            input,
+            ctx,
+            workspace,
+        } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
+        assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
 
@@ -481,17 +477,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claimed_but_broken_envelopes_are_loud_errors_not_passthrough() {
+    async fn claimed_but_broken_envelopes_are_loud_errors() {
         // an unknown version is a mixed-network signal, never model input.
         let err = prepare(r#"{"ducktape_run":99}"#, None).await.unwrap_err();
         assert!(err.contains("version 99"), "got {err:?}");
 
         // a non-integer marker.
-        let err = prepare(r#"{"ducktape_run":"2"}"#, None).await.unwrap_err();
+        let err = prepare(r#"{"ducktape_run":"3"}"#, None).await.unwrap_err();
         assert!(err.contains("not an integer"), "got {err:?}");
 
-        // version 2 with required fields missing.
-        let err = prepare(r#"{"ducktape_run":2,"agent_id":"bot"}"#, None)
+        // v3 with required fields missing.
+        let err = prepare(r#"{"ducktape_run":3,"agent_id":"bot"}"#, None)
             .await
             .unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
@@ -516,6 +512,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_in_flight_envelope_without_a_display_name_uses_the_agent_id() {
+        let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        v.as_object_mut().unwrap().remove("agent_display_name");
+        let Prepared { workspace, .. } = prepare(&v.to_string(), None).await.unwrap();
+        assert_eq!(workspace.agent_display_name, "bot");
+    }
+
+    #[tokio::test]
     async fn job_envelopes_carry_no_thread_key() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
         v["thread_key"] = serde_json::Value::Null;
@@ -525,23 +529,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_envelopes_are_accepted_and_marked_portable_without_activating_a_mount() {
-        // the worker ACCEPTS v3 (proving readiness for a future coordinated
-        // flip) and marks the run portable, but it does NOT activate a
-        // workspace mount: no consensus-supplied cwd override, no workspace
-        // env. the host's own scratch/persistent policy owns the cwd until the
-        // provisioning wrapper lands (ADR ROL/M2 + W1).
+    async fn envelopes_are_accepted_and_marked_portable_without_activating_a_mount() {
+        // the worker ACCEPTS the envelope and marks the run portable, but it
+        // does NOT activate a workspace mount: no consensus-supplied cwd
+        // override, no workspace env. the pool activates the plan iff a
+        // provisioner is wired (ADR ROL/M2 + W1).
         let Prepared {
             input,
             ctx,
             workspace,
-        } = prepare(&v3_envelope_json(None), None).await.unwrap();
+        } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
         assert!(
             ctx.portable,
-            "v3 runs are portable and cannot resume host-local sessions"
+            "runs are portable and cannot resume host-local sessions"
         );
         assert!(
             ctx.workdir_override.is_none(),
@@ -554,56 +557,78 @@ mod tests {
         assert!(ctx.path_entries.is_empty());
         // the pinned plan IS surfaced (so the pool CAN act on it when a
         // provisioner is wired) — surfacing it is not activating it.
-        let plan = workspace.expect("a v3 envelope surfaces its portable plan");
         assert_eq!(
-            plan.source,
+            workspace.source,
             crate::workspace_source::WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
             }
         );
         assert_eq!(
-            plan.sink,
+            workspace.sink,
             crate::provision::Sink::Chain,
             "no requested sink key ⇒ Chain, the default"
         );
-        assert_eq!(plan.base_tools.len(), 3);
         // the C4 skills are surfaced as ro mounts (name -> mount_subpath).
-        assert_eq!(plan.skills.len(), 1);
-        assert_eq!(plan.skills[0].mount_subpath, "release");
-        assert_eq!(plan.skills[0].source_prefix, "/shared/skills/release");
+        assert_eq!(workspace.skills.len(), 1);
+        assert_eq!(workspace.skills[0].mount_subpath, "release");
+        assert_eq!(workspace.skills[0].source_prefix, "/shared/skills/release");
         assert_eq!(
-            plan.skills[0].source_snapshot.as_deref(),
+            workspace.skills[0].source_snapshot.as_deref(),
             Some("bb".repeat(32).as_str())
         );
     }
 
     #[tokio::test]
-    async fn an_old_shape_v3_that_still_carries_mount_path_decodes_fine() {
+    async fn the_plan_carries_the_consensus_run_id_and_tolerates_its_absence() {
+        // the id `runs` resolves the run by. it MUST survive the decode: the
+        // pool has no other way to name the run — its own spec id is
+        // `{saga_id}:{attempt}`, which resolves nothing in consensus — so a
+        // dropped id here silently kills every mid-run write the run makes.
+        let Prepared { workspace, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(
+            workspace.consensus_run_id.as_deref(),
+            Some(CONSENSUS_RUN_ID),
+            "the run id crosses the envelope verbatim, separators and all"
+        );
+
+        // ADDITIVE: an envelope composed before the field existed still runs —
+        // it simply names no run, so the provisioner opens no session (the
+        // read-only tool plane) rather than binding to a run that isn't there.
+        let mut legacy: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        legacy.as_object_mut().unwrap().remove("run_id");
+        let Prepared {
+            input, workspace, ..
+        } = prepare(&legacy.to_string(), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(workspace.consensus_run_id, None);
+    }
+
+    #[tokio::test]
+    async fn an_old_shape_envelope_that_still_carries_mount_path_decodes_fine() {
         // the composer no longer emits mount_path (D7), but an ADDITIVE field
         // inside the tagged workspace object must never reject an in-flight
         // envelope — the extra field is tolerated (decoded and ignored).
         let mut old_shape: serde_json::Value =
-            serde_json::from_str(&v3_envelope_json(None)).unwrap();
+            serde_json::from_str(&envelope_json(None)).unwrap();
         old_shape["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
         let Prepared { ctx, workspace, .. } = prepare(&old_shape.to_string(), None).await.unwrap();
-        assert!(ctx.portable, "an old-shape v3 is still accepted + portable");
-        let plan = workspace.expect("an old-shape v3 still surfaces its plan");
+        assert!(ctx.portable, "an old-shape envelope is still accepted + portable");
         assert!(
             matches!(
-                &plan.source,
+                &workspace.source,
                 crate::workspace_source::WorkspaceSource::Duckfs { source_prefix, .. }
                     if source_prefix == "/shared/agent-workspaces/bot"
             ),
             "got {:?}",
-            plan.source
+            workspace.source
         );
     }
 
     #[tokio::test]
     async fn a_forge_envelope_is_accepted_with_its_pinned_source_and_requested_sink() {
-        // the whole worker half of the forge flag day: the tagged forge source
-        // surfaces on the plan, the item context lands in the assembled input
+        // the worker half of the forge lane: the tagged forge source surfaces
+        // on the plan, the item context lands in the assembled input
         // (instructions → context → contract → conversation), and the
         // requested Pr sink decodes with DEFAULT-EMPTY title/body (the
         // composer omits them; delivery derives them later — contract §1/§3).
@@ -617,11 +642,11 @@ mod tests {
             "GENERIC\n\nForge item context — you are working this item as a session.\n\
              repo: app\nitem: issue #7 (open)\n\nCONTRACT\n\nCONVERSATION"
         );
-        assert!(ctx.portable, "a forge v3 run is portable");
+        assert!(ctx.portable, "a forge run is portable");
         assert_eq!(ctx.thread_key.as_deref(), Some("forge:app:7#2"));
-        let plan = workspace.expect("a forge envelope surfaces its plan");
+        assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(
-            plan.source,
+            workspace.source,
             crate::workspace_source::WorkspaceSource::Forge {
                 repo: "app".into(),
                 commit: "d0".repeat(20),
@@ -630,7 +655,7 @@ mod tests {
             }
         );
         assert_eq!(
-            plan.sink,
+            workspace.sink,
             crate::provision::Sink::Pr {
                 repo: "app".into(),
                 source_branch: "agent/item-7".into(),
@@ -639,8 +664,7 @@ mod tests {
                 body: String::new(),
             }
         );
-        assert_eq!(plan.base_tools.len(), 1);
-        assert!(plan.skills.is_empty());
+        assert!(workspace.skills.is_empty());
     }
 
     #[tokio::test]
@@ -650,30 +674,61 @@ mod tests {
         // the section is byte-exact from the envelope field, joined with the
         // SAME "\n\n" delimiter the existing sections use.
         let mut with_context: serde_json::Value =
-            serde_json::from_str(&v3_envelope_json(None)).unwrap();
+            serde_json::from_str(&envelope_json(None)).unwrap();
         with_context["context"] = serde_json::json!("Forge item context — repo: app");
-        let Prepared {
-            input, workspace, ..
-        } = prepare(&with_context.to_string(), None).await.unwrap();
+        let Prepared { input, .. } = prepare(&with_context.to_string(), None).await.unwrap();
         assert_eq!(
             input,
             "GENERIC\n\nForge item context — repo: app\n\nCONTRACT\n\nCONVERSATION"
         );
-        assert!(workspace.is_some(), "the plan still surfaces");
 
         // the None case stays byte-identical — no stray delimiter: a
-        // context-less v3 assembles exactly the pre-context bytes (the v2
-        // pin lives in a_null_hash_envelope_assembles_…).
-        let Prepared { input, .. } = prepare(&v3_envelope_json(None), None).await.unwrap();
+        // context-less envelope assembles exactly the pre-context bytes.
+        let Prepared { input, .. } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
     }
 
     #[tokio::test]
+    async fn the_runtime_section_reaches_the_provider_input_ahead_of_the_item_context() {
+        // the runtime section (the ducktape tool plane + the run's skill
+        // mounts) is what the session CAN do; the item context is what it works
+        // ON. capabilities read first: instructions → runtime → context →
+        // contract → conversation.
+        let mut with_runtime: serde_json::Value =
+            serde_json::from_str(&forge_envelope_json()).unwrap();
+        with_runtime["runtime"] = serde_json::json!(
+            "A Ducktape MCP tool server named \"ducktape\" is available in this session."
+        );
+        let Prepared { input, .. } = prepare(&with_runtime.to_string(), None).await.unwrap();
+        assert_eq!(
+            input,
+            "GENERIC\n\nA Ducktape MCP tool server named \"ducktape\" is available in this \
+             session.\n\nForge item context — you are working this item as a session.\n\
+             repo: app\nitem: issue #7 (open)\n\nCONTRACT\n\nCONVERSATION"
+        );
+
+        // it is an ADDITIVE field: an envelope composed before the section
+        // existed carries no key and assembles byte-identically to what this
+        // worker produced then — no stray delimiter, no missing section.
+        let Prepared { input, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+
+        // and a runtime-only (non-forge) envelope carries it alone.
+        let mut duckfs_with_runtime: serde_json::Value =
+            serde_json::from_str(&envelope_json(None)).unwrap();
+        duckfs_with_runtime["runtime"] = serde_json::json!("TOOL PLANE");
+        let Prepared { input, .. } = prepare(&duckfs_with_runtime.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(input, "GENERIC\n\nTOOL PLANE\n\nCONTRACT\n\nCONVERSATION");
+    }
+
+    #[tokio::test]
     async fn the_flat_pre_forge_workspace_shape_is_rejected_loudly() {
-        // FLAG DAY (wire contract §1): the workspace block is a tagged enum
-        // now (`kind` = duckfs | forge). the old flat duckfs shape carries no
-        // `kind` — a mixed-binary signal that must fail loudly, never decode.
-        let mut flat: serde_json::Value = serde_json::from_str(&v3_envelope_json(None)).unwrap();
+        // the workspace block is a tagged enum (`kind` = duckfs | forge). the
+        // old flat duckfs shape carries no `kind` — a mixed-binary signal that
+        // must fail loudly, never decode.
+        let mut flat: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
         flat["workspace"] = serde_json::json!({
             "source_prefix": "/shared/agent-workspaces/bot",
             "source_snapshot": "aa".repeat(32)
@@ -684,10 +739,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_v3_envelope_that_omits_or_breaks_the_portable_shape_fails_loudly() {
-        // accept still means VALIDATE: a v3 marker with a missing/empty/wrong
-        // portable block is a mixed-network signal, never silently downgraded.
-        let base: serde_json::Value = serde_json::from_str(&v3_envelope_json(None)).unwrap();
+    async fn an_envelope_that_omits_or_breaks_the_portable_shape_fails_loudly() {
+        // accept still means VALIDATE: a missing/empty/wrong portable block is
+        // a mixed-network signal, never silently downgraded.
+        let base: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
 
         let mut missing = base.clone();
         missing["workspace"] = serde_json::Value::Null;
@@ -702,10 +757,10 @@ mod tests {
             "got {err:?}"
         );
 
-        let mut empty_tools = base.clone();
-        empty_tools["base_tools"] = serde_json::json!([]);
-        let err = prepare(&empty_tools.to_string(), None).await.unwrap_err();
-        assert!(err.contains("base_tools must not be empty"), "got {err:?}");
+        let mut no_contract = base.clone();
+        no_contract["result_contract"] = serde_json::Value::Null;
+        let err = prepare(&no_contract.to_string(), None).await.unwrap_err();
+        assert!(err.contains("missing result_contract"), "got {err:?}");
 
         let mut bad_result = base.clone();
         bad_result["result_contract"]["ducktape_runner_result"] = serde_json::json!(99);
@@ -740,15 +795,5 @@ mod tests {
             .remove("commit");
         let err = prepare(&missing_commit.to_string(), None).await.unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
-    }
-
-    #[tokio::test]
-    async fn v2_envelopes_remain_non_portable_for_legacy_in_flight_runs() {
-        let Prepared { ctx, workspace, .. } = prepare(&envelope_json(None), None).await.unwrap();
-        assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
-        assert!(!ctx.portable);
-        assert!(ctx.workdir_override.is_none());
-        assert!(ctx.env.is_empty());
-        assert!(workspace.is_none(), "v2 runs carry no portable plan");
     }
 }

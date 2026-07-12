@@ -91,6 +91,48 @@ impl ResidentRelay {
             Ok(prepared) => prepared,
             Err(detail) => return Err((hold, detail)),
         };
+        self.relay_frame(frame_id, frame, custodian, targets, relay_tx, hold)
+    }
+
+    /// Relay an ALREADY-SIGNED frame. The frame is not this node's: an agent's
+    /// per-run session key signed it and the resident is only the courier, so
+    /// nothing here re-signs or re-originates it — `RelayMsg::Submit` carries
+    /// frames, not msgs, and the validator verifies the signature before it
+    /// pins. The resident's own `seq` counter is untouched too: the frame
+    /// carries the SIGNER's seq, not the courier's.
+    pub(crate) fn submit_frame<S>(
+        &mut self,
+        frame: Vec<u8>,
+        targets: &[ed25519::PublicKey],
+        relay_tx: &mut S,
+        hold: ResidentHold,
+    ) -> Result<node::FrameId, (ResidentHold, String)>
+    where
+        S: P2pSender<PublicKey = ed25519::PublicKey>,
+    {
+        let custodian = match self.custodian(targets) {
+            Ok(custodian) => custodian,
+            Err(detail) => return Err((hold, detail)),
+        };
+        let frame_id = node::frame_id(&frame);
+        self.relay_frame(frame_id, frame, custodian, targets, relay_tx, hold)
+    }
+
+    /// The shared relay tail both submit paths take: fan a forge pack out to
+    /// every target first when the frame needs one, otherwise hand the frame
+    /// straight to the custodian and hold the caller's reply against its id.
+    fn relay_frame<S>(
+        &mut self,
+        frame_id: node::FrameId,
+        frame: Vec<u8>,
+        custodian: ed25519::PublicKey,
+        targets: &[ed25519::PublicKey],
+        relay_tx: &mut S,
+        hold: ResidentHold,
+    ) -> Result<node::FrameId, (ResidentHold, String)>
+    where
+        S: P2pSender<PublicKey = ed25519::PublicKey>,
+    {
         let deadline = Instant::now() + SUBMIT_HOLD;
         if let Some(digest) = relay::required_blob_digest(&frame) {
             let Some(bytes) = self.blobs.get_chunk(&digest) else {
@@ -249,17 +291,25 @@ impl ResidentRelay {
         target: String,
         payload: Vec<u8>,
     ) -> Result<(node::FrameId, Vec<u8>, ed25519::PublicKey), String> {
-        if targets.is_empty() {
-            return Err("no validator known yet - the manifest poll has not landed".into());
-        }
+        let custodian = self.custodian(targets)?;
         self.seq += 1;
         std::fs::write(&self.seq_file, self.seq.to_string())
             .map_err(|e| format!("cannot persist the submit seq: {e}"))?;
         let frame = node::encode_frame(signer, self.seq, &Msg { target, payload });
         let frame_id = node::frame_id(&frame);
+        Ok((frame_id, frame, custodian))
+    }
+
+    /// The validator that takes custody of the next relayed frame: round-robin
+    /// over the announce targets, so a resident's submit stream never leans on
+    /// one validator. No target means no relay is possible at all.
+    fn custodian(&mut self, targets: &[ed25519::PublicKey]) -> Result<ed25519::PublicKey, String> {
+        if targets.is_empty() {
+            return Err("no validator known yet - the manifest poll has not landed".into());
+        }
         let custodian = targets[self.round % targets.len()].clone();
         self.round += 1;
-        Ok((frame_id, frame, custodian))
+        Ok(custodian)
     }
 }
 

@@ -1,69 +1,63 @@
-# ops/ — fleet QA dashboard
+# Fleet QA
 
-Run the real Ducktape desktop app for **every git worktree** at once, headless,
-and watch them live from any device over Tailscale — so you can see how agents
-are driving and QAing each branch.
-
-```
-ops/
-  fleet.sh          fleet manager (userspace, no root)
-  fleet-console/    the dashboard (Vite + React + @novnc/novnc, @xyflow/react)
-```
+Multi-instance desktop QA is owned by
+[`tauri-agent-fleet`](https://github.com/byeongsu-hong/tauri-agent-fleet).
+Ducktape retains only its application config and suites under `.tauri-agent/`
+plus its CEF build/instance hooks under `qa/fleet/`.
 
 ## Quick start
 
 ```bash
-ops/fleet.sh build-console        # one-time: bun install + vite build → dist/
-ops/fleet.sh up                   # bring up an instance per worktree (or: up <branch> …)
-ops/fleet.sh status               # slots/ports/status + dashboard URL
-# open the printed URL on your Mac/phone (must be on the tailnet)
-ops/fleet.sh down                 # tear it all down
+cd app && bun install
+cd ..
+FLEET="${FLEET:-app/node_modules/.bin/tauri-agent-fleet}"
+"$FLEET" up HEAD
+"$FLEET" status
+"$FLEET" dashboard
+"$FLEET" down
 ```
 
-The dashboard shows one live tile per worktree (branch, sha, ahead/behind vs
-`dev`, status, an agent observe readiness badge, and an **agent activity** line
-— uncommitted-file count + latest commit). Toggle **Grid** ⇄ **Graph** (the git
-branch tree via `@xyflow/react`; `?view=graph` deep-links it). Click a tile to
-open a full-size **interactive** session plus that worktree's commit trail.
+During Fleet development, point `FLEET` at a locally built `dist/cli.js`.
+Update Ducktape's dependency pin only after that Fleet revision is reviewed.
+
+The dashboard is read-oriented and polls Fleet's live instance/run state. It
+shows the revision, CEF runtime, lifecycle and suite state, agent health,
+tokens/cost, artifacts, and loopback-routed noVNC screen. Lifecycle stays in the
+CLI.
 
 ## How it works
 
 ```
-browser ──http/ws :6090 (ONLY exposed port)──▶ one websockify
-                                               ├─ --web fleet-console/dist  (UI + fleet.json)
-                                               └─ ?token=<worktree> ─▶ 127.0.0.1:<vncPort>
-per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591x
-                                             └─ tauri-agent endpoint in $STATE/<id>
+source revision → cached CEF debug artifact → isolated instance(s) → run(s)
+                                              ├─ tauri-agent direct client
+                                              └─ Xvfb + loopback x11vnc
 ```
 
-- **One exposed port** (`:6090`). Every worktree's x11vnc binds `127.0.0.1`; the
-  browser reaches them only through websockify's token router.
-- **Human screen vs agent stream**: people watch the VNC/noVNC tile. Agents use
-  the per-worktree tauri-agent endpoint. `fleet.json` includes an `agent`
-  object with `runtimeDir`, `endpointPath`, `endpointReady`, and an
-  aggregation-ready `observe` command contract (`XDG_RUNTIME_DIR=$STATE/<id>`
-  plus `app/scripts/tauri-agent observe --app com.ducktape.app --format
-  ndjson`). A later aggregator can consume those fields without changing the
-  fleet launcher.
-- **Isolation**: each app runs with its own `$HOME` AND `up_one` seeds a solo
-  workspace there (active, camelCase `registry.json`) + passes a stable
-  `DUCKTAPE_NODE_BIN` (staged outside `target/`, which `tauri dev`'s build.rs
-  clobbers to a 0-byte placeholder). The app then boots **LOCAL** on its own
-  node — not the shared `127.0.0.1:8844`. **Requires the worktree app to carry
-  PR #90** (StrictMode boot fix, on `dev`); worktrees behind `dev` boot REMOTE.
-  `CARGO_HOME`/`RUSTUP_HOME`/caches are pinned to the real home so builds stay
-  warm.
-- **Port bases** are offset from the single-instance `remote-tauri.sh`
-  (`:99/5900/6080`) so both can run at once. Override with `FLEET_DISP_BASE`,
-  `FLEET_VITE_BASE`, `FLEET_VNC_BASE`, `FLEET_WEB_PORT`, `FLEET_SCREEN`.
-- Reuses the x11vnc / xdotool / noVNC / websockify already staged under
-  `~/.local/opt/remote-tauri/` by the `tauri-debug` / remote-tauri setup.
+- `qa/fleet/build-cef.sh` builds once and copies the debug desktop plus node
+  sidecar into Fleet's immutable artifact directory. Debug is deliberate: the
+  tauri-agent endpoint is absent from release builds.
+- `qa/fleet/prepare-instance.sh` seeds a solo Ducktape workspace using the
+  cached sidecar. `qa/fleet/cleanup-instance.ts` verifies the workspace pidfile,
+  executable, config path, and start identity before stopping the detached node
+  group. Fleet owns HOME, XDG/data/display/port isolation and its desktop,
+  VNC, and X process groups.
+- **Stop the instance before deleting its worktree.** `cleanupInstance` is a
+  path *inside* the worktree, while the workspace, pidfile, and detached node
+  live outside it under `FLEET_HOME` — so removing the worktree first destroys
+  the only thing that could stop the node, and it survives forever, unreachable
+  by `fleet down`. `ops/worktree-clean.sh` does the sequence in the right order
+  (dry-run by default, `--yes` to act): it reaps orphaned instances, then
+  removes worktrees whose branch is fully merged into `origin/dev`, and refuses
+  any that is dirty or carries an unmerged commit.
+- Ducktape's desktop is CEF-only on `dev`; the suite declares `runtime: cef`.
+- The dashboard and VNC server bind to loopback unless an operator explicitly
+  chooses another dashboard host. Use an SSH/Tailscale tunnel for remote viewing.
 
 ## Notes
 
-- Read-only console: it views and connects; bring instances up/down with the
-  script (no lifecycle control in the UI — deferred by design).
-- Activity source is git/worktree churn (provider-agnostic — works for any
-  agent). The `<ActivityFeed>` is pluggable if you want a richer source later.
-- Agent QA automation lives in `skills/qa/SKILL.md`; this README is the
-  maintained operator reference for the fleet dashboard.
+- Run the deterministic CEF smoke with
+  `app/node_modules/.bin/tauri-agent-fleet test cef-smoke`.
+- `status --json` is the authoritative way to find an instance ID, display,
+  runtime directory, agent health, and artifact path.
+- On hosts where x11vnc is staged rather than installed, set
+  `FLEET_VNC_COMMAND` and its required `LD_LIBRARY_PATH` before invoking Fleet.

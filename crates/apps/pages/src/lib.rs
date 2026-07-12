@@ -6,9 +6,9 @@
 //! module's whole-doc-per-key layout, the qmdb key here is `sha256(block_id)`
 //! and the value is ONE serialized block — so the merkle root commits to every
 //! block individually, and a single block is readable (and one day provable)
-//! by id alone with no page context. that is the addressability contract that
-//! lets other modules hold a [`crate::BlockRef`] today and resolve
-//! it via `Ctx::query(pages, GetBlock { block_id })`.
+//! by id alone with no page context. that is the addressability contract: any
+//! module can resolve a bare block id via `Ctx::query(pages, GetBlock {
+//! block_id })`.
 //!
 //! ## keys are hashed to a fixed width
 //!
@@ -71,6 +71,7 @@ use commonware_utils::range::NonEmptyRange;
 use sdk::{
     Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
+use tagging::{TagEvent, TaggingMsg};
 
 mod block_ops;
 mod comment_ops;
@@ -134,6 +135,9 @@ where
     /// read ahead of committed state by `get` (read-your-writes) and flushed
     /// to qmdb in one batch by `commit_block`; NOT in `root()` until then.
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Optional engagement router. Tests/minimal registries may leave it
+    /// unwired; production reports each newly-added comment after staging it.
+    tagging: Option<ModuleId>,
 }
 
 #[cfg(test)]

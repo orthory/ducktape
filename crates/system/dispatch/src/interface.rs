@@ -134,8 +134,20 @@ pub struct DispatchView {
     /// assignee), resolved at QUERY TIME by the read facade. `None` unless the
     /// dispatch is `AwaitingResult` — a delivered run runs nowhere. VIEW-ONLY:
     /// never committed state, never part of the app-hash.
-    #[serde(default)]
     pub assignee: Option<Vec<u8>>,
+    /// live saga lease metadata, populated only while awaiting a result.
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub lease_expires_at: Option<u64>,
+    #[serde(default)]
+    pub deadline: Option<u64>,
+    #[serde(default)]
+    pub lease_updated_at: Option<u64>,
+    #[serde(default)]
+    pub reassignable: Option<bool>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -210,6 +222,9 @@ pub enum DispatchMsg {
     /// unknown, foreign, and already-terminal dispatches are deterministic
     /// no-ops — cancellation is idempotent.
     CancelDispatch { dispatch_id: String },
+    /// MODULE-ORIGIN ONLY, receiver-scoped: fence `attempt` and move the
+    /// in-flight dispatch to a different provider.
+    ReassignDispatch { dispatch_id: String, attempt: u32 },
     /// SYSTEM-ORIGIN ONLY: emit up to [`MAX_DELIVERIES_PER_BLOCK`] pending
     /// [`ResultEvent`]s to their receivers. injected by the host drain when
     /// the committed mailbox is non-empty — never submitted by anyone.

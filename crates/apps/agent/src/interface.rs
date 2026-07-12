@@ -22,8 +22,6 @@
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_AGENT_TARGET: &str = "agent";
-
 // ---- consensus constants ----------------------------------------------------
 
 /// hard cap on the actions one run's response may carry — the blast-radius
@@ -62,20 +60,47 @@ pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
 
-/// permission to post reply blocks into chat.
+/// permission to post reply blocks into chat — the run's ANSWER, in the channel
+/// and thread it was engaged from. deliberately NOT the permission to post
+/// wherever it likes: see [`ACTION_CHAT_POST_MESSAGE`].
 pub const ACTION_CHAT_POST: &str = "chat.post";
+/// permission to post a message to an ARBITRARY channel
+/// ([`AgentAction::PostMessage`]) — a strictly wider grant than
+/// [`ACTION_CHAT_POST`], which only ever lets an agent answer where it was
+/// spoken to.
+///
+/// a separate name on purpose. folding "post anywhere, unprompted" into
+/// `chat.post` would have SILENTLY widened every agent already registered with
+/// it — an owner who granted "may answer me" would have been giving "may post
+/// in any channel at any time" without ever being asked. a new action name means
+/// the wider power can only arrive by an owner deliberately granting it.
+pub const ACTION_CHAT_POST_MESSAGE: &str = "chat.post_message";
 /// permission to create a task ([`AgentAction::CreateTask`]).
 pub const ACTION_TASKS_CREATE: &str = "tasks.create";
 /// permission to move a task ([`AgentAction::UpdateTaskStatus`]).
 pub const ACTION_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
+/// permission to anchor a comment to a page or block
+/// ([`AgentAction::AddPageComment`]).
+pub const ACTION_PAGES_COMMENT: &str = "pages.comment";
+/// permission to flip a todo block's checked state
+/// ([`AgentAction::SetPageChecked`]).
+pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 
 /// every action name the platform knows. `RegisterAgent`/`UpdateAgent` reject
 /// an `allowed_actions` entry outside this vocabulary, so a granted permission
 /// always means something.
-pub const KNOWN_ACTIONS: [&str; 3] = [
+///
+/// ADDITIVE only: an existing record's `allowed_actions` is a set of these
+/// names, so a NEW name grants nothing to an agent already registered — it can
+/// only arrive through an owner-gated `UpdateAgent`. removing or renaming one,
+/// by contrast, would strand every record that holds it.
+pub const KNOWN_ACTIONS: [&str; 6] = [
     ACTION_CHAT_POST,
+    ACTION_CHAT_POST_MESSAGE,
     ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS,
+    ACTION_PAGES_COMMENT,
+    ACTION_PAGES_SET_CHECKED,
 ];
 
 // ---- runtime identity ---------------------------------------------------------
@@ -107,6 +132,11 @@ pub struct ResourceCaps {
     /// host-side and NEVER crosses consensus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// page ids this agent may WRITE (comment on / check off). page ids are
+    /// opaque, so matching is exact — no prefix containment — with the one
+    /// literal entry `"*"` granting every page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages_write: Vec<String>,
     /// the D3 sub-agent spawn ceiling; 0 = none. consumption is the runtime's
     /// concern; the record only states the ceiling.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -161,6 +191,8 @@ pub enum CapRequest<'a> {
     Tool(&'a str),
     /// resolve the named vault secret ref.
     Secret(&'a str),
+    /// write (comment on / check off) the named page.
+    PagesWrite(&'a str),
     /// spawn a sub-agent (checked against the budget ceiling).
     SpawnSubagent,
 }
@@ -215,19 +247,14 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
-    /// D2 two-level attribution: an agent's effect is charged to
-    /// `(owner, agent_id)`. keyless (D1): this returns coordinates, never a key
-    /// — no key material exists on the record to return.
-    pub fn attribution(&self) -> (&SagaOrigin, &str) {
-        (&self.owner, &self.agent_id)
-    }
-
     /// the pure D3 cap gate. the runtime calls this before applying an effect
     /// or opening a sink; a record with empty caps denies every request except a
     /// positive budget check. forge/tool/
     /// secret use exact membership; duckfs uses path-PREFIX containment (a
     /// prefix grants itself and any child path, but never a sibling that merely
-    /// shares a textual prefix — `src` does not grant `srcx`). budget
+    /// shares a textual prefix — `src` does not grant `srcx`); pages use exact
+    /// membership with the literal `"*"` entry granting every page (ids are
+    /// opaque — never a prefix). budget
     /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
     pub fn permits(&self, req: &CapRequest) -> bool {
         let c = &self.caps;
@@ -243,6 +270,7 @@ impl AgentRecord {
             CapRequest::DuckfsRead(p) => under(&c.duckfs_read, p) || under(&c.duckfs_write, p),
             CapRequest::Tool(t) => has(&c.tools, t),
             CapRequest::Secret(s) => has(&c.secrets, s),
+            CapRequest::PagesWrite(p) => has(&c.pages_write, "*") || has(&c.pages_write, p),
             CapRequest::SpawnSubagent => c.subagent_budget > 0,
         }
     }
@@ -252,8 +280,8 @@ impl AgentRecord {
 
 /// one reply block in this surface's OWN vocabulary — exactly the shape the
 /// strict-output instruction asks the model for. `kind` is one of
-/// "Paragraph", "Heading", or "Code" (anything else drops in normalization);
-/// the consuming module maps these to chat blocks at emission.
+/// "paragraph", "heading", or "code" (lowercase; anything else drops in
+/// normalization); the consuming module maps these to chat blocks at emission.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReplyBlock {
     pub kind: String,
@@ -279,6 +307,20 @@ pub struct AgentResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    /// post a message to a named channel ([`ACTION_CHAT_POST_MESSAGE`]) — the
+    /// agent SPEAKING, as opposed to `reply_blocks`, which is the agent
+    /// ANSWERING where it was engaged. `thread` makes it a reply under that
+    /// root sequence.
+    ///
+    /// this is what lets an agent report progress while it works instead of
+    /// saving everything for the end. it is a genuinely wider power than a
+    /// reply, which is exactly why it carries its own action name.
+    PostMessage {
+        channel_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<u64>,
+    },
     CreateTask {
         task_id: String,
         title: String,
@@ -289,14 +331,28 @@ pub enum AgentAction {
         task_id: String,
         status: String,
     },
+    /// anchor a comment to `target` — a page id or a block id in the pages
+    /// module ([`ACTION_PAGES_COMMENT`]).
+    AddPageComment {
+        target: String,
+        body: String,
+    },
+    /// flip a todo block's checked state ([`ACTION_PAGES_SET_CHECKED`]).
+    SetPageChecked {
+        block: String,
+        checked: bool,
+    },
 }
 
 impl AgentAction {
     /// the vocabulary name this action needs in the agent's `allowed_actions`.
     pub fn vocabulary_name(&self) -> &'static str {
         match self {
+            AgentAction::PostMessage { .. } => ACTION_CHAT_POST_MESSAGE,
             AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
+            AgentAction::AddPageComment { .. } => ACTION_PAGES_COMMENT,
+            AgentAction::SetPageChecked { .. } => ACTION_PAGES_SET_CHECKED,
         }
     }
 }

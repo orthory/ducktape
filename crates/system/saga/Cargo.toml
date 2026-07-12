@@ -11,7 +11,10 @@ valset = { workspace = true }
 capability = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+# the usage-ledger mapper (src/index.rs): node-local derived tier, no consensus.
+indexer = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
 host = { workspace = true }
+tempfile = "3"

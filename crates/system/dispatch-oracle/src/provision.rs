@@ -6,14 +6,11 @@
 //! dispatch-oracle CANNOT depend on duckfs-client (the reachability wall — a
 //! kernel/system crate must never touch the OS-side checkout engine), so this
 //! module speaks only plain data: the concrete `checkout_with`/`commit` calls
-//! live in the node binary's provisioner impl. the pool brackets a portable
-//! run with provision → bind → run → commit → assemble → cleanup ONLY when
-//! both a v3 plan AND a wired provisioner exist; otherwise the run is
-//! byte-identical to the legacy path (see [`crate::pool`]). this path is LIVE
-//! in both node binaries: they wire the files module unconditionally, so the
-//! runs composer emits v3 for every agent run (the de-versioned activation —
-//! no flag day, pre-production re-genesis). only embedders without a files
-//! module (dev tools, tests) still compose v2.
+//! live in the node binary's provisioner impl. the pool brackets a run with
+//! provision → bind → run → commit → assemble → cleanup ONLY when a
+//! provisioner is wired; an embedder without one keeps the accept-only
+//! degrade (raw-text delivery, no workspace). this path is LIVE in both node
+//! binaries.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,9 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::workspace_source::WorkspaceSource;
 
-/// the pinned portable plan carried by [`crate::Prepared`] for a v3 envelope.
-/// `Some` only for a v3 run; the pool turns it into a
-/// [`WorkspaceSpec`] iff a provisioner is wired, else it is inert (dormant).
+/// the pinned portable plan carried by [`crate::Prepared`]. the pool turns it
+/// into a [`WorkspaceSpec`] iff a provisioner is wired, else it is inert
+/// (dormant).
 ///
 /// carries NO `mount_path`: the composer emits SOURCE coordinates only (D7),
 /// and the provisioner mints its own writable host cwd. `skills` are the C4
@@ -36,40 +33,46 @@ use crate::workspace_source::WorkspaceSource;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePlan {
     pub source: WorkspaceSource,
+    /// the run's CONSENSUS id, verbatim from the envelope — see
+    /// [`WorkspaceSpec::consensus_run_id`]. `None` on an envelope composed
+    /// before the field existed.
+    pub consensus_run_id: Option<String>,
     pub sink: Sink,
-    pub base_tools: Vec<BaseTool>,
     pub skills: Vec<RoMount>,
+    /// committed registry name, carried to the Forge commit boundary.
+    pub agent_display_name: String,
 }
 
 /// what the pool hands the provisioner for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSpec {
     /// `"{saga_id}:{attempt}"` — idempotency key + per-run dir naming.
+    ///
+    /// NOT the id `runs` resolves a run by: it is a HOST-local key, and it
+    /// carries the attempt on purpose (a re-lease spawns a new attempt while
+    /// the old one may still be running, and the two must never share a
+    /// checkout dir). hashing it resolves nothing in consensus — the id a run
+    /// is named by there is [`Self::consensus_run_id`].
     pub run_id: String,
+    /// the id `runs` resolves the run by — the key of its pending map, and the
+    /// run the agent session lane binds to. carried from the composer through
+    /// the envelope because the host cannot derive it (see [`Self::run_id`]).
+    /// `None` = a pre-field envelope, or an embedder that composes its own: the
+    /// run then opens NO agent session and executes on the read-only tool plane
+    /// — the pre-session behaviour, never an error.
+    pub consensus_run_id: Option<String>,
     pub agent_id: Option<String>,
+    pub agent_display_name: Option<String>,
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
-    /// advisory only — NEVER used as a real host path (W1); the provisioner
-    /// mints its own writable mount OUTSIDE storage. duckfs-era debt: always
-    /// empty from the pool, and deliberately NOT part of [`WorkspaceSource`].
-    pub mount_path: String,
-    pub base_tools: Vec<BaseTool>,
-    /// W6 skill/instruction ro subtrees — EMPTY in phase 2, carried so phase 4
-    /// is purely additive.
+    /// W6 skill/instruction ro subtrees — the plan's C4 skill mounts,
+    /// verbatim.
     pub ro_mounts: Vec<RoMount>,
 }
 
-/// one base-tool manifest entry (validated at accept; bindings wired later).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseTool {
-    pub name: String,
-    pub version: String,
-    pub exposure: String,
-}
-
-/// a read-only mount the provisioner materializes beside the rw source (W6).
-/// carried but never populated in phase 2.
+/// a read-only mount the provisioner materializes beside the rw source (W6) —
+/// populated from the composed skills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoMount {
     pub source_prefix: String,
@@ -222,8 +225,8 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.path_entries = ws.path_entries();
 }
 
-// ---- faceted receipt (v1 wire) ------------------------------------------------
-// the receipt grew from message-only to the six ADR facets — message
+// ---- faceted runner result (v1 wire) --------------------------------------------
+// the runner result grew from message-only to the six ADR facets — message
 // (`response_text`) / data / effects / artifact (`workspace_receipt`) / sink /
 // status. the extra five are ADDITIVE and skip-serialized when empty/default, so
 // a plain run still emits the minimal `{ducktape_runner_result, response_text,
@@ -235,12 +238,16 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
 const EFFECT_TASKS_CREATE: &str = "tasks.create";
 /// the wire name a [`RunEffect`] carries for a task status move.
 const EFFECT_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
+/// the wire name a [`RunEffect`] carries for a page comment (M2).
+const EFFECT_PAGES_COMMENT: &str = "pages.comment";
+/// the wire name a [`RunEffect`] carries for a todo check flip (M2).
+const EFFECT_PAGES_SET_CHECKED: &str = "pages.set_checked";
 
 /// one declarative, host-assembled effect the model's answer requested. lifted
 /// out of `response_text` by [`effects_from_response_text`] so at v4 runs applies
 /// the HOST's observation (R1) rather than re-parsing prose. idempotent by
 /// run_id (applied once at the delivery boundary).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct RunEffect {
     pub kind: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -249,11 +256,22 @@ pub struct RunEffect {
     pub title: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// `pages.comment` (M2): the page/block anchor and the comment text.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// `pages.set_checked` (M2): the todo block and the desired state. a
+    /// skipped `checked` decodes false on the runs side — same value.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub block: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
 }
 
 /// the O1/O2 output sink: `Chain` (default — the next run reads this run's
-/// output_ref) / `Pr` (open a forge PR) / `Merge` (merge a forge PR). the
-/// concrete routing is runs' concern; the wrapper only names the intent.
+/// output_ref) / `Pr` (open a forge PR). the concrete routing is runs'
+/// concern; the wrapper only names the intent.
 ///
 /// Deserialize decodes the composer's REQUESTED sink
 /// (`result_contract.sink`, contract §1): the requested-Pr shape carries NO
@@ -274,14 +292,6 @@ pub enum Sink {
         #[serde(default)]
         body: String,
     },
-    Merge {
-        repo: String,
-        number: u64,
-        prev_target_oid: String,
-        expected_source_oid: String,
-        merge_oid: String,
-        pack_digest: String,
-    },
 }
 
 impl Sink {
@@ -298,6 +308,9 @@ pub enum Status {
     #[default]
     Ok,
     Degraded,
+    /// not constructed host-side today — kept so the wire vocabulary states
+    /// all three states runs decodes.
+    #[allow(dead_code)]
     Failed,
 }
 
@@ -331,6 +344,14 @@ struct RunnerResultWire<'a> {
 /// const; `runs` reads it back as `u32 == 1` and unwraps `response_text`
 /// deterministically on every node. empty/default facets skip-serialize, so a
 /// plain run's bytes stay byte-compatible with the pre-v4 minimal shape.
+///
+/// the assembled bytes are delivered as the saga's Ok payload, and the saga
+/// ABORTS any Ok larger than [`saga::MAX_RESULT_BYTES`] at the block — the
+/// attempt could then never land and the run would wedge until its deadline.
+/// so the assembly is capped HERE: an oversized result gets its PROSE
+/// truncated (char-boundary, with a note naming the original size) while the
+/// receipt/effects/sink survive; in the pathological case where even a
+/// note-only wrapper is over, the effects and data facets are dropped too.
 pub fn assemble_runner_result(
     response_text: &str,
     receipt: &WorkspaceReceipt,
@@ -339,25 +360,100 @@ pub fn assemble_runner_result(
     sink: Sink,
     status: Status,
 ) -> Vec<u8> {
-    serde_json::to_vec(&RunnerResultWire {
-        ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
-        response_text,
-        workspace_receipt: receipt,
+    let encode = |text: &str, data: Option<String>, effects: Vec<RunEffect>| {
+        serde_json::to_vec(&RunnerResultWire {
+            ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
+            response_text: text,
+            workspace_receipt: receipt,
+            data,
+            effects,
+            sink: sink.clone(),
+            status,
+        })
+        .expect("runner result serializes")
+    };
+    let full = encode(response_text, data.clone(), effects.clone());
+    if full.len() <= saga::MAX_RESULT_BYTES {
+        return full;
+    }
+    // removing N prose bytes shrinks the JSON by AT LEAST N (escaping only
+    // grows a byte), so cutting the overage plus the note's own length (with
+    // slack for the note's escaped newline) always fits — one re-serialize,
+    // no loop.
+    let note = format!("\n[output truncated ({} bytes)]", response_text.len());
+    let mut keep = response_text
+        .len()
+        .saturating_sub(full.len() - saga::MAX_RESULT_BYTES + note.len() + 16);
+    while keep > 0 && !response_text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let truncated = encode(
+        &format!("{}{note}", &response_text[..keep]),
         data,
         effects,
-        sink,
+    );
+    if truncated.len() <= saga::MAX_RESULT_BYTES {
+        return truncated;
+    }
+    // the non-prose facets alone exceed the cap (a pathological effects/data
+    // payload): drop them — a degraded-but-landing result beats a wedged saga.
+    let bare = encode(&note, None, Vec::new());
+    if bare.len() <= saga::MAX_RESULT_BYTES {
+        return bare;
+    }
+    // last rung: even the receipt+sink alone exceed the cap (an unbounded
+    // commit_error or sink title/body). replace the receipt's free-form
+    // strings with short notes and drop the sink payload — the result MUST
+    // land under the cap or the saga wedges until deadline (the exact
+    // failure this cap exists to prevent).
+    let stub = WorkspaceReceipt {
+        commit_error: receipt
+            .commit_error
+            .as_ref()
+            .map(|e| format!("[commit error truncated ({} bytes)]", e.len())),
+        branch: receipt.branch.clone(),
+        output_commit: receipt.output_commit.clone(),
+        ..receipt_stub(receipt)
+    };
+    serde_json::to_vec(&RunnerResultWire {
+        ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
+        response_text: &note,
+        workspace_receipt: &stub,
+        data: None,
+        effects: Vec::new(),
+        sink: Sink::Chain,
         status,
     })
     .expect("runner result serializes")
 }
 
-/// LIFT the model's `tasks.create` / `tasks.update_status` actions out of its
+/// the bounded core of a receipt: everything except the free-form strings
+/// the last degrade rung replaces.
+fn receipt_stub(r: &WorkspaceReceipt) -> WorkspaceReceipt {
+    WorkspaceReceipt {
+        source_prefix: r.source_prefix.clone(),
+        output_snapshot: r.output_snapshot.clone(),
+        source_snapshot: r.source_snapshot.clone(),
+        commit_height: r.commit_height,
+        rebased: r.rebased,
+        no_changes: r.no_changes,
+        commit_error: None,
+        branch: None,
+        output_commit: None,
+    }
+}
+
+/// LIFT the model's `tasks.create` / `tasks.update_status` /
+/// `pages.comment` / `pages.set_checked` actions out of its
 /// strict-response prose into declarative [`RunEffect`]s (R1, activation
 /// correctness — critic #4). at v4 runs applies these host-assembled effects
 /// rather than re-parsing the prose; an empty result lets runs fall back to the
-/// response-parsed actions so nothing is silently dropped. the parse mirrors
-/// `runs::parse_strict_response`: bare JSON, then a `` ```json `` fence, then the
-/// outermost `{…}` span. the action shape is `AgentAction`'s snake_case tags.
+/// response-parsed actions so nothing is silently dropped — which is also why
+/// EVERY known action kind must lift: a partial lift would make the effects
+/// facet override the prose actions and drop the unlifted ones. the parse
+/// mirrors `runs::parse_strict_response`: bare JSON, then a `` ```json ``
+/// fence, then the outermost `{…}` span. the action shape is `AgentAction`'s
+/// snake_case tags.
 pub fn effects_from_response_text(text: &str) -> Vec<RunEffect> {
     let Some(value) = parse_response_value(text) else {
         return Vec::new();
@@ -380,16 +476,32 @@ pub fn effects_from_response_text(text: &str) -> Vec<RunEffect> {
                     kind: EFFECT_TASKS_CREATE.to_string(),
                     task_id: str_field(create, "task_id"),
                     title: str_field(create, "title"),
-                    status: String::new(),
+                    ..RunEffect::default()
                 });
             }
-            obj.get("update_task_status")
-                .and_then(|v| v.as_object())
-                .map(|update| RunEffect {
+            if let Some(update) = obj.get("update_task_status").and_then(|v| v.as_object()) {
+                return Some(RunEffect {
                     kind: EFFECT_TASKS_UPDATE_STATUS.to_string(),
                     task_id: str_field(update, "task_id"),
-                    title: String::new(),
                     status: str_field(update, "status"),
+                    ..RunEffect::default()
+                });
+            }
+            if let Some(comment) = obj.get("add_page_comment").and_then(|v| v.as_object()) {
+                return Some(RunEffect {
+                    kind: EFFECT_PAGES_COMMENT.to_string(),
+                    target: str_field(comment, "target"),
+                    body: str_field(comment, "body"),
+                    ..RunEffect::default()
+                });
+            }
+            obj.get("set_page_checked")
+                .and_then(|v| v.as_object())
+                .map(|flip| RunEffect {
+                    kind: EFFECT_PAGES_SET_CHECKED.to_string(),
+                    block: str_field(flip, "block"),
+                    checked: flip.get("checked").and_then(|v| v.as_bool()).unwrap_or(false),
+                    ..RunEffect::default()
                 })
         })
         .collect()
@@ -432,22 +544,65 @@ fn outermost_json_object(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pathological_receipt_still_fits_the_saga_cap() {
+        // even when the receipt's free-form strings alone exceed the cap
+        // (an unbounded commit_error), the last degrade rung must land the
+        // result under saga::MAX_RESULT_BYTES — an oversized Ok wedges the
+        // saga until deadline.
+        let receipt = super::WorkspaceReceipt {
+            source_prefix: "p".into(),
+            source_snapshot: None,
+            output_snapshot: None,
+            commit_height: None,
+            rebased: false,
+            no_changes: false,
+            commit_error: Some("x".repeat(saga::MAX_RESULT_BYTES + 4096)),
+            branch: None,
+            output_commit: None,
+        };
+        let out = super::assemble_runner_result(
+            "answer",
+            &receipt,
+            None,
+            Vec::new(),
+            super::Sink::Chain,
+            super::Status::Ok,
+        );
+        assert!(
+            out.len() <= saga::MAX_RESULT_BYTES,
+            "degraded result must fit the cap, got {} bytes",
+            out.len()
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v["workspace_receipt"]["commit_error"]
+                .as_str()
+                .unwrap()
+                .contains("truncated"),
+            "the oversized commit_error is replaced with a bounded note"
+        );
+    }
+
     use super::*;
+
+    /// a CONSENSUS run id in the shape `runs` mints (`chat\x1f<channel>\x1f<seq>\x1f<agent>`).
+    /// written out rather than imported: this crate must not depend on an app
+    /// module. the cross-crate proof that composer and provisioner agree on the
+    /// id space lives where both are reachable — `bin/noded`'s session-boundary
+    /// test.
+    const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}1\u{1f}bot";
 
     fn spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
+            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
             agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
             },
-            mount_path: "/tmp/ducktape-workspace".into(),
-            base_tools: vec![BaseTool {
-                name: "ducktape-files".into(),
-                version: "1".into(),
-                exposure: "cli".into(),
-            }],
             ro_mounts: Vec::new(),
         }
     }
@@ -455,15 +610,15 @@ mod tests {
     fn forge_spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
+            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
             agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
             },
-            mount_path: String::new(),
-            base_tools: Vec::new(),
             ro_mounts: Vec::new(),
         }
     }
@@ -624,18 +779,50 @@ mod tests {
                     kind: "tasks.create".into(),
                     task_id: "t1".into(),
                     title: "ship it".into(),
-                    status: String::new(),
+                    ..RunEffect::default()
                 },
                 RunEffect {
                     kind: "tasks.update_status".into(),
                     task_id: "t1".into(),
-                    title: String::new(),
                     status: "done".into(),
+                    ..RunEffect::default()
                 },
             ]
         );
         // prose with no actions lifts nothing (runs then falls back cleanly).
         assert!(effects_from_response_text("just prose, no json").is_empty());
         assert!(effects_from_response_text("").is_empty());
+    }
+
+    #[test]
+    fn effects_from_response_text_lifts_the_pages_actions() {
+        // M2: the pages verbs must lift alongside the task verbs — a partial
+        // lift would override the prose actions and silently drop these.
+        let text = "{\"actions\":[\
+            {\"add_page_comment\":{\"target\":\"b1\",\"body\":\"nice\"}},\
+            {\"set_page_checked\":{\"block\":\"b2\",\"checked\":true}}]}";
+        let effects = effects_from_response_text(text);
+        assert_eq!(
+            effects,
+            vec![
+                RunEffect {
+                    kind: "pages.comment".into(),
+                    target: "b1".into(),
+                    body: "nice".into(),
+                    ..RunEffect::default()
+                },
+                RunEffect {
+                    kind: "pages.set_checked".into(),
+                    block: "b2".into(),
+                    checked: true,
+                    ..RunEffect::default()
+                },
+            ]
+        );
+        // the wire keys skip-serialize: a set_checked carries no task keys.
+        let json = serde_json::to_value(&effects[1]).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("task_id"));
+        assert!(!obj.contains_key("target"));
     }
 }

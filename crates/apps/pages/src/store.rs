@@ -71,7 +71,14 @@ where
             id,
             db,
             pending: BTreeMap::new(),
+            tagging: None,
         }
+    }
+
+    /// Report newly-added comments to the shared engagement router.
+    pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
+        self.tagging = Some(tagging.into());
+        self
     }
 
     /// read raw bytes for `key` through the staged overlay: a staged write
@@ -116,6 +123,21 @@ where
     /// dropped from qmdb (and the root) at `commit_block`.
     pub(super) fn delete_block(&mut self, block_id: &str) {
         self.pending.insert(block_id.as_bytes().to_vec(), None);
+    }
+
+    /// delete a whole subtree depth-first, purging each block's comments and
+    /// staging its delete (the shared RemoveBlock/DeletePage walk). a child
+    /// listed but absent from the store is a broken invariant, surfaced loudly.
+    pub(super) async fn delete_subtree(&mut self, root: Block) -> Result<(), PageError> {
+        let mut stack = vec![root];
+        while let Some(cur) = stack.pop() {
+            for child in &cur.children {
+                stack.push(self.require_block(child, PageError::Corrupt).await?);
+            }
+            self.purge_comments_for_target(&cur.id).await?;
+            self.delete_block(&cur.id);
+        }
+        Ok(())
     }
 
     /// load the enumeration index — page id → folder parent — through the
@@ -298,6 +320,7 @@ where
             id,
             db,
             pending: BTreeMap::new(),
+            tagging: None,
         })
     }
 }

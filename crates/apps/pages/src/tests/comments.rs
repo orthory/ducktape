@@ -8,7 +8,218 @@ fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
         comment_id: comment.into(),
         target: target.into(),
         text: text.into(),
+        mentions: Vec::new(),
+        as_agent: None,
     }
+}
+
+fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageMsg {
+    PageMsg::AddComment {
+        thread_id: thread.into(),
+        comment_id: comment.into(),
+        target: target.into(),
+        text: "agent says".into(),
+        mentions: Vec::new(),
+        as_agent: Some(agent.into()),
+    }
+}
+
+#[test]
+fn add_comment_reports_structured_agent_mentions_to_tagging() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await.with_tagging("tagging");
+        let mut op = add("t1", "c1", "page-1", "@qa-luna please review");
+        let PageMsg::AddComment { mentions, .. } = &mut op else {
+            unreachable!()
+        };
+        mentions.push(AuthorRef::Agent {
+            module: "runs".into(),
+            agent_id: "qa-luna".into(),
+        });
+        let mut ctx = ctx_as(user("eddy"));
+        p.execute(&mut ctx, &msg(&op)).await.unwrap();
+        assert_eq!(ctx.msgs.len(), 1);
+        assert_eq!(ctx.msgs[0].target, "tagging");
+        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs[0].payload).unwrap()
+        else {
+            panic!("expected tag event")
+        };
+        assert_eq!(event.container, "t1");
+        assert_eq!(event.content_seq, 1);
+        assert_eq!(event.author, tagging::Author::User(b"eddy".to_vec()));
+        assert_eq!(
+            event.tags,
+            vec![tagging::EntityRef {
+                module: "runs".into(),
+                entity: "qa-luna".into(),
+            }]
+        );
+    });
+}
+
+#[test]
+fn add_comment_rejects_over_length_ids_before_staging() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        let long_thread = "t".repeat(MAX_THREAD_ID_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add(&long_thread, "m1", "b1", "hi"),
+            user("alice"),
+            "id or target too large",
+        )
+        .await;
+        let long_comment = "m".repeat(MAX_COMMENT_ID_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add("t1", &long_comment, "b1", "hi"),
+            user("alice"),
+            "id or target too large",
+        )
+        .await;
+        let long_target = "b".repeat(MAX_COMMENT_TARGET_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add("t1", "m1", &long_target, "hi"),
+            user("alice"),
+            "id or target too large",
+        )
+        .await;
+        // nothing staged — an id at exactly the cap still lands.
+        apply_commit_as(
+            &mut p,
+            &add(&"t".repeat(MAX_THREAD_ID_BYTES), "m1", "b1", "hi"),
+            user("alice"),
+        )
+        .await;
+    });
+}
+
+/// pin the ESCAPE vector: an id carrying a serde_json-escaping char (`"`,
+/// `\`, or a control char < 0x20) is rejected at admission even under the
+/// length cap — otherwise its escaped serialization (2–6 B/char) could still
+/// overflow a derived block and abort it. covers thread_id, comment_id, and
+/// target.
+#[test]
+fn add_comment_rejects_escaping_char_ids() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        for (t, c, tg) in [
+            ("th\u{1}read", "m1", "b1"), // control char in thread_id
+            ("t1", "com\"ment", "b1"),   // quote in comment_id
+            ("t1", "m1", "tar\\get"),    // backslash in target
+        ] {
+            apply_err_as(
+                &mut p,
+                &add(t, c, tg, "hi"),
+                user("alice"),
+                "id or target too large",
+            )
+            .await;
+        }
+    });
+}
+
+/// the R4 invariant: at the count caps, ids bounded to their length caps keep
+/// the DERIVED shared blocks under MAX_BLOCK_LEN, so an AddComment append can
+/// never abort a block on size. because admission ALSO rejects escaping chars
+/// (see `add_comment_rejects_escaping_char_ids`), every admitted id
+/// serializes 1:1, so a max-BYTE-length ASCII id is the true worst case — a
+/// non-ASCII UTF-8 id of the same `len()` serializes to the same byte count.
+#[test]
+fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
+    // the per-target thread index is a Vec<thread_id> of up to
+    // MAX_THREADS_PER_TARGET entries.
+    let tid = "t".repeat(MAX_THREAD_ID_BYTES);
+    let index: Vec<String> = (0..MAX_THREADS_PER_TARGET).map(|_| tid.clone()).collect();
+    let index_bytes = serde_json::to_vec(&index).unwrap().len();
+    assert!(
+        index_bytes < MAX_BLOCK_LEN,
+        "full target index {index_bytes} >= {MAX_BLOCK_LEN}"
+    );
+
+    // a thread record holds comment_ids: Vec<comment_id> up to
+    // MAX_COMMENTS_PER_THREAD, plus its own (bounded) id/target fields.
+    let thread = Thread {
+        id: "t".repeat(MAX_THREAD_ID_BYTES),
+        target: "b".repeat(MAX_COMMENT_TARGET_BYTES),
+        opener: AuthorRef::System,
+        created_at: 0,
+        resolved: false,
+        resolved_by: None,
+        comment_ids: (0..MAX_COMMENTS_PER_THREAD)
+            .map(|_| "m".repeat(MAX_COMMENT_ID_BYTES))
+            .collect(),
+    };
+    let thread_bytes = serde_json::to_vec(&thread).unwrap().len();
+    assert!(
+        thread_bytes < MAX_BLOCK_LEN,
+        "full thread block {thread_bytes} >= {MAX_BLOCK_LEN}"
+    );
+}
+
+#[test]
+fn as_agent_refines_a_module_origin_into_an_agent_author() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(
+            &mut p,
+            &add_as_agent("t1", "m1", "b1", "bot"),
+            sdk::Origin::Module("runs".into()),
+        )
+        .await;
+        let view = query_thread(&p, "t1").await.unwrap();
+        let agent = AuthorRef::Agent {
+            module: "runs".into(),
+            agent_id: "bot".into(),
+        };
+        assert_eq!(view.thread.opener, agent, "the opener is the agent");
+        assert_eq!(view.comments[0].author, agent, "the comment author too");
+    });
+}
+
+#[test]
+fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_err_as(
+            &mut p,
+            &add_as_agent("t1", "m1", "b1", "bot"),
+            user("alice"),
+            "as_agent requires a module origin",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &add_as_agent("t1", "m1", "b1", ""),
+            sdk::Origin::Module("runs".into()),
+            "empty as_agent",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn get_comment_serves_the_record_tombstones_included() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        assert_eq!(query_comment(&p, "m1").await, None, "absent id is None");
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
+        assert!(query_comment(&p, "m1").await.is_some());
+        // a tombstoned comment KEEPS its record — the probe must still see it
+        // (AddComment rejects the id even when deleted).
+        apply_commit_as(&mut p, &add("t1", "m2", "b1", "y"), user("alice")).await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m1".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        let m1 = query_comment(&p, "m1").await.unwrap();
+        assert!(m1.deleted, "the tombstone is served, not hidden");
+    });
 }
 
 #[test]

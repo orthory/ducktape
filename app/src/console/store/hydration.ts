@@ -149,10 +149,20 @@ export const fetchValsetSlices = (live: NodeTransport): Promise<ValsetSlices> =>
 
 export const fetchGovernanceSlices = (
   live: NodeTransport,
-): Promise<{ proposals: ProposalView[] }> =>
+): Promise<{
+  proposals: ProposalView[];
+  governanceShares: governanceClient.SharesView;
+}> =>
   Promise.resolve()
-    .then(() => governanceClient.proposals(live).catch((): ProposalView[] => []))
-    .then((proposals) => ({ proposals }));
+    .then(() =>
+      Promise.all([
+        governanceClient.proposals(live).catch((): ProposalView[] => []),
+        governanceClient
+          .shares(live)
+          .catch((): governanceClient.SharesView => ({ active: false, allocations: [], total: 0 })),
+      ]),
+    )
+    .then(([proposals, governanceShares]) => ({ proposals, governanceShares }));
 
 export const fetchForgeSlices = (
   live: NodeTransport,
@@ -216,7 +226,7 @@ export const fetchCapabilitySlices = (
 export interface RunsSlices {
   watches: Awaited<ReturnType<typeof runsClient.watches>>;
   pendingRuns: Awaited<ReturnType<typeof runsClient.pendingRuns>>;
-  runAssignee: Map<string, string>;
+  runLease: Map<string, dispatchClient.RunLease>;
 }
 
 /** Watches + the pending-run timeline + one dispatch read per in-flight run
@@ -236,13 +246,13 @@ export const fetchRunsSlices = (live: NodeTransport): Promise<RunsSlices> =>
         pendingRuns.map((run) =>
           dispatchClient
             .dispatch(live, { dispatchId: run.dispatch_id })
-            .then((view) => [run.run_id, dispatchClient.assigneeHex(view)] as const)
+            .then((view) => [run.run_id, dispatchClient.runLease(view)] as const)
             .catch(() => [run.run_id, null] as const),
         ),
-      ).then((assigneePairs) => {
-        const runAssignee = new Map<string, string>();
-        for (const [runId, hex] of assigneePairs) if (hex) runAssignee.set(runId, hex);
-        return { watches, pendingRuns, runAssignee };
+      ).then((leasePairs) => {
+        const runLease = new Map<string, dispatchClient.RunLease>();
+        for (const [runId, lease] of leasePairs) if (lease) runLease.set(runId, lease);
+        return { watches, pendingRuns, runLease };
       }),
     );
 

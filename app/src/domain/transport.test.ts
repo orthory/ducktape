@@ -123,23 +123,13 @@ describe("remoteTransport", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("http://node.example:8844/v1/status");
   });
 
-  it("mints a gateway session with only the finalized account route identity", async () => {
-    const reply = { url: "http://0123456789abcdef0123456789abcdef.localhost:49152/" };
+  it("reports the dedicated browser-gateway base for the duck:// handler", async () => {
+    const reply = { base: "http://127.0.0.1:49152" };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, reply));
     vi.stubGlobal("fetch", fetchMock);
     const transport = remoteTransport("http://node.example:8844");
-    await expect(transport.gatewaySession!({
-      accountId: [1, 2],
-      name: { label: "api" },
-      revision: 4,
-    })).resolves.toEqual(reply);
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("http://node.example:8844/v1/gateway/session");
-    expect(JSON.parse(String(init.body))).toEqual({
-      accountId: [1, 2],
-      name: { label: "api" },
-      revision: 4,
-    });
+    await expect(transport.gatewayBrowserBase!()).resolves.toEqual(reply);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://node.example:8844/v1/gateway/browser");
   });
 
   it("moves a bounded gateway proxy body as base64 JSON", async () => {

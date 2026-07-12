@@ -44,9 +44,10 @@ use capability::validate_tag;
 use saga::{
     SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, SagaQuery, SagaReply, decode_callback,
     decode_reply as saga_decode_reply, encode_msg as saga_encode_msg,
-    encode_query as saga_encode_query,
+    encode_query as saga_encode_query, put_origin, take_origin,
 };
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::codec;
+use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
 
 /// the field separator inside composite dispatch keys and saga ids. rejected
@@ -111,35 +112,6 @@ struct Committed {
 
 // ---- canonical encoding ----------------------------------------------------------
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-fn put_opt_u64(out: &mut Vec<u8>, opt: Option<u64>) {
-    match opt {
-        None => out.push(0),
-        Some(v) => {
-            out.push(1);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-}
-
-fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
-    match origin {
-        SagaOrigin::External(key) => {
-            out.push(0);
-            put_bytes(out, key);
-        }
-        SagaOrigin::Module(module) => {
-            out.push(1);
-            put_bytes(out, module.as_bytes());
-        }
-        SagaOrigin::System => out.push(2),
-    }
-}
-
 /// canonical byte encoding of the committed state: u64-le counts, sorted-key
 /// order, u64-le length prefixes, single-byte discriminants, 0/1 option tags.
 /// this is the exact preimage `root()` hashes AND the snapshot format.
@@ -148,15 +120,15 @@ fn encode_committed(c: &Committed) -> Vec<u8> {
 
     out.extend_from_slice(&(c.recipes.len() as u64).to_le_bytes());
     for (id, r) in &c.recipes {
-        put_bytes(&mut out, id.as_bytes());
+        codec::push_str(&mut out, id);
         put_origin(&mut out, &r.owner);
-        put_bytes(&mut out, r.description.as_bytes());
-        put_bytes(&mut out, r.capability.as_bytes());
+        codec::push_str(&mut out, &r.description);
+        codec::push_str(&mut out, &r.capability);
         match &r.routing {
             Routing::Rendezvous => out.push(0),
             Routing::Pinned(key) => {
                 out.push(1);
-                put_bytes(&mut out, key);
+                codec::push_bytes(&mut out, key);
             }
         }
         out.push(match r.output_contract {
@@ -164,23 +136,23 @@ fn encode_committed(c: &Committed) -> Vec<u8> {
             OutputContract::Json => 1,
         });
         out.extend_from_slice(&r.max_attempts.to_le_bytes());
-        put_opt_u64(&mut out, r.deadline_views);
-        put_opt_u64(&mut out, r.lease_views);
+        codec::push_opt_u64(&mut out, r.deadline_views);
+        codec::push_opt_u64(&mut out, r.lease_views);
         out.extend_from_slice(&r.created_at.to_le_bytes());
         out.extend_from_slice(&r.updated_at.to_le_bytes());
     }
 
     out.extend_from_slice(&(c.dispatches.len() as u64).to_le_bytes());
     for (key, d) in &c.dispatches {
-        put_bytes(&mut out, key.as_bytes());
-        put_bytes(&mut out, d.receiver.as_bytes());
-        put_bytes(&mut out, d.dispatch_id.as_bytes());
-        put_bytes(&mut out, d.recipe_id.as_bytes());
+        codec::push_str(&mut out, key);
+        codec::push_str(&mut out, &d.receiver);
+        codec::push_str(&mut out, &d.dispatch_id);
+        codec::push_str(&mut out, &d.recipe_id);
         out.push(match d.contract {
             OutputContract::Text => 0,
             OutputContract::Json => 1,
         });
-        put_bytes(&mut out, d.saga_id.as_bytes());
+        codec::push_str(&mut out, &d.saga_id);
         out.push(match d.status {
             Status::AwaitingResult => 0,
             Status::AwaitingDelivery => 1,
@@ -190,11 +162,11 @@ fn encode_committed(c: &Committed) -> Vec<u8> {
             None => out.push(0),
             Some(Ok(bytes)) => {
                 out.push(1);
-                put_bytes(&mut out, bytes);
+                codec::push_bytes(&mut out, bytes);
             }
             Some(Err(error)) => {
                 out.push(2);
-                put_bytes(&mut out, error.as_bytes());
+                codec::push_str(&mut out, error);
             }
         }
         out.extend_from_slice(&d.created_at.to_le_bytes());
@@ -204,7 +176,7 @@ fn encode_committed(c: &Committed) -> Vec<u8> {
     out.extend_from_slice(&(c.mailbox.len() as u64).to_le_bytes());
     for (seq, key) in &c.mailbox {
         out.extend_from_slice(&seq.to_le_bytes());
-        put_bytes(&mut out, key.as_bytes());
+        codec::push_str(&mut out, key);
     }
     out.extend_from_slice(&c.next_seq.to_le_bytes());
 
@@ -217,113 +189,59 @@ fn committed_root(c: &Committed) -> StateRoot {
 
 // ---- strict decode (untrusted snapshot bytes) -------------------------------------
 
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-    if n > buf.len() {
-        return Err("snapshot truncated".into());
-    }
-    let (head, tail) = buf.split_at(n);
-    *buf = tail;
-    Ok(head)
-}
-
-fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        take(buf, 8)?.try_into().expect("8 bytes"),
-    ))
-}
-
-fn take_u32(buf: &mut &[u8]) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(
-        take(buf, 4)?.try_into().expect("4 bytes"),
-    ))
-}
-
-fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
-    let n = take_u64(buf)?;
-    if n > buf.len() as u64 {
-        return Err("snapshot length prefix exceeds input".into());
-    }
-    Ok(n as usize)
-}
-
-fn take_lp_bytes(buf: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let len = take_len(buf)?;
-    Ok(take(buf, len)?.to_vec())
-}
-
-fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
-    let len = take_len(buf)?;
-    Ok(std::str::from_utf8(take(buf, len)?)
-        .map_err(|_| "snapshot string is not utf-8".to_string())?
-        .to_owned())
-}
-
-fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(None),
-        1 => Ok(Some(take_u64(buf)?)),
-        t => Err(format!("snapshot has unknown option tag {t}")),
-    }
-}
-
-fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
-    Ok(match take(buf, 1)?[0] {
-        0 => SagaOrigin::External(take_lp_bytes(buf)?),
-        1 => SagaOrigin::Module(take_lp_string(buf)?),
-        2 => SagaOrigin::System,
-        d => return Err(format!("snapshot has unknown origin discriminant {d}")),
-    })
-}
-
-fn take_contract(buf: &mut &[u8]) -> Result<OutputContract, String> {
-    Ok(match take(buf, 1)?[0] {
+fn take_contract(cur: &mut codec::Cursor) -> Result<OutputContract, Error> {
+    Ok(match cur.byte("snapshot contract")? {
         0 => OutputContract::Text,
         1 => OutputContract::Json,
-        d => return Err(format!("snapshot has unknown contract discriminant {d}")),
+        d => {
+            return Err(Error::Module(format!(
+                "snapshot has unknown contract discriminant {d}"
+            )));
+        }
     })
 }
 
 /// keys must be strictly ascending: one byte encoding per state, uniqueness
 /// for free.
-fn check_ascending<V>(map: &BTreeMap<String, V>, key: &str) -> Result<(), String> {
+fn check_ascending<V>(map: &BTreeMap<String, V>, key: &str) -> Result<(), Error> {
     match map.iter().next_back() {
         Some((last, _)) if last.as_str() >= key => {
-            Err("snapshot keys not strictly ascending".into())
+            Err(Error::Module("snapshot keys not strictly ascending".into()))
         }
         _ => Ok(()),
     }
 }
 
-fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
+fn decode_committed(buf: &[u8]) -> Result<Committed, Error> {
+    let mut cur = codec::Cursor::new(buf);
     let mut c = Committed::default();
 
-    let recipes = take_u64(&mut buf)?;
+    let recipes = cur.u64("snapshot recipe count")?;
     // every recipe costs at least its fixed-width frame; a count the input
     // cannot possibly hold is rejected before the loop builds anything.
     const MIN_RECIPE_BYTES: u64 = 8 + 1 + 8 + 8 + 1 + 1 + 4 + 1 + 1 + 8 + 8;
-    if recipes
-        .checked_mul(MIN_RECIPE_BYTES)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err("snapshot recipe count exceeds input".into());
-    }
+    cur.bound(recipes, MIN_RECIPE_BYTES, "snapshot recipe")?;
     for _ in 0..recipes {
-        let recipe_id = take_lp_string(&mut buf)?;
+        let recipe_id = cur.string("snapshot recipe id")?;
         check_ascending(&c.recipes, &recipe_id)?;
-        let owner = take_origin(&mut buf)?;
-        let description = take_lp_string(&mut buf)?;
-        let capability = take_lp_string(&mut buf)?;
-        let routing = match take(&mut buf, 1)?[0] {
+        let owner = take_origin(&mut cur)?;
+        let description = cur.string("snapshot description")?;
+        let capability = cur.string("snapshot capability")?;
+        let routing = match cur.byte("snapshot routing")? {
             0 => Routing::Rendezvous,
-            1 => Routing::Pinned(take_lp_bytes(&mut buf)?),
-            d => return Err(format!("snapshot has unknown routing discriminant {d}")),
+            1 => Routing::Pinned(cur.bytes("snapshot routing pin")?.to_vec()),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown routing discriminant {d}"
+                )));
+            }
         };
-        let output_contract = take_contract(&mut buf)?;
-        let max_attempts = take_u32(&mut buf)?;
-        let deadline_views = take_opt_u64(&mut buf)?;
-        let lease_views = take_opt_u64(&mut buf)?;
-        let created_at = take_u64(&mut buf)?;
-        let updated_at = take_u64(&mut buf)?;
+        let output_contract = take_contract(&mut cur)?;
+        let max_attempts = cur.u32("snapshot max_attempts")?;
+        let deadline_views = cur.opt_u64("snapshot deadline_views")?;
+        let lease_views = cur.opt_u64("snapshot lease_views")?;
+        let created_at = cur.u64("snapshot created_at")?;
+        let updated_at = cur.u64("snapshot updated_at")?;
         c.recipes.insert(
             recipe_id.clone(),
             Recipe {
@@ -342,36 +260,39 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         );
     }
 
-    let dispatches = take_u64(&mut buf)?;
+    let dispatches = cur.u64("snapshot dispatch count")?;
     const MIN_DISPATCH_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 8 + 1 + 1 + 8 + 8;
-    if dispatches
-        .checked_mul(MIN_DISPATCH_BYTES)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err("snapshot dispatch count exceeds input".into());
-    }
+    cur.bound(dispatches, MIN_DISPATCH_BYTES, "snapshot dispatch")?;
     for _ in 0..dispatches {
-        let key = take_lp_string(&mut buf)?;
+        let key = cur.string("snapshot dispatch key")?;
         check_ascending(&c.dispatches, &key)?;
-        let receiver = take_lp_string(&mut buf)?;
-        let dispatch_id = take_lp_string(&mut buf)?;
-        let recipe_id = take_lp_string(&mut buf)?;
-        let contract = take_contract(&mut buf)?;
-        let saga_id = take_lp_string(&mut buf)?;
-        let status = match take(&mut buf, 1)?[0] {
+        let receiver = cur.string("snapshot receiver")?;
+        let dispatch_id = cur.string("snapshot dispatch id")?;
+        let recipe_id = cur.string("snapshot recipe id")?;
+        let contract = take_contract(&mut cur)?;
+        let saga_id = cur.string("snapshot saga id")?;
+        let status = match cur.byte("snapshot status")? {
             0 => Status::AwaitingResult,
             1 => Status::AwaitingDelivery,
             2 => Status::Delivered,
-            d => return Err(format!("snapshot has unknown status discriminant {d}")),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown status discriminant {d}"
+                )));
+            }
         };
-        let outcome = match take(&mut buf, 1)?[0] {
+        let outcome = match cur.byte("snapshot outcome tag")? {
             0 => None,
-            1 => Some(Ok(take_lp_bytes(&mut buf)?)),
-            2 => Some(Err(take_lp_string(&mut buf)?)),
-            t => return Err(format!("snapshot has unknown outcome tag {t}")),
+            1 => Some(Ok(cur.bytes("snapshot outcome")?.to_vec())),
+            2 => Some(Err(cur.string("snapshot outcome error")?)),
+            t => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown outcome tag {t}"
+                )));
+            }
         };
-        let created_at = take_u64(&mut buf)?;
-        let updated_at = take_u64(&mut buf)?;
+        let created_at = cur.u64("snapshot created_at")?;
+        let updated_at = cur.u64("snapshot updated_at")?;
         c.dispatches.insert(
             key,
             DispatchState {
@@ -388,29 +309,24 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         );
     }
 
-    let mailbox = take_u64(&mut buf)?;
+    let mailbox = cur.u64("snapshot mailbox count")?;
     const MIN_MAILBOX_BYTES: u64 = 8 + 8;
-    if mailbox
-        .checked_mul(MIN_MAILBOX_BYTES)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err("snapshot mailbox count exceeds input".into());
-    }
+    cur.bound(mailbox, MIN_MAILBOX_BYTES, "snapshot mailbox")?;
     for _ in 0..mailbox {
-        let seq = take_u64(&mut buf)?;
+        let seq = cur.u64("snapshot mailbox seq")?;
         if let Some((last, _)) = c.mailbox.iter().next_back()
             && *last >= seq
         {
-            return Err("snapshot mailbox seqs not strictly ascending".into());
+            return Err(Error::Module(
+                "snapshot mailbox seqs not strictly ascending".into(),
+            ));
         }
-        let key = take_lp_string(&mut buf)?;
+        let key = cur.string("snapshot mailbox key")?;
         c.mailbox.insert(seq, key);
     }
-    c.next_seq = take_u64(&mut buf)?;
+    c.next_seq = cur.u64("snapshot next_seq")?;
 
-    if !buf.is_empty() {
-        return Err("snapshot has trailing bytes".into());
-    }
+    cur.finish("snapshot")?;
     Ok(c)
 }
 
@@ -563,12 +479,30 @@ impl DispatchModule {
 
     // ---- intakes ----------------------------------------------------------------------
 
+    /// an observability breadcrumb for the no-fail callback/intake arms: they
+    /// swallow poison instead of aborting the block, and this is the trace
+    /// the swallow leaves behind.
+    fn note(&self, ctx: &mut dyn Ctx, what: String) {
+        ctx.emit_event(Event {
+            source: self.id.clone(),
+            payload: what.into_bytes(),
+        });
+    }
+
     /// the saga callback intake: judge the outcome, stage it, enqueue the
     /// delivery. correlation is the composite dispatch key in the callback's
     /// echoed `reply_payload`. every mismatch is a deterministic no-op — a
-    /// finalized callback must never abort its block.
+    /// finalized callback must never abort its block (an abort would replay
+    /// as a no-op and re-abort forever), so an undecodable payload is
+    /// swallowed as a staged no-op with a diagnostic event, never an `Err`.
     fn on_saga_callback(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
-        let callback: SagaCallback = decode_callback(payload).map_err(Error::Module)?;
+        let callback: SagaCallback = match decode_callback(payload) {
+            Ok(callback) => callback,
+            Err(e) => {
+                self.note(ctx, format!("dropped undecodable saga callback: {e}"));
+                return Ok(());
+            }
+        };
         let key = String::from_utf8_lossy(&callback.payload).into_owned();
         let Some(current) = self.dispatch(&key) else {
             return Ok(());
@@ -692,6 +626,35 @@ impl DispatchModule {
         Ok(())
     }
 
+    fn on_reassign(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        dispatch_id: String,
+        attempt: u32,
+    ) -> Result<(), Error> {
+        let Origin::Module(receiver) = &ctx.env().origin else {
+            return Err(Error::Module(
+                "ReassignDispatch is module-origin only (a module reassigns its own dispatch)"
+                    .into(),
+            ));
+        };
+        let key = dispatch_key(receiver, &dispatch_id);
+        let Some(dispatch) = self.dispatch(&key) else {
+            return Ok(());
+        };
+        if dispatch.status != Status::AwaitingResult {
+            return Ok(());
+        }
+        ctx.emit_msg(Msg {
+            target: self.saga.clone(),
+            payload: saga_encode_msg(&SagaMsg::Reassign {
+                saga_id: dispatch.saga_id.clone(),
+                attempt,
+            }),
+        });
+        Ok(())
+    }
+
     /// the host-injected delivery sweep: emit up to
     /// [`MAX_DELIVERIES_PER_BLOCK`] mailbox events, FIFO, each as one
     /// follow-up `Msg` to its receiver.
@@ -710,18 +673,26 @@ impl DispatchModule {
             .map(|(seq, key)| (*seq, key.clone()))
             .collect();
         for (seq, key) in batch {
-            let Some(current) = self.dispatch(&key) else {
-                // a mailbox entry without a dispatch record cannot be built
-                // by this module's own transitions; refuse to invent a
-                // delivery for it.
-                return Err(Error::Module(format!(
-                    "mailbox entry {key:?} has no dispatch record"
-                )));
+            // a mailbox entry without a dispatch record (or without a
+            // recorded outcome) cannot be built by this module's own
+            // transitions — but this arm is host-injected every block while
+            // the mailbox is non-empty, so erroring here would abort every
+            // future block (the poison loop the module header forbids).
+            // stage-drop the orphan and leave a diagnostic event instead.
+            let Some(current) = self.dispatch(&key).cloned() else {
+                self.note(ctx, format!("dropped orphaned mailbox entry {key:?}"));
+                self.queue_mut().0.remove(&seq);
+                continue;
             };
-            let outcome = current.outcome.clone().ok_or_else(|| {
-                Error::Module(format!("mailbox entry {key:?} has no recorded outcome"))
-            })?;
-            let mut dispatch = current.clone();
+            let Some(outcome) = current.outcome.clone() else {
+                self.note(
+                    ctx,
+                    format!("dropped mailbox entry {key:?} with no recorded outcome"),
+                );
+                self.queue_mut().0.remove(&seq);
+                continue;
+            };
+            let mut dispatch = current;
             dispatch.status = Status::Delivered;
             dispatch.updated_at = now;
             ctx.emit_msg(Msg {
@@ -819,6 +790,10 @@ impl DispatchModule {
                 payload,
             } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload),
             DispatchMsg::CancelDispatch { dispatch_id } => self.on_cancel(ctx, dispatch_id),
+            DispatchMsg::ReassignDispatch {
+                dispatch_id,
+                attempt,
+            } => self.on_reassign(ctx, dispatch_id, attempt),
             DispatchMsg::DeliverPending {} => self.on_deliver_pending(ctx),
             // the block's EXISTENCE is the point (it carries the host's
             // delivery injection); the op itself stages nothing.
@@ -840,6 +815,12 @@ impl DispatchModule {
             },
             outcome: d.outcome.clone(),
             assignee: None,
+            attempt: None,
+            max_attempts: None,
+            lease_expires_at: None,
+            deadline: None,
+            lease_updated_at: None,
+            reassignable: None,
             created_at: d.created_at,
             updated_at: d.updated_at,
         }
@@ -848,7 +829,11 @@ impl DispatchModule {
     /// the saga's current lease holder, read through the host-routed sibling
     /// lane — the filtered-facade pattern (cf. `upgrade::members`). read-only:
     /// this never stages, so it is safe inside `query_with`.
-    async fn saga_assignee(&self, ctx: &dyn Ctx, saga_id: &str) -> Result<Option<Vec<u8>>, Error> {
+    async fn saga_view(
+        &self,
+        ctx: &dyn Ctx,
+        saga_id: &str,
+    ) -> Result<Option<saga::SagaView>, Error> {
         let reply = ctx
             .query(
                 &self.saga,
@@ -858,7 +843,7 @@ impl DispatchModule {
             )
             .await?;
         match saga_decode_reply(&reply).map_err(Error::Module)? {
-            SagaReply::Saga(saga) => Ok(saga.and_then(|v| v.assignee)),
+            SagaReply::Saga(saga) => Ok(saga),
             other => Err(Error::Module(format!("saga answered Get with {other:?}"))),
         }
     }
@@ -874,7 +859,7 @@ impl DispatchModule {
     /// adopt a peer's snapshot — only after the decoded temporaries re-derive
     /// `expected` via the exact `root()` algorithm. all-or-nothing.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let committed = decode_committed(bytes).map_err(Error::Module)?;
+        let committed = decode_committed(bytes)?;
         if committed_root(&committed) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
@@ -956,8 +941,18 @@ impl Module for DispatchModule {
                 let mut view = Self::view(d);
                 // "running on" is only meaningful while the saga is live; a
                 // delivered run has left every node.
-                if matches!(d.status, Status::AwaitingResult) {
-                    view.assignee = self.saga_assignee(ctx, &d.saga_id).await?;
+                if matches!(d.status, Status::AwaitingResult)
+                    && let Some(saga) = self.saga_view(ctx, &d.saga_id).await?
+                {
+                    view.assignee = saga.assignee;
+                    view.attempt = Some(saga.attempt);
+                    view.max_attempts = Some(saga.max_attempts);
+                    view.lease_expires_at = saga.lease_expires_at;
+                    view.deadline = saga.deadline;
+                    view.lease_updated_at = Some(saga.updated_at);
+                    view.reassignable = Some(
+                        saga.pinned_assignee.is_none() && saga.attempt + 1 < saga.max_attempts,
+                    );
                 }
                 Ok(encode_reply(&DispatchReply::Dispatch(Some(view))))
             }
@@ -1000,6 +995,7 @@ mod tests {
     struct CaptureCtx {
         env: Env,
         msgs: Vec<Msg>,
+        events: Vec<Event>,
         saga_reply: Option<Vec<u8>>,
     }
     impl CaptureCtx {
@@ -1013,6 +1009,7 @@ mod tests {
                     protocol_version: 0,
                 },
                 msgs: Vec::new(),
+                events: Vec::new(),
                 saga_reply: None,
             }
         }
@@ -1049,7 +1046,9 @@ mod tests {
         fn emit_msg(&mut self, msg: Msg) {
             self.msgs.push(msg);
         }
-        fn emit_event(&mut self, _ev: Event) {}
+        fn emit_event(&mut self, ev: Event) {
+            self.events.push(ev);
+        }
         fn request_effect(&mut self, _eff: sdk::Effect) {}
     }
 
@@ -1554,6 +1553,83 @@ mod tests {
         assert!(ctx.msgs.is_empty());
     }
 
+    #[test]
+    fn an_undecodable_saga_callback_is_swallowed_not_an_abort() {
+        // the callback-poison rule: the callback intake runs inside a
+        // finalized block, so a payload that fails to decode must be a
+        // staged no-op plus a diagnostic event — an Err would abort the
+        // block, which replays as a no-op and re-aborts forever.
+        let mut m = module();
+        let key = registered_and_dispatched(&mut m, OutputContract::Text);
+        let before = m.root();
+
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("saga".into()));
+        let msg = Msg {
+            target: "dispatch".into(),
+            payload: b"not a callback".to_vec(),
+        };
+        block_on(m.execute(&mut ctx, &msg)).expect("the poisoned callback must not abort");
+        assert_eq!(ctx.events.len(), 1, "the swallow left a diagnostic event");
+        assert!(
+            String::from_utf8_lossy(&ctx.events[0].payload).contains("undecodable"),
+            "the event names the drop"
+        );
+
+        // the block applies and stages nothing: the dispatch still awaits its
+        // result and the root is unmoved.
+        commit(&mut m);
+        assert_eq!(m.root(), before, "nothing was staged");
+        assert!(matches!(
+            get_dispatch(&m, &key).unwrap().status,
+            DispatchStatus::AwaitingResult { .. }
+        ));
+    }
+
+    #[test]
+    fn an_orphaned_mailbox_entry_is_dropped_not_an_abort() {
+        // the never-pop-stack rule's failure mode: a committed non-empty
+        // mailbox is re-injected every block, so an entry the sweep cannot
+        // deliver must be dropped (with an event), never an Err — an abort
+        // here would poison every future block.
+        let mut m = module();
+        // an orphan cannot be built through the module's own transitions;
+        // plant it directly in committed state (same crate, test-only).
+        m.committed.mailbox.insert(0, "ghost\x1fentry".into());
+        m.committed.next_seq = 1;
+        assert_eq!(pending_deliveries(&m), 1);
+
+        let mut sys = CaptureCtx::new().with_origin(Origin::System);
+        exec(&mut m, &mut sys, &DispatchMsg::DeliverPending {})
+            .expect("the orphan must not abort the delivery block");
+        assert!(sys.msgs.is_empty(), "no delivery was invented for it");
+        assert_eq!(sys.events.len(), 1, "the drop left a diagnostic event");
+        assert!(
+            String::from_utf8_lossy(&sys.events[0].payload).contains("orphaned"),
+            "the event names the orphan"
+        );
+
+        // the block applies and the mailbox drains — no re-injection loop.
+        commit(&mut m);
+        assert_eq!(pending_deliveries(&m), 0, "the orphan seq was dropped");
+    }
+
+    #[test]
+    fn reassign_is_receiver_scoped_and_carries_the_expected_attempt() {
+        let mut m = module();
+        let key = registered_and_dispatched(&mut m, OutputContract::Text);
+        let reassign = DispatchMsg::ReassignDispatch {
+            dispatch_id: "d1".into(),
+            attempt: 2,
+        };
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("caller".into()));
+        exec(&mut m, &mut ctx, &reassign).unwrap();
+        assert_eq!(ctx.msgs.len(), 1);
+        assert!(matches!(
+            saga_decode_msg(&ctx.msgs[0].payload).unwrap(),
+            SagaMsg::Reassign { saga_id, attempt: 2 } if saga_id == saga_id_for(&key)
+        ));
+    }
+
     /// a `saga` `Get` reply carrying a Pending saga with the given assignee.
     fn saga_reply_with_assignee(assignee: Option<Vec<u8>>) -> Vec<u8> {
         use saga::{SagaStatus, SagaView, encode_reply as saga_encode_reply};
@@ -1568,13 +1644,13 @@ mod tests {
             max_attempts: 2,
             assignee,
             pinned_assignee: None,
-            lease_views: None,
-            lease_expires_at: None,
-            deadline: None,
+            lease_views: Some(64),
+            lease_expires_at: Some(80),
+            deadline: Some(100),
             result: None,
             error: None,
             created_at: 0,
-            updated_at: 0,
+            updated_at: 40,
         })))
     }
 
@@ -1602,6 +1678,12 @@ mod tests {
             .with_saga_reply(saga_reply_with_assignee(Some(b"worker-key".to_vec())));
         let view = query_dispatch(&m, &ctx, &key).expect("a dispatch view");
         assert_eq!(view.assignee, Some(b"worker-key".to_vec()));
+        assert_eq!(view.attempt, Some(0));
+        assert_eq!(view.max_attempts, Some(2));
+        assert_eq!(view.lease_expires_at, Some(80));
+        assert_eq!(view.deadline, Some(100));
+        assert_eq!(view.lease_updated_at, Some(40));
+        assert_eq!(view.reassignable, Some(true));
     }
 
     #[test]
@@ -1617,5 +1699,7 @@ mod tests {
             .with_saga_reply(saga_reply_with_assignee(Some(b"worker-key".to_vec())));
         let view = query_dispatch(&m, &ctx, &key).expect("a dispatch view");
         assert_eq!(view.assignee, None);
+        assert_eq!(view.attempt, None);
+        assert_eq!(view.reassignable, None);
     }
 }

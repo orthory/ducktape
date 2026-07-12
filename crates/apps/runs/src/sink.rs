@@ -16,8 +16,10 @@ use saga::{
 use sdk::{Ctx, Msg};
 use serde::Serialize;
 
+use crate::facets::{WireSink, WorkspaceReceipt};
 use crate::forge_source::{ForgeItemKind, ForgeItemState};
-use crate::{RunsModule, WireSink, WorkspaceReceipt};
+use crate::response::REPLY_KIND_CODE;
+use crate::{RunsModule, truncate_on_boundary};
 
 /// the PR-title clamp: the first line of the message facet, at most this many
 /// CHARS (char-boundary safe, never a byte slice).
@@ -51,7 +53,7 @@ pub(crate) fn message_facet_text(blocks: &[ReplyBlock]) -> String {
     blocks
         .iter()
         .map(|block| match block.kind.as_str() {
-            crate::REPLY_KIND_CODE => format!(
+            REPLY_KIND_CODE => format!(
                 "```{}\n{}\n```",
                 block.lang.as_deref().unwrap_or(""),
                 block.text
@@ -67,20 +69,16 @@ pub(crate) fn message_facet_text(blocks: &[ReplyBlock]) -> String {
 /// boundaries. a blank facet falls back to `agent run <run_id>` (forge
 /// rejects empty titles — the fallback keeps the no-abort rule).
 fn derive_pr_title(message: &str, run_id: &str) -> String {
-    let line = message
+    let line: String = message
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("agent run {run_id}"));
-    let mut title = String::new();
-    for (count, ch) in line.chars().enumerate() {
-        if count >= PR_TITLE_MAX_CHARS || title.len() + ch.len_utf8() > FORGE_TITLE_BYTE_CAP {
-            break;
-        }
-        title.push(ch);
-    }
-    title
+        .unwrap_or_else(|| format!("agent run {run_id}"))
+        .chars()
+        .take(PR_TITLE_MAX_CHARS)
+        .collect();
+    truncate_on_boundary(&line, FORGE_TITLE_BYTE_CAP, "")
 }
 
 /// the receipt's output as one honest line: `branch@oid` when a push landed,
@@ -111,9 +109,9 @@ fn derive_pr_body(message: &str, run_id: &str, receipt: &WorkspaceReceipt, node:
         return body;
     }
     // unreachable while the reply-blocks cap holds; deterministic degrade —
-    // truncate_utf8 appends a 3-byte ellipsis beyond its bound, so leave room.
-    let budget = FORGE_BODY_BYTE_CAP.saturating_sub(crumb.len() + 2 + 3);
-    format!("{}\n\n{crumb}", crate::truncate_utf8(message, budget))
+    // truncate the MESSAGE, never the breadcrumb.
+    let budget = FORGE_BODY_BYTE_CAP.saturating_sub(crumb.len() + 2);
+    format!("{}\n\n{crumb}", truncate_on_boundary(message, budget, "…"))
 }
 
 // ---- forge sink wire (local mirrors) -----------------------------------------
@@ -122,8 +120,8 @@ fn derive_pr_body(message: &str, run_id: &str, receipt: &WorkspaceReceipt, node:
 // for the sink op it emits, and a dev-only conformance test pins the mirror
 // against `forge::decode_msg` so the wire can't silently drift.
 
-/// the exact `ForgeMsg::OpenPr` JSON the forge module decodes. only the PR sink
-/// is emitted in v1 (the merge sink is inert), so only `OpenPr` is mirrored.
+/// the exact `ForgeMsg::OpenPr` JSON the forge module decodes. only the PR
+/// sink is emitted, so only `OpenPr` is mirrored.
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ForgeSinkMsg<'a> {
@@ -167,8 +165,8 @@ impl RunsModule {
     /// rendered message facet) and `receipt` — the wire sink's echoed empty
     /// title/body are IGNORED. `executing_node` is the caller-computed saga
     /// attribution ([`Self::executing_node`]) the PR body breadcrumb names.
-    /// Merge is inert in v1. any missing precondition degrades to a breadcrumb
-    /// — the sink NEVER aborts the delivery block.
+    /// any missing precondition degrades to a breadcrumb — the sink NEVER
+    /// aborts the delivery block.
     ///
     /// returns the PR number this sink touched — the guard-found open PR the
     /// push updated, or the number the emitted `OpenPr` gets (the tracker
@@ -312,16 +310,6 @@ impl RunsModule {
                 });
                 Some(next_number)
             }
-            WireSink::Merge { repo, number, .. } => {
-                // v1: the merge sink needs a host-computed merge pack (a phase-2
-                // wrapper responsibility). validate the wire, breadcrumb, and
-                // fall through like Chain — never emit a MergePr yet.
-                self.note(
-                    ctx,
-                    format!("run {run_id} merge sink for {repo}#{number} is inert in v1 (treated as chain)"),
-                );
-                None
-            }
         }
     }
 
@@ -459,7 +447,7 @@ mod tests {
 
     #[test]
     fn pr_body_is_the_message_plus_the_receipt_breadcrumb() {
-        let receipt = crate::WorkspaceReceipt {
+        let receipt = crate::facets::WorkspaceReceipt {
             branch: Some("agent/x".into()),
             output_commit: Some("abc123".into()),
             ..Default::default()
@@ -474,7 +462,7 @@ mod tests {
             "---\nrun: r1\noutput: agent/x@abc123\nnode: unknown"
         );
         // honest output lines when nothing was pushed.
-        let no_changes = crate::WorkspaceReceipt {
+        let no_changes = crate::facets::WorkspaceReceipt {
             no_changes: true,
             ..Default::default()
         };
@@ -482,7 +470,7 @@ mod tests {
             derive_pr_body("m", "r1", &no_changes, "unknown"),
             "m\n\n---\nrun: r1\noutput: none (no changes this run)\nnode: unknown"
         );
-        let commit_failed = crate::WorkspaceReceipt {
+        let commit_failed = crate::facets::WorkspaceReceipt {
             branch: Some("agent/x".into()),
             commit_error: Some("cas".into()),
             ..Default::default()
@@ -497,7 +485,7 @@ mod tests {
     fn an_oversized_body_truncates_the_message_and_keeps_the_breadcrumb() {
         // unreachable under the 32 KiB reply-blocks cap; the deterministic
         // guard keeps a regression from handing forge a rejectable op.
-        let receipt = crate::WorkspaceReceipt::default();
+        let receipt = crate::facets::WorkspaceReceipt::default();
         let body = derive_pr_body(&"x".repeat(FORGE_BODY_BYTE_CAP), "r1", &receipt, "unknown");
         assert!(body.len() <= FORGE_BODY_BYTE_CAP, "body stays inside forge's cap");
         assert!(body.ends_with("---\nrun: r1\noutput: none\nnode: unknown"));

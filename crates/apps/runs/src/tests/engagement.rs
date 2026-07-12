@@ -1,5 +1,68 @@
 use super::*;
 
+#[test]
+fn pages_comment_mention_dispatches_without_a_chat_watch() {
+    let mut registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
+    registry.get_mut("bot").unwrap().caps.pages_write = vec!["p1".into()];
+    let mut m = module()
+        .with_files_module("files")
+        .with_pages_module("pages");
+    let thread = pages::ThreadView {
+        thread: pages::Thread {
+            id: "thread-1".into(),
+            target: "b-p".into(),
+            opener: pages::AuthorRef::User(vec![4; 32]),
+            created_at: 1,
+            resolved: false,
+            resolved_by: None,
+            comment_ids: vec!["comment-1".into()],
+        },
+        comments: vec![pages::Comment {
+            id: "comment-1".into(),
+            thread_id: "thread-1".into(),
+            author: pages::AuthorRef::User(vec![4; 32]),
+            text: "@bot review this page".into(),
+            created_at: 1,
+            edited_at: None,
+            deleted: false,
+        }],
+    };
+    let mut ctx = CaptureCtx::new()
+        .at(3)
+        .with_tagging_origin()
+        .with_registry(&registry)
+        .with_page("p1", page_blocks("p1", "Spec"))
+        .with_page_thread(thread);
+    let event = Msg {
+        target: "runs".into(),
+        payload: tagging_encode_event(&EngagementEvent {
+            source: "pages".into(),
+            container: "thread-1".into(),
+            content_seq: 1,
+            author: Author::User(vec![4; 32]),
+            tags: vec![agent_tag("bot")],
+        }),
+    };
+    exec(&mut m, &mut ctx, &event).unwrap();
+    commit(&mut m);
+
+    let run_id = page_run_id_for("thread-1", 1, "bot");
+    let pending = get_pending(&m, &run_id).expect("page mention engaged bot");
+    assert_eq!(pending.channel_id, "runs:pages:thread-1");
+    let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+        panic!("expected page dispatch")
+    };
+    let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(envelope["thread_key"], "pages:thread-1");
+    assert!(
+        envelope["conversation"]
+            .as_str()
+            .unwrap()
+            .contains("review this page")
+    );
+    assert!(envelope["context"].as_str().unwrap().contains("Spec"));
+}
+
 // ---- the engagement intake: turn policies ----------------------------------
 
 #[test]
@@ -56,7 +119,7 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
     assert_eq!(*recipe_id, recipe_id_for("bot1"));
     let envelope: serde_json::Value =
         serde_json::from_slice(payload).expect("the payload is a JSON envelope");
-    assert_eq!(envelope["ducktape_run"], RUN_ENVELOPE_VERSION);
+    assert_eq!(envelope["ducktape_run"], crate::envelope::RUN_ENVELOPE_VERSION);
     assert_eq!(envelope["agent_id"], "bot1");
     assert_eq!(
         envelope["prompt_hash"],

@@ -10,11 +10,14 @@ impl Module for RunsModule {
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
-    /// a length-prefixed fold of every watch and pending-entry field in
-    /// sorted-key order. sensitive to every field, so any transition moves
-    /// the root. the preimage IS the snapshot encoding.
+    /// a length-prefixed fold of every watch, pending-entry, and agent-session
+    /// field in sorted-key order. sensitive to every field, so any transition
+    /// moves the root — opening a session, spending one of its actions, and
+    /// pruning it each move the app-hash, because the session registry IS the
+    /// mid-run ACL and every validator must hold the same one. the preimage IS
+    /// the snapshot encoding.
     fn root(&self) -> StateRoot {
-        committed_root(&self.watches, &self.pending)
+        committed_root(&self.watches, &self.pending, &self.sessions)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -88,6 +91,15 @@ impl Module for RunsModule {
                 // newest first: the ring appends at the back.
                 self.history.iter().rev().cloned().collect(),
             ))),
+            // the audit surface: who holds a key right now, and how much of the
+            // budget they have spent. ascending by run id.
+            RunsQuery::AgentSessions => {
+                let sessions = Self::visible_ids(&self.sessions, &self.pending_sessions)
+                    .into_iter()
+                    .filter_map(|run_id| self.session(&run_id).cloned())
+                    .collect();
+                Ok(encode_reply(&RunsReply::AgentSessions(sessions)))
+            }
         }
     }
 
@@ -112,6 +124,16 @@ impl Module for RunsModule {
                 }
             }
         }
+        for (run_id, staged) in std::mem::take(&mut self.pending_sessions) {
+            match staged {
+                Some(session) => {
+                    self.sessions.insert(run_id, session);
+                }
+                None => {
+                    self.sessions.remove(&run_id);
+                }
+            }
+        }
         for record in std::mem::take(&mut self.pending_history) {
             self.history.push_back(record);
             if self.history.len() > super::RUN_HISTORY_CAP {
@@ -124,6 +146,7 @@ impl Module for RunsModule {
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        self.pending_sessions.clear();
         self.pending_history.clear();
         Ok(())
     }

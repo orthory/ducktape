@@ -10,7 +10,7 @@ import type { NodeStatus } from "../../domain/transport";
 import { makeTransportStub } from "../../test/transport-stub";
 import { receiptFloor } from "./finalization";
 import type { OpLedger } from "./finalization";
-import { changedModules, fetchPeopleSlices, scopeFor } from "./hydration";
+import { changedModules, fetchGovernanceSlices, fetchPeopleSlices, scopeFor } from "./hydration";
 
 // ── Fixtures ────────────────────────────────────────────
 
@@ -105,6 +105,28 @@ describe("fetchPeopleSlices", () => {
     });
     expect(slices.accountHandles).toEqual({ "0a": "rae" });
     expect(query.mock.calls.map(([target]) => target)).toEqual(["identity", "duckdns"]);
+  });
+});
+
+describe("fetchGovernanceSlices", () => {
+  it("hydrates proposals and the account-share registry together", async () => {
+    const query = vi.fn((_target: string, request: unknown) =>
+      Promise.resolve(
+        request === "shares"
+          ? { shares: { active: true, allocations: [{ account_id: [1], shares: 60 }], total: 60 } }
+          : { proposals: [] },
+      ),
+    );
+
+    await expect(fetchGovernanceSlices(makeTransportStub({ query }))).resolves.toEqual({
+      proposals: [],
+      governanceShares: {
+        active: true,
+        allocations: [{ account_id: [1], shares: 60 }],
+        total: 60,
+      },
+    });
+    expect(query.mock.calls.map(([, request]) => request)).toEqual(["proposals", "shares"]);
   });
 });
 

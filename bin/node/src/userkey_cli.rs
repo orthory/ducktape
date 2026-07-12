@@ -1317,7 +1317,7 @@ mod userkey_verb_tests {
         write_legacy(&key_path, &seed);
         let signer = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
         let statement = gateway::RouteStatement {
-            version: gateway::ROUTE_FORMAT_VERSION,
+            version: 1,
             chain_id: "test-chain".into(),
             account_id: signer.public_key().as_ref().to_vec(),
             name: gateway::RouteName::named("api"),
@@ -1331,6 +1331,7 @@ mod userkey_verb_tests {
                     max_request_bytes: 1024,
                     max_response_bytes: 4096,
                     allow_authorization: false,
+                    allow_upgrade: false,
                 },
             }),
         };

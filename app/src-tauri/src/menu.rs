@@ -5,7 +5,7 @@
 //! no Close Window accelerator. Other platforms have no default menu.
 
 #[cfg(target_os = "macos")]
-pub fn install(app: &tauri::App) -> tauri::Result<()> {
+pub fn install(app: &crate::rt::App) -> tauri::Result<()> {
     use tauri::menu::{AboutMetadata, Menu, PredefinedMenuItem, Submenu};
     let handle = app.handle();
     let name = &app.package_info().name;
@@ -55,6 +55,6 @@ pub fn install(app: &tauri::App) -> tauri::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn install(_app: &tauri::App) -> tauri::Result<()> {
+pub fn install(_app: &crate::rt::App) -> tauri::Result<()> {
     Ok(())
 }

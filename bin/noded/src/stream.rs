@@ -163,21 +163,18 @@ pub enum RunStream {
     Stderr,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct BlockNote {
-    height: u64,
-    app_hash: String,
-}
-
 #[derive(Clone)]
 pub struct StreamHub {
-    blocks: broadcast::Sender<BlockNote>,
+    /// block wakeups: subscribers re-scan on any commit; the payload they'd
+    /// want (height/app-hash) lives in `tip`, which the heartbeat reads.
+    blocks: broadcast::Sender<()>,
     tip: Arc<RwLock<Option<(u64, String)>>>,
     logs: LogRing,
     run_output: RunOutputRegistry,
 }
 
 impl StreamHub {
+    #[cfg(test)]
     pub fn new(buffer: usize) -> Self {
         Self::with_log_ring(buffer, LogRing::default())
     }
@@ -193,9 +190,8 @@ impl StreamHub {
     }
 
     pub fn publish_block(&self, height: u64, app_hash: impl Into<String>) {
-        let app_hash = app_hash.into();
-        self.prime(height, app_hash.clone());
-        let _ = self.blocks.send(BlockNote { height, app_hash });
+        self.prime(height, app_hash);
+        let _ = self.blocks.send(());
     }
 
     pub fn prime(&self, height: u64, app_hash: impl Into<String>) {
@@ -210,7 +206,7 @@ impl StreamHub {
         self.run_output.clone()
     }
 
-    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<BlockNote> {
+    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<()> {
         self.blocks.subscribe()
     }
 
@@ -342,6 +338,18 @@ impl Drop for LogRingWriter {
 pub struct RunOutputRegistry {
     inner: Arc<Mutex<RunOutputInner>>,
     watch: watch::Sender<u64>,
+    appends: broadcast::Sender<RunOutputEvent>,
+}
+
+/// One provider line as it entered this node's local registry. The node's
+/// agent data-plane subscribes to this feed and forwards it to peer nodes;
+/// remotely ingested lines deliberately do not re-enter the feed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunOutputEvent {
+    pub id: String,
+    pub stream: RunStream,
+    pub line: String,
 }
 
 #[derive(Default)]
@@ -362,16 +370,26 @@ struct RunRing {
 impl Default for RunOutputRegistry {
     fn default() -> Self {
         let (watch, _) = watch::channel(0);
+        let (appends, _) = broadcast::channel(RUN_OUTPUT_MAX_LINES);
         Self {
             inner: Arc::new(Mutex::new(RunOutputInner::default())),
             watch,
+            appends,
         }
     }
 }
 
 impl RunOutputRegistry {
     pub fn append(&self, id: impl Into<String>, stream: RunStream, line: impl Into<String>) {
-        let id = id.into();
+        self.push(id.into(), stream, line.into(), true);
+    }
+
+    /// Add a line received from another node without broadcasting it again.
+    pub fn append_remote(&self, event: RunOutputEvent) {
+        self.push(event.id, event.stream, event.line, false);
+    }
+
+    fn push(&self, id: String, stream: RunStream, line: String, publish: bool) {
         let mut inner = self.inner.lock().expect("run output lock poisoned");
         inner.version += 1;
         inner.touch += 1;
@@ -381,7 +399,7 @@ impl RunOutputRegistry {
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
-        ring.lines.push_back((seq, stream, line.into()));
+        ring.lines.push_back((seq, stream, line.clone()));
         while ring.lines.len() > RUN_OUTPUT_MAX_LINES {
             if let Some((evicted, _, _)) = ring.lines.pop_front() {
                 ring.floor_seq = evicted;
@@ -401,6 +419,13 @@ impl RunOutputRegistry {
         }
         drop(inner);
         let _ = self.watch.send(version);
+        if publish {
+            let _ = self.appends.send(RunOutputEvent {
+                id,
+                stream,
+                line,
+            });
+        }
     }
 
     pub fn read_after(
@@ -428,6 +453,10 @@ impl RunOutputRegistry {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.watch.subscribe()
+    }
+
+    pub fn subscribe_appends(&self) -> broadcast::Receiver<RunOutputEvent> {
+        self.appends.subscribe()
     }
 }
 
@@ -533,10 +562,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
             }
             note = block_rx.recv() => {
                 match note {
-                    Ok(note) => {
-                        let _ = (note.height, note.app_hash);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
                 if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
@@ -1185,7 +1211,7 @@ mod tests {
             "module:chat",
             &mut state,
             Some(&store),
-            &StreamHub::new(crate::EVENT_BUFFER),
+            &StreamHub::new(crate::handle::EVENT_BUFFER),
         );
         assert!(result.frames.is_empty());
     }
@@ -1278,9 +1304,30 @@ mod tests {
         assert_eq!(floor, 0);
     }
 
+    #[test]
+    fn remote_run_output_does_not_rebroadcast() {
+        let runs = RunOutputRegistry::default();
+        let mut appends = runs.subscribe_appends();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        assert_eq!(appends.try_recv().unwrap().line, "local");
+
+        runs.append_remote(RunOutputEvent {
+            id: "aa".repeat(32),
+            stream: RunStream::Stderr,
+            line: "remote".into(),
+        });
+        assert!(matches!(
+            appends.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].2, "remote");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn heartbeat_frame_shape_under_paused_time() {
-        let hub = StreamHub::new(crate::EVENT_BUFFER);
+        let hub = StreamHub::new(crate::handle::EVENT_BUFFER);
         hub.prime(7, "abc");
         let mut interval = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         interval.tick().await;
