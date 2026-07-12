@@ -127,15 +127,14 @@ export function WorkspacesTable() {
                   // click that came from it rather than connecting twice
                   // (connectActive is not idempotent — it drops the transport).
                   onClick={(e) => {
-                    if (active) return;
                     if ((e.target as HTMLElement).closest("button")) return;
                     actions.selectWorkspace(w.id);
                   }}
                   onMouseEnter={() => setHovered(w.id)}
                   onMouseLeave={() => setHovered((h) => (h === w.id ? null : h))}
                   style={{
-                    cursor: active ? "default" : "pointer",
-                    background: !active && hovered === w.id ? color.titlebar : undefined,
+                    cursor: "pointer",
+                    background: hovered === w.id ? color.titlebar : undefined,
                   }}
                 >
                   <td style={rowCell}>{w.name}</td>
@@ -166,16 +165,14 @@ export function WorkspacesTable() {
                     )}
                   </td>
                   <td style={{ ...rowCell, textAlign: "right" }}>
-                    {!active && (
-                      <HoverButton
-                        ariaLabel={`Enter ${w.name}`}
-                        onClick={() => actions.selectWorkspace(w.id)}
-                        hoverBg={color.titlebar}
-                        style={outlineButton}
-                      >
-                        Enter
-                      </HoverButton>
-                    )}
+                    <HoverButton
+                      ariaLabel={`Enter ${w.name}`}
+                      onClick={() => actions.selectWorkspace(w.id)}
+                      hoverBg={color.titlebar}
+                      style={outlineButton}
+                    >
+                      Enter
+                    </HoverButton>
                   </td>
                 </tr>
               );

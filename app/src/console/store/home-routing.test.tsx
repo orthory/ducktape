@@ -187,5 +187,14 @@ describe("goHome", () => {
     // connection flag are left exactly as they were.
     expect(screen.getByTestId("nodeUrl").textContent).toBe(url);
     expect(screen.getByTestId("connected").textContent).toBe(connected);
+
+    invokeMock.mockClear();
+    await act(async () => {
+      actions!.selectWorkspace("team");
+    });
+
+    expect(screen.getByTestId("home").textContent).toBe("false");
+    expect(screen.getByTestId("nodeUrl").textContent).toBe(url);
+    expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
   });
 });
