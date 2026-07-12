@@ -1056,12 +1056,17 @@ pub(super) async fn park(
                     );
                 }
             }
-            // persist the finalization floor once everything at or
-            // below it has drained — cert first, gate second, same
-            // ordering proof as the validator drain.
-            if let Some((view, cert)) = node_r.orderer().latest_finalization()
+            // persist the finalization floor for the newest certificate
+            // whose view has fully drained — cert first, release point
+            // second, same ordering proof (and the same busy-chain
+            // starvation fix) as the validator drain.
+            if let Some(tip_view) = node_r.finalized_view()
+                && let Some((view, cert)) = node_r.orderer().finalization_at_or_below(tip_view)
                 && view != 0
-                && node_r.orderer().unreleased_len() == 0
+                && node_r
+                    .orderer()
+                    .min_unreleased_view()
+                    .is_none_or(|pending| pending > view)
             {
                 let height = replica_view_base + view;
                 if last_cert_height.is_none_or(|h| height > h) {
