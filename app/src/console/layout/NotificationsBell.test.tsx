@@ -156,7 +156,7 @@ describe("NotificationsBell", () => {
 
     // The two #general mentions collapse into one row; the lone run stays flat.
     const stack = await screen.findByText("#general");
-    expect(screen.getByText("2 new messages")).toBeInTheDocument();
+    expect(screen.getByText("2 messages")).toBeInTheDocument();
     expect(screen.queryByText("Casey mentioned you")).toBeNull();
     expect(screen.getByText("Run done")).toBeInTheDocument();
 

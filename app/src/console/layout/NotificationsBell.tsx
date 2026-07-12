@@ -77,12 +77,13 @@ const groupItems = (
   return [...groups.values()];
 };
 
+// Deliberately NOT "N new": the ring keeps its items after they are seen, so a
+// reopened dropdown would keep claiming newness beside a cleared badge.
 const stackSummary = (group: Group): string => {
-  const noun =
-    group.items[0].category === "mention" || group.items[0].category === "reply"
-      ? "messages"
-      : "updates";
-  return `${group.items.length} new ${noun}`;
+  const chat = (item: NotifyItem) =>
+    item.category === "mention" || item.category === "reply";
+  const noun = group.items.every(chat) ? "messages" : "updates";
+  return `${group.items.length} ${noun}`;
 };
 
 export function NotificationsBell() {
