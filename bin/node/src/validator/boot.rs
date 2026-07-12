@@ -15,7 +15,7 @@ use crate::constants::MAX_PROTOCOL_VERSION;
 use crate::constants::{POST_REBOOT_CATCHUP_MAX_ATTEMPTS, POST_REBOOT_CATCHUP_MAX_ITERS};
 use crate::explorer::{IndexFold, heal_index};
 use crate::host_reads::read_upgrade_version_fields;
-use crate::host_state::{NetworkBindings, genesis_host, restore_host};
+use crate::host_state::{NetworkBindings, genesis_host, preflight_recovery_schema, restore_host};
 use crate::host_state::{SyncSubstrates, sync_all_modules};
 use crate::sync::catchup::{
     BootP2pSyncClient, PostRebootCatchupError, advance_next_seq_from_frames,
@@ -114,6 +114,10 @@ pub(super) async fn restore(
                  protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
                     manifest.required_min_version
                 );
+                std::process::exit(1);
+            }
+            if let Err(e) = preflight_recovery_schema(&manifest) {
+                eprintln!("[node {label}] FATAL: cannot recover — {e}");
                 std::process::exit(1);
             }
             let restored = restore_host(

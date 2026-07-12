@@ -154,6 +154,42 @@ pub(crate) const MODULE_IDS: [&str; 23] = [
     "agent",
     "runs",
 ];
+
+/// Canonical committed-state revisions for the production module set.
+///
+/// Keep this alphabetically ordered and bump a module's revision in the same
+/// change that alters its canonical snapshot/root encoding. The registry
+/// parity test compares these declarations with the live module trait values.
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 23] = [
+    ("agent", 1),
+    ("automations", 1),
+    ("capability", 1),
+    ("chat", 1),
+    ("directory", 1),
+    ("dispatch", 1),
+    ("duckdns", 1),
+    ("files", 1),
+    ("forge", 1),
+    ("gateway", 1),
+    ("governance", 1),
+    ("identity", 1),
+    ("inbox", 1),
+    ("jobs", 1),
+    ("kv", 1),
+    ("pages", 1),
+    ("runs", 2),
+    ("saga", 1),
+    ("tagging", 1),
+    ("tasks", 1),
+    ("upgrade", 1),
+    ("valset", 1),
+    ("vaults", 1),
+];
+
+pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
+    host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
+}
+
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.

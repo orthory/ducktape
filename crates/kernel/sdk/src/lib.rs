@@ -359,6 +359,17 @@ pub trait Module {
     /// this module's genesis-assigned id (e.g. "documents", "forge").
     fn id(&self) -> ModuleId;
 
+    /// Revision of this module's canonical committed-state encoding.
+    ///
+    /// Bump this whenever `root()` or installable snapshot bytes change shape
+    /// in a way an older/newer binary cannot decode byte-for-byte. This is a
+    /// clean-break fence, not a migration selector: recovery compares the
+    /// ordered production module/revision fingerprint before opening module
+    /// storage and refuses an incompatible workspace without mutating it.
+    fn state_schema_revision(&self) -> u32 {
+        1
+    }
+
     /// the module's current authenticated root. called by the host to fold into
     /// the global app-hash after a block applies.
     fn root(&self) -> StateRoot;

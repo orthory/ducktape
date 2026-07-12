@@ -319,6 +319,10 @@ pub(super) async fn park(
             );
             std::process::exit(1);
         }
+        if let Err(e) = crate::host_state::preflight_recovery_schema(ckpt) {
+            eprintln!("[node {label}] FATAL: cannot recover — {e}");
+            std::process::exit(1);
+        }
         let restored = restore_host(
             &context,
             &forge_repo,

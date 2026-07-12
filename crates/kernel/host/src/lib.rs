@@ -67,6 +67,25 @@ pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
     StateRoot(h.finalize().into())
 }
 
+/// Canonical fingerprint of a module set's committed-state schemas.
+///
+/// Entries are sorted by module id before hashing, so registry construction
+/// order is irrelevant. Length-prefixing keeps ids unambiguous; the domain tag
+/// prevents this digest from being confused with an app hash.
+pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, u32)>) -> [u8; 32] {
+    let mut modules: Vec<(&str, u32)> = modules.into_iter().collect();
+    modules.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut h = Sha256::new();
+    h.update(b"ducktape-state-schema-v1");
+    h.update((modules.len() as u64).to_le_bytes());
+    for (id, revision) in modules {
+        h.update((id.len() as u64).to_le_bytes());
+        h.update(id.as_bytes());
+        h.update(revision.to_le_bytes());
+    }
+    h.finalize().into()
+}
+
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
 /// consensus/genesis constant — identical on every node — so the local re-entry
 /// loop is guaranteed to terminate regardless of module behavior.
@@ -383,6 +402,20 @@ impl Host {
     /// register a module under its own [`Module::id`]. genesis-time wiring.
     pub fn register(&mut self, module: Box<dyn Module>) {
         self.registry.insert(module.id(), module);
+    }
+
+    /// Sorted module ids and their canonical-state revisions.
+    pub fn state_schema(&self) -> Vec<(ModuleId, u32)> {
+        self.registry
+            .iter()
+            .map(|(id, module)| (id.clone(), module.state_schema_revision()))
+            .collect()
+    }
+
+    /// Fingerprint persisted in recovery/state-sync manifests.
+    pub fn state_schema_fingerprint(&self) -> [u8; 32] {
+        let schema = self.state_schema();
+        state_schema_fingerprint(schema.iter().map(|(id, revision)| (id.as_str(), *revision)))
     }
 
     /// build a host from a declared module set (registry-as-genesis-state). errors
@@ -1324,4 +1357,21 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
     fn emit_event(&mut self, _ev: Event) {}
 
     fn request_effect(&mut self, _eff: Effect) {}
+}
+
+#[cfg(test)]
+mod state_schema_tests {
+    use super::state_schema_fingerprint;
+
+    #[test]
+    fn fingerprint_is_canonically_sorted_and_revision_sensitive() {
+        let first = state_schema_fingerprint([("runs", 2), ("chat", 1)]);
+        let reordered = state_schema_fingerprint([("chat", 1), ("runs", 2)]);
+        let old_runs = state_schema_fingerprint([("chat", 1), ("runs", 1)]);
+        assert_eq!(
+            first, reordered,
+            "registry construction order is irrelevant"
+        );
+        assert_ne!(first, old_runs, "a canonical schema change requires a bump");
+    }
 }

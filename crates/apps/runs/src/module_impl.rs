@@ -9,6 +9,13 @@ impl Module for RunsModule {
         self.id.clone()
     }
 
+    // Revision 2 added the committed agent-session section after watches and
+    // pending runs. Revision 1 snapshots end there and must clean-break before
+    // install rather than surfacing the misleading `snapshot truncated` error.
+    fn state_schema_revision(&self) -> u32 {
+        2
+    }
+
     /// state-based commitment: sha256 over the canonical committed encoding —
     /// a length-prefixed fold of every watch, pending-entry, and agent-session
     /// field in sorted-key order. sensitive to every field, so any transition

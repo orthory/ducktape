@@ -19,6 +19,7 @@ import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
+import { classifyBootError } from "../../domain/boot-error";
 import type { NodeTransport } from "../../domain/transport";
 import { callSocketUrl } from "../../domain/transport";
 // Task 7 moved the huddle session to call-session (typed /v1/call/ws + audio +
@@ -1291,6 +1292,7 @@ export function createActions({
               // a hollow disconnected console whose toast then vanishes.
               patch({
                 bootError: {
+                  kind: classifyBootError(reason, log.tail),
                   workspaceId: target.id,
                   reason,
                   logPath: log.path,
