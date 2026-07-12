@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
+use dispatch_oracle::{
+    BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, max_concurrent_runs_from_env,
+};
 use futures::SinkExt as _;
 use sdk::Msg;
 
@@ -22,20 +24,6 @@ use sdk::Msg;
 /// by the concurrency cap, so this never fills in practice; senders await
 /// (off-loop) rather than drop if it ever does.
 const ORACLE_RESULT_LANE: usize = 64;
-
-/// mirrors dispatch_oracle's private `max_concurrent_runs_from_env`
-/// (`DUCKTAPE_MAX_CONCURRENT_RUNS`, a positive int, else 4): `with_limit`
-/// needs the number explicitly so the announced capacity can ride alongside
-/// the env-derived concurrency cap, and the crate does not re-export the
-/// helper. ponytail: 6-line clone of a frozen crate constant; delete if the
-/// crate ever exports it.
-fn max_concurrent_runs() -> usize {
-    std::env::var("DUCKTAPE_MAX_CONCURRENT_RUNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(4)
-}
 
 /// build the dispatch worker for this validator: a pool that spawns provider
 /// runs as supervised children of `context` and hands completed results back
@@ -118,7 +106,7 @@ where
         node_key,
         spawn,
         deliver,
-        max_concurrent_runs(),
+        max_concurrent_runs_from_env(),
         capacity,
     )
     .with_resolver(resolver);

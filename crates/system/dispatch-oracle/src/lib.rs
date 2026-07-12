@@ -36,7 +36,7 @@ mod provision;
 mod workspace_source;
 pub use envelope::BlobResolver;
 pub use ledger::{ReservationGuard, ResourceLedger};
-pub use pool::{DeliverFn, DispatchPool, SpawnFn};
+pub use pool::{DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env};
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
     WorkspaceSpec,

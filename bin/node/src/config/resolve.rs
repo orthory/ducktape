@@ -132,10 +132,22 @@ pub struct Resolved {
 /// resolve the operator's sandbox choice into a spawn backend plus the numeric
 /// capacity a sandboxed node announces. absent/`"direct"` → `Direct` (no
 /// capacity — a direct spawn makes no promise); `"podman"` → `Podman` with the
-/// probed host totals, per-key overrides winning; `"tart"` is accepted and
-/// resolves to `Direct` for now (a sibling branch adds the real variant);
+/// probed host totals, per-key overrides winning; `"tart"` → `Tart` (macOS
+/// VMs, same capacity model — the live tart pass awaits a real-Mac QA);
 /// anything else is a loud config error.
 fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
+    // podman and tart share the capacity derivation: probed totals with the
+    // operator's per-key overrides winning.
+    let probed = |raw: &NodeToml| {
+        let mut capacity = crate::host_resources::probe();
+        if let Some(cores) = raw.sandbox_cores {
+            capacity.insert("cores".into(), cores);
+        }
+        if let Some(mem_gb) = raw.sandbox_mem_gb {
+            capacity.insert("mem_gb".into(), mem_gb);
+        }
+        capacity
+    };
     match raw.sandbox.as_deref() {
         None | Some("direct") => Ok((SandboxBackend::Direct, BTreeMap::new())),
         Some("podman") => {
@@ -143,17 +155,15 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
                 .sandbox_image
                 .clone()
                 .unwrap_or_else(|| "docker.io/library/node:22-slim".into());
-            let mut capacity = crate::host_resources::probe();
-            if let Some(cores) = raw.sandbox_cores {
-                capacity.insert("cores".into(), cores);
-            }
-            if let Some(mem_gb) = raw.sandbox_mem_gb {
-                capacity.insert("mem_gb".into(), mem_gb);
-            }
-            Ok((SandboxBackend::Podman { image }, capacity))
+            Ok((SandboxBackend::Podman { image }, probed(raw)))
         }
-        // tart backend lands in a sibling branch; config value reserved.
-        Some("tart") => Ok((SandboxBackend::Direct, BTreeMap::new())),
+        Some("tart") => {
+            let image = raw
+                .sandbox_image
+                .clone()
+                .unwrap_or_else(|| "ghcr.io/cirruslabs/macos-sonoma-base:latest".into());
+            Ok((SandboxBackend::Tart { image }, probed(raw)))
+        }
         Some(other) => Err(format!(
             "sandbox: {other:?} is not \"direct\", \"podman\", or \"tart\""
         )),
@@ -887,11 +897,19 @@ mod tests {
         assert_eq!(resolved.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.sandbox_capacity.get("mem_gb"), Some(&128));
 
-        // "tart" is reserved — accepted, resolves to Direct for now.
+        // "tart" resolves to the Tart backend with the default macOS image and
+        // probed capacity (overrides win, same as podman).
         std::fs::write(dir.join("node.toml"), format!("{base}sandbox = \"tart\"\n")).expect("write");
+        let tart = resolve(&dir.join("node.toml")).expect("tart accepted");
         assert_eq!(
-            resolve(&dir.join("node.toml")).expect("tart accepted").sandbox,
-            SandboxBackend::Direct
+            tart.sandbox,
+            SandboxBackend::Tart {
+                image: "ghcr.io/cirruslabs/macos-sonoma-base:latest".into()
+            }
+        );
+        assert!(
+            tart.sandbox_capacity.contains_key("cores"),
+            "probed capacity rides tart too"
         );
 
         // any other value is a loud config error.
