@@ -314,8 +314,8 @@ pub(super) async fn provision(
     // stages EVERYTHING under the worktree, so a skill tree in there would be
     // committed with the run's work and PUSHED onto the work branch. beside it,
     // git cannot see them at all.
-    let ro_dir = if spec.ro_mounts.is_empty() {
-        None
+    let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
+        (None, None)
     } else {
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
@@ -324,7 +324,9 @@ pub(super) async fn provision(
         // the handle outlives the mounts: the session bind below rides the same
         // actor lane.
         let mount_handle = handle.clone();
-        tokio::task::spawn_blocking(move || {
+        // the same step assembles the run's SOUL from the mounts it just
+        // materialized — the only place holding both the curation and the bodies.
+        let context_doc = tokio::task::spawn_blocking(move || {
             super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
                 // W5: a failed provision removes ALL its own debris. the mount
                 // helper dropped its partial ro tree; the worktree — and its
@@ -334,7 +336,7 @@ pub(super) async fn provision(
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
-        Some(ro_root)
+        (Some(ro_root), context_doc)
     };
 
     // the worktree EXISTS now, so ask consensus to bind the run's agent session
@@ -358,6 +360,7 @@ pub(super) async fn provision(
         agent_display_name: spec.agent_display_name.clone(),
         committer_name: lane.committer_name.clone(),
         env,
+        context_doc,
     }))
 }
 
@@ -437,6 +440,9 @@ struct ForgeWorkspace {
     agent_display_name: Option<String>,
     committer_name: String,
     env: BTreeMap<String, String>,
+    /// the run's assembled soul — its `always` skills inlined, the rest indexed.
+    /// `None` when the agent curated no skills. capability-host delivers it.
+    context_doc: Option<String>,
 }
 
 impl ForgeWorkspace {
@@ -805,6 +811,10 @@ impl ProvisionedWorkspace for ForgeWorkspace {
 
     fn path_entries(&self) -> Vec<PathBuf> {
         super::tool_path_entries()
+    }
+
+    fn context_doc(&self) -> Option<String> {
+        self.context_doc.clone()
     }
 
     async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {

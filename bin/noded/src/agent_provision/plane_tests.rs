@@ -38,11 +38,14 @@ pub(super) fn skill_tree() -> BTreeMap<String, Vec<u8>> {
 }
 
 /// the W6 mount every skill test pins (`<ro-root>/qa` ⇐ the skill subtree).
+/// on-demand by default: the `always` (inlined-persona) half is exercised by
+/// [`super::tests`]' soul assembly, which is where a body read can fail a run.
 pub(super) fn skill_mount() -> RoMount {
     RoMount {
         source_prefix: SKILL_PREFIX.into(),
         source_snapshot: None,
         mount_subpath: "qa".into(),
+        always: false,
     }
 }
 

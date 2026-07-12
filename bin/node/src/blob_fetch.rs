@@ -1,43 +1,29 @@
-//! fetch-on-miss for node-local content-addressed blobs, over the statesync
-//! mesh channel — the host half of `statesync::SyncRequest::Blob`.
+//! the blob mesh lane's SERVE half — the host side of
+//! `statesync::SyncRequest::Blob`, plus the demux that keeps a peer's frames
+//! and our own straight.
 //!
-//! consensus pins some bytes by sha256 but never carries them (an agent's
-//! registered prompt above all: the registry commits `prompt_hash`, the app
-//! stages the text in ONE node's blob store via `POST /v1/files/blob`). a
-//! run leasing on any OTHER node used to fail loudly ("prompt blob not in
-//! this node's blob store" — the #298 cross-node gap). this module closes it
-//! host-side: on a local miss the executing node asks its current peers for
-//! the digest, re-hashes the answer (content addressing makes the bytes
-//! self-verifying — no trust attaches to which peer answered), and writes
-//! the verified copy through its own persistent store so the fetch happens
-//! once, not per run. nothing consensus-visible changes.
+//! the REQUESTER half is gone. it existed for exactly one consumer: an agent's
+//! registered prompt, pinned in consensus as `prompt_hash` and staged in ONE
+//! node's blob store, which a run leasing on any other node had to fetch on
+//! miss (the #298 cross-node gap). the persona is a curated SKILL now —
+//! content-addressed in duckfs, consensus-replicated, materialized as a
+//! read-only mount by the provisioner on whichever node runs — so nothing
+//! fetches blobs across the mesh any more and `MeshBlobFetcher` was deleted
+//! with the prompt lane.
 //!
-//! transport: the SAME rpc-envelope lane the mesh statesync serve arm
-//! already drains. requests ride `encode_rpc(id, encode_request(Blob))`; the
-//! serve loop routes an incoming frame to a pending fetch when its rpc id is
-//! ours (see [`route_response`]) and otherwise treats it as a request. our
-//! ids live in a random high range (top bit set) so they can never collide
-//! with a peer's small sequential request ids.
+//! what remains ANSWERS peers: [`serve_blob`] replies to a blob request from
+//! this node's store, and [`classify_mesh_frame`] sorts inbound frames on the
+//! shared rpc lane. ponytail: with no requester left in the network these are
+//! vestigial — nobody asks. they stay because the serve arm is wired into the
+//! statesync loop, and unpicking that loop is a separate change from retiring
+//! the prompt.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasher as _, Hasher as _};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
-
-use commonware_cryptography::ed25519;
-use commonware_p2p::{Recipients, Sender as P2pSender};
-use commonware_runtime::IoBuf;
-use futures::future::BoxFuture;
-use sha2::{Digest as _, Sha256};
-
-/// one blob fetch waits this long for the whole peer fan-out — generous for
-/// a localhost mesh, small next to the pool's provider timeout budget.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+use std::sync::{Arc, Mutex};
 
 /// the serve side answers only blobs up to this size: the mesh channel is
-/// sized for statesync's 256 KiB chunks, and the one production consumer
-/// (prompt pins) is kilobytes. an oversized blob answers as an honest miss.
+/// sized for statesync's 256 KiB chunks. an oversized blob answers as an
+/// honest miss.
 pub const MAX_SERVED_BLOB: usize = 1024 * 1024;
 
 /// outstanding fetches keyed by rpc id — the serve loop's demux surface: an
@@ -45,10 +31,6 @@ pub const MAX_SERVED_BLOB: usize = 1024 * 1024;
 /// else is a peer's request.
 pub type PendingMap =
     Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<statesync::SyncResponse>>>>;
-
-/// the shape `oracle_pool::build` composes behind its resolver: digest in,
-/// verified bytes (or a miss) out.
-pub type BlobFetchFn = Arc<dyn Fn([u8; 32]) -> BoxFuture<'static, Option<Vec<u8>>> + Send + Sync>;
 
 /// one classified inbound mesh frame — the serve loop acts on exactly this.
 pub enum MeshFrame {
@@ -102,117 +84,6 @@ pub fn serve_blob(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> statesync
         .get_chunk(digest)
         .filter(|b| b.len() <= MAX_SERVED_BLOB);
     statesync::SyncResponse::Blob { bytes }
-}
-
-/// the requester: fan a digest out to the current peer set over the mesh and
-/// return the first answer that re-hashes to the digest.
-pub struct MeshBlobFetcher<S> {
-    sender: S,
-    pending: PendingMap,
-    /// the tracked peer set (members + standbys), swapped at every cutover
-    /// re-track — the same set the mesh serves statesync to.
-    peers: Arc<RwLock<Vec<ed25519::PublicKey>>>,
-    me: ed25519::PublicKey,
-    next_id: AtomicU64,
-}
-
-impl<S> MeshBlobFetcher<S>
-where
-    S: P2pSender<PublicKey = ed25519::PublicKey> + Clone + Send + Sync + 'static,
-{
-    pub fn new(
-        sender: S,
-        pending: PendingMap,
-        peers: Arc<RwLock<Vec<ed25519::PublicKey>>>,
-        me: ed25519::PublicKey,
-    ) -> Self {
-        // a random high id range per process: `RandomState` is std's own
-        // per-process entropy, and the forced top bit keeps our ids disjoint
-        // from any peer's small sequential request ids by construction.
-        let seed = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish()
-            | (1 << 63);
-        Self {
-            sender,
-            pending,
-            peers,
-            me,
-            next_id: AtomicU64::new(seed),
-        }
-    }
-
-    /// erase the sender generic for the oracle pool's resolver seam.
-    pub fn into_fetch_fn(self) -> BlobFetchFn {
-        let this = Arc::new(self);
-        Arc::new(move |digest| {
-            let this = Arc::clone(&this);
-            Box::pin(async move { this.fetch(digest).await })
-        })
-    }
-
-    /// ask every current peer for `digest` concurrently; first verified
-    /// answer wins, a full fan-out of misses (or the deadline) is `None`.
-    pub async fn fetch(&self, digest: [u8; 32]) -> Option<Vec<u8>> {
-        let peers: Vec<ed25519::PublicKey> = self
-            .peers
-            .read()
-            .expect("blob peers lock")
-            .iter()
-            .filter(|p| **p != self.me)
-            .cloned()
-            .collect();
-        if peers.is_empty() {
-            return None;
-        }
-        let mut ids = Vec::with_capacity(peers.len());
-        let mut waits = Vec::with_capacity(peers.len());
-        for peer in &peers {
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.pending
-                .lock()
-                .expect("pending blob lock")
-                .insert(id, tx);
-            ids.push(id);
-            let frame = statesync::encode_rpc(
-                id,
-                &statesync::encode_request(&statesync::SyncRequest::Blob { digest }),
-            );
-            let mut sender = self.sender.clone();
-            // an empty attempt set (peer offline) is fine: that oneshot just
-            // times out with the rest of the fan-out.
-            let _attempted = sender.send(Recipients::One(peer.clone()), IoBuf::from(frame), false);
-            waits.push(rx);
-        }
-        let verified = async {
-            let mut waits: Vec<_> = waits.into_iter().collect();
-            while !waits.is_empty() {
-                let (outcome, _idx, rest) = futures::future::select_all(waits).await;
-                waits = rest;
-                if let Ok(statesync::SyncResponse::Blob { bytes: Some(bytes) }) = outcome {
-                    let mut h = Sha256::new();
-                    h.update(&bytes);
-                    if <[u8; 32]>::from(h.finalize()) == digest {
-                        return Some(bytes);
-                    }
-                    // wrong bytes for the digest: a corrupt or hostile
-                    // answer — keep waiting on the remaining peers.
-                }
-            }
-            None
-        };
-        let outcome = tokio::time::timeout(FETCH_TIMEOUT, verified)
-            .await
-            .unwrap_or(None);
-        // sweep every id this fan-out registered: answered ones are already
-        // gone, timed-out ones must not leak into the demux map.
-        let mut pending = self.pending.lock().expect("pending blob lock");
-        for id in ids {
-            pending.remove(&id);
-        }
-        outcome
-    }
 }
 
 #[cfg(test)]

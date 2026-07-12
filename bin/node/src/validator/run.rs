@@ -20,7 +20,7 @@ use crate::host_state::run_output_sink;
 use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{blob_fetch, oracle_pool, relay_runtime, voice_plane};
+use crate::{oracle_pool, relay_runtime, voice_plane};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -42,7 +42,6 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
-    pub(super) blob_fetcher: blob_fetch::BlobFetchFn,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) lobby_tx: super::MeshSender,
     pub(super) relay_tx: super::MeshSender,
@@ -145,7 +144,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         gateway_book,
         media_peers,
         blob_peers,
-        blob_fetcher,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -290,11 +288,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         context,
         providers,
         signer.public_key().as_ref().to_vec(),
-        blobs.clone(),
         agent_provisioner.clone(),
-        // fetch-on-miss over the mesh: a prompt pin staged on another
-        // node's blob store resolves here instead of failing the run.
-        Some(blob_fetcher),
         // the announced capacity IS the pool's ledger — one source, so the
         // scheduler never promises what this node can't seat.
         sandbox_capacity.clone(),

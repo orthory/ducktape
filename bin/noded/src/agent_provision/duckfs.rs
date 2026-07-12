@@ -71,15 +71,17 @@ pub(super) async fn provision(
     .map_err(|e| e.to_string())?;
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
     // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
-    // skill tree beside it can never leak into the output snapshot.
-    let ro_dir = if spec.ro_mounts.is_empty() {
-        None
+    // skill tree beside it can never leak into the output snapshot. the same
+    // step assembles the run's SOUL from those mounts (it is the only place
+    // that holds both the curation and the materialized bodies).
+    let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
+        (None, None)
     } else {
         let mount_handle = handle.clone();
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let checkout_rw = dir.clone();
-        tokio::task::spawn_blocking(move || {
+        let context_doc = tokio::task::spawn_blocking(move || {
             super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts).inspect_err(|_| {
                 // W5 again: the run never gets a workspace handle on a
                 // failed provision, so the already-materialized rw checkout
@@ -89,7 +91,7 @@ pub(super) async fn provision(
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
-        Some(ro_root)
+        (Some(ro_root), context_doc)
     };
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
@@ -108,6 +110,7 @@ pub(super) async fn provision(
         ro_dir,
         source: spec.source.clone(),
         env,
+        context_doc,
     }))
 }
 
@@ -121,6 +124,9 @@ struct NodedWorkspace {
     ro_dir: Option<PathBuf>,
     source: WorkspaceSource,
     env: BTreeMap<String, String>,
+    /// the run's assembled soul — its `always` skills inlined, the rest indexed.
+    /// `None` when the agent curated no skills. capability-host delivers it.
+    context_doc: Option<String>,
 }
 
 impl NodedWorkspace {
@@ -150,6 +156,10 @@ impl ProvisionedWorkspace for NodedWorkspace {
 
     fn path_entries(&self) -> Vec<PathBuf> {
         super::tool_path_entries()
+    }
+
+    fn context_doc(&self) -> Option<String> {
+        self.context_doc.clone()
     }
 
     async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
