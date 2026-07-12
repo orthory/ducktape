@@ -162,7 +162,7 @@ pub(crate) const MODULE_IDS: [&str; 25] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 23] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("agent", 1),
     ("automations", 1),
     ("capability", 1),
@@ -174,10 +174,12 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 23] = [
     ("forge", 1),
     ("gateway", 1),
     ("governance", 1),
+    ("hello", 1),
     ("identity", 1),
     ("inbox", 1),
     ("jobs", 1),
     ("kv", 1),
+    ("modreg", 1),
     ("pages", 1),
     ("runs", 2),
     ("saga", 1),
