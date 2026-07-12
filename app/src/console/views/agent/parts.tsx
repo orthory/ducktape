@@ -14,7 +14,8 @@ import { accentVar, color, font, radius, shadow, tint } from "../../theme/tokens
 // ── Static labels ───────────────────────────────────────
 
 export const ACTION_LABEL: Record<string, string> = {
-  "chat.post": "Post to chat",
+  "chat.post": "Reply in chat",
+  "chat.post_message": "Post to any channel",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
   "pages.comment": "Comment on pages",
@@ -23,8 +24,14 @@ export const ACTION_LABEL: Record<string, string> = {
 
 // Permission checkboxes read as plain abilities ("what this agent can do"),
 // not as the wire action ids they map to.
+//
+// chat.post and chat.post_message are deliberately worded as the different
+// powers they are: the first only lets an agent answer where it was spoken to,
+// the second lets it speak, unprompted, anywhere. Granting the reply must never
+// look like it grants the broadcast.
 export const ACTION_HINT: Record<string, string> = {
-  "chat.post": "Reply in chat",
+  "chat.post": "Reply in the thread it was mentioned in",
+  "chat.post_message": "Start messages in any channel, on its own initiative",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
   "pages.comment": "Comment on pages",
@@ -92,12 +99,26 @@ export const primaryButton = (enabled: boolean): CSSProperties => ({
   boxShadow: enabled ? "0 1px 2px rgba(160,90,60,.30)" : undefined,
 });
 
+/** Mix the filled control's foreground and background so overlays follow the
+ * filled surface when the theme flips its polarity. */
+export const filledMix = (onFilledPercent: number): string =>
+  `color-mix(in srgb, ${color.onDark} ${onFilledPercent}%, ${color.dark})`;
+
+export const FILLED_IDENTITY_TEXT_PERCENT = 70;
+export const FILLED_SEMANTIC_TEXT_PERCENT = 35;
+
+/** Keep semantic foregrounds readable on the filled identity band. The
+ * status hue stays visible, but the on-filled token supplies the contrast when
+ * dark mode turns that band light. */
+export const filledForeground = (base: string): string =>
+  `color-mix(in srgb, ${base} ${FILLED_SEMANTIC_TEXT_PERCENT}%, ${color.onDark})`;
+
 // A control styled to sit on the agent card's dark identity band.
 export const onDarkButton: CSSProperties = {
   ...secondaryButton,
   minHeight: 30,
-  border: "1px solid rgba(239,239,239,.22)",
-  background: "rgba(239,239,239,.07)",
+  border: `1px solid ${filledMix(22)}`,
+  background: filledMix(7),
   color: color.onDark,
 };
 

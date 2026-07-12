@@ -14,6 +14,9 @@ import {
   CapabilityStrip,
   Chip,
   EmptyState,
+  FILLED_IDENTITY_TEXT_PERCENT,
+  filledForeground,
+  filledMix,
   GroupCard,
   InfoRow,
   onDarkButton,
@@ -110,7 +113,10 @@ export function AgentDetail({
             >
               <span
                 translate="no"
-                style={{ font: `400 11px ${font.mono}`, color: "rgba(239,239,239,.5)" }}
+                style={{
+                  font: `400 11px ${font.mono}`,
+                  color: filledMix(FILLED_IDENTITY_TEXT_PERCENT),
+                }}
               >
                 {agent.agent_id}
               </span>
@@ -121,12 +127,14 @@ export function AgentDetail({
                   gap: 5,
                   padding: "2px 9px",
                   borderRadius: 999,
-                  background: "rgba(239,239,239,.08)",
-                  border: "1px solid rgba(239,239,239,.16)",
+                  background: filledMix(8),
+                  border: `1px solid ${filledMix(16)}`,
                   font: `700 9px ${font.mono}`,
                   letterSpacing: ".07em",
                   textTransform: "uppercase",
-                  color: active ? color.green : color.amber,
+                  color: active
+                    ? filledForeground(color.green)
+                    : filledForeground(color.amber),
                 }}
               >
                 <span
@@ -153,7 +161,12 @@ export function AgentDetail({
             <button
               type="button"
               onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
-              style={{ ...onDarkButton, color: active ? color.amber : color.green }}
+              style={{
+                ...onDarkButton,
+                color: active
+                  ? filledForeground(color.amber)
+                  : filledForeground(color.green),
+              }}
             >
               {active ? "Pause agent" : "Resume agent"}
             </button>

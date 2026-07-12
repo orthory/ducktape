@@ -4,16 +4,35 @@
 //! in-memory. App startup always subscribes live from the tip; carrying cursors
 //! across starts could replay historical events as a burst of notifications.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
+    sync::{Arc, Mutex, PoisonError},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::Value;
 
 use super::{
     decode,
     matchers::{self, Category, MatchState, MatcherCtx, Notification},
-    state::{self, NotifyState},
+    state::{self, NotifyState, StoredNotification},
     NotifyConfig,
 };
+
+/// How many presented notifications the bell dropdown keeps.
+pub const RECENT_CAP: usize = 50;
+
+/// The engine's bell-facing state, shared with [`super::NotifyHandles`] so the
+/// `notify_recent` command can snapshot it without actor plumbing; the engine
+/// is the only writer. `unread` rides along because the boot-time badge event
+/// fires before the webview subscribes — the bell must be able to ask.
+#[derive(Debug, Default)]
+pub struct BellState {
+    pub unread: u32,
+    /// Newest first, capped at [`RECENT_CAP`].
+    pub items: VecDeque<StoredNotification>,
+}
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -35,6 +54,8 @@ pub enum Frame {
 pub trait Sink: Send {
     fn present(&self, n: &Notification);
     fn badge(&self, unread: u32);
+    /// A presented notification for the in-app bell (live dropdown update).
+    fn item(&self, _item: &StoredNotification) {}
 }
 
 pub struct Engine<S: Sink> {
@@ -45,19 +66,27 @@ pub struct Engine<S: Sink> {
     /// IN-MEMORY ONLY, never persisted. These cursors resume a live stream only
     /// during a transient reconnect in the current app session.
     cursors: BTreeMap<String, String>,
+    /// The bell's shared snapshot — see [`BellState`].
+    bell: Arc<Mutex<BellState>>,
 }
 
 impl<S: Sink> Engine<S> {
-    pub fn new(sink: S, state_path: PathBuf) -> Self {
-        let unread = state::load(&state_path).unread;
-        sink.badge(unread);
+    pub fn new(sink: S, state_path: PathBuf, bell: Arc<Mutex<BellState>>) -> Self {
+        let loaded = state::load(&state_path);
+        sink.badge(loaded.unread);
+        {
+            let mut bell = bell.lock().unwrap_or_else(PoisonError::into_inner);
+            bell.unread = loaded.unread;
+            bell.items = loaded.recent.into_iter().collect();
+        }
 
         Self {
             sink,
             match_state: MatchState::default(),
             state_path,
-            unread,
+            unread: loaded.unread,
             cursors: BTreeMap::new(),
+            bell,
         }
     }
 
@@ -91,12 +120,26 @@ impl<S: Sink> Engine<S> {
                 }
 
                 self.sink.present(&notification);
-                let previous_unread = self.unread;
+                let stored = StoredNotification {
+                    category: notification.category,
+                    title: notification.title.clone(),
+                    body: notification.body.clone(),
+                    channel_id: notification.channel_id.clone(),
+                    at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_millis() as u64),
+                };
                 self.unread = self.unread.saturating_add(1);
-                self.sink.badge(self.unread);
-                if self.unread != previous_unread {
-                    self.persist_unread();
+                {
+                    let mut bell = self.bell.lock().unwrap_or_else(PoisonError::into_inner);
+                    bell.items.push_front(stored.clone());
+                    bell.items.truncate(RECENT_CAP);
+                    bell.unread = self.unread;
                 }
+                self.sink.item(&stored);
+                self.sink.badge(self.unread);
+                // Unconditional: even on a saturated count the ring gained an item.
+                self.persist();
             }
             Frame::Lagged { topic, cursor } => {
                 self.cursors.insert(topic, cursor);
@@ -105,9 +148,18 @@ impl<S: Sink> Engine<S> {
     }
 
     pub fn mark_seen(&mut self) {
+        // The bell marks seen on every dropdown open; when nothing is unread
+        // there is nothing to change — skip the badge and the full-ring write.
+        if self.unread == 0 {
+            return;
+        }
         self.unread = 0;
+        self.bell
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unread = 0;
         self.sink.badge(0);
-        self.persist_unread();
+        self.persist();
     }
 
     /// Returns cursors for a transient in-session reconnect.
@@ -123,11 +175,20 @@ impl<S: Sink> Engine<S> {
         self.cursors.clear();
     }
 
-    fn persist_unread(&self) {
+    fn persist(&self) {
+        let recent = self
+            .bell
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .items
+            .iter()
+            .cloned()
+            .collect();
         state::save(
             &self.state_path,
             &NotifyState {
                 unread: self.unread,
+                recent,
             },
         );
     }
@@ -289,7 +350,7 @@ mod tests {
     }
 
     fn engine(path: &TestStatePath) -> Engine<CaptureSink> {
-        let engine = Engine::new(CaptureSink::default(), path.path().to_path_buf());
+        let engine = Engine::new(CaptureSink::default(), path.path().to_path_buf(), Arc::default());
         engine.sink.badges.lock().unwrap().clear();
         engine
     }
@@ -329,8 +390,12 @@ mod tests {
         assert_eq!(engine.unread, 1);
         assert_eq!(badges(&engine), vec![1]);
         assert_eq!(engine.cursors().get("module:chat"), Some(&cursor));
-        assert_eq!(fs::read_to_string(path.path()).unwrap(), r#"{"unread":1}"#);
-        assert_eq!(state::load(path.path()).unread, 1);
+        let persisted = state::load(path.path());
+        assert_eq!(persisted.unread, 1);
+        // The presented notification rides along in the persisted ring.
+        assert_eq!(persisted.recent.len(), 1);
+        assert_eq!(persisted.recent[0].category, Category::Mention);
+        assert_eq!(persisted.recent[0].channel_id.as_deref(), Some("general"));
     }
 
     #[test]
@@ -510,7 +575,7 @@ mod tests {
     #[test]
     fn mark_seen_persists_zero_and_new_restores_unread_badge() {
         let path = TestStatePath::new();
-        let mut engine = Engine::new(CaptureSink::default(), path.path().to_path_buf());
+        let mut engine = Engine::new(CaptureSink::default(), path.path().to_path_buf(), Arc::default());
         assert_eq!(badges(&engine), vec![0]);
 
         engine.handle(
@@ -524,15 +589,15 @@ mod tests {
         assert_eq!(badges(&engine), vec![0, 1, 0]);
         assert_eq!(state::load(path.path()).unread, 0);
 
-        let restored = Engine::new(CaptureSink::default(), path.path().to_path_buf());
+        let restored = Engine::new(CaptureSink::default(), path.path().to_path_buf(), Arc::default());
         assert_eq!(restored.unread, 0);
         assert_eq!(badges(&restored), vec![0]);
         assert!(presented(&restored).is_empty());
         assert!(restored.cursors().is_empty());
 
         let five_path = TestStatePath::new();
-        state::save(five_path.path(), &NotifyState { unread: 5 });
-        let restored_five = Engine::new(CaptureSink::default(), five_path.path().to_path_buf());
+        state::save(five_path.path(), &NotifyState { unread: 5, recent: Vec::new() });
+        let restored_five = Engine::new(CaptureSink::default(), five_path.path().to_path_buf(), Arc::default());
         assert_eq!(restored_five.unread, 5);
         assert_eq!(badges(&restored_five), vec![5]);
     }
@@ -549,9 +614,9 @@ mod tests {
     #[test]
     fn fresh_engine_does_not_replay_or_restore_cursors() {
         let path = TestStatePath::new();
-        state::save(path.path(), &NotifyState { unread: 4 });
+        state::save(path.path(), &NotifyState { unread: 4, recent: Vec::new() });
 
-        let mut engine = Engine::new(CaptureSink::default(), path.path().to_path_buf());
+        let mut engine = Engine::new(CaptureSink::default(), path.path().to_path_buf(), Arc::default());
 
         assert!(presented(&engine).is_empty());
         assert!(engine.cursors().is_empty());
@@ -569,5 +634,61 @@ mod tests {
 
         engine.reset_cursors();
         assert!(engine.cursors().is_empty());
+    }
+
+    #[test]
+    fn recent_ring_is_newest_first_capped_and_persisted() {
+        let path = TestStatePath::new();
+        let bell = Arc::new(Mutex::new(BellState::default()));
+        let mut engine = Engine::new(
+            CaptureSink::default(),
+            path.path().to_path_buf(),
+            bell.clone(),
+        );
+        let config = config();
+        for i in 0..(RECENT_CAP + 5) {
+            let mut op = mention_op("general");
+            op["payload"]["post_message"]["message_id"] = json!(format!("m{i}"));
+            op["payload"]["post_message"]["blocks"][0]["paragraph"][0]["text"] =
+                json!(format!("msg {i}"));
+            engine.handle(event("module:chat", format!("c{i}"), op), &config, &no_root);
+        }
+
+        {
+            let snapshot = bell.lock().unwrap();
+            assert_eq!(snapshot.items.len(), RECENT_CAP);
+            assert_eq!(snapshot.unread as usize, RECENT_CAP + 5);
+            // Newest first: the LAST fed frame sits at the front.
+            assert!(
+                snapshot.items[0].body.contains(&format!("msg {}", RECENT_CAP + 4)),
+                "front should be the newest item, got body {:?}",
+                snapshot.items[0].body
+            );
+            assert_eq!(snapshot.items[0].category, Category::Mention);
+            assert_eq!(snapshot.items[0].channel_id.as_deref(), Some("general"));
+            assert!(snapshot.items[0].at > 0);
+        }
+
+        // Opening the bell zeroes unread but keeps the ring.
+        engine.mark_seen();
+        assert_eq!(bell.lock().unwrap().unread, 0);
+        assert_eq!(bell.lock().unwrap().items.len(), RECENT_CAP);
+
+        // A second open is a no-op: no extra badge event, no state rewrite.
+        let badge_events = badges(&engine).len();
+        engine.mark_seen();
+        assert_eq!(badges(&engine).len(), badge_events);
+
+        // A fresh engine over the same state file reloads the whole snapshot.
+        let reloaded = Arc::new(Mutex::new(BellState::default()));
+        let _restored = Engine::new(
+            CaptureSink::default(),
+            path.path().to_path_buf(),
+            reloaded.clone(),
+        );
+        let snapshot = reloaded.lock().unwrap();
+        assert_eq!(snapshot.items.len(), RECENT_CAP);
+        assert_eq!(snapshot.unread, 0);
+        assert!(snapshot.items[0].body.contains(&format!("msg {}", RECENT_CAP + 4)));
     }
 }

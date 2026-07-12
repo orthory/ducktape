@@ -361,6 +361,24 @@ resume_args = ["resume", "stale-id"]
         }
     }
 
+    /// how many args the codex spec's `[tools]` section splices in. read off the
+    /// LOADED spec rather than hardcoded, so adding a tool flag moves the resume
+    /// assertion with it instead of breaking it.
+    fn spec_tool_arg_count() -> usize {
+        let base = builtin_specs()
+            .iter()
+            .find(|s| s.tag == "codex")
+            .expect("the codex base spec")
+            .args
+            .clone();
+        // everything between the `exec` subcommand and the first non-tool flag
+        // (`--json`) is the spliced tool block.
+        base.iter()
+            .position(|a| a == "--json")
+            .expect("codex's base argv carries --json")
+            - 1
+    }
+
     #[test]
     fn embedded_curated_matrix_pins_the_shipped_tags_and_argv() {
         // a DATA regression test, deliberately unlike the executor-agnostic
@@ -376,11 +394,16 @@ resume_args = ["resume", "stale-id"]
         };
 
         // base tags keep their no-model argv — tools-enabled sandbox posture
-        // (workspace-write / acceptEdits), no model, no effort flag.
+        // (workspace-write / acceptEdits), no model, no effort flag — plus the
+        // [tools] MCP args every embedded spec injects after args[0].
         assert_eq!(
             get("codex").args,
             vec![
                 "exec",
+                "-c",
+                "mcp_servers.ducktape.command=\"ducktape-mcp\"",
+                "-c",
+                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
                 "--json",
                 "--sandbox",
                 "workspace-write",
@@ -392,6 +415,10 @@ resume_args = ["resume", "stale-id"]
             get("claude").args,
             vec![
                 "-p",
+                "--mcp-config",
+                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape-mcp\"}}}",
+                "--allowedTools",
+                "mcp__ducktape",
                 "--output-format",
                 "json",
                 "--permission-mode",
@@ -405,6 +432,10 @@ resume_args = ["resume", "stale-id"]
             get("codex_gpt-5.5_xhigh").args,
             vec![
                 "exec",
+                "-c",
+                "mcp_servers.ducktape.command=\"ducktape-mcp\"",
+                "-c",
+                "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
                 "--json",
                 "--sandbox",
                 "workspace-write",
@@ -420,6 +451,10 @@ resume_args = ["resume", "stale-id"]
             get("claude_opus_max").args,
             vec![
                 "-p",
+                "--mcp-config",
+                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape-mcp\"}}}",
+                "--allowedTools",
+                "mcp__ducktape",
                 "--output-format",
                 "json",
                 "--permission-mode",
@@ -451,7 +486,21 @@ resume_args = ["resume", "stale-id"]
         // inheritance already keeps the pins.
         match &get("codex_gpt-5.5_xhigh").session.as_ref().unwrap().resume {
             crate::ResumeArgv::Replace(args) => {
-                assert_eq!(args[..3], ["exec", "resume", "{session_id}"]);
+                // the [tools] args splice in after args[0] here too, so the
+                // subcommand shape is exec → tool flags → resume <id>. asserted
+                // by SEARCH, not by a fixed index: pinning `resume` to a literal
+                // offset makes every future tool flag look like a regression
+                // (it did — adding codex's approval-mode flag shifted it).
+                assert_eq!(args[0], "exec");
+                let resume_at = args
+                    .windows(2)
+                    .position(|w| w == ["resume", "{session_id}"])
+                    .expect("the subcommand resume shape carries `resume <id>`");
+                let tool_args_end = 1 + spec_tool_arg_count();
+                assert_eq!(
+                    resume_at, tool_args_end,
+                    "`resume <id>` must sit immediately after the spliced tool args: {args:?}"
+                );
                 assert!(
                     args.windows(2).any(|w| w == ["-m", "gpt-5.5"]),
                     "a resumed variant keeps its model pin: {args:?}"

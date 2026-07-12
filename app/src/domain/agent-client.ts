@@ -66,9 +66,15 @@ export interface AgentRecord {
 const TARGET = "agent";
 
 /** Every action name an agent can be granted (KNOWN_ACTIONS). A RegisterAgent /
- *  UpdateAgent rejects an `allowed_actions` entry outside this set. */
+ *  UpdateAgent rejects an `allowed_actions` entry outside this set.
+ *
+ *  Mirrors `agent::KNOWN_ACTIONS`. The node is the authority — an entry missing
+ *  here is simply ungrantable from the UI (the checkbox never renders), which is
+ *  a silent loss of a permission rather than an error, so the two lists have to
+ *  be kept in step by hand. */
 export const KNOWN_ACTIONS = [
   "chat.post",
+  "chat.post_message",
   "tasks.create",
   "tasks.update_status",
   "pages.comment",

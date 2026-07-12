@@ -30,6 +30,8 @@
   --c-border-soft: #ececec;
   --c-border-strong: #d6d6d6;
   --c-chip: #e3e3e3;
+  /* filled/on-filled/green/amber are duplicated in AgentView.test.tsx's WCAG
+     contrast test (jsdom can't evaluate color-mix) — update both together. */
   --c-filled: #26251f;
   --c-on-filled: #efefef;
   --c-green: #5cb45f;
@@ -62,6 +64,7 @@
   --c-border-soft: #292823;
   --c-border-strong: #3b3a33;
   --c-chip: #323029;
+  /* mirrored in AgentView.test.tsx's WCAG contrast test — update both. */
   --c-filled: #ecebe5;
   --c-on-filled: #1b1a17;
   --c-green: #6cc06f;

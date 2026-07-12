@@ -141,7 +141,7 @@ impl RunsModule {
                 // on a failed preparation: this is the root op of its own
                 // block, so an error poisons nothing but the request itself.
                 let prepared = self
-                    .prepare_dispatch(&*ctx, &agent, &channel_id, anchor_seq)
+                    .prepare_dispatch(&*ctx, &agent, &run_id, &channel_id, anchor_seq)
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(
@@ -182,6 +182,16 @@ impl RunsModule {
                 });
                 Ok(())
             }
+            // the session lane (see [`super::sessions`]). deliberately NOT under
+            // `admin_origin`: these two ops carry their own, STRICTER
+            // authorization — the run's committed lease-holder opens, and only
+            // the bound session key acts — and neither is a capability any
+            // "non-empty submitter" has.
+            RunsMsg::OpenAgentSession {
+                run_id,
+                session_key,
+            } => self.open_agent_session(ctx, run_id, session_key).await,
+            RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
         }
     }
 }

@@ -122,10 +122,11 @@ impl RunsModule {
                 }
             };
             let prepared = if is_page {
-                self.prepare_page_dispatch(&*ctx, &agent, &container, seq)
+                self.prepare_page_dispatch(&*ctx, &agent, &run_id, &container, seq)
                     .await
             } else {
-                self.prepare_dispatch(&*ctx, &agent, &container, seq).await
+                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq)
+                    .await
             };
             match prepared {
                 Ok(prepared) => self.stage_dispatch_run(

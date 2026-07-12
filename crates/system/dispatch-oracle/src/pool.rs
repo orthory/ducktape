@@ -320,7 +320,12 @@ async fn execute(
     let sink = plan.sink;
     let spec = WorkspaceSpec {
         run_id: format!("{}:{}", job.saga_id, job.attempt),
+        // the CONSENSUS id, straight from the envelope — the only id that
+        // resolves the run back in `runs`. it is deliberately NOT derived from
+        // the saga id above: that one exists to key the on-disk workspace dir.
+        consensus_run_id: plan.consensus_run_id,
         agent_id: ctx.agent_id.clone(),
+        agent_display_name: Some(plan.agent_display_name),
         // the tagged source (duckfs subtree or forge repo@commit) crosses to
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
@@ -355,6 +360,9 @@ async fn execute(
                 // workspace impl already maps that to Ok.
                 let commit = tokio::time::timeout(
                     workspace_step_timeout(),
+                    // DuckFS persists this as snapshot audit metadata. Forge
+                    // deliberately ignores it and reads the agent-authored
+                    // proposal from the workspace instead.
                     ws.commit(&format!("agent run {}", spec.run_id)),
                 )
                 .await
@@ -817,6 +825,7 @@ format = "text"
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "agent_display_name": "BOT",
             "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
@@ -950,6 +959,7 @@ format = "text"
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "agent_display_name": "BOT",
             "prompt_hash": null,
             "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
@@ -1224,6 +1234,54 @@ format = "text"
         captured: Arc<Mutex<Option<WorkspaceSpec>>>,
     }
 
+    struct CommitMessageProbe {
+        captured: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provision::WorkspaceProvisioner for CommitMessageProbe {
+        async fn provision(
+            &self,
+            _spec: &WorkspaceSpec,
+        ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+            Ok(Box::new(CommitMessageWs {
+                captured: self.captured.clone(),
+            }))
+        }
+    }
+
+    struct CommitMessageWs {
+        captured: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProvisionedWorkspace for CommitMessageWs {
+        fn workdir(&self) -> PathBuf {
+            std::env::temp_dir().join("commit-message-probe")
+        }
+        fn env(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+        fn path_entries(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
+            *self.captured.lock().unwrap() = Some(message.to_string());
+            Ok(WorkspaceReceipt {
+                source_prefix: "forge:app".into(),
+                source_snapshot: Some("d0".repeat(20)),
+                output_snapshot: None,
+                commit_height: None,
+                rebased: false,
+                no_changes: true,
+                commit_error: None,
+                branch: None,
+                output_commit: None,
+            })
+        }
+        async fn cleanup(&self) {}
+    }
+
     #[async_trait::async_trait]
     impl crate::provision::WorkspaceProvisioner for SpecProbe {
         async fn provision(
@@ -1253,6 +1311,8 @@ format = "text"
 
         let spec = captured.lock().unwrap().clone().expect("the spec was captured");
         assert_eq!(spec.run_id, "s1:0");
+        assert_eq!(spec.agent_id.as_deref(), Some("bot"));
+        assert_eq!(spec.agent_display_name.as_deref(), Some("BOT"));
         assert_eq!(
             spec.source,
             crate::workspace_source::WorkspaceSource::Forge {
@@ -1262,6 +1322,24 @@ format = "text"
                 branch_born: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn portable_workspace_commit_preserves_the_run_audit_message() {
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
+        let captured = Arc::new(Mutex::new(None));
+        let provisioner: SharedProvisioner = Arc::new(CommitMessageProbe {
+            captured: captured.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+        let saga_id = "dispatch\u{1f}runs\u{1f}private-hash";
+
+        let eff = effect_with_payload(saga_id, 7, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let _ = next_result(&mut rx).await;
+
+        let message = captured.lock().unwrap().clone().expect("commit called");
+        assert_eq!(message, format!("agent run {saga_id}:7"));
     }
 
     #[tokio::test]

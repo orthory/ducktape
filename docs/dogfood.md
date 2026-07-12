@@ -43,20 +43,22 @@ make dogfood-forge
 (`DUCKTAPE_DEV_FORGE_URL` → the active workspace's `http_listen` from
 `~/.ducktape/registry.json` + `node.toml` → `http://127.0.0.1:8844`),
 registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`, and
-pushes `HEAD` to `refs/heads/main`. Repo creation *is* the first push — no
-separate create step. The whole packfile travels over git smart-HTTP and is
-stored node-locally; only a tiny `forge Push` (digest + oids) crosses
-consensus.
+fetches `origin/dev`, pushes that exact commit to `refs/heads/main`, then reads
+the Forge ref back and requires exact OID equality. Repo creation *is* the first
+push — no separate create step. The whole packfile travels over git smart-HTTP
+and is stored node-locally; only a tiny `forge Push` (digest + oids) crosses
+consensus. Run this before creating or invoking agent work so a clean but stale
+local checkout cannot silently pin the run to obsolete source.
 
 Knobs: `FORGE_REPO` (default `ducktape`), `FORGE_REMOTE` (default
-`ducktape-dev`), `SRC_REF` (default `HEAD` — deliberately not `main`, which
-lags `dev` in this repo), `DUCKTAPE_DEV_FORGE_URL`.
+`ducktape-dev`), `SOURCE_REMOTE` (default `origin`), `SOURCE_BRANCH` (default
+`dev`), `SRC_REF` (explicit local-ref override), `DUCKTAPE_DEV_FORGE_URL`.
 
 Verify: the `ducktape` repo appears in the desktop **Forge** view with `main`
-browsable. Update later with `git push ducktape-dev main` (i.e. re-run the
-target). Caveat: the remote lives in the shared `.git/config`, visible to
-every worktree of this repo — set `FORGE_REMOTE` per worktree if you run
-several nodes at once.
+browsable. Re-run `make dogfood-forge` before later agent work; a raw
+`git push ducktape-dev main` bypasses the fetch and equality gate. Caveat: the
+remote lives in the shared `.git/config`, visible to every worktree of this
+repo — set `FORGE_REMOTE` per worktree if you run several nodes at once.
 
 ## 2. Register the dogfood agent
 

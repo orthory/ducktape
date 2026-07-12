@@ -4,6 +4,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use commonware_cryptography::Signer as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
@@ -40,6 +41,24 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                                 app_hash: String::from_utf8_lossy(&origin).into_owned(),
                             })
                         }
+                    };
+                    let _ = reply.send(result);
+                }
+                // the signed-frame lane, answered as BOTH real binaries answer
+                // it: the origin is the frame's VERIFIED signer, never a caller
+                // string. echoed back through app_hash — the same origin probe
+                // the frameless arm above uses.
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    let result = match node::decode_frame(&frame) {
+                        Ok((sdk::Origin::External(key), msg)) => {
+                            assert_eq!(msg.target, "chat");
+                            Ok(BlockSummary {
+                                height: 11,
+                                app_hash: noded::hex_bytes(&key),
+                            })
+                        }
+                        Ok((origin, _)) => Err(format!("a frame cannot carry {origin:?}")),
+                        Err(err) => Err(err.to_string()),
                     };
                     let _ = reply.send(result);
                 }
@@ -134,6 +153,117 @@ async fn submit_stamps_the_client_origin() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["appHash"], "jess");
+}
+
+// ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
+//
+// the lane exists so an op can carry authorship consensus CHECKS instead of a
+// caller string it has to trust. these cases pin exactly that: the origin the
+// block sees is the frame's verified signer, and a frame whose signature does
+// not bind never reaches the actor at all.
+
+/// the raw-bytes request the lane takes — no json envelope, no origin field.
+fn post_frame(frame: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/submit/frame")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(frame))
+        .unwrap()
+}
+
+/// the op every frame case submits (the fake actor asserts the target).
+fn chat_op() -> sdk::Msg {
+    sdk::Msg {
+        target: "chat".into(),
+        payload: serde_json::to_vec(
+            &serde_json::json!({ "create_channel": { "channel_id": "general", "name": "General" } }),
+        )
+        .unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
+    let frame = node::encode_frame(&signer, 1, &chat_op());
+    let response = noded::router(handle)
+        .oneshot(post_frame(frame))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["height"], 11);
+    // the actor echoes the origin it VERIFIED — the signer's public key, which
+    // no part of the request could have claimed.
+    assert_eq!(
+        body["appHash"],
+        noded::hex_bytes(signer.public_key().as_ref())
+    );
+    // the receipt addresses the op PAYLOAD, exactly as the frameless lane does.
+    assert_eq!(
+        body["opHash"].as_str().map(str::len),
+        Some(64),
+        "the frame lane returns the same receipt shape"
+    );
+}
+
+#[tokio::test]
+async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
+    let mut frame = node::encode_frame(&signer, 1, &chat_op());
+    // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
+    // payload), so the frame no longer verifies — and the actor never sees it.
+    let last = frame.len() - 65;
+    frame[last] ^= 0x01;
+
+    let response = noded::router(handle)
+        .oneshot(post_frame(frame))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    let err = body["error"].as_str().expect("a verbatim refusal");
+    assert!(
+        err.contains("signature"),
+        "the refusal names the cause: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_frame_cannot_claim_another_keys_origin() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    // key A signs; the frame is then re-stamped to claim key B's origin — the
+    // forgery the whole lane exists to make impossible. the origin is INSIDE the
+    // signed preimage, so B's key cannot be swapped in without breaking it.
+    let a = commonware_cryptography::ed25519::PrivateKey::from_seed(1);
+    let b = commonware_cryptography::ed25519::PrivateKey::from_seed(2);
+    let mut frame = node::encode_frame(&a, 1, &chat_op());
+    let b_key = b.public_key();
+    // the origin is the first length-prefixed field: 8 bytes of length, then the
+    // 32 key bytes.
+    frame[8..8 + 32].copy_from_slice(b_key.as_ref());
+
+    let response = noded::router(handle)
+        .oneshot(post_frame(frame))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a frame signed by A cannot act as B"
+    );
 }
 
 #[tokio::test]

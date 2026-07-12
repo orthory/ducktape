@@ -6,7 +6,8 @@
 //! thread-continuity key, generic fallback instructions, the strict output
 //! contract, and the rendered conversation. the host resolves the pin to the
 //! real prompt bytes through an injected [`BlobResolver`] and assembles
-//! `<prompt-or-instructions>\n\n<contract>\n\n<conversation>` — so agents
+//! `<prompt-or-instructions>\n\n[<runtime>\n\n][<context>\n\n]<contract>\n\n<conversation>`
+//! (the bracketed sections ride only when the envelope carries them) — so agents
 //! finally run on their REGISTERED prompt, while consensus stays
 //! deterministic (it committed the hash, and the blob is content-addressed,
 //! so the exact bytes stay verifiable).
@@ -53,6 +54,18 @@ pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u
 #[derive(Deserialize)]
 struct WireEnvelope {
     agent_id: String,
+    /// the run's CONSENSUS id — what `runs` resolves the run by (the id its
+    /// pending map is keyed on, and the one its agent session lane binds). the
+    /// host has no way to derive it: the pool's own `WorkspaceSpec.run_id` is
+    /// `{saga_id}:{attempt}`, a host-local workspace-dir key that names no run
+    /// in consensus. `Option` because it is an ADDITIVE field — an envelope
+    /// composed before it existed carries no key, and such a run must still
+    /// execute (it simply opens no session: the read-only tool plane).
+    run_id: Option<String>,
+    /// additive for v3: old in-flight envelopes fall back to `agent_id`, while
+    /// newly composed runs carry the committed registry display name.
+    #[serde(default)]
+    agent_display_name: Option<String>,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
     /// carries none (the generic `instructions` apply).
     prompt_hash: Option<String>,
@@ -65,6 +78,12 @@ struct WireEnvelope {
     /// input between the instructions and the contract; None-case assembly
     /// stays byte-identical.
     context: Option<String>,
+    /// the deterministic runtime section: the ducktape tool plane plus the
+    /// run's skill mounts, composed in consensus. `Option` because it is an
+    /// ADDITIVE v3 field — an envelope composed before it existed carries no
+    /// key and must still run (it simply assembles without the section, exactly
+    /// as this worker did before).
+    runtime: Option<String>,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
@@ -168,6 +187,9 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
         }
     };
 
+    let agent_display_name = envelope
+        .agent_display_name
+        .unwrap_or_else(|| envelope.agent_id.clone());
     let mut ctx = RunContext {
         agent_id: Some(envelope.agent_id),
         thread_key: envelope.thread_key,
@@ -175,25 +197,30 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
     };
     let workspace = accept_portable_envelope(
         &mut ctx,
+        envelope.run_id,
         envelope.workspace,
         envelope.skills,
         envelope.result_contract,
+        agent_display_name,
     )?;
-    // reading order (coordinator-decided M1 follow-up): system instructions →
-    // item context (forge runs only) → output contract → conversation. the
-    // context section is byte-exact from the envelope field, joined with the
-    // same "\n\n" delimiter as every other section; a context-less envelope
-    // assembles byte-identically to the pre-context worker.
-    let input = match &envelope.context {
-        Some(context) => format!(
-            "{prompt}\n\n{context}\n\n{}\n\n{}",
-            envelope.contract, envelope.conversation
-        ),
-        None => format!(
-            "{prompt}\n\n{}\n\n{}",
-            envelope.contract, envelope.conversation
-        ),
-    };
+    // reading order: system instructions → runtime (the tool plane and the
+    // run's skill mounts: what this session CAN do) → item context (forge runs
+    // only: what it is working ON) → output contract → conversation. every
+    // section is byte-exact from its envelope field, joined with the same
+    // "\n\n" delimiter; an OPTIONAL section that is absent contributes no
+    // delimiter either, so an envelope missing one assembles byte-identically
+    // to the worker that predates it.
+    let input = [
+        Some(prompt.as_str()),
+        envelope.runtime.as_deref(),
+        envelope.context.as_deref(),
+        Some(envelope.contract.as_str()),
+        Some(envelope.conversation.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n");
     Ok(Prepared {
         input,
         ctx,
@@ -218,9 +245,11 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
 /// `capability-host::workdir_for`).
 fn accept_portable_envelope(
     ctx: &mut RunContext,
+    consensus_run_id: Option<String>,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
+    agent_display_name: String,
 ) -> Result<PortablePlan, String> {
     let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
@@ -251,6 +280,11 @@ fn accept_portable_envelope(
     ctx.portable = true;
     Ok(PortablePlan {
         source,
+        // the id CONSENSUS knows this run by — carried through to the
+        // provisioner, which is the only thing that can name the run back to
+        // `runs`. absent on a pre-field envelope: no session, never a failure.
+        consensus_run_id,
+        agent_display_name,
         // the requested sink rides the plan so the pool can echo it on the
         // assembled RunnerResult; Chain (the default) when the key is absent.
         sink: result_contract.sink,
@@ -291,12 +325,18 @@ mod tests {
         })
     }
 
+    /// the CONSENSUS run id the composer stamps — see
+    /// [`crate::provision::WorkspaceSpec::consensus_run_id`].
+    const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}7\u{1f}bot";
+
     /// a duckfs-sourced v3 envelope — the byte shape the runs composer emits
     /// for every non-forge run.
     fn envelope_json(prompt_hash: Option<&str>) -> String {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "run_id": CONSENSUS_RUN_ID,
+            "agent_display_name": "BOT",
             "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
@@ -321,6 +361,8 @@ mod tests {
         serde_json::json!({
             "ducktape_run": 3,
             "agent_id": "bot",
+            "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
+            "agent_display_name": "BOT",
             "prompt_hash": null,
             "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
@@ -376,9 +418,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_null_hash_envelope_assembles_instructions_contract_conversation() {
-        let Prepared { input, ctx, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared {
+            input,
+            ctx,
+            workspace,
+        } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
+        assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
 
@@ -465,6 +512,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_in_flight_envelope_without_a_display_name_uses_the_agent_id() {
+        let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        v.as_object_mut().unwrap().remove("agent_display_name");
+        let Prepared { workspace, .. } = prepare(&v.to_string(), None).await.unwrap();
+        assert_eq!(workspace.agent_display_name, "bot");
+    }
+
+    #[tokio::test]
     async fn job_envelopes_carry_no_thread_key() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
         v["thread_key"] = serde_json::Value::Null;
@@ -525,6 +580,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_plan_carries_the_consensus_run_id_and_tolerates_its_absence() {
+        // the id `runs` resolves the run by. it MUST survive the decode: the
+        // pool has no other way to name the run — its own spec id is
+        // `{saga_id}:{attempt}`, which resolves nothing in consensus — so a
+        // dropped id here silently kills every mid-run write the run makes.
+        let Prepared { workspace, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(
+            workspace.consensus_run_id.as_deref(),
+            Some(CONSENSUS_RUN_ID),
+            "the run id crosses the envelope verbatim, separators and all"
+        );
+
+        // ADDITIVE: an envelope composed before the field existed still runs —
+        // it simply names no run, so the provisioner opens no session (the
+        // read-only tool plane) rather than binding to a run that isn't there.
+        let mut legacy: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
+        legacy.as_object_mut().unwrap().remove("run_id");
+        let Prepared {
+            input, workspace, ..
+        } = prepare(&legacy.to_string(), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(workspace.consensus_run_id, None);
+    }
+
+    #[tokio::test]
     async fn an_old_shape_envelope_that_still_carries_mount_path_decodes_fine() {
         // the composer no longer emits mount_path (D7), but an ADDITIVE field
         // inside the tagged workspace object must never reject an in-flight
@@ -564,6 +644,7 @@ mod tests {
         );
         assert!(ctx.portable, "a forge run is portable");
         assert_eq!(ctx.thread_key.as_deref(), Some("forge:app:7#2"));
+        assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(
             workspace.source,
             crate::workspace_source::WorkspaceSource::Forge {
@@ -605,6 +686,41 @@ mod tests {
         // context-less envelope assembles exactly the pre-context bytes.
         let Prepared { input, .. } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+    }
+
+    #[tokio::test]
+    async fn the_runtime_section_reaches_the_provider_input_ahead_of_the_item_context() {
+        // the runtime section (the ducktape tool plane + the run's skill
+        // mounts) is what the session CAN do; the item context is what it works
+        // ON. capabilities read first: instructions → runtime → context →
+        // contract → conversation.
+        let mut with_runtime: serde_json::Value =
+            serde_json::from_str(&forge_envelope_json()).unwrap();
+        with_runtime["runtime"] = serde_json::json!(
+            "A Ducktape MCP tool server named \"ducktape\" is available in this session."
+        );
+        let Prepared { input, .. } = prepare(&with_runtime.to_string(), None).await.unwrap();
+        assert_eq!(
+            input,
+            "GENERIC\n\nA Ducktape MCP tool server named \"ducktape\" is available in this \
+             session.\n\nForge item context — you are working this item as a session.\n\
+             repo: app\nitem: issue #7 (open)\n\nCONTRACT\n\nCONVERSATION"
+        );
+
+        // it is an ADDITIVE field: an envelope composed before the section
+        // existed carries no key and assembles byte-identically to what this
+        // worker produced then — no stray delimiter, no missing section.
+        let Prepared { input, .. } = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+
+        // and a runtime-only (non-forge) envelope carries it alone.
+        let mut duckfs_with_runtime: serde_json::Value =
+            serde_json::from_str(&envelope_json(None)).unwrap();
+        duckfs_with_runtime["runtime"] = serde_json::json!("TOOL PLANE");
+        let Prepared { input, .. } = prepare(&duckfs_with_runtime.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(input, "GENERIC\n\nTOOL PLANE\n\nCONTRACT\n\nCONVERSATION");
     }
 
     #[tokio::test]

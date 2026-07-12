@@ -34,6 +34,9 @@ const TRUNCATION_MARKER: &str = "\n[item context truncated at 16 KiB]";
 pub(crate) fn render_item_context(repo: &str, item: &ForgeItem, work_branch: &str) -> String {
     let mut out = format!(
         "Forge item context — you are working this item as a session.\n\
+         Before finishing, inspect recent Git history and create a commit with a \
+         repository-appropriate title and body. Follow the repository's conventions; \
+         do not force Conventional Commits when it uses another style.\n\
          repo: {repo}\n\
          item: {} #{} ({})\n\
          title: {}\n\
@@ -259,6 +262,8 @@ mod tests {
         assert!(ctx.contains("(open)"), "{ctx}");
         assert!(ctx.contains("title: Fix the flaky gate"), "{ctx}");
         assert!(ctx.contains("work branch: agent/item-7"), "{ctx}");
+        assert!(ctx.contains("inspect recent Git history"), "{ctx}");
+        assert!(ctx.contains("do not force Conventional Commits"), "{ctx}");
         assert!(ctx.contains("repro:\n- run it twice"), "{ctx}");
         assert!(
             !ctx.contains("source branch") && !ctx.contains("target branch"),

@@ -110,12 +110,12 @@ export interface BootError {
   logTail: string;
 }
 
-/** The node was reachable and then went away MID-SESSION (crash, stop, remote
- *  unplugged, a dev.sh restart, a wrong node grabbing the port) — drives a
- *  persistent reconnecting banner with the reason and (for a managed node) a
- *  Restart action, instead of a lone red dot beside a frozen-but-live-looking
- *  height. Null while connected or before the first connect. Distinct from
- *  `bootError` (never connected) and `error` (transient op failures). */
+/** A mid-session connection warning: either the stream proved the node went
+ *  away (crash, stop, remote unplug, wrong node on the port), or bounded status
+ *  probes found an established node temporarily busy while its stream remains
+ *  alive. Drives the persistent recovery banner; only authoritative stream
+ *  `down` makes the session disconnected. Distinct from `bootError` (never
+ *  connected) and `error` (transient op failures). */
 export interface ConnectionDown {
   reason: string;
   /** True when a DIFFERENT node answered the reused port (identity mismatch on
@@ -321,6 +321,9 @@ export interface ConsoleState {
   workspace: Workspace | null;
   /** Desktop with no active workspace → show the onboarding gate. */
   needsOnboarding: boolean;
+  /** The account-centric Home layer is showing (the workspace shell is hidden).
+   *  Not a disconnect — the node connection is kept alive underneath. */
+  atHome: boolean;
   /** An onboarding step is running (create/join/select) — disables the gate. */
   onboardingBusy: boolean;
   /** The last guarded forget couldn't confirm the node left its valset (node
@@ -741,6 +744,7 @@ export const createInitialState = (): ConsoleState => {
     workspaces: [],
     workspace: null,
     needsOnboarding: false,
+    atHome: false,
     onboardingBusy: false,
     forgetNeedsForce: false,
     deleteNeedsForce: null,
@@ -796,6 +800,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   explorerFocus: null,
   forgeFocus: null,
   ops: {},
+  connectionDown: null,
 });
 
 export interface ConsoleSnapshot {

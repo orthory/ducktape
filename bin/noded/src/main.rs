@@ -44,8 +44,8 @@ use indexer::IndexStore;
 use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
-    payload_preview,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
+    hex_bytes, hex_root, payload_preview,
 };
 use pages::Pages;
 use host::worker::MAX_WORKER_ROUNDS;
@@ -74,7 +74,6 @@ const MODULE_IDS: [&str; 16] = [
     "duckdns",
     "gateway",
 ];
-const ORACLE_ORIGIN: &[u8] = b"oracle";
 
 mod oracle_pool;
 
@@ -102,6 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // daemon's own http surface at loopback (a wildcard bind is rewritten to
     // 127.0.0.1), where receive-pack submits the ref move to the actor.
     let forge_push_base = noded::agent_provision::forge_push_base(Some(&listen.to_string()));
+    // the same surface, bare (no /forge): the base an agent run's tool plane
+    // dials back as DUCKTAPE_NODE.
+    let node_http_base = noded::agent_provision::node_http_base(Some(&listen.to_string()));
 
     // the per-module derived index: one fluent31 database per module under
     // <storage>/index/<module>/, with each module's view mapper registered.
@@ -145,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_storage,
                 actor_forge_repo,
                 forge_push_base,
+                node_http_base,
                 actor_index,
                 blobs,
                 oracle_cmds,
@@ -195,6 +198,7 @@ fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
     forge_push_base: Option<String>,
+    node_http_base: Option<String>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
@@ -321,6 +325,7 @@ fn run_node(
             agent_dirs,
             &storage_for_runs,
             forge_push_base,
+            node_http_base,
         );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
@@ -379,6 +384,38 @@ fn run_node(
                     )
                     .await;
                     let _ = reply.send(result); // caller may have hung up
+                }
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    // the frame lane is FAITHFUL to the real node here, and that
+                    // is the whole point of it: the origin is the frame's
+                    // VERIFIED signer, never the caller's claim. the frameless
+                    // arm above trusts a client string — a convention a local
+                    // daemon can afford — and `bin/node` discards that string
+                    // outright, so an embedded daemon that also stamped a claimed
+                    // origin HERE would let an e2e pass on attribution production
+                    // would never produce. it decodes exactly as the validator's
+                    // ordered drain does instead.
+                    let result = match node::decode_frame(&frame) {
+                        Ok((origin, msg)) => {
+                            submit_and_drain(
+                                &mut host,
+                                &workers,
+                                &mut height,
+                                &index,
+                                &op_blobs,
+                                &stream_hub,
+                                &metrics,
+                                origin,
+                                msg,
+                            )
+                            .await
+                        }
+                        // junk never reaches the store: the http gate already
+                        // refused it, and this is the second wall for any
+                        // embedder-side producer on the command lane.
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host

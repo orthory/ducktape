@@ -11,6 +11,12 @@ import type { Workspace } from "../../../domain/workspace-client";
 import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
 import { makeTransportStub } from "../../../test/transport-stub";
 import { AgentView, runIsMine } from "./AgentView";
+import {
+  FILLED_IDENTITY_TEXT_PERCENT,
+  FILLED_SEMANTIC_TEXT_PERCENT,
+  filledForeground,
+  filledMix,
+} from "./parts";
 import type { PendingRun } from "../../../domain/runs-client";
 
 const bytes = (value: number) => Array.from({ length: 32 }, () => value);
@@ -126,7 +132,10 @@ describe("AgentView", () => {
     expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
     expect(within(detail).getByText("summarizer")).toBeInTheDocument();
     expect(within(detail).getByText("Alpha")).toBeInTheDocument();
-    expect(within(detail).getByText("Post to chat")).toBeInTheDocument();
+    // "chat.post" is the REPLY grant — it only lets an agent answer where it was
+    // engaged. Posting into arbitrary channels is the separate chat.post_message
+    // grant, so the two must never read as the same permission.
+    expect(within(detail).getByText("Reply in chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
 
     fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));
@@ -159,6 +168,118 @@ describe("AgentView", () => {
     expect(heading).toHaveStyle({ color: color.ink, letterSpacing: "0" });
 
     document.documentElement.dataset.theme = "light";
+  });
+
+  it("derives identity-band overlays from filled tokens in both themes", () => {
+    document.documentElement.dataset.theme = "dark";
+    renderAgents();
+
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    const agentId = within(detail).getByText("summarizer");
+    const status = within(detail).getByText("Active", { exact: true });
+    const edit = within(detail).getByRole("button", { name: /^edit$/i });
+    const pause = within(detail).getByRole("button", { name: /pause agent/i });
+
+    const styleText = (element: HTMLElement) => element.getAttribute("style") ?? "";
+    expect(styleText(agentId)).toContain(`color: ${filledMix(FILLED_IDENTITY_TEXT_PERCENT)}`);
+    expect(styleText(status)).toContain(`background: ${filledMix(8)}`);
+    expect(styleText(status)).toContain(`border: 1px solid ${filledMix(16)}`);
+    for (const button of [edit, pause]) {
+      expect(styleText(button)).toContain(`background: ${filledMix(7)}`);
+      expect(styleText(button)).toContain(`border: 1px solid ${filledMix(22)}`);
+    }
+    expect(styleText(edit)).toContain(`color: ${color.onDark}`);
+    expect(styleText(status)).toContain(`color: ${filledForeground(color.green)}`);
+    expect(styleText(pause)).toContain(`color: ${filledForeground(color.amber)}`);
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for qa agent/i }));
+    const pausedDetail = screen.getByRole("region", { name: /agent detail/i });
+    const pausedStatus = within(pausedDetail).getByText("Paused", { exact: true });
+    const resume = within(pausedDetail).getByRole("button", { name: /resume agent/i });
+    expect(styleText(pausedStatus)).toContain(`color: ${filledForeground(color.amber)}`);
+    expect(styleText(resume)).toContain(`color: ${filledForeground(color.green)}`);
+
+    // The inline styles keep referring to live theme variables after the
+    // filled surface changes polarity, rather than baking in light overlays.
+    document.documentElement.dataset.theme = "light";
+    expect(styleText(agentId)).toContain(`color: ${filledMix(FILLED_IDENTITY_TEXT_PERCENT)}`);
+    expect(styleText(pausedStatus)).toContain(`color: ${filledForeground(color.amber)}`);
+    expect(styleText(resume)).toContain(`color: ${filledForeground(color.green)}`);
+    expect(styleText(status)).toContain(`background: ${filledMix(8)}`);
+    document.documentElement.dataset.theme = "light";
+  });
+
+  it("keeps every identity-band label at 4.5:1 in both committed palettes", () => {
+    const palettes = [
+      {
+        name: "light",
+        filled: "#26251f",
+        onFilled: "#efefef",
+        green: "#5cb45f",
+        amber: "#c08a3e",
+      },
+      {
+        name: "dark",
+        filled: "#ecebe5",
+        onFilled: "#1b1a17",
+        green: "#6cc06f",
+        amber: "#d3a25c",
+      },
+    ] as const;
+
+    const channels = (hex: string): [number, number, number] => [
+      parseInt(hex.slice(1, 3), 16) / 255,
+      parseInt(hex.slice(3, 5), 16) / 255,
+      parseInt(hex.slice(5, 7), 16) / 255,
+    ];
+    const mix = (foreground: string, percent: number, background: string) => {
+      const fg = channels(foreground);
+      const bg = channels(background);
+      const weight = percent / 100;
+      return fg.map((value, index) => value * weight + bg[index] * (1 - weight));
+    };
+    const luminance = (rgb: number[]) => {
+      const linear = rgb.map((value) =>
+        value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4,
+      );
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const contrast = (foreground: number[], background: number[]) => {
+      const foregroundLuminance = luminance(foreground);
+      const backgroundLuminance = luminance(background);
+      return (
+        (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
+        (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
+      );
+    };
+
+    for (const palette of palettes) {
+      const band = channels(palette.filled);
+      const chip = mix(palette.onFilled, 8, palette.filled);
+      const control = mix(palette.onFilled, 7, palette.filled);
+      const identityText = mix(
+        palette.onFilled,
+        FILLED_IDENTITY_TEXT_PERCENT,
+        palette.filled,
+      );
+
+      expect(contrast(identityText, band), `${palette.name} agent id`).toBeGreaterThanOrEqual(4.5);
+      for (const [label, hue] of [
+        ["green", palette.green],
+        ["amber", palette.amber],
+      ] as const) {
+        const semanticText = mix(hue, FILLED_SEMANTIC_TEXT_PERCENT, palette.onFilled);
+        expect(contrast(semanticText, chip), `${palette.name} ${label} status`).toBeGreaterThanOrEqual(
+          4.5,
+        );
+        expect(contrast(semanticText, control), `${palette.name} ${label} action`).toBeGreaterThanOrEqual(
+          4.5,
+        );
+      }
+      expect(contrast(channels(palette.onFilled), control), `${palette.name} edit action`).toBeGreaterThanOrEqual(
+        4.5,
+      );
+    }
   });
 
   it("adds an agent through the focused Add-agent pane", () => {

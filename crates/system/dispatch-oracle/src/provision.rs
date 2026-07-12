@@ -33,16 +33,36 @@ use crate::workspace_source::WorkspaceSource;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePlan {
     pub source: WorkspaceSource,
+    /// the run's CONSENSUS id, verbatim from the envelope — see
+    /// [`WorkspaceSpec::consensus_run_id`]. `None` on an envelope composed
+    /// before the field existed.
+    pub consensus_run_id: Option<String>,
     pub sink: Sink,
     pub skills: Vec<RoMount>,
+    /// committed registry name, carried to the Forge commit boundary.
+    pub agent_display_name: String,
 }
 
 /// what the pool hands the provisioner for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSpec {
     /// `"{saga_id}:{attempt}"` — idempotency key + per-run dir naming.
+    ///
+    /// NOT the id `runs` resolves a run by: it is a HOST-local key, and it
+    /// carries the attempt on purpose (a re-lease spawns a new attempt while
+    /// the old one may still be running, and the two must never share a
+    /// checkout dir). hashing it resolves nothing in consensus — the id a run
+    /// is named by there is [`Self::consensus_run_id`].
     pub run_id: String,
+    /// the id `runs` resolves the run by — the key of its pending map, and the
+    /// run the agent session lane binds to. carried from the composer through
+    /// the envelope because the host cannot derive it (see [`Self::run_id`]).
+    /// `None` = a pre-field envelope, or an embedder that composes its own: the
+    /// run then opens NO agent session and executes on the read-only tool plane
+    /// — the pre-session behaviour, never an error.
+    pub consensus_run_id: Option<String>,
     pub agent_id: Option<String>,
+    pub agent_display_name: Option<String>,
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
@@ -566,10 +586,19 @@ mod tests {
 
     use super::*;
 
+    /// a CONSENSUS run id in the shape `runs` mints (`chat\x1f<channel>\x1f<seq>\x1f<agent>`).
+    /// written out rather than imported: this crate must not depend on an app
+    /// module. the cross-crate proof that composer and provisioner agree on the
+    /// id space lives where both are reachable — `bin/noded`'s session-boundary
+    /// test.
+    const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}1\u{1f}bot";
+
     fn spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
+            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
             agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
@@ -581,7 +610,9 @@ mod tests {
     fn forge_spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
+            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
             agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
                 commit: "d0".repeat(20),

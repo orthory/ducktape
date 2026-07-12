@@ -51,7 +51,7 @@ tauri = { version = "2", default-features = false, features = [
 # forwards it to tauri-runtime-wry, so an out-of-tree runtime has to be synced
 # by hand or macOS builds fail E0046 (WindowBuilder::transparent required by
 # the trait but cfg'd out of the impl).
-tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "8ddc1ed48e8650432424bd51d98edf0a024dc2a4", features = [
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "7f8491f220cdc0d5aa955db5d5fa6d6d60c8398d", features = [
   "macos-private-api",
 ] }
 # See the default feature above. This resolves to the same package/version the
@@ -87,6 +87,11 @@ tauri-agent-plugin = { version = "0.0.2", default-features = false, features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Touch ID custody (src/touchid.rs): the vault passphrase behind a biometric
+# Keychain ACL. macOS-target-scoped so the Linux/wasm build is untouched.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

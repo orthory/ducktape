@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tauri_runtime_cef::{StreamResponder, register_streaming_scheme_handler};
+use tauri_runtime_cef::{InitiatorOrigin, StreamResponder, register_streaming_scheme_handler};
 
 /// The dedicated browser-gateway base (`http://127.0.0.1:<ephemeral-port>`) the
 /// active node reports via `/v1/gateway/browser`. The frontend sets it when a
@@ -23,6 +23,9 @@ use tauri_runtime_cef::{StreamResponder, register_streaming_scheme_handler};
 static GATEWAY_BASE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Response headers the node already vetted that we forward verbatim to CEF.
+/// `set-cookie` is here and repeatable (see the `get_all` in `serve`): the node
+/// forwards each host-only-scrubbed cookie, and CEF stores it against the
+/// page's duck origin (the scheme is registered cookieable).
 const FORWARDED_HEADERS: &[&str] = &[
     "content-type",
     "content-security-policy",
@@ -59,9 +62,12 @@ pub fn register() {
 }
 
 fn text_head(status: u16) -> http::Response<()> {
+    // no-store: CEF caches scheme responses; a cached error (e.g. "no active
+    // gateway" during boot) must never mask a later healthy load.
     http::Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
+        .header("cache-control", "no-store")
         .body(())
         .unwrap()
 }
@@ -72,6 +78,15 @@ fn fail(responder: StreamResponder, status: u16, message: &str) {
 }
 
 fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
+    // The browser-process-tracked initiator origin (a request extension the
+    // runtime stamps — never a caller header). The renderer serializes duck://
+    // page origins as `Origin: null` on the wire (POST bodies, WS handshakes),
+    // so the header is useless for same-origin decisions; this is the trusted
+    // replacement. `None` means "not a known non-opaque frame" — fail closed.
+    let initiator = request
+        .extensions()
+        .get::<InitiatorOrigin>()
+        .and_then(|origin| origin.0.clone());
     let uri = request.uri();
     let authority = uri.host().unwrap_or_default().to_ascii_lowercase();
     if authority.is_empty() {
@@ -92,15 +107,15 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
     };
 
     if uri.path() == "/.duck/ws" {
-        // The synthetic /.duck/ws is same-origin, so the fetch's Origin is the
-        // page's own duck origin; fall back to it if a navigation omitted one.
-        let origin = request
-            .headers()
-            .get("origin")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("duck://{authority}"));
-        return serve_ws_bootstrap(&base, &authority, &origin, responder);
+        // Mint strictly same-origin, judged by the TRUSTED initiator: a page
+        // must never mint a door token for another authority's route (the
+        // cross-account WS pivot #415 closed). The renderer's own Origin
+        // header serializes as "null" here, so it cannot carry this check.
+        let expected = format!("duck://{authority}");
+        if initiator.as_deref() != Some(expected.as_str()) {
+            return fail(responder, 403, "duck: ws bootstrap is same-origin only");
+        }
+        return serve_ws_bootstrap(&base, &authority, &expected, responder);
     }
     // `/.duck/` is the node's control-plane namespace (the WS-token mint and
     // door live there). A page must never reach it by proxy — only the synthetic
@@ -128,6 +143,11 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
     // authority. `host`/`content-length` are reqwest's to set from the target
     // URL + body; `accept-encoding` is dropped so the backend never compresses
     // (this hop does not decode, and content-encoding is not forwarded).
+    // Forward the page's own request headers — Origin included, verbatim. The
+    // runtime has already repaired a renderer-serialized `Origin: null` to the
+    // real duck origin, and left it ABSENT where absence is correct (a
+    // navigation, a same-origin GET). Both facts matter to the node's
+    // cross-origin guard, so neither is second-guessed here.
     for (name, value) in request.headers() {
         let lower = name.as_str().to_ascii_lowercase();
         if lower.starts_with("x-duck-")
@@ -150,7 +170,9 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
 
     let mut head = http::Response::builder().status(response.status().as_u16());
     for name in FORWARDED_HEADERS {
-        if let Some(value) = response.headers().get(*name) {
+        // set-cookie is the one legitimately repeatable response header; every
+        // other forwarded header appears at most once, so get_all is exact.
+        for value in response.headers().get_all(*name) {
             head = head.header(*name, value);
         }
     }

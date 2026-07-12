@@ -678,7 +678,7 @@ mod tests {
             let sink = CaptureSink::default();
             let presented = sink.presented.clone();
             let state = TestState::new();
-            let engine = Engine::new(sink, state.path());
+            let engine = Engine::new(sink, state.path(), Arc::default());
             let shared = shared_for(format!("http://{addr}/"));
             let (_cmds_tx, cmds_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
             let shutdown = Arc::new(Notify::new());
@@ -789,7 +789,7 @@ mod tests {
         let sink = CaptureSink::default();
         let presented = sink.presented.clone();
         let state = TestState::new();
-        let engine = Engine::new(sink, state.path());
+        let engine = Engine::new(sink, state.path(), Arc::default());
         let shared = shared_for(base.clone());
         let (_cmds_tx, cmds_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         let shutdown = Arc::new(Notify::new());

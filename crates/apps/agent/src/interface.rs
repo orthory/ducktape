@@ -60,8 +60,21 @@ pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
 
-/// permission to post reply blocks into chat.
+/// permission to post reply blocks into chat — the run's ANSWER, in the channel
+/// and thread it was engaged from. deliberately NOT the permission to post
+/// wherever it likes: see [`ACTION_CHAT_POST_MESSAGE`].
 pub const ACTION_CHAT_POST: &str = "chat.post";
+/// permission to post a message to an ARBITRARY channel
+/// ([`AgentAction::PostMessage`]) — a strictly wider grant than
+/// [`ACTION_CHAT_POST`], which only ever lets an agent answer where it was
+/// spoken to.
+///
+/// a separate name on purpose. folding "post anywhere, unprompted" into
+/// `chat.post` would have SILENTLY widened every agent already registered with
+/// it — an owner who granted "may answer me" would have been giving "may post
+/// in any channel at any time" without ever being asked. a new action name means
+/// the wider power can only arrive by an owner deliberately granting it.
+pub const ACTION_CHAT_POST_MESSAGE: &str = "chat.post_message";
 /// permission to create a task ([`AgentAction::CreateTask`]).
 pub const ACTION_TASKS_CREATE: &str = "tasks.create";
 /// permission to move a task ([`AgentAction::UpdateTaskStatus`]).
@@ -76,8 +89,14 @@ pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 /// every action name the platform knows. `RegisterAgent`/`UpdateAgent` reject
 /// an `allowed_actions` entry outside this vocabulary, so a granted permission
 /// always means something.
-pub const KNOWN_ACTIONS: [&str; 5] = [
+///
+/// ADDITIVE only: an existing record's `allowed_actions` is a set of these
+/// names, so a NEW name grants nothing to an agent already registered — it can
+/// only arrive through an owner-gated `UpdateAgent`. removing or renaming one,
+/// by contrast, would strand every record that holds it.
+pub const KNOWN_ACTIONS: [&str; 6] = [
     ACTION_CHAT_POST,
+    ACTION_CHAT_POST_MESSAGE,
     ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS,
     ACTION_PAGES_COMMENT,
@@ -288,6 +307,20 @@ pub struct AgentResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    /// post a message to a named channel ([`ACTION_CHAT_POST_MESSAGE`]) — the
+    /// agent SPEAKING, as opposed to `reply_blocks`, which is the agent
+    /// ANSWERING where it was engaged. `thread` makes it a reply under that
+    /// root sequence.
+    ///
+    /// this is what lets an agent report progress while it works instead of
+    /// saving everything for the end. it is a genuinely wider power than a
+    /// reply, which is exactly why it carries its own action name.
+    PostMessage {
+        channel_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<u64>,
+    },
     CreateTask {
         task_id: String,
         title: String,
@@ -315,6 +348,7 @@ impl AgentAction {
     /// the vocabulary name this action needs in the agent's `allowed_actions`.
     pub fn vocabulary_name(&self) -> &'static str {
         match self {
+            AgentAction::PostMessage { .. } => ACTION_CHAT_POST_MESSAGE,
             AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
             AgentAction::AddPageComment { .. } => ACTION_PAGES_COMMENT,

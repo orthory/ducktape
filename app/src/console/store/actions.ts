@@ -111,6 +111,10 @@ export interface ConsoleActions {
    *  mark's cross-link. Best-effort: if the ring no longer holds that height
    *  the explorer just lands on the list. */
   openExplorerAt(height: number): void;
+  /** Jump to a forge item — the screen switch plus the one-shot forgeFocus
+   *  hand-off (the explorerFocus idiom). Used by the notification bell; the
+   *  navigate deep-link listener patches the same fields. */
+  openForgeItem(repo: string, number: number | null): void;
   /** The explorer calls this once it has consumed (or given up on) a pending
    *  focus hand-off. */
   clearExplorerFocus(): void;
@@ -503,6 +507,9 @@ export interface ConsoleActions {
    *  the node left its valset flags `state.deleteNeedsForce` with this id —
    *  call again with `force` to override that uncertainty. */
   deleteWorkspace(id: string, force?: boolean): void;
+  /** Show the account-centric Home layer over the shell — a pure view toggle,
+   *  the node connection is kept alive underneath (not a disconnect). */
+  goHome(): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -1139,6 +1146,8 @@ export function createActions({
       workspace: target,
       openTabs: loadDocTabs(docTabsScope(target.id, null)),
       needsOnboarding: false,
+      // entering a workspace shell leaves the Home layer (no disconnect elsewhere).
+      atHome: false,
       onboardingBusy: false,
       // a force-forget/delete offer is scoped to the workspace it was raised
       // for; switching targets clears it so it can never fire on the wrong one.
@@ -1329,6 +1338,18 @@ export function createActions({
 
     clearExplorerFocus: () => {
       patch({ explorerFocus: null });
+    },
+
+    openForgeItem: (repo, number) => {
+      // Same rail-adoption contract as setScreen.
+      const section = sectionForScreen("forge");
+      const forgeFocus = { repo, number };
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "forge", viewMode: section, forgeFocus });
+      } else {
+        patch({ screen: "forge", forgeFocus });
+      }
     },
 
     setViewMode: (mode) => {
@@ -2536,6 +2557,7 @@ export function createActions({
         nodeUrl: url,
         managed: false,
         needsOnboarding: false,
+        atHome: false,
         error: null,
       });
       // Remember it for next launch, then dial. The hydrate effect (keyed on the
@@ -2692,6 +2714,8 @@ export function createActions({
           fail(err);
         });
     },
+
+    goHome: () => patch({ atHome: true }),
 
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 

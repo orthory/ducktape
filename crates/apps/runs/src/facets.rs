@@ -1,6 +1,6 @@
 use super::envelope::RUNNER_RESULT_VERSION;
 use super::{
-    ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, Deserialize,
     JOB_FINALIZE_PAYLOAD_BYTES, MAX_ACTIONS_PER_RUN, Serialize,
 };
@@ -96,6 +96,15 @@ pub(super) struct WireEffect {
     /// `pages.set_checked`: the desired checked state.
     #[serde(default)]
     checked: bool,
+    /// `chat.post_message`: the channel the agent speaks into.
+    #[serde(default)]
+    channel_id: String,
+    /// `chat.post_message`: the message body (one paragraph block).
+    #[serde(default)]
+    text: String,
+    /// `chat.post_message`: the thread root the post replies under, if any.
+    #[serde(default)]
+    thread: Option<u64>,
 }
 
 /// the O1/O2 output sink. internally tagged on `mode`; a MISSING sink field
@@ -181,6 +190,11 @@ pub(super) fn effects_to_actions(effects: &[WireEffect]) -> Result<Vec<AgentActi
     effects
         .iter()
         .map(|e| match e.kind.as_str() {
+            ACTION_CHAT_POST_MESSAGE => Ok(AgentAction::PostMessage {
+                channel_id: e.channel_id.clone(),
+                text: e.text.clone(),
+                thread: e.thread,
+            }),
             ACTION_TASKS_CREATE => Ok(AgentAction::CreateTask {
                 task_id: e.task_id.clone(),
                 title: e.title.clone(),

@@ -141,7 +141,15 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                 http_listen.as_deref().filter(|_| !sync_only),
             ),
             forge_committer,
-        ),
+        )
+        // the agent tool plane: the SAME surface, bare (no /forge), handed to
+        // every run as DUCKTAPE_NODE alongside the running binary's dir on
+        // PATH — that is how the MCP server the runner CLI spawns (outside the
+        // agent's sandbox) finds `ducktape-mcp` and the node it acts against.
+        // no surface (a sync-only joiner) ⇒ nothing to dial ⇒ the var is unset.
+        .with_node_url(noded::agent_provision::node_http_base(
+            http_listen.as_deref().filter(|_| !sync_only),
+        )),
     ));
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)

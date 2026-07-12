@@ -8,7 +8,7 @@ use agent::{
     ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PROMPT_HASH_LEN,
     encode_event as agent_encode_event, encode_reply as agent_encode_reply,
 };
-use chat::{AuthorRef, MessageHead, decode_msg as chat_decode_msg};
+use chat::{AuthorRef, Channel, MessageHead, decode_msg as chat_decode_msg};
 use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
     encode_reply as dispatch_encode_reply, encode_result_event,
@@ -40,6 +40,11 @@ struct CaptureCtx {
     /// dispatch ids the dispatch module already has a record for — the
     /// committed turn-claim layer the module probes.
     taken_dispatches: BTreeSet<String>,
+    /// dispatch id -> the node key holding the run's execution lease, served as
+    /// `DispatchView.assignee` (the session lane's authorization). a dispatch
+    /// listed here is AwaitingResult; one only in `taken_dispatches` is
+    /// delivered, and a delivered run runs nowhere (assignee `None`).
+    dispatch_assignees: BTreeMap<String, Vec<u8>>,
     /// job_id -> board record served by the jobs arm (finalize guard).
     jobs: BTreeMap<String, Job>,
     /// repo -> born (branch, tip-hex) pairs, served by the "forge"
@@ -87,6 +92,7 @@ impl CaptureCtx {
             transcripts: BTreeMap::new(),
             tasks: Vec::new(),
             taken_dispatches: BTreeSet::new(),
+            dispatch_assignees: BTreeMap::new(),
             jobs: BTreeMap::new(),
             forge_refs: BTreeMap::new(),
             forge_items: BTreeMap::new(),
@@ -200,6 +206,14 @@ impl CaptureCtx {
     }
     fn with_taken_dispatch(mut self, dispatch_id: &str) -> Self {
         self.taken_dispatches.insert(dispatch_id.into());
+        self
+    }
+    /// serve `key` as the node holding `run_id`'s execution lease — what the
+    /// dispatch read facade resolves from saga's committed lease, and the ONLY
+    /// origin the session lane lets open a session.
+    fn with_lease_holder(mut self, run_id: &str, key: &[u8]) -> Self {
+        self.dispatch_assignees
+            .insert(dispatch_id_for(run_id), key.to_vec());
         self
     }
     /// a job the board holds as Processing, claimed by "runs" at `height`.
@@ -356,6 +370,21 @@ impl Ctx for CaptureCtx {
                         .find(|v| v.head.message_id == message_id)
                         .cloned(),
                 ))),
+                // a channel EXISTS exactly when it has a transcript — the
+                // fixture idiom already in use everywhere (a channel with no
+                // messages is `with_transcript(ch, vec![])`).
+                ChatQuery::Channel { channel_id } => Ok(chat::encode_reply(&ChatReply::Channel(
+                    self.transcripts.get(&channel_id).map(|msgs| Channel {
+                        id: channel_id.clone(),
+                        name: channel_id,
+                        created_at: 0,
+                        head_seq: msgs.len() as u64,
+                        post_policy: chat::PostPolicy::Open,
+                        hooks: Vec::new(),
+                        pinned: Vec::new(),
+                        huddle: Vec::new(),
+                    }),
+                ))),
                 _ => Err(Error::QueryUnsupported),
             },
             "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
@@ -367,24 +396,34 @@ impl Ctx for CaptureCtx {
             },
             "dispatch" => match dispatch::decode_query(req).map_err(Error::Module)? {
                 DispatchQuery::Dispatch { dispatch_id, .. } => {
-                    let view = self
-                        .taken_dispatches
-                        .contains(&dispatch_id)
-                        .then(|| DispatchView {
-                            dispatch_id,
-                            recipe_id: "agent/x".into(),
-                            receiver: "runs".into(),
-                            status: DispatchStatus::Delivered,
-                            outcome: Some(Ok(Vec::new())),
-                            assignee: None,
-                            attempt: None,
-                            max_attempts: None,
-                            lease_expires_at: None,
-                            deadline: None,
-                            lease_updated_at: None,
-                            reassignable: None,
-                            created_at: 0,
-                            updated_at: 0,
+                    // an assigned dispatch is still AwaitingResult (a lease is
+                    // held); a merely `taken` one already delivered.
+                    let assignee = self.dispatch_assignees.get(&dispatch_id).cloned();
+                    let awaiting = assignee.is_some();
+                    let view =
+                        (awaiting || self.taken_dispatches.contains(&dispatch_id)).then(|| {
+                            DispatchView {
+                                dispatch_id,
+                                recipe_id: "agent/x".into(),
+                                receiver: "runs".into(),
+                                status: if awaiting {
+                                    DispatchStatus::AwaitingResult {
+                                        saga_id: "saga-1".into(),
+                                    }
+                                } else {
+                                    DispatchStatus::Delivered
+                                },
+                                outcome: (!awaiting).then(|| Ok(Vec::new())),
+                                assignee,
+                                attempt: None,
+                                max_attempts: None,
+                                lease_expires_at: None,
+                                deadline: None,
+                                lease_updated_at: None,
+                                reassignable: None,
+                                created_at: 0,
+                                updated_at: 0,
+                            }
                         });
                     Ok(dispatch_encode_reply(&DispatchReply::Dispatch(view)))
                 }
@@ -883,5 +922,6 @@ mod facets;
 mod job_runs;
 mod pages_actions;
 mod registry;
+mod sessions;
 mod state;
 mod validation;

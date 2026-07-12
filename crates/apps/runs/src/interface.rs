@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 
+use agent::AgentAction;
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +161,72 @@ pub enum RunsMsg {
     /// exactly like cancellation; `attempt` prevents a delayed click from
     /// revoking a newer assignment.
     ReassignRun { run_id: String, attempt: u32 },
+
+    // ---- the agent session lane (mid-run writes) --------------------------
+    /// the EXECUTING node binds an ephemeral session key to a live run, so the
+    /// agent it is running can act DURING the run instead of only in the JSON
+    /// it returns at the end.
+    ///
+    /// authorization is the run's own committed lease: the origin must be the
+    /// node that holds it (resolved through `DispatchView::assignee`, which the
+    /// dispatch read facade derives from saga's committed lease). that is
+    /// SELF-AUTHORIZING — no owner signature, so an automated issue-mention run
+    /// works with nobody at a keyboard — and it is correct cross-node, because
+    /// the lease names the node actually executing the run.
+    ///
+    /// the OWNER's authority is deliberately not asked for here, because
+    /// consensus already holds it: `AgentRecord { owner, allowed_actions, caps }`
+    /// IS the capability grant — registering an agent with `chat.post` is the
+    /// act of authorizing it. what this op adds is not authority but PROOF: that
+    /// an op came from this agent's run and no other.
+    OpenAgentSession {
+        run_id: String,
+        /// the session's ed25519 PUBLIC key, exactly [`SESSION_KEY_LEN`] bytes.
+        /// its private half never leaves the executing host and reaches only the
+        /// agent's tool server — never the node key, which can sign anything.
+        session_key: Vec<u8>,
+    },
+    /// one agent action, applied MID-RUN, signed by the bound session key.
+    ///
+    /// the origin must BE that session key. a frame's origin is its VERIFIED
+    /// public key (`node::decode_frame` binds `(origin, seq, target, payload)`,
+    /// and every honest validator rejects a forged frame identically), so this
+    /// is authorship consensus can trust — unlike the frameless `/v1/submit`
+    /// lane, whose caller-supplied origin `bin/node` discards outright.
+    ///
+    /// the action is then validated against the SAME `allowed_actions` + caps
+    /// the response path validates, by the same code: the tool plane must never
+    /// become a second, wider permission vocabulary.
+    AgentAction { run_id: String, action: AgentAction },
+}
+
+// ---- the agent session lane ---------------------------------------------------
+
+/// required byte length of a session key (an ed25519 public key).
+pub const SESSION_KEY_LEN: usize = 32;
+
+/// hard cap on the actions ONE session may apply — the mid-run peer of
+/// [`agent::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
+/// its budget can still RETURN a response; it just cannot keep writing.
+pub const MAX_ACTIONS_PER_SESSION: u32 = 32;
+
+/// one live agent session: an ephemeral key bound to a run, plus the audit
+/// record of what it did with it.
+///
+/// `actions` is BOTH the spent budget and the deterministic id salt — the nth
+/// action of a session mints its chat/task/pages ids from `(run_id, n)`, so every
+/// replaying validator derives byte-identical ids and no host randomness ever
+/// reaches consensus.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentSession {
+    pub run_id: String,
+    pub agent_id: String,
+    /// the ed25519 public key that must sign every [`RunsMsg::AgentAction`] for
+    /// this run.
+    pub session_key: Vec<u8>,
+    pub opened_at: u64,
+    /// how many actions this session has applied — the audit counter.
+    pub actions: u32,
 }
 
 // ---- queries ------------------------------------------------------------------
@@ -174,6 +241,11 @@ pub enum RunsQuery {
     /// the delivered-runs ring, newest first (last 100). derived state — see
     /// [`RunRecord`].
     RecentRuns,
+    /// every LIVE agent session, ascending by run id — the audit surface: which
+    /// agents hold a key right now, and how much of their action budget each has
+    /// spent. sessions prune when their run settles, so this is bounded by the
+    /// in-flight runs.
+    AgentSessions,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -182,6 +254,7 @@ pub enum RunsReply {
     PendingRuns(Vec<PendingRun>),
     Watches(Vec<WatchView>),
     RecentRuns(Vec<RunRecord>),
+    AgentSessions(Vec<AgentSession>),
 }
 
 // ---- codecs -------------------------------------------------------------------

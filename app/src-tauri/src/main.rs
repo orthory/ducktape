@@ -20,11 +20,14 @@ mod gateway_window;
 mod enroll;
 mod forge_git;
 mod huddle;
+mod lan_http;
+mod link_relay;
 mod menu;
 mod notify;
 mod permissions;
 mod rt;
 mod sandbox;
+mod touchid;
 mod tray;
 mod user_identity;
 mod workspaces;
@@ -152,9 +155,19 @@ fn main() {
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,
+            touchid::touchid_available,
+            touchid::touchid_enroll,
+            touchid::touchid_enrolled,
+            touchid::touchid_unlock,
+            touchid::touchid_disable,
             enroll::enroll_start,
             enroll::enroll_poll,
             enroll::enroll_cancel,
+            link_relay::link_relay_start,
+            link_relay::link_relay_poll,
+            link_relay::link_relay_cancel,
+            link_relay::link_fetch_challenge,
+            link_relay::link_send_response,
             forge_git::forge_list_repos,
             forge_git::forge_list_branches,
             forge_git::forge_head,
@@ -171,6 +184,7 @@ fn main() {
             huddle::huddle_pop_in,
             notify::notify_configure,
             notify::notify_mark_seen,
+            notify::notify_recent,
             permissions::permission_prompt_state,
             permissions::permission_prompt_decide,
             sandbox::sandbox_preflight,

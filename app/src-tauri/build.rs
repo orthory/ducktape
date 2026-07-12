@@ -34,6 +34,7 @@ fn main() {
         "gateway_inline_place",
         "gateway_inline_close",
         "gateway_inline_hide_all",
+        "duck_set_gateway_base",
         "workspace_create",
         "workspace_join",
         "workspace_invite_blob",
@@ -62,9 +63,19 @@ fn main() {
         "user_sign_possession",
         "user_sign_add_member",
         "user_sign_remove_member",
+        "touchid_available",
+        "touchid_enroll",
+        "touchid_enrolled",
+        "touchid_unlock",
+        "touchid_disable",
         "enroll_start",
         "enroll_poll",
         "enroll_cancel",
+        "link_relay_start",
+        "link_relay_poll",
+        "link_relay_cancel",
+        "link_fetch_challenge",
+        "link_send_response",
         "forge_list_repos",
         "forge_list_branches",
         "forge_head",
@@ -82,6 +93,7 @@ fn main() {
         "notify_configure",
         "notify_mark_seen",
         "sandbox_preflight",
+        "notify_recent",
     ];
     // The native permission consent window's own commands. They answer requests
     // made by OTHER webviews, so they live in their own capability
@@ -105,9 +117,10 @@ fn main() {
     let registered: std::collections::BTreeSet<&str> = handler
         .lines()
         .filter_map(|line| {
-            line.trim()
-                .strip_suffix(',')
-                .and_then(|line| line.rsplit_once("::").map(|(_, command)| command))
+            // Commands register as `module::command` or as a bare `command`;
+            // both forms must land in the ACL or the drift assert is vacuous.
+            let line = line.trim().strip_suffix(',')?;
+            Some(line.rsplit_once("::").map_or(line, |(_, command)| command))
         })
         .collect();
     let declared: std::collections::BTreeSet<&str> = commands.iter().copied().collect();
