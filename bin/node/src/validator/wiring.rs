@@ -76,6 +76,7 @@ pub(super) async fn finish(
     wireguard_effect: config::WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
@@ -236,6 +237,7 @@ pub(super) async fn finish(
                 me: signer.public_key(),
                 factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 pacer: bulk_pacer,
+                planes,
                 commands: gateway_commands,
                 workspace: gateway_workspace,
             },
@@ -389,6 +391,7 @@ pub(super) async fn wire(
     coord_cap: Option<nat_traversal::CoordCap>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
+    planes: data_plane::PlaneMonitor,
 ) -> PreWiring {
     // consensus membership comes from the RECOVERY RECORD: the epoch's
     // ENGINE PARTICIPANT SET (at genesis: exactly the config seed). the
@@ -524,6 +527,7 @@ pub(super) async fn wire(
                 crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
+                planes,
             );
             Some(peers)
         } else {

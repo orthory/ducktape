@@ -9,12 +9,20 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   blocksPerSecond,
+  formatAge,
   formatBound,
+  formatBytes,
+  formatBytesRate,
   formatLatency,
   formatRate,
   meanLatency,
   perBucket,
+  planeDropTotal,
+  planeRxBytes,
+  planeTxBytes,
   quantile,
+  ratePerSecond,
+  type DataPlaneMetric,
   type NodeMetrics,
 } from "../../../domain/metrics";
 import { useDucktape } from "../../store/use-ducktape";
@@ -28,6 +36,16 @@ const WINDOW = 90; // ~3 min at 2s
 interface Sample {
   t: number;
   m: NodeMetrics;
+}
+
+/** One open plane with its window-derived rates: `series` is total (tx+rx)
+ *  bytes/sec per poll step, `txRate`/`rxRate` the latest step's split. */
+interface PlaneRow {
+  key: string;
+  plane: DataPlaneMetric;
+  txRate: number;
+  rxRate: number;
+  series: number[];
 }
 
 const emptyStyle = { font: `400 12px ${font.sans}`, color: color.muted2 } as const;
@@ -82,6 +100,33 @@ export function MetricsView() {
       .sort((a, b) => b.count - a.count)
       .slice(0, 8);
   }, [latest]);
+
+  // every open plane with per-step (tx+rx) byte rates across the window —
+  // the cumulative counters delta'd over wall time, like `throughput` above.
+  const planes = useMemo<PlaneRow[]>(() => {
+    if (!latest) return [];
+    return latest.planes.map((plane) => {
+      const key = `${plane.service} ${plane.owner}`;
+      const inSample = (s: Sample) =>
+        s.m.planes.find((p) => p.service === plane.service && p.owner === plane.owner);
+      const series: number[] = [];
+      let txRate = 0;
+      let rxRate = 0;
+      for (let i = 1; i < samples.length; i++) {
+        const prev = inSample(samples[i - 1]);
+        const curr = inSample(samples[i]);
+        if (!prev || !curr) {
+          series.push(0);
+          continue;
+        }
+        const dt = samples[i].t - samples[i - 1].t;
+        txRate = ratePerSecond(planeTxBytes(prev), planeTxBytes(curr), dt);
+        rxRate = ratePerSecond(planeRxBytes(prev), planeRxBytes(curr), dt);
+        series.push(txRate + rxRate);
+      }
+      return { key, plane, txRate, rxRate, series };
+    });
+  }, [samples, latest]);
 
   return (
     <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
@@ -139,7 +184,7 @@ export function MetricsView() {
           </div>
         </div>
       ) : (
-        <MetricsBody latest={latest} throughput={throughput} modules={modules} />
+        <MetricsBody latest={latest} throughput={throughput} modules={modules} planes={planes} />
       )}
     </div>
   );
@@ -149,10 +194,12 @@ function MetricsBody({
   latest,
   throughput,
   modules,
+  planes,
 }: {
   latest: NodeMetrics;
   throughput: number[];
   modules: { module: string; count: number }[];
+  planes: PlaneRow[];
 }) {
   const hist = latest.latency;
   const per = perBucket(hist);
@@ -232,6 +279,110 @@ function MetricsBody({
           <div style={emptyStyle}>No dispatches yet.</div>
         )}
       </Panel>
+
+      {/* open data planes: per-use overlay transports, attributed to the
+          module that created each. Presence in the scrape IS openness. */}
+      <Panel
+        title="Data planes"
+        right={planes.length > 0 ? `${planes.length} open` : undefined}
+      >
+        {planes.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 11 }}>
+            {planes.map((row) => (
+              <DataPlaneRow key={row.key} row={row} />
+            ))}
+          </div>
+        ) : (
+          <div style={emptyStyle}>
+            No open data planes — this node is not carrying overlay traffic.
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/** One open plane: identity + attribution, a live throughput sparkline, the
+ *  current tx/rx split, and cumulative totals with drop accounting. */
+function DataPlaneRow({ row }: { row: PlaneRow }) {
+  const { plane } = row;
+  const drops = planeDropTotal(plane);
+  const detail =
+    `datagrams ↑${plane.datagramsTx.toLocaleString()} ↓${plane.datagramsRx.toLocaleString()}` +
+    ` · streams opened ${plane.streamsOpened.toLocaleString()}` +
+    ` / accepted ${plane.streamsAccepted.toLocaleString()}`;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12 }} title={detail}>
+      <div
+        style={{
+          width: 148,
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+        }}
+      >
+        <span style={{ font: `600 12px ${font.mono}`, color: color.ink }}>
+          {plane.service}
+          {plane.halted && (
+            <span
+              style={{
+                marginLeft: 6,
+                font: `600 9.5px ${font.mono}`,
+                letterSpacing: ".08em",
+                color: color.red,
+              }}
+            >
+              HALTED
+            </span>
+          )}
+        </span>
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+          by {plane.owner} · open {formatAge(plane.ageSeconds)}
+        </span>
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <Sparkline values={row.series} height={30} format={formatBytesRate} />
+      </div>
+      <div
+        style={{
+          width: 104,
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          alignItems: "flex-end",
+        }}
+      >
+        <span style={{ font: `500 11px ${font.mono}`, color: color.ink }}>
+          ↑ {formatBytesRate(row.txRate)}
+        </span>
+        <span style={{ font: `500 11px ${font.mono}`, color: color.ink }}>
+          ↓ {formatBytesRate(row.rxRate)}
+        </span>
+      </div>
+      <div
+        style={{
+          width: 118,
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          alignItems: "flex-end",
+        }}
+      >
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted }}>
+          {formatBytes(planeTxBytes(plane) + planeRxBytes(plane))} total
+        </span>
+        <span
+          style={{
+            font: `400 10.5px ${font.mono}`,
+            color: drops > 0 ? color.amber : color.muted2,
+          }}
+        >
+          {drops.toLocaleString()} dropped
+        </span>
+      </div>
     </div>
   );
 }

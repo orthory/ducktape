@@ -41,6 +41,8 @@ pub struct SpawnConfig {
     pub me: ed25519::PublicKey,
     pub factory: Arc<dyn data_plane::SocketFactory>,
     pub pacer: BulkPacer,
+    /// The open-plane registry the bound plane reports into (metrics).
+    pub planes: data_plane::PlaneMonitor,
     pub commands: mpsc::Sender<NodeCommand>,
     pub workspace: PathBuf,
 }
@@ -71,6 +73,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         me,
         factory,
         pacer,
+        planes,
         commands,
         workspace,
     } = config;
@@ -189,6 +192,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
             }
         };
         println!("[node {label}] gateway plane: overlay stream bound on {own}");
+        planes.register("gateway", Service::Gateway, plane.watch());
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;
         let permits = Arc::new(tokio::sync::Semaphore::new(16));

@@ -60,6 +60,7 @@ pub(crate) async fn run_validator(
     agent_dirs: capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
     gateway_workspace: std::path::PathBuf,
     mut recovery: Recovery<commonware_runtime::tokio::Context>,
     manifest: Option<Manifest>,
@@ -129,6 +130,7 @@ pub(crate) async fn run_validator(
         coord_cap,
         voice_requests,
         overlay_slot.clone(),
+        planes.clone(),
     )
     .await;
     let (
@@ -194,6 +196,7 @@ pub(crate) async fn run_validator(
         wireguard_effect,
         overlay_slot.clone(),
         bulk_pacer.clone(),
+        planes.clone(),
         gateway_requests,
         gateway_commands,
         gateway_workspace,
@@ -222,6 +225,7 @@ pub(crate) async fn run_validator(
             std::sync::Arc::clone(peers),
             me,
             bulk_pacer,
+            planes.clone(),
             stream_hub.run_output(),
         );
     }

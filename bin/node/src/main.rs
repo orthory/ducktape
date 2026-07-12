@@ -73,6 +73,7 @@ mod lobby;
 mod main_tests;
 mod oracle_pool;
 mod overlay_book;
+mod plane_metrics;
 mod reachability_plane;
 #[cfg(test)]
 mod reachability_plane_tests;
@@ -343,6 +344,8 @@ fn run_node(
         let boot::mesh::MeshHead {
             context,
             metrics,
+            plane_monitor,
+            plane_metrics,
             mesh_participants,
             status_public_key,
             sync_sources,
@@ -369,6 +372,10 @@ fn run_node(
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
         let bulk_pacer = overlay_book::shared_bulk_pacer();
+        // The `ducktape_dataplane_*` series unregister when this handle
+        // drops — pin it to the whole node future (both role arms await
+        // inside this block).
+        let _plane_metrics = plane_metrics;
 
         if sync_only {
             boot::sync_only::run(
@@ -480,6 +487,7 @@ fn run_node(
                 &agent_dirs,
                 overlay_slot,
                 bulk_pacer.clone(),
+                plane_monitor.clone(),
                 storage_for_sync,
                 recovery,
                 &manifest,
@@ -530,6 +538,7 @@ fn run_node(
             agent_dirs,
             overlay_slot,
             bulk_pacer,
+            plane_monitor,
             workspace,
             recovery,
             manifest,

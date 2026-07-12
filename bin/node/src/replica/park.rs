@@ -84,6 +84,7 @@ pub(super) async fn park(
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
     workspace: std::path::PathBuf,
     storage_for_sync: std::path::PathBuf,
     forge_repo: std::path::PathBuf,
@@ -121,6 +122,7 @@ pub(super) async fn park(
             std::sync::Arc::clone(&tracked),
             me,
             bulk_pacer.clone(),
+            planes.clone(),
             stream_hub.run_output(),
         );
         tracked
@@ -137,6 +139,7 @@ pub(super) async fn park(
                 me: signer.public_key(),
                 factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 pacer: bulk_pacer.clone(),
+                planes: planes.clone(),
                 commands: gateway_commands,
                 workspace,
             },

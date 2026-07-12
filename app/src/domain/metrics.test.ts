@@ -2,13 +2,20 @@ import { describe, expect, it } from "vitest";
 
 import {
   blocksPerSecond,
+  formatAge,
   formatBound,
+  formatBytes,
+  formatBytesRate,
   formatLatency,
   formatRate,
   meanLatency,
   parseMetrics,
   perBucket,
+  planeDropTotal,
+  planeRxBytes,
+  planeTxBytes,
   quantile,
+  ratePerSecond,
 } from "./metrics";
 
 // A representative /metrics scrape: commonware runtime noise (must be ignored)
@@ -48,6 +55,33 @@ ducktape_blocks_total 2
 # TYPE ducktape_dispatch_total counter
 ducktape_dispatch_total{module="chat",origin="external"} 2
 ducktape_dispatch_total{module="tagging",origin="module"} 1
+# HELP ducktape_dataplane_open an open data plane, by service and creating module (1 = open).
+# TYPE ducktape_dataplane_open gauge
+ducktape_dataplane_open{service="voice",owner="chat"} 1
+ducktape_dataplane_open{service="gateway",owner="gateway"} 1
+# TYPE ducktape_dataplane_halted gauge
+ducktape_dataplane_halted{service="voice",owner="chat"} 0
+ducktape_dataplane_halted{service="gateway",owner="gateway"} 0
+# TYPE ducktape_dataplane_age_seconds gauge
+ducktape_dataplane_age_seconds{service="voice",owner="chat"} 90
+ducktape_dataplane_age_seconds{service="gateway",owner="gateway"} 3725
+# TYPE ducktape_dataplane_bytes gauge
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="tx",class="datagram"} 640000
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="rx",class="datagram"} 320000
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="tx",class="stream"} 0
+ducktape_dataplane_bytes{service="voice",owner="chat",dir="rx",class="stream"} 0
+ducktape_dataplane_bytes{service="gateway",owner="gateway",dir="tx",class="stream"} 150000
+ducktape_dataplane_bytes{service="gateway",owner="gateway",dir="rx",class="stream"} 98000
+# TYPE ducktape_dataplane_datagrams gauge
+ducktape_dataplane_datagrams{service="voice",owner="chat",dir="tx"} 4000
+ducktape_dataplane_datagrams{service="voice",owner="chat",dir="rx"} 2000
+# TYPE ducktape_dataplane_streams gauge
+ducktape_dataplane_streams{service="gateway",owner="gateway",kind="opened"} 12
+ducktape_dataplane_streams{service="gateway",owner="gateway",kind="accepted"} 7
+# TYPE ducktape_dataplane_drops gauge
+ducktape_dataplane_drops{service="voice",owner="chat",kind="shed"} 5
+ducktape_dataplane_drops{service="voice",owner="chat",kind="rogue_datagrams"} 2
+ducktape_dataplane_drops{service="gateway",owner="gateway",kind="refused_sends"} 0
 `;
 
 describe("parseMetrics", () => {
@@ -71,6 +105,39 @@ describe("parseMetrics", () => {
     ]);
   });
 
+  it("assembles the per-plane families into open planes, sorted", () => {
+    const m = parseMetrics(SCRAPE);
+    expect(m.planes).toHaveLength(2);
+
+    // sorted by service: gateway before voice.
+    const [gateway, voice] = m.planes;
+    expect(gateway.service).toBe("gateway");
+    expect(gateway.owner).toBe("gateway");
+    expect(gateway.ageSeconds).toBe(3725);
+    expect(gateway.halted).toBe(false);
+    expect(gateway.bytesTxStream).toBe(150000);
+    expect(gateway.bytesRxStream).toBe(98000);
+    expect(gateway.streamsOpened).toBe(12);
+    expect(gateway.streamsAccepted).toBe(7);
+    expect(gateway.drops).toEqual({ refused_sends: 0 });
+
+    expect(voice.service).toBe("voice");
+    expect(voice.owner).toBe("chat");
+    expect(voice.bytesTxDatagram).toBe(640000);
+    expect(voice.bytesRxDatagram).toBe(320000);
+    expect(voice.datagramsTx).toBe(4000);
+    expect(voice.datagramsRx).toBe(2000);
+    expect(voice.drops).toEqual({ shed: 5, rogue_datagrams: 2 });
+  });
+
+  it("keeps `present` a block-series fact: plane series alone don't set it", () => {
+    const m = parseMetrics(
+      '# TYPE ducktape_dataplane_open gauge\nducktape_dataplane_open{service="voice",owner="chat"} 1\n',
+    );
+    expect(m.present).toBe(false);
+    expect(m.planes).toHaveLength(1);
+  });
+
   it("reads a node with only runtime series as not-present (an older binary)", () => {
     const m = parseMetrics(
       "# TYPE runtime_x counter\nruntime_x_total 3\nchat_commit_calls_total 1\n",
@@ -78,6 +145,7 @@ describe("parseMetrics", () => {
     expect(m.present).toBe(false);
     expect(m.blocksTotal).toBe(0);
     expect(m.dispatches).toEqual([]);
+    expect(m.planes).toEqual([]);
   });
 
   it("survives an empty / whitespace body", () => {
@@ -116,6 +184,17 @@ describe("derivations", () => {
     expect(blocksPerSecond(10, 20, 2000)).toBe(5); // +10 over 2s
     expect(blocksPerSecond(20, 5, 1000)).toBe(0); // counter reset
     expect(blocksPerSecond(10, 20, 0)).toBe(0); // no elapsed time
+    expect(ratePerSecond(0, 500_000, 2000)).toBe(250_000); // bytes ride the same math
+  });
+
+  it("totals a plane's directions and drops", () => {
+    const [gateway, voice] = parseMetrics(SCRAPE).planes;
+    expect(planeTxBytes(gateway)).toBe(150000);
+    expect(planeRxBytes(gateway)).toBe(98000);
+    expect(planeDropTotal(gateway)).toBe(0);
+    expect(planeTxBytes(voice)).toBe(640000);
+    expect(planeRxBytes(voice)).toBe(320000);
+    expect(planeDropTotal(voice)).toBe(7);
   });
 });
 
@@ -136,5 +215,23 @@ describe("formatting", () => {
   it("formats a rate", () => {
     expect(formatRate(4.2)).toBe("4.20 /s");
     expect(formatRate(42)).toBe("42.0 /s");
+  });
+
+  it("scales bytes across SI units", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(512)).toBe("512 B");
+    expect(formatBytes(1350)).toBe("1.35 kB");
+    expect(formatBytes(24_000_000)).toBe("24.0 MB");
+    expect(formatBytes(3_200_000_000)).toBe("3.20 GB");
+    expect(formatBytes(-1)).toBe("—");
+    expect(formatBytesRate(1350)).toBe("1.35 kB/s");
+  });
+
+  it("ages in the two most significant units", () => {
+    expect(formatAge(45)).toBe("45s");
+    expect(formatAge(90)).toBe("1m 30s");
+    expect(formatAge(3725)).toBe("1h 2m");
+    expect(formatAge(2 * 86400 + 3 * 3600)).toBe("2d 3h");
+    expect(formatAge(-1)).toBe("—");
   });
 });
