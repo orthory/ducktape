@@ -81,7 +81,7 @@ fn main() {
         let valset = Valset::new("valset");
         let saga = SagaModule::new("saga");
         let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
-        let tagging = tagging::TaggingModule::new("tagging");
+        let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         // the deterministic user->nodes binding registry: no valset gating and
         // a fixed demo chain id (the demo has no real network descriptor).

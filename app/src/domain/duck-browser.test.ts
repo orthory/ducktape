@@ -86,7 +86,8 @@ describe("browser authority boundaries", () => {
 
     // The committed .manifest.json carries the canonically-ordered file table,
     // and the returned hash is its exact byte digest.
-    const request = vi.mocked(transport.filesCommit).mock.calls.at(-1)![0] as {
+    const calls = vi.mocked(transport.filesCommit).mock.calls;
+    const request = calls[calls.length - 1]![0] as {
       changes: { put: { path: string; content: { inline: { b64: string } } } }[];
     };
     const put = request.changes[0].put;

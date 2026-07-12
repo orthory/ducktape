@@ -138,6 +138,11 @@ pub enum PageMsg {
         comment_id: String,
         target: String,
         text: String,
+        /// Structured mentions carried by this comment. Only agent refs are
+        /// translated into tagging-plane entities; default keeps old payloads
+        /// wire-compatible.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<AuthorRef>,
         /// `default` so a pre-M2 payload without the key still decodes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_agent: Option<String>,

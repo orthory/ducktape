@@ -211,3 +211,34 @@ export const hasAgentMention = (blocks: ChatBlock[]): boolean =>
     const spans = "paragraph" in block ? block.paragraph : block.quote;
     return spans.some(spanMentionsAgent);
   });
+
+/** Distinct structured agent refs carried by parsed blocks, in text order.
+ * Pages comments use the same parser even though they store plain text, so
+ * invocation never depends on reparsing an arbitrary `@word` in consensus. */
+export const agentMentions = (blocks: ChatBlock[]): AuthorRef[] => {
+  const mentions: AuthorRef[] = [];
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    if (block === "divider" || "code" in block) continue;
+    const spans = "paragraph" in block ? block.paragraph : block.quote;
+    for (const span of spans) {
+      for (const mark of span.marks) {
+        if (
+          typeof mark !== "object" ||
+          !("mention" in mark) ||
+          typeof mark.mention !== "object" ||
+          !("agent" in mark.mention)
+        ) {
+          continue;
+        }
+        const ref = mark.mention;
+        if (!("agent" in ref)) continue;
+        const key = `${ref.agent.module}\u001f${ref.agent.agent_id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        mentions.push(ref);
+      }
+    }
+  }
+  return mentions;
+};

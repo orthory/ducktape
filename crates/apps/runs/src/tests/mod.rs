@@ -57,6 +57,8 @@ struct CaptureCtx {
     /// arm (the M2 `[[page:<id>]]` injection lane); the GetBlock arm scans
     /// these pages by block id (the pages-effects target resolution).
     pages: BTreeMap<String, Vec<pages::Block>>,
+    /// explicit committed page comment threads used by Pages-triggered runs.
+    page_threads: BTreeMap<String, pages::ThreadView>,
     /// thread/comment ids the pages module already holds — the squat
     /// simulation the CommentThread/GetComment freshness probes hit.
     taken_page_ids: BTreeSet<String>,
@@ -90,6 +92,7 @@ impl CaptureCtx {
             forge_items: BTreeMap::new(),
             saga_assignees: BTreeMap::new(),
             pages: BTreeMap::new(),
+            page_threads: BTreeMap::new(),
             taken_page_ids: BTreeSet::new(),
             page_target_threads: BTreeMap::new(),
             files_head: None,
@@ -134,6 +137,10 @@ impl CaptureCtx {
     /// the "pages" GetPage arm.
     fn with_page(mut self, page_id: &str, blocks: Vec<pages::Block>) -> Self {
         self.pages.insert(page_id.into(), blocks);
+        self
+    }
+    fn with_page_thread(mut self, view: pages::ThreadView) -> Self {
+        self.page_threads.insert(view.thread.id.clone(), view);
         self
     }
     /// mark a thread/comment id as already minted in the pages module (the
@@ -440,9 +447,11 @@ impl Ctx for CaptureCtx {
                 )),
                 pages::PageQuery::CommentThread { thread_id } => Ok(pages::encode_reply(
                     &pages::PageReply::CommentThread(
-                        self.taken_page_ids
-                            .contains(&thread_id)
-                            .then(|| dummy_thread_view(&thread_id)),
+                        self.page_threads.get(&thread_id).cloned().or_else(|| {
+                            self.taken_page_ids
+                                .contains(&thread_id)
+                                .then(|| dummy_thread_view(&thread_id))
+                        }),
                     ),
                 )),
                 pages::PageQuery::GetComment { comment_id } => Ok(pages::encode_reply(

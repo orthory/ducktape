@@ -1,8 +1,31 @@
 use super::{
-    BlockKind, BufferPooler, Context, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId, Msg,
-    PAGE_INDEX_KEY, PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget,
-    StateRoot, StateSyncHandle, TargetThreads, decode_msg, decode_query, encode_reply, hash_key,
+    AuthorRef, BlockKind, BufferPooler, Context, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId,
+    Msg, PAGE_INDEX_KEY, PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget,
+    StateRoot, StateSyncHandle, TagEvent, TaggingMsg, TargetThreads, decode_msg, decode_query,
+    encode_reply, hash_key,
 };
+
+fn tag_author(author: &AuthorRef) -> tagging::Author {
+    match author {
+        AuthorRef::User(key) => tagging::Author::User(key.clone()),
+        AuthorRef::Agent { module, agent_id } => tagging::Author::Entity(tagging::EntityRef {
+            module: module.clone(),
+            entity: agent_id.clone(),
+        }),
+        AuthorRef::Module(module) => tagging::Author::Module(module.clone()),
+        AuthorRef::System => tagging::Author::System,
+    }
+}
+
+fn tag_ref(author: &AuthorRef) -> Option<tagging::EntityRef> {
+    match author {
+        AuthorRef::Agent { module, agent_id } => Some(tagging::EntityRef {
+            module: module.clone(),
+            entity: agent_id.clone(),
+        }),
+        _ => None,
+    }
+}
 
 #[async_trait::async_trait(?Send)]
 impl<E> Module for Pages<E>
@@ -39,13 +62,52 @@ where
     /// `.await` is on own qmdb state — deterministic, so replay-safe.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let m = decode_msg(&msg.payload).map_err(Error::Module)?;
+        let tagged_comment = match &m {
+            super::PageMsg::AddComment {
+                thread_id,
+                comment_id,
+                mentions,
+                ..
+            } => Some((thread_id.clone(), comment_id.clone(), mentions.clone())),
+            _ => None,
+        };
         // origin + consensus time feed the comment ops (author + timestamp);
         // block ops ignore them. clone off `ctx` so `self` can borrow mutably.
         let origin = ctx.env().origin.clone();
         let now = ctx.env().consensus_time;
         self.apply(m, &origin, now)
             .await
-            .map_err(|e| Error::Module(e.to_string()))
+            .map_err(|e| Error::Module(e.to_string()))?;
+        if let (Some(tagging), Some((thread_id, comment_id, mentions))) =
+            (&self.tagging, tagged_comment)
+        {
+            let thread = self
+                .load_thread(&thread_id)
+                .await
+                .map_err(|e| Error::Module(e.to_string()))?
+                .ok_or_else(|| Error::Module("staged comment thread is missing".into()))?;
+            let comment = self
+                .load_comment(&comment_id)
+                .await
+                .map_err(|e| Error::Module(e.to_string()))?
+                .ok_or_else(|| Error::Module("staged comment is missing".into()))?;
+            let ordinal = thread
+                .comment_ids
+                .iter()
+                .position(|id| id == &comment_id)
+                .map(|index| index as u64 + 1)
+                .ok_or_else(|| Error::Module("staged comment is absent from its thread".into()))?;
+            ctx.emit_msg(Msg {
+                target: tagging.clone(),
+                payload: tagging::encode_msg(&TaggingMsg::Tag(TagEvent {
+                    container: thread_id,
+                    content_seq: ordinal,
+                    author: tag_author(&comment.author),
+                    tags: mentions.iter().filter_map(tag_ref).collect(),
+                })),
+            });
+        }
+        Ok(())
     }
 
     /// real async read of own qmdb state, serving STAGED-over-committed via

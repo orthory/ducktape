@@ -231,7 +231,7 @@ fn run_node(
         // next-block result delivery.
         let dispatch = DispatchModule::new("dispatch", "saga");
         // the engagement plane: tag reports in, engagement events out.
-        let tagging = TaggingModule::new("tagging");
+        let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
@@ -259,7 +259,9 @@ fn run_node(
         // the pages effects lane (pages.comment / pages.set_checked) writes
         // to; unwired, both degrade to breadcrumbs.
         .with_pages_module("pages");
-        let pages = Pages::init(context.child("pages"), "pages").await;
+        let pages = Pages::init(context.child("pages"), "pages")
+            .await
+            .with_tagging("tagging");
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).

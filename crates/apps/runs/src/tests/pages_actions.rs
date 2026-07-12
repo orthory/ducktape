@@ -2,6 +2,91 @@ use super::*;
 use agent::{ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED};
 use pages::PageMsg;
 
+fn page_trigger_thread() -> pages::ThreadView {
+    pages::ThreadView {
+        thread: pages::Thread {
+            id: "thread-1".into(),
+            target: "b-p".into(),
+            opener: pages::AuthorRef::User(vec![4; 32]),
+            created_at: 1,
+            resolved: false,
+            resolved_by: None,
+            comment_ids: vec!["comment-1".into()],
+        },
+        comments: vec![pages::Comment {
+            id: "comment-1".into(),
+            thread_id: "thread-1".into(),
+            author: pages::AuthorRef::User(vec![4; 32]),
+            text: "@bot review".into(),
+            created_at: 1,
+            edited_at: None,
+            deleted: false,
+        }],
+    }
+}
+
+#[test]
+fn pages_triggered_run_replies_in_the_same_comment_thread() {
+    let mut registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
+    registry.get_mut("bot").unwrap().caps.pages_write = vec!["p1".into()];
+    let mut m = module()
+        .with_files_module("files")
+        .with_pages_module("pages");
+    let mut engage_ctx = CaptureCtx::new()
+        .with_tagging_origin()
+        .with_registry(&registry)
+        .with_page("p1", page_blocks("p1", "Spec"))
+        .with_page_thread(page_trigger_thread());
+    let engagement = Msg {
+        target: "runs".into(),
+        payload: tagging_encode_event(&EngagementEvent {
+            source: "pages".into(),
+            container: "thread-1".into(),
+            content_seq: 1,
+            author: Author::User(vec![4; 32]),
+            tags: vec![agent_tag("bot")],
+        }),
+    };
+    exec(&mut m, &mut engage_ctx, &engagement).unwrap();
+    commit(&mut m);
+
+    let run_id = page_run_id_for("thread-1", 1, "bot");
+    let mut delivery = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_page("p1", page_blocks("p1", "Spec"))
+        .with_page_thread(page_trigger_thread());
+    exec(
+        &mut m,
+        &mut delivery,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper("Reviewed.", serde_json::json!({}))),
+        ),
+    )
+    .unwrap();
+    assert!(delivery.chat_msgs().is_empty());
+    let replies = delivery.page_msgs();
+    assert_eq!(replies.len(), 1);
+    let PageMsg::AddComment {
+        thread_id,
+        target,
+        text,
+        mentions,
+        as_agent,
+        ..
+    } = &replies[0]
+    else {
+        panic!("expected page comment reply")
+    };
+    assert_eq!(thread_id, "thread-1");
+    assert_eq!(target, "b-p");
+    assert_eq!(text, "Reviewed.");
+    assert!(mentions.is_empty());
+    assert_eq!(as_agent.as_deref(), Some("bot"));
+}
+
 // ---- the pages effects lane (M2) ---------------------------------------------
 // pages.comment / pages.set_checked applied at the run boundary: grant + cap
 // gated, probe-guarded, and — unlike the task lane — degrading PER ACTION.
@@ -65,6 +150,7 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
         comment_id,
         target,
         text,
+        mentions,
         as_agent,
     } = &msgs[0]
     else {
@@ -78,6 +164,7 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
     assert!(pages::id_is_index_safe(thread_id) && pages::id_is_index_safe(comment_id));
     assert_eq!(target, "b-p");
     assert_eq!(text, "looks good");
+    assert!(mentions.is_empty());
     assert_eq!(
         as_agent.as_deref(),
         Some("bot"),

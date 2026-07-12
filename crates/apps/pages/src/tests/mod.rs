@@ -25,6 +25,7 @@ fn msg(m: &PageMsg) -> Msg {
 // a minimal Ctx so execute can be driven without a full host.
 struct TestCtx {
     env: sdk::Env,
+    msgs: Vec<Msg>,
 }
 impl TestCtx {
     fn new() -> Self {
@@ -36,6 +37,7 @@ impl TestCtx {
                 origin: sdk::Origin::System,
                 me: "pages".into(),
             },
+            msgs: Vec::new(),
         }
     }
 }
@@ -50,7 +52,9 @@ impl Ctx for TestCtx {
     async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::QueryUnsupported)
     }
-    fn emit_msg(&mut self, _m: Msg) {}
+    fn emit_msg(&mut self, m: Msg) {
+        self.msgs.push(m);
+    }
     fn emit_event(&mut self, _e: sdk::Event) {}
     fn request_effect(&mut self, _e: sdk::Effect) {}
 }
@@ -126,6 +130,7 @@ fn ctx_as(origin: sdk::Origin) -> TestCtx {
             origin,
             me: "pages".into(),
         },
+        msgs: Vec::new(),
     }
 }
 async fn apply_commit_as<E: Context + BufferPooler>(

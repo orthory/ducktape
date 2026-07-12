@@ -38,6 +38,7 @@ import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
 import {
+  agentMentions,
   hasAgentMention,
   mentionableUsers,
   mentionResolverOf,
@@ -1872,8 +1873,15 @@ export function createActions({
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
+      const mentions = agentMentions(parseMessageInput(clean, mentionResolver()));
       submitTracked(opKey.commentThread(tid), (live) =>
-        pagesClient.addComment(live, { threadId: tid, commentId, target, text: clean }),
+        pagesClient.addComment(live, {
+          threadId: tid,
+          commentId,
+          target,
+          text: clean,
+          mentions,
+        }),
       ).then(() => loadPageThreads());
     },
 

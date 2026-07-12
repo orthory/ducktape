@@ -376,7 +376,7 @@ fn run_sim(
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
-        let tagging = TaggingModule::new("tagging");
+        let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
@@ -398,7 +398,9 @@ fn run_sim(
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
         .with_pages_module("pages");
-        let pages = Pages::init(context.child("pages"), "pages").await;
+        let pages = Pages::init(context.child("pages"), "pages")
+            .await
+            .with_tagging("tagging");
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")
             .with_chat("chat");

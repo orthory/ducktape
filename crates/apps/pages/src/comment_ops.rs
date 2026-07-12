@@ -39,7 +39,7 @@ where
 {
     // ── comment storage (reserved NUL-prefixed keys) ──
 
-    async fn load_thread(&self, id: &str) -> Result<Option<Thread>, PageError> {
+    pub(super) async fn load_thread(&self, id: &str) -> Result<Option<Thread>, PageError> {
         match self.get(thread_key(id).as_bytes()).await {
             Some(b) => Ok(Some(
                 serde_json::from_slice(&b).map_err(|_| PageError::Corrupt)?,
@@ -148,6 +148,7 @@ where
                 comment_id,
                 target,
                 text,
+                mentions: _,
                 as_agent,
             } => {
                 // bound the client-minted ids BEFORE staging: they drive the
