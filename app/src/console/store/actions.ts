@@ -892,12 +892,14 @@ export function createActions({
       .then(() => submit(live))
       .then((result) => {
         if (!isCurrentNode(live)) return false;
-        update((prev) => ({ ops: finalizeOp(prev.ops, key, receiptOf(result)) }));
+        update((prev) => ({
+          ops: finalizeOp(prev.ops, key, receiptOf(result), Date.now()),
+        }));
         return refresh().then(() => true);
       })
       .catch((err) => {
         if (!isCurrentNode(live)) return false;
-        update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
+        update((prev) => ({ ops: failOp(prev.ops, key, String(err), Date.now()) }));
         fail(err);
         // resolve false rather than reject: a failed op is already surfaced to
         // the user here, and rejecting would turn every caller that ignores the
