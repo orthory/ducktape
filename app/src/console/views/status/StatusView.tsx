@@ -27,12 +27,14 @@ import { LogsTab } from "./LogsTab";
 import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
 import { NodeFactsCard } from "./NodeFactsCard";
 import { PeersTab } from "./PeersTab";
+import { SandboxTab } from "./SandboxTab";
 
-type TabId = "overview" | "peers" | "permissions" | "logs";
+type TabId = "overview" | "peers" | "sandbox" | "permissions" | "logs";
 
 const TABS: ReadonlyArray<readonly [TabId, string]> = [
   ["overview", "Overview"],
   ["peers", "Connections"],
+  ["sandbox", "Sandbox"],
   ["permissions", "Permissions"],
   ["logs", "Logs"],
 ];
@@ -1172,6 +1174,8 @@ export function StatusView() {
       >
         {activeTab === "peers" ? (
           <PeersTab />
+        ) : activeTab === "sandbox" ? (
+          <SandboxTab />
         ) : activeTab === "permissions" ? (
           <PermissionsTab />
         ) : activeTab === "logs" ? (
