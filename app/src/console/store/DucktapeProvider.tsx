@@ -58,6 +58,13 @@ import {
   buildHuddleContext,
 } from "./huddle-window";
 import type { HuddleWindowCmd } from "./huddle-window";
+import {
+  latchOneShots,
+  navSnapshotOf,
+  navTransition,
+  readNavEntry,
+  stampNav,
+} from "./nav-history";
 import { reducer } from "./reducer";
 import { normalizeKey } from "../../domain/names";
 import {
@@ -1031,6 +1038,56 @@ export function DucktapeProvider({
       dispatch({ type: "patch", patch: { forgeFocus: null } });
     }
   }, [state.screen, state.forgeFocus]);
+
+  // 5d. Browser-history navigation (see nav-history.ts): apply traversal
+  //     (popstate — the webview's back/forward buttons) through the actions
+  //     facade, whose entry points re-fetch the restored target's data from
+  //     the node. The entry is then re-stamped with what was actually honored
+  //     (a vanished channel/page is skipped), so the stack and the store
+  //     converge instead of fighting over a dead target.
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      const entry = readNavEntry(event.state);
+      if (!entry) return;
+      window.history.replaceState(stampNav(actions.applyNavSnapshot(entry)), "");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [actions]);
+
+  // 5e. The outbound half: mirror the nav slice into history entries. Surface
+  //     moves push; boot hydration filling an empty selection slot replaces
+  //     (no phantom boot entries); a one-shot focus consumption latches into
+  //     the current entry (see latchOneShots) so traversing back re-issues the
+  //     hand-off. Deps are the nav slice ONLY — data churn (blocks, messages)
+  //     must never touch the history stack.
+  useEffect(() => {
+    const entry = readNavEntry(window.history.state);
+    const next = latchOneShots(navSnapshotOf(state), entry);
+    switch (navTransition(next, entry)) {
+      case "push":
+        window.history.pushState(stampNav(next), "");
+        return;
+      case "replace":
+        window.history.replaceState(stampNav(next), "");
+        return;
+      case "none":
+        return;
+    }
+  }, [
+    state.atHome,
+    state.screen,
+    state.viewMode,
+    state.activeChannel,
+    state.activePage,
+    state.forgeFocus,
+    state.forgeRepo,
+    state.explorerFocus,
+    state.agentFocus,
+    state.memberFocus,
+    state.workspace,
+    state.nodeUrl,
+  ]);
 
   // 6. Desktop notifier config push: the Rust notifier learns who "me" is (the
   //    identity account behind our node key and EVERY node bound to it), what

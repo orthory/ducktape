@@ -60,6 +60,8 @@ import {
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity } from "./auto-bind";
+import { navSnapshotOf } from "./nav-history";
+import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -132,6 +134,12 @@ export interface ConsoleActions {
    *  Jumps to the target rail's default surface when the current screen belongs
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
+  /** Apply a browser-history entry's nav snapshot — the popstate half of
+   *  back/forward (see nav-history.ts). Selections re-apply through the
+   *  rehydrating entry points, so a restored surface re-fetches recent data;
+   *  returns the snapshot actually honored (vanished targets are skipped) for
+   *  the caller to re-stamp onto the entry. */
+  applyNavSnapshot(snap: NavSnapshot): NavSnapshot;
   setAccent(accent: string): void;
   /** Flip the light/dark color theme and persist the choice. */
   toggleTheme(): void;
@@ -1177,6 +1185,76 @@ export function createActions({
       });
   };
 
+  // ── Browser-history traversal ──
+  // Apply a history entry's NavSnapshot (see nav-history.ts) — the popstate
+  // half of browser back/forward. Selections route through the same entry
+  // points user clicks take (enterChannel / enterPage / the one-shot focus
+  // hand-offs), so every restored target re-fetches its data from the node
+  // rather than rendering a stale copy. Returns the snapshot actually
+  // honored — a selection whose target vanished from the committed data (or
+  // that another workspace minted) is skipped, and the caller re-stamps the
+  // entry with the honored result so the stack and the store converge.
+  const applyNavSnapshot = (snap: NavSnapshot): NavSnapshot => {
+    const before = getState();
+    // Gated bodies (onboarding, the join waiting room, a boot failure) own
+    // the window — traversal must not fight them.
+    if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
+      return navSnapshotOf(before);
+    }
+
+    // Selections apply only within the scope that minted them, only under the
+    // shell (never through the Home layer), and only when the target still
+    // exists in the recentmost committed data.
+    const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
+    const channel =
+      scopeMatches && snap.channel && before.channels.some((c) => c.id === snap.channel)
+        ? snap.channel
+        : null;
+    const page =
+      scopeMatches && snap.page && before.pages.some((p) => p.id === snap.page)
+        ? snap.page
+        : null;
+    const forge =
+      scopeMatches && snap.screen === "forge" && snap.forgeRepo
+        ? { repo: snap.forgeRepo, number: snap.forgeItem }
+        : null;
+    const explorer =
+      scopeMatches && snap.screen === "explorer" ? snap.explorer : null;
+    const agent = scopeMatches && snap.screen === "agent" ? snap.agent : null;
+    const member = scopeMatches && snap.screen === "members" ? snap.member : null;
+
+    // The entry recorded the LIVE rail, so adopt it verbatim — re-deriving via
+    // sectionForScreen would lose a shell screen's remembered rail.
+    saveViewMode(snap.viewMode);
+    patch({
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      ...(forge ? { forgeFocus: forge } : {}),
+      ...(explorer !== null ? { explorerFocus: explorer } : {}),
+      ...(agent ? { agentFocus: agent } : {}),
+      ...(member ? { memberFocus: member } : {}),
+    });
+    if (channel && channel !== before.activeChannel) enterChannel(channel);
+    if (page && page !== before.activePage) enterPage(page);
+
+    // Built from what was applied, not re-read: the reducer runs on the next
+    // render tick, so getState() here would still see the pre-apply state.
+    return {
+      scope: currentDocTabsScope(),
+      atHome: snap.atHome,
+      screen: snap.screen,
+      viewMode: snap.viewMode,
+      channel: channel ?? before.activeChannel,
+      page: page ?? before.activePage,
+      forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
+      forgeItem: forge ? forge.number : (before.forgeFocus?.number ?? null),
+      explorer: explorer ?? before.explorerFocus,
+      agent: agent ?? before.agentFocus,
+      member: member ?? before.memberFocus,
+    };
+  };
+
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
   // then either wait for a member's surface to answer, or poll a joiner's
   // park→promote phase until its promoted validator surface comes up.
@@ -1435,6 +1513,8 @@ export function createActions({
         patch({ screen: "forge", forgeFocus });
       }
     },
+
+    applyNavSnapshot,
 
     setViewMode: (mode) => {
       saveViewMode(mode);
