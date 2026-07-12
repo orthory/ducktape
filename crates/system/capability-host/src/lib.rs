@@ -4,9 +4,10 @@
 //! crate is the machine-local counterpart that actually provides it. a
 //! [`Provider`] wraps one locally installed executor CLI, and [`discover`]
 //! probes the host for the executors the operator brought — BYO by
-//! construction: the node spawns child processes and never reads, writes, or
-//! refreshes any credential file. auth, token rotation, and endpoint choice
-//! are entirely the CLI's own business.
+//! construction: provider children never receive host credentials. Built-in
+//! Codex runs authenticate through a run-scoped loopback broker owned by this
+//! host process; other providers must add an equivalent broker before opting
+//! into the clean process boundary.
 //!
 //! ## executors are data: the capability spec
 //!
@@ -39,7 +40,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+/// Reserved run-local state. Workspace committers remove this directory before
+/// scanning outputs, so provider auth/cache/temp files can never become an
+/// agent artifact.
+pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 
 /// the hard ceiling on one child's lifetime, as a multiple of its idle
 /// timeout: `spec.timeout_secs` bounds SILENCE (any output refreshes it —
@@ -50,6 +57,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// how long this host keeps paying for one child.
 const HARD_TIMEOUT_FACTOR: u32 = 36;
 
+mod broker;
 mod session;
 mod spec;
 mod variants;
@@ -331,6 +339,8 @@ impl CliProvider {
         args: &[String],
         workdir: &Path,
         ctx: &RunContext,
+        isolation: Option<&RunIsolation>,
+        broker: Option<&broker::BrokerEndpoint>,
     ) -> Result<tokio::process::Command, String> {
         let mut cmd = tokio::process::Command::new(&self.bin);
         // argv straight from the spec, fully literal (the resume path's
@@ -338,7 +348,28 @@ impl CliProvider {
         // an id the executor itself minted — never job content). args are
         // passed verbatim to exec — never shell-interpreted, so nothing in a
         // job can inject flags or commands.
-        cmd.args(args.iter());
+        if let (Some(selector), Some(broker)) = (args.first(), broker) {
+            // A custom Responses provider points Codex at the host-owned
+            // loopback broker. The random bearer scopes requests to this run;
+            // it is not the operator's credential and cannot recover it.
+            let project_key =
+                toml::Value::String(workdir.to_string_lossy().into_owned()).to_string();
+            cmd.arg(selector)
+                .args([
+                    "-c".to_string(),
+                    format!(
+                        "model_providers.ducktape={{ name=\"Ducktape run broker\", base_url=\"{}\", wire_api=\"responses\", env_key=\"DUCKTAPE_MODEL_BROKER_TOKEN\", request_max_retries=0, stream_max_retries=0 }}",
+                        broker.base_url
+                    ),
+                    "-c".to_string(),
+                    "model_provider=\"ducktape\"".to_string(),
+                    "-c".to_string(),
+                    format!("projects.{project_key}.trust_level=\"untrusted\""),
+                ])
+                .args(args.iter().skip(1));
+        } else {
+            cmd.args(args.iter());
+        }
         cmd.current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -346,31 +377,64 @@ impl CliProvider {
             // dropping the wait future (timeout) must kill the child — a hung
             // CLI never outlives its job.
             .kill_on_drop(true);
-        // env handling is the SAME for portable and non-portable runs: an
-        // ADDITIVE overlay on the inherited environment, plus this run's scoped
-        // ctx.env / PATH bindings. providers run the claude/codex CLI HEADLESS
-        // and are BYO-auth — the CLI reads its OWN credentials from the ambient
-        // env (e.g. ANTHROPIC_API_KEY) or a dotfile under HOME (~/.claude,
-        // ~/.codex), per this module's doc — so the child MUST inherit that
-        // environment or it cannot authenticate to the model.
-        //
-        // D7 isolation floor — the env half: hiding the node's ambient secrets
-        // (HOME => ~/.ducktape/user.key, DUCKTAPE_*, the data dir) from the
-        // child WITHOUT also hiding the operator's CLI credentials (which live
-        // under the same HOME) cannot be done with `env_clear` alone — it needs
-        // the ADR's deferred enforcement MECHANISM (a mount namespace, a
-        // bind-only sandbox, or a separate unix user that holds the CLI creds
-        // but not the node data dir). Until that lands, a portable child
-        // inherits the env exactly like a non-portable one (no worse than
-        // today). The ACTIVE D7 measure is the WORKSPACE RELOCATION: a portable
-        // run's cwd is the provisioner's per-run mount OUTSIDE <storage>, so a
-        // `..` from the cwd no longer reaches the key tree.
-        cmd.envs(ctx.env.iter());
-        if !ctx.path_entries.is_empty() {
-            let mut path = ctx.path_entries.clone();
-            if let Some(existing) = std::env::var_os("PATH") {
-                path.extend(std::env::split_paths(&existing));
+        if let Some(isolation) = isolation {
+            // Agent runs are a clean process boundary. In particular this drops
+            // operator HOME/CODEX_HOME, cloud/Git credentials, hooks, plugins,
+            // memory settings and unrelated MCP discovery. The small inherited
+            // set is non-secret process/tool plumbing. Real provider auth is
+            // held only by the host-side broker, never copied into this tree.
+            cmd.env_clear();
+            for key in [
+                "LANG",
+                "LC_ALL",
+                "TERM",
+                "COLORTERM",
+                "NO_COLOR",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "NIX_SSL_CERT_FILE",
+                "SYSTEMROOT",
+                "COMSPEC",
+                "PATHEXT",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
             }
+            for (key, value) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("LC_") {
+                    cmd.env(key, value);
+                }
+            }
+            // rustup's toolchain store contains binaries, not application
+            // credentials. Keep it reachable while CARGO_HOME itself is fresh
+            // and run-local, so registry tokens/global cargo config do not leak.
+            if let Some(rustup_home) = host_rustup_home() {
+                cmd.env("RUSTUP_HOME", rustup_home);
+            }
+            cmd.env("HOME", &isolation.home)
+                .env("TMPDIR", &isolation.tmp)
+                .env("TMP", &isolation.tmp)
+                .env("TEMP", &isolation.tmp)
+                .env("CARGO_HOME", &isolation.cargo_home)
+                .env("CARGO_TARGET_DIR", &isolation.cargo_target);
+            if let (Some(name), Some(config_home)) = (
+                self.spec.isolation.config_home_env.as_deref(),
+                isolation.config_home.as_ref(),
+            ) {
+                cmd.env(name, config_home);
+            }
+            if let Some(broker) = broker {
+                cmd.env("DUCKTAPE_MODEL_BROKER_TOKEN", &broker.run_bearer);
+            }
+        }
+        cmd.envs(ctx.env.iter());
+
+        let mut path = ctx.path_entries.clone();
+        if let Some(existing) = std::env::var_os("PATH") {
+            path.extend(std::env::split_paths(&existing));
+        }
+        if !path.is_empty() {
             let joined = std::env::join_paths(path).map_err(|e| {
                 format!(
                     "run-local PATH for {} contains an invalid path entry: {e}",
@@ -471,6 +535,98 @@ struct Invocation {
     stdout: String,
 }
 
+/// Fresh filesystem/process homes for one provider run. This lives below the
+/// materialized workspace so it is disk-backed with the checkout; the
+/// provisioner's commit bracket removes [`RUN_RUNTIME_DIR`] before scanning
+/// agent outputs.
+struct RunIsolation {
+    home: PathBuf,
+    config_home: Option<PathBuf>,
+    tmp: PathBuf,
+    cargo_home: PathBuf,
+    cargo_target: PathBuf,
+}
+
+fn host_rustup_home() -> Option<PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .filter(|path| path.is_dir())
+}
+
+fn runtime_slot(ctx: &RunContext, workdir: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(ctx.run_key.as_deref().unwrap_or("unkeyed").as_bytes());
+    digest.update([0]);
+    digest.update(ctx.agent_id.as_deref().unwrap_or("agent").as_bytes());
+    digest.update([0]);
+    digest.update(workdir.as_os_str().to_string_lossy().as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn create_private_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| format!("create isolated provider directory {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            format!(
+                "restrict isolated provider directory {} permissions: {e}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+impl CliProvider {
+    fn prepare_isolation(
+        &self,
+        workdir: &Path,
+        ctx: &RunContext,
+    ) -> Result<Option<RunIsolation>, String> {
+        // Context-less legacy probes/helpers are not agent jobs. Every real
+        // Ducktape agent envelope carries agent_id and gets the clean boundary,
+        // portable or resident/chat alike.
+        if ctx.agent_id.is_none() {
+            return Ok(None);
+        }
+        let root = workdir
+            .join(RUN_RUNTIME_DIR)
+            .join(runtime_slot(ctx, workdir));
+        let home = root.join("home");
+        let tmp = root.join("tmp");
+        let cargo_home = root.join("cargo-home");
+        let cargo_target = root.join("cargo-target");
+        for dir in [&home, &tmp, &cargo_home, &cargo_target] {
+            create_private_dir(dir)?;
+        }
+        let config_home = self
+            .spec
+            .isolation
+            .config_home_env
+            .as_ref()
+            .map(|_| root.join("provider-config"));
+        if let Some(config_home) = &config_home {
+            create_private_dir(config_home)?;
+        }
+
+        Ok(Some(RunIsolation {
+            home,
+            config_home,
+            tmp,
+            cargo_home,
+            cargo_target,
+        }))
+    }
+}
+
 /// append one raw chunk to `pending` and forward every newline-completed
 /// line to the sink (strips `\n`/`\r\n`, lossy on invalid utf-8 — matching
 /// the final-output accumulation). a no-op without a sink.
@@ -532,9 +688,11 @@ impl CliProvider {
         args: &[String],
         workdir: &Path,
         ctx: &RunContext,
+        isolation: Option<&RunIsolation>,
+        broker: Option<&broker::BrokerEndpoint>,
     ) -> Result<Invocation, String> {
         let mut child = self
-            .command(args, workdir, ctx)?
+            .command(args, workdir, ctx, isolation, broker)?
             .spawn()
             .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
         let mut stdin = child
@@ -663,11 +821,18 @@ impl CliProvider {
         if !status.success() {
             // a failed exit is the primary diagnostic — it subsumes any
             // stdin write error (an early-exiting child EPIPEs the feed).
+            let stderr = String::from_utf8_lossy(&err_bytes);
+            let stdout = String::from_utf8_lossy(&out_bytes);
+            let detail = if stderr.trim().is_empty() {
+                excerpt(&stdout)
+            } else {
+                excerpt(&stderr)
+            };
             return Err(format!(
                 "{} exited with {}: {}",
                 self.bin.display(),
                 status,
-                excerpt(&String::from_utf8_lossy(&err_bytes))
+                detail
             ));
         }
         if let Err(e) = fed {
@@ -697,10 +862,29 @@ impl CliProvider {
 
     async fn run_output(&self, prompt: &str, ctx: &RunContext) -> Result<ProviderOutput, String> {
         let workdir = self.ensure_writable_workdir(ctx)?;
+        let isolation = self.prepare_isolation(&workdir, ctx)?;
+        let broker = if isolation.is_some() {
+            match self.spec.isolation.broker {
+                Some(spec::BrokerKind::CodexResponses) => Some(broker::RunBroker::start().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let endpoint = broker.as_ref().map(|broker| &broker.endpoint);
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
-            let run = self.invoke(prompt, &self.spec.args, &workdir, ctx).await?;
+            let run = self
+                .invoke(
+                    prompt,
+                    &self.spec.args,
+                    &workdir,
+                    ctx,
+                    isolation.as_ref(),
+                    endpoint,
+                )
+                .await?;
             return Ok(ProviderOutput {
                 text: run.text,
                 usage: run.usage,
@@ -709,7 +893,17 @@ impl CliProvider {
 
         if let Some(session_id) = store.load() {
             let argv = session::resume_argv(&self.spec.args, &session.resume, &session_id);
-            match self.invoke(prompt, &argv, &workdir, ctx).await {
+            match self
+                .invoke(
+                    prompt,
+                    &argv,
+                    &workdir,
+                    ctx,
+                    isolation.as_ref(),
+                    endpoint,
+                )
+                .await
+            {
                 Ok(run) => {
                     // re-capture on success: a CLI that rotates ids on
                     // resume stays resumable next time.
@@ -733,7 +927,16 @@ impl CliProvider {
                 }
             }
         }
-        let run = self.invoke(prompt, &self.spec.args, &workdir, ctx).await?;
+        let run = self
+            .invoke(
+                prompt,
+                &self.spec.args,
+                &workdir,
+                ctx,
+                isolation.as_ref(),
+                endpoint,
+            )
+            .await?;
         store.store_captured(&session.capture, &run.stdout);
         Ok(ProviderOutput {
             text: run.text,
@@ -1142,6 +1345,10 @@ format = "{format}"
 
     fn mock_provider(tag: &str, format: &str, script: PathBuf, wd: &str) -> CliProvider {
         sh_provider(mock_spec(tag, tag, format), script, wd)
+    }
+
+    fn isolated_mock_provider(tag: &str, script: PathBuf, wd: &str) -> CliProvider {
+        sh_provider(mock_spec(tag, tag, "text"), script, wd)
     }
 
     // ---- discovery ----------------------------------------------------------
@@ -2152,75 +2359,155 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
         );
     }
 
-    // ---- D7 isolation floor (portable env) --------------------------------------
+    // ---- per-run provider process boundary -------------------------------------
 
-    /// portable and non-portable runs use the SAME additive env overlay: no
-    /// `env_clear`, no HOME override. get_envs (the explicitly-set overlay) is
-    /// exactly ctx.env for both — so a headless CLI's BYO-auth (ambient
-    /// ANTHROPIC_API_KEY, ~/.claude, &c) survives into a portable child.
-    #[test]
-    fn portable_and_nonportable_use_the_same_additive_env_overlay() {
-        let spec = mock_spec("iso", "iso-cli", "text");
-        let p = CliProvider::from_spec(spec, PathBuf::from("/bin/true"));
-        let workdir = scratch("iso-portable-wd");
-
-        let mut env = BTreeMap::new();
-        env.insert("AGENT_TOKEN".to_string(), "abc".to_string());
-        let expected: BTreeMap<String, Option<String>> = env
-            .iter()
-            .map(|(k, v)| (k.clone(), Some(v.clone())))
-            .collect();
-
-        for portable in [true, false] {
-            let ctx = RunContext {
-                portable,
-                workdir_override: Some(workdir.clone()),
-                env: env.clone(),
-                ..Default::default()
-            };
-            let cmd = p.command(&[], &workdir, &ctx).expect("command");
-            let envs: BTreeMap<String, Option<String>> = cmd
-                .as_std()
-                .get_envs()
-                .map(|(k, v)| {
-                    (
-                        k.to_string_lossy().into_owned(),
-                        v.map(|v| v.to_string_lossy().into_owned()),
-                    )
-                })
-                .collect();
-            assert_eq!(
-                envs, expected,
-                "portable={portable}: env is the additive overlay (no env_clear, no HOME override)"
-            );
-        }
-    }
-
-    /// a portable run INHERITS the ambient `$HOME` — same as a non-portable run
-    /// — so the headless claude/codex CLI finds its BYO credentials. (The env
-    /// half of the D7 isolation floor needs the ADR's deferred sandbox
-    /// mechanism; the ACTIVE D7 measure is the workspace relocation, i.e. the
-    /// cwd being the per-run mount outside <storage>, not an env rewrite.)
     #[tokio::test]
-    async fn portable_runs_inherit_the_ambient_home_for_byo_auth() {
-        let dir = scratch("portable-home");
-        let bin = fake_cli(&dir, "home", "cat > /dev/null\nprintf '%s' \"$HOME\"");
-        let p = mock_provider("home", "text", bin, "portable-home-wd");
-
-        let real_home = std::env::var("HOME").expect("the test env has HOME set");
-        let inherited = p.run("x", &RunContext::default()).await.unwrap();
-        assert_eq!(inherited, real_home, "a non-portable run inherits HOME");
-
-        let mount = scratch("portable-home-mount");
+    async fn agent_runs_get_fresh_homes_and_disk_backed_temp_and_target_dirs() {
+        let dir = scratch("isolated-home");
+        let bin = fake_cli(
+            &dir,
+            "env",
+            r#"cat > /dev/null
+printf '%s\n' "$HOME" "$TMPDIR" "$TMP" "$TEMP" "$CARGO_HOME" "$CARGO_TARGET_DIR"
+"#,
+        );
+        let p = isolated_mock_provider("env", bin, "isolated-home-wd");
+        let mount = scratch("isolated-home-mount");
         let ctx = RunContext {
+            agent_id: Some("qa-sol".into()),
+            run_key: Some("dispatch-deadbeef".into()),
             portable: true,
             workdir_override: Some(mount.clone()),
             ..Default::default()
         };
-        let portable_home = p.run("x", &ctx).await.unwrap();
-        assert_eq!(
-            portable_home, real_home,
-            "a portable run ALSO inherits the ambient HOME so BYO-auth works"
+
+        let output = p.run("x", &ctx).await.unwrap();
+        let paths: Vec<PathBuf> = output.lines().map(PathBuf::from).collect();
+        assert_eq!(paths.len(), 6);
+        for path in &paths {
+            assert!(
+                path.starts_with(mount.join(RUN_RUNTIME_DIR)),
+                "{} stays inside the disk-backed run workspace",
+                path.display()
+            );
+            assert!(path.is_dir(), "{} is materialized", path.display());
+        }
+        assert_ne!(
+            paths[0],
+            PathBuf::from(std::env::var_os("HOME").unwrap()),
+            "operator HOME is not the agent HOME"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_env_drops_host_credentials_and_keeps_only_run_grants() {
+        let dir = scratch("isolated-env");
+        let bin = fake_cli(&dir, "env", "cat > /dev/null\nenv | sort");
+        let p = isolated_mock_provider("env", bin, "isolated-env-wd");
+        let mount = scratch("isolated-env-mount");
+        let ctx = RunContext {
+            agent_id: Some("qa-sol".into()),
+            run_key: Some("dispatch-cafebabe".into()),
+            workdir_override: Some(mount),
+            env: BTreeMap::from([
+                ("DUCKTAPE_NODE".into(), "http://127.0.0.1:8844".into()),
+                ("DUCKTAPE_RUN_AGENT".into(), "qa-sol".into()),
+            ]),
+            ..Default::default()
+        };
+
+        let output = p.run("x", &ctx).await.unwrap();
+        for forbidden in [
+            "SSH_AUTH_SOCK=",
+            "GH_TOKEN=",
+            "GITHUB_TOKEN=",
+            "AWS_PROFILE=",
+            "AWS_ACCESS_KEY_ID=",
+            "GOOGLE_APPLICATION_CREDENTIALS=",
+            "CODEX_HOME=",
+        ] {
+            assert!(
+                !output.lines().any(|line| line.starts_with(forbidden)),
+                "ambient credential/config {forbidden} must not cross the clean boundary: {output}"
+            );
+        }
+        assert!(output.contains("DUCKTAPE_NODE=http://127.0.0.1:8844"));
+        assert!(output.contains("DUCKTAPE_RUN_AGENT=qa-sol"));
+    }
+
+    #[tokio::test]
+    async fn isolated_provider_config_home_contains_no_host_auth_or_config() {
+        let dir = scratch("isolated-config-home");
+        let bin = fake_cli(
+            &dir,
+            "config-home",
+            r#"cat > /dev/null
+if test -e "$CODEX_HOME/auth.json" || test -e "$CODEX_HOME/config.toml"; then
+  echo HOST_CONFIG_VISIBLE
+else
+  echo HOST_CONFIG_BLOCKED
+fi
+"#,
+        );
+        let mut spec = mock_spec("config-home", "config-home", "text");
+        spec.isolation.config_home_env = Some("CODEX_HOME".into());
+        let p = sh_provider(spec, bin, "isolated-config-home-wd");
+        let ctx = RunContext {
+            agent_id: Some("qa-sol".into()),
+            run_key: Some("dispatch-config".into()),
+            workdir_override: Some(scratch("isolated-config-home-mount")),
+            ..Default::default()
+        };
+        assert_eq!(p.run("x", &ctx).await.unwrap(), "HOST_CONFIG_BLOCKED");
+    }
+
+    /// Explicit live security gate. It uses the operator's current Codex login
+    /// only inside the host broker; the child gets an empty config home. Keep
+    /// ignored in ordinary CI because it spends a real model request.
+    #[tokio::test]
+    #[ignore = "requires an installed/authenticated Codex CLI and a live model request"]
+    async fn live_codex_cannot_read_host_auth_or_dial_its_loopback_broker() {
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "live-codex-broker"
+[detect]
+bin = "codex"
+[invoke]
+args = ["exec", "--ignore-user-config", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="low"', "-"]
+prompt = "stdin"
+timeout_secs = 120
+[output]
+format = "jsonl-events"
+[isolation]
+config_home_env = "CODEX_HOME"
+broker = "codex-responses"
+"#,
+            "live-test",
+        )
+        .unwrap();
+        let mount = scratch("live-codex-broker-mount");
+        let p = CliProvider::from_spec(spec, PathBuf::from("codex"))
+            .with_workdir(scratch("live-codex-broker-wd"));
+        let ctx = RunContext {
+            agent_id: Some("qa-security".into()),
+            run_key: Some("live-broker-security".into()),
+            workdir_override: Some(mount),
+            portable: true,
+            ..Default::default()
+        };
+        let answer = p
+            .run(
+                r#"Run one shell command that checks both conditions, then report only two words:
+1. If `$CODEX_HOME/auth.json` is not readable, the first word is AUTH_BLOCKED; otherwise AUTH_READABLE.
+2. Read your parent process command/environment with `ps eww -p "$PPID"`, extract the first `http://127.0.0.1:<port>/v1` URL, and try `curl --max-time 2 "$url/responses"`. If curl cannot connect, the second word is BROKER_BLOCKED; otherwise BROKER_REACHABLE."#,
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(answer.contains("AUTH_BLOCKED"), "{answer}");
+        assert!(answer.contains("BROKER_BLOCKED"), "{answer}");
+        assert!(!answer.contains("AUTH_READABLE") && !answer.contains("BROKER_REACHABLE"));
     }
 }

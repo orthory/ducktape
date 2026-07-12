@@ -68,9 +68,13 @@ in the same trust class as a shell profile or a systemd unit:
   the spec's argv encodes. Fence flags live in the spec — audit them when you
   audit the spec.
 
-**BYO auth is the point.** The node never reads, writes, or refreshes any
-credential file. If the executor needs a login or an API key in *its* config,
-that is between the operator and the executor.
+**Host-owned auth is the point.** An isolated provider child must never receive
+the operator's credential file or token. The Codex built-in uses a run-scoped,
+loopback-only Responses broker: the host reads the existing OAuth/API
+credential, while Codex receives only an unrelated opaque run bearer and a
+localhost base URL. The sandbox cannot dial localhost, and the broker accepts
+only bounded `POST /v1/responses` traffic for that run. Other executors need an
+equivalent broker before enabling isolation; copying auth into HOME is forbidden.
 
 ---
 
@@ -177,6 +181,7 @@ format = "text"
 | `spec` | integer | yes | must be `1` |
 | `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
 | `[session]` | table | no | thread-continuity capture/resume — see [Session](#session--thread-continuity) |
+| `[isolation]` | table | no | clean child HOME/env and optional host auth broker — see [Isolation](#isolation--clean-process-and-host-auth-broker) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
@@ -226,11 +231,42 @@ being silently ignored.
 | `resume_args` | string array | exactly one of the two | FULL replacement resume argv; must carry the `{session_id}` slot |
 | `resume_args_append` | string array | exactly one of the two | appended to the spec's own `args`; must carry the `{session_id}` slot |
 
+### `[isolation]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `config_home_env` | string | no | executor config-home env name such as `CODEX_HOME`; must match `[A-Z_][A-Z0-9_]*` |
+| `broker` | string | no | currently only `"codex-responses"`; credentials remain in the host process |
+
 ### `[tools]`
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `args` | string array | yes (when the section is present) | spliced into every argv the file produces, immediately after `args[0]` |
+
+---
+
+## Isolation — clean process and host auth broker
+
+Every agent-carrying run gets an empty inherited environment plus fresh
+run-local `HOME`, temp, Cargo home, and Cargo target directories. The optional
+`[isolation]` section adds an executor config home and/or a host auth broker.
+`config_home_env` points the executor at another fresh directory under the
+same reserved runtime tree. Runtime state is removed
+before DuckFS or Forge scans output, so it cannot enter a snapshot or commit.
+
+```toml
+[isolation]
+config_home_env = "CODEX_HOME"
+broker = "codex-responses"
+```
+
+The broker is intentionally not a generic proxy: it binds an ephemeral
+loopback port, requires a random per-run bearer, accepts only Responses POSTs,
+enforces body/response/total byte, concurrency, and request-count budgets, and
+is torn down when the provider run ends. It replaces the opaque bearer with
+the host credential only on the upstream hop. The provider child never gets
+`auth.json`, `OPENAI_API_KEY`, or the upstream bearer.
 
 ---
 

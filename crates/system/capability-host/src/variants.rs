@@ -118,6 +118,7 @@ pub(crate) fn expand(
             output: base.output,
             workspace: base.workspace,
             session,
+            isolation: base.isolation.clone(),
         });
     }
     Ok(specs)
@@ -354,24 +355,6 @@ resume_args = ["resume", "stale-id"]
         }
     }
 
-    /// how many args the codex spec's `[tools]` section splices in. read off the
-    /// LOADED spec rather than hardcoded, so adding a tool flag moves the resume
-    /// assertion with it instead of breaking it.
-    fn spec_tool_arg_count() -> usize {
-        let base = builtin_specs()
-            .iter()
-            .find(|s| s.tag == "codex")
-            .expect("the codex base spec")
-            .args
-            .clone();
-        // everything between the `exec` subcommand and the first non-tool flag
-        // (`--json`) is the spliced tool block.
-        base.iter()
-            .position(|a| a == "--json")
-            .expect("codex's base argv carries --json")
-            - 1
-    }
-
     #[test]
     fn embedded_curated_matrix_pins_the_shipped_tags_and_argv() {
         // a DATA regression test, deliberately unlike the executor-agnostic
@@ -397,6 +380,17 @@ resume_args = ["resume", "stale-id"]
                 "mcp_servers.ducktape.command=\"ducktape-mcp\"",
                 "-c",
                 "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
+                "-c",
+                "features.apps=false",
+                "-c",
+                "features.multi_agent=false",
+                "-c",
+                "features.memories=false",
+                "-c",
+                "features.hooks=false",
+                "-c",
+                "tools.web_search=false",
+                "--ignore-user-config",
                 "--json",
                 "--sandbox",
                 "workspace-write",
@@ -412,6 +406,8 @@ resume_args = ["resume", "stale-id"]
                 "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape-mcp\"}}}",
                 "--allowedTools",
                 "mcp__ducktape",
+                "--bare",
+                "--strict-mcp-config",
                 "--output-format",
                 "json",
                 "--permission-mode",
@@ -429,6 +425,17 @@ resume_args = ["resume", "stale-id"]
                 "mcp_servers.ducktape.command=\"ducktape-mcp\"",
                 "-c",
                 "mcp_servers.ducktape.default_tools_approval_mode=\"approve\"",
+                "-c",
+                "features.apps=false",
+                "-c",
+                "features.multi_agent=false",
+                "-c",
+                "features.memories=false",
+                "-c",
+                "features.hooks=false",
+                "-c",
+                "tools.web_search=false",
+                "--ignore-user-config",
                 "--json",
                 "--sandbox",
                 "workspace-write",
@@ -448,6 +455,8 @@ resume_args = ["resume", "stale-id"]
                 "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape-mcp\"}}}",
                 "--allowedTools",
                 "mcp__ducktape",
+                "--bare",
+                "--strict-mcp-config",
                 "--output-format",
                 "json",
                 "--permission-mode",
@@ -489,10 +498,14 @@ resume_args = ["resume", "stale-id"]
                     .windows(2)
                     .position(|w| w == ["resume", "{session_id}"])
                     .expect("the subcommand resume shape carries `resume <id>`");
-                let tool_args_end = 1 + spec_tool_arg_count();
+                let isolated_config_at = args
+                    .iter()
+                    .position(|arg| arg == "--ignore-user-config")
+                    .expect("resume argv disables ambient config");
                 assert_eq!(
-                    resume_at, tool_args_end,
-                    "`resume <id>` must sit immediately after the spliced tool args: {args:?}"
+                    resume_at,
+                    isolated_config_at + 1,
+                    "`resume <id>` must sit after tool args and the config-isolation flag: {args:?}"
                 );
                 assert!(
                     args.windows(2).any(|w| w == ["-m", "gpt-5.5"]),

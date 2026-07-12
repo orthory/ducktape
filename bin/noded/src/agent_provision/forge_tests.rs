@@ -706,9 +706,13 @@ async fn a_clean_tree_yields_no_changes_and_no_push() {
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
+    let runtime = ws.workdir().join(capability_host::RUN_RUNTIME_DIR);
+    std::fs::create_dir_all(runtime.join("provider-config")).unwrap();
+    std::fs::write(runtime.join("provider-config/auth.json"), "must-not-push").unwrap();
 
     let receipt = ws.commit("agent run s1:0").await.expect("commit");
     assert!(receipt.no_changes, "a clean tree is a true no_changes");
+    assert!(!runtime.exists(), "provider runtime debris is removed before commit");
     assert_eq!(receipt.source_prefix, format!("forge:{REPO}"));
     assert_eq!(receipt.source_snapshot.as_deref(), Some(bed.head.as_str()));
     assert_eq!(receipt.branch, None, "no push landed");

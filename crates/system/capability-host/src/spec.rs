@@ -101,6 +101,23 @@ pub struct CapabilitySpec {
     /// optional `[session]` thread-continuity plumbing — host-local capture
     /// and resume of the executor's own session id (see [`crate::session`]).
     pub session: Option<SessionSpec>,
+    /// clean-process policy and optional runtime-side auth broker.
+    pub isolation: IsolationSpec,
+}
+
+/// Provider isolation is data-described, but credentials never are: a broker
+/// kind selects host-owned code that keeps secrets outside the child tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IsolationSpec {
+    /// Optional executor-specific config home (for example `CODEX_HOME`). The
+    /// child receives a fresh directory inside its run-local runtime tree.
+    pub config_home_env: Option<String>,
+    pub broker: Option<BrokerKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerKind {
+    CodexResponses,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -136,6 +153,9 @@ struct RawSpec {
     /// optional `[session]` — validated in [`crate::session`].
     #[serde(default)]
     session: Option<session::RawSession>,
+    /// optional explicit credential/config exceptions to the clean agent env.
+    #[serde(default)]
+    isolation: Option<RawIsolation>,
     /// optional `[tools]` — argv injected into EVERY argv this file produces
     /// (see [`inject_tool_args`]).
     #[serde(default)]
@@ -189,6 +209,47 @@ struct RawOutput {
 #[serde(deny_unknown_fields)]
 struct RawTools {
     args: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawIsolation {
+    #[serde(default)]
+    config_home_env: Option<String>,
+    #[serde(default)]
+    broker: Option<String>,
+}
+
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
+}
+
+fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationSpec, String> {
+    let raw = raw.unwrap_or_default();
+    for name in raw.config_home_env.iter() {
+        if !valid_env_name(name) {
+            return Err(format!(
+                "{origin}: isolation env name {name:?} must match [A-Z_][A-Z0-9_]*"
+            ));
+        }
+    }
+    let broker = raw
+        .broker
+        .map(|broker| match broker.as_str() {
+            "codex-responses" => Ok(BrokerKind::CodexResponses),
+            other => Err(format!(
+                "{origin}: isolation.broker {other:?} is unsupported (want codex-responses)"
+            )),
+        })
+        .transpose()?;
+    Ok(IsolationSpec {
+        config_home_env: raw.config_home_env,
+        broker,
+    })
 }
 
 /// splice `[tools].args` into every argv this spec can produce, ONCE, at load
@@ -324,6 +385,7 @@ impl CapabilitySpec {
             .session
             .map(|s| session::parse_session(&s, origin))
             .transpose()?;
+        let isolation = parse_isolation(raw.isolation, origin)?;
         Ok((
             Self {
                 tag,
@@ -335,6 +397,7 @@ impl CapabilitySpec {
                 output,
                 workspace,
                 session,
+                isolation,
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),
@@ -573,6 +636,26 @@ resume_args_append = ["--resume", "{{session_id}}"]
     }
 
     #[test]
+    fn isolation_broker_parses_and_refuses_unknown_kinds_or_env_names() {
+        let valid = format!(
+            "{}\n[isolation]\nconfig_home_env = \"CODEX_HOME\"\nbroker = \"codex-responses\"\n",
+            spec_toml("ok")
+        );
+        let spec = CapabilitySpec::parse(&valid, "t").unwrap();
+        assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(spec.isolation.broker, Some(BrokerKind::CodexResponses));
+
+        for (needle, replacement) in [
+            ("CODEX_HOME", "CODEX-HOME"),
+            ("codex-responses", "generic-forwarder"),
+        ] {
+            let err = CapabilitySpec::parse(&valid.replace(needle, replacement), "t")
+                .unwrap_err();
+            assert!(err.contains("isolation"), "got {err:?}");
+        }
+    }
+
+    #[test]
     fn single_spec_parse_refuses_a_variants_file() {
         // parse() is the single-tag convenience; silently dropping a file's
         // variants would be exactly the quiet misread this loader forbids.
@@ -787,6 +870,11 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
                 .any(|w| w == ["--allowedTools", "mcp__ducktape"]),
             "claude pre-allows it (print mode cannot prompt): {claude:?}"
         );
+        assert!(
+            claude.iter().any(|arg| arg == "--bare")
+                && claude.iter().any(|arg| arg == "--strict-mcp-config"),
+            "claude must suppress host hooks/memory/config and admit only the explicit Ducktape MCP: {claude:?}"
+        );
 
         // codex's approval mode is LOAD-BEARING and its name reads backwards.
         // `codex exec` is non-interactive: an MCP tool call that wants approval
@@ -796,6 +884,26 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
         // against codex-cli 0.144.1. Dropping this flag does not fail a build;
         // it fails every codex agent run, quietly. Hence a pin.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
+            assert!(
+                spec.args.iter().any(|arg| arg == "--ignore-user-config"),
+                "{}: global config, hooks, memory and MCPs must stay out: {:?}",
+                spec.tag,
+                spec.args
+            );
+            for disabled in [
+                "features.apps=false",
+                "features.multi_agent=false",
+                "features.memories=false",
+                "features.hooks=false",
+                "tools.web_search=false",
+            ] {
+                assert!(
+                    spec.args.iter().any(|arg| arg == disabled),
+                    "{}: non-granted global surface {disabled} must stay disabled: {:?}",
+                    spec.tag,
+                    spec.args
+                );
+            }
             assert!(
                 spec.args.windows(2).any(|w| w[0] == "-c"
                     && w[1] == "mcp_servers.ducktape.default_tools_approval_mode=\"approve\""),
