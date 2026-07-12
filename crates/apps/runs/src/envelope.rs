@@ -2,18 +2,30 @@
 //!
 //! the dispatch plane's rule stands: the DISPATCHER composes the entire model
 //! input, in consensus, and it rides the dispatch as committed payload data
-//! (P4). the payload is a JSON envelope carrying the agent's real prompt pin
-//! (`prompt_hash`), a thread-continuity key, the generic fallback
-//! instructions, the strict output contract, the rendered conversation, the
-//! runtime section (the tool plane and the run's skill mounts), and the
-//! portable workspace plan ([`PortableInputs`]). the host-side worker
-//! routes on the `ducktape_run` marker and assembles the final model input,
-//! resolving `prompt_hash` from the content-addressed blob store — so the
-//! exact prompt bytes stay verifiable against the committed hash. every run
-//! composes the portable v3 envelope; the flat-string and v2 tolerances are
-//! gone (flag day — in-flight legacy runs are unsupported).
+//! (P4). the payload is a JSON envelope carrying a thread-continuity key, the
+//! generic fallback instructions, the strict output contract, the rendered
+//! conversation, and the portable workspace plan ([`PortableInputs`]) — whose
+//! skill list now states, per skill, whether it loads `always`. the host-side
+//! worker routes on the `ducktape_run` marker and assembles the final model
+//! input. every run composes the portable v3 envelope; the flat-string and v2
+//! tolerances are gone (flag day — in-flight legacy runs are unsupported).
+//!
+//! the agent's PERSONA is no longer in here. it was a `prompt_hash` the host
+//! resolved from the blob store; it is now an `always` skill, whose body the
+//! host inlines into the context document the executor natively auto-loads — so
+//! the envelope states which skills ran (pins), and the assembler builds the
+//! soul from them. the tool-plane sentence and the "your skills are mounted
+//! under…" runtime section left with it: both are ambient always-loaded
+//! instructions, and they belong in that one document, composed once, rather
+//! than as a second prompt-shaped channel here.
+//!
+//! `instructions` survives as the fallback for an agent with NO always-skill at
+//! all. this structurally kills a trap: the old code silently DROPPED
+//! `instructions` whenever `prompt_hash` was `Some`, so the fallback was
+//! unreachable exactly when it looked configured. now it is reached by the
+//! absence of always-skills — a state you can see.
 
-use agent::{AgentRecord, PROMPT_HASH_LEN};
+use agent::{AgentRecord, LoadMode};
 use chat::{AuthorRef, Block, MessageView};
 use serde::Serialize;
 
@@ -30,8 +42,8 @@ pub(crate) const RUN_ENVELOPE_VERSION: u32 = 3;
 /// version it cannot unwrap; the `runs` delivery path reads it back as `1`.
 pub(crate) const RUNNER_RESULT_VERSION: u32 = 1;
 
-/// generic instructions for an agent without a consensus-resident prompt —
-/// the host uses `instructions` only when `prompt_hash` is null.
+/// generic instructions for an agent whose curated skills give it no persona —
+/// the floor under an agent with no `always` skill to assemble.
 pub(crate) const DEFAULT_PROMPT: &str =
     "You are a Ducktape agent. Reply helpfully and return only the requested JSON output.";
 
@@ -40,38 +52,6 @@ pub(crate) const DEFAULT_PROMPT: &str =
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
 Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
-
-/// the tool-plane sentence every v3 run is told. deliberately SHORT: the
-/// `ducktape` MCP server carries the full tool guide in its own `initialize`
-/// instructions (versioned with the binary), so restating the surface here
-/// would only give the two something to drift apart about. this section points
-/// at the plane; the plane describes itself.
-pub(crate) const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktape\" is available in this session. It is how you read and write Ducktape state — chat, tasks, pages, forge items, and duckfs files. Call its tools instead of guessing; its own instructions describe every tool it offers.";
-
-/// the deterministic runtime section: what this run's session carries. composed
-/// in consensus from the envelope's OWN fields — the skill names it lists are
-/// exactly the ones the host materializes from `skills` — so it stays a pure
-/// function of committed state, with no host input, wall clock, or ordering of
-/// its own (skills keep envelope order).
-///
-/// the skills sentence exists to close a real gap: the host checks the skill
-/// trees out read-only and exports `DUCKTAPE_RUN_SKILLS`, and until now nothing
-/// ever TOLD the model the directory was there. a run that mounts no skills
-/// gains no skills sentence — an empty mount list is not worth a line of the
-/// model's attention — but every run gets the tool-plane sentence.
-fn runtime_section(skills: &[SkillEnvelope]) -> String {
-    if skills.is_empty() {
-        return TOOL_PLANE_INSTRUCTION.to_string();
-    }
-    let names = skills
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{TOOL_PLANE_INSTRUCTION}\nYour skills are mounted read-only under the directory named by the DUCKTAPE_RUN_SKILLS environment variable, one directory per skill: {names}."
-    )
-}
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -94,10 +74,6 @@ struct RunEnvelope<'a> {
     /// canonical Ducktape attribution trailer. This travels beside the id so
     /// the host never has to reconstruct public Git identity from a run key.
     agent_display_name: &'a str,
-    /// lowercase hex of the agent's [`PROMPT_HASH_LEN`]-byte prompt pin, or
-    /// null when the record carries none — the host resolves the prompt
-    /// content by this digest and falls back to `instructions` on null.
-    prompt_hash: Option<String>,
     /// `<channel_id>#<seq>` — seq is the anchor's thread root when the
     /// anchor is a thread reply (every run in one thread shares a key), else
     /// the anchor itself. null for job runs: there is no channel.
@@ -107,19 +83,12 @@ struct RunEnvelope<'a> {
     conversation: String,
     /// the deterministic forge item-context instructions section (M1),
     /// rendered by `inject` from committed tracker state. the oracle's
-    /// `prepare()` assembles the provider input as instructions → runtime →
-    /// context → contract → conversation, so this reaches the model as its own
-    /// section; a context-less envelope assembles byte-identically to the
-    /// context-less worker. `None` (an ABSENT key) for every non-forge run.
+    /// `prepare()` assembles the provider input as instructions → context →
+    /// contract → conversation, so this reaches the model as its own section; a
+    /// context-less envelope assembles byte-identically to the context-less
+    /// worker. `None` (an ABSENT key) for every non-forge run.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
-    /// the deterministic runtime section: the ducktape tool plane, plus the
-    /// skill mounts this envelope's own `skills` list asks the host for. every
-    /// v3 run carries it — the tool plane is unconditional — so unlike
-    /// `context` it is never an absent key. it rides AFTER `context` in the
-    /// bytes but BEFORE it in the assembled input: field order is the committed
-    /// layout, reading order is the worker's, and the worker decodes by name.
-    runtime: String,
     workspace: WorkspaceSource,
     skills: Vec<SkillEnvelope>,
     result_contract: ResultContractEnvelope,
@@ -171,14 +140,19 @@ struct ResultContractEnvelope {
 }
 
 /// a C4 skill ref: a duckfs read-only source subtree the host mounts for the
-/// run, mirroring the phase-4 [`agent::SkillRef`] (`name` + `source_prefix` +
-/// optional `source_snapshot`). a tracking skill's snapshot is resolved to the
-/// committed head at compose time (see `RunsModule::portable_inputs`).
+/// run, mirroring [`agent::SkillRef`]. a tracking skill's snapshot is resolved
+/// to the committed head at compose time (see `RunsModule::portable_inputs`).
+///
+/// `always` is the curated [`LoadMode`], flattened to the bool the host needs:
+/// it tells the assembler to inline this skill's full body into the run's
+/// context document (the agent's soul) rather than merely index it. consensus
+/// decides it; the host only obeys.
 #[derive(Serialize, Debug)]
 pub(crate) struct SkillEnvelope {
     pub name: String,
     pub source_prefix: String,
     pub source_snapshot: Option<String>,
+    pub always: bool,
 }
 
 /// the portable half of every envelope, resolved by the composer's callsite
@@ -217,6 +191,9 @@ pub(crate) fn duckfs_workspace(
 /// resolves to the SAME committed head (W2) — deterministic across
 /// validators. shared by the duckfs and forge compose lanes (skills are
 /// duckfs subtrees either way).
+///
+/// curation ORDER is preserved verbatim: it is the order the host assembles the
+/// always-bodies in, so a reordered list is a different soul.
 pub(crate) fn resolve_skills(agent: &AgentRecord, head: &Option<String>) -> Vec<SkillEnvelope> {
     agent
         .skills
@@ -225,6 +202,7 @@ pub(crate) fn resolve_skills(agent: &AgentRecord, head: &Option<String>) -> Vec<
             name: s.name.clone(),
             source_prefix: s.source_prefix.clone(),
             source_snapshot: s.source_snapshot.clone().or_else(|| head.clone()),
+            always: matches!(s.load, LoadMode::Always),
         })
         .collect()
 }
@@ -247,13 +225,11 @@ fn envelope(
         agent_id: &agent.agent_id,
         run_id,
         agent_display_name: &agent.display_name,
-        prompt_hash: prompt_hash_hex(agent),
         thread_key,
         instructions: DEFAULT_PROMPT,
         contract: STRICT_OUTPUT_INSTRUCTION,
         conversation,
         context: portable.context,
-        runtime: runtime_section(&portable.skills),
         workspace: portable.workspace,
         skills: portable.skills,
         result_contract: ResultContractEnvelope {
@@ -262,14 +238,6 @@ fn envelope(
         },
     })
     .expect("envelope is serializable")
-}
-
-/// the agent's prompt pin as the lowercase hex the host resolves blobs by.
-/// the registry validates pins to exactly [`PROMPT_HASH_LEN`] bytes, so a
-/// record holding anything else has no resolvable prompt and composes as
-/// null — the generic instructions apply.
-fn prompt_hash_hex(agent: &AgentRecord) -> Option<String> {
-    (agent.prompt_hash.len() == PROMPT_HASH_LEN).then(|| hex(&agent.prompt_hash))
 }
 
 /// compose a chat run's payload: the envelope around the rendered transcript
@@ -410,20 +378,34 @@ mod tests {
     use saga::SagaOrigin;
     use serde_json::Value;
 
-    fn agent_with_hash(prompt_hash: Vec<u8>) -> AgentRecord {
+    /// an agent defined by its curated skills — there is no prompt to give it.
+    fn agent_with_skills(skills: Vec<agent::SkillRef>) -> AgentRecord {
         AgentRecord {
             agent_id: "bot".into(),
             owner: SagaOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
             capability: "model-1".into(),
-            prompt_hash,
             allowed_actions: vec![],
             status: AgentStatus::Active,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),
             caps: agent::ResourceCaps::default(),
-            skills: Vec::new(),
+            skills,
+        }
+    }
+
+    fn bot() -> AgentRecord {
+        agent_with_skills(Vec::new())
+    }
+
+    /// a curated skill ref, as the registry commits it.
+    fn skill_ref(name: &str, load: LoadMode) -> agent::SkillRef {
+        agent::SkillRef {
+            name: name.into(),
+            source_prefix: format!("/shared/skills/{name}"),
+            source_snapshot: Some("bb".repeat(32)),
+            load,
         }
     }
 
@@ -466,10 +448,7 @@ mod tests {
 
     fn portable(snapshot: Option<&str>, skills: Vec<SkillEnvelope>) -> PortableInputs {
         PortableInputs {
-            workspace: duckfs_workspace(
-                &agent_with_hash(vec![7u8; PROMPT_HASH_LEN]),
-                snapshot.map(str::to_string),
-            ),
+            workspace: duckfs_workspace(&bot(), snapshot.map(str::to_string)),
             skills,
             sink: WireSink::Chain,
             context: None,
@@ -486,19 +465,13 @@ mod tests {
             name: name.into(),
             source_prefix: format!("/shared/skills/{name}"),
             source_snapshot: Some("bb".repeat(32)),
+            always: false,
         }
     }
 
-    fn runtime_of(payload: &str) -> String {
-        parse(payload)["runtime"]
-            .as_str()
-            .expect("every v3 envelope carries a runtime section")
-            .to_string()
-    }
-
     #[test]
-    fn a_chat_envelope_carries_the_prompt_pin_and_anchor_thread_key() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+    fn a_chat_envelope_carries_the_anchor_thread_key_and_no_prompt_pin() {
+        let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
         let payload = render_payload(
             "runs",
@@ -515,7 +488,6 @@ mod tests {
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(v["agent_display_name"], "BOT");
-        assert_eq!(v["prompt_hash"], "07".repeat(PROMPT_HASH_LEN));
         assert_eq!(
             v["thread_key"], "general#1",
             "a non-thread anchor keys itself"
@@ -527,13 +499,82 @@ mod tests {
         assert!(conversation.contains("hi bot"));
         assert!(conversation.ends_with("\nReply as the agent."));
 
+        // the persona plane is GONE from the envelope: no prompt pin to resolve
+        // from a blob store, and no composed runtime text. the soul is
+        // assembled host-side from the skills below.
+        assert!(
+            v.get("prompt_hash").is_none(),
+            "prompt_hash retired: {payload}"
+        );
+        assert!(
+            v.get("runtime").is_none(),
+            "the runtime section moved into the assembled context document: {payload}"
+        );
+
         // field order is part of the committed bytes — assert the layout, not
         // just the values.
         assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#));
         assert!(
-            payload.contains(r#","agent_display_name":"BOT","prompt_hash":"#),
-            "display name rides between run_id and prompt_hash: {payload}"
+            payload.contains(r#","agent_display_name":"BOT","thread_key":"#),
+            "the thread key now follows the display name directly: {payload}"
         );
+    }
+
+    /// the soul contract: the composer carries each curated skill's load mode
+    /// through to the host as `always`, in curation order — that flag is what
+    /// tells the assembler which bodies to INLINE into the agent's context
+    /// document and which to merely index.
+    #[test]
+    fn skills_carry_their_load_mode_through_to_the_host() {
+        let agent = agent_with_skills(vec![
+            skill_ref("persona", LoadMode::Always),
+            skill_ref("release", LoadMode::OnDemand),
+        ]);
+        let skills = resolve_skills(&agent, &None);
+        let payload = render_payload(
+            "runs",
+            &agent,
+            &run_id("general", 1),
+            "general",
+            1,
+            None,
+            &[],
+            PortableInputs {
+                workspace: duckfs_workspace(&agent, None),
+                skills,
+                sink: WireSink::Chain,
+                context: None,
+            },
+        );
+        let v = parse(&payload);
+        let skills = v["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["name"], "persona", "curation order is preserved");
+        assert_eq!(
+            skills[0]["always"], true,
+            "the persona is an always-skill — the host inlines its body"
+        );
+        assert_eq!(skills[1]["name"], "release");
+        assert_eq!(
+            skills[1]["always"], false,
+            "an on-demand skill is indexed, not inlined"
+        );
+    }
+
+    /// a tracking skill (no pin) still resolves to the committed head, and its
+    /// load mode is untouched by that resolution.
+    #[test]
+    fn a_tracking_skill_resolves_to_the_head_and_keeps_its_load_mode() {
+        let agent = agent_with_skills(vec![agent::SkillRef {
+            name: "persona".into(),
+            source_prefix: "/shared/skills/persona".into(),
+            source_snapshot: None,
+            load: LoadMode::Always,
+        }]);
+        let head = Some("aa".repeat(32));
+        let resolved = resolve_skills(&agent, &head);
+        assert_eq!(resolved[0].source_snapshot, head);
+        assert!(resolved[0].always);
     }
 
     #[test]
@@ -543,7 +584,7 @@ mod tests {
         // executing node unable to name its own run back to this module — the
         // session bind and every mid-run action then address a run that does
         // not exist. all three lanes must carry it.
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
 
         let chat = run_id("general", 1);
         let v = parse(&render_payload(
@@ -583,9 +624,13 @@ mod tests {
         assert_eq!(v["run_id"], page);
     }
 
+    /// an agent with no always-skill has no persona to assemble — the generic
+    /// `instructions` are the floor under it. this fallback was UNREACHABLE
+    /// before (the old composer dropped `instructions` whenever a prompt pin was
+    /// set); now it is reached by a state you can see.
     #[test]
-    fn an_agent_without_a_prompt_pin_composes_null() {
-        let agent = agent_with_hash(Vec::new());
+    fn a_soulless_agent_falls_back_to_the_generic_instructions() {
+        let agent = agent_with_skills(vec![skill_ref("release", LoadMode::OnDemand)]);
         let payload = render_payload(
             "runs",
             &agent,
@@ -594,10 +639,18 @@ mod tests {
             1,
             None,
             &[],
-            plain(),
+            portable(None, resolve_skills(&agent, &None)),
         );
         let v = parse(&payload);
-        assert!(v["prompt_hash"].is_null());
+        assert_eq!(v["instructions"], DEFAULT_PROMPT);
+        assert!(
+            v["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["always"] == false),
+            "no always-skill ⇒ no assembled persona"
+        );
         assert_eq!(
             v["conversation"],
             "No transcript was embedded for this run. Answer the user helpfully.",
@@ -607,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_threaded_anchor_keys_by_its_thread_root() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let transcript = vec![message(3, AuthorRef::User(vec![1; 32]), "in thread")];
         let payload = render_payload(
             "runs",
@@ -628,7 +681,7 @@ mod tests {
 
     #[test]
     fn a_job_envelope_has_no_thread_key_and_preserves_the_job_framing() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let payload = render_job_payload(
             &agent,
             &job_id("job-1"),
@@ -639,7 +692,6 @@ mod tests {
         let v = parse(&payload);
         assert!(v["thread_key"].is_null(), "job runs have no channel");
         assert_eq!(v["agent_id"], "bot");
-        assert_eq!(v["prompt_hash"], "07".repeat(PROMPT_HASH_LEN));
         assert_eq!(
             v["conversation"],
             "Job job-1 — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\nsummarize this work item"
@@ -648,7 +700,7 @@ mod tests {
 
     #[test]
     fn envelope_bytes_are_deterministic() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let transcript = vec![
             message(1, AuthorRef::User(vec![1; 32]), "hello \"quoted\"\nline"),
             message(
@@ -689,8 +741,8 @@ mod tests {
         let j2 = render_job_payload(&agent, &job_id("job-1"), "job-1", "spec", plain());
         assert_eq!(j1.as_bytes(), j2.as_bytes());
 
-        // the runtime section is composed, not passed in — so it must be
-        // byte-stable across composes of the same skill list too.
+        // a skilled run is byte-stable too — the skill list (names, pins, load
+        // flags) is composed straight from committed state.
         let skilled = || portable(None, vec![skill("release"), skill("triage")]);
         let s1 = render_payload(
             "runs",
@@ -715,13 +767,13 @@ mod tests {
         assert_eq!(
             s1.as_bytes(),
             s2.as_bytes(),
-            "the runtime section is a pure function of the envelope's own fields"
+            "a skilled compose is a pure function of committed state"
         );
     }
 
     #[test]
     fn the_agents_own_messages_render_as_you() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let transcript = vec![
             message(1, AuthorRef::User(vec![1; 32]), "question"),
             message(
@@ -764,12 +816,13 @@ mod tests {
 
     #[test]
     fn the_envelope_carries_source_coords_and_skills_but_no_mount_path() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
         let skills = vec![SkillEnvelope {
             name: "release".into(),
             source_prefix: "/shared/skills/release".into(),
             source_snapshot: Some("bb".repeat(32)),
+            always: false,
         }];
         let payload = render_payload(
             "runs",
@@ -788,8 +841,8 @@ mod tests {
             "the marker leads with a stable field order: {payload}"
         );
         assert!(
-            payload.contains(r#","agent_display_name":"BOT","prompt_hash":"#),
-            "display name rides between run_id and prompt_hash: {payload}"
+            payload.contains(r#","agent_display_name":"BOT","thread_key":"#),
+            "the thread key follows the display name directly: {payload}"
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 3);
@@ -827,7 +880,7 @@ mod tests {
     #[test]
     fn no_head_states_a_null_pin_not_an_absent_key() {
         // an unresolved head is an EXPLICIT null pin decision, not a missing key.
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let payload = render_payload(
             "runs",
             &agent,
@@ -854,14 +907,16 @@ mod tests {
         assert_eq!(v["skills"].as_array().unwrap().len(), 0, "no skills is []");
     }
 
-    // ---- the runtime section (tool plane + skill mounts) -----------------------
-
+    /// the runtime section is GONE from the committed bytes. it used to sit
+    /// between `context` and `workspace` and tell the model about the tool plane
+    /// and its skill mounts; both are ambient always-loaded instructions, so
+    /// they belong in the one context document the host assembles — stated once,
+    /// where the CLI already reads it, instead of as a second prompt channel
+    /// here. `conversation` now runs straight into `workspace`.
     #[test]
-    fn the_runtime_section_names_every_mounted_skill_in_envelope_order() {
-        // the host mounts the skills ro under DUCKTAPE_RUN_SKILLS, one dir per
-        // name — this section is the ONLY thing that tells the model they exist.
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let skills = vec![skill("release"), skill("triage"), skill("qa")];
+    fn the_envelope_composes_no_runtime_text() {
+        let agent = bot();
+        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
         let payload = render_payload(
             "runs",
             &agent,
@@ -869,77 +924,21 @@ mod tests {
             "general",
             1,
             None,
-            &[],
-            portable(None, skills),
-        );
-        let runtime = runtime_of(&payload);
-
-        assert!(
-            runtime.starts_with(TOOL_PLANE_INSTRUCTION),
-            "the tool plane leads: {runtime}"
+            &transcript,
+            portable(None, vec![skill("release")]),
         );
         assert!(
-            runtime.contains("DUCKTAPE_RUN_SKILLS"),
-            "the section names the env var the host actually exports: {runtime}"
+            !payload.contains("\"runtime\""),
+            "no runtime key in the committed layout: {payload}"
         );
-        // names ride VERBATIM, in envelope order — the mount subpaths are these
-        // names, so a reordered or renamed list would point the model at
-        // directories that are not there.
         assert!(
-            runtime.ends_with("one directory per skill: release, triage, qa."),
-            "every mounted skill, in envelope order: {runtime}"
+            !payload.contains("DUCKTAPE_RUN_SKILLS") && !payload.contains("MCP tool server"),
+            "the mount + tool-plane prose moved host-side: {payload}"
         );
-    }
-
-    #[test]
-    fn a_skill_less_run_composes_the_tool_plane_but_no_skills_sentence() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 1),
-            "general",
-            1,
-            None,
-            &[],
-            plain(),
-        );
-        let runtime = runtime_of(&payload);
-        assert_eq!(
-            runtime, TOOL_PLANE_INSTRUCTION,
-            "no mounts ⇒ no mounts sentence; the tool plane is unconditional"
-        );
-        assert!(!runtime.contains("DUCKTAPE_RUN_SKILLS"));
-    }
-
-    #[test]
-    fn the_runtime_key_rides_between_context_and_workspace() {
-        // FIELD ORDER IS THE COMMITTED BYTES: runtime sits after `context` and
-        // before `workspace`. (its READING order in the assembled model input
-        // is the worker's business — dispatch-oracle decodes by name and puts
-        // runtime BEFORE context.)
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 1),
-            "general",
-            1,
-            None,
-            &[],
-            plain(),
-        );
-        let quoted = serde_json::to_string(TOOL_PLANE_INSTRUCTION).unwrap();
         assert!(
-            payload.contains(&format!(
-                r#""runtime":{quoted},"workspace":{{"kind":"duckfs""#
-            )),
-            "runtime precedes workspace in the committed layout: {payload}"
+            payload.contains(r#"Reply as the agent.","workspace":{"kind":"duckfs""#),
+            "conversation runs straight into workspace: {payload}"
         );
-        // v3 is the ONLY composed version (the v2/flat tolerances died at the
-        // flag day), so there is no legacy composer whose bytes this could
-        // move: every composed envelope is v3 and every v3 envelope carries a
-        // runtime key.
         assert_eq!(parse(&payload)["ducktape_run"], 3);
     }
 
@@ -947,7 +946,7 @@ mod tests {
 
     #[test]
     fn a_forge_run_composes_tagged_source_item_context_and_requested_pr_sink() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
         let commit = "ab".repeat(20);
         let inputs = PortableInputs {
@@ -1016,7 +1015,7 @@ mod tests {
 
     #[test]
     fn forge_envelope_bytes_are_deterministic() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "go")];
         let inputs = || PortableInputs {
             workspace: WorkspaceSource::Forge {

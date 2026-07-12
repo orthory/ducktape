@@ -61,7 +61,6 @@ impl TestCtx {
                 owner: SagaOrigin::External(b"alice".to_vec()),
                 display_name: agent_id.to_uppercase(),
                 capability: "model-1".into(),
-                prompt_hash: vec![7u8; 32],
                 allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
                 status: AgentStatus::Active,
                 created_at: 0,

@@ -1,7 +1,7 @@
 //! the agent module — the platform's agent registry, and nothing more.
 //!
 //! a pure state-machine module (in the app-hash) holding one map: agent id →
-//! record (owner, capability tag, prompt pin, granted actions, status). it is
+//! record (owner, capability tag, curated skills, granted actions, status). it is
 //! 100% self-contained — no other module's interface crosses this crate
 //! (`SagaOrigin` and the capability tag shape rule are platform vocabulary,
 //! not module guts) — and it consumes no other module's events. everything
@@ -62,10 +62,6 @@ struct AgentState {
     /// WHAT the run needs; how it executes (binary, flags, model) is host
     /// policy in each provider's spec, invisible to consensus.
     capability: String,
-    /// sha256 of the prompt content (exactly [`PROMPT_HASH_LEN`] bytes); the
-    /// content is content-addressed in the blob store under this digest and
-    /// resolved host-side, so consensus pins only the hash.
-    prompt_hash: Vec<u8>,
     /// granted action names from the known vocabulary, deduped and sorted.
     allowed_actions: BTreeSet<String>,
     /// false = paused: the agent never engages new runs.
@@ -75,11 +71,12 @@ struct AgentState {
     /// runtime-identity tail. all three are empty/default when unset, and
     /// [`encode_committed`] always appends them to the canonical encoding.
     ///
-    /// W4 recipe content-address: empty (unset) or exactly [`PROMPT_HASH_LEN`].
+    /// W4 recipe content-address: empty (unset) or exactly [`RECIPE_HASH_LEN`].
     recipe_hash: Vec<u8>,
     /// D3 resource caps — each list canonical sorted+deduped.
     caps: ResourceCaps,
-    /// C4 ordered skill refs (order is significant to the hash).
+    /// C4 ordered skill refs — the agent's SOUL (order is significant to the
+    /// hash, and to the order `Always` bodies assemble in host-side).
     skills: Vec<SkillRef>,
 }
 
@@ -135,8 +132,12 @@ fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
 }
 
 /// the C4 skills segment: a u64-le count then each ref in ORDER (order is
-/// significant) — name, source_prefix, then a 0/1 option tag for the pinned
-/// snapshot. part of the runtime-identity tail.
+/// significant) — name, source_prefix, a 0/1 option tag for the pinned
+/// snapshot, then the load-mode discriminant. part of the runtime-identity tail.
+///
+/// the load mode is IN the preimage because it decides what the host inlines
+/// into the agent's assembled context document: flipping a skill from on-demand
+/// to always changes what the model is, so it must change the app-hash.
 fn put_skills(out: &mut Vec<u8>, skills: &[SkillRef]) {
     out.extend_from_slice(&(skills.len() as u64).to_le_bytes());
     for s in skills {
@@ -149,6 +150,10 @@ fn put_skills(out: &mut Vec<u8>, skills: &[SkillRef]) {
             }
             None => out.push(0),
         }
+        out.push(match s.load {
+            LoadMode::Always => 0,
+            LoadMode::OnDemand => 1,
+        });
     }
 }
 
@@ -160,7 +165,6 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         put_origin(&mut out, &a.owner);
         put_bytes(&mut out, a.display_name.as_bytes());
         put_bytes(&mut out, a.capability.as_bytes());
-        put_bytes(&mut out, &a.prompt_hash);
         out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
         for action in &a.allowed_actions {
             put_bytes(&mut out, action.as_bytes());
@@ -307,12 +311,12 @@ fn take_caps(buf: &mut &[u8]) -> Result<ResourceCaps, String> {
 }
 
 /// decode the C4 skills segment IN ORDER (skills are an ordered list, not a
-/// set — no ascending check). an unknown option tag is rejected. part of the
-/// runtime-identity tail.
+/// set — no ascending check). an unknown option tag or load discriminant is
+/// rejected: one valid encoding per state. part of the runtime-identity tail.
 fn take_skills(buf: &mut &[u8]) -> Result<Vec<SkillRef>, String> {
-    // per-entry minimum: a name prefix, a source_prefix prefix, and the option
-    // tag byte.
-    let n = take_count(buf, 8 + 8 + 1, "skill")?;
+    // per-entry minimum: a name prefix, a source_prefix prefix, the option tag
+    // byte, and the load-mode byte.
+    let n = take_count(buf, 8 + 8 + 1 + 1, "skill")?;
     let mut v: Vec<SkillRef> = Vec::new();
     for _ in 0..n {
         let name = take_lp_string(buf)?;
@@ -322,10 +326,16 @@ fn take_skills(buf: &mut &[u8]) -> Result<Vec<SkillRef>, String> {
             1 => Some(take_lp_string(buf)?),
             d => return Err(format!("snapshot has unknown skill snapshot tag {d}")),
         };
+        let load = match take(buf, 1)?[0] {
+            0 => LoadMode::Always,
+            1 => LoadMode::OnDemand,
+            d => return Err(format!("snapshot has unknown skill load mode {d}")),
+        };
         v.push(SkillRef {
             name,
             source_prefix,
             source_snapshot,
+            load,
         });
     }
     Ok(v)
@@ -333,11 +343,11 @@ fn take_skills(buf: &mut &[u8]) -> Result<Vec<SkillRef>, String> {
 
 fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, String> {
     // per-entry minimum size: an agent costs its id prefix, one origin
-    // discriminant, three length prefixes, a prompt-doc tag, an action
+    // discriminant, two length prefixes (display_name, capability), an action
     // count, a status byte, two u64s, and the ALWAYS-present runtime-identity
     // tail (a recipe_hash length prefix, seven cap-set counts, the budget u64,
     // and the skills count).
-    const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 7 * 8 + 8 + 8;
+    const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 7 * 8 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -349,7 +359,6 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
         let owner = take_origin(&mut buf)?;
         let display_name = take_lp_string(&mut buf)?;
         let capability = take_lp_string(&mut buf)?;
-        let prompt_hash = take_lp_bytes(&mut buf)?;
         let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
         let actions = take_count(&mut buf, 8, "action")?;
         for _ in 0..actions {
@@ -379,7 +388,6 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
                 owner,
                 display_name,
                 capability,
-                prompt_hash,
                 allowed_actions,
                 active,
                 created_at,
@@ -470,7 +478,6 @@ impl AgentModule {
             owner: a.owner.clone(),
             display_name: a.display_name.clone(),
             capability: a.capability.clone(),
-            prompt_hash: a.prompt_hash.clone(),
             allowed_actions: a.allowed_actions.iter().cloned().collect(),
             status: if a.active {
                 AgentStatus::Active
@@ -494,16 +501,6 @@ impl AgentModule {
         Ok(())
     }
 
-    fn validate_prompt_hash(prompt_hash: &[u8]) -> Result<(), Error> {
-        if prompt_hash.len() != PROMPT_HASH_LEN {
-            return Err(Error::Module(format!(
-                "prompt_hash must be exactly {PROMPT_HASH_LEN} bytes, got {}",
-                prompt_hash.len()
-            )));
-        }
-        Ok(())
-    }
-
     /// every granted action must come from the known vocabulary, so a grant
     /// always means something; duplicates collapse into the set.
     fn validate_actions(actions: Vec<String>) -> Result<BTreeSet<String>, Error> {
@@ -517,12 +514,11 @@ impl AgentModule {
         Ok(set)
     }
 
-    /// a v4 recipe hash is empty (unset) or exactly [`PROMPT_HASH_LEN`] bytes —
-    /// the same discipline as `prompt_hash`, with empty permitted.
+    /// a v4 recipe hash is empty (unset) or exactly [`RECIPE_HASH_LEN`] bytes.
     fn validate_recipe_hash(recipe_hash: &[u8]) -> Result<(), Error> {
-        if !recipe_hash.is_empty() && recipe_hash.len() != PROMPT_HASH_LEN {
+        if !recipe_hash.is_empty() && recipe_hash.len() != RECIPE_HASH_LEN {
             return Err(Error::Module(format!(
-                "recipe_hash must be empty or {PROMPT_HASH_LEN} bytes, got {}",
+                "recipe_hash must be empty or {RECIPE_HASH_LEN} bytes, got {}",
                 recipe_hash.len()
             )));
         }
@@ -644,7 +640,6 @@ impl AgentModule {
                 agent_id,
                 display_name,
                 capability,
-                prompt_hash,
                 allowed_actions,
                 recipe_hash,
                 caps,
@@ -659,7 +654,6 @@ impl AgentModule {
                 }
                 Self::validate_non_empty("display_name", &display_name)?;
                 validate_tag(&capability).map_err(Error::Module)?;
-                Self::validate_prompt_hash(&prompt_hash)?;
                 let allowed_actions = Self::validate_actions(allowed_actions)?;
                 let recipe_hash = recipe_hash.unwrap_or_default();
                 Self::validate_recipe_hash(&recipe_hash)?;
@@ -673,7 +667,6 @@ impl AgentModule {
                     owner,
                     display_name,
                     capability: capability.clone(),
-                    prompt_hash,
                     allowed_actions,
                     active: true,
                     created_at: now,
@@ -700,7 +693,6 @@ impl AgentModule {
                 agent_id,
                 display_name,
                 capability,
-                prompt_hash,
                 allowed_actions,
                 recipe_hash,
                 caps,
@@ -725,10 +717,6 @@ impl AgentModule {
                         );
                     }
                     state.capability = capability;
-                }
-                if let Some(prompt_hash) = prompt_hash {
-                    Self::validate_prompt_hash(&prompt_hash)?;
-                    state.prompt_hash = prompt_hash;
                 }
                 if let Some(allowed_actions) = allowed_actions {
                     state.allowed_actions = Self::validate_actions(allowed_actions)?;
@@ -960,7 +948,6 @@ mod tests {
             agent_id: agent_id.into(),
             display_name: agent_id.to_uppercase(),
             capability: "model-1".into(),
-            prompt_hash: vec![7u8; PROMPT_HASH_LEN],
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
             recipe_hash: None,
             caps: None,
@@ -981,7 +968,6 @@ mod tests {
             agent_id: agent_id.into(),
             display_name: agent_id.to_uppercase(),
             capability: "model-1".into(),
-            prompt_hash: vec![7u8; PROMPT_HASH_LEN],
             allowed_actions: vec![],
             recipe_hash: (!recipe_hash.is_empty()).then_some(recipe_hash),
             caps: Some(caps),
@@ -997,7 +983,6 @@ mod tests {
             owner: SagaOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
             capability: "model-1".into(),
-            prompt_hash: vec![7u8; PROMPT_HASH_LEN],
             allowed_actions: vec![],
             status: AgentStatus::Active,
             created_at: 0,
@@ -1128,18 +1113,35 @@ mod tests {
             (Origin::External(Vec::new()), register("a", &[])),
             // system is not an ownable origin (spec: external or module).
             (Origin::System, register("a", &[])),
-            // a prompt hash that is not exactly 32 bytes.
+            // a recipe hash that is neither empty nor exactly 32 bytes.
             (
                 user(9),
                 AgentMsg::RegisterAgent {
                     agent_id: "a".into(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 31],
+                    allowed_actions: Vec::new(),
+                    recipe_hash: Some(vec![7u8; 31]),
+                    caps: None,
+                    skills: None,
+                },
+            ),
+            // a skill that names no source — an unmountable soul.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
                     allowed_actions: Vec::new(),
                     recipe_hash: None,
                     caps: None,
-                    skills: None,
+                    skills: Some(vec![SkillRef {
+                        name: "persona".into(),
+                        source_prefix: String::new(),
+                        source_snapshot: None,
+                        load: LoadMode::Always,
+                    }]),
                 },
             ),
             // an action outside the known vocabulary.
@@ -1149,7 +1151,6 @@ mod tests {
                     agent_id: "a".into(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: vec!["forge.push".into()],
                     recipe_hash: None,
                     caps: None,
@@ -1163,7 +1164,6 @@ mod tests {
                     agent_id: String::new(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                     recipe_hash: None,
                     caps: None,
@@ -1176,7 +1176,6 @@ mod tests {
                     agent_id: "bad\u{1f}id".into(),
                     display_name: "A".into(),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                     recipe_hash: None,
                     caps: None,
@@ -1189,7 +1188,6 @@ mod tests {
                     agent_id: "a".into(),
                     display_name: "A".into(),
                     capability: String::new(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                     recipe_hash: None,
                     caps: None,
@@ -1203,7 +1201,6 @@ mod tests {
                     agent_id: "a".into(),
                     display_name: "x".repeat(MAX_AGENT_RECORD_BYTES),
                     capability: "m".into(),
-                    prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
                     recipe_hash: None,
                     caps: None,
@@ -1237,7 +1234,6 @@ mod tests {
                 agent_id: "bot".into(),
                 display_name: Some("Stolen".into()),
                 capability: None,
-                prompt_hash: None,
                 allowed_actions: None,
                 recipe_hash: None,
                 caps: None,
@@ -1265,7 +1261,6 @@ mod tests {
                 agent_id: "bot".into(),
                 display_name: None,
                 capability: Some("model-2".into()),
-                prompt_hash: None,
                 allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
                 recipe_hash: None,
                 caps: None,
@@ -1310,7 +1305,6 @@ mod tests {
                 agent_id: "bot".into(),
                 display_name: Some("Bot".into()),
                 capability: Some("model-2".into()),
-                prompt_hash: None,
                 allowed_actions: None,
                 recipe_hash: None,
                 caps: None,
@@ -1422,7 +1416,6 @@ mod tests {
                     agent_id: "alpha".into(),
                     display_name: None,
                     capability: Some("model-2".into()),
-                    prompt_hash: None,
                     allowed_actions: None,
                     recipe_hash: None,
                     caps: None,
@@ -1500,12 +1493,13 @@ mod tests {
     /// recipe_hash/caps/skills tail (empty/default here); if the encoding ever
     /// drifts, this fails loudly.
     ///
-    /// re-pinned for the M2 flag day: `ResourceCaps` grew `pages_write` (a
-    /// seventh cap set), so every agent's caps tail carries one more empty
-    /// u64 count — the old bytes plus 8 zero bytes per agent, nothing else.
+    /// re-pinned for the SOUL flag day: `prompt_hash` retired, so every agent
+    /// loses its 8-byte length prefix and 32 pin bytes from the preimage (each
+    /// skill entry also gains a load-mode byte, invisible here — the fixture
+    /// mounts none). the app-hash moves; that is the flag day, declared.
     #[test]
     fn committed_bytes_match_the_golden() {
-        const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d312000000000000000070707070707070707070707070707070707070707070707070707070707070702000000000000000900000000000000636861742e706f73740c000000000000007461736b732e63726561746500030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d3120000000000000000707070707070707070707070707070707070707070707070707070707070707000000000000000000030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d3102000000000000000900000000000000636861742e706f73740c000000000000007461736b732e63726561746500030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d31000000000000000000030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
         let m = build_fixture_registry();
         assert_eq!(
             hex(&m.snapshot()),
@@ -1552,16 +1546,19 @@ mod tests {
             pages_write: vec!["*".into(), "page-1".into()],
             subagent_budget: 2,
         };
+        // one of each load mode: the persona (always) and a reference skill.
         let skills = vec![
             SkillRef {
                 name: "fmt".into(),
                 source_prefix: "/shared/skills/fmt".into(),
                 source_snapshot: Some("aa".repeat(32)),
+                load: LoadMode::Always,
             },
             SkillRef {
                 name: "lint".into(),
                 source_prefix: "/shared/skills/lint".into(),
                 source_snapshot: None,
+                load: LoadMode::OnDemand,
             },
         ];
         exec(
@@ -1571,7 +1568,7 @@ mod tests {
                 "bot",
                 caps.clone(),
                 skills.clone(),
-                vec![9u8; PROMPT_HASH_LEN],
+                vec![9u8; RECIPE_HASH_LEN],
             )),
         )
         .unwrap();
@@ -1579,7 +1576,7 @@ mod tests {
         let rec = get_agent(&m, "bot").unwrap();
         assert_eq!(rec.caps, caps);
         assert_eq!(rec.skills, skills);
-        assert_eq!(rec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
+        assert_eq!(rec.recipe_hash, vec![9u8; RECIPE_HASH_LEN]);
 
         let (bytes, root) = (m.snapshot(), m.root());
         let mut joiner = module();
@@ -1588,7 +1585,80 @@ mod tests {
         let jrec = get_agent(&joiner, "bot").unwrap();
         assert_eq!(jrec.caps, caps);
         assert_eq!(jrec.skills, skills);
-        assert_eq!(jrec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
+        assert_eq!(jrec.recipe_hash, vec![9u8; RECIPE_HASH_LEN]);
+    }
+
+    /// the soul is the curated skill set: an agent registers with NO prompt at
+    /// all, and its persona is just a skill loaded `Always`. the load mode is in
+    /// the preimage, so flipping one moves the root — what the model IS changed.
+    #[test]
+    fn the_load_mode_is_committed_state() {
+        let skill = |name: &str, load| SkillRef {
+            name: name.into(),
+            source_prefix: format!("/shared/skills/{name}"),
+            source_snapshot: Some("aa".repeat(32)),
+            load,
+        };
+        let registry = |load| {
+            let mut m = module();
+            let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&AgentMsg::RegisterAgent {
+                    agent_id: "bot".into(),
+                    display_name: "BOT".into(),
+                    capability: "model-1".into(),
+                    allowed_actions: vec![],
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![
+                        skill("persona", load),
+                        skill("release", LoadMode::OnDemand),
+                    ]),
+                }),
+            )
+            .expect("an agent needs no prompt — only skills");
+            commit(&mut m);
+            m
+        };
+
+        // the mode round-trips through the record view…
+        let m = registry(LoadMode::Always);
+        let rec = get_agent(&m, "bot").unwrap();
+        assert_eq!(rec.skills[0].load, LoadMode::Always);
+        assert_eq!(rec.skills[1].load, LoadMode::OnDemand);
+
+        // …and through snapshot → install, under the agreed root.
+        let (bytes, root) = (m.snapshot(), m.root());
+        let mut joiner = module();
+        joiner.install(&bytes, root).unwrap();
+        assert_eq!(joiner.root(), root);
+        assert_eq!(get_agent(&joiner, "bot").unwrap().skills, rec.skills);
+
+        // the SAME skills with one load mode flipped is a different app-hash:
+        // an always-skill is inlined into the assembled context document and an
+        // on-demand one is not, so the two agents do not think alike.
+        assert_ne!(
+            registry(LoadMode::OnDemand).root(),
+            root,
+            "the load mode is part of the committed state, not host policy"
+        );
+    }
+
+    /// an omitted `load` decodes as the conservative mode — a skill a submitter
+    /// said nothing about never silently becomes the agent's persona.
+    #[test]
+    fn an_unstated_load_mode_defaults_to_on_demand() {
+        let msg: AgentMsg = decode_msg(
+            br#"{"register_agent":{"agent_id":"bot","display_name":"BOT","capability":"model-1",
+                 "allowed_actions":[],"skills":[{"name":"s","source_prefix":"/p"}]}}"#,
+        )
+        .expect("a registration without a load mode decodes");
+        let AgentMsg::RegisterAgent { skills, .. } = msg else {
+            panic!("expected a registration");
+        };
+        assert_eq!(skills.unwrap()[0].load, LoadMode::OnDemand);
     }
 
     /// a Register carrying the runtime-identity fields is accepted
@@ -1609,14 +1679,14 @@ mod tests {
                 "bot",
                 caps.clone(),
                 vec![],
-                vec![9u8; PROMPT_HASH_LEN],
+                vec![9u8; RECIPE_HASH_LEN],
             )),
         )
         .unwrap();
         commit(&mut m);
         let rec = get_agent(&m, "bot").unwrap();
         assert_eq!(rec.caps, caps);
-        assert_eq!(rec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
+        assert_eq!(rec.recipe_hash, vec![9u8; RECIPE_HASH_LEN]);
     }
 
     /// the pure D3 cap gate: forge read != push, duckfs prefix containment (the
@@ -1746,6 +1816,7 @@ mod tests {
             name: "s".into(),
             source_prefix: "/p".into(),
             source_snapshot: Some("cc".repeat(32)),
+            load: LoadMode::Always,
         }];
         let run = || {
             let mut m = module();
@@ -1757,7 +1828,7 @@ mod tests {
                     "alpha",
                     caps.clone(),
                     skills.clone(),
-                    vec![9u8; PROMPT_HASH_LEN],
+                    vec![9u8; RECIPE_HASH_LEN],
                 )),
             )
             .unwrap();

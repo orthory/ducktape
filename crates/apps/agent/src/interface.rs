@@ -2,7 +2,7 @@
 //!
 //! the agent module is the platform's agent REGISTRY and nothing more: a
 //! self-contained record book of which agents exist — owner, capability tag,
-//! prompt pin, granted actions, status. it consumes no other module's events
+//! curated skill set, granted actions, status. it consumes no other module's events
 //! and emits exactly one follow-up shape ([`AgentEvent`], to a
 //! genesis-configured hook target) so the module that runs agents can keep
 //! each agent's dispatch-plane recipe in lockstep, atomically with the
@@ -47,10 +47,8 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// module must be able to prove the post will fit BEFORE emitting.
 pub const MAX_REPLY_BLOCKS_BYTES: usize = 32 * 1024;
 
-/// required byte length of an agent's prompt hash (a sha256 digest). prompt
-/// CONTENT lives off-registry (e.g. in `document`); consensus commits to the
-/// hash, so which prompt an agent runs is part of the app-hash.
-pub const PROMPT_HASH_LEN: usize = 32;
+/// required byte length of a recipe content-address (a sha256 digest).
+pub const RECIPE_HASH_LEN: usize = 32;
 
 /// the reserved unit separator agent ids must never contain: the runs module
 /// keys its run records with `\x1f`-delimited fields, and an agent id
@@ -154,16 +152,38 @@ pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
     *c == ResourceCaps::default()
 }
 
+/// how a curated skill reaches the model. the agent's SOUL is its `Always`
+/// skills: the host assembles their full bodies into the one context document
+/// the executor auto-loads, in curation order — this is where the old
+/// `prompt_hash` blob went. an `OnDemand` skill is listed by name and
+/// description in that document's index and read from its read-only mount only
+/// when the task calls for it.
+///
+/// the mode rides the agent's skill REFERENCE, not the skill document, because
+/// curation is per-agent: the same skill is one agent's persona and another's
+/// reference material. it lives in consensus (rather than in the document's own
+/// frontmatter) so "what does this agent always load" is visible to the app-hash
+/// and to the UI.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadMode {
+    /// inlined verbatim into the assembled context document — the persona.
+    Always,
+    /// indexed by name + description; the body is read from the mount on demand.
+    #[default]
+    OnDemand,
+}
+
 /// a C4 skill reference an agent's runs mount. this pins the REF, never the
 /// content: `source_prefix` is a duckfs read-only subtree and
 /// `source_snapshot` is its optional consensus pin — `Some` is a PINNED skill
 /// (immutable), `None` is a TRACKING skill (the phase-5 composer resolves the
 /// committed head at compose time). the list is ORDERED (later entries override
-/// earlier), so it is a `Vec`, not a set — order is significant to the hash.
+/// earlier, and `Always` bodies assemble in this order), so it is a `Vec`, not a
+/// set — order is significant to the hash.
 ///
 /// deliberately a struct (not an enum): the phase-5 envelope composer reads
-/// `name` + `source_prefix` + `source_snapshot` straight through into a skill
-/// mount, so the same three fields live here.
+/// every field straight through into a skill mount, so the same fields live here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SkillRef {
     pub name: String,
@@ -172,6 +192,10 @@ pub struct SkillRef {
     /// compose time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_snapshot: Option<String>,
+    /// `default` so a submitter's JSON that omits it decodes as `OnDemand` —
+    /// the conservative mode: an unstated skill never silently becomes persona.
+    #[serde(default)]
+    pub load: LoadMode,
 }
 
 /// a D3 capability request the runtime probes an [`AgentRecord`] with before
@@ -209,13 +233,19 @@ pub enum AgentStatus {
 }
 
 /// one registered agent — an ordered-op registration, so which capability and
-/// prompt an agent runs is part of the app-hash and auditable. `owner` is the
-/// registration origin and gates every mutation of the record.
+/// which SKILLS an agent runs is part of the app-hash and auditable. `owner` is
+/// the registration origin and gates every mutation of the record.
 ///
 /// `capability` names WHAT the run needs (an open-set registry tag like
 /// "codex" — dispatch selects providers of that tag); HOW it runs — binary,
 /// flags, model — is host policy in each provider's capability spec, and
 /// consensus never sees it. the record is a recipe, not an executor config.
+///
+/// there is no prompt pin: an agent is DEFINED by its curated `skills`, and its
+/// persona is simply a skill loaded [`LoadMode::Always`]. determinism is
+/// unchanged in kind — consensus used to commit which prompt bytes ran (a
+/// hash), and now commits which skill snapshots ran (pins). both are content
+/// addresses; the skill one is also editable, diffable, and reviewable.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub agent_id: String,
@@ -223,16 +253,12 @@ pub struct AgentRecord {
     pub display_name: String,
     /// the capability registry tag this agent's runs are dispatched on.
     pub capability: String,
-    /// sha256 of the agent's prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
-    /// the content itself is content-addressed in the blob store under this
-    /// digest; consensus pins only the hash, and the host resolves the prompt.
-    pub prompt_hash: Vec<u8>,
     /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
     pub allowed_actions: Vec<String>,
     pub status: AgentStatus,
     pub created_at: u64,
     pub updated_at: u64,
-    /// W4 recipe content-address: empty (unset) or exactly [`PROMPT_HASH_LEN`]
+    /// W4 recipe content-address: empty (unset) or exactly [`RECIPE_HASH_LEN`]
     /// bytes. the committed encoding always carries it (empty when unset).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipe_hash: Vec<u8>,
@@ -371,7 +397,6 @@ pub enum AgentMsg {
         agent_id: String,
         display_name: String,
         capability: String,
-        prompt_hash: Vec<u8>,
         allowed_actions: Vec<String>,
         /// runtime-identity fields. `default` so a submitter's JSON that omits
         /// them still decodes; the module accepts them unconditionally.
@@ -389,7 +414,6 @@ pub enum AgentMsg {
         agent_id: String,
         display_name: Option<String>,
         capability: Option<String>,
-        prompt_hash: Option<Vec<u8>>,
         allowed_actions: Option<Vec<String>>,
         /// runtime-identity fields; `None` keeps the current value.
         #[serde(default, skip_serializing_if = "Option::is_none")]

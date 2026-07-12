@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 # the agent registry: a self-contained record book (owner, capability tag,
-# prompt pin, granted actions, status). saga supplies the canonical
+# curated skills, granted actions, status). saga supplies the canonical
 # origin mirror; capability the shared capability-tag shape rule (wire types
 # only).
 # everything that ACTS on agents lives in the runs module.
