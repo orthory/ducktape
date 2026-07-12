@@ -578,6 +578,7 @@ impl DispatchModule {
                 max_attempts: recipe.max_attempts,
                 lease_views: recipe.lease_views,
                 capability,
+                demands: Default::default(),
                 pinned_assignee,
             }),
         });
