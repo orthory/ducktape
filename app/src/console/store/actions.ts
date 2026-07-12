@@ -368,6 +368,10 @@ export interface ConsoleActions {
     anchorSeq: number;
     demands?: Record<string, number>;
   }): void;
+  /** Post a canned prompt to the active channel, then run an agent anchored on
+   *  it — the one-click "set up with an agent" path used by the sandbox
+   *  onboarding section. No-op without an active channel. */
+  startSetupRun(params: { agentId: string; prompt: string }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
   /** Fence one attempt and move the run to a different provider. */
@@ -2156,6 +2160,29 @@ export function createActions({
           origin: getState().author,
         }),
       );
+    },
+
+    startSetupRun: ({ agentId, prompt }) => {
+      const channelId = getState().activeChannel;
+      if (!agentId || !channelId || !prompt.trim()) return;
+      // Post the canned prompt, then anchor the run on it. postToChannel
+      // resolves after the submit + refresh, so the committed message is in
+      // state; its seq is the newest in the channel (single-writer node).
+      void postToChannel(channelId, prompt, null).then((ok) => {
+        if (!ok) return;
+        const seq = getState()
+          .messages.filter((m) => m.channel_id === channelId)
+          .reduce((max, m) => Math.max(max, m.seq), 0);
+        if (seq <= 0) return;
+        submitTracked(opKey.runRequest(agentId), (live) =>
+          runsClient.requestRun(live, {
+            agentId,
+            channelId,
+            anchorSeq: seq,
+            origin: getState().author,
+          }),
+        );
+      });
     },
 
     cancelRun: (runId) => {
