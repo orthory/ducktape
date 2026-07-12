@@ -120,7 +120,7 @@ fn spawn_session_actor(
     (actor, binds)
 }
 
-fn committed_block() -> crate::BlockSummary {
+pub(super) fn committed_block() -> crate::BlockSummary {
     crate::BlockSummary {
         height: 1,
         app_hash: "ab".repeat(32),
@@ -131,7 +131,7 @@ fn committed_block() -> crate::BlockSummary {
 ///
 /// `reject_reads` fails every `read` AFTER the enumeration succeeded (see
 /// [`spawn_files_actor`]).
-fn files_reply(
+pub(super) fn files_reply(
     tree: &BTreeMap<String, Vec<u8>>,
     reject_reads: bool,
     req: &[u8],
@@ -179,11 +179,23 @@ fn file_entry(path: &str, bytes: &[u8]) -> EntryInfo {
     }
 }
 
+/// the run id CONSENSUS knows these runs by — minted with the SAME `run_id_for`
+/// the runs module keys its pending map with, never hand-written. the spec's own
+/// `run_id` (`{saga_id}:{attempt}`) is the host's dir key and names no run in
+/// consensus, so a test that asserted the session bind carried THAT would pass
+/// on an id `runs` can never resolve — which is exactly how the write plane
+/// shipped dead. the end-to-end proof that these two ids stay distinct and the
+/// right one is bound lives in [`super::session_boundary_tests`].
+fn consensus_run_id() -> String {
+    runs::run_id_for("general", 1, "quackbot")
+}
+
 /// a duckfs-source spec: the agent's own workspace prefix (empty in the
 /// stand-in tree — the rw checkout materializes nothing) plus the skill mounts.
 fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
     WorkspaceSpec {
         run_id: "s1:0".into(),
+        consensus_run_id: Some(consensus_run_id()),
         agent_id: agent.map(Into::into),
         source: WorkspaceSource::Duckfs {
             source_prefix: "/shared/agent-workspaces/quackbot".into(),
@@ -337,11 +349,17 @@ async fn an_agent_run_gets_a_fresh_session_key_whose_public_half_is_what_was_bou
     let env = ws.env();
 
     // BOTH vars or neither: the key signs the op, the run id says which session
-    // it belongs to.
+    // it belongs to. the id is the CONSENSUS one — the MCP server stamps this
+    // var onto every AgentAction, so the host-local `{saga_id}:{attempt}` here
+    // would make every mid-run write name a run that does not exist.
     let key_hex = env
         .get("DUCKTAPE_RUN_SESSION_KEY")
         .expect("an agent run holds a session key");
-    assert_eq!(env.get("DUCKTAPE_RUN_ID").map(String::as_str), Some("s1:0"));
+    assert_eq!(
+        env.get("DUCKTAPE_RUN_ID").map(String::as_str),
+        Some(consensus_run_id().as_str()),
+        "the run the AGENT names is the one runs resolves, never the spec's dir key"
+    );
     assert_eq!(key_hex.len(), 64, "32 bytes of lowercase hex");
     let seed = duckfs_core::from_hex_32(key_hex).expect("the key is lowercase hex");
 
@@ -355,7 +373,11 @@ async fn an_agent_run_gets_a_fresh_session_key_whose_public_half_is_what_was_bou
                 session_key,
             },
         ] => {
-            assert_eq!(run_id, "s1:0");
+            assert_eq!(
+                run_id,
+                &consensus_run_id(),
+                "the bind names the run in the id space runs can resolve"
+            );
             session_key.clone()
         }
         other => panic!("expected exactly one session bind, got {other:?}"),
@@ -393,6 +415,40 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
     assert!(
         binds.lock().unwrap().is_empty(),
         "a workspace nobody acts for asks consensus for nothing"
+    );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_envelope_with_no_consensus_run_id_opens_no_session_and_submits_no_bind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, rx, _hub) = NodeHandle::channel();
+    let (_actor, binds) = spawn_session_actor(rx, Ok(()));
+
+    // a pre-field (or foreign) envelope: an AGENT run, but no run id consensus
+    // would recognize. binding on the spec's own `{saga_id}:{attempt}` would ask
+    // `runs` to open a session against a run that does not exist — so we ask for
+    // nothing at all and degrade to the read-only plane.
+    let spec = WorkspaceSpec {
+        consensus_run_id: None,
+        ..duckfs_spec(Some("quackbot"), Vec::new())
+    };
+    let ws = NodedProvisioner::new(handle, tmp.path())
+        .provision(&spec)
+        .await
+        .expect("a run without a consensus id still gets its workspace");
+
+    let env = ws.env();
+    assert!(!env.contains_key("DUCKTAPE_RUN_SESSION_KEY"));
+    assert!(!env.contains_key("DUCKTAPE_RUN_ID"));
+    assert!(
+        binds.lock().unwrap().is_empty(),
+        "no run to bind to ⇒ no op is spent asking"
+    );
+    // the READ half is untouched: the run still executes.
+    assert_eq!(
+        env.get("DUCKTAPE_RUN_AGENT").map(String::as_str),
+        Some("quackbot")
     );
     ws.cleanup().await;
 }

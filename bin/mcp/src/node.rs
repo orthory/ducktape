@@ -2,7 +2,7 @@
 //! routes `noded` already serves.
 //!
 //! - `POST /v1/query`  — every module read (chat, tasks, pages, forge, agent).
-//! - `POST /v1/submit` — every module write.
+//! - `POST /v1/submit/frame` — every module write, as a SIGNED op frame.
 //! - `GET  /v1/files/*` — the duckfs read verbs, which are their own routes
 //!   rather than module queries.
 //!

@@ -192,6 +192,115 @@ fn a_full_thread_fails_the_run_instead_of_the_block() {
 }
 
 #[test]
+fn a_reply_and_a_post_message_into_one_near_full_thread_refuse_the_overflow() {
+    // THE SAME-BLOCK ACCOUNTING. the reply and a `chat.post_message` are two
+    // posts into ONE thread inside ONE delivery block, and every probe reads
+    // COMMITTED state — so both see the same 4095 replies and both pass. chat
+    // applies the first (4096) and REJECTS the second, which aborts the delivery
+    // block; the mailbox re-injects it and it aborts again, forever. the
+    // overflowing post must be refused at validation instead.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE])]);
+    let mut m = watched(TurnPolicy::All, &registry);
+    // one reply short of the cap: room for EXACTLY one more post.
+    let mut root = message(1, "root");
+    root.head.reply_count = MAX_THREAD_REPLIES as u64 - 1;
+    let anchor = message_in("general", 2, AuthorRef::User(vec![1; 32]), "reply", Some(1));
+    let nearly_full = vec![root, anchor];
+    let mut ctx = CaptureCtx::new()
+        .at(2)
+        .with_tagging_origin()
+        .with_registry(&registry)
+        .with_transcript("general", nearly_full.clone());
+    exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
+    commit(&mut m);
+    let run_id = run_id_for("general", 2, "bot");
+
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", nearly_full);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![AgentAction::PostMessage {
+                    channel_id: "general".into(),
+                    text: "and one more".into(),
+                    thread: Some(1),
+                }],
+            )),
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        ctx.notes().iter().any(|n| n.contains("thread reply cap")),
+        "the overflow is refused at validation: {:?}",
+        ctx.notes()
+    );
+    // the strict lane's policy: the RUN fails, never the block — and the ⚠
+    // reply still fits the one free slot the thread had.
+    let posts = ctx.chat_msgs();
+    assert_eq!(posts.len(), 1, "only the failure reply: {posts:?}");
+    assert!(
+        matches!(
+            &posts[0],
+            ChatMsg::PostMessage { message_id, thread: Some(1), .. }
+                if *message_id == reply_message_id(&run_id)
+        ),
+        "the agent's own post never existed: {:?}",
+        posts[0]
+    );
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+}
+
+#[test]
+fn two_post_messages_into_one_near_full_thread_refuse_the_second() {
+    // the counter must see the FIRST staged post when it probes the second.
+    // the anchor is unthreaded here, so the run's own reply consumes nothing —
+    // the two actions alone race for the thread's last free slot.
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let mut nearly_full = transcript(2);
+    nearly_full[0].head.reply_count = MAX_THREAD_REPLIES as u64 - 1;
+    let post = |text: &str| AgentAction::PostMessage {
+        channel_id: "general".into(),
+        text: text.into(),
+        thread: Some(1),
+    };
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", nearly_full);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(&["done"], vec![post("fits"), post("overflows")])),
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        ctx.notes().iter().any(|n| n.contains("thread reply cap")),
+        "the second post is refused at validation: {:?}",
+        ctx.notes()
+    );
+    // all-or-nothing: the strict lane fails the whole run, so even the post
+    // that WOULD have fit never lands — only the unthreaded ⚠ reply.
+    let posts = ctx.chat_msgs();
+    assert_eq!(posts.len(), 1, "only the failure reply: {posts:?}");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+}
+
+#[test]
 fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry() {
     // the anchor is a thread reply, so the failure reply must join the
     // same thread a success reply would have.

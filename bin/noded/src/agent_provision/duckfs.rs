@@ -125,10 +125,11 @@ struct NodedWorkspace {
 
 impl NodedWorkspace {
     /// a receipt-only spec: `commit`/`no_changes` read only the source coords,
-    /// so the run_id/tools/mount are irrelevant here.
+    /// so the run ids/tools/mount are irrelevant here.
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
+            consensus_run_id: None,
             agent_id: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),

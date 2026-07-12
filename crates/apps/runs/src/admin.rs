@@ -140,7 +140,7 @@ impl RunsModule {
                 // on a failed preparation: this is the root op of its own
                 // block, so an error poisons nothing but the request itself.
                 let prepared = self
-                    .prepare_dispatch(&*ctx, &agent, &channel_id, anchor_seq)
+                    .prepare_dispatch(&*ctx, &agent, &run_id, &channel_id, anchor_seq)
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(

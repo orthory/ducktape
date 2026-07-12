@@ -42,9 +42,33 @@
 //! inside the no-fail delivery block, and a page annotation is never worth
 //! failing a run over. an action HERE is the opposite: an explicit, synchronous
 //! op the agent submitted and is waiting on. a refusal it never sees is a lie,
-//! so every refusal is an `Err` the submitter reads. the no-fail rule still
-//! binds the EMISSION — a follow-up the target would reject is caught by the
-//! shared probes before it exists, never by the target.
+//! so every refusal is an `Err` the submitter reads.
+//!
+//! ## the no-fail rule does NOT bind this lane (and why that matters)
+//!
+//! the settle path runs inside the dispatch plane's DELIVERY injection: a
+//! follow-up its target rejects aborts that whole block, the committed mailbox
+//! re-injects the delivery next block, and it aborts again — forever. that is
+//! the no-fail rule, and it is why the settle path must prove every follow-up
+//! valid before emitting any of them.
+//!
+//! an `AgentAction` is a ROOT op — the agent's own frame, isolated by the host
+//! like any submitter's op. a follow-up the target rejects rolls THIS op back
+//! and returns the error to the agent that sent it. nothing re-injects it,
+//! nothing else in the block is touched, and the next op is unaffected: a
+//! rejection here is a rejection, not a wedge.
+//!
+//! the probes still run — an agent deserves the refusal SYNCHRONOUSLY, and the
+//! shared validator is the one definition of what it may do — but the failure
+//! POLICIES are what differ, and conflating them is a trap: the settle path
+//! emits the run's reply AND every action of one response into a SINGLE block,
+//! all probed up front against committed state, so its probes must also count
+//! what that same response already staged (chat's thread cap, the duplicate
+//! task ids) or a sibling silently moves the cap out from under them. here each
+//! op stages exactly ONE follow-up and drains it before the next op executes,
+//! and a module query reads its own pending overlay first — so a sibling's post
+//! is already visible to the next probe. that is why this lane needs no
+//! same-block counter and the settle path does.
 
 use super::pages_effects::is_pages_action;
 use super::{

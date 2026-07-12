@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::facets::{
     WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, output_ref_of,
     valid_data,
@@ -414,6 +416,13 @@ impl RunsModule {
     /// the delivery block — the no-fail rule): a squatted reply message id, a
     /// full thread, a duplicate or unknown task id.
     ///
+    /// every probe reads COMMITTED state, so a check on a SHARED, countable
+    /// resource must also count what this same response already staged — the
+    /// duplicate-task-id set below, and the thread-reply counter (the peer of
+    /// the pages lane's `already_staged`). without that, two posts into a
+    /// thread one reply short of the cap both pass the committed probe and the
+    /// SECOND is rejected at apply — aborting the delivery block forever.
+    ///
     /// THE ONE definition of what an agent may do. the session lane
     /// ([`super::sessions`]) validates each mid-run action by calling this with
     /// a one-action response under [`Lane::Session`], so the tool plane can
@@ -453,6 +462,17 @@ impl RunsModule {
             ));
         }
 
+        // the thread posts THIS response has already staged, per (channel,
+        // root) — chat's reply cap is the one countable resource a single
+        // response can now consume TWICE (the reply plus a `chat.post_message`,
+        // or two of them). the emitted follow-ups all land in ONE delivery
+        // block, but each probe below reads committed state only, so without
+        // this counter both posts pass at 4095 replies, chat REJECTS the second
+        // at apply, and the block aborts — forever (the mailbox re-injects it).
+        // counted in EMISSION order: the run's own reply first, then the
+        // actions by index, exactly as `emit_response` emits them.
+        let mut staged_replies: BTreeMap<(String, u64), u64> = BTreeMap::new();
+
         if !response.reply_blocks.is_empty() {
             let page_run = page_thread_id(&entry.channel_id).is_some();
             let action = if page_run {
@@ -483,6 +503,11 @@ impl RunsModule {
                     .await?;
             } else {
                 self.probe_reply_postable(ctx, run_id, entry).await?;
+                if let Some(root) = entry.thread_root {
+                    *staged_replies
+                        .entry((entry.channel_id.clone(), root))
+                        .or_default() += 1;
+                }
             }
         }
 
@@ -530,16 +555,30 @@ impl RunsModule {
                         return Err("chat.post_message requires a non-empty text".into());
                     }
                     // the whole actions vec is already bounded by
-                    // MAX_ACTIONS_BYTES above, so the posted block cannot
-                    // approach chat's own MAX_MESSAGE_HEAD_BYTES.
+                    // MAX_ACTIONS_BYTES above, and every post writes its OWN
+                    // message record, so no number of posts can push one head
+                    // past chat's MAX_MESSAGE_HEAD_BYTES.
                     self.probe_channel_exists(ctx, channel_id).await?;
+                    // the thread cap is the one check a sibling post can move
+                    // out from under: fold in what this response already staged
+                    // into the same thread, then count this post as staged.
+                    let thread_key = thread.map(|root| (channel_id.clone(), root));
+                    let already_staged = thread_key
+                        .as_ref()
+                        .and_then(|key| staged_replies.get(key))
+                        .copied()
+                        .unwrap_or(0);
                     self.probe_post_lands(
                         ctx,
                         channel_id,
                         &post_message_id(run_id, &lane.slot(index)),
                         *thread,
+                        already_staged,
                     )
                     .await?;
+                    if let Some(key) = thread_key {
+                        *staged_replies.entry(key).or_default() += 1;
+                    }
                 }
                 AgentAction::CreateTask { task_id, title } => {
                     if task_id.is_empty() || title.is_empty() {
@@ -573,6 +612,11 @@ impl RunsModule {
     /// construction, so anything chat would reject is probed first. the run's
     /// own channel is where its anchor came from, so only the post itself needs
     /// probing.
+    ///
+    /// the reply is always the FIRST post a response stages (`emit_response`
+    /// emits it before any action, and a failure reply is the only post its run
+    /// makes), so it never has a sibling to account for: it probes at zero
+    /// already-staged, and its caller counts it for the actions that follow.
     async fn probe_reply_postable(
         &self,
         ctx: &dyn Ctx,
@@ -584,6 +628,7 @@ impl RunsModule {
             &entry.channel_id,
             &reply_message_id(run_id),
             entry.thread_root,
+            0,
         )
         .await
     }
@@ -597,12 +642,22 @@ impl RunsModule {
     ///
     /// a `chat.post_message` additionally names its OWN channel (the reply's is
     /// the run's), which is probed by the caller's `require_channel` peer below.
+    ///
+    /// `already_staged` is how many posts this same response has already staged
+    /// into THIS thread — the same-block thread-cap accounting, because chat's
+    /// `reply_count` here is the COMMITTED one and the siblings staged in this
+    /// block are invisible to it (the pages lane's `already_staged` peer). the
+    /// message id needs no such counter: it is minted per lane SLOT
+    /// ([`post_message_id`]) and the reply's is distinct again, so a response's
+    /// own posts can never collide on one — only a squatter can, which the
+    /// committed lookup already catches.
     async fn probe_post_lands(
         &self,
         ctx: &dyn Ctx,
         channel_id: &str,
         message_id: &str,
         thread: Option<u64>,
+        already_staged: u64,
     ) -> Result<(), String> {
         if channel_id.is_empty() {
             return Err("chat posts require a non-empty channel_id".into());
@@ -649,7 +704,7 @@ impl RunsModule {
                     "thread replies cannot start subthreads: {channel_id}/{root_seq}"
                 ));
             }
-            if root.head.reply_count >= MAX_THREAD_REPLIES as u64 {
+            if root.head.reply_count + already_staged >= MAX_THREAD_REPLIES as u64 {
                 return Err(format!("thread reply cap reached: {channel_id}/{root_seq}"));
             }
         }

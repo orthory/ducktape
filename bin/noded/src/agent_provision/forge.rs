@@ -392,6 +392,7 @@ impl ForgeWorkspace {
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
+            consensus_run_id: None,
             agent_id: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),

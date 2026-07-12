@@ -178,6 +178,10 @@ impl Bed {
     fn spec(&self, run_id: &str, commit: &str, branch_born: bool) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: run_id.into(),
+            // the forge lane's session bind rides the same id as every other:
+            // the one `runs` resolves (a forge item run is a chat run on the
+            // item's channel), never the host-local `run_id` above.
+            consensus_run_id: Some(runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT)),
             agent_id: Some(AGENT.into()),
             source: WorkspaceSource::Forge {
                 repo: REPO.into(),

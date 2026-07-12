@@ -26,14 +26,21 @@
 //! deliberately there is no host-side pre-check duplicating the on-chain gate.
 //! two validators drift; one does not.
 //!
-//! ## why handing the agent its own session key is safe
+//! ## the session key is a BEARER CREDENTIAL, and the sandbox is what holds it
 //!
 //! under codex the agent has a shell and can read this process's environment, so
-//! assume it HAS the session key. it gains nothing: the key's entire authority is
-//! "the actions this agent is already permitted to perform, for this one run,
-//! until it settles". the key IS the agent's authority, no more — that is
-//! precisely least privilege. contrast the NODE key, which can sign anything at
-//! all, and which is why the node signs `OpenAgentSession` itself and never lets
+//! assume it HAS the session key — and assume that means MORE than the action
+//! lane. the key signs frames, and a frame can carry any `Msg` to any module.
+//! consensus checks the grant on `RunsMsg::AgentAction`; nothing checks it on
+//! the key. used directly the key is just an unknown external submitter — which
+//! `chat` turns into `AuthorRef::User(key)`, admitted by any `Open` channel with
+//! no `chat.post_message` grant in sight — and it stays a valid signer after the
+//! run settles, because pruning the session only closes the `AgentAction` lane.
+//!
+//! it is contained by the codex SANDBOX (no network), not by its own authority:
+//! the model's shell cannot reach the node's HTTP lane, and this server — which
+//! can — offers only the tools below. the NODE key, by contrast, signs anything
+//! at all, which is why the node signs `OpenAgentSession` itself and never lets
 //! this process near it.
 //!
 //! READS are still gated here, against the committed caps (`forge_read`,

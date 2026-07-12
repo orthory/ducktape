@@ -53,6 +53,12 @@ pub use forge::forge_push_base;
 #[path = "agent_provision/plane_tests.rs"]
 mod plane_tests;
 
+// the composer → provisioner → consensus id boundary, crossed end to end: the
+// one test that fails when a session bind names a run `runs` cannot resolve.
+#[cfg(test)]
+#[path = "agent_provision/session_boundary_tests.rs"]
+mod session_boundary_tests;
+
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
 /// `DUCKTAPE_AGENT_RUNS_ROOT` overrides the base (operators point it at an
@@ -218,11 +224,20 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// no session opened ([`session::open`]) = the read-only plane, which is the
 /// pre-session behaviour and never an error.
 ///
-/// the key is the agent's PRIVATE half, in a process the agent can read. that is
-/// deliberate and safe: its whole authority is "what this agent may already do,
-/// for this run, until it settles" — consensus re-checks the grant on every
-/// action. the NODE key, which signs anything, must never be here (see
-/// [`session`]).
+/// `DUCKTAPE_RUN_ID` is the session's own [`session::RunSession::run_id`] — the
+/// CONSENSUS run id, the only id space `runs` resolves. it is deliberately NOT
+/// `spec.run_id` (`{saga_id}:{attempt}`, the on-disk dir key): the MCP server
+/// stamps this var onto every `RunsMsg::AgentAction` the agent submits, so a
+/// host-local id here would make every mid-run write name a run that does not
+/// exist — which is exactly how the write plane came to be dead-on-arrival.
+///
+/// the key is the agent's PRIVATE half, in a process the agent can read — a
+/// BEARER CREDENTIAL, not a least-privilege token. it can sign any `Msg` to any
+/// module, and consensus only re-checks the grant on the `AgentAction` lane; a
+/// leaked key posts to open channels as a plain user, run or no run. what
+/// contains it is the run's SANDBOX (no network), not its authority — see
+/// [`session`]. the NODE key, which signs validator votes and every op the human
+/// makes, must never be here at all.
 fn run_env(
     dir: &Path,
     ro_dir: Option<&Path>,
@@ -248,7 +263,7 @@ fn run_env(
             "DUCKTAPE_RUN_SESSION_KEY".into(),
             session.private_hex.clone(),
         );
-        env.insert("DUCKTAPE_RUN_ID".into(), spec.run_id.clone());
+        env.insert("DUCKTAPE_RUN_ID".into(), session.run_id.clone());
     }
     env
 }
