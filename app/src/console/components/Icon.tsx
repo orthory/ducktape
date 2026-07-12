@@ -18,6 +18,12 @@ const PATHS: Record<string, ReactNode> = {
       <circle cx="12" cy="12" r="2.3" />
     </>
   ),
+  sandbox: (
+    <>
+      <path d="M12 3.5l7 4v9l-7 4-7-4v-9z" />
+      <path d="M5.3 7.7L12 12l6.7-4.3M12 12v8.2" />
+    </>
+  ),
   modules: (
     <>
       <rect x="4.5" y="4.5" width="6" height="6" rx="1.4" />

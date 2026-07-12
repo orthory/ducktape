@@ -58,6 +58,7 @@ fn main() {
         "workspace_request_leave",
         "workspace_forget",
         "workspace_select",
+        "workspace_sandbox_apply",
         "workspace_phase",
         "workspace_log_tail",
         "workspace_runtime_facts",

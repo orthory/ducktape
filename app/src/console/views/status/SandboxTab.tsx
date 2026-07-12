@@ -4,24 +4,23 @@
 //      preflight probe.
 //   2. Detection checklist — backend binary / base image / cgroup delegation,
 //      green / red / unknown following the view's status styling.
-//   3. Opt-in switch — a mode selector that emits the exact node.toml lines to
-//      paste (the app has no config-write path; onboarding is guided copy).
+//   3. Opt-in switch — a confirmed apply that atomically updates node.toml and
+//      restarts the managed node, rolling back on a failed boot.
 // Red items offer "Set up with an agent": one canned run through the existing
 // runs pipeline, anchored on the active channel.
 
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
-import type { SandboxPreflight } from "../../../domain/sandbox-client";
-import { sandboxPreflight } from "../../../domain/sandbox-client";
+import { sandboxApply, sandboxPreflight, type SandboxPreflight } from "../../../domain/sandbox-client";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import {
   DEFAULT_SANDBOX_IMAGE,
   MODE_OPTIONS,
+  currentSandboxMode,
   modeOptionsFor,
   preflightChecklist,
-  SERVING_OFF_TOML,
-  servingTomlLines,
   setupPrompt,
   type CheckState,
   type SandboxMode,
@@ -42,20 +41,6 @@ const CHECK_TONE: Record<CheckState, { bg: string; text: string; glyph: string }
   fail: { bg: tint(color.red).bg, text: tint(color.red).text, glyph: "✕" },
   unknown: { bg: tint(color.amber).bg, text: tint(color.amber).text, glyph: "?" },
 };
-
-/** A copy-to-clipboard button that flips its label for 1.2s (mirrors the
- *  StateCommitment copy affordance). */
-function useCopy(): [string | null, (key: string, value: string) => void] {
-  const [copied, setCopied] = useState<string | null>(null);
-  const copy = (key: string, value: string) => {
-    setCopied(key);
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(value).catch(() => {});
-    }
-    globalThis.setTimeout(() => setCopied((c) => (c === key ? null : c)), 1200);
-  };
-  return [copied, copy];
-}
 
 function ServingPill({ on }: { on: boolean }) {
   const t = on ? tint(color.green) : tint(color.amber);
@@ -267,62 +252,13 @@ function ChecklistRow({ item, prompt }: { item: ReturnType<typeof preflightCheck
   );
 }
 
-function ModeGuidance({ mode, image }: { mode: "off" | SandboxMode; image: string }) {
-  const [copied, copy] = useCopy();
-  const toml = mode === "off" ? SERVING_OFF_TOML : servingTomlLines(mode, image);
-  return (
-    <div style={{ marginTop: 11 }}>
-      <div style={{ font: `400 11px ${font.sans}`, color: color.muted3, lineHeight: 1.5, marginBottom: 8 }}>
-        The app doesn't edit <code style={{ font: `500 10.5px ${font.mono}` }}>node.toml</code> directly. Add these
-        lines to this workspace's <code style={{ font: `500 10.5px ${font.mono}` }}>node.toml</code> and restart the
-        node — the switch takes effect on the next boot.
-      </div>
-      <div
-        style={{
-          border: `1px solid ${copied === "toml" ? tint(color.green).border : color.border}`,
-          borderRadius: radius.md,
-          background: copied === "toml" ? tint(color.green).bg : color.sunken,
-          padding: "11px 13px",
-          position: "relative",
-        }}
-      >
-        <pre
-          style={{
-            margin: 0,
-            font: `500 12px ${font.mono}`,
-            color: color.inkSoft,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-          }}
-        >
-          {toml}
-        </pre>
-        <button
-          type="button"
-          onClick={() => copy("toml", toml)}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            position: "absolute",
-            top: 8,
-            right: 10,
-            font: `600 9px ${font.mono}`,
-            letterSpacing: ".05em",
-            color: copied === "toml" ? color.accentAlt2 : color.muted2,
-          }}
-        >
-          {copied === "toml" ? "COPIED" : "COPY"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
 export function SandboxTab() {
   const { state } = useDucktape();
   const [pf, setPf] = useState<SandboxPreflight | null>(null);
   const [loading, setLoading] = useState(false);
   const [chosen, setChosen] = useState<"off" | SandboxMode | null>(null);
+  const [applyState, setApplyState] = useState<"idle" | "applying" | "applied">("idle");
+  const [applyError, setApplyError] = useState<string | null>(null);
   const reqId = useRef(0);
 
   // Only the app that owns the local managed node can truthfully probe the node
@@ -353,13 +289,31 @@ export function SandboxTab() {
     runPreflight();
   }, [runPreflight]);
 
+  const applyChosen = () => {
+    if (!chosen || !workspaceId || applyState === "applying") return;
+    const mode = chosen;
+    setChosen(null);
+    setApplyError(null);
+    setApplyState("applying");
+    void sandboxApply(workspaceId, mode)
+      .then(() => {
+        runPreflight();
+        setApplyState("applied");
+      })
+      .catch((error) => {
+        setApplyState("idle");
+        setApplyError(error instanceof Error ? error.message : String(error));
+      });
+  };
+
   const items = preflightChecklist(pf);
   const backendMode: SandboxMode = pf?.backend === "tart" ? "tart" : "podman";
   const image = pf?.image || DEFAULT_SANDBOX_IMAGE;
   const prompt = setupPrompt(backendMode, image);
   const serving = pf?.announceCapabilities ?? false;
-  const configuredMode = pf?.mode ? pf.mode : "unset";
+  const currentMode = currentSandboxMode(pf);
   const modeOptions = modeOptionsFor(pf?.os === "macos");
+  const chosenOption = MODE_OPTIONS.find((option) => option.id === chosen);
 
   return (
     <>
@@ -367,7 +321,7 @@ export function SandboxTab() {
         <div style={{ font: `600 15px ${font.sans}`, color: color.dark }}>Sandbox serving</div>
         <ServingPill on={serving} />
         <span style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>
-          mode {configuredMode}
+          mode {currentMode}
         </span>
         <button
           type="button"
@@ -375,8 +329,8 @@ export function SandboxTab() {
           disabled={!canProbe || loading}
           title={canProbe ? "Re-run the host preflight probes" : "Only a locally managed node can be probed"}
           style={{
-            marginLeft: "auto",
             all: "unset",
+            marginLeft: "auto",
             cursor: canProbe && !loading ? "pointer" : "default",
             font: `600 11px ${font.sans}`,
             color: canProbe ? color.inkSoft : color.muted2,
@@ -390,7 +344,7 @@ export function SandboxTab() {
         </button>
       </div>
 
-      <div style={{ font: `400 11px ${font.sans}`, color: color.muted3, marginTop: 8, lineHeight: 1.5, maxWidth: 640 }}>
+      <div style={{ width: "100%", font: `400 11px ${font.sans}`, color: color.muted3, marginTop: 8, lineHeight: 1.5 }}>
         Nodes serve agent work only when opted in. Turning it on announces this node's executors (and, for sandboxed
         modes, its metered cpu/memory) into the capability registry so demand-carrying runs can land here.
       </div>
@@ -405,7 +359,8 @@ export function SandboxTab() {
             padding: "10px 13px",
             font: `400 11.5px ${font.sans}`,
             color: tint(color.amber).text,
-            maxWidth: 640,
+            width: "100%",
+            boxSizing: "border-box",
           }}
         >
           This app isn't managing a local node, so the checks below can't reach the node host. Run the preflight on the
@@ -422,7 +377,8 @@ export function SandboxTab() {
           background: color.paper,
           boxShadow: shadow.card,
           overflow: "hidden",
-          maxWidth: 640,
+          width: "100%",
+          boxSizing: "border-box",
         }}
       >
         <div style={{ padding: "10px 13px", font: `600 10.5px ${font.mono}`, color: color.muted2, letterSpacing: ".04em" }}>
@@ -442,25 +398,33 @@ export function SandboxTab() {
           background: color.paper,
           boxShadow: shadow.card,
           padding: "14px 16px",
-          maxWidth: 640,
+          width: "100%",
+          boxSizing: "border-box",
         }}
       >
         <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
           {modeOptions.map((opt) => {
             const active = chosen === opt.id;
-            const current = configuredMode === opt.id || (opt.id === "off" && !serving);
+            const current = currentMode === opt.id;
+            const disabled = !canProbe || applyState === "applying" || current;
             return (
               <button
                 key={opt.id}
                 type="button"
-                onClick={() => setChosen(active ? null : opt.id)}
+                disabled={disabled}
+                title={!canProbe ? "Only a locally managed node can be changed" : undefined}
+                onClick={() => {
+                  setApplyError(null);
+                  setApplyState("idle");
+                  setChosen(opt.id);
+                }}
                 style={{
                   all: "unset",
-                  cursor: "pointer",
+                  cursor: disabled ? "default" : "pointer",
                   font: `600 11.5px ${font.sans}`,
-                  color: active ? color.onDark : color.inkSoft,
-                  background: active ? color.dark : color.paper,
-                  border: `1px solid ${active ? color.dark : color.borderStrong}`,
+                  color: active ? color.onDark : disabled ? color.muted2 : color.inkSoft,
+                  background: active ? color.dark : current ? color.sunken : color.paper,
+                  border: `1px solid ${active ? color.dark : current ? color.border : color.borderStrong}`,
                   borderRadius: radius.sm,
                   padding: "6px 13px",
                 }}
@@ -475,21 +439,38 @@ export function SandboxTab() {
             );
           })}
         </div>
-
-        {chosen ? (
-          <>
-            <div style={{ font: `400 11px ${font.sans}`, color: color.muted2, marginTop: 10, lineHeight: 1.5 }}>
-              {MODE_OPTIONS.find((m) => m.id === chosen)?.blurb}
-            </div>
-            <ModeGuidance mode={chosen} image={image} />
-          </>
-        ) : (
-          <div style={{ font: `400 11px ${font.sans}`, color: color.muted3, marginTop: 10 }}>
-            Pick a mode to see the exact <code style={{ font: `500 10.5px ${font.mono}` }}>node.toml</code> lines to
-            paste.
-          </div>
-        )}
+        <div
+          style={{
+            font: `400 11px ${font.sans}`,
+            color: applyError
+              ? tint(color.red).text
+              : applyState === "applied"
+                ? tint(color.green).text
+                : color.muted3,
+            marginTop: 10,
+          }}
+        >
+          {applyError
+            ? `Apply failed: ${applyError}`
+            : applyState === "applying"
+              ? "Applying config and restarting the node…"
+              : applyState === "applied"
+                ? "Applied. The node restarted with the selected mode."
+                : "Choose a mode to review and apply it."}
+        </div>
       </div>
+      {chosen && chosenOption && (
+        <ConfirmDialog
+          title={`Apply ${chosenOption.label}?`}
+          confirmLabel="Apply and restart"
+          danger={false}
+          onCancel={() => setChosen(null)}
+          onConfirm={applyChosen}
+        >
+          {chosenOption.blurb} This updates this workspace's node config and restarts the local node. If the new node
+          fails to start, the previous config is restored.
+        </ConfirmDialog>
+      )}
     </>
   );
 }

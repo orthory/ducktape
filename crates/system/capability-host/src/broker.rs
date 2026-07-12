@@ -1,10 +1,9 @@
 //! Run-scoped Codex Responses broker.
 //!
 //! The provider child never receives the operator's API/OAuth credential.
-//! Only this host process reads it. Codex talks to a loopback-only, single-run
-//! endpoint using an unrelated random bearer; its workspace-write sandbox has
-//! no network, so model-authored shell commands cannot dial the endpoint even
-//! if they recover that opaque bearer from their parent process.
+//! Only this host process reads it. Codex talks to a single-run endpoint using
+//! an unrelated random bearer. Direct/Podman bind loopback; Tart binds the host
+//! side of its private NAT so the VM can reach it by a guest-only hostname.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -114,11 +113,20 @@ pub(crate) struct RunBroker {
 
 impl RunBroker {
     pub(crate) async fn start() -> Result<Self, String> {
-        Self::start_with(UpstreamCredential::from_host()?).await
+        Self::start_with(UpstreamCredential::from_host()?, false).await
     }
 
-    async fn start_with(upstream: UpstreamCredential) -> Result<Self, String> {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+    pub(crate) async fn start_for_tart() -> Result<Self, String> {
+        Self::start_with(UpstreamCredential::from_host()?, true).await
+    }
+
+    async fn start_with(upstream: UpstreamCredential, tart_guest: bool) -> Result<Self, String> {
+        let bind = if tart_guest {
+            std::net::Ipv4Addr::UNSPECIFIED
+        } else {
+            std::net::Ipv4Addr::LOCALHOST
+        };
+        let listener = tokio::net::TcpListener::bind((bind, 0))
             .await
             .map_err(|e| format!("bind run-scoped provider broker: {e}"))?;
         let addr = listener
@@ -156,7 +164,11 @@ impl RunBroker {
         });
         Ok(Self {
             endpoint: BrokerEndpoint {
-                base_url: format!("http://{addr}/v1"),
+                base_url: if tart_guest {
+                    format!("http://ducktape-host:{}/v1", addr.port())
+                } else {
+                    format!("http://{addr}/v1")
+                },
                 run_bearer,
             },
             shutdown: Some(shutdown),
@@ -308,6 +320,26 @@ mod tests {
     use axum::routing::post;
 
     #[tokio::test]
+    async fn tart_broker_uses_the_guest_nat_hostname() {
+        let broker = RunBroker::start_with(
+            UpstreamCredential {
+                bearer: "unused".into(),
+                account_id: None,
+                url: "http://127.0.0.1:1/responses".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            broker
+                .endpoint
+                .base_url
+                .starts_with("http://ducktape-host:")
+        );
+    }
+
+    #[tokio::test]
     async fn broker_is_route_and_run_token_scoped_and_injects_only_host_auth_upstream() {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let seen_handler = seen.clone();
@@ -325,11 +357,14 @@ mod tests {
         let upstream_task = tokio::spawn(async move {
             axum::serve(listener, upstream).await.unwrap();
         });
-        let broker = RunBroker::start_with(UpstreamCredential {
-            bearer: "host-secret-never-in-child".into(),
-            account_id: Some("acct-1".into()),
-            url: format!("http://{addr}/responses"),
-        })
+        let broker = RunBroker::start_with(
+            UpstreamCredential {
+                bearer: "host-secret-never-in-child".into(),
+                account_id: Some("acct-1".into()),
+                url: format!("http://{addr}/responses"),
+            },
+            false,
+        )
         .await
         .unwrap();
         let client = reqwest::Client::new();

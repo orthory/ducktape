@@ -185,6 +185,7 @@ fn main() {
             workspaces::workspace_request_leave,
             workspaces::workspace_forget,
             workspaces::workspace_select,
+            workspaces::workspace_sandbox_apply,
             workspaces::workspace_phase,
             workspaces::workspace_log_tail,
             workspaces::workspace_runtime_facts,
