@@ -18,6 +18,7 @@ import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import {
   latchOneShots,
+  navStackAfter,
   navTransition,
   readNavEntry,
   stampNav,
@@ -92,17 +93,38 @@ describe("latchOneShots", () => {
 });
 
 describe("readNavEntry", () => {
-  it("round-trips a stamped snapshot", () => {
+  it("round-trips a stamped snapshot with its stack position", () => {
     const s = snap({ channel: "general", forgeItem: 7 });
-    expect(readNavEntry(stampNav(s))).toEqual(s);
+    expect(readNavEntry(stampNav(s, 3))).toEqual({ snap: s, index: 3 });
   });
 
   it("rejects foreign or malformed history state", () => {
     expect(readNavEntry(null)).toBeNull();
     expect(readNavEntry("scroll-pos")).toBeNull();
     expect(readNavEntry({ k: "someone-else" })).toBeNull();
-    expect(readNavEntry({ ...stampNav(snap()), viewMode: "root" })).toBeNull();
-    expect(readNavEntry({ ...stampNav(snap()), forgeItem: "7" })).toBeNull();
+    expect(readNavEntry({ ...stampNav(snap(), 0), viewMode: "root" })).toBeNull();
+    expect(readNavEntry({ ...stampNav(snap(), 0), forgeItem: "7" })).toBeNull();
+    expect(readNavEntry({ ...stampNav(snap(), 0), i: "3" })).toBeNull();
+  });
+});
+
+describe("navStackAfter", () => {
+  it("a push lands on `at` and truncates the forward tail", () => {
+    expect(navStackAfter("push", 1, { index: 0, count: 1 })).toEqual({ index: 1, count: 2 });
+    // pushing from mid-stack discards the entries beyond the new one
+    expect(navStackAfter("push", 2, { index: 1, count: 5 })).toEqual({ index: 2, count: 3 });
+  });
+
+  it("a replace stays in place and can only reveal a deeper stack", () => {
+    expect(navStackAfter("replace", 1, { index: 1, count: 3 })).toEqual({ index: 1, count: 3 });
+    // a reload restoring a mid-stack entry boots with count 1 — the entry's
+    // own position proves the stack is at least that deep.
+    expect(navStackAfter("replace", 4, { index: 0, count: 1 })).toEqual({ index: 4, count: 5 });
+  });
+
+  it("a traversal moves within the stack without shrinking it", () => {
+    expect(navStackAfter("traverse", 0, { index: 2, count: 3 })).toEqual({ index: 0, count: 3 });
+    expect(navStackAfter("traverse", 2, { index: 0, count: 3 })).toEqual({ index: 2, count: 3 });
   });
 });
 
@@ -199,6 +221,7 @@ function Probe() {
       <span data-testid="gate">{String(state.needsOnboarding)}</span>
       <span data-testid="channel">{state.activeChannel ?? "none"}</span>
       <span data-testid="agentFocus">{state.agentFocus ?? "none"}</span>
+      <span data-testid="nav">{`${state.nav.index}/${state.nav.count}`}</span>
     </div>
   );
 }
@@ -265,10 +288,12 @@ describe("browser back/forward (provider integration)", () => {
     await bootShell();
     const entry = readNavEntry(window.history.state);
     expect(entry).not.toBeNull();
-    expect(entry?.screen).toBe("chat");
-    expect(entry?.channel).toBe("general");
+    expect(entry?.snap.screen).toBe("chat");
+    expect(entry?.snap.channel).toBe("general");
     // hydration replaced the boot entry rather than pushing new ones.
     expect(window.history.length).toBe(lengthBefore);
+    // ...so the stack position still says "nowhere to go".
+    expect(screen.getByTestId("nav").textContent).toBe("0/1");
   });
 
   it("screen switches push entries; back/forward walk them and restore the rail", async () => {
@@ -280,15 +305,35 @@ describe("browser back/forward (provider integration)", () => {
     });
     expect(screen.getByTestId("viewMode").textContent).toBe("operator");
     expect(window.history.length).toBe(lengthBefore + 1);
-    expect(readNavEntry(window.history.state)?.screen).toBe("members");
+    expect(readNavEntry(window.history.state)?.snap.screen).toBe("members");
+    expect(screen.getByTestId("nav").textContent).toBe("1/2");
 
     await traverse(() => window.history.back());
     await waitFor(() => expect(screen.getByTestId("screen").textContent).toBe("chat"));
     expect(screen.getByTestId("viewMode").textContent).toBe("user");
+    // walked back within the stack — forward stays available.
+    expect(screen.getByTestId("nav").textContent).toBe("0/2");
 
     await traverse(() => window.history.forward());
     await waitFor(() => expect(screen.getByTestId("screen").textContent).toBe("members"));
     expect(screen.getByTestId("viewMode").textContent).toBe("operator");
+    expect(screen.getByTestId("nav").textContent).toBe("1/2");
+  });
+
+  it("a push from mid-stack truncates the forward tail", async () => {
+    await bootShell();
+
+    await act(async () => {
+      actions!.setScreen("members");
+    });
+    await traverse(() => window.history.back());
+    await waitFor(() => expect(screen.getByTestId("nav").textContent).toBe("0/2"));
+
+    await act(async () => {
+      actions!.setScreen("agent");
+    });
+    // the members entry ahead is gone — forward must disable again.
+    expect(screen.getByTestId("nav").textContent).toBe("1/2");
   });
 
   it("back into a channel re-enters it AND re-fetches its recent messages", async () => {
@@ -313,7 +358,7 @@ describe("browser back/forward (provider integration)", () => {
       actions!.goHome();
     });
     expect(screen.getByTestId("home").textContent).toBe("true");
-    expect(readNavEntry(window.history.state)?.atHome).toBe(true);
+    expect(readNavEntry(window.history.state)?.snap.atHome).toBe(true);
 
     await traverse(() => window.history.back());
     await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("false"));
@@ -333,6 +378,7 @@ describe("browser back/forward (provider integration)", () => {
               viewMode: "operator",
               channel: "dev",
             }),
+            1,
           ),
         }),
       );
@@ -349,14 +395,14 @@ describe("browser back/forward (provider integration)", () => {
     await act(async () => {
       actions!.openAgent("agent-1");
     });
-    expect(readNavEntry(window.history.state)?.agent).toBe("agent-1");
+    expect(readNavEntry(window.history.state)?.snap.agent).toBe("agent-1");
 
     // the view consumes the hand-off — the entry must keep it.
     await act(async () => {
       actions!.clearAgentFocus();
     });
     expect(screen.getByTestId("agentFocus").textContent).toBe("none");
-    expect(readNavEntry(window.history.state)?.agent).toBe("agent-1");
+    expect(readNavEntry(window.history.state)?.snap.agent).toBe("agent-1");
   });
 
   it("traversal is ignored while onboarding gates the window", async () => {
@@ -383,7 +429,7 @@ describe("browser back/forward (provider integration)", () => {
     await act(async () => {
       window.dispatchEvent(
         new PopStateEvent("popstate", {
-          state: stampNav(snap({ screen: "members", viewMode: "operator", scope: "session" })),
+          state: stampNav(snap({ screen: "members", viewMode: "operator", scope: "session" }), 1),
         }),
       );
     });

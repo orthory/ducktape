@@ -1,8 +1,11 @@
 // Sidebar + the routed screen body, plus the error strip. Routing is the
 // registry lookup: state.screen is a module id or the shell-owned "settings"
-// screen. The account Home is NOT a routed screen — it's a full-window layer
-// gated by state.atHome, one level up in DucktapeConsole. Cross-module search
-// is not a route either — it's the ⌘K palette the shell overlays.
+// screen. The account Home is NOT a routed screen — it's a body layer gated
+// by state.atHome that covers the routed screen while the sidebar (and the
+// huddle dock, palette, browser surface) stay live; only the fully
+// disconnected Home owns the whole window, one level up in DucktapeConsole.
+// Cross-module search is not a route either — it's the ⌘K palette the shell
+// overlays.
 
 import { useEffect } from "react";
 
@@ -14,6 +17,7 @@ import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
 import { CHANNEL_RAIL_WIDTH } from "../views/chat/ChatView";
 import { BrowserView } from "../views/browser/BrowserView";
+import { HomeView } from "../views/home/HomeView";
 import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
 
 function resolveScreen(screen: string) {
@@ -71,7 +75,10 @@ function ErrorStrip() {
 export function ConsoleShell() {
   const { state, actions } = useDucktape();
   const Screen = resolveScreen(state.screen);
-  const browserVisible = state.screen === "browser";
+  // The Home layer covers the routed screen; the browser surface stays
+  // mounted underneath it (hidden, like behind the palette) so a Home visit
+  // never resets live browser state.
+  const browserVisible = state.screen === "browser" && !state.atHome;
   const browserSurfaceVisible = browserVisible && !state.searchOpen;
 
   // ⌘K / Ctrl-K opens the command palette from anywhere. Escape and backdrop
@@ -94,7 +101,7 @@ export function ConsoleShell() {
         <div style={{ flex: 1, minWidth: 0, display: browserVisible ? "flex" : "none" }}>
           <BrowserView visible={browserSurfaceVisible} />
         </div>
-        {!browserVisible && <Screen />}
+        {!browserVisible && (state.atHome ? <HomeView /> : <Screen />)}
       </div>
       {/* the live-huddle session card floats above EVERY screen — a hot mic
           must never lose its mute/leave controls to navigation. Sized to sit

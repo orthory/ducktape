@@ -131,7 +131,9 @@ export function Sidebar() {
       <ModeToggle mode={state.viewMode} onSelect={actions.setViewMode} />
 
       {rail.map((mod) => {
-        const active = state.screen === mod.id;
+        // at Home the layer covers the routed screen, so no rail entry is the
+        // visible surface — only the avatar below highlights.
+        const active = !state.atHome && state.screen === mod.id;
         return (
           <button
             key={mod.id}
@@ -163,7 +165,7 @@ export function Sidebar() {
       <div style={{ flex: 1 }} />
 
       {/* The person's console — pinned above the gear: the avatar opens the
-          account Home (a full-window layer, not a rail module or a disconnect),
+          account Home (a shell-level layer, not a rail module or a disconnect),
           so it highlights on state.atHome. */}
       <button
         onClick={() => actions.goHome()}
@@ -199,11 +201,15 @@ export function Sidebar() {
           width: 34,
           height: 34,
           borderRadius: 9,
-          background: navBg(state.screen === "settings"),
-          color: navIc(state.screen === "settings"),
+          background: navBg(!state.atHome && state.screen === "settings"),
+          color: navIc(!state.atHome && state.screen === "settings"),
         }}
       >
-        <Icon name="settings" size={18} color={navIc(state.screen === "settings")} />
+        <Icon
+          name="settings"
+          size={18}
+          color={navIc(!state.atHome && state.screen === "settings")}
+        />
       </button>
 
       {/* Light/dark switch — a peer of the gear, not a screen. The sun/moon

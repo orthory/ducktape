@@ -8,6 +8,7 @@
 // (a workspace whose node is still parking), or the shell.
 
 import { DucktapeProvider } from "./store/DucktapeProvider";
+import { hasNodeContext } from "./store/state";
 import { useDucktape } from "./store/use-ducktape";
 import { ConsoleShell } from "./layout/ConsoleShell";
 import { WindowFrame } from "./layout/WindowFrame";
@@ -20,9 +21,14 @@ import { NodeFailed } from "./views/onboarding/NodeFailed";
 function ConsoleBody() {
   const { state } = useDucktape();
   if (state.needsOnboarding) return <OnboardingGate />;
-  // The account-centric Home is a full-window layer, not a rail screen — it
-  // sits AHEAD of the shell but is NOT a disconnect (see state.atHome / goHome).
-  if (state.atHome) return <HomeView />;
+  // The account-centric Home sits AHEAD of the shell but is NOT a disconnect
+  // (see state.atHome / goHome). With a workspace/node context it renders as
+  // the shell's body layer — the sidebar must stay navigable from Home — and
+  // owns the window only when nothing is connected (smart boot with no active
+  // workspace), where a rail with nothing to show would be dead chrome.
+  if (state.atHome) {
+    return hasNodeContext(state) ? <ConsoleShell /> : <HomeView />;
+  }
   // a managed node that failed to start gets a dedicated, actionable body with
   // the real reason + Retry — never a hollow disconnected shell (see BootError).
   if (state.bootError) return <NodeFailed />;

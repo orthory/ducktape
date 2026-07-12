@@ -38,4 +38,20 @@ describe("Sidebar", () => {
     // The avatar no longer routes through the rail's setScreen("account").
     expect(spies.setScreen?.mock.calls ?? []).not.toContainEqual(["account"]);
   });
+
+  const railBg = () =>
+    (screen.getByRole("button", { name: "Chat" }) as HTMLButtonElement).style
+      .background;
+
+  it("highlights the routed screen's rail entry under the shell", () => {
+    renderSidebar({ screen: "chat", atHome: false });
+    expect(railBg()).not.toBe("transparent");
+  });
+
+  it("at Home only the avatar highlights — never the covered rail screen", () => {
+    // the Home layer covers the routed chat screen: its rail entry must not
+    // claim to be the visible surface.
+    renderSidebar({ screen: "chat", atHome: true });
+    expect(railBg()).toBe("transparent");
+  });
 });

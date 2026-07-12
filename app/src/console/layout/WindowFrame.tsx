@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 
 import { Icon } from "../components/Icon";
 import { accentVar, color, font, radius } from "../theme/tokens";
+import { hasNodeContext } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
@@ -104,10 +105,83 @@ function SearchBar() {
   );
 }
 
+// One half of the global back/forward pair. Traversal goes through the
+// webview's own history stack — popstate then restores the surface AND
+// re-fetches its data (see nav-history.ts) — so the button only has to call
+// history.back()/forward(); enablement mirrors state.nav, the store's picture
+// of the stack position.
+function NavButton({
+  label,
+  icon,
+  enabled,
+  onClick,
+}: {
+  label: string;
+  icon: "chevronLeft" | "chevronRight";
+  enabled: boolean;
+  onClick: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      disabled={!enabled}
+      aria-label={label}
+      title={label}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        all: "unset",
+        boxSizing: "border-box",
+        cursor: enabled ? "pointer" : "default",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 26,
+        height: 26,
+        borderRadius: radius.md,
+        background: enabled && hover ? color.hover : "transparent",
+        transition: "background .12s",
+        flexShrink: 0,
+      }}
+    >
+      <Icon name={icon} size={15} color={enabled ? color.muted : color.muted3} />
+    </button>
+  );
+}
+
+function NavButtons() {
+  const { state } = useDucktape();
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 2, flexShrink: 0 }}>
+      <NavButton
+        label="Back"
+        icon="chevronLeft"
+        enabled={state.nav.index > 0}
+        onClick={() => window.history.back()}
+      />
+      <NavButton
+        label="Forward"
+        icon="chevronRight"
+        enabled={state.nav.index < state.nav.count - 1}
+        onClick={() => window.history.forward()}
+      />
+    </div>
+  );
+}
+
 function TitleBar() {
   const { state } = useDucktape();
   const dot = state.connected ? color.green : color.red;
   const label = state.connected ? "Connected" : "Disconnected";
+  // With the onboarding gate up, a join in flight, or a window-owning
+  // disconnected Home, the console isn't navigable (traversal is refused,
+  // there is nothing to search) — both the nav pair and the palette
+  // affordance hide rather than render dead.
+  const gated =
+    state.needsOnboarding ||
+    Boolean(state.onboardingPhase) ||
+    (state.atHome && !hasNodeContext(state));
 
   return (
     <div
@@ -141,6 +215,7 @@ function TitleBar() {
           paddingLeft: TRAFFIC_LIGHT_INSET,
         }}
       >
+        {!gated && <NavButtons />}
         <div
           style={{
             display: "flex",
@@ -197,15 +272,9 @@ function TitleBar() {
         </div>
       </div>
 
-      {/* search opens the ⌘K palette over a connected console — with the
-          onboarding gate up or a join in flight there is nothing to search,
-          so the affordance hides (an empty middle cell keeps the grid's two
-          1fr halves, and thus the bar's centering, intact). */}
-      {state.needsOnboarding || state.onboardingPhase ? (
-        <div data-tauri-drag-region />
-      ) : (
-        <SearchBar />
-      )}
+      {/* an empty middle cell keeps the grid's two 1fr halves, and thus the
+          bar's centering, intact while the palette affordance hides. */}
+      {gated ? <div data-tauri-drag-region /> : <SearchBar />}
 
       <div
         data-tauri-drag-region
