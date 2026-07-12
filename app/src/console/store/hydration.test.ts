@@ -99,12 +99,39 @@ describe("fetchPeopleSlices", () => {
     });
     const slices = await fetchPeopleSlices(makeTransportStub({ query }));
 
-    expect(slices.authorNames).toEqual({ "0b": "Rae" });
+    // Keyed by the ACCOUNT ("0a") *and* by every node it owns ("0b"): a message
+    // author is a node key, but a mention mark carries the account id, and both
+    // resolve through the same `authorName` map.
+    expect(slices.authorNames).toEqual({ "0a": "Rae", "0b": "Rae" });
     expect(slices.nodeUsers).toEqual({
       "0b": { accountId: "0a", name: "Rae" },
     });
     expect(slices.accountHandles).toEqual({ "0a": "rae" });
     expect(query.mock.calls.map(([target]) => target)).toEqual(["identity", "duckdns"]);
+  });
+
+  it("names an account with no nodes yet — a mention still resolves", async () => {
+    const query = vi.fn((target: string) =>
+      target === "identity"
+        ? Promise.resolve({
+            accounts: [
+              {
+                account_id: [12],
+                display_name: "Nomad",
+                nonce: 0,
+                member_keys: [],
+                nodes: [],
+                updated_at: 1,
+              },
+            ],
+          })
+        : Promise.resolve({ registrations: [] }),
+    );
+
+    const slices = await fetchPeopleSlices(makeTransportStub({ query }));
+
+    expect(slices.authorNames).toEqual({ "0c": "Nomad" });
+    expect(slices.nodeUsers).toEqual({});
   });
 });
 

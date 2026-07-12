@@ -6,6 +6,7 @@ import { useState } from "react";
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames } from "../../../domain/chat-client";
 import type { ThreadView } from "../../../domain/pages-client";
+import { PageRefText } from "../chat/rich-text";
 import { color, font, radius } from "../../theme/tokens";
 
 /** What the new-thread composer is aimed at: the target id the thread will
@@ -162,7 +163,11 @@ export function ThreadCard({
               </div>
             ) : (
               <div style={{ marginTop: 2, font: `400 12.5px/1.5 ${font.sans}`, color: color.ink, whiteSpace: "pre-wrap" }}>
-                {c.text}
+                {/* Page comments store PLAIN TEXT on the wire — no marks — so a
+                    `[[page:…]]` ref is all there is to resolve here. An @handle
+                    stays literal: without a mention mark there is no principal
+                    behind it, only a string that looks like one. */}
+                <PageRefText text={c.text} />
               </div>
             )}
           </div>

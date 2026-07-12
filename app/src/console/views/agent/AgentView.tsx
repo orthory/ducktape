@@ -10,7 +10,7 @@
 // This file is the thin shell — tabs, layout, store wiring. The sections live
 // in sibling files; parts.tsx holds the shared atoms.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
@@ -107,6 +107,19 @@ export function AgentView() {
     setSelectedAgentId(id);
     setAdding(false);
   };
+
+  // Consume a clicked @agent mention's hand-off (state.agentFocus). One-shot:
+  // cleared on consume, so the same agent can be clicked again after browsing
+  // away. Selection is by id only — the roster may not hold it yet, and the
+  // detail pane already falls back to the first agent when it doesn't.
+  const { agentFocus } = state;
+  useEffect(() => {
+    if (agentFocus === null) return;
+    setTab("agents");
+    setAdding(false);
+    setSelectedAgentId(agentFocus);
+    actions.clearAgentFocus();
+  }, [agentFocus, actions]);
 
   return (
     <div

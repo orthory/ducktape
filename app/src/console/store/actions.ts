@@ -115,9 +115,18 @@ export interface ConsoleActions {
    *  hand-off (the explorerFocus idiom). Used by the notification bell; the
    *  navigate deep-link listener patches the same fields. */
   openForgeItem(repo: string, number: number | null): void;
+  /** Jump to an agent's detail — a clicked @agent mention (the forgeFocus idiom). */
+  openAgent(agentId: string): void;
+  /** Jump to a person in Members — a clicked @user mention. Takes the ACCOUNT id
+   *  the mention mark carries; the view resolves it to that account's node rows. */
+  openMember(accountId: string): void;
   /** The explorer calls this once it has consumed (or given up on) a pending
    *  focus hand-off. */
   clearExplorerFocus(): void;
+  /** AgentView / MembersView call these once the mention hand-off is consumed —
+   *  the focus is one-shot, so the same person can be clicked twice. */
+  clearAgentFocus(): void;
+  clearMemberFocus(): void;
   /** Switch the sidebar rail (user apps vs operator surfaces) and persist it.
    *  Jumps to the target rail's default surface when the current screen belongs
    *  to the other rail, so the body always matches the rail. */
@@ -1327,6 +1336,37 @@ export function createActions({
 
     clearExplorerFocus: () => {
       patch({ explorerFocus: null });
+    },
+
+    openAgent: (agentId) => {
+      // Same rail-adoption contract as setScreen.
+      const section = sectionForScreen("agent");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "agent", viewMode: section, agentFocus: agentId });
+      } else {
+        patch({ screen: "agent", agentFocus: agentId });
+      }
+    },
+
+    clearAgentFocus: () => {
+      patch({ agentFocus: null });
+    },
+
+    openMember: (accountId) => {
+      // Members lives on the OPERATOR rail — a mention clicked from chat (a user
+      // surface) has to move the rail with it or the sidebar and body disagree.
+      const section = sectionForScreen("members");
+      if (section) {
+        saveViewMode(section);
+        patch({ screen: "members", viewMode: section, memberFocus: accountId });
+      } else {
+        patch({ screen: "members", memberFocus: accountId });
+      }
+    },
+
+    clearMemberFocus: () => {
+      patch({ memberFocus: null });
     },
 
     openForgeItem: (repo, number) => {

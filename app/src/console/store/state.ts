@@ -298,6 +298,17 @@ export interface ConsoleState {
    *  a repo-only focus. Null when nothing is pending. */
   forgeFocus: { repo: string; number: number | null } | null;
 
+  /** The agent the agent view should select on next render — a clicked @agent
+   *  mention's hand-off (the explorerFocus idiom: the mention sets it, AgentView
+   *  consumes it and clears it). Null when nothing is pending. */
+  agentFocus: string | null;
+
+  /** The person the members view should select on next render — a clicked @user
+   *  mention's hand-off. An ACCOUNT id, not a node key: a mention mark carries
+   *  the account, and the view maps it back to one of that account's node rows
+   *  through `nodeUsers`. Null when nothing is pending. */
+  memberFocus: string | null;
+
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
    *  inclusion height + addressable op hash from the submit receipt. Client
@@ -737,6 +748,8 @@ export const createInitialState = (): ConsoleState => {
     blocks: [],
     explorerFocus: null,
     forgeFocus: null,
+    agentFocus: null,
+    memberFocus: null,
     ops: {},
     error: null,
     bootError: null,
@@ -799,6 +812,8 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   blocks: [],
   explorerFocus: null,
   forgeFocus: null,
+  agentFocus: null,
+  memberFocus: null,
   ops: {},
   connectionDown: null,
 });
