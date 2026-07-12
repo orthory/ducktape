@@ -39,6 +39,8 @@ pub struct PortablePlan {
     pub consensus_run_id: Option<String>,
     pub sink: Sink,
     pub skills: Vec<RoMount>,
+    /// committed registry name, carried to the Forge commit boundary.
+    pub agent_display_name: String,
 }
 
 /// what the pool hands the provisioner for one run.
@@ -60,6 +62,7 @@ pub struct WorkspaceSpec {
     /// — the pre-session behaviour, never an error.
     pub consensus_run_id: Option<String>,
     pub agent_id: Option<String>,
+    pub agent_display_name: Option<String>,
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
@@ -595,6 +598,7 @@ mod tests {
             run_id: "s1:0".into(),
             consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
             agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
@@ -608,6 +612,7 @@ mod tests {
             run_id: "s1:0".into(),
             consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
             agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
                 commit: "d0".repeat(20),

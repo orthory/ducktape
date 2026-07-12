@@ -131,6 +131,7 @@ impl NodedWorkspace {
             run_id: String::new(),
             consensus_run_id: None,
             agent_id: None,
+            agent_display_name: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
         }

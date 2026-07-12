@@ -90,6 +90,10 @@ struct RunEnvelope<'a> {
     /// mid-run action named a run that never existed, and the whole write plane
     /// degraded silently. the composer knows the id; the host must be TOLD it.
     run_id: &'a str,
+    /// the committed registry name used for Forge authorship and the
+    /// canonical Ducktape attribution trailer. This travels beside the id so
+    /// the host never has to reconstruct public Git identity from a run key.
+    agent_display_name: &'a str,
     /// lowercase hex of the agent's [`PROMPT_HASH_LEN`]-byte prompt pin, or
     /// null when the record carries none — the host resolves the prompt
     /// content by this digest and falls back to `instructions` on null.
@@ -242,6 +246,7 @@ fn envelope(
         ducktape_run: RUN_ENVELOPE_VERSION,
         agent_id: &agent.agent_id,
         run_id,
+        agent_display_name: &agent.display_name,
         prompt_hash: prompt_hash_hex(agent),
         thread_key,
         instructions: DEFAULT_PROMPT,
@@ -509,6 +514,7 @@ mod tests {
 
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
         assert_eq!(v["agent_id"], "bot");
+        assert_eq!(v["agent_display_name"], "BOT");
         assert_eq!(v["prompt_hash"], "07".repeat(PROMPT_HASH_LEN));
         assert_eq!(
             v["thread_key"], "general#1",
@@ -524,6 +530,10 @@ mod tests {
         // field order is part of the committed bytes — assert the layout, not
         // just the values.
         assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#));
+        assert!(
+            payload.contains(r#","agent_display_name":"BOT","prompt_hash":"#),
+            "display name rides between run_id and prompt_hash: {payload}"
+        );
     }
 
     #[test]
@@ -776,6 +786,10 @@ mod tests {
         assert!(
             payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#),
             "the marker leads with a stable field order: {payload}"
+        );
+        assert!(
+            payload.contains(r#","agent_display_name":"BOT","prompt_hash":"#),
+            "display name rides between run_id and prompt_hash: {payload}"
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 3);

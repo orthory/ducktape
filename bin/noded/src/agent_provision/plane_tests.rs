@@ -197,6 +197,7 @@ fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
         run_id: "s1:0".into(),
         consensus_run_id: Some(consensus_run_id()),
         agent_id: agent.map(Into::into),
+        agent_display_name: agent.map(Into::into),
         source: WorkspaceSource::Duckfs {
             source_prefix: "/shared/agent-workspaces/quackbot".into(),
             source_snapshot: None,

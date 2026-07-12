@@ -33,20 +33,27 @@
 //! `Status::Degraded` via the pool), never the reply (R4).
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use dispatch_oracle::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::NodeHandle;
 
 /// every run commit's committer email — the committer NAME is the node's
 /// stable identity (D2: author is the agent, committer is the executing node).
 const NODE_COMMITTER_EMAIL: &str = "node@ducktape.local";
-/// the synthetic domain agent author emails are minted under.
-const AGENT_EMAIL_DOMAIN: &str = "agents.ducktape.local";
+/// the public synthetic domain used for agent authorship and attribution.
+const AGENT_EMAIL_DOMAIN: &str = "agents.ducktape.network";
+/// the complete normalized commit message, canonical trailer included.
+const MAX_COMMIT_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_DISPLAY_NAME_BYTES: usize = 128;
+const MAX_AGENT_ID_BYTES: usize = 64;
+const FALLBACK_COMMIT_MESSAGE: &str = "Apply agent changes";
 
 /// one node's configured forge lane: where the materialized repos live, where
 /// pushes rendezvous, and who the committer is. built by
@@ -107,9 +114,10 @@ pub fn forge_push_base(http_listen: Option<&str>) -> Option<String> {
     Some(format!("{}/forge", super::node_http_base(http_listen)?))
 }
 
-/// the construction-time probe: host `git` exists AND supports worktrees,
-/// proven functionally (`git init` + `git worktree list` in a scratch dir)
-/// rather than by version-string parsing. failure is permanent for the lane.
+/// the construction-time probe: host `git` exists AND supports the worktree
+/// and rebase features the runtime invokes. prove those functionally in a
+/// scratch repo rather than accepting a version string that can admit a Git
+/// binary which only fails after a concurrent push.
 pub(super) fn probe_host_git() -> Result<(), String> {
     probe_host_git_with("git")
 }
@@ -128,13 +136,52 @@ fn probe_host_git_with(program: &str) -> Result<(), String> {
             .map_err(|e| format!("probe scratch dir {}: {e}", scratch.display()))?;
         run_git_program(program, &scratch, &["init", "-q"], &[])
             .map_err(|e| format!("`git init` failed — is git installed? {e}"))?;
-        run_git_program(program, &scratch, &["worktree", "list"], &[])
-            .map_err(|e| format!("`git worktree list` failed — host git lacks worktree support: {e}"))?;
+        let identity = [
+            ("GIT_AUTHOR_NAME", "Ducktape probe"),
+            ("GIT_AUTHOR_EMAIL", "probe@ducktape.local"),
+            ("GIT_COMMITTER_NAME", "Ducktape probe"),
+            ("GIT_COMMITTER_EMAIL", "probe@ducktape.local"),
+        ];
+        run_git_program(
+            program,
+            &scratch,
+            &["commit", "--allow-empty", "-q", "-m", "probe"],
+            &identity,
+        )
+        .map_err(|e| format!("`git commit` probe setup failed: {e}"))?;
+
+        let worktree = scratch.join("worktree");
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        run_git_program(
+            program,
+            &scratch,
+            &["worktree", "add", "--detach", &worktree_arg, "HEAD"],
+            &[],
+        )
+        .map_err(|e| {
+            format!(
+                "`git worktree add --detach` failed — host git lacks runtime worktree support: {e}"
+            )
+        })?;
+        run_git_program(
+            program,
+            &worktree,
+            &["rebase", "--reapply-cherry-picks", "--empty=keep", "HEAD"],
+            &identity,
+        )
+        .map_err(|e| {
+            format!(
+                "`git rebase --reapply-cherry-picks --empty=keep` failed — \
+                 host git lacks the runtime rebase options: {e}"
+            )
+        })?;
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     result.map_err(|e: String| {
-        format!("host `git` probe failed (forge worktree provisioning needs a worktree-capable git on PATH): {e}")
+        format!(
+            "host `git` probe failed (forge provisioning needs a runtime-compatible git on PATH): {e}"
+        )
     })
 }
 
@@ -304,6 +351,7 @@ pub(super) async fn provision(
         push_url,
         source: spec.source.clone(),
         agent_id: spec.agent_id.clone(),
+        agent_display_name: spec.agent_display_name.clone(),
         committer_name: lane.committer_name.clone(),
         env,
     }))
@@ -382,6 +430,7 @@ struct ForgeWorkspace {
     push_url: String,
     source: WorkspaceSource,
     agent_id: Option<String>,
+    agent_display_name: Option<String>,
     committer_name: String,
     env: BTreeMap<String, String>,
 }
@@ -394,6 +443,7 @@ impl ForgeWorkspace {
             run_id: String::new(),
             consensus_run_id: None,
             agent_id: None,
+            agent_display_name: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
         }
@@ -427,39 +477,239 @@ enum CommitOutcome {
 /// the commit bracket.
 const PUSH_ATTEMPTS: u32 = 3;
 
+/// Normalize an agent proposal and own the final Ducktape attribution. A
+/// proposal containing controls beyond line endings and tabs, or exceeding
+/// the Git-facing byte cap, is discarded wholesale: partially exposing a
+/// dispatch key is worse than using the explicit fallback. Every
+/// agent-supplied identity trailer is removed; Forge appends the only
+/// trusted attribution last.
+fn normalize_commit_message(proposal: Option<&str>, display_name: &str, agent_id: &str) -> String {
+    let display_name = sanitize_display_name(display_name);
+    let agent_id = attribution_email_local_part(agent_id);
+    let trailer =
+        format!("Co-Authored-By: {display_name} via Ducktape <{agent_id}@{AGENT_EMAIL_DOMAIN}>");
+
+    let candidate = proposal.unwrap_or(FALLBACK_COMMIT_MESSAGE);
+    let normalized = candidate.replace("\r\n", "\n").replace('\r', "\n");
+    // tabs are legitimate in bodies (indented snippets); everything else
+    // outside \n stays a wholesale-reject signal.
+    let invalid = normalized
+        .chars()
+        .any(|c| c != '\n' && c != '\t' && c.is_control());
+    let mut message = if invalid || normalized.len() > MAX_COMMIT_MESSAGE_BYTES {
+        FALLBACK_COMMIT_MESSAGE.to_string()
+    } else {
+        normalized
+            .lines()
+            .filter(|line| !is_identity_trailer(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    };
+    if message
+        .lines()
+        .next()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        message = FALLBACK_COMMIT_MESSAGE.to_string();
+    }
+    let proposed = format!("{message}\n\n{trailer}");
+    if proposed.len() <= MAX_COMMIT_MESSAGE_BYTES {
+        proposed
+    } else {
+        format!("{FALLBACK_COMMIT_MESSAGE}\n\n{trailer}")
+    }
+}
+
+/// trailers that assert someone's identity or endorsement in public history —
+/// an agent must not be able to forge any of them, not just co-authorship.
+const IDENTITY_TRAILERS: &[&str] = &[
+    "co-authored-by:",
+    "signed-off-by:",
+    "reviewed-by:",
+    "acked-by:",
+    "tested-by:",
+];
+
+fn is_identity_trailer(line: &str) -> bool {
+    let line = line.trim();
+    IDENTITY_TRAILERS.iter().any(|trailer| {
+        line.get(..trailer.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(trailer))
+    })
+}
+
+fn sanitize_display_name(input: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    for c in input.chars() {
+        if c.is_control() || matches!(c, '<' | '>') {
+            continue;
+        }
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        let add_space = if pending_space { 1 } else { 0 };
+        if out.len() + add_space + c.len_utf8() > MAX_DISPLAY_NAME_BYTES {
+            break;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        "Ducktape Agent".into()
+    } else {
+        out
+    }
+}
+
+fn readable_agent_slug(input: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for c in input.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            let add_dash = pending_dash && !out.is_empty() && !out.ends_with('-');
+            let dash_bytes = if add_dash { 1 } else { 0 };
+            if out.len() + dash_bytes + c.len_utf8() > max_bytes {
+                break;
+            }
+            if add_dash {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(c);
+        } else {
+            pending_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches(|c| matches!(c, '.' | '_' | '-'));
+    if trimmed.is_empty() {
+        "agent".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// RFC 5321 bounds the local part at 64 bytes. Keep a readable prefix while
+/// deriving the collision-resistant suffix from the complete committed id,
+/// before any lossy normalization.
+fn attribution_email_local_part(input: &str) -> String {
+    const HASH_BYTES: usize = 16;
+    const HASH_HEX_BYTES: usize = HASH_BYTES * 2;
+    const SLUG_BYTES: usize = MAX_AGENT_ID_BYTES - HASH_HEX_BYTES - 1;
+
+    let slug = readable_agent_slug(input, SLUG_BYTES);
+    let digest = Sha256::digest(input.as_bytes());
+    let hash = digest[..HASH_BYTES]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{slug}-{hash}")
+}
+
+fn head_message(run_dir: &Path, pinned_commit: &str) -> Result<Option<String>, String> {
+    let head = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
+    if head == pinned_commit {
+        return Ok(None);
+    }
+    let out = git(run_dir)
+        .args(["show", "-s", "--format=%B", "HEAD"])
+        .output()
+        .map_err(|e| format!("host `git` failed to spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git show of agent commit message failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8(out.stdout).ok())
+}
+
+fn create_run_commit(
+    run_dir: &Path,
+    tree: &str,
+    pinned_commit: &str,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+) -> Result<String, String> {
+    let mut command = git(run_dir);
+    command
+        .args(["commit-tree", tree, "-p", pinned_commit])
+        .env("GIT_AUTHOR_NAME", author_name)
+        .env("GIT_AUTHOR_EMAIL", author_email)
+        .env("GIT_COMMITTER_NAME", committer_name)
+        .env("GIT_COMMITTER_EMAIL", NODE_COMMITTER_EMAIL)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("host `git commit-tree` failed to spawn: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "git commit-tree stdin was unavailable".to_string())?
+        .write_all(message.as_bytes())
+        .map_err(|e| format!("git commit-tree message write failed: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git commit-tree wait failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git commit-tree failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout)
+        .map(|oid| oid.trim().to_string())
+        .map_err(|_| "git commit-tree returned a non-utf8 oid".to_string())
+}
+
 fn commit_blocking(
     run_dir: &Path,
     pinned_commit: &str,
     branch: &str,
     push_url: &str,
-    message: &str,
-    author_name: &str,
+    agent_display_name: &str,
+    agent_id: &str,
     committer_name: &str,
 ) -> Result<CommitOutcome, String> {
     run_git(run_dir, &["add", "-A"], &[])?;
-    let staged = staged_changes(run_dir)?;
-    if staged {
-        // D2 identities, env-only (NEVER global config): author = the agent
-        // under the synthetic domain, committer = the executing node.
-        let author_email = format!("{author_name}@{AGENT_EMAIL_DOMAIN}");
-        run_git(
-            run_dir,
-            &["commit", "-m", message],
-            &[
-                ("GIT_AUTHOR_NAME", author_name),
-                ("GIT_AUTHOR_EMAIL", &author_email),
-                ("GIT_COMMITTER_NAME", committer_name),
-                ("GIT_COMMITTER_EMAIL", NODE_COMMITTER_EMAIL),
-            ],
-        )?;
-    }
-    let head = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
-    // a true no_changes needs BOTH: nothing to stage AND the branch still at
-    // the pinned base — an agent that `git commit`ed its own work leaves a
-    // clean tree that must still push.
-    if !staged && head == pinned_commit {
+    let final_tree = run_git(run_dir, &["write-tree"], &[])?;
+    let pinned_tree = run_git(
+        run_dir,
+        &["rev-parse", &format!("{pinned_commit}^{{tree}}")],
+        &[],
+    )?;
+    if final_tree == pinned_tree {
         return Ok(CommitOutcome::NoChanges);
     }
+    let proposal = head_message(run_dir, pinned_commit)?;
+    let safe_display_name = sanitize_display_name(agent_display_name);
+    let safe_message = normalize_commit_message(proposal.as_deref(), &safe_display_name, agent_id);
+    let author_email = format!(
+        "{}@{AGENT_EMAIL_DOMAIN}",
+        attribution_email_local_part(agent_id)
+    );
+    let oid = create_run_commit(
+        run_dir,
+        &final_tree,
+        pinned_commit,
+        &safe_message,
+        &safe_display_name,
+        &author_email,
+        committer_name,
+    )?;
+    run_git(run_dir, &["reset", "--hard", &oid], &[])?;
     // plain push, NEVER --force. a rejection means the branch advanced while
     // the run executed — an ordering problem, so do what a git user does:
     // fetch the new tip, rebase the run's commits onto it (the author
@@ -494,7 +744,17 @@ fn commit_blocking(
                 // race that resolved away, or a non-tip reject like a hook):
                 // skip the rebase and just push again.
                 if run_git(run_dir, &["fetch", push_url, &fetchspec], &[]).is_ok() {
-                    run_git(run_dir, &["rebase", "FETCH_HEAD"], &committer_env).map_err(|e| {
+                    run_git(
+                        run_dir,
+                        &[
+                            "rebase",
+                            "--reapply-cherry-picks",
+                            "--empty=keep",
+                            "FETCH_HEAD",
+                        ],
+                        &committer_env,
+                    )
+                    .map_err(|e| {
                         // never leave the worktree mid-rebase; the
                         // interloper's tip stays branch head (best-effort
                         // abort, then degrade).
@@ -507,23 +767,6 @@ fn commit_blocking(
         }
     }
     unreachable!("the push loop returns on every arm of its final attempt")
-}
-
-/// whether `git add -A` staged anything (index vs HEAD) — the exit-code
-/// trichotomy of `git diff --cached --quiet`.
-fn staged_changes(run_dir: &Path) -> Result<bool, String> {
-    let out = git(run_dir)
-        .args(["diff", "--cached", "--quiet"])
-        .output()
-        .map_err(|e| format!("host `git` failed to spawn: {e}"))?;
-    match out.status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => Err(format!(
-            "git diff --cached failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-    }
 }
 
 /// remove the run worktree AND its metadata in the parent repo — shared by
@@ -556,13 +799,15 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         super::tool_path_entries()
     }
 
-    async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
+    async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
         let (pinned_commit, branch) = self.coords();
         let run_dir = self.run_dir.clone();
         let push_url = self.push_url.clone();
-        let message = message.to_string();
-        // D2: author = the agent (synthetic email), committer = the node.
-        let author_name = self.agent_id.clone().unwrap_or_else(|| "agent".into());
+        let agent_id = self.agent_id.clone().unwrap_or_else(|| "agent".into());
+        let agent_display_name = self
+            .agent_display_name
+            .clone()
+            .unwrap_or_else(|| agent_id.clone());
         let committer_name = self.committer_name.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             commit_blocking(
@@ -570,8 +815,8 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &pinned_commit,
                 &branch,
                 &push_url,
-                &message,
-                &author_name,
+                &agent_display_name,
+                &agent_id,
                 &committer_name,
             )
         })
