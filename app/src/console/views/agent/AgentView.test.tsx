@@ -121,6 +121,26 @@ const renderAgents = (
 const openTab = (name: RegExp) => fireEvent.click(screen.getByRole("tab", { name }));
 
 describe("AgentView", () => {
+  // A clicked @agent mention hands off through state.agentFocus. If the agent is
+  // gone from the roster, the pane used to fall back to `agents[0]` — showing a
+  // DIFFERENT agent as if it were the one clicked. A miss must read as a miss.
+  it("says an agent is missing rather than showing a different one", () => {
+    renderAgents({ agentFocus: "ghost-bot" });
+
+    expect(screen.getByText(/agent not found/i)).toBeInTheDocument();
+    expect(screen.getByText("ghost-bot")).toBeInTheDocument();
+    // the first agent's detail must NOT be standing in for the one that was
+    // clicked. (Summary Agent still appears in the ROSTER — that's the list, not
+    // the pane; the defect was the DETAIL pane silently showing it.)
+    expect(screen.queryByRole("region", { name: /agent detail/i })).not.toBeInTheDocument();
+  });
+
+  it("still defaults to the first agent when nothing is selected", () => {
+    renderAgents();
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    expect(within(detail).getByText("Summary Agent")).toBeInTheDocument();
+  });
+
   it("shows the selected agent's detail and pauses/resumes it", () => {
     const { spies } = renderAgents();
 

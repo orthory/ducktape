@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::codec::{Reader, push_bytes, push_string, push_u64};
 use crate::{
     DuckDnsName, HandleRegistration, MAX_LABEL_LEN, MAX_QUERY_LIMIT, ResolvedAccount,
-    validate_handle,
+    validate_handle, validate_handle_shape,
 };
 
 const MAX_ACCOUNT_ID_LEN: usize = 1024;
@@ -156,10 +156,16 @@ fn validate_account(account: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// SHAPE and structure only — never the reserved-label policy. `decode_state`
+/// runs this on every snapshot install, so anything it rejects is state the node
+/// cannot hold: growing `RESERVED_ROOT_LABELS` would retroactively make a
+/// legitimately-committed snapshot undecodable and brick state sync and
+/// checkpoint restore. Reserved labels are refused at ADMISSION (`set_handle`,
+/// `parse_hostname`); a handle already in state stays decodable and inert.
 fn validate_state(state: &State) -> Result<(), String> {
     let mut accounts = BTreeSet::new();
     for (handle, owner) in &state.handles {
-        validate_handle(handle)?;
+        validate_handle_shape(handle)?;
         validate_account(owner)?;
         if !accounts.insert(owner) {
             return Err("duckdns: an account may register at most one handle".into());

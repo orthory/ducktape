@@ -18,6 +18,7 @@ import type { MessageView } from "../../../../domain/chat-client";
 import { useDucktape } from "../../../store/use-ducktape";
 import { color, font, radius } from "../../../theme/tokens";
 import { Composer } from "../../chat/Composer";
+import { RichText } from "../../chat/rich-text";
 import { errMsg, panelLabel, relTime } from "../ui";
 
 /** ~100 latest messages is plenty for a tracker thread's v1. */
@@ -126,14 +127,15 @@ function DiscussionRow({
   names: Record<string, string>;
 }) {
   const author = message.head.author;
-  const text = blocksText(message.head.blocks);
   const time = relTime(message.head.created_at);
   const isMarker = author !== "system" && typeof author === "object" && "module" in author;
 
   // The tracker's own lifecycle markers ("closed this", "merged this pull
   // request") post as Module("forge") — render them as muted system lines, not
-  // comment cards.
+  // comment cards. A marker is one flat sentence the module wrote, so it stays
+  // a flattened string; only real comments carry marks worth rendering.
   if (isMarker) {
+    const text = blocksText(message.head.blocks);
     return (
       <div
         style={{
@@ -175,11 +177,13 @@ function DiscussionRow({
           font: `400 12.5px ${font.sans}`,
           color: color.inkSoft,
           lineHeight: 1.55,
-          whiteSpace: "pre-wrap",
           wordBreak: "break-word",
         }}
       >
-        {text}
+        {/* The same renderer chat uses — a forge comment is a chat message, so
+            its mention marks and page refs are click targets here too (it used
+            to be flattened to a string, which threw the marks away). */}
+        <RichText blocks={message.head.blocks} names={names} />
       </div>
     </div>
   );

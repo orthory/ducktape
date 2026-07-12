@@ -65,6 +65,22 @@ export interface AgentRecord {
 
 const TARGET = "agent";
 
+/** The agent's address, or `null` when there is no honest one to show.
+ *
+ *  `agent_id` is a DNS label by consensus rule (`validate_agent_id`,
+ *  crates/apps/agent/src/lib.rs), and a label IS an RFC 5321 local part verbatim
+ *  — so the id is the ident forge attributes every agent commit to
+ *  (`bin/noded/src/agent_provision/forge.rs`). `agents` is a RESERVED root label
+ *  in duckdns: no account can register the handle and inherit these addresses.
+ *
+ *  LEGACY agents, registered before that rule, may hold any id — and forge does
+ *  NOT address them this way. It derives `<slug>.<hash>@agents.duck` from the
+ *  complete id. Reproducing that here means sha256 in a render path; printing
+ *  `<id>@agents.duck` anyway would print an address that is simply NOT the
+ *  agent's. Show nothing rather than something false. */
+export const agentAddress = (agentId: string): string | null =>
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(agentId) ? `${agentId}@agents.duck` : null;
+
 /** Every action name an agent can be granted (KNOWN_ACTIONS). A RegisterAgent /
  *  UpdateAgent rejects an `allowed_actions` entry outside this set.
  *

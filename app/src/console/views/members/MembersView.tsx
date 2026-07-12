@@ -1198,6 +1198,30 @@ export function MembersView() {
   const selected = selectedKey
     ? rows.find((member) => member.keyNorm === normalizeKey(selectedKey)) ?? null
     : null;
+
+  // Consume a clicked @user mention's hand-off (state.memberFocus). The mention
+  // names an ACCOUNT, but this view's selectable unit is a NODE key, so invert
+  // nodeUsers to land on one of that account's rows. Held (not consumed) while
+  // nodeUsers is still empty — the identity slice hydrates asynchronously and
+  // clearing early would drop the focus on the floor. A focus naming an account
+  // with no node here is simply cleared: nothing to select, no error.
+  const { memberFocus, nodeUsers } = state;
+  useEffect(() => {
+    if (memberFocus === null) return;
+    const entries = Object.entries(nodeUsers);
+    if (entries.length === 0) return;
+    // Case-insensitive: the mention mark's account id round-trips through
+    // keyHex (always lowercase), while nodeUsers keeps whatever identity sent.
+    const hit = entries.find(([, user]) => user.accountId.toLowerCase() === memberFocus);
+    if (hit) {
+      setSelectedKey(hit[0]);
+      // The row has to be VISIBLE to read as selected — a stale filter/search
+      // from an earlier visit would otherwise hide the person we just opened.
+      setFilter("all");
+      setQuery("");
+    }
+    actions.clearMemberFocus();
+  }, [memberFocus, nodeUsers, actions]);
   const canAdmin = Boolean(state.workspace?.founder || state.workspace?.member);
   const groupedRows = useMemo(
     () => groupMembersByUser(visibleRows, state.nodeUsers),

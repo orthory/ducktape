@@ -8,7 +8,7 @@ import { useContext, useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import { authorName } from "../../../domain/chat-client";
-import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
+import type { AuthorNames, AuthorRef, MessageView } from "../../../domain/chat-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { ConsoleContext } from "../../store/context";
 import type { OpRecord } from "../../store/finalization";
@@ -17,6 +17,7 @@ import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helper
 import { blocksToInput } from "./chat-input";
 import { EmojiPicker } from "./EmojiPicker";
 import { HoverButton } from "./HoverButton";
+import { RichText } from "./rich-text";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 const QUICK_REACTS = ["👍", "✅", "👀"];
@@ -155,170 +156,6 @@ function AgentPill() {
       AGENT
     </span>
   );
-}
-
-// ── Block rendering (mark-aware where the wire actually carries marks) ──
-
-// The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
-// letters/digits/`_`/`-` at a whitespace boundary (parts are already
-// whitespace-split). Only what the node indexed reads as clickable.
-const TAG_TOKEN = /^#([\p{L}\p{N}_-]{1,64})/u;
-
-function TagToken({ token, onClick }: { token: string; onClick: (tag: string) => void }) {
-  return (
-    <button
-      type="button"
-      title={`Filter by ${token}`}
-      onClick={(event) => {
-        event.stopPropagation();
-        onClick(token.slice(1));
-      }}
-      style={{
-        all: "unset",
-        cursor: "pointer",
-        color: accentVar,
-        fontWeight: 500,
-      }}
-    >
-      {token}
-    </button>
-  );
-}
-
-function renderSpan(
-  span: Span,
-  names: AuthorNames,
-  key: number,
-  onTagClick?: (tag: string) => void,
-): ReactNode {
-  const mentionMark = span.marks.find(
-    (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
-  );
-  if (mentionMark) {
-    return (
-      <span key={key} style={{ color: accentVar, fontWeight: 500 }}>
-        @{authorName(mentionMark.mention, names)}
-      </span>
-    );
-  }
-  const linkMark = span.marks.find((m): m is { link: string } => typeof m === "object" && "link" in m);
-  const linkHref = linkMark && /^https?:\/\//i.test(linkMark.link) ? linkMark.link : null;
-  const style: CSSProperties = {
-    fontWeight: span.marks.includes("bold") ? 600 : 400,
-    fontStyle: span.marks.includes("italic") ? "italic" : "normal",
-    color: linkHref ? accentVar : undefined,
-    textDecoration: linkHref ? "underline" : undefined,
-    overflowWrap: "anywhere",
-    wordBreak: "break-word",
-  };
-  if (linkHref) {
-    return (
-      <a
-        key={key}
-        href={linkHref}
-        target="_blank"
-        rel="noreferrer"
-        style={{ ...style, cursor: "pointer" }}
-      >
-        {span.text}
-      </a>
-    );
-  }
-  // No real Mark::Mention crosses the wire from the composer yet. Fall back to
-  // sniffing @/# tokens in plain text so mentions/channel refs still read
-  // visually distinct. A #token matching the index's tag grammar becomes a
-  // click-to-filter affordance when the surface wires one up.
-  const parts = span.text.split(/(\s+)/);
-  return (
-    <span key={key} style={style}>
-      {parts.map((part, i) => {
-        const tag = part.startsWith("#") ? TAG_TOKEN.exec(part) : null;
-        if (tag && onTagClick) {
-          return (
-            <span key={i}>
-              <TagToken token={tag[0]} onClick={onTagClick} />
-              {part.slice(tag[0].length)}
-            </span>
-          );
-        }
-        return part.startsWith("@") || part.startsWith("#") ? (
-          <span key={i} style={{ color: accentVar, fontWeight: 500 }}>
-            {part}
-          </span>
-        ) : (
-          part
-        );
-      })}
-    </span>
-  );
-}
-
-function renderBlocks(
-  blocks: ChatBlock[],
-  names: AuthorNames,
-  onTagClick?: (tag: string) => void,
-): ReactNode {
-  return blocks.map((block, i) => {
-    if (block === "divider") {
-      return <div key={i} style={{ height: 1, background: color.borderSoft, margin: "7px 0" }} />;
-    }
-    if ("paragraph" in block) {
-      return (
-        <div
-          key={i}
-          style={{
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-            wordBreak: "break-word",
-            maxWidth: "100%",
-            minWidth: 0,
-          }}
-        >
-          {block.paragraph.map((span, j) => renderSpan(span, names, j, onTagClick))}
-        </div>
-      );
-    }
-    if ("quote" in block) {
-      return (
-        <div
-          key={i}
-          style={{
-            borderLeft: `2px solid ${color.borderStrong}`,
-            paddingLeft: 9,
-            margin: "3px 0",
-            color: color.muted3,
-            fontStyle: "italic",
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-            wordBreak: "break-word",
-            maxWidth: "100%",
-          }}
-        >
-          {block.quote.map((span, j) => renderSpan(span, names, j, onTagClick))}
-        </div>
-      );
-    }
-    return (
-      <pre
-        key={i}
-        style={{
-          margin: "4px 0",
-          padding: "8px 10px",
-          borderRadius: radius.sm,
-          background: color.sunken,
-          font: `400 12px ${font.mono}`,
-          color: color.inkSoft,
-          overflowX: "auto",
-          maxWidth: "100%",
-          minWidth: 0,
-          boxSizing: "border-box",
-          whiteSpace: "pre",
-        }}
-      >
-        {block.code.text}
-      </pre>
-    );
-  });
 }
 
 // ── Reactions ────────────────────────────────────────────
@@ -1029,7 +866,7 @@ export function MessageItem({
           ) : editing ? (
             <EditBox draft={editDraft} onChange={setEditDraft} onSave={saveEdit} onCancel={() => setEditing(false)} />
           ) : (
-            renderBlocks(message.head.blocks, names, onTagClick)
+            <RichText blocks={message.head.blocks} names={names} onTagClick={onTagClick} />
           )}
         </div>
         {confirmingDelete && (

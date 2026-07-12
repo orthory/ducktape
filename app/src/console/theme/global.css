@@ -144,6 +144,19 @@ button:focus-visible,
   background-clip: content-box;
 }
 
+/* A syntax-highlighted code token (forge's CodeView). shiki tokenizes against
+   github-light AND github-dark at once and hands each token both colors as
+   inline custom properties; this picks the one matching the live `data-theme`,
+   so the Code tab re-paints on a theme flip with no re-tokenize. Without the
+   dark arm, every token would keep its light-theme color and vanish against the
+   dark paper. */
+.code-tok {
+  color: var(--shiki-light);
+}
+:root[data-theme="dark"] .code-tok {
+  color: var(--shiki-dark);
+}
+
 /* Scrollable, but with no visible scrollbar chrome — the doc tab strip still
    scrolls (wheel/trackpad/keyboard) yet never paints the global 10px bar. */
 .no-scrollbar {

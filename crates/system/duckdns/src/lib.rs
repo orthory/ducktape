@@ -13,6 +13,6 @@ mod registry;
 mod wire;
 
 pub use module::DuckDns;
-pub use names::{parse_hostname, validate_handle};
+pub use names::{parse_hostname, validate_handle, validate_handle_shape};
 pub use registry::Registry;
 pub use wire::*;
