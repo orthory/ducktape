@@ -71,6 +71,13 @@ saga = { workspace = true }
 # (and their native saga / chat+tasks+inbox siblings) beside the wasm ports.
 agent = { workspace = true }
 automations = { workspace = true }
+# the runs adapter-port parity proof drives the REAL collaboration loop —
+# chat-over-QmdbStore, pages-over-QmdbStore, tagging, saga, dispatch (native
+# by design), agent, tasks, jobs, files — through the native runs module and
+# its wasm port side by side. files needs an on-disk odb dir (tempfile).
+runs = { workspace = true }
+files = { workspace = true }
+tempfile = "3"
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"

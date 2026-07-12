@@ -197,7 +197,10 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("modreg", 1),
     // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
-    ("runs", 2),
+    // 3: the wasm adapter port — the native canonical snapshot (itself at
+    // revision 2 since the session section landed) persisted as one host-KV
+    // value, so root()/snapshot bytes changed shape again at cutover.
+    ("runs", 3),
     // 2: the wasm adapter port (saga's empty-map root coincides with the
     // empty host-KV root, but every written state re-encodes — a break).
     ("saga", 2),

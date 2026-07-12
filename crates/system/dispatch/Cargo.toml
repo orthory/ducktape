@@ -9,7 +9,14 @@ version.workspace = true
 [dependencies]
 sdk = { workspace = true }
 serde = { workspace = true }
-saga = { workspace = true }
+# default-features = false: dispatch consumes only saga's consensus surface
+# (SagaOrigin/SagaView, the codecs, the shared byte caps, the trigger msgs),
+# and the `runs-wasm` guest builds this crate for wasm32 — saga's native-only
+# usage-ledger mapper (indexer -> unix-only IO) must not ride along. a direct
+# path dep because workspace inheritance cannot switch default features off;
+# feature unification keeps native binaries (which enable saga's default
+# `native`) whole.
+saga = { path = "../saga", default-features = false }
 # the shared capability-tag shape rule for Recipe.capability validation.
 capability = { workspace = true }
 sha2 = { workspace = true }

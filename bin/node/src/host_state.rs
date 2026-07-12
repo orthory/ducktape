@@ -14,7 +14,6 @@ use host::Host;
 use kv::Kv;
 use modreg::Modreg;
 use recovery::Manifest;
-use runs::RunsModule;
 use sha2::Digest as _;
 use sdk::StateRoot;
 use statesync::{fetch_snapshot, qmdb::{QmdbStore, RemoteQmdbResolver}};
@@ -167,6 +166,26 @@ const AUTOMATIONS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/examples/automations-wasm/component.wasm");
 const AUTOMATIONS_MODULE_ID: &str = "automations";
 
+/// runs — the FINAL adapter-ported tenant: the collaboration loop's actor.
+/// every decision in its handle paths reads staged-over-committed (the
+/// watch/pending-entry/session accessors shadow the committed maps with the
+/// block's overlays), so the whole-state fold is behavior-identical (pinned
+/// by `wasm_runs_parity`). its ten collaborator ids — chat, saga, tagging,
+/// dispatch, agent, tasks, jobs, plus the files/forge/pages builder chain —
+/// are genesis-constant and compiled into the guest (the exact production
+/// constructor these builders used to call natively). the dispatch reads it
+/// depends on (`turn_taken`'s permanent record, the session lane's
+/// `lease_holder`) are COMMITTED-ONLY by dispatch's design — dispatch stays
+/// native and answers committed-only regardless of caller, so the guest's
+/// host-routed queries read exactly what the native module read. the
+/// delivered-runs ring (`RecentRuns`) — derived per-node state outside the
+/// NATIVE root/snapshot — persists through the guest's own `__history` key
+/// (the app's runs client and the dogfood receipt lane read it), so it rides
+/// the wasm root and snapshots like everything else the guest keeps.
+const RUNS_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/examples/runs-wasm/component.wasm");
+const RUNS_MODULE_ID: &str = "runs";
+
 /// pages / chat — the first STORE-BACKED wasm tenants: the native crates are
 /// pure logic over an injected `sdk::MerkleStore`, so the guests compile that
 /// SAME logic over the adapter's `WitStore` while the REAL qmdb store stays
@@ -256,6 +275,10 @@ fn seeded_modreg() -> Modreg {
     modreg.seed(
         AUTOMATIONS_MODULE_ID,
         sha2::Sha256::digest(AUTOMATIONS_WASM_COMPONENT).to_vec(),
+    );
+    modreg.seed(
+        RUNS_MODULE_ID,
+        sha2::Sha256::digest(RUNS_WASM_COMPONENT).to_vec(),
     );
     modreg
 }
@@ -348,6 +371,16 @@ fn genesis_automations_wasm() -> WasmModule {
     WasmModule::from_bytes(AUTOMATIONS_MODULE_ID, AUTOMATIONS_WASM_COMPONENT)
         .expect("embedded automations component loads")
         .with_state_schema_revision(2)
+}
+
+/// runs at its GENESIS code (adapter-ported — see the component const's doc).
+/// revision 3: the native canonical snapshot (itself at revision 2 since the
+/// session section landed) is persisted as one host-KV value, so the encoding
+/// breaks shape again at cutover.
+fn genesis_runs_wasm() -> WasmModule {
+    WasmModule::from_bytes(RUNS_MODULE_ID, RUNS_WASM_COMPONENT)
+        .expect("embedded runs component loads")
+        .with_state_schema_revision(3)
 }
 
 /// pages at its GENESIS code over the host-constructed store (a fresh/reopened
@@ -471,7 +504,7 @@ struct ProductionModules {
     files: Files,
     jobs: WasmModule,
     agent: WasmModule,
-    runs: RunsModule,
+    runs: WasmModule,
     directory: WasmModule,
     automations: WasmModule,
 }
@@ -549,6 +582,7 @@ pub(super) async fn genesis_host(
     blobs.put_chunk(SAGA_WASM_COMPONENT.to_vec());
     blobs.put_chunk(AGENT_WASM_COMPONENT.to_vec());
     blobs.put_chunk(AUTOMATIONS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -628,27 +662,10 @@ pub(super) async fn genesis_host(
         agent: genesis_agent_wasm(),
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
-        runs: RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("jobs".into()),
-        )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2). its presence is what selects the v3 composer;
-        // unwired, the composer emits the v2 wire.
-        .with_files_module("files")
-        // the forge module the composer resolves forge:<repo>:<n> channels
-        // against and the PR sink queries; unwired, forge-channel mentions
-        // skip at compose.
-        .with_sink_forge("forge")
-        // the pages module the composer renders [[page:<id>]] refs from
-        // and the pages effects lane writes to; unwired, both degrade.
-        .with_pages_module("pages"),
+        // adapter-ported; the whole production wiring (chat/saga/tagging/
+        // dispatch/agent/tasks/jobs + the files/forge/pages builder chain) is
+        // compiled into the guest.
+        runs: genesis_runs_wasm(),
         // the first real wasm tenant: bytes-compatible with the retired native
         // implementation, so this cutover left the app-hash untouched.
         directory: genesis_directory_wasm(),
@@ -820,20 +837,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("agent install: {e}"))?;
 
-    let mut runs = RunsModule::new(
-        "runs",
-        "chat",
-        "saga",
-        "tagging",
-        "dispatch",
-        "agent",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    )
-    .with_files_module("files")
-    .with_sink_forge("forge")
-    .with_pages_module("pages");
-    let (bytes, root) = snapshot_of("runs")?;
+    let mut runs = genesis_runs_wasm();
+    let (bytes, root) = snapshot_of(RUNS_MODULE_ID)?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
@@ -1187,20 +1192,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("agent install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("runs").await?;
-    let mut runs = RunsModule::new(
-        "runs",
-        "chat",
-        "saga",
-        "tagging",
-        "dispatch",
-        "agent",
-        Some("tasks".into()),
-        Some("jobs".into()),
-    )
-    .with_files_module("files")
-    .with_sink_forge("forge")
-    .with_pages_module("pages");
+    let (bytes, root) = snapshot_of(RUNS_MODULE_ID).await?;
+    let mut runs = genesis_runs_wasm();
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 

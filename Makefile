@@ -330,6 +330,13 @@ wasm-modules:
 	cp crates/examples/automations-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/automations.component.wasm
 
+	cd crates/examples/runs-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/examples/runs-wasm/target/wasm32-unknown-unknown/release/runs_wasm.wasm \
+	  -o crates/examples/runs-wasm/component.wasm
+	cp crates/examples/runs-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/runs.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -371,6 +378,8 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/agent.component.wasm
 	cmp crates/examples/automations-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/automations.component.wasm
+	cmp crates/examples/runs-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/runs.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:
