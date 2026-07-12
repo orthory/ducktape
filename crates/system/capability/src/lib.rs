@@ -301,10 +301,11 @@ impl Module for CapabilityRegistry {
             }
         }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            CapabilityMsg::Announce { capabilities } => {
+            CapabilityMsg::Announce { capabilities, resources: _ } => {
                 let tags = Self::validate_tags(capabilities)?;
                 // declarative replace: the last announcement staged in a block
-                // wins, and an empty set stages a removal.
+                // wins, and an empty set stages a removal. resources are plumbed
+                // in the wire msg but not yet used in the registry (Task 2).
                 self.pending.insert(node, tags);
             }
         }
@@ -330,6 +331,14 @@ impl Module for CapabilityRegistry {
                     .map(|t| t.iter().cloned().collect())
                     .unwrap_or_default();
                 encode_reply(&CapabilityReply::Node(tags))
+            }
+            CapabilityQuery::CapableProviders { .. } => {
+                // replaced in the next commit (Task 2)
+                return Err(Error::QueryUnsupported);
+            }
+            CapabilityQuery::Resources { .. } => {
+                // replaced in the next commit (Task 2)
+                return Err(Error::QueryUnsupported);
             }
             CapabilityQuery::All => {
                 let all = view
@@ -439,6 +448,7 @@ mod tests {
             target: "capability".into(),
             payload: encode_msg(&CapabilityMsg::Announce {
                 capabilities: tags.iter().map(|t| t.to_string()).collect(),
+                resources: Default::default(),
             }),
         }
     }

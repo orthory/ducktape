@@ -153,7 +153,10 @@ impl CapabilityAnnouncer {
         let capabilities = self.decide(&committed)?;
         Some(Msg {
             target: "capability".into(),
-            payload: encode_msg(&CapabilityMsg::Announce { capabilities }),
+            payload: encode_msg(&CapabilityMsg::Announce {
+                capabilities,
+                resources: Default::default(),
+            }),
         })
     }
 }
