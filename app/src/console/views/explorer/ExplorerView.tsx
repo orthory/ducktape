@@ -7,7 +7,7 @@
 // payload preview). An idle window rides as an empty-`ops` nop, shown as an
 // idle block with no op rows. Read-only; records re-pull on every block.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 
 import { displayNameForKey } from "../../../domain/names";
 import type { BlockRecord, DispatchInfo, RootOp } from "../../../domain/transport";
@@ -18,8 +18,20 @@ import { color, font, radius } from "../../theme/tokens";
 const shortHex = (hex: string): string =>
   hex.length > 10 ? `${hex.slice(0, 10)}…` : hex || "—";
 
-/** Grid template shared by the list header and every row. */
-const ROW_GRID = "72px 1.4fr 1.4fr 1.4fr 52px";
+/** Grid template shared by the list header and every row.
+ *  `minmax(0, …)` — NOT a bare `fr` — because a bare `fr` track's floor is its
+ *  min-content width, so the mono digests below would pin the row wider than the
+ *  container at narrow widths. The window frame is `overflow:hidden`, so that
+ *  surplus is silently clipped rather than scrolled. minmax(0,…) lets the tracks
+ *  shrink and the cells ellipsize instead. */
+const ROW_GRID = "72px minmax(0, 1.4fr) minmax(0, 1.4fr) minmax(0, 1.4fr) 52px";
+
+/** Mono digest cells must ellipsize, or their min-content re-inflates the row. */
+const ELLIPSIZE: CSSProperties = {
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
 
 function ColumnHeaders() {
   const cell = { font: `600 10.5px ${font.sans}`, color: color.muted };
@@ -85,10 +97,10 @@ function BlockRow({
       <span style={{ font: `600 12.5px ${font.mono}`, color: color.ink }}>
         #{block.height.toLocaleString()}
       </span>
-      <span style={{ font: `400 11.5px ${font.mono}`, color: color.inkSofter }}>
+      <span style={{ ...ELLIPSIZE, font: `400 11.5px ${font.mono}`, color: color.inkSofter }}>
         {shortHex(block.hash)}
       </span>
-      <span style={{ font: `400 11.5px ${font.mono}`, color: color.muted3 }}>
+      <span style={{ ...ELLIPSIZE, font: `400 11.5px ${font.mono}`, color: color.muted3 }}>
         {shortHex(block.commitHash)}
       </span>
       <span

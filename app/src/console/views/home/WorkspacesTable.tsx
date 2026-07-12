@@ -90,7 +90,13 @@ export function WorkspacesTable() {
         style={{
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
-          overflow: "hidden",
+          // `overflowX:auto`, NOT `hidden`: the window frame is `overflow:hidden`
+          // end to end, so there is no global scrollbar to catch this table when
+          // the mono chainId column forces it past the container — the right-hand
+          // Active/actions columns were simply clipped away, silently. Scrolling
+          // on this axis still clips to the rounded corners (a scroll container
+          // always does), so the rounded box is preserved.
+          overflowX: "auto",
           background: color.paper,
         }}
       >

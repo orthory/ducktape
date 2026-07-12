@@ -111,7 +111,8 @@ export function SelfCheck({
     aspectRatio: "16 / 9",
     borderRadius: radius.md,
     overflow: "hidden",
-    background: color.dark,
+    // video letterbox → scrim, not the inverting `color.dark` (see CallTiles).
+    background: color.scrim,
     border: `2px solid ${speaking ? color.green : "transparent"}`,
     boxSizing: "border-box",
     display: "flex",
@@ -139,7 +140,11 @@ export function SelfCheck({
                     padding: "7px 14px",
                     borderRadius: radius.md,
                     background: accentVar,
-                    color: color.onDark,
+                    // The accent does NOT invert with the theme, so its text must
+                    // not either: `color.onDark` is --c-on-filled, which flips to
+                    // near-black in dark mode (3.33:1 on the accent — below AA).
+                    // Literal white, as everywhere else we paint on the accent.
+                    color: "#fff",
                     font: `600 12px ${font.sans}`,
                   }}
                   hoverStyle={{ filter: "brightness(1.06)" }}
@@ -158,8 +163,9 @@ export function SelfCheck({
               bottom: 8,
               padding: "2px 8px",
               borderRadius: 999,
-              background: "rgba(38,37,31,.62)",
-              color: color.onDark,
+              // always-dark chip over video → always-light text (see CallTiles).
+              background: color.scrimSoft,
+              color: color.onScrim,
               font: `600 11px ${font.sans}`,
             }}
           >

@@ -1,12 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 
 import { color, font } from "../../theme/tokens";
 import type { HlToken } from "./highlight";
-
-// github-light's default foreground — text outside any token, kept in sync with
-// the shiki theme used by ./highlight. Inlined so this module doesn't statically
-// pull in shiki (see the dynamic import below).
-const CODE_FG = "#24292e";
 
 // shiki tokenizes synchronously on the main thread; above this size that would
 // jank the webview for seconds (lockfiles, minified bundles), so we render such
@@ -72,7 +67,10 @@ export function CodeView({ text, filename }: { text: string; filename: string | 
             style={{
               flex: 1,
               whiteSpace: "pre",
-              color: highlighted ? CODE_FG : color.inkSoft,
+              // Highlighted tokens carry their own per-theme color (see below);
+              // this is the color of the plain fallback, and of any token shiki
+              // left unstyled — a theme token, so it inverts with the app.
+              color: color.inkSoft,
               paddingLeft: 13,
               paddingRight: 24,
             }}
@@ -81,7 +79,11 @@ export function CodeView({ text, filename }: { text: string; filename: string | 
               " "
             ) : (
               tokens.map((token, tokenIndex) => (
-                <span key={tokenIndex} style={token.color ? { color: token.color } : undefined}>
+                <span
+                  key={tokenIndex}
+                  className={token.style ? "code-tok" : undefined}
+                  style={token.style as CSSProperties | undefined}
+                >
                   {token.content}
                 </span>
               ))

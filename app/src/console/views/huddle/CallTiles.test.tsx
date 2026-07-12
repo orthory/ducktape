@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { render } from "@testing-library/react";
 import { CallTiles } from "./CallTiles";
+import { color } from "../../theme/tokens";
 import type { HuddleParticipant } from "../../store/huddle-roster";
 
 const p = (over: Partial<HuddleParticipant> & { key: string }): HuddleParticipant => ({
@@ -70,6 +71,48 @@ describe("CallTiles", () => {
       />,
     );
     expect(getByTitle("Sharing screen")).toBeTruthy();
+  });
+
+  // A video tile is theme-INVARIANT: the picture looks the same in light and
+  // dark, so the letterbox behind it and the name chip on top of it must stay
+  // dark-with-light-text in BOTH themes. `color.dark`/`color.onDark` are
+  // --c-filled/--c-on-filled, which INVERT — in dark mode that letterboxed video
+  // in near-white and turned the participant's name dark-on-dark (invisible).
+  // Hence the scrim tokens. jsdom can't resolve CSS vars or compute contrast, so
+  // this asserts the property that actually broke: these two colors must be
+  // concrete literals, never a `var(--c-*)` that a theme flip can invert.
+  it("paints the video frame and name chip with theme-invariant scrim colors", () => {
+    const { container, getByText } = render(
+      <CallTiles layout="gallery" participants={[p({ key: "self", isSelf: true })]} {...common} />,
+    );
+    const frame = container.querySelector("video")!.parentElement!;
+    const chip = getByText("You").parentElement!;
+
+    // A reverted token renders as `var(--c-filled, …)`, which jsdom either keeps
+    // verbatim or drops as an invalid color — both fail these two assertions.
+    for (const [what, value] of [
+      ["frame background", frame.style.background || frame.style.backgroundColor],
+      ["chip background", chip.style.background || chip.style.backgroundColor],
+      ["chip text", chip.style.color],
+    ] as const) {
+      expect(value, `${what} must be a concrete color`).not.toBe("");
+      expect(value, `${what} must not be a theme-inverting var()`).not.toContain("var(");
+    }
+  });
+
+  it("keeps the scrim swatch pair readable (WCAG AA) in both themes", () => {
+    // jsdom can't evaluate color-mix/vars, so contrast is checked on the literal
+    // scrim tokens — which is sound precisely BECAUSE they don't vary by theme.
+    const channels = (hex: string) =>
+      [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16) / 255);
+    const luminance = (rgb: number[]) => {
+      const [r, g, b] = rgb.map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const l1 = luminance(channels(color.onScrim));
+    const l2 = luminance(channels(color.scrim));
+    const contrast = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    expect(contrast, "onScrim on scrim").toBeGreaterThanOrEqual(4.5);
   });
 
   it("caps a strip and surfaces the overflow tail", () => {

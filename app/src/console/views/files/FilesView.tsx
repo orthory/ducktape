@@ -291,7 +291,10 @@ function UploadNotice({ upload }: { upload: UploadState | null }) {
         width: "min(360px, calc(100% - 32px))",
         borderRadius: radius.lg,
         border: `1px solid ${color.borderStrong}`,
-        background: "rgba(255, 255, 255, 0.96)",
+        // the surface token, not a literal white: its children are `color.ink`,
+        // which is near-WHITE in dark mode — a hardcoded white card made the
+        // toast unreadable there.
+        background: color.paper,
         boxShadow: shadow.pop,
         padding: 14,
       }}
@@ -389,7 +392,9 @@ function UploadDropOverlay({ targetDir }: { targetDir: string }) {
           padding: "34px 28px",
           borderRadius: radius.lg,
           border: `2px dashed ${color.green}`,
-          background: "rgba(255, 255, 255, 0.97)",
+          // surface token — see the upload toast above. A literal white card
+          // hid this drop target's `color.ink` text entirely in dark mode.
+          background: color.paper,
           boxShadow: shadow.pop,
           textAlign: "center",
         }}
