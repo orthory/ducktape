@@ -17,7 +17,6 @@ import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
-import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import { classifyBootError } from "../../domain/boot-error";
 import type { NodeTransport } from "../../domain/transport";
@@ -480,9 +479,6 @@ export interface ConsoleActions {
    *  "Node failed to start" surface). Idempotent — re-runs connectActive
    *  against the existing workspace, never re-minting one. */
   retryConnect(): void;
-  /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
-   *  scrape fails — best-effort, for the poll-driven Metrics view. */
-  readMetrics(): Promise<NodeMetrics | null>;
   /** The active workspace's `daemon.log` path + last 64 KB — polled by the
    *  Node → Logs tab. Null when there is no managed workspace or the read
    *  fails (node stopped mid-view); the viewer keeps its last good frame. */
@@ -1602,13 +1598,6 @@ export function createActions({
           approvePhoneEnrollment(accountDeps(), enrollment, newKeyHex, sigHex, label),
         )
         .then(() => refresh()),
-
-    readMetrics: () => {
-      const live = getNode();
-      return live
-        ? live.metrics().then(parseMetrics).catch(() => null)
-        : Promise.resolve(null);
-    },
 
     // The Logs tab surfaces the LOCAL daemon.log — a per-workspace file only the
     // desktop shell that spawned the node can read. Both reads are best-effort:

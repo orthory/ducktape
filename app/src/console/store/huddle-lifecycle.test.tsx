@@ -157,7 +157,6 @@ const makeFakeNode = () => {
         modules: [{ id: "chat", root: String(state.height).padStart(64, "c") }],
       }),
     ),
-    metrics: vi.fn().mockResolvedValue(""),
     subscribe: vi.fn((_topics: string[], handlers: TopicHandlers) => {
       topicHandlers.add(handlers);
       return () => topicHandlers.delete(handlers);

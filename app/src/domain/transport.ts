@@ -12,7 +12,7 @@
 
 // ── Types ───────────────────────────────────────────────
 
-import type { ClientMsg, ServerFrame } from "./stream.gen";
+import type { ClientMsg, ServerFrame, StreamErrorCode } from "./stream.gen";
 import type {
   EventFrame,
   HeartbeatFrame,
@@ -344,13 +344,6 @@ export interface NodeTransport {
 
   status(): Promise<NodeStatus>;
   /**
-   * The node's Prometheus/OpenMetrics scrape (`GET /metrics`) as raw text —
-   * commonware's runtime series plus this node's `ducktape_*` block series
-   * (height, blocks, apply-latency histogram, per-module dispatch counters).
-   * Parse with `domain/metrics`. Rejects when the node has no metrics surface.
-   */
-  metrics(): Promise<string>;
-  /**
    * Recent finalized blocks from the node's ring, oldest-first — the explorer's
    * backing read. Each record carries every op aggregated into its window (an
    * idle window rides as an empty-`ops` nop). `limit` caps the count (default:
@@ -371,6 +364,10 @@ export interface TopicHandlers {
   onEvent?(frame: EventFrame): void;
   onTail?(frame: TailFrame): void;
   onLagged?(topic: string, cursor: string): void;
+  /** The node refused this topic (unknown on an older build, unavailable, …):
+   *  no frames will arrive on it for the rest of this connection, so a
+   *  subscriber can stop waiting and say so instead of spinning forever. */
+  onRefused?(topic: string, code: StreamErrorCode, detail: string): void;
 }
 
 export type StreamSignal =
@@ -614,6 +611,11 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       if (frame.topic) {
         refusedTopics.add(frame.topic);
         cursors.delete(frame.topic);
+        topicSubs
+          .get(frame.topic)
+          ?.forEach((handlers) =>
+            handlers.onRefused?.(frame.topic, frame.code, frame.detail),
+          );
         const key = `${frame.topic}:${frame.code}`;
         if (!loggedTopicErrors.has(key)) {
           loggedTopicErrors.add(key);
@@ -802,12 +804,6 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         throw new NodeError("badBody", "the process answering this port is not a ducktape node");
       }
       return parsed;
-    },
-    // OpenMetrics text exposition (not json, not under /v1) — the scrape body.
-    metrics: async () => {
-      const res = await fetchDeadline(`${base}/metrics`, undefined, STATUS_TIMEOUT_MS);
-      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
-      return res.text();
     },
     blocks: async (limit) => {
       const res = await fetchDeadline(
