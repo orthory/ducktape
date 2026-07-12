@@ -17,6 +17,8 @@ import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import {
   DEFAULT_SANDBOX_IMAGE,
+  MODE_OPTIONS,
+  modeOptionsFor,
   preflightChecklist,
   SERVING_OFF_TOML,
   servingTomlLines,
@@ -265,13 +267,6 @@ function ChecklistRow({ item, prompt }: { item: ReturnType<typeof preflightCheck
   );
 }
 
-const MODE_OPTIONS: { id: "off" | SandboxMode; label: string; blurb: string }[] = [
-  { id: "off", label: "Off", blurb: "Serve no agent work — leave the capability registry." },
-  { id: "direct", label: "Direct", blurb: "Unsandboxed spawn. Tags only, no metered capacity." },
-  { id: "podman", label: "Podman", blurb: "Rootless podman with per-run cpu/memory caps (Linux)." },
-  { id: "tart", label: "Tart", blurb: "Apple-Silicon VM per run (macOS, phase 2)." },
-];
-
 function ModeGuidance({ mode, image }: { mode: "off" | SandboxMode; image: string }) {
   const [copied, copy] = useCopy();
   const toml = mode === "off" ? SERVING_OFF_TOML : servingTomlLines(mode, image);
@@ -364,8 +359,7 @@ export function SandboxTab() {
   const prompt = setupPrompt(backendMode, image);
   const serving = pf?.announceCapabilities ?? false;
   const configuredMode = pf?.mode ? pf.mode : "unset";
-  const macos = pf?.os === "macos";
-  const modeOptions = MODE_OPTIONS.filter((m) => m.id !== (macos ? "podman" : "tart"));
+  const modeOptions = modeOptionsFor(pf?.os === "macos");
 
   return (
     <>

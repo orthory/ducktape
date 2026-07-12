@@ -13,6 +13,15 @@ import type { SandboxPreflight, ProbeResult } from "../../../domain/sandbox-clie
 export type SandboxMode = "direct" | "podman" | "tart";
 export type CheckState = "ok" | "fail" | "unknown";
 
+export const MODE_OPTIONS: { id: "off" | SandboxMode; label: string; blurb: string }[] = [
+  { id: "off", label: "Off", blurb: "Serve no agent work — leave the capability registry." },
+  { id: "direct", label: "Direct", blurb: "Unsandboxed spawn. Tags only, no metered capacity." },
+  { id: "podman", label: "Podman", blurb: "Rootless podman with per-run cpu/memory caps." },
+  { id: "tart", label: "Tart", blurb: "Apple-Silicon VM per run." },
+];
+
+export const modeOptionsFor = (macos: boolean) => MODE_OPTIONS.filter((m) => m.id !== "tart" || macos);
+
 export interface ChecklistItem {
   id: "backend" | "image" | "cgroup";
   label: string;

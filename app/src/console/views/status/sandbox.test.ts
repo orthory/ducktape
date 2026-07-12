@@ -3,11 +3,22 @@ import { describe, expect, it } from "vitest";
 import type { SandboxPreflight } from "../../../domain/sandbox-client";
 import {
   DEFAULT_SANDBOX_IMAGE,
+  modeOptionsFor,
   preflightChecklist,
   SERVING_OFF_TOML,
   servingTomlLines,
   setupPrompt,
 } from "./sandbox";
+
+describe("modeOptionsFor", () => {
+  it("offers both sandbox backends on macOS", () => {
+    expect(modeOptionsFor(true).map((mode) => mode.id)).toEqual(["off", "direct", "podman", "tart"]);
+  });
+
+  it("keeps Tart off non-macOS hosts", () => {
+    expect(modeOptionsFor(false).map((mode) => mode.id)).toEqual(["off", "direct", "podman"]);
+  });
+});
 
 const linuxPreflight = (over: Partial<SandboxPreflight> = {}): SandboxPreflight => ({
   os: "linux",
