@@ -13,16 +13,16 @@ A Ducktape network is a sovereign consensus domain, and one node process
 belongs to exactly one of them by construction:
 
 - The genesis namespace domain-separates discovery, the simplex scheme, and
-  the epoch floor (`bin/node/src/config.rs:259-282`); a node of network A
+  the epoch floor (`bin/node/src/config/mod.rs:128-160`); a node of network A
   cannot even complete a handshake with network B.
 - Every node-bind/member certificate folds in `chain_id`
-  (`crates/system/identity/src/lib.rs:100-102`), so no credential issued in A
+  (`crates/system/identity/src/lib.rs:97-99`), so no credential issued in A
   has effect in B.
 - Overlay meshes are disjoint — the WireGuard ULA prefix and member addresses
-  derive from `chain_id` (`crates/system/wireguard-upgrade/src/lib.rs:569,584`).
+  derive from the chain namespace (`crates/system/wireguard/src/lib.rs:540,555`).
 - Multi-network per machine is already the product: one workspace = one
-  network = one node process (`app/src-tauri/src/workspaces.rs`), one user key
-  shared across all of them (`app/src-tauri/src/user_identity.rs:1-4`).
+  network = one node process (`app/src-tauri/src/workspaces/mod.rs:1-9`), one
+  user key shared across all of them (`app/src-tauri/src/user_identity.rs:1-4`).
 
 The requirement this ADR answers: **Slack-Connect-style federation.** Two
 networks connect so that members of one can converse with — and specifically
