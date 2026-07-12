@@ -25,6 +25,7 @@ import {
   quantile,
   ratePerSecond,
   syncBlocksLeft,
+  syncParked,
   syncPhase,
   syncProgress,
   type DataPlaneMetric,
@@ -430,9 +431,11 @@ function DataPlaneRow({ row }: { row: PlaneRow }) {
 
 /** One served sync peer: identity + phase, its progression toward this
  *  node's height (bar, %, blocks left) when the served responses establish
- *  one, a live serve-rate sparkline, and cumulative totals. */
+ *  one, a live serve-rate sparkline, and cumulative totals. A parked peer's
+ *  sync is over — it reads "synced", never a stale % against a moving goal. */
 function SyncPeerRowView({ row, goalHeight }: { row: SyncPeerRow; goalHeight: number }) {
   const { peer } = row;
+  const parked = syncParked(peer);
   const progress = syncProgress(peer, goalHeight);
   const blocksLeft = syncBlocksLeft(peer, goalHeight);
   const detail =
@@ -459,7 +462,19 @@ function SyncPeerRowView({ row, goalHeight }: { row: SyncPeerRow; goalHeight: nu
         </span>
       </div>
       <div style={{ width: 170, flexShrink: 0, display: "flex", flexDirection: "column", gap: 3 }}>
-        {progress !== null && blocksLeft !== null ? (
+        {parked ? (
+          <>
+            <div
+              style={{
+                height: 5,
+                borderRadius: 3,
+                background: color.green,
+                border: `1px solid ${color.borderSoft}`,
+              }}
+            />
+            <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted }}>synced</span>
+          </>
+        ) : progress !== null && blocksLeft !== null ? (
           <>
             <div
               style={{

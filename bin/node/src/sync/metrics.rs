@@ -16,6 +16,11 @@
 //! the peer restores from, `frame_height` the highest finalized frame this
 //! node has handed it. The goal to measure either against is the node's own
 //! `ducktape_block_height` from the same scrape.
+//!
+//! The heights are conversation history and FREEZE once a joiner finishes
+//! and parks (its tip polls keep the entry alive); `last_request{kind}` — an
+//! info gauge, constant 1, the kind label is the value — carries the recency
+//! discriminant readers phase a peer by instead.
 
 use commonware_runtime::telemetry::metrics::{EncodeMetric, MetricEncoder, MetricType, Registered};
 use statesync::monitor::{PeerServeReport, ServeMonitor};
@@ -120,6 +125,11 @@ impl SyncServeMetrics {
                     },
                 ),
                 series(
+                    "ducktape_statesync_serve_last_request",
+                    "the peer's most recent answered request kind (info gauge: constant 1)",
+                    |r| vec![(vec![("kind", r.last_kind)], 1)],
+                ),
+                series(
                     "ducktape_statesync_serve_boundary_height",
                     "the snapshot boundary height last served to the peer (its restore base)",
                     |r| match r.boundary_height {
@@ -175,6 +185,12 @@ mod tests {
                 ),
                 "requests series missing from scrape:\n{scrape}"
             );
+            assert!(
+                scrape.contains(
+                    r#"ducktape_statesync_serve_last_request{peer="abcd1234",kind="tip_coords"} 1"#
+                ),
+                "last-request info gauge missing from scrape:\n{scrape}"
+            );
             // no manifest and no frames served yet: neither height encodes.
             assert!(
                 !scrape.contains("ducktape_statesync_serve_boundary_height{"),
@@ -208,6 +224,19 @@ mod tests {
             assert!(
                 scrape.contains(r#"ducktape_statesync_serve_frames{peer="abcd1234"} 1"#),
                 "frames counter missing:\n{scrape}"
+            );
+            // the recency discriminant followed the latest request kind.
+            assert!(
+                scrape.contains(
+                    r#"ducktape_statesync_serve_last_request{peer="abcd1234",kind="frames"} 1"#
+                ),
+                "last-request info gauge did not follow the latest kind:\n{scrape}"
+            );
+            assert!(
+                !scrape.contains(
+                    r#"ducktape_statesync_serve_last_request{peer="abcd1234",kind="tip_coords"}"#
+                ),
+                "stale last-request sample lingered:\n{scrape}"
             );
         });
     }

@@ -70,12 +70,14 @@ const withSyncPeersText = [
   'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="manifest"} 1',
   'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="chunk"} 21',
   'ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 4',
+  'ducktape_statesync_serve_last_request{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 1',
   // a tip poller: no manifest/frames served yet, so no height-shaped series.
   'ducktape_statesync_serve_age_seconds{peer="0011223344556677"} 3000',
   'ducktape_statesync_serve_idle_seconds{peer="0011223344556677"} 9',
   'ducktape_statesync_serve_bytes{peer="0011223344556677"} 4200',
   'ducktape_statesync_serve_frames{peer="0011223344556677"} 0',
   'ducktape_statesync_serve_requests{peer="0011223344556677",kind="tip_coords"} 250',
+  'ducktape_statesync_serve_last_request{peer="0011223344556677",kind="tip_coords"} 1',
   "# EOF",
   "",
 ].join("\n");
@@ -230,5 +232,22 @@ describe("MetricsView charts", () => {
     // cumulative serve totals per peer.
     expect(screen.getByText(/5.25 MB · 40 frames/)).toBeInTheDocument();
     expect(screen.queryByText(/state-sync lane is idle/)).toBeNull();
+  });
+
+  it("renders a joiner that finished and parked as synced, not a regressing sync", () => {
+    const { push } = renderMetrics();
+    // the joiner's latest ask flips from frames to a routine tip poll.
+    push(
+      withSyncPeersText.replace(
+        'ducktape_statesync_serve_last_request{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 1',
+        'ducktape_statesync_serve_last_request{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="tip_coords"} 1',
+      ),
+    );
+
+    expect(screen.getByText(/parked · 1m 15s/)).toBeInTheDocument();
+    expect(screen.getByText("synced")).toBeInTheDocument();
+    // the frozen reach is never measured against the advancing goal.
+    expect(screen.queryByText(/blocks left/)).toBeNull();
+    expect(screen.queryByText(/replaying frames/)).toBeNull();
   });
 });
