@@ -1,11 +1,12 @@
-// The metrics surface: the node's own operational health, scraped from
-// GET /metrics (Prometheus) and read live. Unlike the Explorer (WHAT the chain
-// did — durable, canonical), this is HOW THIS node is running: block height and
-// throughput, apply-latency distribution, and which modules are busiest. Poll
-// only while mounted; a node that doesn't report the `ducktape_*` block series
-// (an older binary) says so plainly rather than drawing empty charts.
+// The metrics surface: the node's own operational health, streamed live over
+// the shared node socket's `metrics` topic (one OpenMetrics snapshot per
+// heartbeat tick, subscribed only while mounted). Unlike the Explorer (WHAT
+// the chain did — durable, canonical), this is HOW THIS node is running:
+// block height and throughput, apply-latency distribution, and which modules
+// are busiest. A node that doesn't report the `ducktape_*` block series (an
+// older binary) says so plainly rather than drawing empty charts.
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import {
   blocksPerSecond,
@@ -14,6 +15,7 @@ import {
   formatBytes,
   formatBytesRate,
   formatLatency,
+  formatPeer,
   formatRate,
   meanLatency,
   perBucket,
@@ -22,24 +24,20 @@ import {
   planeTxBytes,
   quantile,
   ratePerSecond,
+  syncBlocksLeft,
+  syncPhase,
+  syncProgress,
   type DataPlaneMetric,
   type NodeMetrics,
+  type StateSyncPeerMetric,
 } from "../../../domain/metrics";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font } from "../../theme/tokens";
 import { Histogram, Panel, RankedBars, Sparkline, StatTile } from "./charts";
-
-/** How often to re-scrape, and how many samples the rolling window keeps. */
-const POLL_MS = 2_000;
-const WINDOW = 90; // ~3 min at 2s
-
-interface Sample {
-  t: number;
-  m: NodeMetrics;
-}
+import { useMetricsStream, type MetricsSample } from "./use-metrics-stream";
 
 /** One open plane with its window-derived rates: `series` is total (tx+rx)
- *  bytes/sec per poll step, `txRate`/`rxRate` the latest step's split. */
+ *  bytes/sec per sample step, `txRate`/`rxRate` the latest step's split. */
 interface PlaneRow {
   key: string;
   plane: DataPlaneMetric;
@@ -48,34 +46,20 @@ interface PlaneRow {
   series: number[];
 }
 
+/** One served sync peer with its window-derived serve rate (bytes/sec per
+ *  poll step; `txRate` is the latest step). */
+interface SyncPeerRow {
+  peer: StateSyncPeerMetric;
+  txRate: number;
+  series: number[];
+}
+
 const emptyStyle = { font: `400 12px ${font.sans}`, color: color.muted2 } as const;
 
 export function MetricsView() {
-  const { state, actions } = useDucktape();
-  const { connected, nodeUrl } = state;
-  const [samples, setSamples] = useState<Sample[]>([]);
-
-  // Scrape /metrics on an interval while mounted + connected. Reset the window
-  // when the node changes so one node's samples never bleed into another's.
-  useEffect(() => {
-    setSamples([]);
-    if (!connected) return;
-    let cancelled = false;
-    const poll = () => {
-      actions.readMetrics().then((m) => {
-        if (cancelled || !m) return;
-        setSamples((prev) => [...prev, { t: Date.now(), m }].slice(-WINDOW));
-      });
-    };
-    poll();
-    const timer = setInterval(poll, POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [connected, nodeUrl, actions]);
-
-  const latest = samples.length ? samples[samples.length - 1].m : undefined;
+  const { state, transport } = useDucktape();
+  const { connected } = state;
+  const { samples, latest, refused } = useMetricsStream(transport, connected);
 
   // blocks/second across the rolling window (counter deltas over wall time).
   const throughput = useMemo(() => {
@@ -107,7 +91,7 @@ export function MetricsView() {
     if (!latest) return [];
     return latest.planes.map((plane) => {
       const key = `${plane.service} ${plane.owner}`;
-      const inSample = (s: Sample) =>
+      const inSample = (s: MetricsSample) =>
         s.m.planes.find((p) => p.service === plane.service && p.owner === plane.owner);
       const series: number[] = [];
       let txRate = 0;
@@ -125,6 +109,28 @@ export function MetricsView() {
         series.push(txRate + rxRate);
       }
       return { key, plane, txRate, rxRate, series };
+    });
+  }, [samples, latest]);
+
+  // every recently served sync peer with its per-step serve-byte rate across
+  // the window — cumulative counters delta'd over wall time, like `planes`.
+  const syncPeers = useMemo<SyncPeerRow[]>(() => {
+    if (!latest) return [];
+    return latest.syncPeers.map((peer) => {
+      const inSample = (s: MetricsSample) => s.m.syncPeers.find((p) => p.peer === peer.peer);
+      const series: number[] = [];
+      let txRate = 0;
+      for (let i = 1; i < samples.length; i++) {
+        const prev = inSample(samples[i - 1]);
+        const curr = inSample(samples[i]);
+        if (!prev || !curr) {
+          series.push(0);
+          continue;
+        }
+        txRate = ratePerSecond(prev.bytesTx, curr.bytesTx, samples[i].t - samples[i - 1].t);
+        series.push(txRate);
+      }
+      return { peer, txRate, series };
     });
   }, [samples, latest]);
 
@@ -167,13 +173,20 @@ export function MetricsView() {
       {!connected ? (
         <div style={{ padding: 17 }}>
           <div style={emptyStyle}>
-            Not connected — metrics stream from the node's <code>/metrics</code> scrape once
-            it's reachable.
+            Not connected — metrics stream from the node once it's reachable.
+          </div>
+        </div>
+      ) : refused ? (
+        <div style={{ padding: 17 }}>
+          <div style={emptyStyle}>
+            This node doesn't stream metrics — its build predates the{" "}
+            <code>metrics</code> stream topic. Rebuild and restart it (
+            <code>make dev</code>) to chart it here.
           </div>
         </div>
       ) : !latest ? (
         <div style={{ padding: 17 }}>
-          <div style={emptyStyle}>Reading /metrics…</div>
+          <div style={emptyStyle}>Waiting for the first metrics sample…</div>
         </div>
       ) : !latest.present ? (
         <div style={{ padding: 17 }}>
@@ -184,7 +197,13 @@ export function MetricsView() {
           </div>
         </div>
       ) : (
-        <MetricsBody latest={latest} throughput={throughput} modules={modules} planes={planes} />
+        <MetricsBody
+          latest={latest}
+          throughput={throughput}
+          modules={modules}
+          planes={planes}
+          syncPeers={syncPeers}
+        />
       )}
     </div>
   );
@@ -195,11 +214,13 @@ function MetricsBody({
   throughput,
   modules,
   planes,
+  syncPeers,
 }: {
   latest: NodeMetrics;
   throughput: number[];
   modules: { module: string; count: number }[];
   planes: PlaneRow[];
+  syncPeers: SyncPeerRow[];
 }) {
   const hist = latest.latency;
   const per = perBucket(hist);
@@ -298,6 +319,26 @@ function MetricsBody({
           </div>
         )}
       </Panel>
+
+      {/* the statesync serve lane: peers pulling state from THIS node —
+          statesync rides the mesh carrier (never a data plane), so it gets
+          its own panel. Presence in the scrape IS recent utilization. */}
+      <Panel
+        title="State sync"
+        right={syncPeers.length > 0 ? `serving ${syncPeers.length}` : undefined}
+      >
+        {syncPeers.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 11 }}>
+            {syncPeers.map((row) => (
+              <SyncPeerRowView key={row.peer.peer} row={row} goalHeight={latest.blockHeight} />
+            ))}
+          </div>
+        ) : (
+          <div style={emptyStyle}>
+            No peer is pulling state from this node — the state-sync lane is idle.
+          </div>
+        )}
+      </Panel>
     </div>
   );
 }
@@ -381,6 +422,91 @@ function DataPlaneRow({ row }: { row: PlaneRow }) {
           }}
         >
           {drops.toLocaleString()} dropped
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** One served sync peer: identity + phase, its progression toward this
+ *  node's height (bar, %, blocks left) when the served responses establish
+ *  one, a live serve-rate sparkline, and cumulative totals. */
+function SyncPeerRowView({ row, goalHeight }: { row: SyncPeerRow; goalHeight: number }) {
+  const { peer } = row;
+  const progress = syncProgress(peer, goalHeight);
+  const blocksLeft = syncBlocksLeft(peer, goalHeight);
+  const detail =
+    `requests ${Object.entries(peer.requests)
+      .map(([kind, n]) => `${kind} ${n.toLocaleString()}`)
+      .join(", ")}` +
+    (peer.boundaryHeight !== null ? ` · boundary ${peer.boundaryHeight.toLocaleString()}` : "");
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12 }} title={detail}>
+      <div
+        style={{
+          width: 148,
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+        }}
+      >
+        <span style={{ font: `600 12px ${font.mono}`, color: color.ink }}>
+          {formatPeer(peer.peer)}
+        </span>
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+          {syncPhase(peer)} · {formatAge(peer.ageSeconds)}
+        </span>
+      </div>
+      <div style={{ width: 170, flexShrink: 0, display: "flex", flexDirection: "column", gap: 3 }}>
+        {progress !== null && blocksLeft !== null ? (
+          <>
+            <div
+              style={{
+                height: 5,
+                borderRadius: 3,
+                background: color.sunken,
+                border: `1px solid ${color.borderSoft}`,
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  width: `${Math.round(progress * 100)}%`,
+                  height: "100%",
+                  background: blocksLeft === 0 ? color.green : color.blue,
+                }}
+              />
+            </div>
+            <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted }}>
+              {`${(progress * 100).toFixed(progress < 0.995 && progress > 0.9 ? 1 : 0)}%`} ·{" "}
+              {blocksLeft === 0 ? "at goal" : `${blocksLeft.toLocaleString()} blocks left`}
+            </span>
+          </>
+        ) : (
+          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
+            no block progression yet
+          </span>
+        )}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <Sparkline values={row.series} height={30} format={formatBytesRate} />
+      </div>
+      <div
+        style={{
+          width: 118,
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          alignItems: "flex-end",
+        }}
+      >
+        <span style={{ font: `500 11px ${font.mono}`, color: color.ink }}>
+          ↑ {formatBytesRate(row.txRate)}
+        </span>
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted }}>
+          {formatBytes(peer.bytesTx)} · {peer.framesServed.toLocaleString()} frames
         </span>
       </div>
     </div>

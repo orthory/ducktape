@@ -1247,6 +1247,49 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
     );
 }
 
+#[test]
+fn metrics_stream_topic_pushes_the_scrape_over_ws() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // commit one block so the ducktape series carry observed values.
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["metrics"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert_eq!(subscribed["topics"]["metrics"], "0", "fresh snapshot cursor");
+
+    // the subscribe replay pushes the first sample immediately — no wait for
+    // the next heartbeat tick — carrying the SAME exposition GET /metrics
+    // serves, stamped with the server-side sample instant as its cursor.
+    let tail = Daemon::ws_read_type(&mut ws, "tail");
+    assert_eq!(tail["topic"], "metrics");
+    let text = tail["item"]["text"].as_str().expect("scrape text");
+    assert!(
+        text.contains("ducktape_blocks_total"),
+        "stream sample carries the block series: {text}"
+    );
+    assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
+    let time_ms = tail["item"]["timeMs"].as_u64().expect("sample instant");
+    assert_eq!(tail["cursor"], time_ms.to_string());
+
+    // the next sample arrives on the heartbeat tick without any block moving.
+    let tail2 = Daemon::ws_read_type(&mut ws, "tail");
+    assert_eq!(tail2["topic"], "metrics");
+    assert!(
+        tail2["item"]["timeMs"].as_u64().expect("second instant") >= time_ms,
+        "tick samples advance monotonically"
+    );
+}
+
 // ============================================================================
 // off-loop oracle execution: REAL script-backed providers through the full
 // capability-host path, proving the daemon's command loop no longer awaits

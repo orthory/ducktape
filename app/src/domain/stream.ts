@@ -18,9 +18,11 @@ export type ErrorFrame = Extract<ServerFrame, { type: "error" }>;
 export type LogTailItem = Extract<TailItem, { line: string }>;
 export type FileChangeTailItem = Extract<TailItem, { paths: string[] }>;
 export type RunOutputTailItem = Extract<TailItem, { stream: RunStream; line: string }>;
+export type MetricsTailItem = Extract<TailItem, { text: string }>;
 
 export const LOGS_TOPIC = "logs";
 export const FILES_WATCH_TOPIC = "files:watch";
+export const METRICS_TOPIC = "metrics";
 
 export const moduleTopic = (id: string): string => `module:${id}`;
 export const runOutputTopic = (dispatchId: string): string =>
@@ -96,3 +98,9 @@ export const isRunOutputTailItem = (value: TailItem): value is RunOutputTailItem
   "stream" in value &&
   (value.stream === "stdout" || value.stream === "stderr") &&
   typeof value.line === "string";
+
+export const isMetricsTailItem = (value: TailItem): value is MetricsTailItem =>
+  "text" in value &&
+  typeof value.text === "string" &&
+  "timeMs" in value &&
+  typeof value.timeMs === "number";

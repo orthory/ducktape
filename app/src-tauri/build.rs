@@ -1,4 +1,16 @@
 fn main() {
+    // Pin the CEF runtime lookup to the binary's own directory. cef-dll-sys
+    // stages libcef.so and its support files next to the binary on every
+    // build, and the Linux `make install-app` stages the same set beside the
+    // installed binary. --disable-new-dtags emits DT_RPATH, which ld.so
+    // consults BEFORE LD_LIBRARY_PATH — deliberate: the app is ABI-pinned to
+    // its CEF distribution, and an ambient path to a system CEF (e.g.
+    // /usr/lib/cef) boots via API-versioning but silently drops features
+    // (cef-vaapi-bin 150 has no GTK input-method integration, killing IME).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
     // tauri_build validates bundle.externalBin at COMPILE time, but the node
     // sidecar is another workspace crate's artifact and cargo gives no build
     // ordering between them. materialize an empty placeholder so plain
@@ -18,15 +30,6 @@ fn main() {
             std::fs::create_dir_all("binaries").expect("create binaries dir");
             std::fs::write(&path, []).expect("write sidecar placeholder");
         }
-    }
-    // Linux links libcef.so dynamically (CEF ships no static library), and app
-    // launchers spawn with a clean environment — no LD_LIBRARY_PATH to lean on.
-    // $ORIGIN makes the loader resolve libcef.so and the ANGLE/swiftshader libs
-    // from the executable's own directory, which is exactly where both the
-    // cargo target dir (cef-dll-sys copies them) and the staged install
-    // (ops/stage-linux-app.sh) place them.
-    if triple.contains("linux") {
-        println!("cargo::rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
     }
     // Register every application command with Tauri's ACL. Without an app
     // manifest, custom invoke-handler commands are globally allowed; that is

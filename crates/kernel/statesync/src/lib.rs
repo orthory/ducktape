@@ -71,6 +71,7 @@ use host::{FinalizedBlock, Host};
 use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle, UpgradeCoords};
 
 pub mod dataplane;
+pub mod monitor;
 pub mod p2p;
 pub mod qmdb;
 pub mod wire;
@@ -362,6 +363,24 @@ pub enum SyncRequest {
     /// re-hashes the bytes and drops a mismatch, so no trust attaches to
     /// which peer answered.
     Blob { digest: [u8; 32] },
+}
+
+impl SyncRequest {
+    /// the request's kind as a wire-stable snake_case label — the
+    /// [`monitor::ServeMonitor`]'s per-kind attribution (and thus a metric
+    /// label value downstream), so renaming a variant must not rename these.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Chunk { .. } => "chunk",
+            Self::Module { .. } => "module",
+            Self::Frames { .. } => "frames",
+            Self::IndexModules { .. } => "index_modules",
+            Self::IndexChunk { .. } => "index_chunk",
+            Self::TipCoords => "tip_coords",
+            Self::Blob { .. } => "blob",
+        }
+    }
 }
 
 /// the tip's consensus coordinates without a captured boundary — the

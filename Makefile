@@ -3,9 +3,9 @@
 # `make install` builds the networked node and the desktop app, installs
 # ducktape-node into ~/.cargo/bin, and installs the app — on macOS
 # Ducktape.app into /Applications, on Linux the self-contained app dir
-# (binary + ducktape-node sidecar + CEF payload, resolved via the binary's
-# $ORIGIN rpath) into ~/.ducktape/app with a `ducktape` launcher symlink in
-# ~/.cargo/bin. individual targets below for the pieces.
+# (binary + ducktape-node sidecar + pinned CEF runtime, resolved via the
+# binary's DT_RPATH of $ORIGIN) into ~/.ducktape/app with a `ducktape`
+# launcher symlink in ~/.cargo/bin. individual targets below for the pieces.
 
 CARGO ?= cargo
 BUN ?= bun
@@ -150,11 +150,13 @@ install-coordinator: cef-env
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
 ## macOS: Ducktape.app -> $(APP_DEST); Linux: the staged self-contained dir
-## -> $(DUCKTAPE_HOME)/app (binary + ducktape-node sidecar + CEF payload, so
-## sidecar resolution — a `ducktape-node` sibling of the executable — and the
-## $ORIGIN rpath both land in the same directory), plus a launcher symlink in
-## $(BIN_DEST). the symlink is safe: the loader resolves $ORIGIN through the
-## real executable path, and the desktop entry Exec's the real path anyway.
+## -> $(DUCKTAPE_HOME)/app (binary + ducktape-node sidecar + pinned CEF
+## runtime in ONE directory, so sidecar sibling-resolution and the DT_RPATH
+## $ORIGIN lookup both land beside the executable), plus a launcher symlink
+## in $(BIN_DEST) — a symlink, NOT a copy: ld.so resolves $ORIGIN through
+## symlinks to the real file's directory, while a copied binary would sit
+## beside no runtime and fall back to LD_LIBRARY_PATH, which is how a system
+## CEF of the wrong major version silently breaks IME.
 ifeq ($(UNAME_S),Darwin)
 install-app: app
 	mkdir -p "$(APP_DEST)"

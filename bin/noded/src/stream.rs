@@ -6,18 +6,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use duckfs_core::{Change, FilesMsg};
 use futures::StreamExt as _;
+use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::NodeHandle;
+use crate::{NodeCommand, NodeHandle};
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000;
 pub const STREAM_CATCHUP_BUDGET: usize = 256;
 /// per-connection subscription ceiling. the ws surface is unauthenticated
 /// (trusted-client convention), so per-connection state must stay bounded:
-/// the console needs ~15 module topics + logs + files:watch + a few
-/// run-output panes; far below this. beyond it, subscribes refuse per-topic.
+/// the console needs ~15 module topics + logs + files:watch + metrics + a
+/// few run-output panes; far below this. beyond it, subscribes refuse
+/// per-topic.
 pub const MAX_TOPICS_PER_CONNECTION: usize = 64;
 /// rows a files:watch catch-up may SCAN (not just emit) per wakeup — a
 /// stage-heavy history is mostly non-commit rows, and an unbounded back-scan
@@ -152,6 +154,15 @@ pub enum TailItem {
     RunOutput {
         stream: RunStream,
         line: String,
+    },
+    /// one OpenMetrics snapshot — the same text GET /metrics serves, pushed
+    /// per heartbeat tick while the `metrics` topic is subscribed. `time_ms`
+    /// is the server-side sample instant, so a client derives counter rates
+    /// from one clock instead of its own frame-arrival jitter.
+    Metrics {
+        #[cfg_attr(test, ts(type = "number"))]
+        time_ms: u64,
+        text: String,
     },
 }
 
@@ -466,6 +477,10 @@ enum TopicState {
     FilesWatch { cursor: String },
     Logs { seq: u64 },
     RunOutput { id: String, seq: u64 },
+    /// a SNAPSHOT topic: each wakeup re-samples the whole exposition, so the
+    /// cursor (the last sample's `time_ms`) is bookkeeping, never a resume
+    /// point — there is no backlog to replay and the topic never lags.
+    Metrics { sampled_ms: u64 },
 }
 
 impl TopicState {
@@ -473,6 +488,7 @@ impl TopicState {
         match self {
             Self::Module { cursor, .. } | Self::FilesWatch { cursor } => cursor.clone(),
             Self::Logs { seq } | Self::RunOutput { seq, .. } => seq.to_string(),
+            Self::Metrics { sampled_ms } => sampled_ms.to_string(),
         }
     }
 }
@@ -501,12 +517,15 @@ impl CatchUpResult {
 /// which wakeup source fired — each catch-up pass only visits the topic
 /// classes that source can have fed, so a log-line storm never re-scans
 /// module topics and a run-output append never touches the index. `All`
-/// covers subscribe replay, where any topic may owe frames.
+/// covers subscribe replay, where any topic may owe frames. `Tick` is the
+/// heartbeat interval — the cadence of snapshot topics (metrics), which
+/// re-sample on time rather than on any append.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Wake {
     Block,
     Logs,
     RunOutput,
+    Tick,
     All,
 }
 
@@ -517,6 +536,7 @@ impl TopicState {
             Wake::Block => matches!(self, Self::Module { .. } | Self::FilesWatch { .. }),
             Wake::Logs => matches!(self, Self::Logs { .. }),
             Wake::RunOutput => matches!(self, Self::RunOutput { .. }),
+            Wake::Tick => matches!(self, Self::Metrics { .. }),
         }
     }
 }
@@ -571,6 +591,9 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
             }
             _ = heartbeat.tick() => {
                 if !send_frame(&mut socket, heartbeat_frame(&hub)).await {
+                    return;
+                }
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::Tick).await {
                     return;
                 }
             }
@@ -695,6 +718,11 @@ fn prepare_topic(
             None,
         ));
     }
+    if topic == "metrics" {
+        // a resume cursor is accepted but meaningless for a snapshot topic:
+        // every (re)subscribe starts from a fresh sample, never a replay.
+        return Ok((TopicState::Metrics { sampled_ms: 0 }, None));
+    }
     Err(unknown_topic(topic))
 }
 
@@ -752,7 +780,12 @@ async fn catch_up(
         let Some(state) = topics.get_mut(&topic) else {
             continue;
         };
-        let result = catch_up_topic(&topic, state, store.as_ref(), &hub);
+        // metrics is the one topic whose catch-up crosses the actor command
+        // lane (an await); every cursor-scan topic stays on the sync path.
+        let result = match state {
+            TopicState::Metrics { .. } => catch_up_metrics(&topic, state, handle).await,
+            _ => catch_up_topic(&topic, state, store.as_ref(), &hub),
+        };
         if !send_frames(socket, result.frames).await {
             return false;
         }
@@ -784,6 +817,9 @@ fn catch_up_topic(
         }
         TopicState::Logs { seq } => catch_up_logs(topic, seq, &hub.log_ring()),
         TopicState::RunOutput { id, seq } => catch_up_run_output(topic, id, seq, &hub.run_output()),
+        // routed to catch_up_metrics by the caller (it needs the actor lane,
+        // an await this sync path cannot make) — nothing owed here.
+        TopicState::Metrics { .. } => CatchUpResult::keep(Vec::new()),
     }
 }
 
@@ -1000,6 +1036,35 @@ fn catch_up_run_output(
         }
     }
     CatchUpResult::keep(frames)
+}
+
+/// re-sample the node's OpenMetrics exposition through the SAME actor command
+/// GET /metrics answers (`NodeCommand::Metrics` — every embedder already
+/// handles it), so the stream needs no second registry encoder. one Tail
+/// frame per wakeup carrying the whole scrape text; a gone actor drops the
+/// topic with the same `unavailable` shape the http lane's 503 carries.
+async fn catch_up_metrics(
+    topic: &str,
+    state: &mut TopicState,
+    handle: &NodeHandle,
+) -> CatchUpResult {
+    let TopicState::Metrics { sampled_ms } = state else {
+        return CatchUpResult::keep(Vec::new());
+    };
+    let (reply, rx) = oneshot::channel();
+    if handle.send(NodeCommand::Metrics { reply }).await.is_err() {
+        return CatchUpResult::drop(vec![unavailable(topic, "node actor is gone")]);
+    }
+    let Ok(text) = rx.await else {
+        return CatchUpResult::drop(vec![unavailable(topic, "node actor dropped the reply")]);
+    };
+    let time_ms = unix_millis();
+    *sampled_ms = time_ms;
+    CatchUpResult::keep(vec![ServerFrame::Tail {
+        topic: topic.to_string(),
+        cursor: time_ms.to_string(),
+        item: TailItem::Metrics { time_ms, text },
+    }])
 }
 
 fn lag_if_below_backfill(
@@ -1400,13 +1465,78 @@ mod tests {
             id: "r1".into(),
             seq: 0,
         };
+        let metrics = TopicState::Metrics { sampled_ms: 0 };
         assert!(module.wakes_on(Wake::Block) && files.wakes_on(Wake::Block));
         assert!(!logs.wakes_on(Wake::Block) && !run.wakes_on(Wake::Block));
         assert!(logs.wakes_on(Wake::Logs) && !module.wakes_on(Wake::Logs));
         assert!(run.wakes_on(Wake::RunOutput) && !files.wakes_on(Wake::RunOutput));
+        // metrics is time-driven ONLY: a block/log/run wakeup never re-samples
+        // it, and no other topic class re-scans on the heartbeat tick.
+        assert!(metrics.wakes_on(Wake::Tick) && !metrics.wakes_on(Wake::Block));
+        assert!(!metrics.wakes_on(Wake::Logs) && !metrics.wakes_on(Wake::RunOutput));
         for state in [&module, &files, &logs, &run] {
             assert!(state.wakes_on(Wake::All));
+            assert!(!state.wakes_on(Wake::Tick));
         }
+        assert!(metrics.wakes_on(Wake::All));
+    }
+
+    #[test]
+    fn metrics_topic_subscribes_without_a_store_and_ignores_resume() {
+        // metrics rides the actor lane, not the index — a daemon with no index
+        // store still serves it, and a reconnect's stored cursor is harmless.
+        let (state, lagged) =
+            prepare_topic("metrics", Some(&"1752000000000".to_string()), None).expect("topic");
+        assert!(lagged.is_none());
+        assert_eq!(state.cursor(), "0", "a fresh subscribe never resumes");
+    }
+
+    #[tokio::test]
+    async fn metrics_catch_up_samples_through_the_actor_lane() {
+        let (handle, mut cmds, _hub) = crate::NodeHandle::channel();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmds.next().await {
+                if let NodeCommand::Metrics { reply } = cmd {
+                    let _ = reply.send("ducktape_blocks_total 5\n".to_string());
+                }
+            }
+        });
+        let (mut state, _) = prepare_topic("metrics", None, None).expect("topic");
+        let result = catch_up_metrics("metrics", &mut state, &handle).await;
+        assert!(!result.drop_topic);
+        match &result.frames[..] {
+            [ServerFrame::Tail {
+                topic,
+                cursor,
+                item: TailItem::Metrics { time_ms, text },
+            }] => {
+                assert_eq!(topic, "metrics");
+                assert_eq!(text, "ducktape_blocks_total 5\n");
+                assert_eq!(cursor, &time_ms.to_string());
+                assert_eq!(
+                    &state.cursor(),
+                    cursor,
+                    "the sample instant becomes the topic cursor"
+                );
+            }
+            other => panic!("expected one metrics tail frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_catch_up_drops_the_topic_when_the_actor_is_gone() {
+        let (handle, cmds, _hub) = crate::NodeHandle::channel();
+        drop(cmds); // the actor never ran (or exited) — the command lane is closed
+        let (mut state, _) = prepare_topic("metrics", None, None).expect("topic");
+        let result = catch_up_metrics("metrics", &mut state, &handle).await;
+        assert!(result.drop_topic);
+        assert!(matches!(
+            result.frames.first(),
+            Some(ServerFrame::Error {
+                code: StreamErrorCode::Unavailable,
+                ..
+            })
+        ));
     }
 
     #[test]

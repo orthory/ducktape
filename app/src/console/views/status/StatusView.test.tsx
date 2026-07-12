@@ -56,11 +56,6 @@ const renderStatus = (patch: Partial<ConsoleState> = {}) => {
     {},
     {
       get: (_target, key: string) => {
-        // The overview polls /metrics on mount, so readMetrics must resolve.
-        if (key === "readMetrics") {
-          spies[key] ??= vi.fn().mockResolvedValue(null);
-          return spies[key];
-        }
         spies[key] ??= vi.fn() as (...args: unknown[]) => unknown;
         return spies[key];
       },

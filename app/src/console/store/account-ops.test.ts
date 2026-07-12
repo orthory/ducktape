@@ -41,7 +41,6 @@ const stubTransport = (account: AccountView | null): NodeTransport =>
     putBlob: vi.fn(),
     getBlob: vi.fn(),
     status: vi.fn(),
-    metrics: vi.fn(),
     blocks: vi.fn(),
     filesStage: vi.fn(),
     filesCommit: vi.fn(),

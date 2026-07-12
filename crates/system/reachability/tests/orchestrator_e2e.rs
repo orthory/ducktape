@@ -1202,6 +1202,86 @@ async fn cold_restart_filters_departed_members() {
         .await;
 }
 
+/// The NATed-member restart: the coordinated invite bootstrap brings the
+/// interface up (the join-window tunnel to the inviter) BEFORE the first
+/// epoch event triggers the restore. The restore must land on that live
+/// interface — reconfigure, not re-create — and the invite tunnel must
+/// survive the merge. Regression: the restore used to die with
+/// `AlreadyCreated`, so a restarted member never re-applied its persisted
+/// mesh exactly in the posture the restore was built for.
+#[tokio::test]
+async fn restore_lands_on_an_interface_the_invite_layer_already_created() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+                retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+                await_applied(&mut collected, &[0, 1], 1).await;
+            })
+            .await;
+    }
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2], vec![], links_up);
+
+            // node 0's boot re-runs first contact with its inviter (an
+            // identity OUTSIDE the persisted mesh) before any epoch exists.
+            let inviter = PrivateKey::from_seed(9).public_key();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            nodes[0]
+                .cmd
+                .send(ReachabilityCommand::InstallInvitePeer {
+                    peer: inviter.clone(),
+                    wireguard_public_key: X25519PublicKey([9; 32]),
+                    endpoint: "203.0.113.77:40100".parse().unwrap(),
+                    reply: reachability::InstallReply(reply_tx),
+                })
+                .await
+                .unwrap();
+            reply_rx
+                .await
+                .expect("installer alive")
+                .expect("invite peer installed");
+
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+
+            let restored = await_restored(&mut collected, &[0, 1]).await;
+            for i in 0..2 {
+                assert_eq!(restored[&i], (1, 1), "node {i}: the persisted peer");
+            }
+            let fake = nodes[0].effect.0.lock().unwrap();
+            assert_eq!(
+                fake.create_calls, 1,
+                "the invite layer's interface is reconfigured, never re-created"
+            );
+            assert_eq!(fake.remove_calls, 0);
+            assert_eq!(fake.applied.len(), 2, "invite apply, then restore apply");
+            let config = &fake.applied[1];
+            assert!(
+                config
+                    .peers
+                    .iter()
+                    .any(|p| p.allowed_ips == vec![ula(nodes[1].identity)]),
+                "the restored mesh peer is on the interface"
+            );
+            assert!(
+                config
+                    .peers
+                    .iter()
+                    .any(|p| p.allowed_ips == vec![ula(binding::identity_of(&inviter))]),
+                "the invite tunnel survives the restore"
+            );
+        })
+        .await;
+}
+
 /// A tampered state file is refused (surfaced as `RestoreFailed`), never
 /// applied — and the node still converges live once transport exists,
 /// exactly the pre-persistence behavior.
