@@ -86,17 +86,22 @@ export function NodeFailed() {
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {incompatible ? (
+            // Both of the ordinary buttons land on onboarding, where creating
+            // and picking a workspace live side by side. Offering them as two
+            // buttons here would promise two destinations and deliver one.
             <button onClick={() => actions.newWorkspace()} style={primaryBtn}>
               Create fresh workspace
             </button>
           ) : (
-            <button onClick={() => actions.retryConnect()} style={primaryBtn}>
-              Retry
-            </button>
+            <>
+              <button onClick={() => actions.retryConnect()} style={primaryBtn}>
+                Retry
+              </button>
+              <button onClick={() => actions.newWorkspace()} style={ghostBtn}>
+                Choose another workspace
+              </button>
+            </>
           )}
-          <button onClick={() => actions.newWorkspace()} style={ghostBtn}>
-            Choose another workspace
-          </button>
           {hasLog && (
             <button onClick={() => setShowLog((v) => !v)} style={ghostBtn}>
               {showLog ? "Hide" : "Open"} daemon.log
