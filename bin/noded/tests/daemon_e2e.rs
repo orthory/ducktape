@@ -529,6 +529,63 @@ fn full_surface_blocks_authorship_and_ws() {
     daemon.status(); // still alive, still answering.
 }
 
+/// read frames until block `height`'s module event and require a heartbeat
+/// carrying that height to have arrived FIRST — the per-block tip push, not
+/// the interval beat (which the loop tolerates at other heights).
+fn assert_tip_precedes_event(ws: &mut BufReader<TcpStream>, height: u64) {
+    let mut tip_seen = false;
+    loop {
+        let frame = Daemon::ws_read_json(ws);
+        if frame["type"] == "heartbeat" && frame["height"] == height {
+            tip_seen = true;
+            continue;
+        }
+        if frame["type"] == "event" {
+            assert_eq!(frame["op"]["height"], height, "event for block {height}");
+            assert!(
+                tip_seen,
+                "no tip heartbeat at height {height} arrived before its event"
+            );
+            return;
+        }
+    }
+}
+
+/// the tip rides the block wake itself: every committed block pushes a
+/// heartbeat frame with the new height BEFORE that block's module events, so
+/// a console's height ticks per block instead of waiting out the 3s timer
+/// beat. asserting the ordering on TWO consecutive blocks makes a
+/// coincidental timer beat unable to false-pass the test — two timer beats
+/// are 3s apart and cannot both land inside one test's submit window.
+#[test]
+fn block_commits_push_tip_heartbeats_before_their_events() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut ws = daemon.ws_connect();
+    let heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
+    assert_eq!(heartbeat["height"], 0);
+
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let _subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+    assert_eq!(block["height"], 1);
+    assert_tip_precedes_event(&mut ws, 1);
+
+    let (code, block) = daemon.submit("chat", post_message("general", "m1", "tick"), None);
+    assert_eq!(code, 200, "post failed: {block}");
+    assert_eq!(block["height"], 2);
+    assert_tip_precedes_event(&mut ws, 2);
+}
+
 #[test]
 fn agent_run_drains_oracle_effect_and_posts_reply() {
     let storage = tempfile::TempDir::new().expect("storage dir");
