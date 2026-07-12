@@ -428,6 +428,94 @@ describe("AgentView", () => {
     expect(await screen.findByRole("status")).toHaveTextContent(/already exists/);
   });
 
+  it("composes an agent out of the global skill library — and publishes into it", async () => {
+    const dir = (path: string) => ({
+      path,
+      kind: "dir" as const,
+      size: 0,
+      exec: false,
+      object: "",
+      meta: {},
+    });
+    const docs: Record<string, string> = {
+      "/shared/skills/release/SKILL.md": "---\nname: release\ndescription: Cut a release.\n---\n",
+      // No frontmatter: still a library skill, listed under its folder name.
+      "/shared/skills/triage/SKILL.md": "# triage\n",
+    };
+    const filesLs = vi.fn().mockResolvedValue({
+      entries: [dir("/shared/skills/release"), dir("/shared/skills/triage")],
+      next: null,
+    });
+    const filesRead = vi.fn(async ({ path }: { path: string }) => ({
+      b64: btoa(docs[path] ?? ""),
+      eof: true,
+    }));
+    const filesStat = vi.fn().mockResolvedValue(null);
+    const filesCommit = vi.fn().mockResolvedValue({ height: 2, appHash: "aa".repeat(32) });
+    const query = vi.fn().mockResolvedValue({ refs: { head: "beef", pins: {}, window: 1 } });
+    const transport = makeTransportStub({ filesLs, filesRead, filesStat, filesCommit, query });
+    const { spies } = renderAgents({}, transport);
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+
+    // The library is one duckfs directory — browsed with the ordinary files
+    // client, described by each SKILL.md's frontmatter.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /from library/i }));
+    });
+    expect(filesLs).toHaveBeenCalledWith({ path: "/shared/skills" });
+    expect(await screen.findByText("Cut a release.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /add triage from the library/i }),
+    ).toBeInTheDocument();
+
+    // Search narrows the pool; picking curates the skill with its prefix filled in.
+    fireEvent.change(screen.getByLabelText("Search the skill library"), {
+      target: { value: "release" },
+    });
+    expect(screen.queryByRole("button", { name: /add triage from the library/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /add release from the library/i }));
+    expect(screen.getByLabelText("Document folder (duckfs)")).toHaveValue(
+      "/shared/skills/release",
+    );
+
+    // Publishing a skill the library doesn't have yet seeds its SKILL.md through
+    // the same create-doc commit — under the shared root, not the agent's folder.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /from library/i }));
+    });
+    fireEvent.change(screen.getByLabelText("Search the skill library"), {
+      target: { value: "Release Notes" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /publish .*to the library/i }));
+    });
+    const put = filesCommit.mock.calls[0][0].changes[0].put;
+    expect(put.path).toBe("/shared/skills/release-notes/SKILL.md");
+
+    // Exact match: library skills ride the ordinary skills key (with `load`),
+    // and no prompt blob is ever sent.
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith({
+      displayName: "Triage Agent",
+      agentId: "triage-agent",
+      capability: "beta",
+      allowedActions: ["chat.post"],
+      skills: [
+        { name: "release", source_prefix: "/shared/skills/release", load: "on_demand" },
+        {
+          name: "Release Notes",
+          source_prefix: "/shared/skills/release-notes",
+          load: "on_demand",
+        },
+      ],
+    });
+  });
+
   it("manages auto-reply on its own tab", () => {
     const { spies } = renderAgents();
 

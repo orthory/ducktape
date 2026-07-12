@@ -3,6 +3,10 @@
 // decides whether that document is inlined into every run (the persona) or only
 // indexed for the agent to read when the task calls for it.
 //
+// Curation happens against the global skill library (/shared/skills) — the
+// picker is the easy path in, but the typed prefix stays, because an
+// agent-private skill (a persona) lives outside the library.
+//
 // The documents themselves live in Files. This field never holds their text —
 // it points at them, opens them in the files browser, and can seed a starter
 // SKILL.md through the ordinary duckfs client (files-client's uploadFile), the
@@ -16,6 +20,8 @@ import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { errMsg } from "../files/files-format";
 import { FieldLabel, monoInputStyle, inputStyle, secondaryButton, statusTone } from "./parts";
+import { inLibrary, LIBRARY_ROOT, libraryPrefix, type LibrarySkill } from "./skill-library";
+import { SkillLibraryPicker } from "./SkillLibraryPicker";
 import { cleanPrefix, newSkill, skillDocPath, skillTemplate } from "./skills";
 
 const smallButton = {
@@ -42,6 +48,7 @@ export function SkillsField({
   const { transport, actions } = useDucktape();
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
 
   const patch = (index: number, next: Partial<SkillRef>) =>
     onChange(skills.map((skill, i) => (i === index ? { ...skill, ...next } : skill)));
@@ -52,7 +59,8 @@ export function SkillsField({
 
   /** Seed the skill's SKILL.md from a template — a plain duckfs commit. Never
    *  clobbers: an existing document is reported, not overwritten (editing its
-   *  text happens in Files, not here). */
+   *  text happens in Files, not here). A prefix under the library root seeds the
+   *  shared wording: the document belongs to no one agent. */
   const createDoc = async (skill: SkillRef) => {
     const prefix = cleanPrefix(skill.source_prefix);
     const name = skill.name.trim();
@@ -71,7 +79,12 @@ export function SkillsField({
       await uploadFile(transport, {
         path,
         bytes: new TextEncoder().encode(
-          skillTemplate({ name, displayName: displayName.trim() || agentId, load: skill.load }),
+          skillTemplate({
+            name,
+            displayName: displayName.trim() || agentId,
+            load: skill.load,
+            shared: inLibrary(prefix),
+          }),
         ),
         message: `create skill doc ${path}`,
       });
@@ -81,6 +94,26 @@ export function SkillsField({
     } finally {
       setBusy(null);
     }
+  };
+
+  /** Curate a library skill: its prefix, its frontmatter name, on demand (the
+   *  cheap mode — the operator promotes it with "Always load"). */
+  const pickFromLibrary = (skill: LibrarySkill) => {
+    onChange([...skills, { name: skill.name, source_prefix: skill.prefix, load: "on_demand" }]);
+    setPicking(false);
+  };
+
+  /** Publish a new library skill and curate it in the same click: the row goes
+   *  in, and the ordinary create-doc path seeds its SKILL.md. */
+  const publishToLibrary = (name: string) => {
+    const skill: SkillRef = {
+      name,
+      source_prefix: libraryPrefix(name),
+      load: "on_demand",
+    };
+    onChange([...skills, skill]);
+    setPicking(false);
+    void createDoc(skill);
   };
 
   return (
@@ -96,18 +129,37 @@ export function SkillsField({
       >
         SKILLS
       </legend>
-      <div
+      {/* The three tiers, one line each — curation is about what the agent LEADS
+          WITH, not about what it can reach. */}
+      <ul
         style={{
-          marginBottom: 8,
+          margin: "0 0 8px",
+          padding: 0,
+          listStyle: "none",
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
           font: `400 10.5px ${font.sans}`,
           color: color.muted2,
           lineHeight: 1.5,
         }}
       >
-        Always-loaded skills are pasted into every run — together they are the agent's
-        persona. The rest are listed by name, and the agent opens them from its skill
-        folder only when the job calls for one.
-      </div>
+        <li>
+          <b style={{ color: color.muted3 }}>Always</b> — pasted into every run: the agent's
+          persona, and a cost paid on every single run.
+        </li>
+        <li>
+          <b style={{ color: color.muted3 }}>On demand</b> — the agent is told the skill exists
+          and reads the document itself when the job calls for it.
+        </li>
+        <li>
+          <b style={{ color: color.muted3 }}>Everything else</b> — the rest of{" "}
+          <span translate="no" style={{ font: `400 10px ${font.mono}` }}>
+            {LIBRARY_ROOT}
+          </span>{" "}
+          stays reachable at runtime through the agent's file tools, curated or not.
+        </li>
+      </ul>
 
       {skills.length === 0 && (
         <div
@@ -243,7 +295,17 @@ export function SkillsField({
         })}
       </div>
 
-      <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
+      <div
+        style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+      >
+        <button
+          type="button"
+          onClick={() => setPicking((open) => !open)}
+          aria-expanded={picking}
+          style={smallButton}
+        >
+          + From library
+        </button>
         {!hasPersona && (
           <button type="button" onClick={() => add("always")} style={smallButton}>
             + Persona (always loaded)
@@ -253,6 +315,15 @@ export function SkillsField({
           + Skill (on demand)
         </button>
       </div>
+
+      {picking && (
+        <SkillLibraryPicker
+          curated={skills.map((skill) => cleanPrefix(skill.source_prefix))}
+          onPick={pickFromLibrary}
+          onCreate={publishToLibrary}
+          onClose={() => setPicking(false)}
+        />
+      )}
 
       {note && (
         <div

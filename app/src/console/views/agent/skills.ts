@@ -31,19 +31,26 @@ export const skillDocPath = (prefix: string): string => `${cleanPrefix(prefix)}/
 
 /** The starter document written by the form's "create doc" affordance. The
  *  frontmatter `description` is what an `on_demand` skill shows in the run's
- *  index; the body is what an `always` skill inlines. */
+ *  index (and what the library picker lists); the body is what an `always` skill
+ *  inlines. `shared` seeds a library skill — one any agent may compose from, so
+ *  its prose names no agent. */
 export const skillTemplate = (params: {
   name: string;
   displayName: string;
   load: LoadMode;
+  shared?: boolean;
 }): string => {
   const always = params.load === "always";
-  const description = always
-    ? `Who ${params.displayName} is and how it works.`
-    : `What ${params.displayName} does when this skill applies.`;
-  const body = always
-    ? `Write ${params.displayName}'s persona here: its voice, its judgment, the standing rules it carries into every run. This whole document is loaded into every run.`
-    : `Write the procedure here. ${params.displayName} reads this document only when the task calls for it, so say up front when that is.`;
+  const description = params.shared
+    ? `When to use ${params.name}, in one line — this is what an agent sees before it opens the document.`
+    : always
+      ? `Who ${params.displayName} is and how it works.`
+      : `What ${params.displayName} does when this skill applies.`;
+  const body = params.shared
+    ? `Write the procedure here. Any agent can compose this skill from the library, so write it for whoever reads it, and say up front when it applies.`
+    : always
+      ? `Write ${params.displayName}'s persona here: its voice, its judgment, the standing rules it carries into every run. This whole document is loaded into every run.`
+      : `Write the procedure here. ${params.displayName} reads this document only when the task calls for it, so say up front when that is.`;
   return `---\nname: ${params.name}\ndescription: ${description}\n---\n\n# ${params.name}\n\n${body}\n`;
 };
 
