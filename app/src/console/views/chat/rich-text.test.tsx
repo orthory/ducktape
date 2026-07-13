@@ -254,6 +254,24 @@ describe("CommentText (plain-text comment bodies)", () => {
   });
 });
 
+describe("inline code", () => {
+  it("renders a backtick run literal — refs inside are source, not chips", () => {
+    withStore(
+      <RichText blocks={para({ text: "see `[x](duck://page/p1)` now" })} names={{}} />,
+      { pages: [page("p1", "Launch plan")] },
+    );
+
+    expect(screen.getByText("[x](duck://page/p1)")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Open page/ })).toBeNull();
+  });
+
+  it("leaves an unclosed backtick as plain text", () => {
+    const { container } = render(<RichText blocks={para({ text: "a ` b" })} names={{}} />);
+
+    expect(container.textContent).toBe("a ` b");
+  });
+});
+
 describe("duck://files attachment chips (markdown refs)", () => {
   const ATTACH = "[report.pdf](duck://files/shared/attachments/uuid-1/report.pdf)";
   const IMG = "![photo.png](duck://files/shared/attachments/uuid-2/photo.png)";

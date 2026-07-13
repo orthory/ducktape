@@ -15,7 +15,7 @@ import { color, font } from "../theme/tokens";
 import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
-import { CHANNEL_RAIL_WIDTH } from "../views/chat/ChatView";
+import { channelRailWidth } from "../views/chat/ChatView";
 import { BrowserView } from "../views/browser/BrowserView";
 import { HomeView } from "../views/home/HomeView";
 import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
@@ -112,7 +112,7 @@ export function ConsoleShell() {
           position: "absolute",
           left: SIDEBAR_ICON_RAIL_WIDTH,
           bottom: 6,
-          width: CHANNEL_RAIL_WIDTH,
+          width: channelRailWidth,
           zIndex: 25,
         }}
       >

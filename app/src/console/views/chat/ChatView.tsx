@@ -11,6 +11,7 @@ import type { FormEvent } from "react";
 import { isModuleChannel } from "../../../domain/chat-client";
 import type { Channel, PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
+import { PanelResizer } from "../../layout/PanelResizer";
 import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
@@ -64,9 +65,12 @@ function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (polic
 
 // ── Channel rail ────────────────────────────────────────
 
-/** The channel rail's fixed width — ConsoleShell sizes the floating huddle
- *  dock to sit inside this rail, so the two must agree. */
+/** The channel rail's DEFAULT width. The live width is the `--chat-rail-w`
+ *  CSS var (drag the rail's right edge to change it) — ConsoleShell sizes the
+ *  floating huddle dock off the same var, so the two always agree. */
 export const CHANNEL_RAIL_WIDTH = 200;
+export const CHANNEL_RAIL_WIDTH_VAR = "--chat-rail-w";
+export const channelRailWidth = `var(${CHANNEL_RAIL_WIDTH_VAR}, ${CHANNEL_RAIL_WIDTH}px)`;
 
 /** One rail row. `muted` dims an archived channel — it still enters on click
  *  (that is how you get back to its "…" menu to unarchive it). */
@@ -96,7 +100,7 @@ function ChannelRow({
         borderRadius: radius.sm,
         background: active ? color.hover : "transparent",
         color: active ? color.ink : muted ? color.muted2 : color.muted3,
-        font: `${active ? 600 : 400} 12.5px ${font.sans}`,
+        font: `${active ? 600 : 400} 13.5px ${font.sans}`,
         boxSizing: "border-box",
       }}
     >
@@ -136,7 +140,8 @@ function ChannelRail() {
   return (
     <div
       style={{
-        width: CHANNEL_RAIL_WIDTH,
+        position: "relative",
+        width: channelRailWidth,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
@@ -144,9 +149,15 @@ function ChannelRail() {
         flexDirection: "column",
         padding: "13px 0",
         boxSizing: "border-box",
-        overflow: "hidden",
       }}
     >
+      <PanelResizer
+        varName={CHANNEL_RAIL_WIDTH_VAR}
+        defaultWidth={CHANNEL_RAIL_WIDTH}
+        min={160}
+        max={340}
+        side="right"
+      />
       <div
         style={{
           display: "flex",
@@ -519,7 +530,7 @@ export function ChatView() {
           <Icon name="hash" size={15} color={color.muted} />
           <span
             style={{
-              font: `600 14px ${font.sans}`,
+              font: `600 15px ${font.sans}`,
               color: color.ink,
               minWidth: 0,
               overflow: "hidden",

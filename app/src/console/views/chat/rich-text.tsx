@@ -9,12 +9,14 @@
 // rather than through props: the renderer is used from three views and the
 // context is optional, so a bare component test just gets inert affordances.
 
-import { useContext, useMemo } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
 import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
+import { highlightLines, langForTag } from "../forge/highlight";
+import type { HlToken } from "../forge/highlight";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { AttachmentChip } from "./AttachmentChip";
 import { splitMentions } from "./chat-input";
@@ -27,6 +29,30 @@ import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from
 const TAG_TOKEN = /^#([\p{L}\p{N}_-]{1,64})/u;
 
 const REF_STYLE: CSSProperties = { color: accentVar, fontWeight: 500 };
+
+// Inline code: a `run` renders as a mono chip. Split with the capture group so
+// the code tokens come back as their own chunks; anything unclosed stays plain
+// text. Like the fenced block below, the run is literal — no tags, refs, or
+// mentions resolve inside it.
+const INLINE_CODE = /(`[^`\n]+`)/;
+
+function InlineCode({ text }: { text: string }) {
+  return (
+    <code
+      style={{
+        font: `400 12.5px ${font.mono}`,
+        background: color.sunken,
+        border: `1px solid ${color.borderSoft}`,
+        borderRadius: 4,
+        padding: "1px 4px",
+        color: color.red,
+        overflowWrap: "anywhere",
+      }}
+    >
+      {text}
+    </code>
+  );
+}
 
 function TagToken({ token, onClick }: { token: string; onClick: (tag: string) => void }) {
   return (
@@ -99,16 +125,16 @@ export function PageRefChip({ pageId }: { pageId: string }) {
     borderRadius: radius.sm,
     border: `1px solid ${color.borderSoft}`,
     background: color.sunken,
-    font: `500 12.5px ${font.sans}`,
+    font: `500 13.5px ${font.sans}`,
     color: title ? accentVar : color.muted3,
     verticalAlign: "baseline",
   };
   const body = (
     <>
-      <span aria-hidden style={{ font: `400 10px ${font.mono}`, color: color.muted2 }}>
+      <span aria-hidden style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>
         ¶
       </span>
-      <span style={{ font: title ? undefined : `400 12px ${font.mono}` }}>{title ?? pageId}</span>
+      <span style={{ font: title ? undefined : `400 13px ${font.mono}` }}>{title ?? pageId}</span>
     </>
   );
   if (!store) return <span style={style}>{body}</span>;
@@ -249,17 +275,24 @@ function SpanText({
       </a>
     );
   }
-  // One tokenizer for every duck:// reference: page chips, file chips, and
-  // image embeds, all from markdown link/image syntax in the plain span text.
+  // Inline code splits FIRST (a code run is literal), then one tokenizer for
+  // every duck:// reference in the rest: page chips, file chips, and image
+  // embeds, all from markdown link/image syntax in the plain span text.
   return (
     <span style={style}>
-      {splitDuckRefs(span.text).map((seg, i) =>
-        isPageSeg(seg) ? (
-          <PageRefChip key={i} pageId={seg.page.id} />
-        ) : isFileSeg(seg) ? (
-          <AttachmentChip key={i} attachment={seg.file} />
+      {span.text.split(INLINE_CODE).map((chunk, c) =>
+        chunk.startsWith("`") && chunk.endsWith("`") && chunk.length > 2 ? (
+          <InlineCode key={c} text={chunk.slice(1, -1)} />
         ) : (
-          <LiteralRun key={i} text={seg.text} onTagClick={onTagClick} />
+          splitDuckRefs(chunk).map((seg, i) =>
+            isPageSeg(seg) ? (
+              <PageRefChip key={`${c}:${i}`} pageId={seg.page.id} />
+            ) : isFileSeg(seg) ? (
+              <AttachmentChip key={`${c}:${i}`} attachment={seg.file} />
+            ) : (
+              <LiteralRun key={`${c}:${i}`} text={seg.text} onTagClick={onTagClick} />
+            ),
+          )
         ),
       )}
     </span>
@@ -303,11 +336,10 @@ export function RichText({
         <div
           key={i}
           style={{
-            borderLeft: `2px solid ${color.borderStrong}`,
-            paddingLeft: 9,
+            borderLeft: `3px solid ${color.borderStrong}`,
+            paddingLeft: 10,
             margin: "3px 0",
             color: color.muted3,
-            fontStyle: "italic",
             whiteSpace: "pre-wrap",
             overflowWrap: "anywhere",
             wordBreak: "break-word",
@@ -320,27 +352,65 @@ export function RichText({
         </div>
       );
     }
-    // Code stays literal — a `[[page:…]]` or #tag inside a fence is source, not
-    // a reference to chip.
-    return (
-      <pre
-        key={i}
-        style={{
-          margin: "4px 0",
-          padding: "8px 10px",
-          borderRadius: radius.sm,
-          background: color.sunken,
-          font: `400 12px ${font.mono}`,
-          color: color.inkSoft,
-          overflowX: "auto",
-          maxWidth: "100%",
-          minWidth: 0,
-          boxSizing: "border-box",
-          whiteSpace: "pre",
-        }}
-      >
-        {block.code.text}
-      </pre>
-    );
+    return <CodeBlock key={i} lang={block.code.lang} text={block.code.text} />;
   });
+}
+
+// Code stays literal — a duck:// ref or #tag inside a fence is source, not a
+// reference to chip. Long lines WRAP (pre-wrap) instead of scrolling sideways:
+// a horizontal scrollbar inside a chat row hides content. A fence tag naming a
+// language the forge viewer bundles gets shiki tokens (same `.code-tok`
+// per-theme colors); highlighting is async, so the plain text paints first.
+function CodeBlock({ lang, text }: { lang: string | null; text: string }) {
+  const langId = lang ? langForTag(lang) : null;
+  const [lines, setLines] = useState<HlToken[][] | null>(null);
+  useEffect(() => {
+    if (!langId) {
+      setLines(null);
+      return;
+    }
+    let live = true;
+    void highlightLines(text, langId).then((tokens) => {
+      if (live) setLines(tokens);
+    });
+    return () => {
+      live = false;
+    };
+  }, [text, langId]);
+  return (
+    <pre
+      style={{
+        margin: "4px 0",
+        padding: "8px 10px",
+        borderRadius: radius.sm,
+        background: color.sunken,
+        border: `1px solid ${color.borderSoft}`,
+        font: `400 12.5px ${font.mono}`,
+        lineHeight: 1.5,
+        color: color.inkSoft,
+        maxWidth: "100%",
+        minWidth: 0,
+        boxSizing: "border-box",
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+      }}
+    >
+      {lines
+        ? lines.map((line, i) => (
+            <span key={i}>
+              {line.map((token, j) => (
+                <span
+                  key={j}
+                  className={token.style ? "code-tok" : undefined}
+                  style={token.style as CSSProperties | undefined}
+                >
+                  {token.content}
+                </span>
+              ))}
+              {i < lines.length - 1 ? "\n" : null}
+            </span>
+          ))
+        : text}
+    </pre>
+  );
 }

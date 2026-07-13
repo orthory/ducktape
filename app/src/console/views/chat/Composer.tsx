@@ -428,7 +428,7 @@ export function Composer({
               minWidth: 0,
               resize: "none",
               display: "block",
-              font: `400 13.5px ${font.sans}`,
+              font: `400 15px ${font.sans}`,
               color: color.ink,
               lineHeight: 1.5,
               padding: 0,
