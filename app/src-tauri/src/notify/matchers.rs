@@ -93,6 +93,7 @@ fn match_pages(op: &OpRow, ctx: &MatcherCtx<'_>) -> Option<Notification> {
             140,
         ),
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -444,6 +445,7 @@ mod tests {
         assert_eq!(notification.category, Category::Mention);
         assert_eq!(notification.title, "Casey mentioned you in Pages");
         assert_eq!(notification.body, "please review this");
+        assert_eq!(notification.message_id, None);
 
         let own = op(
             OriginKind::External,
