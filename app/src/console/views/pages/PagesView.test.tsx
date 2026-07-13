@@ -181,6 +181,67 @@ describe("PagesView", () => {
     );
   });
 
+  it("moves a right-side exact comment with text split into a new block", async () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a"] }),
+        blockOf({ id: "a", text: "left right" }),
+      ],
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 5, end: 10 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(5, 5);
+    fireEvent.keyDown(area, { key: "Enter" });
+    await settle();
+
+    const inserted = (spies.insertPageBlock as unknown as Mock).mock.calls[0][0];
+    expect(spies.moveCommentThread).toHaveBeenCalledWith({
+      threadId: "t1",
+      target: inserted.blockId,
+      anchor: { start: 0, end: 5 },
+    });
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "left " });
+  });
+
+  it("keeps a crossing comment intact when its split insert fails", async () => {
+    const { spies, fails, materialize } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a"] }),
+        blockOf({ id: "a", text: "left right" }),
+      ],
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 3, end: 8 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    materialize("updatePageBlockText", "moveCommentThread");
+    fails("insertPageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(5, 5);
+    fireEvent.keyDown(area, { key: "Enter" });
+    await settle();
+
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    expect(spies.moveCommentThread).not.toHaveBeenCalled();
+  });
+
   it("converts a paragraph via a typed markdown prefix", () => {
     const { spies } = renderPagesView();
     fireEvent.change(screen.getByLabelText("Edit paragraph block 1"), {
@@ -479,7 +540,7 @@ describe("floating comment card", () => {
     expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
   });
 
-  it("opens block style and comment actions when text is selected", () => {
+  it("persists inline marks and exact comment anchors for selected text", () => {
     const { spies } = renderPagesView();
     const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
     fireEvent.focus(area);
@@ -487,16 +548,60 @@ describe("floating comment card", () => {
     fireEvent.select(area);
 
     screen.getByRole("toolbar", { name: "Selection actions" });
-    fireEvent.change(screen.getByLabelText("Block style"), {
-      target: { value: "heading2" },
-    });
-    expect(spies.setPageBlockKind).toHaveBeenCalledWith({
+    fireEvent.click(screen.getByRole("button", { name: "Bold" }));
+    expect(spies.setPageBlockSpanMark).toHaveBeenCalledWith({
       blockId: "a",
-      kind: "heading2",
+      start: 0,
+      end: 5,
+      kind: "bold",
+      active: true,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Comment on selected block" }));
+    fireEvent.click(screen.getByRole("button", { name: "Comment on selected text" }));
+    const dialog = screen.getByRole("dialog", { name: "Comments on selected text" });
+    fireEvent.change(within(dialog).getByLabelText("New comment text"), {
+      target: { value: "tighten this" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add comment" }));
+    expect(spies.addComment).toHaveBeenCalledWith({
+      target: "a",
+      text: "tighten this",
+      anchor: { start: 0, end: 5 },
+    });
+  });
+
+  it("renders persisted marks and opens an anchored thread from its highlight", () => {
+    const marked = PAGE.map((block) =>
+      block.id === "a"
+        ? { ...block, marks: [{ start: 0, end: 5, kind: "bold" as const }] }
+        : block,
+    );
+    renderPagesView({
+      activePageBlocks: marked,
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 0, end: 5 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [{
+            id: "c1", thread_id: "t1", author: { user: [1] }, text: "note",
+            created_at: 1, edited_at: null, deleted: false,
+          }],
+        }],
+      }],
+    });
+    const mirror = document.querySelector("[data-inline-text]");
+    expect(mirror?.textContent).toBe("First draft");
+    expect(mirror?.querySelector("span")?.style.fontWeight).toBe("750");
+
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(2, 2);
+    fireEvent.click(area);
     screen.getByRole("dialog", { name: "Comments on this block" });
+    expect(screen.getByLabelText("Commented text").textContent).toBe("First");
   });
 });
 
@@ -633,6 +738,33 @@ describe("text moves across block boundaries", () => {
       text: "First draftShip it",
     });
     expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  it("moves exact comments before removing a merged source block", async () => {
+    const { spies } = renderPagesView({
+      pageThreads: [{
+        target: "b",
+        threads: [{
+          thread: {
+            id: "t1", target: "b", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 0, end: 4 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    expect(spies.moveCommentThread).toHaveBeenCalledWith({
+      threadId: "t1",
+      target: "a",
+      anchor: { start: 11, end: 15 },
+    });
+    expect(callOrder(spies.moveCommentThread)[0]).toBeLessThan(callOrder(spies.removePageBlock)[0]);
   });
 
   it("leaves Backspace alone in the middle of a block", () => {
@@ -964,6 +1096,78 @@ describe("pasting a document", () => {
     materialize("insertPageBlock");
     pasteInto("Edit paragraph block 1", "just some words");
     expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+
+  it("keeps marks with the original text around a multi-block paste", async () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({
+          id: "e",
+          text: "AA middle ZZ",
+          marks: [
+            { start: 0, end: 2, kind: "bold" },
+            { start: 10, end: 12, kind: "italic" },
+          ],
+        }),
+      ],
+      pageThreads: [{
+        target: "e",
+        threads: [{
+          thread: {
+            id: "tail-thread", target: "e", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 10, end: 12 }, resolved: false, resolved_by: null,
+            comment_ids: ["tail-comment"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    pasteInto("Edit paragraph block 1", "one\ntwo", [3, 9]);
+    await settle();
+
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "e",
+      text: "AA one",
+      marks: [{ start: 0, end: 2, kind: "bold" }],
+    });
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(expect.objectContaining({
+      text: "two ZZ",
+      marks: [{ start: 4, end: 6, kind: "italic" }],
+    }));
+    const inserted = (spies.insertPageBlock as unknown as Mock).mock.calls[0][0];
+    expect(spies.moveCommentThread).toHaveBeenCalledWith({
+      threadId: "tail-thread",
+      target: inserted.blockId,
+      anchor: { start: 4, end: 6 },
+    });
+  });
+
+  it("keeps an anchored tail in the source when a pasted block fails", async () => {
+    const { spies, fails, materialize } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({ id: "e", text: "head tail" }),
+      ],
+      pageThreads: [{
+        target: "e",
+        threads: [{
+          thread: {
+            id: "tail-thread", target: "e", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 5, end: 9 }, resolved: false, resolved_by: null,
+            comment_ids: ["tail-comment"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    materialize("updatePageBlockText", "moveCommentThread");
+    fails("insertPageBlock");
+    pasteInto("Edit paragraph block 1", "one\ntwo", [5, 5]);
+    await settle();
+
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    expect(spies.moveCommentThread).not.toHaveBeenCalled();
   });
 
   it("caps the burst and says so — every block is one consensus write", () => {

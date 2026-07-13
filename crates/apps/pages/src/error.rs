@@ -25,6 +25,11 @@ pub(super) enum PageError {
     PageViaBlockOp,
     /// `SetChecked` on a non-`Todo` block.
     NotTodo,
+    /// an inline mark/comment anchor is empty, outside the target text, or
+    /// splits a UTF-16 surrogate pair.
+    InvalidTextRange,
+    /// normalized inline formatting exceeded the per-block span cap.
+    TooManySpanMarks,
     /// the op would grow a serialized block (or the index) past
     /// [`MAX_BLOCK_LEN`] — rejected at write time so the oversized bytes never
     /// reach the panicking commit/read paths (the codec bound is decode-only).
@@ -85,6 +90,8 @@ impl core::fmt::Display for PageError {
             PageError::PageRootImmutable => "page roots cannot be moved, removed, or converted",
             PageError::PageViaBlockOp => "a page block can only be created by CreatePage",
             PageError::NotTodo => "checked applies only to todo blocks",
+            PageError::InvalidTextRange => "invalid text range",
+            PageError::TooManySpanMarks => "too many inline marks",
             PageError::BlockTooLarge => "block too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",

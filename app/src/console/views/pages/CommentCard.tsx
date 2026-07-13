@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { AuthorNames } from "../../../domain/chat-client";
-import type { ThreadView } from "../../../domain/pages-client";
+import type { RelativeAnchor, ThreadView } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import type { OpLedger } from "../../store/finalization";
 import { inMentionMenu } from "../chat/use-mention-menu";
@@ -27,6 +27,8 @@ export function CommentCard({
   target,
   label,
   anchor,
+  selection,
+  targetText = "",
   threads,
   authorNames,
   selfKey,
@@ -43,6 +45,10 @@ export function CommentCard({
   /** "this page" | "this block" — names the card and its composer. */
   label: string;
   anchor: CommentAnchor;
+  /** Exact range for the new thread; absent for block/page-level comments. */
+  selection?: RelativeAnchor;
+  /** Current target text, used to show each thread's live selected quote. */
+  targetText?: string;
   /** Threads for THIS target only. */
   threads: ThreadView[];
   authorNames: AuthorNames;
@@ -52,7 +58,7 @@ export function CommentCard({
   /** Finalization ledger, handed through to each thread's marks. */
   ops?: OpLedger;
   onClose: () => void;
-  onSubmitNew: (target: string, text: string) => void;
+  onSubmitNew: (target: string, text: string, selection?: RelativeAnchor) => void;
   onReply: (threadId: string, text: string) => void;
   onResolve: (threadId: string, resolved: boolean) => void;
   onEdit: (commentId: string, text: string) => void;
@@ -95,7 +101,13 @@ export function CommentCard({
     };
   }, [onClose]);
 
-  const left = Math.max(8, Math.min(anchor.x - CARD_WIDTH, window.innerWidth - CARD_WIDTH - 8));
+  const left = Math.max(
+    8,
+    Math.min(
+      selection ? anchor.x : anchor.x - CARD_WIDTH,
+      window.innerWidth - CARD_WIDTH - 8,
+    ),
+  );
   const top = Math.max(8, Math.min(anchor.y + 8, window.innerHeight - 120));
 
   return (
@@ -166,6 +178,11 @@ export function CommentCard({
           <ThreadCard
             key={view.thread.id}
             view={view}
+            anchorText={
+              view.thread.anchor
+                ? targetText.slice(view.thread.anchor.start, view.thread.anchor.end)
+                : undefined
+            }
             authorNames={authorNames}
             selfKey={selfKey}
             selfName={selfName}
@@ -181,7 +198,8 @@ export function CommentCard({
             key={target}
             composer={{ target, label }}
             onSubmit={(t, text) => {
-              onSubmitNew(t, text);
+              if (selection) onSubmitNew(t, text, selection);
+              else onSubmitNew(t, text);
               setComposing(false);
             }}
             // an empty target has nothing else to show — cancel closes the

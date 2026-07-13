@@ -376,6 +376,7 @@ export interface ConsoleActions {
     after: string | null;
     kind: PageBlockKind;
     text: string;
+    marks?: pagesClient.SpanMark[];
     /** Keep a rejection out of the global error surface — the caller reports it
      *  instead. The delete-undo replay sets it: its ops are anchor-chained, so a
      *  parent or anchor removed under it rejects EVERY op in the batch, one
@@ -385,7 +386,19 @@ export interface ConsoleActions {
   }): Promise<boolean>;
   /** Replace a block's text; on the page root this renames the page.
    *  Resolves true once the op commits — see `insertPageBlock`. */
-  updatePageBlockText(params: { blockId: string; text: string }): Promise<boolean>;
+  updatePageBlockText(params: {
+    blockId: string;
+    text: string;
+    marks?: pagesClient.SpanMark[];
+  }): Promise<boolean>;
+  /** Apply/remove inline formatting over an exact UTF-16 selection. */
+  setPageBlockSpanMark(params: {
+    blockId: string;
+    start: number;
+    end: number;
+    kind: pagesClient.InlineMark;
+    active: boolean;
+  }): void;
   /** Convert a block to another kind (markdown shortcuts, slash menu). */
   setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
   /** Flip a Todo block's checked state. */
@@ -407,7 +420,18 @@ export interface ConsoleActions {
   loadPageThreads(): void;
   /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
    *  is minted), else appends to that thread. `target` is a block or page id. */
-  addComment(params: { threadId?: string; target: string; text: string }): void;
+  addComment(params: {
+    threadId?: string;
+    target: string;
+    text: string;
+    anchor?: pagesClient.RelativeAnchor;
+  }): void;
+  /** Re-anchor a thread when its selected text crosses a split/merge boundary. */
+  moveCommentThread(params: {
+    threadId: string;
+    target: string;
+    anchor: pagesClient.RelativeAnchor | null;
+  }): Promise<boolean>;
   /** Edit own comment text. */
   editComment(params: { commentId: string; text: string }): void;
   /** Tombstone own comment (removes the thread if it was the last live one). */
@@ -2468,7 +2492,7 @@ export function createActions({
     // projection outlives its failed submit (the FinalizationMark shows the
     // failure; the next successful reload converges). A local undo snapshot in
     // submitTracked would close that window if dead-node UX ever matters.
-    addComment: ({ threadId, target, text }) => {
+    addComment: ({ threadId, target, text, anchor }) => {
       const clean = text.trim();
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
@@ -2476,24 +2500,42 @@ export function createActions({
       const mentions = structuredMentions(parseMessageInput(clean, mentionResolver()));
       submitTracked(
         opKey.commentThread(tid),
-        (live) =>
-          pagesClient.addComment(live, {
+        (live) => {
+          const submit = () => pagesClient.addComment(live, {
             threadId: tid,
             commentId,
             target,
             text: clean,
+            anchor,
             mentions,
-          }),
+          });
+          return anchor ? inPageOrder(submit) : submit();
+        },
         (prev) =>
           optimistic.commentAdded(prev, {
             threadId: tid,
             commentId,
             target,
             text: clean,
+            anchor,
             authorBytes: selfAuthorBytes(prev.status, prev.author),
             at: Date.now(),
           }),
       ).then(() => loadPageThreads());
+    },
+
+    moveCommentThread: ({ threadId, target, anchor }) => {
+      const moved = submitTracked(
+        opKey.commentThread(threadId),
+        (live) => inPageOrder(() => pagesClient.moveCommentThread(live, {
+          threadId,
+          target,
+          anchor,
+        })),
+        (prev) => optimistic.commentThreadMoved(prev, threadId, target, anchor),
+      );
+      void moved.then(() => loadPageThreads());
+      return moved;
     },
 
     editComment: ({ commentId, text }) => {
@@ -2542,7 +2584,7 @@ export function createActions({
 
     // Every page-block write goes out through `inPageOrder` — the editor's ops
     // are anchor-chained and the wire has no ordering of its own.
-    insertPageBlock: ({ blockId, parent, after, kind, text, quiet }) => {
+    insertPageBlock: ({ blockId, parent, after, kind, text, marks, quiet }) => {
       const page = getState().activePage;
       if (!page) return Promise.resolve(false);
       return submitTracked(
@@ -2552,25 +2594,48 @@ export function createActions({
             pagesClient.insertBlock(live, {
               parent,
               after,
-              block: { id: blockId, kind, text },
+              block: { id: blockId, kind, text, ...(marks ? { marks } : {}) },
             }),
           ),
         (prev) =>
           optimistic.pageBlockInserted(prev, {
             parent,
             after,
-            block: { id: blockId, parent, page, kind, text, checked: false, children: [] },
+            block: {
+              id: blockId,
+              parent,
+              page,
+              kind,
+              text,
+              ...(marks ? { marks } : {}),
+              checked: false,
+              children: [],
+            },
           }),
         quiet,
       );
     },
 
-    updatePageBlockText: ({ blockId, text }) =>
+    updatePageBlockText: ({ blockId, text, marks }) =>
       submitTracked(
         opKey.pageBlock(blockId),
-        (live) => inPageOrder(() => pagesClient.updateText(live, { blockId, text })),
-        (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
+        (live) => inPageOrder(() => pagesClient.updateText(live, { blockId, text, marks })),
+        (prev) => optimistic.pageBlockPatched(prev, blockId, { text, ...(marks ? { marks } : {}) }),
       ),
+
+    setPageBlockSpanMark: ({ blockId, start, end, kind, active }) => {
+      void submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => inPageOrder(() => pagesClient.setSpanMark(live, {
+          blockId,
+          start,
+          end,
+          kind,
+          active,
+        })),
+        (prev) => optimistic.pageSpanMarked(prev, blockId, { start, end }, kind, active),
+      );
+    },
 
     setPageBlockKind: ({ blockId, kind }) => {
       void submitTracked(

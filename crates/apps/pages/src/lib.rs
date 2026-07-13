@@ -80,6 +80,7 @@ mod module_impl;
 mod ops;
 mod page_ops;
 mod store;
+mod text_ranges;
 
 use error::{PageError, to_page_err};
 use store::hash_key;

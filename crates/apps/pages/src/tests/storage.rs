@@ -189,6 +189,7 @@ fn corrupt_stored_block_errors_as_corruption_not_absence() {
             &PageMsg::UpdateText {
                 block_id: "blk1".into(),
                 text: "x".into(),
+                marks: None,
             },
             "corrupt",
         )

@@ -9,6 +9,7 @@ fn page_trigger_thread() -> pages::ThreadView {
             target: "b-p".into(),
             opener: pages::AuthorRef::User(vec![4; 32]),
             created_at: 1,
+            anchor: None,
             resolved: false,
             resolved_by: None,
             comment_ids: vec!["comment-1".into()],
@@ -73,6 +74,7 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
         thread_id,
         target,
         text,
+        anchor,
         mentions,
         as_agent,
         ..
@@ -84,6 +86,7 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
     assert_eq!(target, "b-p");
     assert_eq!(text, "Reviewed.");
     assert!(mentions.is_empty());
+    assert!(anchor.is_none());
     assert_eq!(as_agent.as_deref(), Some("bot"));
 }
 
@@ -150,6 +153,7 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
         comment_id,
         target,
         text,
+        anchor,
         mentions,
         as_agent,
     } = &msgs[0]
@@ -164,6 +168,7 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
     assert!(pages::id_is_index_safe(thread_id) && pages::id_is_index_safe(comment_id));
     assert_eq!(target, "b-p");
     assert_eq!(text, "looks good");
+    assert!(anchor.is_none());
     assert!(mentions.is_empty());
     assert_eq!(
         as_agent.as_deref(),

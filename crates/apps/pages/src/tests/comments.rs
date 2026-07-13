@@ -8,6 +8,7 @@ fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
         comment_id: comment.into(),
         target: target.into(),
         text: text.into(),
+        anchor: None,
         mentions: Vec::new(),
         as_agent: None,
     }
@@ -19,9 +20,62 @@ fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageM
         comment_id: comment.into(),
         target: target.into(),
         text: "agent says".into(),
+        anchor: None,
         mentions: Vec::new(),
         as_agent: Some(agent.into()),
     }
+}
+
+#[test]
+fn exact_comment_anchor_rebases_with_target_text() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        seed_page(&mut p, "p1").await;
+        let mut anchored = add("t1", "m1", "b1", "on the selection");
+        if let PageMsg::AddComment { anchor, .. } = &mut anchored {
+            *anchor = Some(RelativeAnchor { start: 0, end: 99 });
+        }
+        apply_err_as(
+            &mut p,
+            &anchored,
+            user("alice"),
+            "invalid text range",
+        )
+        .await;
+        if let PageMsg::AddComment { anchor, .. } = &mut anchored {
+            *anchor = Some(RelativeAnchor { start: 0, end: 2 });
+        }
+        apply_commit_as(&mut p, &anchored, user("alice")).await;
+        apply_commit(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "++b1".into(),
+                marks: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            query_thread(&p, "t1").await.unwrap().thread.anchor,
+            Some(RelativeAnchor { start: 2, end: 4 })
+        );
+        apply_commit(
+            &mut p,
+            &PageMsg::MoveCommentThread {
+                thread_id: "t1".into(),
+                target: "b2".into(),
+                anchor: Some(RelativeAnchor { start: 0, end: 2 }),
+            },
+        )
+        .await;
+        let moved = query_threads(&p, &["b1", "b2"]).await;
+        assert!(moved[0].threads.is_empty());
+        assert_eq!(moved[1].threads[0].thread.target, "b2");
+        assert_eq!(
+            moved[1].threads[0].thread.anchor,
+            Some(RelativeAnchor { start: 0, end: 2 })
+        );
+    });
 }
 
 #[test]
@@ -177,6 +231,7 @@ fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
         target: "b".repeat(MAX_COMMENT_TARGET_BYTES),
         opener: AuthorRef::System,
         created_at: 0,
+        anchor: None,
         resolved: false,
         resolved_by: None,
         comment_ids: (0..MAX_COMMENTS_PER_THREAD)

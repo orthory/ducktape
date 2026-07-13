@@ -8,6 +8,7 @@ fn nb(id: &str, kind: BlockKind, text: &str) -> NewBlock {
         id: id.into(),
         kind,
         text: text.into(),
+        marks: Vec::new(),
     }
 }
 

@@ -30,7 +30,14 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ClipboardEvent, DragEvent, KeyboardEvent } from "react";
 
-import type { BlockKind } from "../../../domain/pages-client";
+import type {
+  BlockKind,
+  InlineMark,
+  RelativeAnchor,
+  SpanMark,
+  ThreadView,
+} from "../../../domain/pages-client";
+import { rebaseMarks, rebaseRange } from "../../../domain/pages-ranges";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
 import type { OpRecord } from "../../store/finalization";
@@ -40,6 +47,7 @@ import { BlockGutter } from "./BlockGutter";
 import { BlockMarker, BlockShell } from "./BlockShell";
 import { SlashMenu } from "./SlashMenu";
 import { SelectionToolbar } from "./SelectionToolbar";
+import { InlineText } from "./InlineText";
 import { RemoteCursors, type PagePresencePeer } from "./PagePresence";
 import type { Row } from "./pages-model";
 import { DRAG_MIME } from "./page-drag";
@@ -59,7 +67,7 @@ import {
 // ── One editable block row ───────────────────────────────
 
 export interface RowHandlers {
-  commitText(blockId: string, text: string): void;
+  commitText(blockId: string, text: string, marks?: SpanMark[]): void;
   /** This block keeps `left`; a fresh sibling below takes `right`. */
   split(row: Row, left: string, right: string): void;
   /** Join `text` onto the block above and drop this one. */
@@ -71,6 +79,7 @@ export interface RowHandlers {
   moveUp(row: Row): void;
   moveDown(row: Row): void;
   setKind(blockId: string, kind: BlockKind): void;
+  setMark(blockId: string, range: RelativeAnchor, kind: InlineMark, active: boolean): void;
   setChecked(blockId: string, checked: boolean): void;
   /** Delete the block and its subtree. A block WITH children is confirmed
    *  first — the guard lives in the handler, so every caller inherits it. */
@@ -88,7 +97,11 @@ export interface RowHandlers {
   /** Reported by the row once it has placed a requested caret. */
   focusApplied(blockId: string): void;
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
-  openComments(blockId: string, anchor: { x: number; y: number }): void;
+  openComments(
+    blockId: string,
+    anchor: { x: number; y: number },
+    range?: RelativeAnchor,
+  ): void;
   createSubpage(): void;
   dragStart(blockId: string): void;
   dragOver(blockId: string, edge: DropEdge): void;
@@ -102,6 +115,50 @@ const edgeOf = (event: DragEvent<HTMLElement>): DropEdge => {
   return event.clientY < rect.top + rect.height / 2 ? "before" : "after";
 };
 
+/** The native textarea owns selection, so mirror just enough of its layout to
+ * place the floating toolbar over the selected glyphs (including wrapped
+ * lines) instead of over the center of the whole block. */
+const selectionAnchorOf = (
+  area: HTMLTextAreaElement,
+  start: number,
+  end: number,
+): { x: number; y: number } => {
+  const rect = area.getBoundingClientRect();
+  const computed = getComputedStyle(area);
+  const mirror = document.createElement("div");
+  Object.assign(mirror.style, {
+    position: "fixed",
+    visibility: "hidden",
+    pointerEvents: "none",
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    width: `${rect.width}px`,
+    boxSizing: computed.boxSizing,
+    padding: computed.padding,
+    border: computed.border,
+    font: computed.font,
+    letterSpacing: computed.letterSpacing,
+    whiteSpace: "pre-wrap",
+    overflowWrap: "break-word",
+  });
+  const marker = () => {
+    const span = document.createElement("span");
+    span.textContent = "\u200b";
+    return span;
+  };
+  const from = marker();
+  const to = marker();
+  mirror.append(area.value.slice(0, start), from, area.value.slice(start, end), to);
+  document.body.append(mirror);
+  const a = from.getBoundingClientRect();
+  const b = to.getBoundingClientRect();
+  mirror.remove();
+  return {
+    x: Math.abs(a.top - b.top) < 1 ? (a.left + b.left) / 2 : a.left,
+    y: Math.max(a.bottom, b.bottom),
+  };
+};
+
 function BlockRowInner({
   row,
   index,
@@ -109,7 +166,7 @@ function BlockRowInner({
   caret,
   expanded,
   op,
-  threadCount,
+  threads,
   dropEdge,
   presence,
   onCursor,
@@ -127,8 +184,8 @@ function BlockRowInner({
   expanded: boolean;
   /** The block's finalization record — only rendered while pending/failed. */
   op: OpRecord | undefined;
-  /** Number of live comment threads on this block. */
-  threadCount: number;
+  /** Live comment threads on this block, including exact selection anchors. */
+  threads: ThreadView[];
   /** A drag is hovering this row and would land on this edge. */
   dropEdge: DropEdge | null;
   /** Live, off-consensus peers whose caret is in this block. */
@@ -142,7 +199,10 @@ function BlockRowInner({
   const [slashIndex, setSlashIndex] = useState(0);
   const [focused, setFocused] = useState(false);
   const [hover, setHover] = useState(false);
-  const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);
+  const [selection, setSelection] = useState<{
+    anchor: { x: number; y: number };
+    range: RelativeAnchor;
+  } | null>(null);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
   const rowRef = useRef<HTMLDivElement | null>(null);
   const localCaretRef = useRef<number | null>(null);
@@ -197,8 +257,20 @@ function BlockRowInner({
 
   const dirty = () => draft !== block.text;
   const maybeCommit = () => {
-    if (dirty()) handlers.commitText(block.id, draft);
+    if (dirty()) {
+      handlers.commitText(
+        block.id,
+        draft,
+        block.marks?.length ? visibleMarks : undefined,
+      );
+    }
   };
+  const visibleMarks = rebaseMarks(block.text, draft, block.marks);
+  const commentRanges = threads
+    .filter(({ thread }) => !thread.resolved && thread.anchor)
+    .map(({ thread }) => rebaseRange(block.text, draft, thread.anchor as RelativeAnchor))
+    .filter((range) => range.start < range.end);
+  const threadCount = threads.length;
 
   // the latest commit closure lives in a ref so the boundary timer neither
   // resets when the store re-renders (handlers is rebuilt per store change)
@@ -227,7 +299,7 @@ function BlockRowInner({
   };
 
   const onChange = (next: string) => {
-    setSelectionAnchor(null);
+    setSelection(null);
     if (!next.startsWith("/")) setSlashDismissed(false);
     if (slashOpen || next.startsWith("/")) {
       setSlashIndex(0);
@@ -239,7 +311,7 @@ function BlockRowInner({
       if (shortcut) {
         handlers.setKind(block.id, shortcut.kind);
         if (shortcut.kind === "divider") {
-          handlers.commitText(block.id, "");
+          handlers.commitText(block.id, "", block.marks?.length ? [] : undefined);
           setDraft("");
         } else {
           setDraft(shortcut.rest);
@@ -267,8 +339,8 @@ function BlockRowInner({
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     const el = event.currentTarget;
 
-    if (event.key === "Escape" && selectionAnchor) {
-      setSelectionAnchor(null);
+    if (event.key === "Escape" && selection) {
+      setSelection(null);
       return;
     }
 
@@ -374,64 +446,93 @@ function BlockRowInner({
   const blockNumber = index + 1;
 
   const area = (
-    <textarea
-      ref={(el) => {
-        areaRef.current = el;
-        handlers.registerInput(block.id, el);
-      }}
-      aria-label={`Edit ${block.kind} block ${blockNumber}`}
-      value={draft}
-      rows={1}
-      onChange={(event) => {
-        onChange(event.target.value);
-        publishCursor(event.currentTarget);
-      }}
-      onPaste={onPaste}
-      onSelect={(event) => {
-        const el = event.currentTarget;
-        publishCursor(el);
-        if (el.selectionStart === el.selectionEnd) {
-          setSelectionAnchor(null);
-          return;
+    <div style={{ position: "relative" }}>
+      {visibleMarks.length > 0 || commentRanges.length > 0 ? (
+        <InlineText
+          text={draft}
+          marks={visibleMarks}
+          comments={commentRanges}
+          fontStyle={kindFont(block.kind)}
+          done={todoDone}
+        />
+      ) : null}
+      <textarea
+        ref={(el) => {
+          areaRef.current = el;
+          handlers.registerInput(block.id, el);
+        }}
+        aria-label={`Edit ${block.kind} block ${blockNumber}`}
+        value={draft}
+        rows={1}
+        onChange={(event) => {
+          onChange(event.target.value);
+          publishCursor(event.currentTarget);
+        }}
+        onPaste={onPaste}
+        onSelect={(event) => {
+          const el = event.currentTarget;
+          publishCursor(el);
+          if (el.selectionStart === el.selectionEnd) {
+            setSelection(null);
+            return;
+          }
+          setSelection({
+            anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
+            range: { start: el.selectionStart, end: el.selectionEnd },
+          });
+        }}
+        onFocus={(event) => {
+          focusedRef.current = true;
+          setFocused(true);
+          publishCursor(event.currentTarget);
+        }}
+        onBlur={() => {
+          focusedRef.current = false;
+          setFocused(false);
+          onCursor(null, 0, 0);
+          maybeCommit();
+        }}
+        onKeyDown={onKeyDown}
+        placeholder={
+          draft === ""
+            ? focused
+              ? kindPlaceholder(block.kind)
+              : restPlaceholder(block.kind)
+            : ""
         }
-        const rect = el.getBoundingClientRect();
-        setSelectionAnchor({ x: rect.left + rect.width / 2, y: rect.top });
-      }}
-      onFocus={(event) => {
-        focusedRef.current = true;
-        setFocused(true);
-        publishCursor(event.currentTarget);
-      }}
-      onBlur={() => {
-        focusedRef.current = false;
-        setFocused(false);
-        onCursor(null, 0, 0);
-        maybeCommit();
-      }}
-      onKeyDown={onKeyDown}
-      placeholder={
-        draft === ""
-          ? focused
-            ? kindPlaceholder(block.kind)
-            : restPlaceholder(block.kind)
-          : ""
-      }
-      spellCheck={block.kind !== "code"}
-      style={{
-        display: "block",
-        width: "100%",
-        boxSizing: "border-box",
-        border: "none",
-        outline: "none",
-        resize: "none",
-        overflow: "hidden",
-        background: "transparent",
-        padding: 0,
-        color: todoDone ? color.muted2 : color.ink,
-        textDecoration: todoDone ? "line-through" : "none",
-        font: kindFont(block.kind),
-      }}
-    />
+        spellCheck={block.kind !== "code"}
+        style={{
+          display: "block",
+          width: "100%",
+          boxSizing: "border-box",
+          border: "none",
+          outline: "none",
+          resize: "none",
+          overflow: "hidden",
+          background: "transparent",
+          padding: 0,
+          color: visibleMarks.length > 0 || commentRanges.length > 0
+            ? "transparent"
+            : todoDone
+              ? color.muted2
+              : color.ink,
+          caretColor: todoDone ? color.muted2 : color.ink,
+          WebkitTextFillColor:
+            visibleMarks.length > 0 || commentRanges.length > 0 ? "transparent" : undefined,
+          textDecoration: todoDone ? "line-through" : "none",
+          font: kindFont(block.kind),
+        }}
+        onClick={(event) => {
+          const el = event.currentTarget;
+          if (el.selectionStart !== el.selectionEnd) return;
+          if (!commentRanges.some(
+            (range) => range.start <= el.selectionStart && range.end > el.selectionStart,
+          )) return;
+          const rect = el.getBoundingClientRect();
+          handlers.openComments(block.id, { x: rect.right, y: rect.top });
+        }}
+      />
+    </div>
   );
 
   return (
@@ -553,17 +654,21 @@ function BlockRowInner({
         ) : null}
       </div>
 
-      {selectionAnchor ? (
+      {selection ? (
         <SelectionToolbar
           blockId={block.id}
-          kind={block.kind}
-          anchor={selectionAnchor}
-          onStyle={(kind) => handlers.setKind(block.id, kind)}
-          onComment={(anchor) => {
-            setSelectionAnchor(null);
-            handlers.openComments(block.id, anchor);
+          marks={visibleMarks}
+          range={selection.range}
+          anchor={selection.anchor}
+          onMark={(kind, active) => {
+            maybeCommit();
+            handlers.setMark(block.id, selection.range, kind, active);
           }}
-          onDismiss={() => setSelectionAnchor(null)}
+          onComment={(anchor) => {
+            handlers.openComments(block.id, anchor, selection.range);
+            setSelection(null);
+          }}
+          onDismiss={() => setSelection(null)}
         />
       ) : null}
 
@@ -611,6 +716,11 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     x.id === y.id &&
     x.kind === y.kind &&
     x.text === y.text &&
+    (x.marks ?? []).length === (y.marks ?? []).length &&
+    (x.marks ?? []).every((mark, index) => {
+      const other = (y.marks ?? [])[index];
+      return other?.start === mark.start && other.end === mark.end && other.kind === mark.kind;
+    }) &&
     x.checked === y.checked &&
     // a toggle's chevron exists only while it HAS children, so the row reads
     // the child count and must re-render when it changes.
@@ -622,7 +732,7 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.caret === b.caret &&
     a.expanded === b.expanded &&
     a.op === b.op &&
-    a.threadCount === b.threadCount &&
+    a.threads === b.threads &&
     a.dropEdge === b.dropEdge &&
     a.presence === b.presence &&
     a.onCursor === b.onCursor &&

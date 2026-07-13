@@ -30,6 +30,7 @@ where
             }
             PageMsg::InsertBlock { parent, block, .. } => vec![parent.as_str(), block.id.as_str()],
             PageMsg::UpdateText { block_id, .. }
+            | PageMsg::SetSpanMark { block_id, .. }
             | PageMsg::SetKind { block_id, .. }
             | PageMsg::SetChecked { block_id, .. }
             | PageMsg::RemoveBlock { block_id } => vec![block_id.as_str()],
@@ -52,6 +53,9 @@ where
             } => {
                 vec![thread_id.as_str(), comment_id.as_str(), target.as_str()]
             }
+            PageMsg::MoveCommentThread {
+                thread_id, target, ..
+            } => vec![thread_id.as_str(), target.as_str()],
             PageMsg::EditComment { comment_id, .. } => vec![comment_id.as_str()],
             PageMsg::DeleteComment { comment_id } => vec![comment_id.as_str()],
             PageMsg::ResolveThread { thread_id, .. } => vec![thread_id.as_str()],
@@ -63,6 +67,7 @@ where
         if matches!(
             &msg,
             PageMsg::AddComment { .. }
+                | PageMsg::MoveCommentThread { .. }
                 | PageMsg::EditComment { .. }
                 | PageMsg::DeleteComment { .. }
                 | PageMsg::ResolveThread { .. }

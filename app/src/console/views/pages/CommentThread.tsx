@@ -321,6 +321,7 @@ function CommentRow({
 
 export function ThreadCard({
   view,
+  anchorText,
   authorNames,
   selfKey,
   selfName,
@@ -331,6 +332,8 @@ export function ThreadCard({
   onDelete,
 }: {
   view: ThreadView;
+  /** Current text covered by this thread's relative anchor. */
+  anchorText?: string;
   authorNames: AuthorNames;
   /** The local author's key (`selfAuthorKeyOf(selfAuthorBytes(...))`). Edit and
    *  Delete used to render on EVERY comment while the module enforces
@@ -389,6 +392,25 @@ export function ThreadCard({
           <Icon name="check" size={11} strokeWidth={2} />
           Resolved
           {thread.resolved_by ? ` by ${authorName(thread.resolved_by, authorNames)}` : ""}
+        </div>
+      ) : null}
+
+      {anchorText ? (
+        <div
+          aria-label="Commented text"
+          style={{
+            margin: "12px 16px 0",
+            padding: "6px 9px",
+            borderLeft: `2px solid ${color.amber}`,
+            borderRadius: radius.sm,
+            background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
+            color: color.muted3,
+            font: `500 11.5px/1.4 ${font.sans}`,
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {anchorText}
         </div>
       ) : null}
 
