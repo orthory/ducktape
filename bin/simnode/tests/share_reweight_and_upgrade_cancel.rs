@@ -14,6 +14,12 @@
 //!   schedule. this is the operator's explicit clear — distinct from the already-
 //!   pinned abort path (governance_scenarios.rs), where the system-injected
 //!   boundary `Advance` clears an incomplete-readiness upgrade AT its activation.
+//!   the boundary block itself is too late on BOTH block paths, with different
+//!   refusals: the single-op drain queues the `Advance` ahead of the root op's
+//!   follow-ups (the cancel finds an empty slot; the block aborts, rolling the
+//!   `Advance` back), while the batch engine drains a member's follow-ups
+//!   before its step-4 injections (the cancel finds the slot occupied — the
+//!   too-late arm — and the block's own `Advance` then settles it).
 //!
 //! ceremony mirrors share_governance.rs / governance_scenarios.rs: validators
 //! author through the `hex:` origin escape (governance keys ballots on
@@ -396,5 +402,102 @@ fn a_governance_cancel_clears_a_pending_upgrade_early_and_frees_the_slot() {
     assert!(
         error.contains("no matching pending upgrade to cancel"),
         "cancelling nothing is refused by the module: {error}"
+    );
+}
+
+/// the boundary block is TOO LATE to cancel — and WHICH refusal fires exposes
+/// a real reactor-ordering seam between the two block paths:
+///
+/// - single-op drain: the queue is `[root, Advance, …]`, and the root's
+///   follow-ups push BEHIND the injections — so the governance cancel's
+///   emitted `UpgradeMsg::Cancel` drains AFTER the `Advance` already cleared
+///   the slot, and dies with "no matching pending upgrade to cancel". the
+///   whole block aborts, rolling the `Advance` back with it: state is
+///   untouched, the boundary has not passed.
+/// - batch engine (`submit_block`): each member drains root+follow-ups to
+///   completion FIRST; the injections run once, after every member (step 4).
+///   so the same cancel reaches the module while the slot is still occupied
+///   at `height == activation` — past the `height < activation_height`
+///   window — and dies with "cannot cancel: activation height already
+///   reached". the member is rejected and isolated, the block still commits,
+///   and its step-4 `Advance` settles the incomplete upgrade in the same
+///   breath: slot cleared, version untouched.
+#[test]
+fn a_cancel_landing_at_the_activation_boundary_is_too_late_on_both_block_paths() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, validators) = governed(storage.path());
+    let v0 = origin(&validators[0]);
+    let v1 = origin(&validators[1]);
+
+    // schedule v2 with enough lead to fit the cancel ballot before the boundary.
+    let activation = height(&sim) + 20;
+    pass(
+        &sim,
+        &[&v0, &v1],
+        "sched-v2",
+        schedule("v2", activation, 2),
+        1_000_000,
+    );
+
+    // pass the cancel ballot but hold its EXECUTE: it must land exactly at the
+    // boundary, so walk the chain to activation - 1 first.
+    propose(&sim, v0.as_str(), "cancel-late", cancel("v2"), 1_000_000);
+    vote(&sim, v0.as_str(), "cancel-late", true);
+    vote(&sim, v1.as_str(), "cancel-late", true);
+    walk_to(&sim, activation - 1);
+
+    // SINGLE-OP LANE: the boundary block's queue runs root → Advance →
+    // follow-ups, so the cancel drains after the Advance emptied the slot. the
+    // abort rolls the whole block back — Advance included — so nothing moved.
+    let error = execute_rejected(&sim, v0.as_str(), "cancel-late");
+    assert!(
+        error.contains("no matching pending upgrade to cancel"),
+        "on the single-op lane the Advance outruns the follow-up: {error}"
+    );
+    assert_eq!(
+        height(&sim),
+        activation - 1,
+        "the aborted execute minted no block"
+    );
+    let st = upgrade_status(&sim);
+    assert!(
+        st["pending"].is_object(),
+        "the rolled-back Advance left v2 pending: {st}"
+    );
+
+    // BATCH LANE: a member's follow-ups drain BEFORE the step-4 injections, so
+    // the same cancel now finds the slot occupied AT the boundary — the
+    // module's too-late arm. the member is rejected and isolated; the block
+    // commits; its own step-4 Advance settles the incomplete upgrade.
+    let (code, reply) = sim.peer_batch(json!([{
+        "target": "governance",
+        "payload": { "execute": { "proposal_id": "cancel-late" } },
+        "origin": v0,
+    }]));
+    assert_eq!(code, 200, "the batch block commits: {reply}");
+    assert_eq!(
+        reply["members"][0]["disposition"], "rejected",
+        "the boundary cancel member is rejected: {reply}"
+    );
+    assert!(
+        reply["members"][0]["rejection"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot cancel: activation height already reached"),
+        "the batch lane reaches the too-late arm: {reply}"
+    );
+    assert_eq!(
+        reply["height"],
+        json!(activation),
+        "the batch block IS the boundary block: {reply}"
+    );
+    let st = upgrade_status(&sim);
+    assert!(
+        st["pending"].is_null(),
+        "the same block's step-4 Advance settled the slot: {st}"
+    );
+    assert_eq!(
+        st["current_version"], 0,
+        "incomplete readiness aborts, never arms: {st}"
     );
 }
