@@ -169,13 +169,33 @@ impl ValidatorRuntime<'_> {
                         cap: gate.cap,
                     },
                     node::Disposition::Rejected => {
-                        let (code, terminal) = lobby::redeem_reject_outcome(d.reason.as_deref());
-                        lobby::GateMsg::Rejected {
-                            code,
-                            detail: d.reason.clone().unwrap_or_else(|| {
-                                "invite redemption rejected in consensus".into()
-                            }),
-                            terminal,
+                        // settle-race guard: this member's Redeem lost to a
+                        // SIBLING member's grant for the same joiner (a slow
+                        // settle swept us to Busy, the joiner failed over, and
+                        // both Redeems batched — governance answers "already
+                        // redeemed" to the loser). the joiner IS admitted; a
+                        // terminal Spent here would `exit(1)` a granted join.
+                        // if the joiner now holds resident standing, answer
+                        // Admitted, not Spent.
+                        let admitted = read_valset_residents(node.host())
+                            .await
+                            .iter()
+                            .any(|r| r.as_slice() == gate.joiner.as_slice());
+                        if admitted {
+                            lobby::GateMsg::Admitted {
+                                height: d.height,
+                                cap: gate.cap,
+                            }
+                        } else {
+                            let (code, terminal) =
+                                lobby::redeem_reject_outcome(d.reason.as_deref());
+                            lobby::GateMsg::Rejected {
+                                code,
+                                detail: d.reason.clone().unwrap_or_else(|| {
+                                    "invite redemption rejected in consensus".into()
+                                }),
+                                terminal,
+                            }
                         }
                     }
                     node::Disposition::Discarded => unreachable!("filtered at the loop top"),

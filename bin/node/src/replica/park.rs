@@ -525,6 +525,15 @@ pub(super) async fn park(
                         }
                         reply = lobby_rx.recv().fuse() => {
                             let Ok((peer, msg)) = reply else { break };
+                            // only a GATING VALIDATOR may move this joiner: a
+                            // forged Admitted would mark standing + DELETE the
+                            // invite token (no gate-rerun path left), a forged
+                            // terminal Rejected is a DoS exit. members answer
+                            // from their real validator key, so drop anything
+                            // off a peer not in the gated set.
+                            if !announce_targets.contains(&peer) {
+                                continue;
+                            }
                             let bytes: Vec<u8> = msg.into();
                             match lobby::decode_msg(&bytes) {
                                 // the AUTHORITATIVE admission: standing is
