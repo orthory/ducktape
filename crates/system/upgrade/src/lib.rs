@@ -101,6 +101,16 @@ impl Upgrade {
         }
     }
 
+    /// Raw committed coordinates for recovery preflight. Unlike `Status`, this
+    /// needs no valset query and can validate a checkpoint before disk-backed
+    /// modules are opened.
+    pub fn committed_coordinates(&self) -> (u32, Option<ScheduledUpgrade>) {
+        (
+            self.committed.current_version,
+            self.committed.pending.clone(),
+        )
+    }
+
     /// staged-over-committed read (read-your-writes within a block).
     fn read(&self) -> &UpgradeState {
         self.staged.as_ref().unwrap_or(&self.committed)

@@ -149,6 +149,21 @@ fn checkpoint_upgrade_status(
         .map_err(Into::into)
 }
 
+fn checkpoint_modreg_is_idle(
+    manifest: &recovery::Manifest,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut modreg = modreg::Modreg::new(host::MODREG_MODULE_ID, "valset").with_legacy_v1_state();
+    modreg.install(
+        manifest
+            .snapshot(host::MODREG_MODULE_ID)
+            .ok_or("checkpoint has no modreg snapshot")?,
+        manifest
+            .root(host::MODREG_MODULE_ID)
+            .ok_or("checkpoint has no modreg root")?,
+    )?;
+    Ok(!modreg.has_pending_swaps())
+}
+
 fn validate_bridge_preflight(
     phase: PreflightPhase,
     manifest: &recovery::Manifest,
@@ -189,8 +204,7 @@ fn validate_bridge_preflight(
     };
     if phase == PreflightPhase::Roll {
         return Err(
-            "a legacy-schema binary roll must finish before scheduling the v1 transition"
-                .into(),
+            "a legacy-schema binary roll must finish before scheduling the v1 transition".into(),
         );
     }
     if pending.to_version != crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION {
@@ -224,6 +238,52 @@ fn validate_bridge_preflight(
         ));
     }
     Ok("activation-ready; scheduled v1 and R=n")
+}
+
+fn validate_native_v1_preflight(
+    phase: PreflightPhase,
+    manifest: &recovery::Manifest,
+    status: &upgrade::UpgradeStatus,
+    modreg_idle: bool,
+) -> Result<&'static str, String> {
+    if phase != PreflightPhase::Roll {
+        return Err(
+            "native v1 compatibility is a binary roll only; rerun with --phase roll".into(),
+        );
+    }
+    if status.current_version != manifest.current_version {
+        return Err(format!(
+            "upgrade snapshot protocol_v{} disagrees with checkpoint protocol_v{}",
+            status.current_version, manifest.current_version
+        ));
+    }
+    let mirrored_pending = status.pending.as_ref().map(|pending| {
+        (
+            pending.name.as_str(),
+            pending.activation_height,
+            pending.to_version,
+        )
+    });
+    let manifest_pending = manifest.pending_upgrade.as_ref().map(|pending| {
+        (
+            pending.name.as_str(),
+            pending.activation_height,
+            pending.to_version,
+        )
+    });
+    if mirrored_pending != manifest_pending {
+        return Err("upgrade snapshot disagrees with checkpoint pending_upgrade".into());
+    }
+    if manifest_pending.is_some() {
+        return Err(
+            "native v1 binary roll requires pending_upgrade: none; activation remains blocked"
+                .into(),
+        );
+    }
+    if !modreg_idle {
+        return Err("native v1 binary roll requires no pending module code swap".into());
+    }
+    Ok("roll-safe; native v1 registry remains active and wasm activation stays blocked")
 }
 
 /// `preflight-state [--config node.toml]` — classify the persisted checkpoint
@@ -284,6 +344,10 @@ fn cmd_preflight_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             println!("schema_route: bridge +clients@protocol-v1");
             println!("schema_delta: + clients (empty state at activation)");
         }
+        host_state::StateSchemaRoute::NativeV1 => {
+            println!("schema_route: native-v1 compatibility (wasm dormant)");
+            println!("schema_delta: none");
+        }
     };
     match manifest.pending_upgrade.as_ref() {
         Some(upgrade) => println!(
@@ -300,6 +364,11 @@ fn cmd_preflight_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             status.ready_count, status.member_count, status.armed
         );
         let verdict = validate_bridge_preflight(phase, &manifest, &status)?;
+        println!("verdict: {verdict}");
+    } else if route == host_state::StateSchemaRoute::NativeV1 {
+        let status = checkpoint_upgrade_status(&manifest)?;
+        let modreg_idle = checkpoint_modreg_is_idle(&manifest)?;
+        let verdict = validate_native_v1_preflight(phase, &manifest, &status, modreg_idle)?;
         println!("verdict: {verdict}");
     }
     Ok(())
@@ -473,7 +542,11 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // `--short` is a boolean flag; parse_flags treats every `--flag` as taking
     // a value, so lift it out before parsing the rest.
     let short = args.iter().any(|a| a == "--short");
-    let rest: Vec<String> = args.iter().filter(|a| a.as_str() != "--short").cloned().collect();
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--short")
+        .cloned()
+        .collect();
     let (pos, flags) = parse_flags(&rest)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
@@ -932,7 +1005,7 @@ fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         reply
             .get("join_state")
             .cloned()
-            .unwrap_or_else(|| serde_json::json!(null))
+            .unwrap_or(serde_json::Value::Null)
     );
     Ok(())
 }
@@ -1646,10 +1719,8 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let issuer_identity =
                 wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
                     .map_err(|e| format!("inviter identity: {e:?}"))?;
-            let inviter_ula = wireguard::ula_v6_member_addr(
-                &descriptor.genesis_namespace(),
-                issuer_identity,
-            );
+            let inviter_ula =
+                wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), issuer_identity);
             descriptor.add_reach_route(&config::ReachHint {
                 expected_key: invite.token.issuer.clone(),
                 reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
@@ -1663,13 +1734,10 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let Ok(member) = ed25519::PublicKey::decode(&front.member_key[..]) else {
                 continue;
             };
-            let Ok(identity) =
-                wireguard::ValidatorIdentity::try_from(&front.member_key[..])
-            else {
+            let Ok(identity) = wireguard::ValidatorIdentity::try_from(&front.member_key[..]) else {
                 continue;
             };
-            let ula =
-                wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
+            let ula = wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
             descriptor.add_reach_route(&config::ReachHint {
                 expected_key: member,
                 reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),
@@ -1725,6 +1793,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 mod preflight_state_tests {
     use super::{
         PreflightPhase, read_manifest_without_opening_workspace, validate_bridge_preflight,
+        validate_native_v1_preflight,
     };
 
     fn legacy_manifest(pending: Option<sdk::UpgradeCoords>) -> recovery::Manifest {
@@ -1818,6 +1887,46 @@ mod preflight_state_tests {
             )
             .expect("scheduled v1 with R=n"),
             "activation-ready; scheduled v1 and R=n"
+        );
+    }
+
+    #[test]
+    fn native_v1_compatibility_is_roll_only_and_unscheduled() {
+        let mut manifest = legacy_manifest(None);
+        manifest.current_version = 1;
+        manifest.required_min_version = 1;
+        manifest.state_schema = Some(crate::constants::native_v1_state_schema_fingerprint());
+
+        let mut native_status = status(None, false);
+        native_status.current_version = 1;
+        assert!(
+            validate_native_v1_preflight(
+                PreflightPhase::Activate,
+                &manifest,
+                &native_status,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            validate_native_v1_preflight(PreflightPhase::Roll, &manifest, &native_status, true,)
+                .expect("explicit unscheduled roll"),
+            "roll-safe; native v1 registry remains active and wasm activation stays blocked"
+        );
+        assert!(
+            validate_native_v1_preflight(PreflightPhase::Roll, &manifest, &native_status, false,)
+                .is_err(),
+            "pending code swaps fail closed"
+        );
+
+        manifest.pending_upgrade = Some(sdk::UpgradeCoords {
+            name: "unrelated".into(),
+            activation_height: 20,
+            to_version: 2,
+        });
+        assert!(
+            validate_native_v1_preflight(PreflightPhase::Roll, &manifest, &native_status, true,)
+                .is_err()
         );
     }
 

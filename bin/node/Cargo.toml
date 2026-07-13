@@ -48,6 +48,7 @@ forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
+vaults = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 gateway = { workspace = true }
