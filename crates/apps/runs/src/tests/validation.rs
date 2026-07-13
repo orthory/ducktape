@@ -126,6 +126,97 @@ fn task_actions_without_a_configured_tasks_module_fail_the_run() {
 }
 
 #[test]
+fn duckfs_write_text_requires_current_refs_head() {
+    let head = "aa".repeat(32);
+    let stale = "bb".repeat(32);
+    let mut registry = registry(&[(
+        "bot",
+        &[ACTION_CHAT_POST, agent::ACTION_DUCKFS_WRITE_TEXT],
+    )]);
+    registry
+        .get_mut("bot")
+        .unwrap()
+        .caps
+        .duckfs_write
+        .push("/shared/agents/qa-fixer".into());
+
+    let mut m = watched(TurnPolicy::All, &registry).with_files_module("files");
+    engage_post(&mut m, &registry, 2, &[]);
+    commit(&mut m);
+    let run_id = run_id_for("general", 2, "bot");
+
+    let mut ctx = CaptureCtx::new()
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_files_head(&head);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["ok"],
+                vec![AgentAction::DuckfsWriteText {
+                    path: "/shared/agents/qa-fixer/self-improvement/SKILL.md".into(),
+                    text: "lesson".into(),
+                    base_snapshot: Some(stale.clone()),
+                }],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(ctx.files_msgs().is_empty(), "stale writes must not escape");
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|note| note.contains("base snapshot is stale")),
+        "failure should name stale CAS: {:?}",
+        ctx.notes()
+    );
+    commit(&mut m);
+
+    engage_post(&mut m, &registry, 3, &[]);
+    commit(&mut m);
+    let run_id = run_id_for("general", 3, "bot");
+    let mut ctx = CaptureCtx::new()
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(3))
+        .with_files_head(&head);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["ok"],
+                vec![AgentAction::DuckfsWriteText {
+                    path: "/shared/agents/qa-fixer/self-improvement/SKILL.md".into(),
+                    text: "lesson".into(),
+                    base_snapshot: Some(head.clone()),
+                }],
+            )),
+        ),
+    )
+    .unwrap();
+    let files = ctx.files_msgs();
+    assert_eq!(files.len(), 1);
+    match &files[0] {
+        FilesMsg::Commit {
+            base_snapshot,
+            message,
+            ..
+        } => {
+            assert_eq!(base_snapshot.as_deref(), Some(head.as_str()));
+            assert_eq!(message, "agent duckfs.write_text");
+            assert!(message.len() <= duckfs_core::MAX_MESSAGE_BYTES);
+        }
+        other => panic!("expected files commit, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_squatted_reply_message_id_fails_the_run_instead_of_the_block() {
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
     // someone posted a message whose id IS the run's reply id.

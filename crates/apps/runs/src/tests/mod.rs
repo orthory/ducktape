@@ -13,7 +13,10 @@ use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
     encode_reply as dispatch_encode_reply, encode_result_event,
 };
-use duckfs_core::{decode_query as files_decode_query, encode_reply as files_encode_reply};
+use duckfs_core::{
+    decode_msg as files_decode_msg, decode_query as files_decode_query,
+    encode_reply as files_encode_reply,
+};
 use futures::executor::block_on;
 use jobs::{
     Claim as JobClaim, Job, encode_event as jobs_encode_event, encode_reply as jobs_encode_reply,
@@ -285,6 +288,14 @@ impl CaptureCtx {
             .iter()
             .filter(|m| m.target == "pages")
             .map(|m| pages::decode_msg(&m.payload).expect("pages msg"))
+            .collect()
+    }
+    /// decoded files msgs emitted this dispatch.
+    fn files_msgs(&self) -> Vec<FilesMsg> {
+        self.msgs
+            .iter()
+            .filter(|m| m.target == "files")
+            .map(|m| files_decode_msg(&m.payload).expect("files msg"))
             .collect()
     }
     /// the breadcrumb notes emitted this dispatch, as strings.
