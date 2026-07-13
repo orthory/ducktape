@@ -46,6 +46,12 @@ blobstore = { workspace = true }
 # genesis keys (raw ed25519 bytes the JSON-string origin lane cannot express).
 duckfs-core = { workspace = true }
 noded = { path = "../noded" }
+# the op-frame codec: `node::decode_frame` verifies a signed frame's signature
+# and yields the VERIFIED signer as the op origin — the SAME function every
+# validator and the embedded daemon use, so the sim's `/v1/submit/frame` lane
+# authenticates authorship identically (also available to the frame/batch tests
+# for composing frames via `node::encode_frame`).
+node = { workspace = true }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
 # feeds it block-by-block exactly like the real daemons.
 indexer = { workspace = true }

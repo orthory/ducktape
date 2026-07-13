@@ -177,6 +177,31 @@ impl Sim {
         })
     }
 
+    /// POST raw signed-frame bytes to `/v1/submit/frame` — the authenticated
+    /// lane. the body is `application/octet-stream` (the exact bytes
+    /// `node::encode_frame` produced), not json, so it needs its own sender.
+    /// only sound in auto mode (the reply commits without a step).
+    pub fn submit_frame(&self, frame: &[u8]) -> (u16, serde_json::Value) {
+        post_raw(
+            self.port,
+            "/v1/submit/frame",
+            "application/octet-stream",
+            frame,
+        )
+        .expect("frame submit reachable")
+    }
+
+    /// a `/sim/peer-block` batch: N ops committed as ONE block. returns the
+    /// (status, reply) so a test can assert per-member verdicts (the reply
+    /// carries `members: [{applied|rejected}]`) and the single committed height.
+    pub fn peer_batch(&self, ops: serde_json::Value) -> (u16, serde_json::Value) {
+        self.request(
+            "POST",
+            "/sim/peer-block",
+            Some(&serde_json::json!({ "ops": ops })),
+        )
+    }
+
     /// commit a concurrent writer's block, independent of the held queue.
     pub fn peer_block(
         &self,
@@ -231,6 +256,39 @@ fn try_request(
     );
     stream.write_all(req.as_bytes())?;
     stream.write_all(&body_bytes)?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let payload = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .map(|b| serde_json::from_str(b.trim()).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(serde_json::Value::Null);
+    Ok((status, payload))
+}
+
+/// POST arbitrary body bytes with an explicit content-type — the raw-bytes
+/// twin of [`try_request`] (which is json-only), for the octet-stream frame
+/// lane. same deliberately-raw std-TCP http/1.1 transport.
+fn post_raw(
+    port: u16,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<(u16, serde_json::Value)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(req.as_bytes())?;
+    stream.write_all(body)?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
     let text = String::from_utf8_lossy(&raw);
