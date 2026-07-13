@@ -268,6 +268,19 @@ export const validatePolicy = (policy: RoutePolicy): void => {
   }
 };
 
+/** Build an explicit `accounts` audience from account-id hexes: decode each to
+ * bytes, sort lexicographically, drop duplicates, and cap at 32. The owner is
+ * never implicit; `validatePolicy` re-checks these bounds before signing. */
+export const accountsAudience = (accountHex: string[]): RouteAudience => {
+  const sorted = accountHex.map((hex) => Array.from(hexToBytes(hex))).sort(compareBytes);
+  const account_ids: number[][] = [];
+  for (const id of sorted) {
+    const last = account_ids[account_ids.length - 1];
+    if (!last || compareBytes(last, id) !== 0) account_ids.push(id);
+  }
+  return { kind: "accounts", account_ids: account_ids.slice(0, 32) };
+};
+
 /** Mirrors `gateway::validate_manifest`. Content is opaque: no MIME whitelist. */
 export const validateManifest = (manifest: RouteManifest): void => {
   if (!Array.isArray(manifest.files) || manifest.files.length === 0 || manifest.files.length > MAX_MANIFEST_FILES) {
