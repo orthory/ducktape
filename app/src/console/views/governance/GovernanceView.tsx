@@ -23,6 +23,7 @@ import {
   type ProposalView,
 } from "../../../domain/governance-client";
 import { sameKey, shortKey } from "../../../domain/names";
+import { UpgradePanel } from "./UpgradePanel";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
 
@@ -869,6 +870,8 @@ export function GovernanceView() {
           shareMode={state.governanceShares.active}
           onPropose={actions.proposeSignal}
         />
+
+        <UpgradePanel canPropose={canPropose} />
 
         <div
           style={{

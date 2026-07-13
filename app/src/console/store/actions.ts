@@ -445,6 +445,17 @@ export interface ConsoleActions {
   proposeSetShares(accountId: string, shares: number): void;
   /** Switch future proposals between account shares and validator ballots. */
   proposeSetShareMode(enabled: boolean): void;
+  /** Authorize a height-gated node upgrade: opens a ScheduleUpgrade proposal.
+   *  Governance only SCHEDULES — arming still needs the upgrade module's R=n
+   *  readiness quorum at the boundary. */
+  proposeScheduleUpgrade(params: {
+    name: string;
+    toVersion: number;
+    activationHeight: number;
+  }): void;
+  /** Authorize clearing the pending upgrade before its boundary: opens a
+   *  CancelUpgrade proposal. */
+  proposeCancelUpgrade(name: string): void;
   /** Cast (or change) this node's ballot on an open proposal. */
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
@@ -2544,6 +2555,36 @@ export function createActions({
         governanceClient.propose(live, {
           proposalId,
           action: { set_share_mode: { enabled } },
+        }),
+      );
+    },
+
+    proposeScheduleUpgrade: ({ name, toVersion, activationHeight }) => {
+      const label = name.trim();
+      if (!label) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: {
+            schedule_upgrade: {
+              name: label,
+              activation_height: activationHeight,
+              to_version: toVersion,
+            },
+          },
+        }),
+      );
+    },
+
+    proposeCancelUpgrade: (name) => {
+      const label = name.trim();
+      if (!label) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: { cancel_upgrade: { name: label } },
         }),
       );
     },
