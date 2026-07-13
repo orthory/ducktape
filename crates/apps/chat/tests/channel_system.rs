@@ -2076,3 +2076,101 @@ fn ownerless_channels_admit_any_user_for_rename_and_archive() {
         assert!(channel.archived);
     });
 }
+
+#[test]
+fn users_cannot_archive_module_namespaced_channels() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        // a module-minted channel is unowned (owner = None), so `check_channel_admin`
+        // alone would admit ANY user — the ':' namespace gate is what keeps them out.
+        module
+            .execute(
+                &mut TestCtx::with_origin(10, Origin::Module("forge".into())),
+                &module_msg(create_channel("forge:demo:1")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // a user may not archive forge's discussion channel: archiving turns away
+        // every posting author, the owning module included — a cross-principal DoS.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(11, user(1)),
+                &module_msg(set_archived("forge:demo:1", true)),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("reserved for modules"));
+        module.abort_block().await.unwrap();
+
+        // the rejected attempt left no mark: the channel is still open and the
+        // owning module can still post to it.
+        module
+            .execute(
+                &mut TestCtx::with_origin(12, Origin::Module("forge".into())),
+                &module_msg(post("forge:demo:1", "m1", "still open", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "forge:demo:1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("module channel must exist");
+        };
+        assert!(!channel.archived, "the user's archive must not have landed");
+
+        // the owning module still administers its own channel: archive...
+        module
+            .execute(
+                &mut TestCtx::with_origin(13, Origin::Module("forge".into())),
+                &module_msg(set_archived("forge:demo:1", true)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "forge:demo:1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("module channel must exist");
+        };
+        assert!(channel.archived, "the module may archive its own channel");
+
+        // ...and unarchive, which restores posting.
+        module
+            .execute(
+                &mut TestCtx::with_origin(14, Origin::Module("forge".into())),
+                &module_msg(set_archived("forge:demo:1", false)),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::with_origin(15, Origin::Module("forge".into())),
+                &module_msg(post("forge:demo:1", "m2", "after unarchive", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let reply = query(
+            &module,
+            ChatQuery::MessagesLatest {
+                channel_id: "forge:demo:1".into(),
+                limit: 16,
+            },
+        )
+        .await;
+        assert_eq!(seqs(&reply), vec![1, 2]);
+    });
+}

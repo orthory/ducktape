@@ -410,9 +410,11 @@ where
     /// author is a module origin refined by `as_agent`); external users need
     /// membership under `MembersOnly`.
     async fn check_post_policy(&self, channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
-        // an archived channel is read-only for writes: every posting-class op
-        // (post, reaction, huddle join/sweep) routes through here, so one guard
-        // rejects them all. membership, rename, and unarchive do not call this.
+        // an archived channel rejects posts, reactions, and huddle join/sweep:
+        // every posting-class op routes through here, so one guard turns them
+        // all away. edits and deletes deliberately do not call this — redacting
+        // your own message stays possible in a closed channel — and neither do
+        // membership, rename, or unarchive.
         if channel.archived {
             return Err(Error::Module(format!("channel {} is archived", channel.id)));
         }
@@ -552,8 +554,11 @@ where
         )
     }
 
-    /// archive or unarchive a channel. authorization mirrors `stage_rename`;
-    /// the flag itself is what `check_post_policy` reads to gate writes.
+    /// archive or unarchive a channel. authorization mirrors `stage_rename`
+    /// (the same `:` namespace gate keeps a user off a module-namespaced
+    /// channel — otherwise any user could archive a `forge:<repo>:<n>`
+    /// discussion, and an archived channel rejects the owning module's posts
+    /// too); the flag itself is what `check_post_policy` reads to gate writes.
     async fn stage_set_archived(
         &mut self,
         author: &AuthorRef,
@@ -561,6 +566,7 @@ where
         archived: bool,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
+        Self::validate_channel_namespace(author, channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
         Self::check_channel_admin(&channel, author)?;
         if channel.archived == archived {
