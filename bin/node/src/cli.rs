@@ -31,6 +31,7 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "promote" => cmd_promote(args),
         "resident-remove" => cmd_resident_remove(args),
         "join-requests" => cmd_join_requests(args),
+        "join-state" => cmd_join_state(args),
         "member-remove" => cmd_member_remove(args),
         "member-leave" => cmd_member_leave(args),
         "member-status" => cmd_member_status(args),
@@ -631,6 +632,36 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .get("join_requests")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]))
+    );
+    Ok(())
+}
+
+/// `join-state [--config node.toml]` — the node's AUTHORITATIVE onboarding
+/// phase over its local rpc: `parked | admitted | synced | promoted`, derived
+/// from committed standing (not log markers), so it is restart-proof. the
+/// desktop app reads this instead of parsing daemon.log, which loses the
+/// admission markers across a restart and mis-reads a re-syncing resident as
+/// unjoined. prints the `join_state` projection as JSON.
+fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let addr = resolved
+        .rpc_listen
+        .ok_or("join-state reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let reply = rpc_call(&addr, &serde_json::json!({ "cmd": "join_state" }))?;
+    if reply["ok"] != true {
+        return Err(format!("join-state: {}", reply["error"]).into());
+    }
+    println!(
+        "{}",
+        reply
+            .get("join_state")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(null))
     );
     Ok(())
 }
