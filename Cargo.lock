@@ -8934,6 +8934,7 @@ dependencies = [
  "axum",
  "blobstore",
  "chat",
+ "commonware-cryptography",
  "commonware-runtime",
  "dispatch",
  "duckdns",
