@@ -4,34 +4,50 @@
 //! state into the canonical host. The live node loop only consumes the three
 //! lifecycle operations and output adapter exported below.
 
+use clients::Clients;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use dispatch::DispatchModule;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
-use clients::Clients;
 use host::Host;
 use kv::Kv;
 use modreg::Modreg;
 use recovery::Manifest;
-use sha2::Digest as _;
 use sdk::StateRoot;
-use statesync::{fetch_snapshot, qmdb::{QmdbStore, RemoteQmdbResolver}};
+use sha2::Digest as _;
+use statesync::{
+    fetch_snapshot,
+    qmdb::{QmdbStore, RemoteQmdbResolver},
+};
 use upgrade::Upgrade;
 use valset::Valset;
 use wasm_host::WasmModule;
 
 use crate::constants::{
     CLIENTS_MODULE_ACTIVATION_VERSION, current_state_schema_fingerprint,
-    pre_clients_state_schema_fingerprint,
+    native_v1_state_schema_fingerprint, pre_clients_state_schema_fingerprint,
 };
 use crate::util::hex;
+
+mod native_v1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StateSchemaRoute {
     Exact,
     AddClientsAtV1,
+    NativeV1,
+}
+
+fn classify_recovery_state_schema(
+    found: Option<[u8; 32]>,
+    current_version: u32,
+) -> Result<StateSchemaRoute, String> {
+    if found == Some(native_v1_state_schema_fingerprint()) && current_version == 1 {
+        return Ok(StateSchemaRoute::NativeV1);
+    }
+    classify_state_schema(found, current_version)
 }
 
 fn classify_state_schema(
@@ -52,13 +68,17 @@ fn classify_state_schema(
 }
 
 pub(super) fn preflight_recovery_schema(manifest: &Manifest) -> Result<StateSchemaRoute, String> {
-    classify_state_schema(manifest.state_schema, manifest.current_version)
+    let route = classify_recovery_state_schema(manifest.state_schema, manifest.current_version)?;
+    if route == StateSchemaRoute::NativeV1 && manifest.pending_upgrade.is_some() {
+        return Err("native v1 recovery requires pending_upgrade: none".into());
+    }
+    Ok(route)
 }
 
 pub(super) fn preflight_sync_schema(
     manifest: &statesync::Manifest,
 ) -> Result<StateSchemaRoute, String> {
-    classify_state_schema(Some(manifest.state_schema), manifest.current_version)
+    classify_recovery_state_schema(Some(manifest.state_schema), manifest.current_version)
 }
 
 /// Consensus-visible network names shared by genesis, restore, and state sync.
@@ -611,12 +631,19 @@ pub(super) async fn genesis_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Host {
-    let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let kv = Kv::new(
+        "kv",
+        Box::new(QmdbStore::init(context.child("kv"), "kv").await),
+    );
     // pages/chat are STORE-BACKED wasm tenants: the host still constructs the
     // concrete qmdb stores exactly as before — only the executor wrapped
     // around them changed (and `.with_tagging` moved into the guests).
-    let pages = pages_wasm(Box::new(QmdbStore::init(context.child("pages"), "pages").await));
-    let chat = chat_wasm(Box::new(QmdbStore::init(context.child("chat"), "chat").await));
+    let pages = pages_wasm(Box::new(
+        QmdbStore::init(context.child("pages"), "pages").await,
+    ));
+    let chat = chat_wasm(Box::new(
+        QmdbStore::init(context.child("chat"), "chat").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -736,13 +763,24 @@ pub(super) async fn restore_host(
     // mismatch is classification, not a failed install attempt, and the
     // archived workspace must remain byte-for-byte untouched.
     let schema_route = preflight_recovery_schema(manifest)?;
-    let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    if schema_route == StateSchemaRoute::NativeV1 {
+        return native_v1::restore_host(context, forge_repo, duckfs_dir, manifest, bindings, blobs)
+            .await;
+    }
+    let kv = Kv::new(
+        "kv",
+        Box::new(QmdbStore::init(context.child("kv"), "kv").await),
+    );
     // store-backed wasm tenants restore like the other qmdb modules: the
     // stores reopen themselves at their committed positions and the wasm
     // wrapper computes root() straight from them (no snapshot install — see
     // [`pages_wasm`]).
-    let pages = pages_wasm(Box::new(QmdbStore::init(context.child("pages"), "pages").await));
-    let chat = chat_wasm(Box::new(QmdbStore::init(context.child("chat"), "chat").await));
+    let pages = pages_wasm(Box::new(
+        QmdbStore::init(context.child("pages"), "pages").await,
+    ));
+    let chat = chat_wasm(Box::new(
+        QmdbStore::init(context.child("chat"), "chat").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -1013,6 +1051,12 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     // Refuse before creating scratch/canonical stores. A peer can only offer
     // state for the exact binary schema this joiner understands.
     let schema_route = preflight_sync_schema(manifest)?;
+    if schema_route == StateSchemaRoute::NativeV1 {
+        return native_v1::sync_all_modules(
+            context, client, manifest, bindings, substrates, attempt,
+        )
+        .await;
+    }
     let SyncSubstrates {
         forge_repo,
         duckfs_dir,
@@ -1097,8 +1141,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
-
-
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1368,7 +1410,8 @@ mod tests {
 
     use super::*;
     use crate::constants::{
-        MODULE_IDS, MODULE_STATE_SCHEMAS, pre_clients_state_schema_fingerprint,
+        MODULE_IDS, MODULE_STATE_SCHEMAS, native_v1_state_schema_fingerprint,
+        pre_clients_state_schema_fingerprint,
     };
 
     #[test]
@@ -1392,6 +1435,27 @@ mod tests {
             classify_state_schema(Some(current_state_schema_fingerprint()), 1),
             Ok(StateSchemaRoute::Exact)
         );
+    }
+
+    #[test]
+    fn native_v1_schema_has_one_exact_compatibility_route() {
+        assert_eq!(
+            crate::config::hex_bytes(&native_v1_state_schema_fingerprint()),
+            "363608db2d6271c5fba5b2dd55b1de6043aeeb101fb3e0db43d60550c7aca1af"
+        );
+        assert_eq!(
+            classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 1),
+            Ok(StateSchemaRoute::NativeV1)
+        );
+        assert!(
+            classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 0).is_err()
+        );
+        assert!(
+            classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 2).is_err()
+        );
+        let mut unknown = native_v1_state_schema_fingerprint();
+        unknown[0] ^= 1;
+        assert!(classify_recovery_state_schema(Some(unknown), 1).is_err());
     }
 
     /// the registry ↔ `MODULE_IDS` parity pin. [`ProductionModules`] already

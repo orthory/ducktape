@@ -25,9 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_plane::{
-    AddressBook, AdmissionPolicy, BulkPacer, DataPlane, DataPlaneTransport, FlowId, PeerId,
-    Service, SocketFactory, StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService,
-    bind_stream_plane,
+    AddressBook, AdmissionPolicy, BulkPacer, DataPlaneTransport, FlowId, PeerId, Service,
+    SocketFactory, StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -417,7 +416,7 @@ fn decode_pull_meta(meta: &[u8]) -> Option<([u8; 32], u64)> {
 mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519};
-    use data_plane::PlaneConfig;
+    use data_plane::{DataPlane, PlaneConfig};
     use data_plane::sim::{LinkModel, SimNet};
 
     fn two_peer_net() -> (PeerId, PeerId, Arc<MediaPeers>, SimNet) {

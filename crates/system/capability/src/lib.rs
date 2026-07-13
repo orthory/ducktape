@@ -70,8 +70,8 @@ use sdk::codec;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
-    decode_reply as valset_decode_reply, encode_query as valset_encode_query, ValsetQuery,
-    ValsetReply,
+    ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
+    encode_query as valset_encode_query,
 };
 
 /// most tags a single node may announce. a bound, not a schema: it exists so
@@ -113,6 +113,10 @@ pub struct CapabilityRegistry {
     /// `class_claims` (read-your-writes: a rival claim in the same block sees
     /// the earlier stage), merged on `commit_block`, dropped on `abort_block`.
     pending_class_claims: BTreeMap<String, ModuleId>,
+    /// Recovery-only execution mode for the protocol-v1 native registry. Its
+    /// root preimage predates capability classes, so the class section must be
+    /// omitted exactly and class mutations must remain unavailable.
+    legacy_v1: bool,
 }
 
 impl CapabilityRegistry {
@@ -124,7 +128,15 @@ impl CapabilityRegistry {
             pending: BTreeMap::new(),
             class_claims: BTreeMap::new(),
             pending_class_claims: BTreeMap::new(),
+            legacy_v1: false,
         }
+    }
+
+    /// Preserve the exact protocol-v1 snapshot/root contract while rolling a
+    /// newer node binary over an existing native workspace.
+    pub fn with_legacy_v1_state(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
     }
 
     /// validate and canonicalize an announced tag list. duplicates collapse
@@ -238,13 +250,14 @@ impl CapabilityRegistry {
     /// unhashed). pending is deliberately excluded — a snapshot ships what
     /// consensus committed to.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::snapshot_of(&self.announced, &self.class_claims)
+        if self.legacy_v1 {
+            Self::snapshot_announcements(&self.announced)
+        } else {
+            Self::snapshot_of(&self.announced, &self.class_claims)
+        }
     }
 
-    fn snapshot_of(
-        map: &BTreeMap<Vec<u8>, NodeEntry>,
-        classes: &BTreeMap<String, ModuleId>,
-    ) -> Vec<u8> {
+    fn snapshot_announcements(map: &BTreeMap<Vec<u8>, NodeEntry>) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(map.len() as u64).to_le_bytes());
         for (key, entry) in map {
@@ -259,6 +272,14 @@ impl CapabilityRegistry {
                 out.extend_from_slice(&value.to_le_bytes());
             }
         }
+        out
+    }
+
+    fn snapshot_of(
+        map: &BTreeMap<Vec<u8>, NodeEntry>,
+        classes: &BTreeMap<String, ModuleId>,
+    ) -> Vec<u8> {
+        let mut out = Self::snapshot_announcements(map);
         out.extend_from_slice(&(classes.len() as u64).to_le_bytes());
         for (class, module) in classes {
             codec::push_str(&mut out, class);
@@ -274,8 +295,12 @@ impl CapabilityRegistry {
     /// before the call. success clears pending — staged changes belong to the
     /// state being replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (announced, class_claims) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&announced, &class_claims);
+        let (announced, class_claims) = Self::decode_snapshot(bytes, self.legacy_v1)?;
+        let root = if self.legacy_v1 {
+            Self::legacy_root_of(&announced)
+        } else {
+            Self::root_of(&announced, &class_claims)
+        };
         if root != expected {
             return Err(Error::Module(format!(
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
@@ -301,6 +326,7 @@ impl CapabilityRegistry {
     #[allow(clippy::type_complexity)]
     fn decode_snapshot(
         bytes: &[u8],
+        legacy_v1: bool,
     ) -> Result<(BTreeMap<Vec<u8>, NodeEntry>, BTreeMap<String, ModuleId>), Error> {
         let mut cur = codec::Cursor::new(bytes);
         let count = cur.u64("snapshot node count")?;
@@ -371,6 +397,11 @@ impl CapabilityRegistry {
             map.insert(key.to_vec(), NodeEntry { tags, resources });
         }
 
+        if legacy_v1 {
+            cur.finish("snapshot")?;
+            return Ok((map, BTreeMap::new()));
+        }
+
         let class_count = cur.u64("snapshot class count")?;
         // each class entry costs at least its two 8-byte length prefixes.
         cur.bound(class_count, 16, "snapshot class")?;
@@ -406,6 +437,13 @@ impl CapabilityRegistry {
         }
         StateRoot(Sha256::digest(Self::snapshot_of(map, classes)).into())
     }
+
+    fn legacy_root_of(map: &BTreeMap<Vec<u8>, NodeEntry>) -> StateRoot {
+        if map.is_empty() {
+            return StateRoot::ZERO;
+        }
+        StateRoot(Sha256::digest(Self::snapshot_announcements(map)).into())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -419,7 +457,11 @@ impl Module for CapabilityRegistry {
     /// map. order-independent (BTreeMap / BTreeSet) and idempotent. an empty
     /// registry reports `ZERO`.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.announced, &self.class_claims)
+        if self.legacy_v1 {
+            Self::legacy_root_of(&self.announced)
+        } else {
+            Self::root_of(&self.announced, &self.class_claims)
+        }
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -473,6 +515,11 @@ impl Module for CapabilityRegistry {
                 self.pending.insert(node, NodeEntry { tags, resources });
             }
             CapabilityMsg::ClaimClass { class } => {
+                if self.legacy_v1 {
+                    return Err(Error::Module(
+                        "capability classes are unavailable in native v1 compatibility mode".into(),
+                    ));
+                }
                 // a class is claimed by the module that serves it: the
                 // claimant is the verified MODULE origin, never payload data.
                 // external submitters and the system have no module to route
@@ -528,7 +575,10 @@ impl Module for CapabilityRegistry {
                     .unwrap_or_default();
                 encode_reply(&CapabilityReply::Node(tags))
             }
-            CapabilityQuery::CapableProviders { capability, demands } => {
+            CapabilityQuery::CapableProviders {
+                capability,
+                demands,
+            } => {
                 let providers = view
                     .iter()
                     .filter(|(_, e)| e.tags.contains(&capability))
@@ -542,7 +592,10 @@ impl Module for CapabilityRegistry {
                 encode_reply(&CapabilityReply::Providers(providers))
             }
             CapabilityQuery::Resources { node } => {
-                let resources = view.get(&node).map(|e| e.resources.clone()).unwrap_or_default();
+                let resources = view
+                    .get(&node)
+                    .map(|e| e.resources.clone())
+                    .unwrap_or_default();
                 encode_reply(&CapabilityReply::Resources(resources))
             }
             CapabilityQuery::All => {
@@ -553,10 +606,16 @@ impl Module for CapabilityRegistry {
                 encode_reply(&CapabilityReply::All(all))
             }
             CapabilityQuery::ResolveClass { class } => {
+                if self.legacy_v1 {
+                    return Err(Error::QueryUnsupported);
+                }
                 let owner = self.effective_class_owner(&class).cloned();
                 encode_reply(&CapabilityReply::ClassOwner(owner))
             }
             CapabilityQuery::Classes => {
+                if self.legacy_v1 {
+                    return Err(Error::QueryUnsupported);
+                }
                 let classes = self.effective_classes().into_iter().collect();
                 encode_reply(&CapabilityReply::Classes(classes))
             }
@@ -589,7 +648,7 @@ impl Module for CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encode_msg, encode_query, MAX_CLASS_LEN, MAX_TAG_LEN};
+    use crate::{MAX_CLASS_LEN, MAX_TAG_LEN, encode_msg, encode_query};
     use valset::encode_reply as valset_encode_reply;
 
     /// a minimal Ctx: origin-configurable, and (optionally) answers BOTH the
@@ -707,6 +766,36 @@ mod tests {
     /// not the member gate.
     fn ungated() -> CapabilityRegistry {
         CapabilityRegistry::new("capability", None)
+    }
+
+    #[test]
+    fn legacy_v1_mode_round_trips_old_snapshot_and_rejects_classes() {
+        let node = vec![42; 32];
+        let mut src = ungated().with_legacy_v1_state();
+        futures::executor::block_on(src.execute(
+            &mut TestCtx::external(&node),
+            &announce_with(&["codex"], &[("cpu", 2)]),
+        ))
+        .unwrap();
+        futures::executor::block_on(src.commit_block()).unwrap();
+
+        let bytes = src.snapshot();
+        let root = src.root();
+        let mut dst = ungated().with_legacy_v1_state();
+        dst.install(&bytes, root).expect("legacy snapshot installs");
+        assert_eq!(dst.root(), root);
+        assert_eq!(node_tags(&dst, &node), vec!["codex"]);
+
+        assert!(
+            ungated().install(&bytes, root).is_err(),
+            "modern mode requires the class-count section"
+        );
+        let err = futures::executor::block_on(dst.execute(
+            &mut TestCtx::with_origin(sdk::Origin::Module("dispatch".into())),
+            &claim("agent"),
+        ))
+        .expect_err("legacy registry has no class lane");
+        assert!(matches!(err, Error::Module(message) if message.contains("unavailable")));
     }
 
     #[test]
@@ -1060,22 +1149,27 @@ mod tests {
         let mut c = ungated();
         let me = vec![30u8; 32];
         let mut ctx = TestCtx::external(&me);
-        futures::executor::block_on(c.execute(&mut ctx, &announce_with(&["codex"], &[])))
-            .unwrap();
+        futures::executor::block_on(c.execute(&mut ctx, &announce_with(&["codex"], &[]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         let tags_only_root = c.root();
 
-        futures::executor::block_on(
-            c.execute(&mut ctx, &announce_with(&["codex"], &[("cores", 8), ("mem_gb", 32)])),
-        )
+        futures::executor::block_on(c.execute(
+            &mut ctx,
+            &announce_with(&["codex"], &[("cores", 8), ("mem_gb", 32)]),
+        ))
         .unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
-        assert_ne!(c.root(), tags_only_root, "resources are part of the commitment");
+        assert_ne!(
+            c.root(),
+            tags_only_root,
+            "resources are part of the commitment"
+        );
 
-        let reply = futures::executor::block_on(c.query(&encode_query(
-            &CapabilityQuery::Resources { node: me.clone() },
-        )))
-        .unwrap();
+        let reply =
+            futures::executor::block_on(c.query(&encode_query(&CapabilityQuery::Resources {
+                node: me.clone(),
+            })))
+            .unwrap();
         match crate::decode_reply(&reply).unwrap() {
             CapabilityReply::Resources(r) => {
                 assert_eq!(r.get("cores"), Some(&8));
@@ -1318,13 +1412,25 @@ mod tests {
         let small = vec![32u8; 32];
         let bare = vec![33u8; 32];
         futures::executor::block_on(async {
-            c.execute(&mut TestCtx::external(&big),
-                &announce_with(&["codex"], &[("cores", 16), ("mem_gb", 64)])).await.unwrap();
-            c.execute(&mut TestCtx::external(&small),
-                &announce_with(&["codex"], &[("cores", 4), ("mem_gb", 8)])).await.unwrap();
+            c.execute(
+                &mut TestCtx::external(&big),
+                &announce_with(&["codex"], &[("cores", 16), ("mem_gb", 64)]),
+            )
+            .await
+            .unwrap();
+            c.execute(
+                &mut TestCtx::external(&small),
+                &announce_with(&["codex"], &[("cores", 4), ("mem_gb", 8)]),
+            )
+            .await
+            .unwrap();
             // tags-only node (direct mode): never matches ANY demand.
-            c.execute(&mut TestCtx::external(&bare), &announce_with(&["codex"], &[]))
-                .await.unwrap();
+            c.execute(
+                &mut TestCtx::external(&bare),
+                &announce_with(&["codex"], &[]),
+            )
+            .await
+            .unwrap();
             c.commit_block().await.unwrap();
         });
 
@@ -1334,7 +1440,10 @@ mod tests {
         // a dimension nobody announced matches nobody.
         assert!(capable(&c, "codex", &[("gpu", 1)]).is_empty());
         // both dimensions must hold.
-        assert_eq!(capable(&c, "codex", &[("cores", 4), ("mem_gb", 32)]), vec![big]);
+        assert_eq!(
+            capable(&c, "codex", &[("cores", 4), ("mem_gb", 32)]),
+            vec![big]
+        );
     }
 
     #[test]
@@ -1343,26 +1452,27 @@ mod tests {
         let me = vec![34u8; 32];
         let mut ctx = TestCtx::external(&me);
         // capacity with nothing to execute is meaningless — reject loudly.
-        let err = futures::executor::block_on(
-            c.execute(&mut ctx, &announce_with(&[], &[("cores", 8)])),
-        )
-        .unwrap_err();
+        let err =
+            futures::executor::block_on(c.execute(&mut ctx, &announce_with(&[], &[("cores", 8)])))
+                .unwrap_err();
         assert!(matches!(err, Error::Module(_)), "got {err:?}");
         // zero value / bad key reject via validate_resources.
-        assert!(futures::executor::block_on(
-            c.execute(&mut ctx, &announce_with(&["codex"], &[("cores", 0)]))
-        )
-        .is_err());
+        assert!(
+            futures::executor::block_on(
+                c.execute(&mut ctx, &announce_with(&["codex"], &[("cores", 0)]))
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn snapshot_round_trip_carries_resources() {
         let mut src = ungated();
         let a = vec![35u8; 32];
-        futures::executor::block_on(
-            src.execute(&mut TestCtx::external(&a),
-                &announce_with(&["codex"], &[("cores", 8)])),
-        )
+        futures::executor::block_on(src.execute(
+            &mut TestCtx::external(&a),
+            &announce_with(&["codex"], &[("cores", 8)]),
+        ))
         .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
         let bytes = src.snapshot();

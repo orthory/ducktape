@@ -228,6 +228,40 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     ("vaults", 2),
 ];
 
+/// The exact pre-wasm production registry still running on the dogfood v1
+/// network. A latest binary may reopen this schema for a binary-only roll, but
+/// it must not reinterpret any module as wasm or advertise this as a fresh
+/// genesis/state-sync target. The route is deliberately exact: every other
+/// historical schema remains fail-closed.
+pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
+    ("agent", 1),
+    ("automations", 1),
+    ("capability", 1),
+    ("chat", 1),
+    ("clients", 1),
+    ("directory", 1),
+    ("dispatch", 1),
+    ("duckdns", 1),
+    ("files", 1),
+    ("forge", 1),
+    ("gateway", 1),
+    ("governance", 1),
+    ("hello", 1),
+    ("identity", 1),
+    ("inbox", 1),
+    ("jobs", 1),
+    ("kv", 1),
+    ("modreg", 1),
+    ("pages", 1),
+    ("runs", 2),
+    ("saga", 1),
+    ("tagging", 1),
+    ("tasks", 1),
+    ("upgrade", 1),
+    ("valset", 1),
+    ("vaults", 1),
+];
+
 /// The only registry this binary can migrate in place: the CURRENT schema
 /// minus `clients` — a workspace captured (or restored) with the clients
 /// module still dormant below its activation version. Everything else —
@@ -270,13 +304,17 @@ pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
 /// dormant-registry route.
 pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
     "commit:clients-v1:",
-    "77418fd66a437b7fa39f09cb6ea731b117502da8afa712c24212add196028c90:",
-    "363608db2d6271c5fba5b2dd55b1de6043aeeb101fb3e0db43d60550c7aca1af:",
+    "2a98f8c74b3ba96be0526b307d5ad6c332988d0e1632bb627b8198afd93c0a59:",
+    "86b954b96af007e2f9b1865d5fc84b2d19b1627b9f018281789994c7b0c5e117:",
     "dormant-registry-v1"
 );
 
 pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
     host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
+}
+
+pub(crate) fn native_v1_state_schema_fingerprint() -> [u8; 32] {
+    host::state_schema_fingerprint(NATIVE_V1_MODULE_STATE_SCHEMAS.iter().copied())
 }
 
 pub(crate) fn pre_clients_state_schema_fingerprint() -> [u8; 32] {

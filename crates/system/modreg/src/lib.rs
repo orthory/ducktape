@@ -74,6 +74,11 @@ pub struct Modreg {
     valset_id: ModuleId,
     committed: ModregState,
     staged: Option<ModregState>,
+    /// Recovery-only protocol-v1 encoding. Pending swaps in that registry did
+    /// not carry byte-readiness state. The compatibility route preserves its
+    /// height-only register/schedule/cancel/advance behavior and rejects only
+    /// the newer readiness signal that old validators cannot decode.
+    legacy_v1: bool,
 }
 
 impl Modreg {
@@ -83,7 +88,20 @@ impl Modreg {
             valset_id: valset_id.into(),
             committed: ModregState::default(),
             staged: None,
+            legacy_v1: false,
         }
+    }
+
+    pub fn with_legacy_v1_state(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
+    }
+
+    pub fn has_pending_swaps(&self) -> bool {
+        self.committed
+            .modules
+            .values()
+            .any(|entry| entry.pending.is_some())
     }
 
     /// the CURRENT boundary member set: the valset module's staged-over-
@@ -188,7 +206,9 @@ impl Modreg {
         Self::require_hash_len(&code_hash)?;
         let mut next = self.read().clone();
         let entry = next.modules.get_mut(&module_id).ok_or_else(|| {
-            Error::Module(format!("cannot schedule a swap for unregistered module {module_id}"))
+            Error::Module(format!(
+                "cannot schedule a swap for unregistered module {module_id}"
+            ))
         })?;
         // minimum lead: activation is strictly in the future, never retroactive.
         let floor = ctx.env().height.saturating_add(MIN_SWAP_LEAD);
@@ -242,9 +262,7 @@ impl Modreg {
                 ));
             }
             _ => {
-                return Err(Error::Module(
-                    "no matching pending swap to cancel".into(),
-                ));
+                return Err(Error::Module("no matching pending swap to cancel".into()));
             }
         }
         entry.pending = None;
@@ -294,7 +312,10 @@ impl Modreg {
         }
         // the covering signal LATCHES ready (R = n at this instant). a member
         // admitted later heals through the fetch lane, never un-arms a swap.
-        if !members.is_empty() && members.iter().all(|m| swap.readiness.binary_search(m).is_ok())
+        if !members.is_empty()
+            && members
+                .iter()
+                .all(|m| swap.readiness.binary_search(m).is_ok())
         {
             swap.ready = true;
         }
@@ -317,7 +338,7 @@ impl Modreg {
             .filter(|(_, e)| {
                 e.pending
                     .as_ref()
-                    .is_some_and(|p| p.ready && height >= p.activation_height)
+                    .is_some_and(|p| (self.legacy_v1 || p.ready) && height >= p.activation_height)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -359,9 +380,11 @@ impl Modreg {
             .iter()
             .filter_map(|(id, e)| {
                 e.pending.as_ref().and_then(|p| {
-                    (p.ready && height >= p.activation_height).then(|| ArmedSwap {
-                        module_id: id.clone(),
-                        code_hash: p.code_hash.clone(),
+                    ((self.legacy_v1 || p.ready) && height >= p.activation_height).then(|| {
+                        ArmedSwap {
+                            module_id: id.clone(),
+                            code_hash: p.code_hash.clone(),
+                        }
                     })
                 })
             })
@@ -371,7 +394,7 @@ impl Modreg {
 
     // ---- canonical state bytes (root preimage + snapshot format) ------------
 
-    fn encode_state(s: &ModregState) -> Vec<u8> {
+    fn encode_state(s: &ModregState, legacy_v1: bool) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(s.modules.len() as u64).to_le_bytes());
         for (id, entry) in &s.modules {
@@ -384,10 +407,12 @@ impl Modreg {
                     push_bytes(&mut out, swap.name.as_bytes());
                     out.extend_from_slice(&swap.activation_height.to_le_bytes());
                     push_bytes(&mut out, &swap.code_hash);
-                    out.push(u8::from(swap.ready));
-                    out.extend_from_slice(&(swap.readiness.len() as u64).to_le_bytes());
-                    for key in &swap.readiness {
-                        push_bytes(&mut out, key);
+                    if !legacy_v1 {
+                        out.push(u8::from(swap.ready));
+                        out.extend_from_slice(&(swap.readiness.len() as u64).to_le_bytes());
+                        for key in &swap.readiness {
+                            push_bytes(&mut out, key);
+                        }
                     }
                 }
             }
@@ -396,25 +421,25 @@ impl Modreg {
     }
 
     /// sha256 over the canonical encoding; `ZERO` iff no module is registered.
-    fn root_of(s: &ModregState) -> StateRoot {
+    fn root_of(s: &ModregState, legacy_v1: bool) -> StateRoot {
         if s.modules.is_empty() {
             return StateRoot::ZERO;
         }
         let mut h = Sha256::new();
-        h.update(Self::encode_state(s));
+        h.update(Self::encode_state(s, legacy_v1));
         StateRoot(h.finalize().into())
     }
 
     /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.committed)
+        Self::encode_state(&self.committed, self.legacy_v1)
     }
 
     /// verify-then-adopt a peer snapshot: decode, recompute the root, refuse on
     /// mismatch — committed state and stage untouched on any error.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let decoded = decode_state(bytes)?;
-        if Self::root_of(&decoded) != expected {
+        let decoded = decode_state(bytes, self.legacy_v1)?;
+        if Self::root_of(&decoded, self.legacy_v1) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
         self.committed = decoded;
@@ -430,7 +455,7 @@ impl Module for Modreg {
     }
 
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.committed)
+        Self::root_of(&self.committed, self.legacy_v1)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -439,6 +464,12 @@ impl Module for Modreg {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
+            ModregMsg::SignalReady { .. } if self.legacy_v1 => {
+                Err(Error::Module(
+                    "modreg readiness signals are unavailable in native v1 compatibility mode"
+                        .into(),
+                ))
+            }
             ModregMsg::Register {
                 module_id,
                 code_hash,
@@ -518,7 +549,7 @@ fn take_string(buf: &mut &[u8]) -> Result<String, Error> {
     String::from_utf8(take_vec(buf)?).map_err(|_| Error::Module("snapshot: bad utf-8".into()))
 }
 
-fn decode_state(bytes: &[u8]) -> Result<ModregState, Error> {
+fn decode_state(bytes: &[u8], legacy_v1: bool) -> Result<ModregState, Error> {
     let mut buf = bytes;
     let count = take_u64(&mut buf)?;
     // each module costs at least an 8-byte id-length prefix + a 40-byte hash
@@ -549,33 +580,38 @@ fn decode_state(bytes: &[u8]) -> Result<ModregState, Error> {
                 if code_hash.len() != CODE_HASH_LEN {
                     return Err(Error::Module("snapshot: bad pending hash length".into()));
                 }
-                let ready = match take_u8(&mut buf)? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(Error::Module(format!("snapshot: bad ready tag {other}")));
-                    }
-                };
-                let signals = take_u64(&mut buf)?;
-                // each key costs at least its 8-byte length prefix.
-                if signals > (buf.len() / 8) as u64 {
-                    return Err(Error::Module(
-                        "snapshot readiness count exceeds buffer".into(),
-                    ));
-                }
-                let mut readiness = Vec::with_capacity(signals as usize);
-                let mut prev_key: Option<Vec<u8>> = None;
-                for _ in 0..signals {
-                    let key = take_vec(&mut buf)?;
-                    // strictly increasing keys: one state, one encoding.
-                    if prev_key.as_ref().is_some_and(|p| p >= &key) {
+                let (ready, readiness) = if legacy_v1 {
+                    (false, Vec::new())
+                } else {
+                    let ready = match take_u8(&mut buf)? {
+                        0 => false,
+                        1 => true,
+                        other => {
+                            return Err(Error::Module(format!("snapshot: bad ready tag {other}")));
+                        }
+                    };
+                    let signals = take_u64(&mut buf)?;
+                    // each key costs at least its 8-byte length prefix.
+                    if signals > (buf.len() / 8) as u64 {
                         return Err(Error::Module(
-                            "snapshot readiness keys must be strictly increasing".into(),
+                            "snapshot readiness count exceeds buffer".into(),
                         ));
                     }
-                    prev_key = Some(key.clone());
-                    readiness.push(key);
-                }
+                    let mut readiness = Vec::with_capacity(signals as usize);
+                    let mut prev_key: Option<Vec<u8>> = None;
+                    for _ in 0..signals {
+                        let key = take_vec(&mut buf)?;
+                        // strictly increasing keys: one state, one encoding.
+                        if prev_key.as_ref().is_some_and(|p| p >= &key) {
+                            return Err(Error::Module(
+                                "snapshot readiness keys must be strictly increasing".into(),
+                            ));
+                        }
+                        prev_key = Some(key.clone());
+                        readiness.push(key);
+                    }
+                    (ready, readiness)
+                };
                 Some(ScheduledSwap {
                     name,
                     activation_height,
@@ -587,10 +623,13 @@ fn decode_state(bytes: &[u8]) -> Result<ModregState, Error> {
             other => return Err(Error::Module(format!("snapshot: bad pending tag {other}"))),
         };
         prev = Some(id.clone());
-        modules.insert(id, ModuleEntry {
-            active_code_hash,
-            pending,
-        });
+        modules.insert(
+            id,
+            ModuleEntry {
+                active_code_hash,
+                pending,
+            },
+        );
     }
     if !buf.is_empty() {
         return Err(Error::Module("snapshot carries trailing bytes".into()));
@@ -660,6 +699,78 @@ mod tests {
 
     fn mr() -> Modreg {
         Modreg::new("modreg", "valset")
+    }
+
+    #[test]
+    fn legacy_v1_mode_matches_historical_height_only_transitions() {
+        let mut src = mr().with_legacy_v1_state();
+        let mut sys = TestCtx::new(Origin::System, 0);
+        run(
+            &mut src,
+            &mut sys,
+            &msg(ModregMsg::Register {
+                module_id: "hello".into(),
+                code_hash: hash(1),
+            }),
+        )
+        .unwrap();
+        commit(&mut src);
+        run(&mut src, &mut sys, &schedule("hello", "v2", 10, 2)).unwrap();
+        commit(&mut src);
+
+        let mut historical_pending = Vec::new();
+        historical_pending.extend_from_slice(&1u64.to_le_bytes());
+        push_bytes(&mut historical_pending, b"hello");
+        push_bytes(&mut historical_pending, &hash(1));
+        historical_pending.push(1);
+        push_bytes(&mut historical_pending, b"v2");
+        historical_pending.extend_from_slice(&10u64.to_le_bytes());
+        push_bytes(&mut historical_pending, &hash(2));
+        assert_eq!(src.snapshot(), historical_pending);
+        assert_eq!(
+            src.root(),
+            StateRoot(Sha256::digest(&historical_pending).into())
+        );
+        assert_eq!(armed_at(&src, 10)[0].code_hash, hash(2));
+
+        let bytes = src.snapshot();
+        let root = src.root();
+        let mut dst = mr().with_legacy_v1_state();
+        dst.install(&bytes, root).expect("legacy snapshot installs");
+        assert_eq!(dst.root(), root);
+        assert!(dst.has_pending_swaps());
+        assert!(
+            mr().install(&bytes, root).is_err(),
+            "modern mode requires readiness bytes on pending swaps"
+        );
+
+        let mut at_ten = TestCtx::new(Origin::System, 10);
+        run(&mut dst, &mut at_ten, &advance()).unwrap();
+        commit(&mut dst);
+        assert_eq!(status(&dst)[0].active_code_hash, hash(2));
+        assert!(!dst.has_pending_swaps());
+
+        let mut historical_active = Vec::new();
+        historical_active.extend_from_slice(&1u64.to_le_bytes());
+        push_bytes(&mut historical_active, b"hello");
+        push_bytes(&mut historical_active, &hash(2));
+        historical_active.push(0);
+        assert_eq!(dst.snapshot(), historical_active);
+        assert_eq!(
+            dst.root(),
+            StateRoot(Sha256::digest(&historical_active).into())
+        );
+
+        run(&mut dst, &mut sys, &schedule("hello", "v3", 20, 3)).unwrap();
+        commit(&mut dst);
+        run(&mut dst, &mut sys, &cancel("hello", "v3")).unwrap();
+        commit(&mut dst);
+        assert_eq!(dst.snapshot(), historical_active);
+
+        assert!(
+            run(&mut dst, &mut sys, &signal("hello", "v3")).is_err(),
+            "old validators cannot decode readiness signals"
+        );
     }
 
     fn msg(m: ModregMsg) -> Msg {
@@ -949,8 +1060,7 @@ mod tests {
 
         let two = vec![member(1), member(2)];
         // first of two members: recorded, not latched.
-        let mut m1 =
-            TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
+        let mut m1 = TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
         run(&mut mr, &mut m1, &signal("hello", "v2")).unwrap();
         commit(&mut mr);
         let pending = status(&mr)[0].pending.clone().unwrap();
@@ -959,8 +1069,7 @@ mod tests {
         assert!(armed_at(&mr, 10).is_empty());
 
         // re-signal is idempotent.
-        let mut again =
-            TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
+        let mut again = TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
         run(&mut mr, &mut again, &signal("hello", "v2")).unwrap();
         commit(&mut mr);
         assert_eq!(status(&mr)[0].pending.clone().unwrap().readiness.len(), 1);
@@ -1052,9 +1161,17 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(mr.root(), StateRoot::ZERO, "staged only: committed still ZERO");
+        assert_eq!(
+            mr.root(),
+            StateRoot::ZERO,
+            "staged only: committed still ZERO"
+        );
         commit(&mut mr);
-        assert_ne!(mr.root(), StateRoot::ZERO, "committed register moves off ZERO");
+        assert_ne!(
+            mr.root(),
+            StateRoot::ZERO,
+            "committed register moves off ZERO"
+        );
     }
 
     #[test]
@@ -1070,12 +1187,19 @@ mod tests {
         run(&mut src, &mut at, &advance()).unwrap();
         commit(&mut src);
         let root_active2 = src.root();
-        assert_ne!(root_active1, root_active2, "activating a swap changes the root");
+        assert_ne!(
+            root_active1, root_active2,
+            "activating a swap changes the root"
+        );
 
         // snapshot IS the root preimage; install reconstructs.
         let bytes = src.snapshot();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        assert_eq!(StateRoot(digest), root_active2, "sha256(snapshot()) == root()");
+        assert_eq!(
+            StateRoot(digest),
+            root_active2,
+            "sha256(snapshot()) == root()"
+        );
         let mut dst = mr();
         dst.install(&bytes, root_active2).unwrap();
         assert_eq!(dst.root(), root_active2);
