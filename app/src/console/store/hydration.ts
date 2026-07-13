@@ -36,6 +36,7 @@ import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import * as runsClient from "../../domain/runs-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { NodeStatus, NodeTransport } from "../../domain/transport";
+import type { ChatWindow } from "./state";
 
 // ── Types ───────────────────────────────────────────────
 
@@ -121,11 +122,13 @@ export interface ChatSlices {
  *  delete / react) are only ever erased by an authoritative refresh, so a frozen
  *  slice would strand a failed op on screen. The window ends when the reader
  *  leaves it (enterChannel) or posts (postToChannel) — both clear `chatWindow`,
- *  and the tail comes back on the next refresh. */
+ *  and the tail comes back on the next refresh. Those exits can land mid-fetch,
+ *  which is why `focused` is also the caller's request token: the provider drops
+ *  `messages` from the patch if `state.chatWindow` moved while this ran. */
 export const fetchChatSlices = (
   live: NodeTransport,
   currentActive: string | null,
-  focused: { channelId: string; seq: number } | null = null,
+  focused: ChatWindow | null = null,
 ): Promise<ChatSlices> =>
   Promise.resolve()
     .then(() => chatClient.channels(live))

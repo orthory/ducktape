@@ -1158,6 +1158,9 @@ where
     ) -> Result<Vec<MessageView>, Error> {
         let channel = self.require_channel(channel_id).await?;
         let limit = clamp_limit(limit);
+        // KEEP THIS GUARD ABOVE THE CLAMP: `clamp(1, head_seq)` PANICS when
+        // min > max, i.e. on an empty channel (head_seq == 0). The early return
+        // is the only thing keeping a user-supplied query off that panic.
         if limit == 0 || channel.head_seq == 0 {
             return Ok(Vec::new());
         }

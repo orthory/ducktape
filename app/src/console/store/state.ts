@@ -135,6 +135,22 @@ export interface ConnectionDown {
 
 // ── State shape ─────────────────────────────────────────
 
+/** A focused history window (see ConsoleState.chatWindow). Doubles as the
+ *  REQUEST TOKEN for every read taken on the window's behalf: it is patched in
+ *  before the round trip and cleared synchronously when the reader leaves the
+ *  window, so a response is applicable only while the window it was fetched for
+ *  is still the one on screen — compare with `sameChatWindow`. */
+export interface ChatWindow {
+  channelId: string;
+  seq: number;
+}
+
+export const sameChatWindow = (
+  a: ChatWindow | null,
+  b: ChatWindow | null,
+): boolean =>
+  a === b || (!!a && !!b && a.channelId === b.channelId && a.seq === b.seq);
+
 export interface ConsoleState {
   // ── Session / node core ──
   screen: string;
@@ -172,7 +188,7 @@ export interface ConsoleState {
    *  channel (rail click / "Jump to latest") or posting drops it and the tail
    *  comes back. Also ChatView's record that it already asked, so a seq the
    *  window can't produce is asked for once, not forever. */
-  chatWindow: { channelId: string; seq: number } | null;
+  chatWindow: ChatWindow | null;
   /** The active #tag filter (see TagFilter), or null for the live view. */
   tagFilter: TagFilter | null;
   /** The active tag filter's hits (newest first) — query-driven, like

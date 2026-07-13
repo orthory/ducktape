@@ -1023,7 +1023,16 @@ export function createActions({
       .then(() => chatClient.latestMessages(live, channelId))
       .then((messages) =>
         update((prev) =>
-          isCurrentNode(live) && prev.activeChannel === channelId ? { messages } : {},
+          // A window installed while this tail read was in flight wins over it:
+          // focusMessage calls enterChannel and THEN arms the focus that loads
+          // the window, so the two round trips overlap and can land in either
+          // order. A late tail would drop the reader back on the newest message
+          // with the history bar still up.
+          isCurrentNode(live) &&
+          prev.activeChannel === channelId &&
+          prev.chatWindow === null
+            ? { messages }
+            : {},
         ),
       )
       .catch((err) => {
@@ -1799,24 +1808,44 @@ export function createActions({
         .messagesAround(live, channelId, seq)
         .then((messages) =>
           update((prev) =>
-            isCurrentNode(live) && prev.activeChannel === channelId
+            // `chatWindow` is the REQUEST TOKEN, not just a flag: both exits
+            // from a window clear it synchronously while this round trip can
+            // still be in flight — posting (postToChannel) and "jump to latest"
+            // / a rail click (enterChannel). Applying a superseded response
+            // would overwrite `messages` with the old window: the just-posted
+            // message would vanish with no bar left to escape by. A matching
+            // token also means the channel is unchanged — enterChannel is the
+            // only thing that moves `activeChannel`, and it clears the window.
+            isCurrentNode(live) &&
+            prev.chatWindow?.channelId === channelId &&
+            prev.chatWindow.seq === seq
               ? // re-arm the focus: the row exists now, so ChatView's next pass
                 // scrolls and flashes it exactly as it does for a tail hit.
                 { messages, chatFocusSeq: seq }
               : {},
           ),
         )
-        .catch(() => {
-          if (!isCurrentNode(live)) return;
-          // A node too old to know the messages_around variant rejects the
-          // query outright. Stay on the tail enterChannel already loaded and
-          // say so — landing on the newest message with no word is the bug
-          // this whole path exists to fix.
-          patch({
-            chatWindow: null,
-            error: "Couldn't load the history around that message — this node may be too old to page it in.",
-          });
-        });
+        .catch(() =>
+          update((prev) =>
+            // Same token, same reason: a rejection that lost the race must not
+            // clear a window the reader has since asked for (that window's own
+            // response would then fail the guard above and never land), nor
+            // report an error about a window they already left.
+            isCurrentNode(live) &&
+            prev.chatWindow?.channelId === channelId &&
+            prev.chatWindow.seq === seq
+              ? // A node too old to know the messages_around variant rejects
+                // the query outright. Stay on the tail enterChannel already
+                // loaded and say so — landing on the newest message with no
+                // word is the bug this whole path exists to fix.
+                {
+                  chatWindow: null,
+                  error:
+                    "Couldn't load the history around that message — this node may be too old to page it in.",
+                }
+              : {},
+          ),
+        );
     },
 
     clearChatFocus: () => {

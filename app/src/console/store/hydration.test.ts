@@ -13,6 +13,7 @@ import type { OpLedger } from "./finalization";
 import {
   changedModules,
   fetchCapabilitySlices,
+  fetchChatSlices,
   fetchGovernanceSlices,
   fetchPeopleSlices,
   scopeFor,
@@ -76,6 +77,79 @@ describe("scopeFor", () => {
     expect(scopeFor(new Set(["kv", "blobstore", "tagging", "upgrade"]))).toEqual(
       new Set(),
     );
+  });
+});
+
+// ── The chat slice's focused window ─────────────────────
+
+describe("fetchChatSlices", () => {
+  const channel = {
+    id: "general",
+    name: "general",
+    created_at: 1,
+    head_seq: 900,
+    post_policy: "open",
+    hooks: [],
+    pinned: [],
+  };
+  /** Answers `channels`, then routes the message read by variant. */
+  const chatNode = (
+    reply: (variant: "messages_latest" | "messages_around") => Promise<unknown>,
+  ) =>
+    vi.fn((_target: string, query: unknown) => {
+      if (query === "channels") return Promise.resolve({ channels: [channel] });
+      const variant =
+        (query as { messages_around?: unknown }).messages_around !== undefined
+          ? "messages_around"
+          : "messages_latest";
+      return reply(variant);
+    });
+
+  it("re-pulls the FOCUSED window rather than the tail while one is up", async () => {
+    const query = chatNode((variant) =>
+      Promise.resolve({ messages: [{ channel_id: "general", seq: variant === "messages_around" ? 12 : 900 }] }),
+    );
+
+    const slices = await fetchChatSlices(makeTransportStub({ query }), "general", {
+      channelId: "general",
+      seq: 12,
+    });
+
+    expect(slices.messages.map((m) => m.seq)).toEqual([12]);
+  });
+
+  it("falls back to the tail when the node cannot answer the window query", async () => {
+    // An old node rejects messages_around outright. Degrade to the tail — the
+    // whole hydrate must not fail over one unknown query variant (loadMessageWindow's
+    // own catch is what tells the reader why they are back on the newest messages).
+    const query = chatNode((variant) =>
+      variant === "messages_around"
+        ? Promise.reject(new Error("unknown query variant"))
+        : Promise.resolve({ messages: [{ channel_id: "general", seq: 900 }] }),
+    );
+
+    const slices = await fetchChatSlices(makeTransportStub({ query }), "general", {
+      channelId: "general",
+      seq: 12,
+    });
+
+    expect(slices.messages.map((m) => m.seq)).toEqual([900]);
+    expect(slices.activeChannel).toBe("general");
+  });
+
+  it("reads the tail for a window focused on a DIFFERENT channel", async () => {
+    const query = chatNode((variant) =>
+      variant === "messages_around"
+        ? Promise.reject(new Error("should not have been asked"))
+        : Promise.resolve({ messages: [{ channel_id: "general", seq: 900 }] }),
+    );
+
+    const slices = await fetchChatSlices(makeTransportStub({ query }), "general", {
+      channelId: "random",
+      seq: 12,
+    });
+
+    expect(slices.messages.map((m) => m.seq)).toEqual([900]);
   });
 });
 
