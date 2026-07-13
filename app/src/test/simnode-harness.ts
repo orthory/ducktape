@@ -59,6 +59,10 @@ export interface SimSpawnOptions {
   persona?: SimPersona;
   auto?: boolean;
   echoOracle?: boolean;
+  /** Fabricate a mesh identity: `status.publicKey` serves this 64-hex ed25519
+   *  key (no mesh behind it). Required by consensus-op scenarios that name a
+   *  node key (huddle membership, account writes keyed off `status.publicKey`). */
+  nodeKey?: string;
 }
 
 // ── Binary discovery ────────────────────────────────────
@@ -141,6 +145,7 @@ export const spawnSimnode = (options: SimSpawnOptions = {}): Promise<SimNode> =>
       if (options.auto) args.push("--auto");
       if (options.persona) args.push("--persona", options.persona);
       if (options.echoOracle) args.push("--echo-oracle");
+      if (options.nodeKey) args.push("--node-key", options.nodeKey);
       child = spawn(bin, args, {
         // stderr stays visible so a startup failure reads as itself, not as
         // a readiness timeout.
