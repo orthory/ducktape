@@ -13,7 +13,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
-import { parseItemChannelId } from "../../domain/forge-client";
+import { forgeItemTarget } from "../../domain/forge-client";
 import {
   isTauri,
   resolveNode,
@@ -114,6 +114,8 @@ export interface NavigateTarget {
   threadRoot?: number;
   repo?: string;
   number?: number;
+  messageId?: string;
+  messageSeq?: number;
 }
 
 /** Defensive parse of an untrusted navigate payload: anything without a
@@ -129,6 +131,8 @@ const parseNavigateTarget = (payload: unknown): NavigateTarget | null => {
     threadRoot: typeof raw.threadRoot === "number" ? raw.threadRoot : undefined,
     repo: typeof raw.repo === "string" && raw.repo.length > 0 ? raw.repo : undefined,
     number: typeof raw.number === "number" ? raw.number : undefined,
+    messageId: typeof raw.messageId === "string" ? raw.messageId : undefined,
+    messageSeq: typeof raw.messageSeq === "number" ? raw.messageSeq : undefined,
   };
 };
 
@@ -1088,7 +1092,7 @@ export function DucktapeProvider({
           // Discussion, so route to the forge item view instead.
           const forgeItem =
             target.screen === "chat" && target.channelId
-              ? parseItemChannelId(target.channelId)
+              ? forgeItemTarget(target.channelId, { messageSeq: target.threadRoot })
               : null;
           if (forgeItem) target = { screen: "forge", ...forgeItem };
           const { channelId, threadRoot } = target;
@@ -1116,7 +1120,14 @@ export function DucktapeProvider({
           if (target.repo) {
             dispatch({
               type: "patch",
-              patch: { forgeFocus: { repo: target.repo, number: target.number ?? null } },
+              patch: {
+                forgeFocus: {
+                  repo: target.repo,
+                  number: target.number ?? null,
+                  ...(target.messageId ? { messageId: target.messageId } : {}),
+                  ...(target.messageSeq ? { messageSeq: target.messageSeq } : {}),
+                },
+              },
             });
           }
         }),

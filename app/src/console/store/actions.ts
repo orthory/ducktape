@@ -7,6 +7,7 @@ import type { ChatBlock, PostPolicy } from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
 import type {
   ForgeItemDetail,
+  ForgeItemTarget,
   ForgeReviewComment,
   ForgeReviewVerdict,
 } from "../../domain/forge-client";
@@ -120,7 +121,7 @@ export interface ConsoleActions {
   /** Jump to a forge item — the screen switch plus the one-shot forgeFocus
    *  hand-off (the explorerFocus idiom). Used by the notification bell; the
    *  navigate deep-link listener patches the same fields. */
-  openForgeItem(repo: string, number: number | null): void;
+  openForgeItem(target: ForgeItemTarget): void;
   /** Jump to the files browser opened on `path` — the same one-shot hand-off,
    *  used by the agent form to open a skill document in Files. */
   openFiles(path: string): void;
@@ -1390,7 +1391,12 @@ export function createActions({
         : null;
     const forge =
       scopeMatches && screen === "forge" && snap.forgeRepo
-        ? { repo: snap.forgeRepo, number: snap.forgeItem }
+        ? {
+            repo: snap.forgeRepo,
+            number: snap.forgeItem,
+            ...(snap.forgeMessageId ? { messageId: snap.forgeMessageId } : {}),
+            ...(snap.forgeMessageSeq ? { messageSeq: snap.forgeMessageSeq } : {}),
+          }
         : null;
     const explorer =
       scopeMatches && screen === "explorer" ? snap.explorer : null;
@@ -1423,6 +1429,8 @@ export function createActions({
       page: page ?? before.activePage,
       forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
       forgeItem: forge ? forge.number : (before.forgeFocus?.number ?? null),
+      forgeMessageId: forge?.messageId ?? before.forgeFocus?.messageId ?? null,
+      forgeMessageSeq: forge?.messageSeq ?? before.forgeFocus?.messageSeq ?? null,
       explorer: explorer ?? before.explorerFocus,
       agent: agent ?? before.agentFocus,
       member: member ?? before.memberFocus,
@@ -1659,7 +1667,7 @@ export function createActions({
       patch({ memberFocus: null });
     },
 
-    openForgeItem: (repo, number) => landOn("forge", { forgeFocus: { repo, number } }),
+    openForgeItem: (target) => landOn("forge", { forgeFocus: target }),
 
     openFiles: (path) => landOn("files", { filesFocus: path }),
     applyNavSnapshot,

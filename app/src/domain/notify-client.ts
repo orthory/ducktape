@@ -71,6 +71,7 @@ export interface NotifyItem {
   title: string;
   body: string;
   channelId: string | null;
+  messageId: string | null;
   at: number;
 }
 

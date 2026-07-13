@@ -138,7 +138,11 @@ export function ForgeView() {
 
   // The deep-linked item to show instead of the tab bodies (a notification's
   // forgeFocus hand-off), and the last focus object already consumed.
-  const [focusItem, setFocusItem] = useState<number | null>(null);
+  const [focusItem, setFocusItem] = useState<{
+    number: number;
+    messageId?: string;
+    messageSeq?: number;
+  } | null>(null);
   const consumedFocusRef = useRef<object | null>(null);
 
   const fileRequestRef = useRef(0);
@@ -333,7 +337,15 @@ export function ForgeView() {
         ? state.forgeItems.find((item) => item.number === focus.number)?.kind
         : undefined;
     setTab(kind === "pr" ? "pulls" : "issues");
-    setFocusItem(focus.number);
+    setFocusItem(
+      focus.number === null
+        ? null
+        : {
+            number: focus.number,
+            ...(focus.messageId ? { messageId: focus.messageId } : {}),
+            ...(focus.messageSeq ? { messageSeq: focus.messageSeq } : {}),
+          },
+    );
   }, [state.forgeFocus, repos, desktop, state.forgeRepo, state.forgeItems]);
 
   // A repo switch always lands back on the default branch.
@@ -717,7 +729,7 @@ function RepoListing({
   openIssues: number;
   openPulls: number;
   /** A deep-linked item to render in place of the tab bodies (null = none). */
-  focusItem: number | null;
+  focusItem: { number: number; messageId?: string; messageSeq?: number } | null;
   onCloseFocus: () => void;
   onOpenRepo: (repoId: string) => void;
   onGoRepos: () => void;
@@ -817,7 +829,9 @@ function RepoListing({
         >
           <ItemDetailPanel
             repo={repo.name}
-            number={focusItem}
+            number={focusItem.number}
+            messageId={focusItem.messageId}
+            messageSeq={focusItem.messageSeq}
             backLabel={tab === "pulls" ? "Pull requests" : "Issues"}
             onBack={onCloseFocus}
           />

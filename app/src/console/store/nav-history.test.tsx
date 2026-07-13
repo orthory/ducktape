@@ -41,6 +41,8 @@ const snap = (over: Partial<NavSnapshot> = {}): NavSnapshot => ({
   page: null,
   forgeRepo: null,
   forgeItem: null,
+  forgeMessageId: null,
+  forgeMessageSeq: null,
   explorer: null,
   agent: null,
   member: null,
@@ -94,8 +96,23 @@ describe("latchOneShots", () => {
 
 describe("readNavEntry", () => {
   it("round-trips a stamped snapshot with its stack position", () => {
-    const s = snap({ channel: "general", forgeItem: 7 });
+    const s = snap({
+      channel: "general",
+      forgeItem: 7,
+      forgeMessageId: "m7",
+      forgeMessageSeq: 4,
+    });
     expect(readNavEntry(stampNav(s, 3))).toEqual({ snap: s, index: 3 });
+  });
+
+  it("reads pre-anchor history entries with empty Forge message focus", () => {
+    const old = stampNav(snap(), 1) as unknown as Record<string, unknown>;
+    delete old.forgeMessageId;
+    delete old.forgeMessageSeq;
+    expect(readNavEntry(old)?.snap).toMatchObject({
+      forgeMessageId: null,
+      forgeMessageSeq: null,
+    });
   });
 
   it("rejects foreign or malformed history state", () => {

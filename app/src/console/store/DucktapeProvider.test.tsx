@@ -2523,11 +2523,20 @@ describe("ducktape://navigate deep-link", () => {
     );
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", { screen: "forge", repo: "default", number: 7 });
+      tauriEvent.emitTo("ducktape://navigate", {
+        screen: "forge",
+        repo: "default",
+        number: 7,
+        messageId: "m7",
+      });
     });
     await waitFor(() => {
       expect(capturedState!.screen).toBe("forge");
-      expect(capturedState!.forgeFocus).toEqual({ repo: "default", number: 7 });
+      expect(capturedState!.forgeFocus).toEqual({
+        repo: "default",
+        number: 7,
+        messageId: "m7",
+      });
     });
 
     // the hand-off is one-shot: leaving the forge screen retires it, so a
@@ -2558,7 +2567,11 @@ describe("ducktape://navigate deep-link", () => {
     });
     await waitFor(() => {
       expect(capturedState!.screen).toBe("forge");
-      expect(capturedState!.forgeFocus).toEqual({ repo: "app", number: 12 });
+      expect(capturedState!.forgeFocus).toEqual({
+        repo: "app",
+        number: 12,
+        messageSeq: 7,
+      });
     });
     // no chat-side effects: the hidden channel is never entered.
     expect(capturedState!.activeChannel).toBe("general");

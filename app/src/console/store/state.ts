@@ -342,7 +342,12 @@ export interface ConsoleState {
    *  navigate listener sets it, ForgeView consumes it, and the provider
    *  retires it when the user leaves the forge screen). `number` null means
    *  a repo-only focus. Null when nothing is pending. */
-  forgeFocus: { repo: string; number: number | null } | null;
+  forgeFocus: {
+    repo: string;
+    number: number | null;
+    messageId?: string;
+    messageSeq?: number;
+  } | null;
 
   /** The duckfs path the files browser should open on next render — the same
    *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an

@@ -37,6 +37,8 @@ export interface NavSnapshot {
   page: string | null;
   forgeRepo: string | null;
   forgeItem: number | null;
+  forgeMessageId: string | null;
+  forgeMessageSeq: number | null;
   explorer: number | null;
   agent: string | null;
   member: string | null;
@@ -50,6 +52,8 @@ const SELECTION_KEYS = [
   "page",
   "forgeRepo",
   "forgeItem",
+  "forgeMessageId",
+  "forgeMessageSeq",
   "explorer",
   "agent",
   "member",
@@ -67,6 +71,8 @@ export const navSnapshotOf = (state: ConsoleState): NavSnapshot => ({
   // A pending forge hand-off names the repo ahead of the view's own stamp.
   forgeRepo: state.forgeFocus?.repo ?? state.forgeRepo,
   forgeItem: state.forgeFocus?.number ?? null,
+  forgeMessageId: state.forgeFocus?.messageId ?? null,
+  forgeMessageSeq: state.forgeFocus?.messageSeq ?? null,
   explorer: state.explorerFocus,
   agent: state.agentFocus,
   member: state.memberFocus,
@@ -85,6 +91,8 @@ export const latchOneShots = (
     ? {
         ...snap,
         forgeItem: snap.forgeItem ?? entry.forgeItem,
+        forgeMessageId: snap.forgeItem === null ? entry.forgeMessageId : snap.forgeMessageId,
+        forgeMessageSeq: snap.forgeItem === null ? entry.forgeMessageSeq : snap.forgeMessageSeq,
         explorer: snap.explorer ?? entry.explorer,
         agent: snap.agent ?? entry.agent,
         member: snap.member ?? entry.member,
@@ -197,6 +205,8 @@ export const readNavEntry = (
     isStringOrNull(e.page) &&
     isStringOrNull(e.forgeRepo) &&
     isNumberOrNull(e.forgeItem) &&
+    (e.forgeMessageId === undefined || isStringOrNull(e.forgeMessageId)) &&
+    (e.forgeMessageSeq === undefined || isNumberOrNull(e.forgeMessageSeq)) &&
     isNumberOrNull(e.explorer) &&
     isStringOrNull(e.agent) &&
     isStringOrNull(e.member);
@@ -212,6 +222,8 @@ export const readNavEntry = (
       page: e.page as string | null,
       forgeRepo: e.forgeRepo as string | null,
       forgeItem: e.forgeItem as number | null,
+      forgeMessageId: (e.forgeMessageId as string | null | undefined) ?? null,
+      forgeMessageSeq: (e.forgeMessageSeq as number | null | undefined) ?? null,
       explorer: e.explorer as number | null,
       agent: e.agent as string | null,
       member: e.member as string | null,
