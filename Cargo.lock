@@ -9609,7 +9609,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-cef"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=7f8491f220cdc0d5aa955db5d5fa6d6d60c8398d#7f8491f220cdc0d5aa955db5d5fa6d6d60c8398d"
+source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=3329d9f39f5aea9721c855ec7407b4ade9ad231c#3329d9f39f5aea9721c855ec7407b4ade9ad231c"
 dependencies = [
  "base64 0.22.1",
  "cef",
