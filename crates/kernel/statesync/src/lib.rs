@@ -937,6 +937,8 @@ pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: 
 
 /// decode the authenticated envelope into borrowed `(requester, proof, id, body)`.
 /// errors `Truncated` on any buffer shorter than the 32+64+8 fixed header.
+// the 4-tuple mirrors the fixed wire layout; a named type would just indirect it.
+#[allow(clippy::type_complexity)]
 pub fn decode_rpc_authed(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
     let (requester, rest) = bytes.split_first_chunk::<32>().ok_or(WireError::Truncated)?;
     let (proof, rest) = rest.split_first_chunk::<64>().ok_or(WireError::Truncated)?;
