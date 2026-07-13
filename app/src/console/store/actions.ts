@@ -184,6 +184,12 @@ export interface ConsoleActions {
   ): Promise<void>;
   selectChannel(channelId: string): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
+  /** Load the active channel's member set into `state.channelMembers` — the
+   *  members panel calls it on open. */
+  refreshChannelMembers(channelId: string): void;
+  /** Add/remove a channel member (SetMembership) as a tracked op, refetching
+   *  the roster on settle. A members_only channel gates posting on this set. */
+  setChannelMembership(channelId: string, user: number[], member: boolean): void;
   sendMessage(body: string): void;
   /** Post `body` into ANY channel (not just the active one) with the same
    *  mention parsing + first-agent-mention watch arming as `sendMessage` —
@@ -960,6 +966,7 @@ export function createActions({
       tagHits: [],
       tagHitsPending: false,
       channelTags: [],
+      channelMembers: [],
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
@@ -972,6 +979,41 @@ export function createActions({
         if (isCurrentNode(live)) fail(err);
       });
   };
+
+  // Load a channel's member set into `channelMembers` (guarded on the active
+  // channel + current node, like the message load). The members panel calls it
+  // on open; membership writes refetch through it so the panel reconciles to
+  // committed truth whether the op landed or not.
+  const refreshChannelMembers = (channelId: string): Promise<void> => {
+    const live = getNode();
+    if (!live) return Promise.resolve();
+    return chatClient
+      .channelMembers(live, channelId)
+      .then((channelMembers) =>
+        update((prev) =>
+          isCurrentNode(live) && prev.activeChannel === channelId ? { channelMembers } : {},
+        ),
+      )
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
+  };
+
+  // The one membership write path: a tracked SetMembership keyed by channel +
+  // target so each member row carries its own finalization mark, then a refetch
+  // that reconciles the panel to committed state (no optimistic projection —
+  // the mark is the immediate feedback; the refetch is the truth).
+  const submitMembership = (
+    channelId: string,
+    user: number[],
+    member: boolean,
+  ): Promise<boolean> =>
+    submitTracked(opKey.membership(channelId, keyHex(user)), (live) =>
+      chatClient.setMembership(live, { channelId, user, member, origin: getState().author }),
+    ).then((landed) => {
+      void refreshChannelMembers(channelId);
+      return landed;
+    });
 
   // A first agent mention in an UNWATCHED channel creates the runs watch the
   // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
@@ -1700,8 +1742,24 @@ export function createActions({
             atMs: Date.now(),
           }),
       ).then((current) => {
-        if (current) enterChannel(channelId);
+        if (!current) return;
+        enterChannel(channelId);
+        // CreateChannel seeds NO members, so a members_only channel would lock
+        // its own creator out (an external author must be a member to post).
+        // Add the creator's own User identity as the first member.
+        if (postPolicy === "members_only") {
+          const { status, author } = getState();
+          void submitMembership(channelId, selfAuthorBytes(status, author), true);
+        }
       });
+    },
+
+    refreshChannelMembers: (channelId) => {
+      void refreshChannelMembers(channelId);
+    },
+
+    setChannelMembership: (channelId, user, member) => {
+      void submitMembership(channelId, user, member);
     },
 
     sendMessage: (body) => {

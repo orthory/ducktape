@@ -170,6 +170,11 @@ export interface ConsoleState {
   /** The active channel's tag catalog (count-ordered), loaded on demand for
    *  the header's tag dropdown. Cleared on channel switch. */
   channelTags: ChatTagRow[];
+  /** The active channel's member set (User-author key bytes), loaded on demand
+   *  for the members panel and refetched after a membership op. Only meaningful
+   *  for a members_only channel; cleared on channel switch. Not part of the
+   *  per-block snapshot — a separate query, like `channelTags`. */
+  channelMembers: number[][];
   /** hex(node key bytes) → canonical account display name, projected from
    *  `identity` for author rendering. Unbound nodes deliberately have no
    *  replicated display-name record. */
@@ -727,6 +732,7 @@ export const createInitialState = (): ConsoleState => {
     tagHits: [],
     tagHitsPending: false,
     channelTags: [],
+    channelMembers: [],
     authorNames: {},
     nodeUsers: {},
     accountKeys: {},
@@ -817,6 +823,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   tagHits: [],
   tagHitsPending: false,
   channelTags: [],
+  channelMembers: [],
   authorNames: {},
   nodeUsers: {},
   accountKeys: {},

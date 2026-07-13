@@ -262,6 +262,24 @@ export const deleteMessage = (
     params.origin,
   );
 
+// ── Membership (members-only channel gate — who may post) ──
+
+/** Add or remove an external user from a channel's member set (SetMembership).
+ *  `user` is the AuthorRef::User bytes the module compares against (the node
+ *  pubkey on a networked node, the origin bytes on the embedded daemon — the
+ *  same bytes `selfAuthorBytes` derives). Only members may post in a
+ *  members_only channel; any non-empty origin may modify the set for now.
+ *  Authorship comes from `origin`. */
+export const setMembership = (
+  transport: NodeTransport,
+  params: { channelId: string; user: number[]; member: boolean; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { set_membership: { channel_id: params.channelId, user: params.user, member: params.member } },
+    params.origin,
+  );
+
 // ── Huddle (voice roster ops — consensus membership, not the audio) ──
 
 /** Join a channel's voice huddle. `node` is THIS node's 32-byte ed25519 mesh
@@ -338,6 +356,16 @@ export const thread = (
       }),
     )
     .then((reply) => replyVariant<ChatThread | null>(reply, "thread"));
+
+/** The channel's member set — the User-author key bytes SetMembership added.
+ *  Empty in an open channel (membership is only consulted for members_only). */
+export const channelMembers = (
+  transport: NodeTransport,
+  channelId: string,
+): Promise<number[][]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { members: { channel_id: channelId } }))
+    .then((reply) => replyVariant<number[][]>(reply, "members"));
 
 // ── Materialized view (the module's derived-index endpoint) ──
 

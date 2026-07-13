@@ -14,6 +14,7 @@ import { Icon } from "../../components/Icon";
 import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { ChannelMembersButton } from "./ChannelMembers";
 import { selfAuthorKeyOf } from "./chat-helpers";
 import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
@@ -21,15 +22,6 @@ import { HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
 import { MessageList } from "./MessageList";
 import { ChannelTagsButton, TagFilterBar, TagHitList } from "./TagFilter";
 import { ThreadPanel } from "./ThreadPanel";
-
-function LockGlyph({ size = 11 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-      <rect x="5" y="11" width="14" height="9" rx="2" />
-      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
-    </svg>
-  );
-}
 
 // A segmented Open / Members-only toggle for a channel's post policy.
 function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (policy: PostPolicy) => void }) {
@@ -387,26 +379,7 @@ export function ChatView() {
               · {rootMessageCount} {rootMessageCount === 1 ? "message" : "messages"}
             </span>
           )}
-          {channel?.post_policy === "members_only" && (
-            <span
-              title="Only channel members can post"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 4,
-                marginLeft: 2,
-                padding: "2px 8px",
-                borderRadius: 999,
-                background: color.sunken,
-                border: `1px solid ${color.borderSoft}`,
-                font: `600 10px ${font.mono}`,
-                color: color.muted,
-                whiteSpace: "nowrap",
-              }}
-            >
-              <LockGlyph size={10} /> Members only
-            </span>
-          )}
+          {channel?.post_policy === "members_only" && <ChannelMembersButton channel={channel} />}
           {channel && <ChannelTagsButton />}
           {channel && <HuddleHeaderButton channel={channel} />}
         </div>

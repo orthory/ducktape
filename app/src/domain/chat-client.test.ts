@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   authorName,
   blocksText,
+  channelMembers,
   channels,
   createChannel,
   isModuleChannel,
@@ -17,6 +18,7 @@ import {
   leaveHuddle,
   postMessage,
   searchMessages,
+  setMembership,
   sweepHuddle,
   tagSearch,
   tags,
@@ -144,6 +146,26 @@ describe("huddle msgs", () => {
   it("keyBytes inverts keyHex for a mesh key", () => {
     const bytes = Array.from({ length: 32 }, (_, i) => i * 7 % 256);
     expect(keyBytes(keyHex(bytes))).toEqual(bytes);
+  });
+});
+
+describe("membership", () => {
+  it("encodes SetMembership with the user bytes + flag and stamps the origin", async () => {
+    const transport = stubTransport();
+    const user = Array.from(new TextEncoder().encode("jess"));
+    await setMembership(transport, { channelId: "general", user, member: true, origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { set_membership: { channel_id: "general", user, member: true } },
+      "jess",
+    );
+  });
+
+  it("queries Members by channel and decodes the byte-key list", async () => {
+    const wire = [Array.from(new TextEncoder().encode("jess")), keyBytes("ab".repeat(32))];
+    const transport = stubTransport({ members: wire });
+    await expect(channelMembers(transport, "general")).resolves.toEqual(wire);
+    expect(transport.query).toHaveBeenCalledWith("chat", { members: { channel_id: "general" } });
   });
 });
 

@@ -69,6 +69,10 @@ export const opKey = {
   /** A join/leave of a channel's voice huddle — keyed by channel so the pill's
    *  optimistic roster change carries a finalization record. */
   huddle: (channelId: string) => `chat/huddle/${channelId}`,
+  /** An add/remove of one channel member — keyed by channel + the target's
+   *  hex user key, so each member row in the panel carries its own mark. */
+  membership: (channelId: string, userHex: string) =>
+    `chat/members/${channelId}/${userHex}`,
   forgeHead: () => "forge/head",
   /** An op on an EXISTING forge issue/PR (edit/state/merge/review) — keyed by
    *  the repo-scoped item number the row renders. */
