@@ -50,11 +50,14 @@ export interface WindowSessionView {
   setDevices(prefs: DevicePrefs): void;
   bindPreview(el: HTMLVideoElement | null): void;
   bindTile(nodeHex: string, el: HTMLCanvasElement | null): void;
+  /** Re-dial after a hard error — stops the old session and starts a fresh one. */
+  retry(): void;
 }
 
-/** Own the window's media session against `ctx`. `onMediaEnded` fires when the
- *  session dies (hard error or replaced) — the window closes itself so main
- *  re-takes and the call is never stranded in a dead float. `makeSession` is
+/** Own the window's media session against `ctx`. `onMediaEnded("closed")` fires
+ *  when the session is replaced — the window closes itself so main re-takes and
+ *  the call is never stranded in a dead float. A hard error instead surfaces the
+ *  "error" status (window stays open) so retry() can re-dial. `makeSession` is
  *  injectable for tests. Returns null when there is no context yet. */
 export function useHuddleWindowSession(
   ctx: HuddleContext | null,
@@ -71,6 +74,9 @@ export function useHuddleWindowSession(
   const [mediaNote, setMediaNote] = useState<"camera-failed" | "screen-failed" | null>(null);
   const [sessionStartMs, setSessionStartMs] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  // Bumped by retry() to re-run the start effect — its cleanup stops the old
+  // session and the re-run resets status/peers, so an errored float re-dials clean.
+  const [retryNonce, setRetryNonce] = useState(0);
 
   const sessionRef = useRef<CallSession | null>(null);
   const mediaNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -120,10 +126,15 @@ export function useHuddleWindowSession(
         }, 5_000);
         return;
       }
-      // Any terminal end (hard error or replaced) ends this float — the window
-      // closes and main re-takes, so recovery is "fall back to the dock", not an
-      // in-window retry (there is deliberately no retry control here).
-      if (e.status === "closed" || e.status === "error") {
+      // A hard error stays IN the window — surface the error state so its Retry
+      // control shows (retry() re-dials into the now-free hub slot). A "closed"
+      // (replaced) session still ends the float: main re-takes and the call
+      // falls back to the working dock.
+      if (e.status === "error") {
+        setStatus("error");
+        return;
+      }
+      if (e.status === "closed") {
         endedRef.current(e.status);
         return;
       }
@@ -152,7 +163,7 @@ export function useHuddleWindowSession(
     };
     // seedMuted intentionally excluded — see comment above.
 
-  }, [channelId, nodeUrl, makeSession]);
+  }, [channelId, nodeUrl, makeSession, retryNonce]);
 
   // Re-push the fan-out set whenever it changes (roster edits). Runs after the
   // start effect (declared first), so the session exists on the initial mount.
@@ -190,6 +201,7 @@ export function useHuddleWindowSession(
     (nodeHex: string, el: HTMLCanvasElement | null) => sessionRef.current?.bindTile(nodeHex, el),
     [],
   );
+  const retry = useCallback(() => setRetryNonce((n) => n + 1), []);
 
   if (!ctx) return null;
 
@@ -226,5 +238,6 @@ export function useHuddleWindowSession(
     setDevices,
     bindPreview,
     bindTile,
+    retry,
   };
 }
