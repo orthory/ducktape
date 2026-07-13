@@ -23,6 +23,7 @@ const renderPreferences = (patch: Partial<ConsoleState> = {}) => {
   };
   const setNotifyPrefs = vi.fn<(prefs: NotifyPrefs) => void>();
   const toggleChannelMute = vi.fn<(channelId: string) => void>();
+  const toggleTheme = vi.fn<() => void>();
 
   function Harness() {
     const [state, setState] = useState(initialState);
@@ -30,6 +31,13 @@ const renderPreferences = (patch: Partial<ConsoleState> = {}) => {
       setNotifyPrefs: (prefs: NotifyPrefs) => {
         setNotifyPrefs(prefs);
         setState((previous) => ({ ...previous, notifyPrefs: prefs }));
+      },
+      toggleTheme: () => {
+        toggleTheme();
+        setState((previous) => ({
+          ...previous,
+          theme: previous.theme === "dark" ? "light" : "dark",
+        }));
       },
       toggleChannelMute: (channelId: string) => {
         toggleChannelMute(channelId);
@@ -57,8 +65,24 @@ const renderPreferences = (patch: Partial<ConsoleState> = {}) => {
 
   render(<Harness />);
 
-  return { setNotifyPrefs, toggleChannelMute };
+  return { setNotifyPrefs, toggleChannelMute, toggleTheme };
 };
+
+describe("PreferencesSection theme", () => {
+  it("toggles the color theme and reflects its checked state", () => {
+    const { toggleTheme } = renderPreferences({ theme: "light" });
+
+    const theme = screen.getByRole("switch", {
+      name: "Toggle theme notifications",
+    });
+    expect(theme).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(theme);
+
+    expect(toggleTheme).toHaveBeenCalledTimes(1);
+    expect(theme).toHaveAttribute("aria-checked", "true");
+  });
+});
 
 describe("PreferencesSection notifications", () => {
   it("flips the master notification preference with a fresh prefs object", () => {

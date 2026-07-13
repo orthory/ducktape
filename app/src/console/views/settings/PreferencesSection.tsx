@@ -151,6 +151,18 @@ export function PreferencesSection() {
       <SectionLabel>PREFERENCES</SectionLabel>
       <GroupCard>
         <ControlRow
+          title="Theme"
+          desc="Dark mode"
+          control={
+            <Toggle
+              name="theme"
+              checked={state.theme === "dark"}
+              accent={state.accent}
+              onToggle={actions.toggleTheme}
+            />
+          }
+        />
+        <ControlRow
           title="Accent"
           desc="Used for active navigation, focus, and primary controls."
           last
