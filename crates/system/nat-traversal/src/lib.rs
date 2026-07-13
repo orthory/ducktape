@@ -33,4 +33,4 @@ pub use invite_store::{InviteStore, PutOutcome, invite_id};
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 #[cfg(any(test, feature = "simnat"))]
 pub use simnat::SimNat;
-pub use wire::{AuthRequest, Msg, NodeKey, WireError};
+pub use wire::{AuthRequest, INVITE_ID_LEN, Msg, NodeKey, WireError};

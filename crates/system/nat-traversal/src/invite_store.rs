@@ -22,7 +22,7 @@ pub const GET_BURST: u64 = 20;
 /// distinct source IPs tracked; at the cap the stalest bucket is evicted.
 const MAX_GET_BUCKETS: usize = 1024;
 
-/// the id IS the first 16 bytes of sha256(blob) — content addressing makes
+/// the id IS the first 4 bytes of sha256(blob) — content addressing makes
 /// the shelf tamper-evident without trusting the coordinator.
 pub fn invite_id(blob: &[u8]) -> [u8; INVITE_ID_LEN] {
     use commonware_cryptography::{Hasher as _, Sha256};
