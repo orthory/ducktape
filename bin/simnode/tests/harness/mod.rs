@@ -1,0 +1,268 @@
+//! the shared spawn/drive harness behind the sim integration suites: a REAL
+//! `ducktape-simnode` child process driven over its /v1 + /sim wires.
+//! transport is the same deliberately raw std-TCP http/1.1 as noded's
+//! daemon_e2e: any plain http client must be a full citizen of this wire.
+//!
+//! each tests/*.rs file is its own crate, so unused helpers per binary are
+//! expected — hence the file-wide dead_code allow.
+#![allow(dead_code)]
+
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+pub struct Sim {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for Sim {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Sim {
+    /// spawn with an explicit fresh storage dir: the sim has no height-resume
+    /// watermark, so reusing a dir would restart heights over persisted state.
+    pub fn spawn(storage: &Path, extra_args: &[&str]) -> Self {
+        let port = free_port();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-simnode"));
+        cmd.arg("--listen")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--storage")
+            .arg(storage)
+            .args(extra_args)
+            .stdout(Stdio::null())
+            // startup failures land on stderr — keep it visible or they read
+            // as an opaque readiness timeout.
+            .stderr(Stdio::inherit());
+        let child = cmd.spawn().expect("spawn ducktape-simnode");
+        let mut sim = Self { child, port };
+        sim.await_status();
+        sim
+    }
+
+    fn await_status(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok((200, _)) = try_request(self.port, "GET", "/v1/status", None) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll sim") {
+                panic!("sim exited during startup ({status}) — see stderr above");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sim on port {} never answered /v1/status",
+                self.port
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    pub fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        try_request(self.port, method, path, body).expect("sim reachable")
+    }
+
+    pub fn status(&self) -> serde_json::Value {
+        let (status, reply) = self.request("GET", "/v1/status", None);
+        assert_eq!(status, 200, "status failed: {reply}");
+        reply
+    }
+
+    pub fn sim_state(&self) -> serde_json::Value {
+        let (status, reply) = self.request("GET", "/sim/state", None);
+        assert_eq!(status, 200, "sim state failed: {reply}");
+        reply
+    }
+
+    pub fn step(&self) -> serde_json::Value {
+        let (status, reply) = self.request("POST", "/sim/step", None);
+        assert_eq!(status, 200, "step failed: {reply}");
+        reply
+    }
+
+    pub fn set_auto(&self, enabled: bool) {
+        let (status, reply) = self.request(
+            "POST",
+            "/sim/auto",
+            Some(&serde_json::json!({ "enabled": enabled })),
+        );
+        assert_eq!(status, 200, "set auto failed: {reply}");
+    }
+
+    pub fn query(&self, target: &str, query: serde_json::Value) -> serde_json::Value {
+        let (status, reply) = self.request(
+            "POST",
+            "/v1/query",
+            Some(&serde_json::json!({ "target": target, "query": query })),
+        );
+        assert_eq!(status, 200, "query {target} failed: {reply}");
+        reply
+    }
+
+    /// an inline submit — only sound in auto mode (or for an op the module
+    /// rejects at once), where the reply does not wait on a step.
+    pub fn submit(
+        &self,
+        target: &str,
+        payload: serde_json::Value,
+        origin: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        let mut body = serde_json::json!({ "target": target, "payload": payload });
+        if let Some(origin) = origin {
+            body["origin"] = serde_json::json!(origin);
+        }
+        try_request(self.port, "POST", "/v1/submit", Some(&body)).expect("submit reachable")
+    }
+
+    /// inline submit that must COMMIT — returns the receipt.
+    pub fn submit_ok(
+        &self,
+        target: &str,
+        payload: serde_json::Value,
+        origin: Option<&str>,
+    ) -> serde_json::Value {
+        let (code, reply) = self.submit(target, payload, origin);
+        assert_eq!(code, 200, "submit to {target} failed: {reply}");
+        reply
+    }
+
+    /// inline submit that the module must REJECT — returns the error text.
+    pub fn submit_rejected(
+        &self,
+        target: &str,
+        payload: serde_json::Value,
+        origin: Option<&str>,
+    ) -> String {
+        let (code, reply) = self.submit(target, payload, origin);
+        assert_eq!(code, 400, "submit to {target} was not rejected: {reply}");
+        reply["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("rejection carries no error text: {reply}"))
+            .to_string()
+    }
+
+    /// spawn a submit on its own thread — in hold mode the http reply hangs
+    /// until a step releases it, so the caller must not block on it inline.
+    pub fn submit_in_background(
+        &self,
+        target: &str,
+        payload: serde_json::Value,
+        origin: Option<&str>,
+    ) -> std::thread::JoinHandle<(u16, serde_json::Value)> {
+        let port = self.port;
+        let target = target.to_string();
+        let mut body = serde_json::json!({ "target": target, "payload": payload });
+        if let Some(origin) = origin {
+            body["origin"] = serde_json::json!(origin);
+        }
+        std::thread::spawn(move || {
+            try_request(port, "POST", "/v1/submit", Some(&body)).expect("held submit reachable")
+        })
+    }
+
+    /// commit a concurrent writer's block, independent of the held queue.
+    pub fn peer_block(
+        &self,
+        target: &str,
+        payload: serde_json::Value,
+        origin: &str,
+    ) -> serde_json::Value {
+        let (status, reply) = self.request(
+            "POST",
+            "/sim/peer-block",
+            Some(&serde_json::json!({
+                "target": target,
+                "payload": payload,
+                "origin": origin,
+            })),
+        );
+        assert_eq!(status, 200, "peer block failed: {reply}");
+        reply
+    }
+
+    /// poll /sim/state until `field` reaches `want` — the held queue is fed by
+    /// another thread's in-flight request, so arrival is asynchronous.
+    pub fn await_sim_state(&self, field: &str, want: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.sim_state()[field] == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sim state {field} never reached {want}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+fn try_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> std::io::Result<(u16, serde_json::Value)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let body_bytes = body
+        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream.write_all(req.as_bytes())?;
+    stream.write_all(&body_bytes)?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let payload = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .map(|b| serde_json::from_str(b.trim()).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(serde_json::Value::Null);
+    Ok((status, payload))
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind port probe")
+        .local_addr()
+        .expect("probe addr")
+        .port()
+}
+
+pub fn create_channel(channel: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "create_channel": { "channel_id": channel, "name": name, "post_policy": "open" }
+    })
+}
+
+pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "post_message": {
+            "channel_id": channel,
+            "message_id": message_id,
+            "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
+            "thread": null,
+            "as_agent": null,
+        }
+    })
+}
