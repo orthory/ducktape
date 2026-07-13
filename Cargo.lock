@@ -8908,6 +8908,7 @@ dependencies = [
  "axum",
  "blobstore",
  "chat",
+ "clients",
  "commonware-cryptography",
  "commonware-runtime",
  "dispatch",

@@ -388,16 +388,15 @@ fn a_blob_holder_cannot_redeem_under_its_own_key_when_the_invite_names_another()
     );
 }
 
-// ── B5c: the role gate — Client tokens wait for their plane ──
+// ── B5c: a role=Client invite grants CLIENT standing (thin-client plane) ──
 
 #[test]
-fn a_client_role_invite_is_not_redeemable_until_the_thin_client_plane_lands() {
+fn a_client_role_invite_grants_client_standing_not_residency_and_is_single_use() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, validators) = governed(storage.path());
     let issuer = &validators[0];
 
-    // the role byte is signature-covered (a flipped byte dies at the token
-    // sig), so this is a WELL-FORMED Client invite refused by the role gate.
+    // the role byte is signature-covered; this is a WELL-FORMED Client invite.
     let client = Ed::from_seed(54);
     let token = mint_as(
         issuer,
@@ -408,6 +407,36 @@ fn a_client_role_invite_is_not_redeemable_until_the_thin_client_plane_lands() {
         FAR_FUTURE,
     );
     let proof = sign_join_proof(&client, BINDING, &token);
+    sim.submit_ok(
+        "governance",
+        redeem(
+            &token,
+            client.public_key().as_ref().to_vec(),
+            proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+
+    // client standing is granted — queryable in the clients module.
+    let clients = sim.query("clients", json!("clients"));
+    assert!(
+        has_key(&clients["clients"], client.public_key().as_ref()),
+        "joiner holds client standing: {clients}"
+    );
+    // …and it is CLIENT standing, NOT residency or a quorum seat: the joiner is
+    // absent from BOTH valset sets (the separate-module boundary in the wire).
+    let residents = sim.query("valset", json!("residents"));
+    assert!(
+        !has_key(&residents["residents"], client.public_key().as_ref()),
+        "a Client redeem grants NO resident standing: {residents}"
+    );
+    let validators_now = sim.query("valset", json!("validators"));
+    assert!(
+        !has_key(&validators_now["validators"], client.public_key().as_ref()),
+        "a Client redeem grants NO quorum seat: {validators_now}"
+    );
+
+    // single-use: the same Client nonce cannot redeem again.
     let error = sim.submit_rejected(
         "governance",
         redeem(
@@ -418,8 +447,8 @@ fn a_client_role_invite_is_not_redeemable_until_the_thin_client_plane_lands() {
         Some("relay"),
     );
     assert!(
-        error.contains("client invites are not redeemable yet"),
-        "role gate: {error}"
+        error.contains("already redeemed") || error.contains("already holds client standing"),
+        "single-use: {error}"
     );
 }
 
