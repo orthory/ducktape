@@ -4347,6 +4347,7 @@ name = "governance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clients",
  "commonware-codec",
  "commonware-cryptography",
  "futures",
@@ -5974,6 +5975,7 @@ dependencies = [
  "capability-host",
  "chacha20poly1305",
  "chat",
+ "clients",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",

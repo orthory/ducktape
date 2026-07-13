@@ -132,12 +132,13 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 25] = [
+pub(crate) const MODULE_IDS: [&str; 26] = [
     "kv",
     "pages",
     "chat",
     "forge",
     "valset",
+    "clients",
     "governance",
     "upgrade",
     "modreg",
@@ -165,11 +166,12 @@ pub(crate) const MODULE_IDS: [&str; 25] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     ("agent", 1),
     ("automations", 1),
     ("capability", 1),
     ("chat", 1),
+    ("clients", 1),
     ("directory", 1),
     ("dispatch", 1),
     ("duckdns", 1),

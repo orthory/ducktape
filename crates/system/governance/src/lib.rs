@@ -46,6 +46,7 @@ use identity::{
 use sdk::codec::{Cursor, push_bytes};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
+use clients::{ClientsMsg, encode_msg as clients_encode_msg};
 use modreg::{ModregMsg, encode_msg as modreg_encode_msg};
 use upgrade::{UpgradeMsg, encode_msg as upgrade_encode_msg};
 use valset::{
@@ -112,6 +113,11 @@ pub struct Governance {
     modreg_id: Option<ModuleId>,
     /// the Identity account registry used in account-share mode.
     identity_id: ModuleId,
+    /// the id of the client-ACL module a redeemed `role=Client` invite grants
+    /// standing in. genesis wiring — every node of a network must wire the same
+    /// id (or none). `None` (a shape without the module) rejects Client redeems
+    /// deterministically; Resident redeems are unaffected.
+    clients_id: Option<ModuleId>,
     /// the network binding invite tokens sign over (the genesis namespace).
     /// genesis wiring — identical on every node of the same network. `None`
     /// (a shape without a descriptor) refuses every `Redeem` with a clear
@@ -150,6 +156,7 @@ impl Governance {
             upgrade_id: upgrade_id.into(),
             modreg_id: None,
             identity_id: identity_id.into(),
+            clients_id: None,
             invite_binding: None,
             proposals: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -167,6 +174,14 @@ impl Governance {
     /// id (or none), or nodes diverge on whether those proposals are accepted.
     pub fn with_modreg(mut self, modreg_id: impl Into<ModuleId>) -> Self {
         self.modreg_id = Some(modreg_id.into());
+        self
+    }
+
+    /// wire the client-ACL module a redeemed `role=Client` invite grants standing
+    /// in. genesis wiring — every node of a network must wire the same id (or
+    /// none), or nodes diverge on whether Client redeems are accepted.
+    pub fn with_clients(mut self, clients_id: impl Into<ModuleId>) -> Self {
+        self.clients_id = Some(clients_id.into());
         self
     }
 
@@ -1119,12 +1134,6 @@ impl Governance {
         // doorbells), and single-use bounds any residual window. the field
         // stays in the op because it is signature-covered — members need it
         // to check expiry against the same bytes the issuer signed.
-        if token.role == invite::InviteRole::Client {
-            return Err(Error::Module(
-                "client invites are not redeemable yet — the thin-client plane lands separately"
-                    .into(),
-            ));
-        }
         if !invite::verify_join_proof(&joiner_key, binding, &token, &proof_sig) {
             return Err(Error::Module(
                 "joiner proof-of-possession does not verify".into(),
@@ -1137,31 +1146,67 @@ impl Governance {
                 "the inviting member is no longer part of this network".into(),
             ));
         }
-        if members.iter().any(|m| m == &joiner) {
-            return Err(Error::Module("joiner is already a validator".into()));
-        }
-        if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
-            return Err(Error::Module(
-                "joiner already holds resident standing".into(),
-            ));
-        }
-        // exactly-once: the nonce is the single-use key (pending-over-committed
-        // read, so two redemptions in one block settle first-wins too).
+        // the standing grant differs by role: a Resident invite grants valset
+        // resident standing (mesh + statesync, pre-promotion); a Client invite
+        // grants client-ACL standing — SUBMIT AUTHORIZATION ONLY, never
+        // statesync or a quorum seat (that is why clients live in a separate
+        // module the sync door never reads). the dedup gate and the emitted
+        // follow-up op are role-specific; every check above is shared.
+        let grant = match token.role {
+            invite::InviteRole::Resident => {
+                if members.iter().any(|m| m == &joiner) {
+                    return Err(Error::Module("joiner is already a validator".into()));
+                }
+                if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
+                    return Err(Error::Module(
+                        "joiner already holds resident standing".into(),
+                    ));
+                }
+                Msg {
+                    target: self.valset_id.clone(),
+                    payload: valset_encode_msg(&ValsetMsg::Grant {
+                        key: joiner.clone(),
+                    }),
+                }
+            }
+            invite::InviteRole::Client => {
+                let Some(clients_id) = self.clients_id.as_deref() else {
+                    return Err(Error::Module(
+                        "this network is not wired for client redemption (no clients module)".into(),
+                    ));
+                };
+                if clients::clients(ctx, clients_id)
+                    .await?
+                    .iter()
+                    .any(|c| c == &joiner)
+                {
+                    return Err(Error::Module("joiner already holds client standing".into()));
+                }
+                Msg {
+                    target: clients_id.to_string(),
+                    payload: clients_encode_msg(&ClientsMsg::Grant {
+                        key: joiner.clone(),
+                    }),
+                }
+            }
+        };
+        // exactly-once: the nonce is the single-use key, SHARED across roles
+        // (pending-over-committed read, so two redemptions in one block settle
+        // first-wins too). a Client and a Resident invite carry different
+        // nonces, but the set is shared so neither token can be replayed as the
+        // other's.
         if self.pending_redeemed.contains_key(&nonce) || self.redeemed.contains_key(&nonce) {
             return Err(Error::Module("invite already redeemed".into()));
         }
         self.pending_redeemed.insert(
             nonce,
             Redemption {
-                joiner: joiner.clone(),
+                joiner,
                 issuer,
                 height: ctx.env().height,
             },
         );
-        ctx.emit_msg(Msg {
-            target: self.valset_id.clone(),
-            payload: valset_encode_msg(&ValsetMsg::Grant { key: joiner }),
-        });
+        ctx.emit_msg(grant);
         Ok(())
     }
 }

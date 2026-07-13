@@ -24,6 +24,7 @@ kv = { workspace = true }
 directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
 valset = { workspace = true }
+clients = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
 # the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
