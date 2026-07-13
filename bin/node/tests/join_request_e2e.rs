@@ -106,28 +106,27 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
             })
     });
 
-    // second redeemer: the SAME blob under a fresh identity — the shared-blob
-    // mistake. before the loud-failure fix this spun forever on "redemption
-    // not landed yet" while the member blindly resubmitted the doomed Redeem.
+    // second redeemer: the SAME blob under a FRESH identity — the shared-blob
+    // mistake. every invite is now TARGETED, so `join` refuses the mismatched
+    // local key at the CLI, loudly, BEFORE any node spawns. (the spent-nonce
+    // lobby path this test used to drive is now unreachable — a non-target key
+    // can never announce; the nonce single-use invariant is covered by the
+    // governance redemption rig.)
     cluster.kill(1);
     std::fs::remove_dir_all(&cluster.friend_dir).expect("wipe first redeemer");
-    let second_key = cluster.join_friend(&invite);
-    assert_ne!(second_key, friend_key, "a wiped dir mints a fresh identity");
-    cluster.spawn(1);
-
-    // the member refuses PERMANENTLY (never resubmits the Redeem op) ...
-    cluster.wait_marker(0, "ALREADY-REDEEMED", Duration::from_secs(120));
-    // ... and the joiner stops retrying with the app/operator FATAL marker.
-    let fatal = cluster.wait_marker(1, "FATAL", Duration::from_secs(120));
+    let out = cluster.try_join_friend(&invite);
     assert!(
-        fatal.contains("invite already redeemed"),
-        "the fatal line names the cause: {fatal}"
+        !out.status.success(),
+        "a mismatched-target join must fail loudly at the CLI, not park a node"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("locked to a different key"),
+        "the join names the real problem: {stderr}"
     );
     assert!(
-        fatal.contains("fresh invite"),
-        "the fatal line carries actionable guidance: {fatal}"
+        stderr.contains("fresh invite"),
+        "the refusal carries actionable guidance (ask for a fresh invite): {stderr}"
     );
-    // ... and the process actually DIES — a FATAL print followed by a silent
-    // retry loop is exactly the "joiner waits forever" field symptom.
-    cluster.wait_exit(1, Duration::from_secs(30));
+    let _ = friend_key;
 }

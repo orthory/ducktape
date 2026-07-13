@@ -18,6 +18,19 @@ fn command_output(out: &std::process::Output) -> String {
     )
 }
 
+/// mint (or reuse) `<dir>/identity.key` via the `keygen` verb and return its
+/// pubkey hex — the join code every targeted invite locks to. `join --dir <dir>`
+/// reuses this identity, so the join-side target self-check passes.
+fn keygen(dir: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args(["keygen", "--dir"])
+        .arg(dir)
+        .output()
+        .expect("run keygen");
+    assert!(out.status.success(), "keygen failed:\n{}", command_output(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// grab `n` distinct free localhost ports by holding every listener at once
 /// (sequential bind-drop can hand the same port back twice).
 fn alloc_ports(n: usize) -> Vec<u16> {
@@ -156,9 +169,11 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
         command_output(&init)
     );
 
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -250,9 +265,11 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     reachability::store::save(&storage.join("mesh-state.json"), &mesh)
         .expect("seed mesh-state.json");
 
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -328,9 +345,11 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
 
     // a default founder advertises the overlay ULA (not a routable host), so its
     // WireGuard bootstrap is coordinated-only — no underlay endpoint baked in.
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(

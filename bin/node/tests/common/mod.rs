@@ -188,11 +188,33 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// mint (or reuse) the friend workspace's identity via the `keygen` verb
+    /// and return its pubkey hex — the JOIN CODE the invite locks to.
+    /// `join_friend` reuses this pre-generated identity.
+    pub fn keygen_friend(&self, _idx: usize) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["keygen", "--dir"])
+            .arg(&self.friend_dir)
+            .output()
+            .expect("run keygen");
+        assert!(
+            out.status.success(),
+            "keygen failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// mint an invite LOCKED to the friend's key. Every invite is targeted now,
+    /// so this pre-generates the friend identity (which `join_friend` reuses)
+    /// and passes `--target`.
     pub fn invite(&self) -> String {
+        let target = self.keygen_friend(1);
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .args(["invite", "--config"])
             .arg(cfg)
+            .args(["--target", &target])
             .output()
             .expect("run invite");
         assert!(
@@ -234,8 +256,11 @@ impl NetworkShapeCluster {
             .expect("join-requests prints json")
     }
 
-    pub fn join_friend(&self, invite: &str) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    /// run the `join` verb against the friend workspace WITHOUT asserting
+    /// success — the caller inspects the outcome (a targeted invite refuses a
+    /// mismatched local identity at the CLI, before any node spawns).
+    pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .args([
                 "join",
                 invite,
@@ -251,7 +276,11 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.rpc_ports[1]),
             ])
             .output()
-            .expect("run join");
+            .expect("run join")
+    }
+
+    pub fn join_friend(&self, invite: &str) -> String {
+        let out = self.try_join_friend(invite);
         assert!(
             out.status.success(),
             "join failed:\n{}",
