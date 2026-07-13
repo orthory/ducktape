@@ -15,7 +15,13 @@ import { color, font } from "../theme/tokens";
 import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
-import { channelRailWidth } from "../views/chat/ChatView";
+import {
+  CHANNEL_RAIL_MAX,
+  CHANNEL_RAIL_MIN,
+  CHANNEL_RAIL_WIDTH_VAR,
+  channelRailWidth,
+} from "../views/chat/ChatView";
+import { restorePanelVar } from "./PanelResizer";
 import { BrowserView } from "../views/browser/BrowserView";
 import { HomeView } from "../views/home/HomeView";
 import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
@@ -80,6 +86,13 @@ export function ConsoleShell() {
   // never resets live browser state.
   const browserVisible = state.screen === "browser" && !state.atHome;
   const browserSurfaceVisible = browserVisible && !state.searchOpen;
+
+  // The huddle dock sizes off the rail's width var even on screens where the
+  // chat rail (whose resizer owns the var) isn't mounted — prime it here so a
+  // saved width applies from boot, not from the first chat visit.
+  useEffect(() => {
+    restorePanelVar(CHANNEL_RAIL_WIDTH_VAR, CHANNEL_RAIL_MIN, CHANNEL_RAIL_MAX);
+  }, []);
 
   // ⌘K / Ctrl-K opens the command palette from anywhere. Escape and backdrop
   // clicks close it from within the modal.

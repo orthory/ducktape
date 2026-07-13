@@ -15,7 +15,6 @@ import type { CSSProperties, ReactNode } from "react";
 import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
 import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
-import { highlightLines, langForTag } from "../forge/highlight";
 import type { HlToken } from "../forge/highlight";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { AttachmentChip } from "./AttachmentChip";
@@ -281,7 +280,9 @@ function SpanText({
   return (
     <span style={style}>
       {span.text.split(INLINE_CODE).map((chunk, c) =>
-        chunk.startsWith("`") && chunk.endsWith("`") && chunk.length > 2 ? (
+        // re-test rather than endpoint-check: a bare "```" run starts and ends
+        // with a backtick but was never a captured code token.
+        /^`[^`\n]+`$/.test(chunk) ? (
           <InlineCode key={c} text={chunk.slice(1, -1)} />
         ) : (
           splitDuckRefs(chunk).map((seg, i) =>
@@ -361,22 +362,29 @@ export function RichText({
 // a horizontal scrollbar inside a chat row hides content. A fence tag naming a
 // language the forge viewer bundles gets shiki tokens (same `.code-tok`
 // per-theme colors); highlighting is async, so the plain text paints first.
+// The highlighter is dynamically imported like CodeView's — shiki + grammars
+// must stay in their lazy chunk, out of the console's startup bundle.
+const HIGHLIGHT_MAX_BYTES = 200_000; // same too-large-stays-plain bar as CodeView
+
 function CodeBlock({ lang, text }: { lang: string | null; text: string }) {
-  const langId = lang ? langForTag(lang) : null;
   const [lines, setLines] = useState<HlToken[][] | null>(null);
   useEffect(() => {
-    if (!langId) {
-      setLines(null);
-      return;
-    }
+    setLines(null); // never render a previous fence's tokens over new text
+    if (!lang || text.length > HIGHLIGHT_MAX_BYTES) return;
     let live = true;
-    void highlightLines(text, langId).then((tokens) => {
-      if (live) setLines(tokens);
-    });
+    void import("../forge/highlight")
+      .then(({ highlightLines, langForTag }) => {
+        const langId = langForTag(lang);
+        return langId ? highlightLines(text, langId) : null;
+      })
+      .then((tokens) => {
+        if (live && tokens) setLines(tokens);
+      })
+      .catch(() => {}); // any failure just stays plain text
     return () => {
       live = false;
     };
-  }, [text, langId]);
+  }, [text, lang]);
   return (
     <pre
       style={{

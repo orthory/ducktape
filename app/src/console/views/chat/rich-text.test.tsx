@@ -270,6 +270,28 @@ describe("inline code", () => {
 
     expect(container.textContent).toBe("a ` b");
   });
+
+  it("leaves a bare ``` run as plain text — not a one-backtick chip", () => {
+    const { container } = render(<RichText blocks={para({ text: "a ``` b" })} names={{}} />);
+
+    expect(container.textContent).toBe("a ``` b");
+    expect(container.querySelector("code")).toBeNull();
+  });
+});
+
+describe("fenced code highlighting", () => {
+  it("a known fence tag lazily gains shiki tokens; the text stays intact", async () => {
+    const { container } = render(
+      <RichText blocks={[{ code: { lang: "rust", text: 'fn main() { println!("hi"); }' } }]} names={{}} />,
+    );
+
+    // plain first paint, tokens after the lazy highlighter resolves
+    expect(container.textContent).toContain("fn main()");
+    await waitFor(() => expect(container.querySelector(".code-tok")).toBeTruthy(), {
+      timeout: 5000,
+    });
+    expect(container.textContent).toContain('fn main() { println!("hi"); }');
+  });
 });
 
 describe("duck://files attachment chips (markdown refs)", () => {

@@ -1,5 +1,7 @@
 // The drag math is the contract: pointer delta resizes the panel through the
-// CSS var (clamped), release persists, double-click resets.
+// CSS var (clamped), release persists, double-click resets, arrow keys resize
+// without a pointer. Events target the handle itself — pointer capture routes
+// the whole drag through it.
 
 import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
@@ -22,9 +24,9 @@ const mount = (side: "left" | "right", varName: string) => {
 
 afterEach(() => {
   localStorage.clear();
-  document.documentElement.style.removeProperty("--t-right");
-  document.documentElement.style.removeProperty("--t-left");
-  document.documentElement.style.removeProperty("--t-reset");
+  for (const name of ["--t-right", "--t-left", "--t-reset", "--t-keys"]) {
+    document.documentElement.style.removeProperty(name);
+  }
 });
 
 describe("PanelResizer", () => {
@@ -32,23 +34,40 @@ describe("PanelResizer", () => {
     const handle = mount("right", "--t-right");
 
     fireEvent.pointerDown(handle, { clientX: 10 });
-    fireEvent(window, new MouseEvent("pointermove", { clientX: 60 }));
+    fireEvent.pointerMove(handle, { clientX: 60 });
     expect(varOf("--t-right")).toBe("250px");
 
     // clamp: a huge drag stops at max
-    fireEvent(window, new MouseEvent("pointermove", { clientX: 900 }));
+    fireEvent.pointerMove(handle, { clientX: 900 });
     expect(varOf("--t-right")).toBe("340px");
 
-    fireEvent(window, new MouseEvent("pointerup", { clientX: 60 }));
+    fireEvent.pointerUp(handle, { clientX: 60 });
     expect(localStorage.getItem("--t-right")).toBe("250");
+    expect(handle.getAttribute("aria-valuenow")).toBe("250");
+
+    // the drag ended — a later stray move must not resize
+    fireEvent.pointerMove(handle, { clientX: 500 });
+    expect(varOf("--t-right")).toBe("250px");
   });
 
   it("drags a left-edge handle: -x grows (right-docked panel)", () => {
     const handle = mount("left", "--t-left");
 
     fireEvent.pointerDown(handle, { clientX: 100 });
-    fireEvent(window, new MouseEvent("pointermove", { clientX: 40 }));
+    fireEvent.pointerMove(handle, { clientX: 40 });
     expect(varOf("--t-left")).toBe("260px");
+    fireEvent.pointerCancel(handle, { clientX: 40 });
+    expect(varOf("--t-left")).toBe("260px");
+  });
+
+  it("resizes from the keyboard and persists", () => {
+    const handle = mount("right", "--t-keys");
+
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(varOf("--t-keys")).toBe("216px");
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(varOf("--t-keys")).toBe("200px");
+    expect(localStorage.getItem("--t-keys")).toBe("200");
   });
 
   it("double-click resets to the default and forgets the saved width", () => {

@@ -38,3 +38,13 @@ describe("highlight", () => {
     await expect(highlightLines("hello", "not-a-language")).resolves.toBeNull();
   });
 });
+
+describe("langForTag (chat fences)", () => {
+  it("accepts extension aliases, full language ids, and rejects unknowns", async () => {
+    const { langForTag } = await import("./highlight");
+    expect(langForTag("rs")).toBe("rust");
+    expect(langForTag("rust")).toBe("rust");
+    expect(langForTag("TS")).toBe("typescript");
+    expect(langForTag("brainfuck")).toBeNull();
+  });
+});

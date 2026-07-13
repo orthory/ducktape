@@ -70,6 +70,8 @@ function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (polic
  *  floating huddle dock off the same var, so the two always agree. */
 export const CHANNEL_RAIL_WIDTH = 200;
 export const CHANNEL_RAIL_WIDTH_VAR = "--chat-rail-w";
+export const CHANNEL_RAIL_MIN = 160;
+export const CHANNEL_RAIL_MAX = 340;
 export const channelRailWidth = `var(${CHANNEL_RAIL_WIDTH_VAR}, ${CHANNEL_RAIL_WIDTH}px)`;
 
 /** One rail row. `muted` dims an archived channel — it still enters on click
@@ -154,8 +156,8 @@ function ChannelRail() {
       <PanelResizer
         varName={CHANNEL_RAIL_WIDTH_VAR}
         defaultWidth={CHANNEL_RAIL_WIDTH}
-        min={160}
-        max={340}
+        min={CHANNEL_RAIL_MIN}
+        max={CHANNEL_RAIL_MAX}
         side="right"
       />
       <div
