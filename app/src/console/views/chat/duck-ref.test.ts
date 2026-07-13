@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import { blocksToInput, parseMessageInput } from "./chat-input";
 import {
   fileRefMarkdown,
+  isChannelSeg,
   isFileSeg,
+  isForgeSeg,
   isPageSeg,
   pageRefMarkdown,
   parsePageRefs,
@@ -99,6 +101,24 @@ describe("splitDuckRefs — the unified tokenizer", () => {
     expect(rebuilt).toContain("[not a ref]");
     expect(rebuilt).toContain("[x](https://example.com)");
     expect(rebuilt).toContain("[p](duck://page/ok)");
+  });
+
+  it("chips forge and channel refs; unknown modules stay literal", () => {
+    const segs = splitDuckRefs(
+      "fix in [PR](duck://forge/ducktape/58) discussed in [#general](duck://channel/general#42), " +
+        "see [notes](duck://memory/notes.md)",
+    );
+    expect(segs.filter(isForgeSeg)).toEqual([{ forge: { repo: "ducktape", number: 58 } }]);
+    expect(segs.filter(isChannelSeg)).toEqual([{ channel: { id: "general", seq: 42 } }]);
+    // unknown module: the whole markdown ref stays in the literal run.
+    expect(
+      segs.some((s) => "text" in s && s.text.includes("[notes](duck://memory/notes.md)")),
+    ).toBe(true);
+  });
+
+  it("never chips a gateway host — dotted authorities belong to the browser", () => {
+    const gw = "[site](duck://team.duck/index.html)";
+    expect(splitDuckRefs(gw)).toEqual([{ text: gw }]);
   });
 
   it("parsePageRefs lists distinct page ids in first-seen order", () => {
