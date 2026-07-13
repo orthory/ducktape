@@ -103,14 +103,9 @@ pub(crate) const CHANNEL_LOBBY: u64 = 5;
 /// EVERY mode — an unregistered channel is a protocol violation that kills
 /// the sender's connection — and black-holed where the plane does not run.
 pub(crate) const CHANNEL_REACHABILITY: u64 = 6;
-/// while parked and un-admitted, re-announce every N park-loop attempts
-/// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
-/// survive member restarts (the request queue is in-memory), quiet enough to
-/// stay out of the members' way.
-pub(crate) const LOBBY_ANNOUNCE_EVERY: usize = 5;
-/// the park loop's poll cadence while the joiner still knocks for standing or
-/// has no served boundary yet: fast, because this tick is all that paces the
-/// first sync and the `LOBBY_ANNOUNCE_EVERY` knock counter.
+/// the park loop's poll cadence while the joiner has standing but no served
+/// boundary yet, and the join gate's per-candidate re-send tick (ADR §3.3):
+/// fast, because this tick paces the first sync and the gate's warm-up resend.
 pub(crate) const JOINER_POLL: Duration = Duration::from_secs(2);
 /// a standing, SERVING resident's fallback poll. head-following is wake-driven
 /// (cert-lane traffic nudges the park loop the moment a boundary seals), so
@@ -206,6 +201,21 @@ pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.
 pub(crate) const SUBMIT_HOLD: Duration = Duration::from_secs(10);
+
+/// the joiner's per-candidate gate budget (ADR §3.3): how long the joiner
+/// blocks on ONE candidate member's authoritative reply before failing over to
+/// the next. wider than the member's settle budget so a slow-but-working member
+/// is preferred over churning candidates. three rounds over the candidate list,
+/// then the join is a fail-stop.
+pub(crate) const GATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// the join gate's settle budget (ADR §3.2): a gating member holds the joiner's
+/// pending `Admitted`/`Rejected` reply against its submitted `Redeem` frame for
+/// this long. if the frame has not drained by then the member answers
+/// `Rejected{ Busy, terminal: false }` and the joiner fails over to another
+/// member. wider than `SUBMIT_HOLD` because a fresh joiner's first block can
+/// wait on mesh warm-up.
+pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// the five channels epoch `e`'s engine uses: vote, certificate, resolver, the
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up

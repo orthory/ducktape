@@ -31,6 +31,9 @@ pub(super) fn classify(log: &str) -> PhaseReport {
     const MARKERS: &[(&str, &str)] = &[
         ("parked", "joiner mode:"),
         ("parked", "joining:"),
+        // the synchronous join gate (ADR §3.3) prints this the instant a member
+        // answers Admitted — the authoritative admission, ahead of any sync.
+        ("admitted", "ADMITTED at height"),
         ("admitted", "admitted at epoch"),
         ("admitted", "resident: standing granted"),
         ("synced", "synced app_hash="),
@@ -185,6 +188,21 @@ mod tests {
         let report = classify(log);
         assert_eq!(report.phase, "synced");
         assert!(report.detail.as_deref().unwrap_or("").contains("app_hash"));
+    }
+
+    #[test]
+    fn classify_gate_admitted_then_synced() {
+        // the synchronous join gate (ADR §3.3): a tokened joiner prints
+        // "ADMITTED at height N" the instant a member answers Admitted, then
+        // pre-syncs. the admitted phase must show between parked and synced.
+        let admitted = "[node ab] joiner mode: parking on the mesh\n\
+                        [node ab] invite announce sent to member 11223344 — awaiting the gate (round 1)\n\
+                        [node ab] ADMITTED at height 7 by member 55667788\n";
+        assert_eq!(classify(admitted).phase, "admitted");
+        let synced = format!(
+            "{admitted}[node ab] resident: pre-synced boundary 9 app_hash=deadbeef\n"
+        );
+        assert_eq!(classify(&synced).phase, "synced");
     }
 
     #[test]

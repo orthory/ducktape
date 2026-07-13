@@ -147,7 +147,6 @@ pub(crate) async fn run(
         invite_wireguard,
         invite_fronts,
         voice_requests,
-        workspace.clone(),
         overlay_slot.clone(),
     )
     .await;

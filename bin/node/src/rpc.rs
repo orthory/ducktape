@@ -15,8 +15,24 @@ pub(crate) enum RpcRequest {
     /// the verified join requests parked joiners announced to THIS member —
     /// the queue the approve button (or `invite-accept`) settles.
     JoinRequests,
+    /// the node-owned join state (ADR §6): the ONE authoritative source the
+    /// app renders instead of parsing daemon.log markers. derived from gate
+    /// progress + committed chain state, never a scattered guess.
+    JoinState,
     /// graceful stop: replies ok, then exits 0 after the current pump turn.
     Shutdown,
+}
+
+/// the node-owned join-state projection (ADR §6). `phase` uses the app's
+/// onboarding vocabulary so the console renders it verbatim:
+/// `parked | admitted | synced | promoted`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JoinStateView {
+    pub(crate) phase: String,
+    pub(crate) detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) height: Option<u64>,
 }
 
 /// one verified, unapproved join announce (node-local, in-memory; the parked
@@ -49,6 +65,8 @@ pub(crate) struct RpcReply {
     pub(crate) status: Option<RpcStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) join_requests: Option<Vec<JoinRequestView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) join_state: Option<JoinStateView>,
 }
 
 #[derive(serde::Serialize)]
@@ -66,6 +84,7 @@ impl RpcReply {
             reply_hex: None,
             status: None,
             join_requests: None,
+            join_state: None,
         }
     }
     pub(crate) fn err(msg: impl Into<String>) -> Self {
@@ -75,6 +94,7 @@ impl RpcReply {
             reply_hex: None,
             status: None,
             join_requests: None,
+            join_state: None,
         }
     }
 }

@@ -35,7 +35,7 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     // the joiner's announce reaches the founder, which redeems it — NO verb
     // runs anywhere in this window.
     cluster.wait_marker(1, "invite announce sent to member", Duration::from_secs(90));
-    cluster.wait_marker(0, "invite redemption submitted:", Duration::from_secs(90));
+    cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
 
     // the redemption lands in consensus state: the friend holds RESIDENT
     // standing (a full node), while the quorum still seats only the founder.
@@ -94,7 +94,7 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     let invite = cluster.invite();
     let friend_key = cluster.join_friend(&invite);
     cluster.spawn(1);
-    cluster.wait_marker(0, "invite redemption submitted:", Duration::from_secs(90));
+    cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
     let expected = vec![common::unhex(&friend_key)];
     poll_until("the redemption to grant resident standing", CONVERGE, || {
         cluster

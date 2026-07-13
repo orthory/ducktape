@@ -180,6 +180,43 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
 }
 
 #[tokio::test]
+async fn a_client_role_intro_neither_installs_nor_tunnels() {
+    // a cryptographically VALID intro whose token grants the `Client` role:
+    // verify passes (role is signature-covered), but only `Resident` is
+    // redeemable this generation, so the intro gate (ADR §3.1 V8) must refuse
+    // the tunnel — a doomed join never obtains one.
+    let issuer = ed25519::PrivateKey::from_seed(1);
+    let joiner = ed25519::PrivateKey::from_seed(2);
+    let token = mint_invite_token(
+        &issuer,
+        BINDING,
+        &joiner.public_key(),
+        crate::config::InviteRole::Client,
+        u64::MAX,
+    );
+    let bytes = lobby::encode_intro(&lobby::intro_request(&joiner, BINDING, &token, [9u8; 32]));
+
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
+    let weak = cmd_tx.downgrade();
+    let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let store = acked.clone();
+    let alive = handle_intro(&bytes, src(), BINDING, "test", IntroPath::Direct, &weak, |b| {
+        store.lock().unwrap().push(b);
+        async {}
+    })
+    .await;
+    assert!(alive);
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "no tunnel install for a non-Resident role"
+    );
+    let acked = acked.lock().unwrap();
+    let ack = lobby::decode_intro_ack(&acked[0]).expect("the refusal is acked");
+    assert!(!ack.installed);
+    assert!(ack.detail.contains("not redeemable"), "{}", ack.detail);
+}
+
+#[tokio::test]
 async fn a_dead_plane_channel_stops_the_loop() {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
     let weak = cmd_tx.downgrade();

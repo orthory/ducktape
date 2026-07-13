@@ -213,6 +213,58 @@ own plan (likely: client ACL plane → client-mode noded tunnel/proxy → app
 remote-workspace UX), written after the invite-plane PRs land, since it
 builds on Design 3's role field.
 
+## Design 5 — Synchronous join gate (PR4, user-requested 2026-07-13)
+
+The join flow today is eventually-consistent: the joiner fire-and-retries an
+advisory announce and its authoritative signal is polled state (manifest
+watching, parking bails). That indirection is the root of the fail-loud bug
+class PR1 patched. Once Design 3 lands, every deterministic reject is
+decidable by a single member at handshake time — so the join becomes a GATE:
+
+- Member validates the announce fully (crypto, target == joiner, expiry,
+  spent nonce, issuer in view) and REJECTS inline with a reason — no tunnel,
+  no lobby residence for a doomed join. The intro path runs the same checks
+  before installing a tunnel peer.
+- On pass, the member submits `Redeem` and awaits the frame's consensus fate
+  (the relay lane already reports settle), then replies authoritatively:
+  `Admitted { height }` or `Rejected { reason }`.
+- The joiner BLOCKS on that reply with a bounded wait (~30s, a few blocks),
+  fails over across members a bounded number of rounds, then exits FATAL.
+  It enters statesync already holding standing; parked-polling remains only
+  for the restart/restore path.
+
+**No statesync before admission (user mandate, 2026-07-13):** pre-admission,
+a joiner runs ONLY the gate protocol — no manifest polling, no sync client,
+no boundary fetches. Admission detection IS the gate's `Admitted` reply, not
+polled chain state (today's park loop polls the manifest to notice its own
+admission — that disappears). And the boundary is enforced on BOTH sides,
+fail-closed: members refuse statesync/manifest service to any key without
+committed standing (validator/resident), so a valid invite blob alone —
+even targeted — leaks zero chain state before consensus grants standing.
+The lobby identity carries lobby traffic only. Exception: a node with
+PERSISTED standing syncing after a restart is the restore path, not a join —
+it keeps its current behavior.
+
+**One source of truth for join state (user-reported confusion, 2026-07-13):**
+today admission state is scattered across five independent signals — app-side
+log-marker classification (`phase.rs`), members' in-memory `join_requests`
+queues, the workspace registry's join-time `member` flag, the joiner's own
+manifest polling, and leftover on-disk invite files — and surfaces disagree
+(observed: a joined network rendering as "admission not claimed"). The gate
+therefore ships with a node-owned join state machine as the ONLY source:
+`Unjoined → GateInProgress(step) → Admitted(height) → Synced → Promoted |
+Rejected(reason)`, derived solely from gate progress + committed chain state,
+exposed via one `join-state` RPC. The app's daemon.log phase classification
+is RETIRED; JoinProgress, pending-join surfaces, and node-page banners all
+render the RPC. The registry's cached `member` flag is dropped or refreshed
+from the same RPC; a consumed invite token file is cleaned up at Admitted.
+The reported joined-but-unclaimed symptom becomes a PR4 QA repro case.
+
+The only irreducible asynchrony is block-commit latency (seconds), wrapped
+inside the bounded handshake. PR1's fatal-reply machinery becomes the gate's
+reject half verbatim. Detailed plan written after PR3 merges (the gate needs
+target/role/expiry checks in the token).
+
 ## Delivery
 
 Order, all targeting `dev`, each from its own worktree:

@@ -71,6 +71,25 @@ where
         }
         return true;
     }
+    // V8 (ADR §3.1): role supported. only `Resident` is redeemable this
+    // generation; a `Client` token must not obtain a tunnel it can never
+    // redeem (the lobby gate would refuse it terminally at Phase B anyway —
+    // refuse here so a doomed join never gets a tunnel at all, R2). the raw
+    // role byte is signature-covered (verify proved it) and any INVALID byte
+    // was already rejected by `verify_intro`, so this only splits Resident
+    // from Client. spent (V6) and issuer-in-valset (V7) need committed state
+    // the transport plane does not hold — those stay enforced at Phase B.
+    if msg.role != config::InviteRole::Resident.as_u8() {
+        if path == IntroPath::Direct {
+            ack(ack_bytes(
+                false,
+                "this invite role is not redeemable yet — the thin-client plane lands separately"
+                    .into(),
+            ))
+            .await;
+        }
+        return true;
+    }
     let Some(cmds) = cmds.upgrade() else {
         return false;
     };
