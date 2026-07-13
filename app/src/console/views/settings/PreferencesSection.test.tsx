@@ -72,9 +72,7 @@ describe("PreferencesSection theme", () => {
   it("toggles the color theme and reflects its checked state", () => {
     const { toggleTheme } = renderPreferences({ theme: "light" });
 
-    const theme = screen.getByRole("switch", {
-      name: "Toggle theme notifications",
-    });
+    const theme = screen.getByRole("switch", { name: "Toggle dark mode" });
     expect(theme).toHaveAttribute("aria-checked", "false");
 
     fireEvent.click(theme);
