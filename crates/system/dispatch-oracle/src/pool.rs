@@ -22,15 +22,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use capability_host::{ProviderSet, RunCancellation};
-use futures::future::{BoxFuture, Either, select};
+use futures::future::{select, BoxFuture, Either};
 use host::worker::{WorkOutcome, Worker};
 use sdk::{Event, Msg};
 use tokio::sync::Semaphore;
 
-use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
+use crate::provision::{assemble_runner_result, bind_workspace, SharedProvisioner, WorkspaceSpec};
 use crate::{
-    AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
-    oracle_result_with_usage, renew_lease,
+    attempt_output, clean_error, gate, oracle_result_with_usage, renew_lease, AttemptOutput,
+    ExecJob, Gated, ResourceLedger,
 };
 
 /// how many provider runs may execute concurrently unless
@@ -168,6 +168,10 @@ pub struct DispatchPool {
     /// caps concurrent provider runs; acquired INSIDE the spawned task so
     /// over-cap work queues there, never on the host loop.
     semaphore: Arc<Semaphore>,
+    /// Caps the full lifetime of dedicated teardown owners, including late
+    /// workspace cleanup and result delivery after the provider permit is free.
+    /// The bound allows one late tail plus one provider per concurrency slot.
+    owner_semaphore: Arc<Semaphore>,
     /// attempts executing locally right now. a redelivered `WorkerRequest`
     /// for an in-flight attempt is a claimed skip — never a second child
     /// process for the same paid call. pruned when the attempt's result has
@@ -218,12 +222,15 @@ impl DispatchPool {
         limit: usize,
         capacity: BTreeMap<String, u64>,
     ) -> Self {
+        let limit = limit.max(1);
+        let owner_limit = limit.checked_mul(2).unwrap_or(limit);
         Self {
             providers,
             node_key,
             spawn,
             deliver,
-            semaphore: Arc::new(Semaphore::new(limit.max(1))),
+            semaphore: Arc::new(Semaphore::new(limit)),
+            owner_semaphore: Arc::new(Semaphore::new(owner_limit)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             provisioner: None,
             ledger: Arc::new(ResourceLedger::new(capacity)),
@@ -260,6 +267,7 @@ impl DispatchPool {
         let providers = self.providers.clone();
         let deliver = self.deliver.clone();
         let semaphore = self.semaphore.clone();
+        let owner_semaphore = self.owner_semaphore.clone();
         let inflight = self.inflight.clone();
         let ledger = self.ledger.clone();
         let provisioner = self.provisioner.clone();
@@ -292,9 +300,21 @@ impl DispatchPool {
                             }
                             running.reservation = Some(reservation);
                         }
-                        // over-cap runs queue HERE, on their own task. the heartbeat
-                        // below already runs while they wait, so a healthy local
-                        // queue does not lose its lease before execution starts.
+                        // Bound the whole dedicated-owner lifetime separately from
+                        // provider concurrency. A completed provider may release its
+                        // permit before late commit/cleanup/delivery, but it keeps this
+                        // owner permit until the dedicated future actually exits.
+                        let owner_permit = tokio::select! {
+                            permit = owner_semaphore.acquire_owned() => {
+                                permit.expect("owner semaphore is never closed")
+                            }
+                            _ = cancellation.cancelled() => {
+                                return Err("attempt cancelled".into());
+                            }
+                        };
+                        // over-cap providers queue HERE, on their own task. the
+                        // heartbeat below already runs while they wait, so a healthy
+                        // local queue does not lose its lease before execution starts.
                         let permit = tokio::select! {
                             permit = semaphore.acquire_owned() => {
                                 permit.expect("run semaphore is never closed")
@@ -321,7 +341,7 @@ impl DispatchPool {
                                 .take()
                                 .expect("an admitted attempt owns its ledger reservation")
                         };
-                        Ok((reservation, permit))
+                        Ok((reservation, permit, owner_permit))
                     };
                     let heartbeat_deliver = deliver.clone();
                     let heartbeat_saga = job.saga_id.clone();
@@ -339,7 +359,7 @@ impl DispatchPool {
                         Either::Right(_) => unreachable!("lease heartbeat loop never completes"),
                     }
                 };
-                let (reservation, permit) = match admission {
+                let (reservation, permit, owner_permit) = match admission {
                     Ok(admission) => admission,
                     Err(error) => {
                         settle_attempt(&inflight, &key, &job, Err(error), None, &deliver).await;
@@ -356,6 +376,7 @@ impl DispatchPool {
                     SpawnKind::TeardownOwner,
                     Box::pin(async move {
                         let _attempt_guard = attempt_owner;
+                        let _owner_permit = owner_permit;
                         let owned_reservation = reservation;
                         let run = async {
                             // Re-resolve inside the owner: ProviderSet is immutable for
@@ -401,10 +422,9 @@ impl DispatchPool {
                                     .await;
                             }
                         };
-                        // `run` is declared after `owned_reservation`, so destroying
-                        // this future drops the live provider/workspace owner first.
-                        // Its fail-closed Drop completes exact teardown before the
-                        // ledger reservation can be released.
+                        // `run` is declared after both admission guards, so destroying
+                        // this future drops the live provider/workspace owner first,
+                        // then releases the ledger reservation, then the owner slot.
                         futures::pin_mut!(run, heartbeat);
                         let outcome = match select(run, heartbeat).await {
                             Either::Left((outcome, _)) => outcome,
@@ -751,15 +771,15 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::Condvar;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Condvar;
     use std::time::Duration;
 
     use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
-    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
+    use dispatch::{encode_work_spec, WorkSpec, WORK_SPEC_KIND};
     use futures::StreamExt as _;
     use saga::{
-        SagaMsg, WorkerControl, WorkerRequest, encode_worker_control, encode_worker_request,
+        encode_worker_control, encode_worker_request, SagaMsg, WorkerControl, WorkerRequest,
     };
 
     fn spec_toml(tag: &str) -> capability_host::CapabilitySpec {
@@ -1324,6 +1344,125 @@ format = "text"
         .await
         .expect("running attempt finishes and queued cancellation prunes");
         assert_eq!(owners.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hung_commits_cap_teardown_owners_after_one_overlap() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let owners = Arc::new(AtomicUsize::new(0));
+        let spawn: SpawnFn = Arc::new({
+            let owners = owners.clone();
+            move |kind, future| {
+                if kind == SpawnKind::TeardownOwner {
+                    owners.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::spawn(future);
+            }
+        });
+        let deliver: DeliverFn = Arc::new(|_| Box::pin(async {}));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            Default::default(),
+        )
+        .with_provisioner(Arc::new(HungCommitProvisioner { cleaned }));
+
+        pool.run(&effect_for("hung-commit-1", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first provider starts");
+        tokio::time::sleep(workspace_step_timeout() + Duration::from_millis(50)).await;
+
+        pool.run(&effect_for("hung-commit-2", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second provider overlaps the first commit tail");
+        tokio::time::sleep(workspace_step_timeout() + Duration::from_millis(50)).await;
+
+        pool.run(&effect_for("hung-commit-3", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(owners.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            2,
+            "released provider permits must not bypass the bounded overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_deliveries_cap_teardown_owners_after_one_overlap() {
+        let (providers, probes) = slow_providers(Duration::from_millis(1), false);
+        let owners = Arc::new(AtomicUsize::new(0));
+        let spawn: SpawnFn = Arc::new({
+            let owners = owners.clone();
+            move |kind, future| {
+                if kind == SpawnKind::TeardownOwner {
+                    owners.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::spawn(future);
+            }
+        });
+        let delivery_started = Arc::new(tokio::sync::Notify::new());
+        let deliver: DeliverFn = Arc::new({
+            let delivery_started = delivery_started.clone();
+            move |_| {
+                let delivery_started = delivery_started.clone();
+                Box::pin(async move {
+                    delivery_started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            }
+        });
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            Default::default(),
+        );
+
+        pool.run(&effect_for("blocked-delivery-1", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delivery_started.notified())
+            .await
+            .expect("the first owner reaches delivery");
+        pool.run(&effect_for("blocked-delivery-2", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delivery_started.notified())
+            .await
+            .expect("the second owner overlaps the first blocked delivery");
+        pool.run(&effect_for("blocked-delivery-3", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        assert_eq!(owners.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            2,
+            "blocked deliveries must retain the bounded owner slots"
+        );
     }
 
     #[tokio::test]
