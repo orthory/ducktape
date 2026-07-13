@@ -208,6 +208,11 @@ impl WorkspaceReceipt {
 /// OUTSIDE `<storage>` (D7), with zero external network (W2). injected by the
 /// node binary, where duckfs-client + the actor lane are reachable. an
 /// embedder that never wires one keeps today's accept-only behavior.
+///
+/// Dispatch may keep awaiting a slow provision future after the attempt's step
+/// threshold or cancellation. It retains both this provisioner and the
+/// [`WorkspaceSpec`], then cleans a workspace that materializes late before
+/// releasing the attempt's aggregate resource reservation.
 #[async_trait::async_trait]
 pub trait WorkspaceProvisioner: Send + Sync {
     async fn provision(
@@ -218,6 +223,10 @@ pub trait WorkspaceProvisioner: Send + Sync {
 
 /// a live materialized workspace the pool binds onto a [`RunContext`],
 /// commits, and cleans up.
+///
+/// A slow commit can likewise cross its step threshold: dispatch releases the
+/// provider permit, but awaits it and invokes [`Self::cleanup`] exactly once
+/// before releasing the attempt's aggregate resource reservation.
 #[async_trait::async_trait]
 pub trait ProvisionedWorkspace: Send + Sync {
     /// the rw mount root → `ctx.workdir_override`.

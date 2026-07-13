@@ -13,11 +13,10 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
+use dispatch_oracle::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::{NodeCommand, ORACLE_ORIGIN};
-
 
 fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
     Arc::new(move |ctx, line| {
@@ -65,6 +64,7 @@ where
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
     let providers = capability_host::discover(
+        ORACLE_ORIGIN,
         agent_dirs,
         Some(run_output_sink(run_output)),
         // the embedded daemon stays Direct this phase: it exposes no operator
@@ -77,10 +77,20 @@ where
     // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
 
-    // one supervised node for the pool; each run spawns as its own child.
+    // Queue waiters share the ordinary runtime. Only resource-admitted runs
+    // get a supervised dedicated owner because their fail-closed Drop may
+    // synchronously reap an exact process tree/container.
     let exec_ctx = context.child("oracle_pool");
-    let spawn: SpawnFn = Box::new(move |fut| {
-        exec_ctx.child("oracle_run").spawn(move |_ctx| fut);
+    let spawn: SpawnFn = Arc::new(move |kind, fut| {
+        let run = exec_ctx.child("oracle_run");
+        match kind {
+            SpawnKind::Queued => {
+                run.spawn(move |_ctx| fut);
+            }
+            SpawnKind::TeardownOwner => {
+                run.dedicated().spawn(move |_ctx| fut);
+            }
+        }
     });
 
     let deliver: DeliverFn = Arc::new(move |msg| {

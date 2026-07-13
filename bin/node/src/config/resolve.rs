@@ -126,7 +126,7 @@ pub struct Resolved {
     /// default) is the plain host spawn; `Podman` sandboxes every run AND
     /// makes this node announce `sandbox_capacity`.
     pub sandbox: SandboxBackend,
-    /// the numeric capacity a `Podman` node announces alongside its tags
+    /// the numeric capacity a sandboxed node announces alongside its tags
     /// (probed host totals, per-key overrides winning). EMPTY for a `Direct`
     /// node — a direct spawn makes no capacity promise. This one value is both
     /// the dispatch pool's ledger and the capability announce's resources.
@@ -155,6 +155,13 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
         }
         capability::validate_resources(&capacity)
             .map_err(|e| format!("sandbox capacity: {e}"))?;
+        for dimension in ["cores", "mem_gb"] {
+            if !capacity.contains_key(dimension) {
+                return Err(format!(
+                    "sandbox capacity: could not determine {dimension}; set sandbox_{dimension} explicitly"
+                ));
+            }
+        }
         Ok(capacity)
     };
     match raw.sandbox.as_deref() {
@@ -171,7 +178,14 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
                 .sandbox_image
                 .clone()
                 .unwrap_or_else(|| "ghcr.io/cirruslabs/macos-sonoma-base:latest".into());
-            Ok((SandboxBackend::Tart { image }, probed(raw)?))
+            let capacity = probed(raw)?;
+            if capacity.get("cores").copied().unwrap_or(0) < capability_host::TART_MIN_CORES {
+                return Err(format!(
+                    "sandbox capacity: Tart requires at least {} cores",
+                    capability_host::TART_MIN_CORES
+                ));
+            }
+            Ok((SandboxBackend::Tart { image }, capacity))
         }
         Some(other) => Err(format!(
             "sandbox: {other:?} is not \"direct\", \"podman\", or \"tart\""
@@ -1090,9 +1104,18 @@ mod tests {
             }
         );
         assert!(
-            tart.sandbox_capacity.contains_key("cores"),
-            "probed capacity rides tart too"
+            ["cores", "mem_gb"]
+                .iter()
+                .all(|dimension| tart.sandbox_capacity.contains_key(*dimension)),
+            "both enforceable capacity dimensions ride Tart"
         );
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}sandbox = \"tart\"\nsandbox_cores = 1\n"),
+        )
+        .expect("write");
+        let err = resolve(&dir.join("node.toml")).expect_err("undersized Tart capacity refused");
+        assert!(err.contains("requires at least 2 cores"), "{err}");
 
         // a zero capacity override is a loud BOOT error, not an announce-time
         // module reject: the consensus rule (validate_resources) runs at this

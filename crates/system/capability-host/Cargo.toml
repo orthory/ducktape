@@ -25,3 +25,6 @@ sha2 = { workspace = true }
 # defaults + operator dir), not Rust — see src/spec.rs and docs/records/specs/capability-spec.md.
 toml = "0.8"
 tokio = { workspace = true, features = ["process", "io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

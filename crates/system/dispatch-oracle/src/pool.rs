@@ -17,20 +17,20 @@
 //! ([`DeliverFn`]) are the embedding host's business (bin/node's select-loop
 //! mpsc lane, bin/noded's command channel).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capability_host::ProviderSet;
-use futures::future::{BoxFuture, Either, select};
+use capability_host::{ProviderSet, RunCancellation};
+use futures::future::{select, BoxFuture, Either};
 use host::worker::{WorkOutcome, Worker};
 use sdk::{Event, Msg};
 use tokio::sync::Semaphore;
 
-use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
+use crate::provision::{assemble_runner_result, bind_workspace, SharedProvisioner, WorkspaceSpec};
 use crate::{
-    AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
-    oracle_result_with_usage, renew_lease,
+    attempt_output, clean_error, gate, oracle_result_with_usage, renew_lease, AttemptOutput,
+    ExecJob, Gated, ResourceLedger,
 };
 
 /// how many provider runs may execute concurrently unless
@@ -45,10 +45,20 @@ fn lease_renew_interval() -> Duration {
     }
 }
 
-/// hand one Send future to the host's background lane. the pool never
-/// blocks on it; over-cap runs queue INSIDE their spawned task (on the
-/// semaphore), so spawning is always immediate.
-pub type SpawnFn = Box<dyn Fn(BoxFuture<'static, ()>)>;
+/// Which host execution lane owns a pool future.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnKind {
+    /// Cheap reservation/semaphore waiting. This lane may share runtime workers.
+    Queued,
+    /// An admitted run whose Drop may synchronously prove child/container absence.
+    TeardownOwner,
+}
+
+/// Hand one Send future to the appropriate supervised host lane. Hosts must
+/// isolate [`SpawnKind::TeardownOwner`] from shared runtime workers. The pool
+/// only requests that lane after both resource admission and a provider permit,
+/// so its dedicated owner count is bounded by the configured run concurrency.
+pub type SpawnFn = Arc<dyn Fn(SpawnKind, BoxFuture<'static, ()>) + Send + Sync>;
 
 /// deliver one completed `OracleResult` op to the host's submit lane. runs
 /// on the spawned task, so it may await (a bounded channel send, a command
@@ -77,8 +87,77 @@ fn run_key_for(saga_id: &str) -> String {
 /// idempotency key the saga itself dedups results on.
 type AttemptKey = (String, u32);
 
-/// Production worker for dispatch `WorkSpec` saga work-order events: gate inline,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttemptState {
+    Running,
+    Cancelling,
+    Delivering,
+}
+
+struct RunningAttempt {
+    state: AttemptState,
+    cancellation: RunCancellation,
+    reservation: Option<crate::ReservationGuard>,
+}
+
+type RunningAttempts = Arc<Mutex<HashMap<AttemptKey, RunningAttempt>>>;
+
+/// Cloneable host-local cancellation handle. Consensus cancellation reaches a
+/// validator through a worker-control effect; a resident uses the same handle
+/// after committed state confirms an attempt disappeared twice.
+#[derive(Clone)]
+pub struct AttemptControl {
+    node_key: Vec<u8>,
+    attempts: RunningAttempts,
+}
+
+impl AttemptControl {
+    /// Cancel exactly this node's matching live attempt. The map is the single
+    /// completion/cancel linearizer: only `Running` can become `Cancelling`.
+    /// The task retains its resource reservation until provider teardown and
+    /// any late workspace work has settled and cleaned up.
+    pub fn cancel(&self, saga_id: &str, attempt: u32, assignee: &[u8]) -> bool {
+        if assignee != self.node_key {
+            return false;
+        }
+        let mut attempts = self.attempts.lock().expect("attempts lock");
+        let Some(running) = attempts.get_mut(&(saga_id.to_string(), attempt)) else {
+            return false;
+        };
+        if running.state != AttemptState::Running {
+            return false;
+        }
+        running.state = AttemptState::Cancelling;
+        running.cancellation.cancel();
+        true
+    }
+}
+
+/// Panic/shutdown-safe finalizer for one spawned attempt. A key cannot be
+/// reinserted while this guard's map entry exists, so no generation is needed.
+struct AttemptTaskGuard {
+    key: AttemptKey,
+    attempts: RunningAttempts,
+}
+
+impl Drop for AttemptTaskGuard {
+    fn drop(&mut self) {
+        let removed = self
+            .attempts
+            .lock()
+            .expect("attempts lock")
+            .remove(&self.key);
+        drop(removed);
+    }
+}
+
+/// Production worker for dispatch `WorkSpec` saga events: gate inline,
 /// execute on a spawned task, submit the result through the delivery lane.
+///
+/// Providers installed in this pool must observe [`RunCancellation`] in their
+/// [`capability_host::RunContext`], terminate and wait their exact child process
+/// tree/container, and only then resolve. The pool intentionally retains the
+/// attempt and its resource reservation until that provider future resolves.
 pub struct DispatchPool {
     providers: Arc<ProviderSet>,
     /// this node's external submit key — compared against a request's
@@ -89,11 +168,15 @@ pub struct DispatchPool {
     /// caps concurrent provider runs; acquired INSIDE the spawned task so
     /// over-cap work queues there, never on the host loop.
     semaphore: Arc<Semaphore>,
+    /// Caps the full lifetime of dedicated teardown owners, including late
+    /// workspace cleanup and result delivery after the provider permit is free.
+    /// The bound allows one late tail plus one provider per concurrency slot.
+    owner_semaphore: Arc<Semaphore>,
     /// attempts executing locally right now. a redelivered `WorkerRequest`
     /// for an in-flight attempt is a claimed skip — never a second child
     /// process for the same paid call. pruned when the attempt's result has
     /// been handed to the delivery lane.
-    inflight: Arc<Mutex<HashSet<AttemptKey>>>,
+    inflight: RunningAttempts,
     /// materializes/commits/cleans a per-run workspace — injected by the node
     /// binary, where duckfs-client + the actor lane are reachable. `None`
     /// (the default) keeps the accept-only degrade: the plan is surfaced but
@@ -101,11 +184,10 @@ pub struct DispatchPool {
     /// node binaries wire a real provisioner, so this is LIVE on every
     /// production agent run.
     provisioner: Option<SharedProvisioner>,
-    /// the host-local load ledger: `gate()` checks `fits()` inline on both
-    /// the own-lease and announcement paths; `spawn_exec` reserves a run's
-    /// demands before the semaphore acquire, releasing via RAII guard held
-    /// to the spawned task's end. `Arc`-wrapped so the spawned task can hold
-    /// its own cheap clone alongside `providers`.
+    /// the host-local load ledger: announcements claim only current fit;
+    /// assigned work that fits total capacity queues in `spawn_exec`, then
+    /// reserves before the semaphore acquire. `Arc`-wrapped so the spawned
+    /// task can hold its own cheap clone alongside `providers`.
     ledger: Arc<ResourceLedger>,
 }
 
@@ -140,13 +222,16 @@ impl DispatchPool {
         limit: usize,
         capacity: BTreeMap<String, u64>,
     ) -> Self {
+        let limit = limit.max(1);
+        let owner_limit = limit.checked_mul(2).unwrap_or(limit);
         Self {
             providers,
             node_key,
             spawn,
             deliver,
-            semaphore: Arc::new(Semaphore::new(limit.max(1))),
-            inflight: Arc::new(Mutex::new(HashSet::new())),
+            semaphore: Arc::new(Semaphore::new(limit)),
+            owner_semaphore: Arc::new(Semaphore::new(owner_limit)),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             provisioner: None,
             ledger: Arc::new(ResourceLedger::new(capacity)),
         }
@@ -169,93 +254,240 @@ impl DispatchPool {
         self.inflight.lock().expect("inflight lock").len()
     }
 
+    pub fn attempt_control(&self) -> AttemptControl {
+        AttemptControl {
+            node_key: self.node_key.clone(),
+            attempts: self.inflight.clone(),
+        }
+    }
+
     /// spawn one gated job. the returned future owns everything it needs
     /// (`Arc`s all the way down), so the pool itself never blocks on it.
-    fn spawn_exec(&self, key: AttemptKey, job: ExecJob) {
+    fn spawn_exec(&self, key: AttemptKey, cancellation: RunCancellation, job: ExecJob) {
         let providers = self.providers.clone();
         let deliver = self.deliver.clone();
         let semaphore = self.semaphore.clone();
+        let owner_semaphore = self.owner_semaphore.clone();
         let inflight = self.inflight.clone();
-        let provisioner = self.provisioner.clone();
         let ledger = self.ledger.clone();
-        (self.spawn)(Box::pin(async move {
-            // reserve BEFORE the semaphore acquire: capacity was already
-            // promised at gate time, so a run queued behind the cap still
-            // holds its share while it waits. held to the end of THIS task
-            // (the whole async block) via the guard's Drop — every exit path
-            // (ok, error, panic-unwind) releases. demandless jobs (empty
-            // `job.demands`) reserve nothing: `reserve` is a no-op on the
-            // legacy path.
-            let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
-            let _reservation = ledger.reserve(&reservation_key, &job.demands);
-            let run = async {
-                // over-cap runs queue HERE, on their own task. the heartbeat
-                // below already runs while they wait, so a healthy local
-                // queue does not lose its lease before execution starts.
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("run semaphore is never closed");
-                // re-resolve by tag inside the task: the gate already proved
-                // the capability resolves, and a provider surface is
-                // immutable for the process lifetime — this is just how the
-                // borrow crosses.
-                match providers.resolve(&job.capability) {
-                    // the envelope step runs on the spawned task too. its errors
-                    // are the run's result: a saga Err, never a silent fallback.
-                    Ok(provider) => {
-                        match crate::envelope::prepare(&job.input).await {
-                            Ok(mut prepared) => {
-                                // the live-output registry key: the dispatch_id half of
-                                // the saga id, exactly what the app's PendingRun rows
-                                // expose — set before execute so BOTH the dormant and
-                                // provisioned paths carry it into provider.run.
-                                prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
-                                // the run's numeric demands ride into RunContext so a
-                                // Podman-backed provider can enforce them as container
-                                // limits; a Direct backend ignores them.
-                                prepared.ctx.limits = job.demands.clone();
-                                execute(&job, prepared, provider, provisioner.as_ref())
-                                    .await
-                                    .map_err(clean_error)
+        let provisioner = self.provisioner.clone();
+        let executing_node = capability_host::execution_node_id(&self.node_key);
+        let owner_spawn = self.spawn.clone();
+        let attempt_guard = AttemptTaskGuard {
+            key: key.clone(),
+            attempts: inflight.clone(),
+        };
+        (self.spawn)(
+            SpawnKind::Queued,
+            Box::pin(async move {
+                let attempt_owner = attempt_guard;
+                let admission = {
+                    let admission = async {
+                        let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
+                        let Some(reservation) = ledger
+                            .reserve_when_available(&reservation_key, &job.demands, &cancellation)
+                            .await
+                        else {
+                            return Err("attempt cancelled while waiting for resources".into());
+                        };
+                        {
+                            let mut attempts = inflight.lock().expect("attempts lock");
+                            let Some(running) = attempts.get_mut(&key) else {
+                                return Err("attempt disappeared before resource admission".into());
+                            };
+                            if running.state != AttemptState::Running {
+                                return Err("attempt cancelled while waiting for resources".into());
                             }
-                            Err(e) => Err(clean_error(e)),
+                            running.reservation = Some(reservation);
                         }
+                        // Bound the whole dedicated-owner lifetime separately from
+                        // provider concurrency. A completed provider may release its
+                        // permit before late commit/cleanup/delivery, but it keeps this
+                        // owner permit until the dedicated future actually exits.
+                        let owner_permit = tokio::select! {
+                            permit = owner_semaphore.acquire_owned() => {
+                                permit.expect("owner semaphore is never closed")
+                            }
+                            _ = cancellation.cancelled() => {
+                                return Err("attempt cancelled".into());
+                            }
+                        };
+                        // over-cap providers queue HERE, on their own task. the
+                        // heartbeat below already runs while they wait, so a healthy
+                        // local queue does not lose its lease before execution starts.
+                        let permit = tokio::select! {
+                            permit = semaphore.acquire_owned() => {
+                                permit.expect("run semaphore is never closed")
+                            }
+                            _ = cancellation.cancelled() => {
+                                return Err("attempt cancelled".into());
+                            }
+                        };
+                        // Both branches can become ready in the same scheduler turn.
+                        // A permit win must not start a provider after cancellation.
+                        if cancellation.is_cancelled() {
+                            return Err("attempt cancelled before provider start".into());
+                        }
+                        let reservation = {
+                            let mut attempts = inflight.lock().expect("attempts lock");
+                            let Some(running) = attempts.get_mut(&key) else {
+                                return Err("attempt disappeared before teardown handoff".into());
+                            };
+                            if running.state != AttemptState::Running {
+                                return Err("attempt cancelled before teardown handoff".into());
+                            }
+                            running
+                                .reservation
+                                .take()
+                                .expect("an admitted attempt owns its ledger reservation")
+                        };
+                        Ok((reservation, permit, owner_permit))
+                    };
+                    let heartbeat_deliver = deliver.clone();
+                    let heartbeat_saga = job.saga_id.clone();
+                    let heartbeat_attempt = job.attempt;
+                    let heartbeat = async move {
+                        loop {
+                            tokio::time::sleep(lease_renew_interval()).await;
+                            heartbeat_deliver(renew_lease(&heartbeat_saga, heartbeat_attempt))
+                                .await;
+                        }
+                    };
+                    futures::pin_mut!(admission, heartbeat);
+                    match select(admission, heartbeat).await {
+                        Either::Left((admission, _)) => admission,
+                        Either::Right(_) => unreachable!("lease heartbeat loop never completes"),
                     }
-                    Err(e) => Err(clean_error(e)),
+                };
+                let (reservation, permit, owner_permit) = match admission {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        settle_attempt(&inflight, &key, &job, Err(error), None, &deliver).await;
+                        return;
+                    }
+                };
+
+                // This is the ownership boundary for #40. The host maps only this
+                // post-admission future to a supervised dedicated thread. Queue
+                // length therefore cannot create threads, while unexpected future
+                // destruction runs exact provider/container cleanup off shared
+                // runtime workers and keeps both admission guards alive.
+                owner_spawn(
+                    SpawnKind::TeardownOwner,
+                    Box::pin(async move {
+                        let _attempt_guard = attempt_owner;
+                        let _owner_permit = owner_permit;
+                        let owned_reservation = reservation;
+                        let run = async {
+                            // Re-resolve inside the owner: ProviderSet is immutable for
+                            // the process lifetime and the owner now holds its Arc.
+                            if cancellation.is_cancelled() {
+                                Err("attempt cancelled before provider start".into())
+                            } else {
+                                match providers.resolve(&job.capability) {
+                                    Ok(provider) => {
+                                        match crate::envelope::prepare(&job.input).await {
+                                            Ok(mut prepared) => {
+                                                prepared.ctx.run_key =
+                                                    Some(run_key_for(&job.saga_id));
+                                                prepared.ctx.executing_node = Some(executing_node);
+                                                prepared.ctx.limits = job.demands.clone();
+                                                prepared.ctx.cancellation =
+                                                    Some(cancellation.clone());
+                                                execute(
+                                                    &job,
+                                                    prepared,
+                                                    provider,
+                                                    provisioner.as_ref(),
+                                                    &cancellation,
+                                                    permit,
+                                                )
+                                                .await
+                                                .map_err(clean_error)
+                                            }
+                                            Err(error) => Err(clean_error(error)),
+                                        }
+                                    }
+                                    Err(error) => Err(clean_error(error)),
+                                }
+                            }
+                        };
+                        let heartbeat_deliver = deliver.clone();
+                        let heartbeat_saga = job.saga_id.clone();
+                        let heartbeat_attempt = job.attempt;
+                        let heartbeat = async move {
+                            loop {
+                                tokio::time::sleep(lease_renew_interval()).await;
+                                heartbeat_deliver(renew_lease(&heartbeat_saga, heartbeat_attempt))
+                                    .await;
+                            }
+                        };
+                        // `run` is declared after both admission guards, so destroying
+                        // this future drops the live provider/workspace owner first,
+                        // then releases the ledger reservation, then the owner slot.
+                        futures::pin_mut!(run, heartbeat);
+                        let outcome = match select(run, heartbeat).await {
+                            Either::Left((outcome, _)) => outcome,
+                            Either::Right(_) => {
+                                unreachable!("lease heartbeat loop never completes")
+                            }
+                        };
+                        settle_attempt(
+                            &inflight,
+                            &key,
+                            &job,
+                            outcome,
+                            Some(owned_reservation),
+                            &deliver,
+                        )
+                        .await;
+                    }),
+                );
+            }),
+        );
+    }
+}
+
+async fn settle_attempt(
+    inflight: &RunningAttempts,
+    key: &AttemptKey,
+    job: &ExecJob,
+    outcome: Result<AttemptOutput, String>,
+    owned_reservation: Option<crate::ReservationGuard>,
+    deliver: &DeliverFn,
+) {
+    // Error/timeout results are submitted like any other. Cancellation has
+    // already latched `Cancelling`, so it loses this completion race and is
+    // deliberately suppressed.
+    let (outcome, usage) = match outcome {
+        Ok(output) => (Ok(output.bytes), output.usage),
+        Err(error) => (Err(error), None),
+    };
+    let (won_completion, queued_reservation) = {
+        let mut attempts = inflight.lock().expect("attempts lock");
+        match attempts.get_mut(key) {
+            Some(running) => {
+                let won = running.state == AttemptState::Running;
+                if won {
+                    running.state = AttemptState::Delivering;
                 }
-            };
-            let heartbeat_deliver = deliver.clone();
-            let heartbeat_saga = job.saga_id.clone();
-            let heartbeat_attempt = job.attempt;
-            let heartbeat = async move {
-                loop {
-                    tokio::time::sleep(lease_renew_interval()).await;
-                    heartbeat_deliver(renew_lease(&heartbeat_saga, heartbeat_attempt)).await;
-                }
-            };
-            futures::pin_mut!(run, heartbeat);
-            let outcome = match select(run, heartbeat).await {
-                Either::Left((outcome, _)) => outcome,
-                Either::Right(_) => unreachable!("lease heartbeat loop never completes"),
-            };
-            // error/timeout results are submitted like any other: the saga
-            // must see the failure to complete or retry the attempt.
-            let (outcome, usage) = match outcome {
-                Ok(output) => (Ok(output.bytes), output.usage),
-                Err(error) => (Err(error), None),
-            };
-            deliver(oracle_result_with_usage(
-                &job.saga_id,
-                job.attempt,
-                outcome,
-                usage,
-            ))
-            .await;
-            // prune AFTER delivery: a redelivery racing the result's submit
-            // is still a skip, not a second child.
-            inflight.lock().expect("inflight lock").remove(&key);
-        }));
+                (won, running.reservation.take())
+            }
+            None => (false, None),
+        }
+    };
+    // Both the pre-handoff and admitted paths converge here. No waiter may
+    // start until provider termination and late workspace cleanup have settled.
+    drop(owned_reservation);
+    drop(queued_reservation);
+    if won_completion {
+        deliver(oracle_result_with_usage(
+            &job.saga_id,
+            job.attempt,
+            outcome,
+            usage,
+        ))
+        .await;
     }
 }
 
@@ -266,17 +498,19 @@ impl DispatchPool {
 /// `provider.run(&input, &ctx).await` with the raw text as the delivered
 /// bytes. on the provisioned path the winning attempt's bytes are the
 /// host-assembled `RunnerResult` (prose + receipt).
-/// commit runs ONLY on a successful run (a failed/timed-out run yields a saga
-/// `Err` with the dir cleaned up and no `output_ref`); cleanup always runs
-/// (W5). a commit-mechanism failure degrades to a `no_changes` receipt (R4) —
+/// commit runs ONLY after a successful provider run (provider failure yields a
+/// saga `Err` with no `output_ref`). Cleanup ownership is retained (W5), either
+/// synchronously, including after a late storage future settles. A
+/// commit-mechanism failure produces a degraded receipt (R4) —
 /// the run's answer is never lost to a receipt-plumbing error.
-/// the workspace bracket's host-side bound (#298): provision and commit both
-/// block on the daemon actor lane, and a stalled lane must not pin one of
-/// the pool's `DUCKTAPE_MAX_CONCURRENT_RUNS` permits until the saga deadline
-/// re-leases elsewhere — the step fails, the attempt settles, the lease
-/// moves on. the model call itself is bounded separately (X3, in
-/// capability-host). tests shrink the window so a hung step is observable
-/// without a wall-clock minute.
+/// the workspace bracket's host-side threshold (#298): provision and commit
+/// can block on actor/spawn-blocking work. Crossing the threshold releases the
+/// provider slot, but the attempt retains resource admission and heartbeat
+/// fail-closed until the late operation settles and cleanup completes. This
+/// prevents host-side storage work from overlapping a replacement beyond the
+/// node's aggregate resource cap. The model call itself is bounded separately
+/// (X3, in capability-host). Tests shrink the window so a late step is
+/// observable without a wall-clock minute.
 fn workspace_step_timeout() -> Duration {
     if cfg!(test) {
         Duration::from_millis(250)
@@ -290,7 +524,10 @@ async fn execute(
     prepared: crate::envelope::Prepared,
     provider: &dyn capability_host::Provider,
     provisioner: Option<&SharedProvisioner>,
+    cancellation: &RunCancellation,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<AttemptOutput, String> {
+    let mut permit = Some(permit);
     let crate::envelope::Prepared {
         input,
         mut ctx,
@@ -298,7 +535,8 @@ async fn execute(
     } = prepared;
     let Some(prov) = provisioner else {
         // accept-only / legacy: unchanged behavior, raw text bytes.
-        let output = provider.run_with_usage(&input, &ctx).await?;
+        let output = run_provider(provider, &input, &ctx, cancellation).await?;
+        drop(permit.take());
         let bytes = output.text.as_bytes().to_vec();
         return Ok(attempt_output(output, bytes));
     };
@@ -320,26 +558,63 @@ async fn execute(
         // the committed library grant, straight through to the assembler.
         library_readable: plan.library_readable,
     };
-    // (a)+(b) materialize OUTSIDE storage — bounded: a stalled actor lane
-    // fails this attempt instead of pinning a pool permit to the saga
-    // deadline. nothing exists yet, so there is nothing to clean up.
-    let ws = tokio::time::timeout(workspace_step_timeout(), prov.provision(&spec))
-        .await
-        .map_err(|_| {
+    // (a)+(b) materialize OUTSIDE storage. A late blocking result releases the
+    // provider slot, but keeps this attempt's resource admission until cleanup.
+    let provisioner = Arc::clone(prov);
+    let provision_spec = spec.clone();
+    let mut provision = Box::pin(async move { provisioner.provision(&provision_spec).await });
+    let provision_timeout = tokio::time::sleep(workspace_step_timeout());
+    futures::pin_mut!(provision_timeout);
+    let mut provision_cancelled = false;
+    let provision_result = tokio::select! {
+        result = &mut provision => Some(result),
+        _ = &mut provision_timeout => None,
+        _ = cancellation.cancelled() => {
+            provision_cancelled = true;
+            None
+        }
+    };
+    let Some(ws) = provision_result else {
+        // An actor/spawn_blocking request may still create a workspace after
+        // the threshold. Await it fail-closed and reap that workspace exactly
+        // once before this attempt releases aggregate resource admission.
+        drop(permit.take());
+        if let Ok(ws) = provision.await {
+            ws.cleanup().await;
+        }
+        return Err(if provision_cancelled {
+            "attempt cancelled during workspace provision".into()
+        } else {
             format!(
                 "workspace provision for {} timed out after {:?}",
                 spec.run_id,
                 workspace_step_timeout()
             )
-        })??;
+        });
+    };
+    let ws: Arc<dyn crate::provision::ProvisionedWorkspace> = ws?.into();
     bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/path_entries
+    if cancellation.is_cancelled() {
+        drop(permit.take());
+        ws.cleanup().await;
+        return Err("attempt cancelled after workspace provision".into());
+    }
     // run → commit → assemble, unwind-guarded: a panicking provider (or
     // receipt path) must not skip the cleanup below and leak the per-run
     // dir. the panic surfaces as this attempt's Err — the saga settles a
     // failed attempt instead of a silent task death.
+    let mut cleanup_here = true;
     let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-        match provider.run_with_usage(&input, &ctx).await {
+        match run_provider(provider, &input, &ctx, cancellation).await {
             Ok(output) => {
+                // The provider process/container has exited and been waited.
+                // Commit and cleanup are storage work, not provider concurrency.
+                drop(permit.take());
+                if cancellation.is_cancelled() {
+                    ws.cleanup().await;
+                    cleanup_here = false;
+                    return Err("attempt cancelled after provider completion".into());
+                }
                 // (d) capture output_ref. a commit-MECHANISM failure (conflict,
                 // transport, rejection, a hung actor lane) must never
                 // masquerade as a clean tree: the receipt records the error
@@ -348,25 +623,46 @@ async fn execute(
                 // `CommitError::Nothing` is a true `no_changes`, and the
                 // workspace impl already maps that to Ok.
                 let audit_message = format!("agent run {}", spec.run_id);
-                let proposal =
-                    crate::provision::commit_message_from_response_text(&output.text);
-                let commit = tokio::time::timeout(
-                    workspace_step_timeout(),
-                    ws.commit(&audit_message, proposal.as_deref()),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(format!(
-                        "commit timed out after {:?}",
-                        workspace_step_timeout()
-                    ))
-                });
-                let (receipt, status) = match commit {
-                    Ok(receipt) => (receipt, crate::provision::Status::Ok),
-                    Err(e) => {
+                let proposal = crate::provision::commit_message_from_response_text(&output.text);
+                let commit_ws = Arc::clone(&ws);
+                let mut commit =
+                    Box::pin(
+                        async move { commit_ws.commit(&audit_message, proposal.as_deref()).await },
+                    );
+                let commit_timeout = tokio::time::sleep(workspace_step_timeout());
+                futures::pin_mut!(commit_timeout);
+                let mut commit_cancelled = false;
+                let commit_result = tokio::select! {
+                    result = &mut commit => Some(result),
+                    _ = &mut commit_timeout => None,
+                    _ = cancellation.cancelled() => {
+                        commit_cancelled = true;
+                        None
+                    }
+                };
+                let (receipt, status) = match commit_result {
+                    Some(Ok(receipt)) => (receipt, crate::provision::Status::Ok),
+                    Some(Err(e)) => {
                         eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
+                            crate::provision::Status::Degraded,
+                        )
+                    }
+                    None => {
+                        let _ =
+                            futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(commit))
+                                .await;
+                        ws.cleanup().await;
+                        cleanup_here = false;
+                        if commit_cancelled {
+                            return Err("attempt cancelled during workspace commit".into());
+                        }
+                        let error =
+                            format!("commit timed out after {:?}", workspace_step_timeout());
+                        eprintln!("[oracle] commit failed for {}: {error}", spec.run_id);
+                        (
+                            crate::provision::WorkspaceReceipt::commit_failed(&spec, error),
                             crate::provision::Status::Degraded,
                         )
                     }
@@ -386,7 +682,12 @@ async fn execute(
         }
     }))
     .await;
-    ws.cleanup().await; // (e) W5 always — even past a panicking provider
+    // A normal provider settlement releases its slot before commit. A panic
+    // still releases here, before storage cleanup begins.
+    drop(permit.take());
+    if cleanup_here {
+        ws.cleanup().await; // (e) W5 always — even past a panicking provider
+    }
     match outcome {
         Ok(result) => result,
         Err(panic) => Err(format!(
@@ -400,27 +701,63 @@ async fn execute(
     }
 }
 
+/// A production provider must treat `ctx.cancellation` as a fail-closed
+/// lifecycle contract: after the signal it terminates and waits its exact child
+/// process tree/container, then resolves this future. Dispatch deliberately has
+/// no grace-drop escape hatch; reservation release before that future settles
+/// would allow replacement work to overlap a provider that may still be alive.
+async fn run_provider(
+    provider: &dyn capability_host::Provider,
+    input: &str,
+    ctx: &capability_host::RunContext,
+    cancellation: &RunCancellation,
+) -> Result<capability_host::ProviderOutput, String> {
+    let run = provider.run_with_usage(input, ctx);
+    futures::pin_mut!(run);
+    tokio::select! {
+        result = &mut run => result,
+        _ = cancellation.cancelled() => run.as_mut().await,
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchPool {
     async fn run(&self, event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+        if let Ok(control) = saga::decode_worker_control(&event.payload) {
+            match control.command {
+                saga::WorkerControlCommand::CancelAttempt {
+                    saga_id,
+                    attempt,
+                    assignee,
+                } => {
+                    self.attempt_control().cancel(&saga_id, attempt, &assignee);
+                    return Ok(WorkOutcome::Handled(None));
+                }
+            }
+        }
         match gate(&self.providers, &self.node_key, &self.ledger, event) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
             Gated::Skip => Ok(WorkOutcome::Handled(None)),
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
             Gated::Execute(job) => {
                 let key: AttemptKey = (job.saga_id.clone(), job.attempt);
-                // the dedup gate and the insert are ONE critical section:
-                // a redelivered request for an executing attempt is a
-                // claimed skip.
-                if !self
-                    .inflight
-                    .lock()
-                    .expect("inflight lock")
-                    .insert(key.clone())
-                {
+                // Insert before spawning so an assigned job that fits total
+                // capacity is retained while it waits for current occupancy.
+                let mut attempts = self.inflight.lock().expect("attempts lock");
+                if attempts.contains_key(&key) {
                     return Ok(WorkOutcome::Handled(None));
                 }
-                self.spawn_exec(key, job);
+                let cancellation = RunCancellation::new();
+                attempts.insert(
+                    key.clone(),
+                    RunningAttempt {
+                        state: AttemptState::Running,
+                        cancellation: cancellation.clone(),
+                        reservation: None,
+                    },
+                );
+                drop(attempts);
+                self.spawn_exec(key, cancellation, job);
                 // handled, result later: the follow-up op arrives through
                 // the delivery lane, not this return value.
                 Ok(WorkOutcome::Handled(None))
@@ -435,12 +772,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Condvar;
     use std::time::Duration;
 
     use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
-    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
+    use dispatch::{encode_work_spec, WorkSpec, WORK_SPEC_KIND};
     use futures::StreamExt as _;
-    use saga::{SagaMsg, WorkerRequest, encode_worker_request};
+    use saga::{
+        encode_worker_control, encode_worker_request, SagaMsg, WorkerControl, WorkerRequest,
+    };
 
     fn spec_toml(tag: &str) -> capability_host::CapabilitySpec {
         capability_host::CapabilitySpec::parse(
@@ -508,7 +848,20 @@ format = "text"
             *self.last_run.lock().unwrap() = Some((prompt.to_string(), ctx.clone()));
             let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
+            if let Some(cancellation) = &ctx.cancellation {
+                tokio::select! {
+                    _ = tokio::time::sleep(self.delay) => {}
+                    _ = cancellation.cancelled() => {
+                        // Model a provider that has observed cancellation but
+                        // still needs a bounded TERM/wait teardown window.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        self.current.fetch_sub(1, Ordering::SeqCst);
+                        return Err("mock provider cancelled after teardown".into());
+                    }
+                }
+            } else {
+                tokio::time::sleep(self.delay).await;
+            }
             self.current.fetch_sub(1, Ordering::SeqCst);
             if self.fail {
                 Err(format!("provider exploded on: {prompt}"))
@@ -528,6 +881,75 @@ format = "text"
                     text,
                     usage: self.usage,
                 })
+        }
+    }
+
+    /// Deliberately ignores RunCancellation until the external release. The
+    /// pool must fail closed and retain the attempt instead of dropping this
+    /// provider future after an arbitrary grace period.
+    struct FailClosedProvider {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl capability_host::Provider for FailClosedProvider {
+        fn capability(&self) -> &str {
+            "alpha"
+        }
+
+        async fn run(
+            &self,
+            _prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.finished.store(true, Ordering::SeqCst);
+            Ok("late provider result".into())
+        }
+    }
+
+    struct BlockingDropProvider {
+        entered: Arc<tokio::sync::Notify>,
+        cleanup_entered: Arc<AtomicBool>,
+        cleanup_release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct BlockingCleanup {
+        entered: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Drop for BlockingCleanup {
+        fn drop(&mut self) {
+            self.entered.store(true, Ordering::SeqCst);
+            let (lock, ready) = &*self.release;
+            let mut released = lock.lock().expect("cleanup release lock");
+            while !*released {
+                released = ready.wait(released).expect("cleanup release wait");
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl capability_host::Provider for BlockingDropProvider {
+        fn capability(&self) -> &str {
+            "alpha"
+        }
+
+        async fn run(
+            &self,
+            _prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
+            let _cleanup = BlockingCleanup {
+                entered: self.cleanup_entered.clone(),
+                release: self.cleanup_release.clone(),
+            };
+            self.entered.notify_one();
+            futures::future::pending().await
         }
     }
 
@@ -572,8 +994,16 @@ format = "text"
         providers: Arc<ProviderSet>,
         limit: usize,
     ) -> (DispatchPool, futures::channel::mpsc::UnboundedReceiver<Msg>) {
+        pool_with_capacity(providers, limit, Default::default())
+    }
+
+    fn pool_with_capacity(
+        providers: Arc<ProviderSet>,
+        limit: usize,
+        capacity: BTreeMap<String, u64>,
+    ) -> (DispatchPool, futures::channel::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let spawn: SpawnFn = Box::new(|fut| {
+        let spawn: SpawnFn = Arc::new(|_, fut| {
             tokio::spawn(fut);
         });
         let deliver: DeliverFn = Arc::new(move |msg| {
@@ -583,14 +1013,7 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(
-                providers,
-                b"me".to_vec(),
-                spawn,
-                deliver,
-                limit,
-                Default::default(),
-            ),
+            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit, capacity),
             rx,
         )
     }
@@ -621,6 +1044,41 @@ format = "text"
 
     fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Event {
         effect_with_payload(saga_id, attempt, assignee, &envelope_payload())
+    }
+
+    fn effect_with_demands(
+        saga_id: &str,
+        attempt: u32,
+        assignee: Option<&[u8]>,
+        demands: BTreeMap<String, u64>,
+    ) -> Event {
+        Event {
+            source: "saga".into(),
+            payload: encode_worker_request(&WorkerRequest {
+                saga_id: saga_id.into(),
+                attempt,
+                spec: encode_work_spec(&WorkSpec {
+                    kind: WORK_SPEC_KIND.into(),
+                    dispatch_id: saga_id.into(),
+                    capability: "alpha".into(),
+                    payload: envelope_payload(),
+                    demands,
+                }),
+                deadline: None,
+                assignee: assignee.map(|a| a.to_vec()),
+            }),
+        }
+    }
+
+    fn cancel_effect(saga_id: &str, attempt: u32, assignee: &[u8]) -> Event {
+        Event {
+            source: "saga".into(),
+            payload: encode_worker_control(&WorkerControl::cancel_attempt(
+                saga_id.into(),
+                attempt,
+                assignee.to_vec(),
+            )),
+        }
     }
 
     /// what an unprovisioned pool delivers for [`envelope_payload`]: the raw
@@ -657,6 +1115,547 @@ format = "text"
                 other => panic!("expected an OracleResult, got {other:?}"),
             }
         }
+    }
+
+    async fn no_oracle_result(
+        rx: &mut futures::channel::mpsc::UnboundedReceiver<Msg>,
+        budget: Duration,
+    ) -> bool {
+        tokio::time::timeout(budget, async {
+            loop {
+                let Some(msg) = rx.next().await else {
+                    return;
+                };
+                if matches!(
+                    saga::decode_msg(&msg.payload),
+                    Ok(SagaMsg::OracleResult { .. })
+                ) {
+                    panic!("a cancelled attempt delivered an OracleResult");
+                }
+            }
+        })
+        .await
+        .is_err()
+    }
+
+    #[tokio::test]
+    async fn worker_control_cancels_only_the_matching_node_and_suppresses_late_result() {
+        let (providers, probes) = slow_providers(Duration::from_secs(5), false);
+        let (pool, mut rx) = pool_with(providers, 1);
+        let work = effect_for("s1", 2, Some(b"me"));
+        pool.run(&work).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        pool.run(&cancel_effect("s1", 2, b"other")).await.unwrap();
+        assert_eq!(pool.in_flight(), 1, "foreign control is a claimed no-op");
+
+        pool.run(&cancel_effect("s1", 2, b"me")).await.unwrap();
+        // Redelivery while Cancelling is latched, never a second provider.
+        pool.run(&work).await.unwrap();
+        assert_eq!(probes.executions.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_provider_termination_before_releasing_admission() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(FailClosedProvider {
+                entered: entered.clone(),
+                release: release.clone(),
+                finished: finished.clone(),
+            })],
+        ));
+        let demands = BTreeMap::from([("cores".to_string(), 1)]);
+        let (pool, mut rx) = pool_with_capacity(providers, 1, demands.clone());
+        pool.run(&effect_with_demands("s1", 0, Some(b"me"), demands.clone()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("provider starts");
+
+        pool.run(&cancel_effect("s1", 0, b"me")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.in_flight(), 1);
+        assert!(!pool.ledger.fits(&demands));
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider settles before admission releases");
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(pool.ledger.fits(&demands));
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_holds_resources_until_provider_teardown_and_workspace_cleanup() {
+        let (providers, probes) = slow_providers(Duration::from_secs(5), false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned,
+            committed,
+            cleaned: cleaned.clone(),
+            fail_commit: None,
+        });
+        let capacity = BTreeMap::from([("cores".to_string(), 2)]);
+        let (pool, _rx) = pool_with_capacity_and_provisioner(providers, 2, capacity, provisioner);
+        let demands = BTreeMap::from([("cores".to_string(), 2)]);
+        let parent = effect_with_demands("parent", 0, Some(b"me"), demands.clone());
+        pool.run(&parent).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        pool.run(&cancel_effect("parent", 0, b"me")).await.unwrap();
+        assert!(
+            !pool.ledger.fits(&demands),
+            "cancel retains the full-capacity reservation during teardown"
+        );
+        let child = effect_with_demands("child", 0, Some(b"me"), demands);
+        pool.run(&child).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            1,
+            "the child stays in the resource queue during parent teardown"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the child starts after parent teardown releases resources");
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "workspace cleanup happens before the child starts"
+        );
+        pool.run(&cancel_effect("child", 0, b"me")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_attempt_cancellation_never_starts_the_provider() {
+        let (providers, probes) = slow_providers(Duration::from_millis(300), false);
+        let (pool, mut rx) = pool_with(providers, 1);
+        pool.run(&effect_for("running", 0, Some(b"me")))
+            .await
+            .unwrap();
+        pool.run(&effect_for("queued", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pool.run(&cancel_effect("queued", 0, b"me")).await.unwrap();
+
+        let (saga_id, _, outcome) = next_result(&mut rx).await;
+        assert_eq!(saga_id, "running");
+        assert!(outcome.is_ok());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            1,
+            "the queued attempt never reaches the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_attempts_do_not_allocate_teardown_owners() {
+        let (providers, probes) = slow_providers(Duration::from_millis(300), false);
+        let owners = Arc::new(AtomicUsize::new(0));
+        let spawn: SpawnFn = Arc::new({
+            let owners = owners.clone();
+            move |kind, future| {
+                if kind == SpawnKind::TeardownOwner {
+                    owners.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::spawn(future);
+            }
+        });
+        let deliver: DeliverFn = Arc::new(|_| Box::pin(async {}));
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            Default::default(),
+        );
+
+        pool.run(&effect_for("running", 0, Some(b"me")))
+            .await
+            .unwrap();
+        pool.run(&effect_for("queued", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the admitted run starts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+
+        pool.run(&cancel_effect("queued", 0, b"me")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("running attempt finishes and queued cancellation prunes");
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hung_commits_cap_teardown_owners_after_one_overlap() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let owners = Arc::new(AtomicUsize::new(0));
+        let spawn: SpawnFn = Arc::new({
+            let owners = owners.clone();
+            move |kind, future| {
+                if kind == SpawnKind::TeardownOwner {
+                    owners.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::spawn(future);
+            }
+        });
+        let deliver: DeliverFn = Arc::new(|_| Box::pin(async {}));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            Default::default(),
+        )
+        .with_provisioner(Arc::new(HungCommitProvisioner { cleaned }));
+
+        pool.run(&effect_for("hung-commit-1", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first provider starts");
+        tokio::time::sleep(workspace_step_timeout() + Duration::from_millis(50)).await;
+
+        pool.run(&effect_for("hung-commit-2", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probes.executions.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second provider overlaps the first commit tail");
+        tokio::time::sleep(workspace_step_timeout() + Duration::from_millis(50)).await;
+
+        pool.run(&effect_for("hung-commit-3", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(owners.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            2,
+            "released provider permits must not bypass the bounded overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_deliveries_cap_teardown_owners_after_one_overlap() {
+        let (providers, probes) = slow_providers(Duration::from_millis(1), false);
+        let owners = Arc::new(AtomicUsize::new(0));
+        let spawn: SpawnFn = Arc::new({
+            let owners = owners.clone();
+            move |kind, future| {
+                if kind == SpawnKind::TeardownOwner {
+                    owners.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::spawn(future);
+            }
+        });
+        let delivery_started = Arc::new(tokio::sync::Notify::new());
+        let deliver: DeliverFn = Arc::new({
+            let delivery_started = delivery_started.clone();
+            move |_| {
+                let delivery_started = delivery_started.clone();
+                Box::pin(async move {
+                    delivery_started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+            }
+        });
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            Default::default(),
+        );
+
+        pool.run(&effect_for("blocked-delivery-1", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delivery_started.notified())
+            .await
+            .expect("the first owner reaches delivery");
+        pool.run(&effect_for("blocked-delivery-2", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delivery_started.notified())
+            .await
+            .expect("the second owner overlaps the first blocked delivery");
+        pool.run(&effect_for("blocked-delivery-3", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        assert_eq!(owners.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            2,
+            "blocked deliveries must retain the bounded owner slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_owner_drop_keeps_the_runtime_responsive_and_admission_held() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let cleanup_entered = Arc::new(AtomicBool::new(false));
+        let cleanup_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(BlockingDropProvider {
+                entered: entered.clone(),
+                cleanup_entered: cleanup_entered.clone(),
+                cleanup_release: cleanup_release.clone(),
+            })],
+        ));
+        let (abort_tx, abort_rx) = futures::channel::oneshot::channel::<()>();
+        let abort_rx = Arc::new(Mutex::new(Some(abort_rx)));
+        let owner_thread = Arc::new(Mutex::new(None));
+        let spawn: SpawnFn = Arc::new({
+            let abort_rx = abort_rx.clone();
+            let owner_thread = owner_thread.clone();
+            move |kind, future| match kind {
+                SpawnKind::Queued => {
+                    tokio::spawn(future);
+                }
+                SpawnKind::TeardownOwner => {
+                    let abort = abort_rx
+                        .lock()
+                        .expect("abort receiver lock")
+                        .take()
+                        .expect("one teardown owner");
+                    let handle = std::thread::spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("owner runtime")
+                            .block_on(async move {
+                                tokio::select! {
+                                    _ = future => {}
+                                    _ = abort => {}
+                                }
+                            });
+                    });
+                    *owner_thread.lock().expect("owner thread lock") = Some(handle);
+                }
+            }
+        });
+        let deliver: DeliverFn = Arc::new(|_| Box::pin(async {}));
+        let demands = BTreeMap::from([("cores".to_string(), 1)]);
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            demands.clone(),
+        );
+
+        pool.run(&effect_with_demands(
+            "forced-drop",
+            0,
+            Some(b"me"),
+            demands.clone(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("provider starts on its teardown owner");
+
+        let watchdog_release = cleanup_release.clone();
+        let watchdog = std::thread::spawn(move || {
+            let (lock, ready) = &*watchdog_release;
+            let released = lock.lock().expect("watchdog release lock");
+            let (mut released, _) = ready
+                .wait_timeout_while(released, Duration::from_secs(2), |done| !*done)
+                .expect("watchdog wait");
+            if !*released {
+                *released = true;
+                ready.notify_all();
+            }
+        });
+        let responsive_since = std::time::Instant::now();
+        abort_tx.send(()).expect("force owner future destruction");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !cleanup_entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup Drop runs off the shared runtime");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(responsive_since.elapsed() < Duration::from_millis(500));
+        assert_eq!(pool.in_flight(), 1, "the owner still owns the attempt");
+        assert!(
+            !pool.ledger.fits(&demands),
+            "cleanup must finish before admission is released"
+        );
+
+        {
+            let (lock, ready) = &*cleanup_release;
+            *lock.lock().expect("cleanup release lock") = true;
+            ready.notify_all();
+        }
+        tokio::task::spawn_blocking(move || {
+            owner_thread
+                .lock()
+                .expect("owner thread lock")
+                .take()
+                .expect("owner thread exists")
+                .join()
+                .expect("owner thread joins");
+            watchdog.join().expect("watchdog joins");
+        })
+        .await
+        .expect("join helper");
+        assert_eq!(pool.in_flight(), 0);
+        assert!(pool.ledger.fits(&demands));
+    }
+
+    #[tokio::test]
+    async fn discarding_a_spawn_future_prunes_its_attempt() {
+        let (providers, probes) = slow_providers(Duration::ZERO, false);
+        let deliver: DeliverFn = Arc::new(|_| Box::pin(async {}));
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            Arc::new(|_, future| drop(future)),
+            deliver,
+            1,
+            Default::default(),
+        );
+
+        pool.run(&effect_for("discarded", 0, Some(b"me")))
+            .await
+            .unwrap();
+        assert_eq!(pool.in_flight(), 0);
+        assert_eq!(probes.executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn completion_wins_once_before_a_late_cancel() {
+        let (providers, _) = slow_providers(Duration::ZERO, false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliver: DeliverFn = Arc::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            let deliveries = deliveries.clone();
+            move |msg| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let deliveries = deliveries.clone();
+                Box::pin(async move {
+                    if matches!(
+                        saga::decode_msg(&msg.payload),
+                        Ok(SagaMsg::OracleResult { .. })
+                    ) {
+                        deliveries.fetch_add(1, Ordering::SeqCst);
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                })
+            }
+        });
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            Arc::new(|_, future| {
+                tokio::spawn(future);
+            }),
+            deliver,
+            1,
+            Default::default(),
+        );
+
+        pool.run(&effect_for("completed", 0, Some(b"me")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("completion reaches delivery");
+        assert!(!pool.attempt_control().cancel("completed", 0, b"me"));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delivery finishes");
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -889,6 +1888,9 @@ format = "text"
         assert_eq!(outcome.unwrap(), PLAIN_ANSWER.to_vec());
         let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
         assert_eq!(ctx.run_key.as_deref(), Some("d1"));
+        let expected_node = capability_host::execution_node_id(b"me");
+        assert_eq!(ctx.executing_node.as_deref(), Some(expected_node.as_str()));
+        assert!(ctx.cancellation.is_some());
     }
 
     // ---- the portable (v3) provisioning bracket -----------------------------
@@ -1022,6 +2024,95 @@ format = "text"
         }
     }
 
+    struct PhaseProvisioner {
+        provision_entered: Option<Arc<tokio::sync::Notify>>,
+        provision_release: Option<Arc<tokio::sync::Notify>>,
+        commit_entered: Option<Arc<tokio::sync::Notify>>,
+        commit_release: Option<Arc<tokio::sync::Notify>>,
+        commits: Arc<AtomicUsize>,
+        cleanups: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provision::WorkspaceProvisioner for PhaseProvisioner {
+        async fn provision(
+            &self,
+            spec: &WorkspaceSpec,
+        ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+            if let Some(entered) = &self.provision_entered {
+                entered.notify_one();
+            }
+            if let Some(release) = &self.provision_release {
+                release.notified().await;
+            }
+            let (source_prefix, source_snapshot) = spec.source.receipt_coords();
+            Ok(Box::new(PhaseWs {
+                dir: std::env::temp_dir()
+                    .join(format!("phase-ws-{}", spec.run_id.replace(':', "_"))),
+                source_prefix,
+                source_snapshot,
+                commit_entered: self.commit_entered.clone(),
+                commit_release: self.commit_release.clone(),
+                commits: self.commits.clone(),
+                cleanups: self.cleanups.clone(),
+            }))
+        }
+    }
+
+    struct PhaseWs {
+        dir: PathBuf,
+        source_prefix: String,
+        source_snapshot: Option<String>,
+        commit_entered: Option<Arc<tokio::sync::Notify>>,
+        commit_release: Option<Arc<tokio::sync::Notify>>,
+        commits: Arc<AtomicUsize>,
+        cleanups: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProvisionedWorkspace for PhaseWs {
+        fn workdir(&self) -> PathBuf {
+            self.dir.clone()
+        }
+
+        fn env(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+
+        fn path_entries(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        async fn commit(
+            &self,
+            _audit_message: &str,
+            _proposal: Option<&str>,
+        ) -> Result<WorkspaceReceipt, String> {
+            if let Some(entered) = &self.commit_entered {
+                entered.notify_one();
+            }
+            if let Some(release) = &self.commit_release {
+                release.notified().await;
+            }
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(WorkspaceReceipt {
+                source_prefix: self.source_prefix.clone(),
+                source_snapshot: self.source_snapshot.clone(),
+                output_snapshot: Some("dd".repeat(32)),
+                commit_height: Some(10),
+                rebased: false,
+                no_changes: false,
+                commit_error: None,
+                branch: None,
+                output_commit: None,
+            })
+        }
+
+        async fn cleanup(&self) {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
         (
             Arc::new(AtomicBool::new(false)),
@@ -1034,8 +2125,17 @@ format = "text"
         providers: Arc<ProviderSet>,
         provisioner: SharedProvisioner,
     ) -> (DispatchPool, futures::channel::mpsc::UnboundedReceiver<Msg>) {
+        pool_with_capacity_and_provisioner(providers, 4, Default::default(), provisioner)
+    }
+
+    fn pool_with_capacity_and_provisioner(
+        providers: Arc<ProviderSet>,
+        limit: usize,
+        capacity: BTreeMap<String, u64>,
+        provisioner: SharedProvisioner,
+    ) -> (DispatchPool, futures::channel::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let spawn: SpawnFn = Box::new(|fut| {
+        let spawn: SpawnFn = Arc::new(|_, fut| {
             tokio::spawn(fut);
         });
         let deliver: DeliverFn = Arc::new(move |msg| {
@@ -1045,17 +2145,261 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(
-                providers,
-                b"me".to_vec(),
-                spawn,
-                deliver,
-                4,
-                Default::default(),
-            )
-            .with_provisioner(provisioner),
+            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit, capacity)
+                .with_provisioner(provisioner),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn provider_phase_cancel_cleans_workspace_without_commit_or_result() {
+        let (providers, probes) = slow_providers(Duration::from_secs(5), false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+            fail_commit: None,
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+        let work = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&work).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !provisioned.load(Ordering::SeqCst)
+                || probes.executions.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        pool.run(&cancel_effect("s1", 0, b"me")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cleaned.load(Ordering::SeqCst) || pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
+    }
+
+    #[tokio::test]
+    async fn provision_timeout_holds_admission_until_late_cleanup_finishes() {
+        let (providers, probes) = slow_providers(Duration::ZERO, false);
+        let provision_entered = Arc::new(tokio::sync::Notify::new());
+        let provision_release = Arc::new(tokio::sync::Notify::new());
+        let commits = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let provisioner: SharedProvisioner = Arc::new(PhaseProvisioner {
+            provision_entered: Some(provision_entered.clone()),
+            provision_release: Some(provision_release.clone()),
+            commit_entered: None,
+            commit_release: None,
+            commits: commits.clone(),
+            cleanups: cleanups.clone(),
+        });
+        let demands = BTreeMap::from([("cores".to_string(), 1)]);
+        let (pool, mut rx) =
+            pool_with_capacity_and_provisioner(providers, 1, demands.clone(), provisioner);
+        pool.run(&effect_with_demands("s1", 0, Some(b"me"), demands.clone()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), provision_entered.notified())
+            .await
+            .expect("provision starts");
+
+        tokio::time::sleep(workspace_step_timeout() + Duration::from_millis(25)).await;
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.in_flight(), 1, "late provision retains the attempt");
+        assert!(
+            !pool.ledger.fits(&demands),
+            "late provision retains aggregate admission"
+        );
+        provision_release.notify_one();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        assert!(outcome.unwrap_err().contains("workspace provision"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cleanups.load(Ordering::SeqCst) != 1 || pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late workspace is collected and reaped");
+        assert!(pool.ledger.fits(&demands));
+        assert_eq!(probes.executions.load(Ordering::SeqCst), 0);
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provision_cancel_holds_admission_until_late_cleanup_finishes() {
+        let (providers, probes) = slow_providers(Duration::ZERO, false);
+        let provision_entered = Arc::new(tokio::sync::Notify::new());
+        let provision_release = Arc::new(tokio::sync::Notify::new());
+        let commits = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let provisioner: SharedProvisioner = Arc::new(PhaseProvisioner {
+            provision_entered: Some(provision_entered.clone()),
+            provision_release: Some(provision_release.clone()),
+            commit_entered: None,
+            commit_release: None,
+            commits: commits.clone(),
+            cleanups: cleanups.clone(),
+        });
+        let demands = BTreeMap::from([("cores".to_string(), 1)]);
+        let (pool, mut rx) =
+            pool_with_capacity_and_provisioner(providers, 1, demands.clone(), provisioner);
+        pool.run(&effect_with_demands("s1", 0, Some(b"me"), demands.clone()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), provision_entered.notified())
+            .await
+            .expect("provision starts");
+
+        pool.run(&cancel_effect("s1", 0, b"me")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.in_flight(), 1, "cancelled provision stays owned");
+        assert!(
+            !pool.ledger.fits(&demands),
+            "cancelled provision retains aggregate admission"
+        );
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        provision_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cleanups.load(Ordering::SeqCst) != 1 || pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late workspace is cleaned exactly once");
+        assert!(pool.ledger.fits(&demands));
+        assert_eq!(probes.executions.load(Ordering::SeqCst), 0);
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
+    }
+
+    #[tokio::test]
+    async fn commit_timeout_holds_attempt_until_late_cleanup_finishes() {
+        let (providers, _) = slow_providers(Duration::ZERO, false);
+        let commit_entered = Arc::new(tokio::sync::Notify::new());
+        let commit_release = Arc::new(tokio::sync::Notify::new());
+        let commits = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let provisioner: SharedProvisioner = Arc::new(PhaseProvisioner {
+            provision_entered: None,
+            provision_release: None,
+            commit_entered: Some(commit_entered.clone()),
+            commit_release: Some(commit_release.clone()),
+            commits: commits.clone(),
+            cleanups: cleanups.clone(),
+        });
+        let demands = BTreeMap::from([("cores".to_string(), 1)]);
+        let (pool, mut rx) =
+            pool_with_capacity_and_provisioner(providers, 1, demands.clone(), provisioner);
+        pool.run(&effect_with_demands("s1", 0, Some(b"me"), demands.clone()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), commit_entered.notified())
+            .await
+            .expect("commit starts");
+
+        tokio::time::sleep(workspace_step_timeout() + Duration::from_millis(25)).await;
+        assert_eq!(pool.in_flight(), 1, "late commit retains the attempt");
+        assert!(
+            !pool.ledger.fits(&demands),
+            "late commit retains aggregate admission"
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+
+        commit_release.notify_one();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        let bytes = outcome.expect("provider answer survives a commit timeout");
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["status"], "degraded");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while commits.load(Ordering::SeqCst) != 1
+                || cleanups.load(Ordering::SeqCst) != 1
+                || pool.in_flight() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late commit is collected then cleaned exactly once");
+        assert!(pool.ledger.fits(&demands));
+    }
+
+    #[tokio::test]
+    async fn commits_do_not_hold_provider_permits_and_cancel_cleans_late_work_once() {
+        let (providers, probes) = slow_providers(Duration::ZERO, false);
+        let commit_entered = Arc::new(tokio::sync::Notify::new());
+        let commit_release = Arc::new(tokio::sync::Notify::new());
+        let commits = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let provisioner: SharedProvisioner = Arc::new(PhaseProvisioner {
+            provision_entered: None,
+            provision_release: None,
+            commit_entered: Some(commit_entered.clone()),
+            commit_release: Some(commit_release.clone()),
+            commits: commits.clone(),
+            cleanups: cleanups.clone(),
+        });
+        let (pool, mut rx) =
+            pool_with_capacity_and_provisioner(providers, 1, Default::default(), provisioner);
+        pool.run(&effect_with_payload(
+            "s1",
+            0,
+            Some(b"me"),
+            &v3_envelope_payload(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), commit_entered.notified())
+            .await
+            .expect("commit starts");
+
+        pool.run(&effect_with_payload(
+            "s2",
+            0,
+            Some(b"me"),
+            &v3_envelope_payload(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while probes.executions.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second provider starts while first commit is pending");
+        pool.run(&cancel_effect("s1", 0, b"me")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), commit_entered.notified())
+            .await
+            .expect("second commit starts");
+
+        pool.run(&cancel_effect("s2", 0, b"me")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            pool.in_flight(),
+            2,
+            "cancelled commits remain owned until storage cleanup"
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        commit_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cleanups.load(Ordering::SeqCst) != 2 || pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit and cleanup complete after cancellation");
+        assert_eq!(commits.load(Ordering::SeqCst), 2);
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
     }
 
     #[tokio::test]
@@ -1295,7 +2639,11 @@ format = "text"
         pool.run(&eff).await.unwrap();
         let _ = next_result(&mut rx).await;
 
-        let spec = captured.lock().unwrap().clone().expect("the spec was captured");
+        let spec = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the spec was captured");
         assert_eq!(spec.run_id, "s1:0");
         assert_eq!(spec.agent_id.as_deref(), Some("bot"));
         assert_eq!(spec.agent_display_name.as_deref(), Some("BOT"));
@@ -1389,9 +2737,9 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_hung_commit_on_the_forge_path_times_out_into_a_degraded_receipt() {
-        // the #298 timeout bracket covers the forge path exactly as duckfs:
-        // a stalled commit step fails the capture, the answer still delivers.
+    async fn a_hung_commit_on_the_forge_path_keeps_the_attempt_fail_closed() {
+        // Forge follows the same aggregate-resource boundary as duckfs: a
+        // commit that never settles cannot release or deliver the attempt.
         let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
         let cleaned = Arc::new(AtomicBool::new(false));
         let provisioner: SharedProvisioner = Arc::new(HungCommitProvisioner {
@@ -1401,18 +2749,12 @@ format = "text"
 
         let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
         pool.run(&eff).await.unwrap();
-        let (_, _, outcome) = next_result(&mut rx).await;
-
-        let bytes = outcome.expect("the run's answer still delivers (R4)");
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["status"], "degraded");
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
+        assert_eq!(pool.in_flight(), 1, "the hung commit remains owned");
         assert!(
-            v["workspace_receipt"]["commit_error"]
-                .as_str()
-                .is_some_and(|e| e.contains("timed out")),
-            "the receipt records the timeout: {v}"
+            !cleaned.load(Ordering::SeqCst),
+            "cleanup must not race a commit that has never settled"
         );
-        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs (W5)");
     }
 
     #[tokio::test]
@@ -1421,7 +2763,9 @@ format = "text"
         // no leaked per-run dir, the attempt settles as a failure.
         let providers = Arc::new(ProviderSet::assemble(
             capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
-            vec![Box::new(PanicProvider { tag: "alpha".into() })],
+            vec![Box::new(PanicProvider {
+                tag: "alpha".into(),
+            })],
         ));
         let (provisioned, committed, cleaned) = flags();
         let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
@@ -1439,8 +2783,14 @@ format = "text"
         let err = outcome.expect_err("a panic settles the attempt as a failure");
         assert!(err.contains("panicked"), "got {err}");
         assert!(provisioned.load(Ordering::SeqCst));
-        assert!(!committed.load(Ordering::SeqCst), "a panicked run commits NOTHING");
-        assert!(cleaned.load(Ordering::SeqCst), "cleanup runs past the panic (W5)");
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "a panicked run commits NOTHING"
+        );
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup runs past the panic (W5)"
+        );
     }
 
     #[tokio::test]
@@ -1567,11 +2917,11 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_hung_commit_times_out_into_a_degraded_receipt_not_a_pinned_permit() {
+    async fn a_hung_commit_releases_the_provider_permit_but_keeps_the_attempt() {
         // the #298 bracket bound: commit blocks on the daemon actor lane, and
         // a stalled lane must not pin a pool permit until the saga deadline.
-        // the step times out, the answer still delivers (R4), the receipt
-        // records the timeout, cleanup runs.
+        // The provider permit is released before commit, but aggregate resource
+        // admission remains fail-closed because the commit never settles.
         let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
         let cleaned = Arc::new(AtomicBool::new(false));
         let provisioner: SharedProvisioner = Arc::new(HungCommitProvisioner {
@@ -1581,21 +2931,12 @@ format = "text"
 
         let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
         pool.run(&eff).await.unwrap();
-        let (_, _, outcome) = next_result(&mut rx).await;
-
-        let bytes = outcome.expect("the run's answer still delivers (R4)");
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            v["status"], "degraded",
-            "a timed-out capture degrades the run"
-        );
+        assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
+        assert_eq!(pool.in_flight(), 1, "the hung commit remains owned");
         assert!(
-            v["workspace_receipt"]["commit_error"]
-                .as_str()
-                .is_some_and(|e| e.contains("timed out")),
-            "the receipt records the timeout: {v}"
+            !cleaned.load(Ordering::SeqCst),
+            "cleanup must not race a commit that has never settled"
         );
-        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs (W5)");
     }
 
     /// a provider that panics mid-run — the unwind probe for the cleanup
@@ -1701,8 +3042,7 @@ format = "text"
         let err = outcome.unwrap_err();
         assert!(err.contains("no ducktape_run envelope marker"), "got {err}");
 
-        let mut v2: serde_json::Value =
-            serde_json::from_slice(&envelope_payload()).unwrap();
+        let mut v2: serde_json::Value = serde_json::from_slice(&envelope_payload()).unwrap();
         v2["ducktape_run"] = serde_json::json!(2);
         pool.run(&effect_with_payload(
             "s2",
@@ -1731,7 +3071,9 @@ format = "text"
         // (receipt intact) instead.
         let providers = Arc::new(ProviderSet::assemble(
             capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
-            vec![Box::new(HugeProvider { tag: "alpha".into() })],
+            vec![Box::new(HugeProvider {
+                tag: "alpha".into(),
+            })],
         ));
         let (provisioned, committed, cleaned) = flags();
         let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
@@ -2033,7 +3375,7 @@ format = "text"
         let pool = DispatchPool::with_limit(
             providers,
             b"me".to_vec(),
-            Box::new(|_fut| {}),
+            Arc::new(|_, _fut| {}),
             deliver,
             0,
             Default::default(),

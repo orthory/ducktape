@@ -69,6 +69,25 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// how long this host keeps paying for one child.
 const HARD_TIMEOUT_FACTOR: u32 = 36;
 
+/// how long a cancelled child process group gets to handle SIGTERM before the
+/// host escalates to SIGKILL. Podman gets the same budget for each targeted
+/// stop/wait operation; every cleanup command is itself kill-on-drop.
+const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const PODMAN_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PODMAN_RETRY_MIN: Duration = Duration::from_millis(250);
+const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
+const PODMAN_EMPTY_MIN_OBSERVATIONS: usize = 3;
+const PODMAN_REAP_MAX: usize = 64;
+const PODMAN_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
+const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
+const PODMAN_OWNER_BOOT_LABEL: &str = "io.ducktape.owner.boot";
+const PODMAN_OWNER_PID_LABEL: &str = "io.ducktape.owner.pid";
+const PODMAN_OWNER_START_LABEL: &str = "io.ducktape.owner.starttime";
+const PODMAN_INSTANCE_LABEL: &str = "io.ducktape.instance";
+const TART_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
+const TART_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// reserved run-local state INSIDE the run's workdir: the fresh provider config
 /// home lives here (see [`CliProvider::prepare_config_home`]). the provisioner's
 /// commit bracket removes this directory before duckfs/forge scan the tree, so a
@@ -97,10 +116,72 @@ mod session;
 mod spec;
 mod variants;
 mod workspace;
-pub use sandbox::{SandboxBackend, wrap_podman};
+pub use sandbox::{SandboxBackend, TART_MIN_CORES, wrap_podman};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
+
+/// canonical label-safe identity for the node executing a provider run.
+pub fn execution_node_id(identity: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(identity.len() * 2);
+    for byte in identity {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// a cloneable, run-local cancellation signal. cancelling one clone wakes all
+/// current waiters, and future waiters observe the already-cancelled state.
+#[derive(Debug, Clone)]
+pub struct RunCancellation {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl RunCancellation {
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::watch::channel(false);
+        Self { tx }
+    }
+
+    /// idempotently mark the run cancelled and wake every waiter.
+    pub fn cancel(&self) {
+        self.tx.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    /// wait until this run is cancelled. safe for late subscribers: cancellation
+    /// is state, not an edge-triggered notification that can be missed.
+    pub async fn cancelled(&self) {
+        let mut rx = self.tx.subscribe();
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for RunCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for RunCancellation {
+    fn eq(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+}
+
+impl Eq for RunCancellation {}
 
 /// per-run, host-local context riding beside the prompt: which agent is
 /// running and which conversation thread the run continues. populated by the
@@ -116,6 +197,14 @@ pub struct RunContext {
     /// set by the oracle pool before provider.run so the output sink can key
     /// a per-run ring the app subscribes as run-output:<dispatch_id>.
     pub run_key: Option<String>,
+    /// host-local cancellation for this live run. `None` preserves the legacy
+    /// run-to-completion behavior; cancelling the token terminates the provider
+    /// process tree and any managed Podman container.
+    pub cancellation: Option<RunCancellation>,
+    /// canonical [`execution_node_id`] of the node running this attempt. Direct
+    /// runs may omit it; Podman requires it so lifecycle cleanup can never
+    /// cross into another Ducktape node sharing the same rootless user.
+    pub executing_node: Option<String>,
     /// an already-materialized workspace this specific run must execute in.
     /// set only by the provisioning wrapper (`dispatch-oracle::bind_workspace`)
     /// after a successful per-run duckfs checkout — never a consensus-supplied
@@ -206,7 +295,11 @@ pub trait Provider: Send + Sync {
     fn capability(&self) -> &str;
     /// run one prompt to completion and return the assistant's final text.
     /// `ctx` is host-local run identity (see [`RunContext`]) — implementations
-    /// that predate workspaces/sessions may simply ignore it.
+    /// that predate workspaces/sessions may ignore it only when
+    /// `ctx.cancellation` is `None`. Once cancellation is present, resolving
+    /// this future means every execution resource owned by this run is proven
+    /// stopped and its wait/reap completed. If that proof cannot be obtained,
+    /// the implementation must remain pending fail-closed rather than return.
     async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String>;
     /// the same run plus optional executor-reported usage. legacy/custom
     /// providers inherit the text-only default without changing their API.
@@ -415,6 +508,7 @@ impl CliProvider {
         self
     }
 
+    #[cfg(test)]
     fn command(
         &self,
         args: &[String],
@@ -422,6 +516,17 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
     ) -> Result<tokio::process::Command, String> {
+        self.prepared_command(args, workdir, ctx, auth)
+            .map(|prepared| prepared.command)
+    }
+
+    fn prepared_command(
+        &self,
+        args: &[String],
+        workdir: &Path,
+        ctx: &RunContext,
+        auth: &RunAuth<'_>,
+    ) -> Result<PreparedCommand, String> {
         // a broker rewrites the argv BEFORE the backend sees it, so all three
         // backends aim the CLI at the loopback endpoint identically.
         let args = self.broker_argv(args, workdir, auth);
@@ -430,10 +535,12 @@ impl CliProvider {
         // exec — never shell-interpreted (the resume path's {session_id} slot
         // was substituted host-side with an executor-minted id, never job
         // content) — so nothing in a job can inject flags or commands.
-        let mut cmd = match &self.backend {
-            SandboxBackend::Direct => self.direct_command(&args, ctx, auth)?,
+        let (mut command, podman) = match &self.backend {
+            SandboxBackend::Direct => (self.direct_command(&args, ctx, auth)?, None),
             SandboxBackend::Podman { image } => {
-                self.podman_command(image, &args, workdir, ctx, auth)?
+                let (command, run) =
+                    self.podman_command(image, &args, workdir, ctx, auth)?;
+                (command, Some(run))
             }
             // Tart has a multi-process lifecycle (clone/set/boot, then SSH), so
             // [`Self::invoke`] constructs it before reaching this single-child
@@ -442,15 +549,15 @@ impl CliProvider {
                 return Err("internal error: Tart command bypassed its VM lifecycle".into());
             }
         };
-        cmd.current_dir(workdir)
+        command
+            .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // dropping the wait future (timeout) must kill the child — a hung
-            // CLI never outlives its job. under Podman the killed process is
-            // `podman run`, which tears down the container (--rm) with it.
+            // final panic/drop safety; cancellation and timeouts take the
+            // explicit process-group + Podman cleanup path in invoke().
             .kill_on_drop(true);
-        Ok(cmd)
+        Ok(PreparedCommand { command, podman })
     }
 
     /// the plain host spawn: the spec's binary with the spec's argv and an
@@ -513,22 +620,28 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
-    ) -> Result<tokio::process::Command, String> {
+    ) -> Result<(tokio::process::Command, PodmanRun), String> {
         let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
-        let (bin, argv) = sandbox::wrap_podman(
+        let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
+        let workdir = canonical_mount_path(workdir, "Podman workdir")?;
+        let bin_path = canonical_mount_path(&self.bin, "Podman executor")?;
+        let run = PodmanRun::new(ctx, &workdir, &bin_path, &ro_paths, &rw_dirs)?;
+        let (bin, argv) = sandbox::wrap_podman_managed(
             image,
-            &self.bin,
+            &bin_path,
             args,
-            workdir,
+            &workdir,
             &envs,
-            &self.sandbox_ro_paths(ctx, workdir, auth)?,
+            &ro_paths,
             &rw_dirs,
             &ctx.limits,
+            &run.cidfile,
+            &run.labels,
         );
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(argv)
             .envs(envs.iter().map(|(key, value)| (key, value)));
-        Ok(cmd)
+        Ok((cmd, run))
     }
 
     /// Assemble the real Tart VM boot + guest execution plan. Writable auth
@@ -597,19 +710,46 @@ impl CliProvider {
                 self.spec.tag
             )
         })?;
+        let home = canonical_mount_path(&home, "sandbox HOME")?;
         let mut envs: Vec<(String, String)> = vec![("HOME".into(), home.display().to_string())];
         if let Some(path) = self.run_path(ctx)? {
             envs.push(("PATH".into(), path.to_string_lossy().into_owned()));
         }
-        envs.extend(ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for (key, value) in &ctx.env {
+            if key == "HOME" {
+                continue;
+            }
+            let value = if key == SKILLS_ROOT_ENV {
+                canonical_mount_path(Path::new(value), "sandbox skills root")?
+                    .display()
+                    .to_string()
+            } else {
+                value.clone()
+            };
+            envs.push((key.clone(), value));
+        }
         self.apply_auth_env(auth, |k, v| envs.push((k.to_string(), v)));
         // spec.rs already rejected absolute / `..` entries, so join is safe.
         let rw_dirs: Vec<PathBuf> = self
             .spec
             .rw_dirs
             .iter()
-            .map(|d| home.join(d.strip_prefix("~/").unwrap_or(d)))
-            .collect();
+            .map(|d| {
+                let path = home.join(d.strip_prefix("~/").unwrap_or(d));
+                std::fs::create_dir_all(&path).map_err(|error| {
+                    format!("create sandbox writable mount {}: {error}", path.display())
+                })?;
+                let resolved = canonical_mount_path(&path, "sandbox writable mount")?;
+                if resolved != path {
+                    return Err(format!(
+                        "sandbox writable mount {} resolves to {}; symlinked auth mounts are refused",
+                        path.display(),
+                        resolved.display()
+                    ));
+                }
+                Ok(resolved)
+            })
+            .collect::<Result<_, _>>()?;
         Ok((envs, rw_dirs))
     }
 
@@ -643,7 +783,14 @@ impl CliProvider {
         {
             paths.push(doc);
         }
-        Ok(paths)
+        if matches!(self.backend, SandboxBackend::Direct) {
+            Ok(paths)
+        } else {
+            paths
+                .into_iter()
+                .map(|path| canonical_mount_path(&path, "sandbox read-only mount"))
+                .collect()
+        }
     }
 
     /// where this run's assembled context doc lands — the spec's [`ContextLocation`]
@@ -848,64 +995,79 @@ impl CliProvider {
         };
         let plan = plan.ok_or_else(|| "internal error: missing Tart execution plan".to_string())?;
         let vm = &plan.vm;
+        let set_argv = sandbox::tart_set_argv(vm, &ctx.limits)
+            .map_err(|error| format!("{}: {error}", self.spec.tag))?;
         // WAITS if 2 tart runs are already live — this is the cap, not an error.
-        let permit = sandbox::tart_semaphore()
-            .acquire()
-            .await
-            .map_err(|e| format!("{}: tart concurrency gate closed: {e}", self.spec.tag))?;
-        let status = tokio::process::Command::new("tart")
-            .args(["clone", image, vm])
-            .status()
-            .await
-            .map_err(|e| {
-                format!(
-                    "{}: `tart clone {image} {vm}` failed to spawn: {e}",
-                    self.spec.tag
-                )
-            })?;
-        if !status.success() {
-            return Err(format!(
-                "{}: `tart clone {image} {vm}` exited with {status}",
-                self.spec.tag
-            ));
-        }
+        let permit = tokio::select! {
+            permit = sandbox::tart_semaphore().acquire() => permit
+                .map_err(|e| format!("{}: tart concurrency gate closed: {e}", self.spec.tag))?,
+            _ = cancellation_requested(ctx.cancellation.as_ref()) => {
+                return Err(format!("{}: Tart setup cancelled at concurrency gate", self.spec.tag));
+            }
+        };
+        // Install the guard before clone starts: a cancelled/dropped clone may
+        // have created a partial VM even when it never returns success.
         let mut guard = TartGuard {
             vm: vm.clone(),
             ip: String::new(),
             run: None,
+            setup: None,
+            vm_may_exist: false,
             _permit: permit,
         };
+        let clone_args = vec!["clone".into(), image.clone(), vm.clone()];
+        let output = guard
+            .setup_command(
+                "tart",
+                &clone_args,
+                ctx.cancellation.as_ref(),
+                TART_SETUP_TIMEOUT,
+                false,
+            )
+            .await
+            .map_err(|error| format!("{}: {error}", self.spec.tag))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{}: `tart clone {image} {vm}` exited with {}",
+                self.spec.tag, output.status
+            ));
+        }
 
-        if let Some(set_argv) = sandbox::tart_set_argv(vm, &ctx.limits) {
-            let status = tokio::process::Command::new("tart")
-                .args(&set_argv)
-                .status()
+        if let Some(set_argv) = set_argv {
+            let output = guard
+                .setup_command(
+                    "tart",
+                    &set_argv,
+                    ctx.cancellation.as_ref(),
+                    TART_SETUP_TIMEOUT,
+                    false,
+                )
                 .await
-                .map_err(|e| format!("{}: `tart set {vm}` failed to spawn: {e}", self.spec.tag))?;
-            if !status.success() {
+                .map_err(|error| format!("{}: {error}", self.spec.tag))?;
+            if !output.status.success() {
                 return Err(format!(
-                    "{}: `tart set {vm}` exited with {status}",
-                    self.spec.tag
+                    "{}: `tart set {vm}` exited with {}",
+                    self.spec.tag, output.status
                 ));
             }
         }
 
-        let mut run = tokio::process::Command::new("tart");
-        run.args(&plan.run_argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
         guard.run = Some(
-            run.spawn()
+            GroupChild::spawn("tart", &plan.run_argv, false)
                 .map_err(|e| format!("{}: `tart run {vm}` failed to spawn: {e}", self.spec.tag))?,
         );
 
-        let output = tokio::process::Command::new("tart")
-            .args(["ip", vm, "--wait", "60"])
-            .output()
+        let ip_args = vec!["ip".into(), vm.clone(), "--wait".into(), "60".into()];
+        let output = guard
+            .setup_command(
+                "tart",
+                &ip_args,
+                ctx.cancellation.as_ref(),
+                TART_SETUP_TIMEOUT,
+                true,
+            )
             .await
-            .map_err(|e| format!("{}: `tart ip {vm} --wait 60` failed: {e}", self.spec.tag))?;
+            .map_err(|error| format!("{}: {error}", self.spec.tag))?;
         if !output.status.success() {
             return Err(format!(
                 "{}: `tart ip {vm} --wait 60` exited with {}: {}",
@@ -923,16 +1085,24 @@ impl CliProvider {
         }
 
         for attempt in 0..30 {
-            let status = tokio::process::Command::new("sshpass")
-                .args(sandbox::tart_ssh_argv(&guard.ip, "true"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+            let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true");
+            let status = guard
+                .setup_command(
+                    "sshpass",
+                    &ssh_args,
+                    ctx.cancellation.as_ref(),
+                    TART_PROBE_TIMEOUT,
+                    false,
+                )
                 .await;
             match status {
-                Ok(status) if status.success() => return Ok(Some(guard)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(output) if output.status.success() => return Ok(Some(guard)),
+                Err(error)
+                    if error.contains("failed to spawn")
+                        && (error.contains("not found")
+                            || error.contains("No such file")
+                            || error.contains("os error 2")) =>
+                {
                     return Err(format!(
                         "{}: sshpass is required for Tart guest execution; install it with \
                          `brew install cirruslabs/cli/sshpass`: {error}",
@@ -947,20 +1117,40 @@ impl CliProvider {
                 }
                 Ok(_) => {}
             }
-            if let Some(status) = guard
+            #[cfg(unix)]
+            let run_exited = {
+                let group = guard
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.process_group)
+                    .expect("Tart run has an owned process group");
+                leader_exited_unreaped(group)
+                    .map_err(|e| format!("{}: inspect `tart run {vm}`: {e}", self.spec.tag))?
+            };
+            #[cfg(not(unix))]
+            let run_exited = guard
                 .run
                 .as_mut()
                 .expect("Tart run child is installed")
+                .child
+                .as_mut()
+                .expect("Tart run process is installed")
                 .try_wait()
                 .map_err(|e| format!("{}: inspect `tart run {vm}`: {e}", self.spec.tag))?
-            {
+                .is_some();
+            if run_exited {
                 return Err(format!(
-                    "{}: `tart run {vm}` exited during boot with {status}",
+                    "{}: `tart run {vm}` exited during boot",
                     self.spec.tag
                 ));
             }
             if attempt < 29 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = cancellation_requested(ctx.cancellation.as_ref()) => {
+                        return Err(format!("{}: Tart SSH readiness cancelled", self.spec.tag));
+                    }
+                }
             }
         }
         Err(format!(
@@ -976,7 +1166,14 @@ impl CliProvider {
         if ctx.path_entries.is_empty() {
             return Ok(None);
         }
-        let mut path = ctx.path_entries.clone();
+        let mut path = if matches!(self.backend, SandboxBackend::Direct) {
+            ctx.path_entries.clone()
+        } else {
+            ctx.path_entries
+                .iter()
+                .map(|path| canonical_mount_path(path, "sandbox PATH mount"))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         if let Some(existing) = std::env::var_os("PATH") {
             path.extend(std::env::split_paths(&existing));
         }
@@ -1106,6 +1303,37 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve every sandbox mount before handing it to a container/VM. Relative
+/// paths and symlink aliases make containment checks lie about which host tree
+/// is exposed, so they fail before a sandbox command is built.
+fn canonical_mount_path(path: &Path, purpose: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{purpose} must be absolute, got {}",
+            path.display()
+        ));
+    }
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("resolve {purpose} {}: {error}", path.display()))
+}
+
+fn ensure_podman_control_hidden<'a>(
+    root: &Path,
+    mounts: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), String> {
+    for mount in mounts {
+        let mount = canonical_mount_path(mount, "Podman host mount")?;
+        if root.starts_with(&mount) {
+            return Err(format!(
+                "refusing Podman run: host-only cidfile root {} would be exposed by mount {}",
+                root.display(),
+                mount.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// removes a run's context document on drop — every exit path (success, error,
 /// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
 /// it sits beside the checkout, where nothing else would ever clean it up, and a
@@ -1125,49 +1353,1581 @@ impl Drop for ContextGuard {
     }
 }
 
+/// A prepared provider command plus the host-only Podman identity needed to
+/// stop the exact container if this invocation is cancelled.
+struct PreparedCommand {
+    command: tokio::process::Command,
+    podman: Option<PodmanRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PodmanOwner {
+    boot_id: String,
+    pid: u32,
+    starttime: u64,
+}
+
+impl PodmanOwner {
+    #[cfg(target_os = "linux")]
+    fn current() -> Result<Self, String> {
+        let pid = std::process::id();
+        Ok(Self {
+            boot_id: linux_boot_id()?,
+            pid,
+            starttime: linux_process_starttime(pid)?.ok_or_else(|| {
+                format!("current process {pid} disappeared while building Podman ownership")
+            })?,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn current() -> Result<Self, String> {
+        // Non-Linux hosts still use exact cidfile/label cancellation. Startup
+        // reaping is disabled there; these labels are diagnostic only.
+        let pid = std::process::id();
+        Ok(Self {
+            boot_id: format!("{pid:08x}"),
+            pid,
+            starttime: 1,
+        })
+    }
+
+    fn from_inspect(output: &str) -> Option<Self> {
+        let mut fields = output.trim().split('\t');
+        let boot_id = fields.next()?.to_string();
+        let pid = fields.next()?.parse().ok()?;
+        let starttime = fields.next()?.parse().ok()?;
+        (fields.next().is_none()
+            && valid_boot_id(&boot_id)
+            && pid != 0
+            && starttime != 0)
+            .then_some(Self {
+                boot_id,
+                pid,
+                starttime,
+            })
+    }
+}
+
+/// Host-owned Podman lifecycle state. The cidfile deliberately lives below
+/// `$HOME/.ducktape/provider-runs`, which the Podman sandbox does not mount;
+/// we also reject any spec/run mount that would expose it.
+struct PodmanRun {
+    cidfile: PathBuf,
+    labels: Vec<String>,
+}
+
+impl PodmanRun {
+    fn new(
+        ctx: &RunContext,
+        workdir: &Path,
+        bin: &Path,
+        ro_paths: &[PathBuf],
+        rw_dirs: &[PathBuf],
+    ) -> Result<Self, String> {
+        static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            "Podman lifecycle isolation needs $HOME set for its host-only cidfile".to_string()
+        })?;
+        let home = canonical_mount_path(&home, "Podman HOME")?;
+        let root = home
+            .join(".ducktape")
+            .join("provider-runs")
+            .join("podman");
+        create_private_dir(&root)?;
+        let root = canonical_mount_path(&root, "Podman cidfile root")?;
+        let owner = PodmanOwner::current()?;
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("Podman run clock is before Unix epoch: {error}"))?
+            .as_nanos();
+        let instance = format!(
+            "{}-{}-{}-{created}-{}",
+            owner.boot_id,
+            owner.pid,
+            owner.starttime,
+            NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let cidfile = root.join(format!("{instance}.cid"));
+        let executing_node = ctx.executing_node.as_deref().ok_or_else(|| {
+            "Podman provider run is missing its canonical executing-node id".to_string()
+        })?;
+        if !valid_execution_node_id(executing_node) {
+            return Err(format!(
+                "Podman provider run has invalid executing-node id {executing_node:?}"
+            ));
+        }
+
+        let exposed = std::iter::once(workdir)
+            .chain(std::iter::once(bin))
+            .chain(ro_paths.iter().map(PathBuf::as_path))
+            .chain(rw_dirs.iter().map(PathBuf::as_path));
+        ensure_podman_control_hidden(&root, exposed)?;
+
+        Ok(Self {
+            cidfile,
+            labels: vec![
+                PODMAN_MANAGED_LABEL.into(),
+                format!("{PODMAN_NODE_LABEL}={executing_node}"),
+                format!("{PODMAN_OWNER_BOOT_LABEL}={}", owner.boot_id),
+                format!("{PODMAN_OWNER_PID_LABEL}={}", owner.pid),
+                format!("{PODMAN_OWNER_START_LABEL}={}", owner.starttime),
+                format!("io.ducktape.run={}", runtime_slot(ctx, workdir)),
+                format!("{PODMAN_INSTANCE_LABEL}={instance}"),
+            ],
+        })
+    }
+
+    fn prepare_cidfile(&self) -> Result<(), String> {
+        let root = self
+            .cidfile
+            .parent()
+            .expect("a Podman cidfile always has its managed root");
+        create_private_dir(root)?;
+        self.remove_cidfile();
+        Ok(())
+    }
+
+    fn container_id(&self) -> Option<String> {
+        let id = std::fs::read_to_string(&self.cidfile).ok()?;
+        let id = id.trim();
+        valid_container_id(id).then(|| id.to_string())
+    }
+
+    async fn wait_container_id_until(&self, deadline: tokio::time::Instant) -> Option<String> {
+        loop {
+            if let Some(cid) = self.container_id() {
+                return Some(cid);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            tokio::time::sleep_until((now + PODMAN_CID_POLL_INTERVAL).min(deadline)).await;
+        }
+    }
+
+    fn stop_argv(cid: &str) -> Vec<String> {
+        vec![
+            "stop".into(),
+            "--ignore".into(),
+            "--time".into(),
+            TERMINATION_GRACE.as_secs().to_string(),
+            cid.into(),
+        ]
+    }
+
+    fn wait_argv(cid: &str) -> Vec<String> {
+        vec!["wait".into(), cid.into()]
+    }
+
+    fn remove_argv(cid: &str) -> Vec<String> {
+        vec!["rm".into(), "--force".into(), "--ignore".into(), cid.into()]
+    }
+
+    async fn control(&self, args: &[String]) -> Result<String, String> {
+        let args = args.to_vec();
+        tokio::task::spawn_blocking(move || {
+            run_command_bounded(Path::new("podman"), &args, PODMAN_CONTROL_TIMEOUT)
+        })
+        .await
+        .map_err(|error| format!("join bounded Podman control command: {error}"))?
+    }
+
+    fn control_blocking(&self, args: &[String]) -> Result<String, String> {
+        run_command_bounded(Path::new("podman"), args, PODMAN_CONTROL_TIMEOUT)
+    }
+
+    fn exact_query_argv(&self) -> Vec<String> {
+        let mut argv = vec![
+            "ps".into(),
+            "--all".into(),
+            "--quiet".into(),
+            "--no-trunc".into(),
+        ];
+        for label in &self.labels {
+            argv.extend(["--filter".into(), format!("label={label}")]);
+        }
+        argv
+    }
+
+    /// Prove this exact run's container is stopped or absent. `stop --ignore`
+    /// success is the proof for a known CID. Before a CID exists, only the full
+    /// unique label set may locate it; a stable sequence of successful exact
+    /// empty queries after the `podman run` process is reaped proves absence.
+    /// Any Podman error retries forever, deliberately retaining the caller's
+    /// resource reservation rather than declaring an unproven stop.
+    async fn stop_until_confirmed(&self, mut cid: Option<String>) -> Option<String> {
+        let mut empty_since = None;
+        let mut empty_observations = 0usize;
+        let mut failures = 0u64;
+        let mut retry_delay = PODMAN_RETRY_MIN;
+        loop {
+            if cid.is_none() {
+                cid = self.container_id();
+            }
+            if let Some(id) = cid.as_deref() {
+                match self.control(&Self::stop_argv(id)).await {
+                    Ok(_) => return Some(id.to_string()),
+                    Err(error) => {
+                        failures += 1;
+                        if failures == 1 || failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] exact Podman stop for {id} not yet proven \
+                                 (attempt {failures}): {error}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                match self
+                    .control(&self.exact_query_argv())
+                    .await
+                    .and_then(|output| parse_container_ids(&output))
+                {
+                    Ok(ids) if ids.is_empty() => {
+                        let since = empty_since.get_or_insert_with(tokio::time::Instant::now);
+                        empty_observations += 1;
+                        if empty_observations >= PODMAN_EMPTY_MIN_OBSERVATIONS
+                            && since.elapsed() >= PODMAN_CONTROL_TIMEOUT
+                        {
+                            return None;
+                        }
+                    }
+                    Ok(mut ids) if ids.len() == 1 => {
+                        cid = ids.pop();
+                        empty_since = None;
+                        empty_observations = 0;
+                    }
+                    Ok(ids) => {
+                        empty_since = None;
+                        empty_observations = 0;
+                        failures += 1;
+                        if failures == 1 || failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] exact Podman identity matched {} containers; \
+                                 refusing broad cleanup (attempt {failures})",
+                                ids.len()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        empty_since = None;
+                        empty_observations = 0;
+                        failures += 1;
+                        if failures == 1 || failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] exact Podman absence query failed \
+                                 (attempt {failures}): {error}"
+                            );
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
+        }
+    }
+
+    async fn cleanup_stopped(&self, cid: &str) {
+        if let Err(error) = self.control(&Self::wait_argv(cid)).await {
+            eprintln!("[capability-host] wait for stopped Podman container {cid}: {error}");
+        }
+        let mut failures = 0u64;
+        let mut retry_delay = PODMAN_RETRY_MIN;
+        loop {
+            match self.control(&Self::remove_argv(cid)).await {
+                Ok(_) => return,
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] remove stopped Podman container {cid} \
+                             failed (attempt {failures}): {error}"
+                        );
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
+                }
+            }
+        }
+    }
+
+    /// Synchronous twin used only from a dropped invoke future. Drop cannot
+    /// await, and returning would release the dispatch reservation, so an
+    /// unavailable Podman daemon deliberately keeps retrying fail-closed.
+    fn cleanup_blocking(&self) {
+        let mut cid = self.container_id();
+        let mut empty_since = None;
+        let mut empty_observations = 0usize;
+        let mut failures = 0u64;
+        let mut retry_delay = PODMAN_RETRY_MIN;
+        loop {
+            if cid.is_none() {
+                cid = self.container_id();
+            }
+            if let Some(id) = cid.as_deref() {
+                match self.control_blocking(&Self::stop_argv(id)) {
+                    Ok(_) => break,
+                    Err(error) => {
+                        failures += 1;
+                        if failures == 1 || failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] dropped-run Podman stop for {id} \
+                                 not yet proven (attempt {failures}): {error}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                match self
+                    .control_blocking(&self.exact_query_argv())
+                    .and_then(|output| parse_container_ids(&output))
+                {
+                    Ok(ids) if ids.is_empty() => {
+                        let since = empty_since.get_or_insert_with(std::time::Instant::now);
+                        empty_observations += 1;
+                        if empty_observations >= PODMAN_EMPTY_MIN_OBSERVATIONS
+                            && since.elapsed() >= PODMAN_CONTROL_TIMEOUT
+                        {
+                            self.remove_cidfile();
+                            return;
+                        }
+                    }
+                    Ok(mut ids) if ids.len() == 1 => {
+                        cid = ids.pop();
+                        empty_since = None;
+                        empty_observations = 0;
+                    }
+                    Ok(ids) => {
+                        empty_since = None;
+                        empty_observations = 0;
+                        failures += 1;
+                        if failures == 1 || failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] dropped-run identity matched {} containers; \
+                                 refusing broad cleanup (attempt {failures})",
+                                ids.len()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        empty_since = None;
+                        empty_observations = 0;
+                        failures += 1;
+                        if failures == 1 || failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] dropped-run Podman absence query failed \
+                                 (attempt {failures}): {error}"
+                            );
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(retry_delay);
+            retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
+        }
+
+        let cid = cid.expect("a successful exact stop has a container id");
+        let _ = self.control_blocking(&Self::wait_argv(&cid));
+        let mut retry_delay = PODMAN_RETRY_MIN;
+        loop {
+            match self.control_blocking(&Self::remove_argv(&cid)) {
+                Ok(_) => break,
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] dropped-run Podman remove for {cid} failed \
+                             (attempt {failures}): {error}"
+                        );
+                    }
+                    std::thread::sleep(retry_delay);
+                    retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
+                }
+            }
+        }
+        self.remove_cidfile();
+    }
+
+    fn remove_cidfile(&self) {
+        if let Err(error) = std::fs::remove_file(&self.cidfile)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[capability-host] removing Podman cidfile {} failed: {error}",
+                self.cidfile.display()
+            );
+        }
+    }
+}
+
+fn valid_container_id(id: &str) -> bool {
+    id.len() >= 12 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn valid_execution_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len().is_multiple_of(2)
+        && id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_boot_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id() -> Result<String, String> {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| format!("read Linux boot id for Podman ownership: {error}"))?;
+    let boot_id = boot_id.trim().to_ascii_lowercase();
+    valid_boot_id(&boot_id)
+        .then_some(boot_id)
+        .ok_or_else(|| "Linux returned an invalid boot id for Podman ownership".into())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_starttime(pid: u32) -> Result<Option<u64>, String> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {path} for Podman ownership: {error}")),
+    };
+    // `comm` is parenthesized and may itself contain spaces or `)`, so fields
+    // after it start at the final `)`. starttime is proc stat field 22: index
+    // 19 in the field-3-and-later suffix.
+    let suffix = stat
+        .rsplit_once(')')
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| format!("{path} has no parenthesized command field"))?;
+    let starttime = suffix
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| format!("{path} has no starttime field"))?
+        .parse::<u64>()
+        .map_err(|error| format!("parse {path} starttime: {error}"))?;
+    Ok(Some(starttime))
+}
+
+fn parse_container_ids(output: &str) -> Result<Vec<String>, String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            valid_container_id(id)
+                .then(|| id.to_string())
+                .ok_or_else(|| format!("Podman returned an invalid container id: {id:?}"))
+        })
+        .collect()
+}
+
+fn podman_reap_query_argv(executing_node: &str) -> Vec<String> {
+    vec![
+        "ps".into(),
+        "--all".into(),
+        "--quiet".into(),
+        "--no-trunc".into(),
+        "--filter".into(),
+        format!("label={PODMAN_MANAGED_LABEL}"),
+        "--filter".into(),
+        format!("label={PODMAN_NODE_LABEL}={executing_node}"),
+    ]
+}
+
+fn podman_owner_inspect_argv(cid: &str) -> Vec<String> {
+    vec![
+        "inspect".into(),
+        "--type".into(),
+        "container".into(),
+        "--format".into(),
+        format!(
+            "{{{{ index .Config.Labels \"{PODMAN_OWNER_BOOT_LABEL}\" }}}}\t\
+             {{{{ index .Config.Labels \"{PODMAN_OWNER_PID_LABEL}\" }}}}\t\
+             {{{{ index .Config.Labels \"{PODMAN_OWNER_START_LABEL}\" }}}}"
+        ),
+        cid.into(),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+fn owner_liveness_with(
+    owner: &PodmanOwner,
+    current_boot_id: &str,
+    process_starttime: &mut impl FnMut(u32) -> Result<Option<u64>, String>,
+) -> OwnerLiveness {
+    if owner.boot_id != current_boot_id {
+        return OwnerLiveness::Dead;
+    }
+    match process_starttime(owner.pid) {
+        Ok(Some(starttime)) if starttime == owner.starttime => OwnerLiveness::Alive,
+        Ok(Some(_)) | Ok(None) => OwnerLiveness::Dead,
+        Err(_) => OwnerLiveness::Unknown,
+    }
+}
+
+/// Reap only a bounded set of containers whose Linux owner identity is proven
+/// dead. A same-node live owner, a missing label, failed inspect, or unreadable
+/// `/proc` record is preserved: node identity alone is never kill authority.
+fn reap_podman_orphans_with(
+    executing_node: &str,
+    current_boot_id: &str,
+    mut process_starttime: impl FnMut(u32) -> Result<Option<u64>, String>,
+    mut run: impl FnMut(&[String]) -> Result<String, String>,
+) -> Result<(), String> {
+    if !valid_execution_node_id(executing_node) {
+        return Err(format!(
+            "refusing Podman reaper with invalid executing-node id {executing_node:?}"
+        ));
+    }
+    if !valid_boot_id(current_boot_id) {
+        return Err("refusing Podman reaper without a valid current boot id".into());
+    }
+    let query = podman_reap_query_argv(executing_node);
+    let listed = run(&query)?;
+    let ids = parse_container_ids(&listed)?;
+    if ids.len() > PODMAN_REAP_MAX {
+        return Err(format!(
+            "refusing to inspect {} Podman containers; bounded reaper limit is {PODMAN_REAP_MAX}",
+            ids.len()
+        ));
+    }
+    for cid in ids {
+        let owner = match run(&podman_owner_inspect_argv(&cid))
+            .ok()
+            .and_then(|output| PodmanOwner::from_inspect(&output))
+        {
+            Some(owner) => owner,
+            None => continue,
+        };
+        if owner_liveness_with(&owner, current_boot_id, &mut process_starttime)
+            != OwnerLiveness::Dead
+        {
+            continue;
+        }
+        // `stop --ignore` success proves this exact CID stopped or absent.
+        // The managed run uses --rm, so it may auto-remove before `wait`; that
+        // cleanup observation is deliberately non-fatal. `rm --ignore` then
+        // proves no stopped metadata remains.
+        run(&PodmanRun::stop_argv(&cid))?;
+        let _ = run(&PodmanRun::wait_argv(&cid));
+        run(&PodmanRun::remove_argv(&cid))?;
+    }
+    Ok(())
+}
+
+fn run_podman_bounded(args: &[String]) -> Result<String, String> {
+    run_command_bounded(Path::new("podman"), args, PODMAN_CONTROL_TIMEOUT)
+}
+
+fn kill_std_child_fail_closed(
+    child: &mut std::process::Child,
+    group: u32,
+    label: &str,
+) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    let _ = signal_process_group(group, libc::SIGKILL);
+    let _ = child.kill();
+    let mut failures = 0u64;
+    loop {
+        match child.wait() {
+            Ok(status) => {
+                #[cfg(unix)]
+                wait_process_group_gone_blocking(group, label);
+                return status;
+            }
+            Err(error) => {
+                failures += 1;
+                if failures == 1 || failures.is_multiple_of(16) {
+                    eprintln!(
+                        "[capability-host] wait/reap {label} failed \
+                         (attempt {failures}): {error}"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn run_command_bounded(
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let display = format!("{} {}", program.display(), args.join(" "));
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("`{display}` failed to spawn: {error}"))?;
+    let process_group = child.id();
+    // Drain both pipes immediately. Waiting first deadlocks once either stream
+    // fills its kernel pipe buffer (for example a large `podman ps` result).
+    let stdout = child.stdout.take().expect("Podman stdout was piped");
+    let stderr = child.stderr.take().expect("Podman stderr was piped");
+    let stdout = std::thread::spawn(move || {
+        let mut pipe = stdout;
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut pipe = stderr;
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut inspect_failures = 0u64;
+    let status = loop {
+        #[cfg(unix)]
+        match leader_exited_unreaped(process_group) {
+            Ok(true) => {
+                if process_group_alive(process_group) {
+                    let _ = signal_process_group(process_group, libc::SIGKILL);
+                }
+                let status = loop {
+                    match child.wait() {
+                        Ok(status) => break status,
+                        Err(error) => {
+                            inspect_failures += 1;
+                            if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
+                                eprintln!(
+                                    "[capability-host] reap completed `{display}` \
+                                     (attempt {inspect_failures}): {error}"
+                                );
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                };
+                wait_process_group_gone_blocking(process_group, &display);
+                break Ok(status);
+            }
+            Ok(false) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(false) => {
+                kill_std_child_fail_closed(&mut child, process_group, &display);
+                break Err(format!("`{display}` exceeded {timeout:?}"));
+            }
+            Err(error) => {
+                // Ownership could not be verified without consuming the
+                // leader. Do not signal a numeric PGID on this path.
+                inspect_failures += 1;
+                if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
+                    eprintln!(
+                        "[capability-host] observe unreaped `{display}` \
+                         (attempt {inspect_failures}): {error}"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        #[cfg(not(unix))]
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                kill_std_child_fail_closed(&mut child, process_group, &display);
+                break Err(format!("`{display}` exceeded {timeout:?}"));
+            }
+            Err(error) => {
+                kill_std_child_fail_closed(&mut child, process_group, &display);
+                break Err(format!("inspect `{display}`: {error}"));
+            }
+        }
+    };
+    let stdout = stdout
+        .join()
+        .map_err(|_| "Podman stdout reader panicked".to_string())?
+        .map_err(|error| format!("read Podman stdout: {error}"))?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| "Podman stderr reader panicked".to_string())?
+        .map_err(|error| format!("read Podman stderr: {error}"))?;
+    let status = status?;
+    if !status.success() {
+        return Err(format!(
+            "`{display}` exited with {status}: {}",
+            excerpt(&String::from_utf8_lossy(&stderr))
+        ));
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn reap_podman_orphans_once(executing_node: &str) -> Result<(), String> {
+    struct Reap {
+        executing_node: String,
+        result: Result<(), String>,
+    }
+    static REAP: std::sync::OnceLock<Reap> = std::sync::OnceLock::new();
+    let reap = REAP.get_or_init(|| Reap {
+        executing_node: executing_node.to_string(),
+        result: PodmanOwner::current().and_then(|owner| {
+            reap_podman_orphans_with(
+                executing_node,
+                &owner.boot_id,
+                linux_process_starttime,
+                run_podman_bounded,
+            )
+        }),
+    });
+    if reap.executing_node != executing_node {
+        return Err(format!(
+            "Podman reaper already ran for node {}, refusing a second node {executing_node} in the same process",
+            reap.executing_node
+        ));
+    }
+    reap.result.clone()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_podman_orphans_once(_executing_node: &str) -> Result<(), String> {
+    // There is no /proc boot-id + starttime identity with which to distinguish
+    // a live owner from PID reuse. Exact per-run cancellation still works, but
+    // startup reaping is disabled fail-safe rather than guessing from PID.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut tokio::process::Command) {}
+
+#[cfg(unix)]
+fn signal_process_group(group: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: kill is called with a valid signal and the negative child pid,
+    // which targets only the process group created for this provider child.
+    if unsafe { libc::kill(-(group as libc::pid_t), signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn process_group_alive(group: u32) -> bool {
+    // Signal 0 performs existence/permission checking without delivering a
+    // signal. EPERM still means the group exists; ESRCH means it is gone.
+    if unsafe { libc::kill(-(group as libc::pid_t), 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    }
+
+    // Linux keeps an orphaned zombie visible to kill(-pgid, 0) until PID 1
+    // reaps it. A containerized test runner may itself be PID 1 and never reap
+    // grandchildren, but zombies own no compute and cannot spawn descendants.
+    // Treat a group containing only dead members as absent; any unreadable
+    // /proc state stays fail-closed. Other Unix platforms retain kill(0).
+    #[cfg(target_os = "linux")]
+    return linux_process_group_has_live_member(group).unwrap_or(true);
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_member(group: u32) -> Option<bool> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        if entry.file_name().to_str()?.parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let (state, process_group) = linux_process_state_and_group(&stat)?;
+        if process_group == group && !matches!(state, 'Z' | 'X' | 'x') {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state_and_group(stat: &str) -> Option<(char, u32)> {
+    // /proc/<pid>/stat starts `pid (comm) state ppid pgrp`; `comm` may contain
+    // spaces and parentheses, so split after its final closing delimiter.
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    fields.next()?; // ppid
+    let process_group = fields.next()?.parse().ok()?;
+    Some((state, process_group))
+}
+
+#[cfg(unix)]
+fn leader_exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    // WNOWAIT observes exit without consuming it. Keeping the leader as a
+    // zombie pins its PID/PGID while we decide whether its exact group still
+    // needs a signal; only the final Child::wait opens a reuse window.
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(unix)]
+async fn wait_leader_exit_unreaped(pid: u32, label: &str) {
+    let mut failures = 0u64;
+    loop {
+        match leader_exited_unreaped(pid) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                failures += 1;
+                if failures == 1 || failures.is_multiple_of(16) {
+                    eprintln!(
+                        "[capability-host] observe unreaped {label} exit \
+                         (attempt {failures}): {error}"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_process_group_gone(group: u32, label: &str) {
+    let mut observations = 0u64;
+    while process_group_alive(group) {
+        observations += 1;
+        if observations == 1 || observations.is_multiple_of(160) {
+            eprintln!(
+                "[capability-host] waiting for {label} process group {group} to disappear"
+            );
+        }
+        tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(unix)]
+fn wait_process_group_gone_blocking(group: u32, label: &str) {
+    let mut observations = 0u64;
+    while process_group_alive(group) {
+        observations += 1;
+        if observations == 1 || observations.is_multiple_of(400) {
+            eprintln!(
+                "[capability-host] waiting for {label} process group {group} to disappear"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+async fn wait_tokio_child_fail_closed(
+    child: &mut tokio::process::Child,
+    label: &str,
+) -> std::process::ExitStatus {
+    let mut failures = 0u64;
+    loop {
+        match child.wait().await {
+            Ok(status) => return status,
+            Err(error) => {
+                failures += 1;
+                if failures == 1 || failures.is_multiple_of(16) {
+                    eprintln!(
+                        "[capability-host] wait/reap {label} failed \
+                         (attempt {failures}): {error}"
+                    );
+                }
+                tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn reap_observed_child_group(
+    child: &mut tokio::process::Child,
+    group: u32,
+    label: &str,
+    leader_reaped: &mut bool,
+) -> std::process::ExitStatus {
+    // The leader was observed with WNOWAIT and still pins the group identity.
+    // SIGKILL is a no-op for the zombie itself and removes any helper keeping
+    // pipes or compute alive after the nominal command exited.
+    if process_group_alive(group) {
+        let _ = signal_process_group(group, libc::SIGKILL);
+    }
+    let status = wait_tokio_child_fail_closed(child, label).await;
+    *leader_reaped = true;
+    wait_process_group_gone(group, label).await;
+    status
+}
+
+async fn wait_owned_child_complete(
+    child: &mut tokio::process::Child,
+    process_group: Option<u32>,
+    label: &str,
+    leader_reaped: &mut bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        let group = process_group.ok_or_else(|| {
+            std::io::Error::other(format!("{label} has no owned Unix process group"))
+        })?;
+        wait_leader_exit_unreaped(group, label).await;
+        return Ok(reap_observed_child_group(child, group, label, leader_reaped).await);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process_group;
+        let _ = label;
+        let status = child.wait().await?;
+        *leader_reaped = true;
+        Ok(status)
+    }
+}
+
+/// Gracefully terminate the child tree, then forcibly reap anything that
+/// ignored TERM. A SIGKILLed leader is always waited before return: a zombie is
+/// therefore reaped, while an uninterruptible D-state leader intentionally
+/// keeps this future (and its resource reservation) pending fail-closed.
+/// Podman cleanup targets the exact CID/full unique run labels, never a node or
+/// process-name match, and likewise does not return before stopped/absent proof.
+async fn terminate_child(
+    child: &mut tokio::process::Child,
+    process_group: Option<u32>,
+    podman: Option<&PodmanRun>,
+    leader_reaped: &mut bool,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
+    #[cfg(unix)]
+    if let Some(group) = process_group
+        && let Err(error) = signal_process_group(group, libc::SIGTERM)
+    {
+        eprintln!("[capability-host] SIGTERM provider process group {group}: {error}");
+    }
+
+    // `podman run` may have created the container but not written --cidfile at
+    // the instant cancellation wins. Poll within the same TERM grace window;
+    // killing the CLI after one read can otherwise strand that exact race.
+    let cid = match podman {
+        Some(podman) => podman.wait_container_id_until(deadline).await,
+        None => None,
+    };
+    #[cfg(unix)]
+    {
+        if let Some(group) = process_group {
+            loop {
+                match leader_exited_unreaped(group) {
+                    Ok(true) => {
+                        // The zombie leader still pins this PGID. Kill any
+                        // helper that outlived it before performing the reap.
+                        if process_group_alive(group) {
+                            let _ = signal_process_group(group, libc::SIGKILL);
+                        }
+                        break;
+                    }
+                    Ok(false) if tokio::time::Instant::now() < deadline => {}
+                    Ok(false) => {
+                        if let Err(error) = signal_process_group(group, libc::SIGKILL) {
+                            eprintln!(
+                                "[capability-host] SIGKILL provider process group {group}: {error}"
+                            );
+                        }
+                        let _ = child.start_kill();
+                        break;
+                    }
+                    Err(error) => {
+                        // ECHILD or an unreadable wait state makes ownership
+                        // unverifiable. Retain the reservation fail-closed.
+                        eprintln!(
+                            "[capability-host] observe cancelled provider leader {group}: {error}"
+                        );
+                    }
+                }
+                tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+            }
+            let _ = wait_tokio_child_fail_closed(child, "killed provider child").await;
+            *leader_reaped = true;
+            // Never signal after reap: only observe until the exact old group
+            // is gone, so PID reuse cannot turn cleanup into an unrelated kill.
+            wait_process_group_gone(group, "provider").await;
+        } else {
+            let _ = child.start_kill();
+            let _ = wait_tokio_child_fail_closed(child, "killed provider child").await;
+            *leader_reaped = true;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.start_kill();
+        let _ = wait_tokio_child_fail_closed(child, "killed provider child").await;
+        *leader_reaped = true;
+    }
+
+    cid
+}
+
+async fn cancellation_requested(cancellation: Option<&RunCancellation>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+struct GroupChild {
+    child: Option<tokio::process::Child>,
+    process_group: Option<u32>,
+    leader_reaped: bool,
+    cleaned: bool,
+}
+
+impl GroupChild {
+    fn spawn(
+        program: &str,
+        args: &[String],
+        capture: bool,
+    ) -> Result<Self, std::io::Error> {
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(if capture { Stdio::piped() } else { Stdio::null() })
+            .stderr(if capture { Stdio::piped() } else { Stdio::null() })
+            .kill_on_drop(true);
+        configure_process_group(&mut command);
+        let child = command.spawn()?;
+        let process_group = child.id();
+        Ok(Self {
+            child: Some(child),
+            process_group,
+            leader_reaped: false,
+            cleaned: false,
+        })
+    }
+
+    fn kill_and_wait_blocking(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        #[cfg(unix)]
+        if self.leader_reaped {
+            if let Some(group) = self.process_group {
+                // The PGID may now be reused. Never signal it; retain the
+                // reservation until absence is observed fail-closed.
+                wait_process_group_gone_blocking(group, "reaped setup");
+            }
+            self.cleaned = true;
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            let mut inspect_failures = 0u64;
+            loop {
+                match leader_exited_unreaped(group) {
+                    Ok(_) => {
+                        // Both a live and a zombie leader pin this exact PGID.
+                        let _ = signal_process_group(group, libc::SIGKILL);
+                        let _ = child.start_kill();
+                        break;
+                    }
+                    Err(error) => {
+                        inspect_failures += 1;
+                        if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] inspect setup child before kill \
+                                 (attempt {inspect_failures}): {error}"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            let mut wait_failures = 0u64;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => {
+                        wait_failures += 1;
+                        if wait_failures == 1 || wait_failures.is_multiple_of(16) {
+                            eprintln!(
+                                "[capability-host] reap killed setup child \
+                                 (attempt {wait_failures}): {error}"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            self.leader_reaped = true;
+            wait_process_group_gone_blocking(group, "setup");
+            self.cleaned = true;
+            return;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = child.start_kill();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) | Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            self.cleaned = true;
+            return;
+        }
+
+        #[cfg(unix)]
+        let mut inspect_failures = 0u64;
+        #[cfg(unix)]
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.leader_reaped = true;
+                    self.cleaned = true;
+                    return;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    inspect_failures += 1;
+                    if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] inspect setup child before kill \
+                             (attempt {inspect_failures}): {error}"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        #[cfg(unix)]
+        let _ = child.start_kill();
+        #[cfg(unix)]
+        let mut wait_failures = 0u64;
+        #[cfg(unix)]
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.leader_reaped = true;
+                    self.cleaned = true;
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    wait_failures += 1;
+                    if wait_failures == 1 || wait_failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] reap killed setup child \
+                             (attempt {wait_failures}): {error}"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            self.kill_and_wait_blocking();
+        }
+    }
+}
+
+/// Drop owner for one live provider invocation. This is intentionally
+/// synchronous on unexpected future destruction: returning from Drop would
+/// release the outer dispatch reservation while descendants or a container
+/// could still consume it.
+struct LiveChild {
+    process: GroupChild,
+    podman: Option<PodmanRun>,
+    cleaned: bool,
+}
+
+impl LiveChild {
+    fn new(child: tokio::process::Child, podman: Option<PodmanRun>) -> Self {
+        let process_group = child.id();
+        Self {
+            process: GroupChild {
+                child: Some(child),
+                process_group,
+                leader_reaped: false,
+                cleaned: false,
+            },
+            podman,
+            cleaned: false,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.process
+            .child
+            .as_mut()
+            .expect("a live invocation owns its child")
+    }
+
+    async fn terminate(&mut self) {
+        let process_group = self.process.process_group;
+        let cid = if self.process.cleaned {
+            self.podman.as_ref().and_then(PodmanRun::container_id)
+        } else if self.process.leader_reaped {
+            #[cfg(unix)]
+            if let Some(group) = process_group {
+                wait_process_group_gone(group, "provider").await;
+            }
+            self.process.cleaned = true;
+            self.podman.as_ref().and_then(PodmanRun::container_id)
+        } else {
+            let podman = self.podman.as_ref();
+            let child = self
+                .process
+                .child
+                .as_mut()
+                .expect("a live invocation owns its child");
+            terminate_child(
+                child,
+                process_group,
+                podman,
+                &mut self.process.leader_reaped,
+            )
+            .await
+        };
+        // terminate_child has reaped the leader and proved the group gone.
+        // Mark that boundary before awaiting Podman, so aborting cleanup falls
+        // through to this owner's exact synchronous container cleanup only.
+        self.process.cleaned = true;
+        if let Some(podman) = &self.podman {
+            if let Some(cid) = podman.stop_until_confirmed(cid).await {
+                podman.cleanup_stopped(&cid).await;
+            }
+            podman.remove_cidfile();
+        }
+        self.cleaned = true;
+    }
+
+    async fn wait_complete(&mut self, label: &str) -> std::io::Result<std::process::ExitStatus> {
+        let process_group = self.process.process_group;
+        let child = self
+            .process
+            .child
+            .as_mut()
+            .expect("a live invocation owns its child");
+        let status = wait_owned_child_complete(
+            child,
+            process_group,
+            label,
+            &mut self.process.leader_reaped,
+        )
+        .await?;
+        self.process.cleaned = true;
+        // A successful Podman CLI exit is not by itself cleanup proof. Target
+        // its exact CID/full label identity even on normal provider completion.
+        if let Some(podman) = &self.podman {
+            let cid = podman.stop_until_confirmed(podman.container_id()).await;
+            if let Some(cid) = cid {
+                podman.cleanup_stopped(&cid).await;
+            }
+            podman.remove_cidfile();
+        }
+        self.cleaned = true;
+        Ok(status)
+    }
+}
+
+impl Drop for LiveChild {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.process.kill_and_wait_blocking();
+        if let Some(podman) = &self.podman {
+            podman.cleanup_blocking();
+        }
+        self.cleaned = true;
+    }
+}
+
+struct SetupOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// Owns the boot process and concurrency permit for one ephemeral Tart VM.
-/// Drop performs the documented stop → delete sequence on every exit path.
+/// `tart run` is the foreground VM compute owner (Tart has no detached daemon
+/// in this lifecycle): its isolated process group is killed and its leader
+/// reaped before Drop performs exact stop/delete/absence cleanup. The permit is
+/// released only after `tart list --source local --quiet` proves this VM name
+/// absent, so neither compute nor a partial clone escapes the concurrency gate.
 struct TartGuard {
     vm: String,
     ip: String,
-    run: Option<tokio::process::Child>,
+    run: Option<GroupChild>,
+    setup: Option<GroupChild>,
+    vm_may_exist: bool,
     _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl TartGuard {
+    async fn setup_command(
+        &mut self,
+        program: &str,
+        args: &[String],
+        cancellation: Option<&RunCancellation>,
+        timeout: Duration,
+        capture: bool,
+    ) -> Result<SetupOutput, String> {
+        if cancellation.is_some_and(RunCancellation::is_cancelled) {
+            return Err(format!("`{program} {}` cancelled before spawn", args.join(" ")));
+        }
+        self.setup = Some(GroupChild::spawn(program, args, capture).map_err(|error| {
+            format!(
+                "`{program} {}` failed to spawn: {error}",
+                args.join(" ")
+            )
+        })?);
+        if program == "tart" && args.first().map(String::as_str) == Some("clone") {
+            // From this point clone may have created metadata even if its
+            // command is cancelled, dropped, or exits unsuccessfully.
+            self.vm_may_exist = true;
+        }
+        let process = self
+            .setup
+            .as_mut()
+            .expect("a Tart setup child was just installed");
+        let process_group = process.process_group;
+        let child = process
+            .child
+            .as_mut()
+            .expect("a Tart setup child was just installed");
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = stdout {
+                pipe.read_to_end(&mut bytes).await?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let stderr = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = stderr {
+                pipe.read_to_end(&mut bytes).await?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        });
+
+        enum Outcome {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            Cancelled,
+            TimedOut,
+        }
+        let outcome = tokio::select! {
+            status = wait_owned_child_complete(
+                child,
+                process_group,
+                program,
+                &mut process.leader_reaped,
+            ) => {
+                Outcome::Exited(status)
+            },
+            _ = cancellation_requested(cancellation) => Outcome::Cancelled,
+            _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
+        };
+        if matches!(&outcome, Outcome::Cancelled | Outcome::TimedOut)
+            && let Some(process) = self.setup.as_mut()
+        {
+            if process.leader_reaped {
+                #[cfg(unix)]
+                if let Some(group) = process.process_group {
+                    wait_process_group_gone(group, program).await;
+                }
+            } else if let Some(child) = process.child.as_mut() {
+                let _ = terminate_child(
+                    child,
+                    process.process_group,
+                    None,
+                    &mut process.leader_reaped,
+                )
+                .await;
+            }
+            process.cleaned = true;
+        }
+        if matches!(&outcome, Outcome::Exited(Ok(_)))
+            && let Some(process) = self.setup.as_mut()
+        {
+            // wait_owned_child_complete reaped the leader and proved its exact
+            // process group gone; Drop must not inspect that stale PGID.
+            process.cleaned = true;
+        }
+        // Drop the process owner before joining pipe readers so every
+        // cancellation/timeout path has completed its kill + wait first.
+        drop(self.setup.take());
+        let stdout = stdout
+            .await
+            .map_err(|error| format!("join `{program}` stdout reader: {error}"))?
+            .map_err(|error| format!("read `{program}` stdout: {error}"))?;
+        let stderr = stderr
+            .await
+            .map_err(|error| format!("join `{program}` stderr reader: {error}"))?
+            .map_err(|error| format!("read `{program}` stderr: {error}"))?;
+        let status = match outcome {
+            Outcome::Exited(status) => status.map_err(|error| {
+                format!("wait for `{program} {}`: {error}", args.join(" "))
+            })?,
+            Outcome::Cancelled => {
+                return Err(format!("`{program} {}` cancelled", args.join(" ")))
+            }
+            Outcome::TimedOut => {
+                return Err(format!(
+                    "`{program} {}` exceeded {timeout:?}",
+                    args.join(" ")
+                ))
+            }
+        };
+        Ok(SetupOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 impl Drop for TartGuard {
     fn drop(&mut self) {
-        match std::process::Command::new("tart")
-            .args(["stop", &self.vm])
-            .status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!(
-                "[capability-host] `tart stop {}` exited with {status}",
-                self.vm
-            ),
-            Err(error) => eprintln!(
-                "[capability-host] `tart stop {}` failed to spawn: {error}",
-                self.vm
-            ),
+        // If the setup future itself is dropped, kill and reap clone/set/ip/SSH
+        // before touching the partially-created VM. Drop cannot await, so this
+        // synchronous wait is deliberately fail-closed if the kernel cannot
+        // reap a killed child.
+        if let Some(mut setup) = self.setup.take() {
+            setup.kill_and_wait_blocking();
         }
-        if let Some(run) = self.run.as_mut() {
-            let _ = run.start_kill();
+        // Compute boundary: the foreground `tart run` leader plus every helper
+        // it spawned share this process group. SIGKILL + leader wait completes
+        // before the semaphore field can be dropped.
+        if let Some(mut run) = self.run.take() {
+            run.kill_and_wait_blocking();
         }
-        match std::process::Command::new("tart")
-            .args(["delete", &self.vm])
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => eprintln!(
-                "[capability-host] `tart delete {}` exited with {s}",
-                self.vm
-            ),
-            Err(e) => eprintln!(
-                "[capability-host] `tart delete {}` failed to spawn: {e}",
-                self.vm
-            ),
+        if !self.vm_may_exist {
+            return;
+        }
+        let mut failures = 0u64;
+        let mut retry_delay = PODMAN_RETRY_MIN;
+        loop {
+            match tart_vm_absent(&self.vm) {
+                Ok(true) => break,
+                Ok(false) => {
+                    let _ = run_tart_cleanup_bounded("stop", &self.vm);
+                    let _ = run_tart_cleanup_bounded("delete", &self.vm);
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] verify Tart VM {} absence \
+                             (attempt {failures}): {error}",
+                            self.vm
+                        );
+                    }
+                }
+            }
+            match tart_vm_absent(&self.vm) {
+                Ok(true) => break,
+                Ok(false) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] Tart VM {} still present after exact cleanup \
+                             (attempt {failures})",
+                            self.vm
+                        );
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(16) {
+                        eprintln!(
+                            "[capability-host] Tart cleanup for {} remains unproven \
+                             (attempt {failures}): {error}",
+                            self.vm
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(retry_delay);
+            retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
         }
     }
+}
+
+fn tart_vm_absent(vm: &str) -> Result<bool, String> {
+    let output = run_command_bounded(
+        Path::new("tart"),
+        &[
+            "list".into(),
+            "--source".into(),
+            "local".into(),
+            "--quiet".into(),
+        ],
+        PODMAN_CONTROL_TIMEOUT,
+    )?;
+    Ok(!output.lines().any(|name| name.trim() == vm))
+}
+
+fn run_tart_cleanup_bounded(action: &str, vm: &str) -> Result<(), String> {
+    run_command_bounded(
+        Path::new("tart"),
+        &[action.to_string(), vm.to_string()],
+        PODMAN_CONTROL_TIMEOUT,
+    )
+    .map(|_| ())
 }
 
 /// one finished invocation: the parsed answer plus the raw stdout the
@@ -1242,6 +3002,13 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
     ) -> Result<Invocation, String> {
+        if ctx
+            .cancellation
+            .as_ref()
+            .is_some_and(RunCancellation::is_cancelled)
+        {
+            return Err(format!("{} cancelled before spawn", self.bin.display()));
+        }
         let tart_plan = matches!(self.backend, SandboxBackend::Tart { .. })
             .then(|| {
                 let args = self.broker_argv(args, workdir, auth);
@@ -1251,31 +3018,41 @@ impl CliProvider {
         // Declared before the SSH child so VM stop/delete runs after the child
         // is dropped on success, error, or timeout.
         let tart_guard = self.tart_setup(tart_plan.as_ref(), ctx).await?;
-        let mut command = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
+        let (mut command, podman) = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
             let mut command = tokio::process::Command::new("sshpass");
             command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script));
-            command
+            (command, None)
         } else {
-            self.command(args, workdir, ctx, auth)?
+            let PreparedCommand { command, podman } =
+                self.prepared_command(args, workdir, ctx, auth)?;
+            (command, podman)
         };
+        if let Some(podman) = &podman {
+            podman.prepare_cidfile()?;
+        }
         command
             .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
+        configure_process_group(&mut command);
+        let child = command
             .spawn()
             .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
-        let mut stdin = child
+        let mut live = LiveChild::new(child, podman);
+        let mut stdin = live
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| "child stdin was not piped".to_string())?;
-        let mut stdout_pipe = child
+        let mut stdout_pipe = live
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| "child stdout was not piped".to_string())?;
-        let mut stderr_pipe = child
+        let mut stderr_pipe = live
+            .child_mut()
             .stderr
             .take()
             .ok_or_else(|| "child stderr was not piped".to_string())?;
@@ -1331,6 +3108,7 @@ impl CliProvider {
                         last_activity = tokio::time::Instant::now();
                     }
                     Err(e) => {
+                        live.terminate().await;
                         return Err(format!(
                             "reading {} stdout failed: {e}",
                             self.bin.display()
@@ -1348,15 +3126,22 @@ impl CliProvider {
                         last_activity = tokio::time::Instant::now();
                     }
                     Err(e) => {
+                        live.terminate().await;
                         return Err(format!(
                             "reading {} stderr failed: {e}",
                             self.bin.display()
                         ));
                     }
                 },
-                // returning drops `child` (kill_on_drop): a stalled or
-                // runaway CLI never outlives its job.
+                _ = cancellation_requested(ctx.cancellation.as_ref()) => {
+                    live.terminate().await;
+                    return Err(format!(
+                        "{} cancelled (child terminated)",
+                        self.bin.display()
+                    ));
+                },
                 _ = tokio::time::sleep_until(deadline) => {
+                    live.terminate().await;
                     return Err(if deadline == hard {
                         format!(
                             "{} timed out: still running at the hard cap of {:?} \
@@ -1377,15 +3162,42 @@ impl CliProvider {
         }
         // both streams closed: the child is done (or moments from it) — a
         // bounded wait, never indefinite.
-        let status = tokio::time::timeout(idle, child.wait())
-            .await
-            .map_err(|_| {
-                format!(
-                    "{} closed its output but did not exit within {idle:?}",
+        enum WaitOutcome {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            Cancelled,
+            TimedOut,
+        }
+        let label = self.bin.display().to_string();
+        let status = match tokio::select! {
+            status = live.wait_complete(&label) => {
+                WaitOutcome::Exited(status)
+            },
+            _ = cancellation_requested(ctx.cancellation.as_ref()) => WaitOutcome::Cancelled,
+            _ = tokio::time::sleep(idle) => WaitOutcome::TimedOut,
+        } {
+            WaitOutcome::Exited(Ok(status)) => status,
+            WaitOutcome::Exited(Err(error)) => {
+                live.terminate().await;
+                return Err(format!(
+                    "waiting on {} failed: {error}",
                     self.bin.display()
-                )
-            })?
-            .map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?;
+                ));
+            }
+            WaitOutcome::Cancelled => {
+                live.terminate().await;
+                return Err(format!(
+                    "{} cancelled (child terminated)",
+                    self.bin.display()
+                ));
+            }
+            WaitOutcome::TimedOut => {
+                live.terminate().await;
+                return Err(format!(
+                    "{} closed its output but did not exit within {idle:?} (child killed)",
+                    self.bin.display()
+                ));
+            }
+        };
         // an unfinished feed at this point means the child exited without
         // draining stdin — the exit status below is the primary diagnostic.
         let fed = fed.unwrap_or(Ok(()));
@@ -1426,7 +3238,19 @@ impl CliProvider {
     }
 
     async fn run_output(&self, prompt: &str, ctx: &RunContext) -> Result<ProviderOutput, String> {
+        if ctx
+            .cancellation
+            .as_ref()
+            .is_some_and(RunCancellation::is_cancelled)
+        {
+            return Err(format!("{} cancelled before start", self.bin.display()));
+        }
         let workdir = self.ensure_writable_workdir(ctx)?;
+        let workdir = if matches!(self.backend, SandboxBackend::Direct) {
+            workdir
+        } else {
+            canonical_mount_path(&workdir, "sandbox workdir")?
+        };
         // the run's auth materials, prepared once and shared by every invocation
         // below (a resume and its cold retry are the SAME run — one config home,
         // one broker). `broker` is held here so the endpoint outlives the child
@@ -1468,6 +3292,13 @@ impl CliProvider {
                     });
                 }
                 Err(e) => {
+                    if ctx
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(RunCancellation::is_cancelled)
+                    {
+                        return Err(e);
+                    }
                     // a stale/expired session must degrade to a cold start,
                     // never break the agent: forget it and retry ONCE below.
                     // (if the failure was not the session's fault, the cold
@@ -1686,12 +3517,20 @@ fn excerpt(s: &str) -> String {
 /// sessions stay off beyond env overrides). `DUCKTAPE_AGENT_WORKSPACES` /
 /// `DUCKTAPE_AGENT_SESSIONS` override the wired roots. `output_sink`
 /// installs a live tail on every discovered CLI provider.
+/// `node_identity` is the verified local signer/origin bytes; Podman uses its
+/// canonical [`execution_node_id`] to scope crash reaping to this node only.
 pub fn discover(
+    node_identity: &[u8],
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
+    let executing_node = execution_node_id(node_identity);
+    if matches!(&backend, SandboxBackend::Podman { .. }) {
+        reap_podman_orphans_once(&executing_node)
+            .map_err(|error| format!("Podman crash-orphan cleanup failed: {error}"))?;
+    }
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -1906,7 +3745,416 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
+    fn podman_ctx() -> RunContext {
+        RunContext {
+            executing_node: Some(execution_node_id(b"test-node")),
+            ..RunContext::default()
+        }
+    }
+
+    #[test]
+    fn execution_node_identity_is_canonical_lower_hex() {
+        assert_eq!(execution_node_id(&[0, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_clone_visible_and_sticky() {
+        let cancellation = RunCancellation::new();
+        let waiter = cancellation.clone();
+        let waiting = tokio::spawn(async move { waiter.cancelled().await });
+        assert!(!cancellation.is_cancelled());
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("an active waiter is woken")
+            .expect("waiter task does not panic");
+        assert!(cancellation.is_cancelled());
+        tokio::time::timeout(Duration::from_millis(50), cancellation.cancelled())
+            .await
+            .expect("a late waiter observes the cancelled state");
+    }
+
     // ---- podman backend glue ------------------------------------------------
+
+    #[test]
+    fn podman_cleanup_commands_target_one_container_id() {
+        let cid = "0123456789abcdef";
+        assert_eq!(
+            PodmanRun::stop_argv(cid),
+            vec!["stop", "--ignore", "--time", "2", cid]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            PodmanRun::wait_argv(cid),
+            vec!["wait".to_string(), cid.to_string()]
+        );
+        assert_eq!(
+            PodmanRun::remove_argv(cid),
+            vec!["rm", "--force", "--ignore", cid]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn podman_late_cid_query_uses_the_full_unique_run_identity() {
+        let labels = vec![
+            PODMAN_MANAGED_LABEL.into(),
+            format!("{PODMAN_NODE_LABEL}=node"),
+            format!("{PODMAN_OWNER_BOOT_LABEL}=boot"),
+            format!("{PODMAN_OWNER_PID_LABEL}=7"),
+            format!("{PODMAN_OWNER_START_LABEL}=11"),
+            format!("{PODMAN_INSTANCE_LABEL}=7-1"),
+        ];
+        let run = PodmanRun {
+            cidfile: scratch("podman-exact-query").join("run.cid"),
+            labels: labels.clone(),
+        };
+        let query = run.exact_query_argv();
+        assert_eq!(query[..4].join(" "), "ps --all --quiet --no-trunc");
+        assert_eq!(
+            query.iter().filter(|arg| *arg == "--filter").count(),
+            labels.len()
+        );
+        for label in labels {
+            assert!(query.contains(&format!("label={label}")), "{query:?}");
+        }
+        assert!(query.iter().all(|arg| !arg.contains("name=") && !arg.contains("pkill")));
+    }
+
+    #[test]
+    fn podman_process_reaper_preserves_live_owner_and_reaps_only_dead_owner() {
+        let live_cid = "0123456789abcdef";
+        let dead_cid = "fedcba9876543210";
+        let executing_node = execution_node_id(b"node-a");
+        let query = podman_reap_query_argv(&executing_node);
+        let boot_id = "11111111-2222-3333-4444-555555555555";
+        let mut calls = Vec::new();
+        reap_podman_orphans_with(
+            &executing_node,
+            boot_id,
+            |pid| match pid {
+                101 => Ok(Some(1001)),
+                // PID 202 exists but starttime differs: it was reused and is
+                // not the process that created this container.
+                202 => Ok(Some(9999)),
+                _ => Err("unexpected pid".into()),
+            },
+            |args| {
+                calls.push(args.to_vec());
+                if args == query.as_slice() {
+                    return Ok(format!("{live_cid}\n{dead_cid}\n"));
+                }
+                if args == podman_owner_inspect_argv(live_cid).as_slice() {
+                    return Ok(format!("{boot_id}\t101\t1001\n"));
+                }
+                if args == podman_owner_inspect_argv(dead_cid).as_slice() {
+                    return Ok(format!("{boot_id}\t202\t2002\n"));
+                }
+                if args == PodmanRun::wait_argv(dead_cid).as_slice() {
+                    return Err("container auto-removed after stop".into());
+                }
+                Ok(String::new())
+            },
+        )
+        .expect("fake managed container is reaped");
+
+        assert_eq!(
+            calls,
+            vec![
+                query.clone(),
+                podman_owner_inspect_argv(live_cid),
+                podman_owner_inspect_argv(dead_cid),
+                PodmanRun::stop_argv(dead_cid),
+                PodmanRun::wait_argv(dead_cid),
+                PodmanRun::remove_argv(dead_cid),
+            ]
+        );
+        assert!(calls.iter().all(|args| {
+            !args.iter().any(|arg| arg.contains("pkill"))
+                && (args.first().map(String::as_str) != Some("ps")
+                    || (args
+                        .iter()
+                        .any(|arg| arg == "label=io.ducktape.managed=capability-host")
+                        && args.iter().any(|arg| {
+                            arg == &format!("label=io.ducktape.node={executing_node}")
+                        })))
+        }));
+        assert!(parse_container_ids("not-a-container-id\n").is_err());
+    }
+
+    #[test]
+    fn podman_process_reaper_preserves_missing_or_unverifiable_owner() {
+        let missing = "0123456789abcdef";
+        let unreadable = "fedcba9876543210";
+        let executing_node = execution_node_id(b"node-a");
+        let query = podman_reap_query_argv(&executing_node);
+        let boot_id = "11111111-2222-3333-4444-555555555555";
+        let mut calls = Vec::new();
+        reap_podman_orphans_with(
+            &executing_node,
+            boot_id,
+            |_| Err("/proc denied".into()),
+            |args| {
+                calls.push(args.to_vec());
+                if args == query.as_slice() {
+                    return Ok(format!("{missing}\n{unreadable}\n"));
+                }
+                if args == podman_owner_inspect_argv(missing).as_slice() {
+                    return Ok("<no value>\t<no value>\t<no value>\n".into());
+                }
+                if args == podman_owner_inspect_argv(unreadable).as_slice() {
+                    return Ok(format!("{boot_id}\t303\t3003\n"));
+                }
+                panic!("preserved containers must not receive cleanup: {args:?}");
+            },
+        )
+        .expect("unknown owners are preserved safely");
+        assert_eq!(calls.len(), 3, "one query and two exact inspections");
+    }
+
+    #[test]
+    fn podman_process_reaper_has_a_hard_inspection_bound() {
+        let executing_node = execution_node_id(b"node-a");
+        let query = podman_reap_query_argv(&executing_node);
+        let listed = (1..=PODMAN_REAP_MAX + 1)
+            .map(|id| format!("{id:016x}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = reap_podman_orphans_with(
+            &executing_node,
+            "11111111-2222-3333-4444-555555555555",
+            |_| panic!("limit is checked before /proc"),
+            |args| {
+                assert_eq!(args, query.as_slice());
+                Ok(listed.clone())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("bounded reaper limit"), "got: {error}");
+    }
+
+    #[test]
+    fn bounded_command_drains_large_stdout_and_stderr_while_waiting() {
+        let dir = scratch("podman-large-control-output");
+        let script = fake_cli(
+            &dir,
+            "large-output",
+            "i=0\n\
+             while [ \"$i\" -lt 4096 ]; do printf '%064d\\n' 0; i=$((i + 1)); done\n\
+             i=0\n\
+             while [ \"$i\" -lt 4096 ]; do printf '%064d\\n' 1 >&2; i=$((i + 1)); done",
+        );
+        let stdout = run_command_bounded(
+            Path::new("/bin/sh"),
+            &[script.display().to_string()],
+            Duration::from_secs(10),
+        )
+        .expect("both streams are drained before their pipe buffers fill");
+        assert!(stdout.len() > 64 * 1024, "stdout crossed a pipe buffer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_removes_a_helper_that_keeps_its_pipes_open() {
+        let dir = scratch("bounded-command-residual-helper");
+        let pidfile = dir.join("helper.pid");
+        let script = fake_cli(
+            &dir,
+            "residual-helper",
+            &format!("sleep 30 &\necho $! > {}\nexit 0", pidfile.display()),
+        );
+        let started = std::time::Instant::now();
+        run_command_bounded(
+            Path::new("/bin/sh"),
+            &[script.display().to_string()],
+            Duration::from_secs(2),
+        )
+        .expect("the exited leader's residual group is removed before pipe join");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a background helper must not hold pipe readers until timeout"
+        );
+        let helper = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{helper}/stat")) {
+            let (state, _) = linux_process_state_and_group(&stat).expect("helper proc stat");
+            assert!(matches!(state, 'Z' | 'X' | 'x'), "helper still computes: {stat}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(unsafe { libc::kill(helper, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn podman_cancellation_collects_a_delayed_cid_before_exact_cleanup() {
+        let dir = scratch("podman-delayed-cid");
+        let cidfile = dir.join("run.cid");
+        let run = PodmanRun {
+            cidfile: cidfile.clone(),
+            labels: Vec::new(),
+        };
+        let cid = "0123456789abcdef";
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(cidfile, format!("{cid}\n")).unwrap();
+        });
+        let collected = run
+            .wait_container_id_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the cidfile creation race is collected");
+        writer.await.unwrap();
+        assert_eq!(collected, cid);
+        assert_eq!(
+            PodmanRun::stop_argv(&collected).last().map(String::as_str),
+            Some(cid)
+        );
+        assert_eq!(
+            PodmanRun::wait_argv(&collected).last().map(String::as_str),
+            Some(cid)
+        );
+        assert_eq!(
+            PodmanRun::remove_argv(&collected).last().map(String::as_str),
+            Some(cid)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_mount_checks_resolve_symlinks_and_reject_relative_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("podman-canonical-mounts");
+        let home = dir.join("real-home");
+        let control = home.join(".ducktape/provider-runs/podman");
+        std::fs::create_dir_all(&control).unwrap();
+        let home_alias = dir.join("home-alias");
+        symlink(&home, &home_alias).unwrap();
+        assert_eq!(
+            canonical_mount_path(&home_alias, "test HOME").unwrap(),
+            std::fs::canonicalize(&home).unwrap()
+        );
+
+        let exposed_alias = dir.join("exposed-alias");
+        symlink(&control, &exposed_alias).unwrap();
+        let error = ensure_podman_control_hidden(
+            &std::fs::canonicalize(&control).unwrap(),
+            [exposed_alias.as_path()],
+        )
+        .unwrap_err();
+        assert!(error.contains("would be exposed"), "got: {error}");
+        assert!(canonical_mount_path(Path::new("relative/home"), "test HOME").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_kill_does_not_return_before_the_child_is_reaped() {
+        let args = vec!["-c".into(), "sleep 30".into()];
+        let mut process =
+            GroupChild::spawn("/bin/sh", &args, false).expect("spawn setup process");
+        process.kill_and_wait_blocking();
+        assert!(matches!(
+            process.child.as_mut().unwrap().try_wait(),
+            Ok(Some(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parser_handles_parentheses_and_distinguishes_zombies() {
+        assert_eq!(
+            linux_process_state_and_group("42 (agent (worker)) S 7 19 19 0"),
+            Some(('S', 19))
+        );
+        assert_eq!(
+            linux_process_state_and_group("43 (sleep) Z 1 19 19 0"),
+            Some(('Z', 19))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_setup_process_reaps_its_whole_process_group() {
+        let dir = scratch("tart-setup-drop");
+        let pidfile = dir.join("setup.pid");
+        let args = vec![
+            "-c".into(),
+            format!(
+                "trap '' TERM; echo $$ > {}; sleep 30 & wait",
+                pidfile.display()
+            ),
+        ];
+        let process = GroupChild::spawn("/bin/sh", &args, false).expect("spawn setup process");
+        let group = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("setup process reports its group");
+        drop(process);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while process_group_alive(group) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping setup leaves no descendant behind");
+    }
+
+    #[test]
+    fn a_finished_podman_run_removes_its_host_cidfile() {
+        let dir = scratch("podman-cidfile-cleanup");
+        let cidfile = dir.join("run.cid");
+        std::fs::write(&cidfile, b"0123456789abcdef\n").unwrap();
+        let run = PodmanRun {
+            cidfile: cidfile.clone(),
+            labels: Vec::new(),
+        };
+        run.remove_cidfile();
+        assert!(!cidfile.exists());
+    }
+
+    #[test]
+    fn podman_refuses_a_run_without_its_executing_node_scope() {
+        let root = scratch("podman-missing-node-scope");
+        let bin = root.join("pod");
+        let workdir = root.join("wd");
+        std::fs::write(&bin, b"pod").unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        let provider = CliProvider::from_spec(sandbox_spec("pod"), bin)
+            .with_backend(SandboxBackend::Podman {
+                image: "img".into(),
+            });
+        let error = match provider.command(
+            &[],
+            &workdir,
+            &RunContext::default(),
+            &RunAuth::default(),
+        ) {
+            Ok(_) => panic!("an unscoped Podman run could be reaped by the wrong node"),
+            Err(error) => error,
+        };
+        assert!(error.contains("executing-node"), "got: {error}");
+    }
 
     #[test]
     fn podman_backend_wraps_command_with_identical_paths_and_rw_mounts() {
@@ -1932,19 +4180,24 @@ rw_dirs = ["~/.claude"]
             "test",
         )
         .unwrap();
-        let provider = CliProvider::from_spec(spec, PathBuf::from("/usr/bin/pod"))
+        let root = scratch("podman-command-paths");
+        let bin = root.join("pod");
+        let workdir = root.join("wd");
+        std::fs::write(&bin, b"pod").unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        let provider = CliProvider::from_spec(spec, bin.clone())
             .with_backend(SandboxBackend::Podman {
                 image: "img".into(),
             });
         let ctx = RunContext {
             env: BTreeMap::from([("RUN_SECRET".to_string(), "not-in-argv".to_string())]),
             limits: BTreeMap::from([("cores".to_string(), 2u64)]),
-            ..RunContext::default()
+            ..podman_ctx()
         };
         let cmd = provider
             .command(
                 &["--go".into()],
-                Path::new("/tmp/wd"),
+                &workdir,
                 &ctx,
                 &RunAuth::default(),
             )
@@ -1956,14 +4209,21 @@ rw_dirs = ["~/.claude"]
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let joined = argv.join(" ");
-        let home = std::env::var("HOME").expect("HOME set in test env");
+        let home = canonical_mount_path(
+            &PathBuf::from(std::env::var_os("HOME").expect("HOME set in test env")),
+            "test HOME",
+        )
+        .unwrap();
         // the spec's `~/.claude` expands against the real HOME and mounts rw at
         // its IDENTICAL container path; the bin mounts ro; limits become flags.
         assert!(
-            joined.contains(&format!("-v {home}/.claude:{home}/.claude")),
+            joined.contains(&format!("-v {home}/.claude:{home}/.claude", home = home.display())),
             "rw mount at identical path: {joined}"
         );
-        assert!(joined.contains("-v /usr/bin/pod:/usr/bin/pod:ro"), "{joined}");
+        assert!(
+            joined.contains(&format!("-v {bin}:{bin}:ro", bin = bin.display())),
+            "{joined}"
+        );
         assert!(joined.contains("-e HOME"), "{joined}");
         assert!(joined.contains("-e RUN_SECRET"), "{joined}");
         assert!(
@@ -1983,7 +4243,31 @@ rw_dirs = ["~/.claude"]
             Some(std::ffi::OsStr::new(&home))
         );
         assert!(joined.contains("--cpus 2"), "{joined}");
-        assert!(joined.ends_with("img /usr/bin/pod --go"), "{joined}");
+        assert!(
+            joined.contains("--cidfile")
+                && joined.contains("--label io.ducktape.managed=capability-host")
+                && joined.contains(&format!(
+                    "--label io.ducktape.node={}",
+                    execution_node_id(b"test-node")
+                ))
+                && joined.contains("--label io.ducktape.owner.boot=")
+                && joined.contains("--label io.ducktape.owner.pid=")
+                && joined.contains("--label io.ducktape.owner.starttime=")
+                && joined.contains("--label io.ducktape.run=")
+                && joined.contains("--label io.ducktape.instance="),
+            "managed lifecycle identity: {joined}"
+        );
+        let cidfile = joined
+            .split_whitespace()
+            .skip_while(|arg| *arg != "--cidfile")
+            .nth(1)
+            .expect("cidfile value");
+        assert!(
+            !joined.contains(&format!("-v {cidfile}:"))
+                && !joined.contains(&format!("-e {cidfile}")),
+            "host cidfile is not visible inside the container: {joined}"
+        );
+        assert!(joined.ends_with(&format!("img {} --go", bin.display())), "{joined}");
     }
 
     #[test]
@@ -2067,6 +4351,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
         let ctx = RunContext {
             workdir_override: Some(workdir.clone()),
             limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            executing_node: Some(execution_node_id(b"hardware-smoke")),
             ..RunContext::default()
         };
 
@@ -2115,27 +4400,32 @@ printf 'sandbox-ok:%s' "$prompt""#,
         // via DUCKTAPE_RUN_SKILLS. under Direct the env alone works — the path is
         // on the host. under a sandbox, only what we mount exists, so without the
         // mount the agent would find its own skills dir simply MISSING.
-        let provider = CliProvider::from_spec(sandbox_spec("pod"), PathBuf::from("/usr/bin/pod"))
+        let root = scratch("podman-skills-mount");
+        let bin = root.join("pod");
+        let workdir = root.join("wd");
+        let skills = root.join("agent-7-ro");
+        std::fs::write(&bin, b"pod").unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        let provider = CliProvider::from_spec(sandbox_spec("pod"), bin)
             .with_backend(SandboxBackend::Podman {
                 image: "img".into(),
             });
         let ctx = RunContext {
             env: BTreeMap::from([(
                 SKILLS_ROOT_ENV.to_string(),
-                "/var/run/ducktape/agent-7-ro".to_string(),
+                skills.display().to_string(),
             )]),
-            ..RunContext::default()
+            ..podman_ctx()
         };
         let cmd = provider
-            .command(&[], Path::new("/tmp/wd"), &ctx, &RunAuth::default())
+            .command(&[], &workdir, &ctx, &RunAuth::default())
             .expect("podman command builds");
         let joined = argv_of(&cmd);
         // READ-ONLY, at the identical path the env names: the agent may read its
         // skills, never rewrite them.
         assert!(
-            joined.contains(
-                "-v /var/run/ducktape/agent-7-ro:/var/run/ducktape/agent-7-ro:ro"
-            ),
+            joined.contains(&format!("-v {s}:{s}:ro", s = skills.display())),
             "the skills root mounts ro at its identical path: {joined}"
         );
         assert!(
@@ -2148,17 +4438,17 @@ printf 'sandbox-ok:%s' "$prompt""#,
     fn a_run_with_no_skills_mounts_none() {
         // no skills on the run = no mount. (the provisioner omits the env entirely
         // when the agent has no skill records — see agent_provision's plane tests.)
-        let provider = CliProvider::from_spec(sandbox_spec("pod"), PathBuf::from("/usr/bin/pod"))
+        let root = scratch("podman-no-skills-mount");
+        let bin = root.join("pod");
+        let workdir = root.join("wd");
+        std::fs::write(&bin, b"pod").unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        let provider = CliProvider::from_spec(sandbox_spec("pod"), bin)
             .with_backend(SandboxBackend::Podman {
                 image: "img".into(),
             });
         let cmd = provider
-            .command(
-                &[],
-                Path::new("/tmp/wd"),
-                &RunContext::default(),
-                &RunAuth::default(),
-            )
+            .command(&[], &workdir, &podman_ctx(), &RunAuth::default())
             .expect("podman command builds");
         let joined = argv_of(&cmd);
         assert!(!joined.contains(SKILLS_ROOT_ENV), "{joined}");
@@ -2294,26 +4584,33 @@ format = "text"
 
     #[test]
     fn a_sandbox_binds_a_workspace_parent_soul_read_only_and_needs_no_bind_for_a_config_home_one() {
+        let root = scratch("podman-context-mount");
+        let workdir = root.join("wd");
+        let bin = root.join("pod");
+        let soul = root.join("CLAUDE.md");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(&bin, b"pod").unwrap();
+        std::fs::write(&soul, SOUL).unwrap();
         let ctx = RunContext {
             context_doc: Some(SOUL.to_string()),
-            ..RunContext::default()
+            ..podman_ctx()
         };
 
         // OUTSIDE the workdir mount: without this bind the file would exist on the
         // host and simply not be there for the child — a silently unsouled agent.
         let provider = CliProvider::from_spec(
             spec_with("pod", "[context]\npath = \"workspace-parent:CLAUDE.md\"\n"),
-            PathBuf::from("/usr/bin/pod"),
+            bin.clone(),
         )
         .with_backend(SandboxBackend::Podman {
             image: "img".into(),
         });
         let cmd = provider
-            .command(&[], Path::new("/tmp/wd"), &ctx, &RunAuth::default())
+            .command(&[], &workdir, &ctx, &RunAuth::default())
             .expect("podman command builds");
         let joined = argv_of(&cmd);
         assert!(
-            joined.contains("-v /tmp/CLAUDE.md:/tmp/CLAUDE.md:ro"),
+            joined.contains(&format!("-v {s}:{s}:ro", s = soul.display())),
             "the soul binds ro at its identical path: {joined}"
         );
 
@@ -2325,18 +4622,19 @@ format = "text"
                 "[isolation]\nconfig_home_env = \"H\"\n\n\
                  [context]\npath = \"config-home:AGENTS.md\"\n",
             ),
-            PathBuf::from("/usr/bin/pod"),
+            bin,
         )
         .with_backend(SandboxBackend::Podman {
             image: "img".into(),
         });
-        let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
+        let config_home = workdir.join(".ducktape-run/slot/provider-config");
+        std::fs::create_dir_all(&config_home).unwrap();
         let auth = RunAuth {
             config_home: Some(&config_home),
             broker: None,
         };
         let cmd = provider
-            .command(&[], Path::new("/tmp/wd"), &ctx, &auth)
+            .command(&[], &workdir, &ctx, &auth)
             .expect("podman command builds");
         let joined = argv_of(&cmd);
         assert!(
@@ -2904,6 +5202,58 @@ printf '{"type":"turn.completed"}\n'"#,
         assert!(err.contains("no output"), "names the idle window: {err}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_the_whole_provider_process_group() {
+        let dir = scratch("cancel-process-group");
+        let pidfile = dir.join("group.pid");
+        let bin = fake_cli(
+            &dir,
+            "term-ignorer",
+            &format!(
+                "cat > /dev/null\ntrap '' TERM\necho $$ > {}\nsleep 30 &\nwait",
+                pidfile.display()
+            ),
+        );
+        let provider = mock_provider("term-ignorer", "text", bin, "cancel-process-group-wd")
+            .with_timeout(Duration::from_secs(30));
+        let cancellation = RunCancellation::new();
+        let ctx = RunContext {
+            cancellation: Some(cancellation.clone()),
+            ..RunContext::default()
+        };
+        let running = tokio::spawn(async move { provider.run("x", &ctx).await });
+
+        let group = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake provider reports its process group");
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(6), running)
+            .await
+            .expect("TERM grace is bounded and escalates to KILL")
+            .expect("provider task does not panic")
+            .unwrap_err();
+        assert!(error.contains("cancelled"), "got: {error}");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while process_group_alive(group) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no TERM-ignoring descendant survives the run");
+    }
+
     #[tokio::test]
     async fn a_streaming_cli_refreshes_the_timeout_and_outlives_the_window() {
         // THE refreshable-timeout property: total runtime (≈1s) is far past
@@ -3192,6 +5542,8 @@ printf '%s\n' "$PATH"
             agent_id: Some("bot".into()),
             thread_key: Some("general#7".into()),
             run_key: None,
+            cancellation: None,
+            executing_node: None,
             workdir_override: Some(override_dir.clone()),
             env: BTreeMap::from([(
                 "DUCKTAPE_RUN_WORKSPACE".to_string(),

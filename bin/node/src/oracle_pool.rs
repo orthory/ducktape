@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
 use dispatch_oracle::{
-    DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, max_concurrent_runs_from_env,
+    AttemptControl, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind,
+    max_concurrent_runs_from_env,
 };
 use futures::SinkExt as _;
 use sdk::Msg;
@@ -26,9 +27,10 @@ use sdk::Msg;
 const ORACLE_RESULT_LANE: usize = 64;
 
 /// build the dispatch worker for this validator: a pool that spawns provider
-/// runs as supervised children of `context` and hands completed results back
-/// over the returned receiver. the caller owns the receiver as a select-loop
-/// ingress arm and submits each `Msg` through the normal signed submit path.
+/// runs as supervised children of `context`, a cloneable control for cancelling
+/// them, and the receiver completed results return over. the caller owns the
+/// receiver as a select-loop ingress arm and submits each `Msg` through the
+/// normal signed submit path.
 ///
 /// no blob lane is wired any more: an agent's persona used to be an opaque
 /// `prompt_hash` blob this pool resolved (locally, then over the mesh). the
@@ -47,6 +49,7 @@ pub(crate) fn build<C>(
     capacity: BTreeMap<String, u64>,
 ) -> (
     Box<dyn host::worker::Worker>,
+    AttemptControl,
     futures::channel::mpsc::Receiver<Msg>,
 )
 where
@@ -54,11 +57,20 @@ where
 {
     let (tx, rx) = futures::channel::mpsc::channel::<Msg>(ORACLE_RESULT_LANE);
 
-    // one supervised node for the whole pool; each run spawns as its own
-    // child task under it (the blackhole/background-lane precedent).
+    // Queue waiters share the ordinary runtime. Only resource-admitted runs
+    // get a supervised dedicated owner because their fail-closed Drop may
+    // synchronously reap an exact process tree/container.
     let exec_ctx = context.child("oracle_pool");
-    let spawn: SpawnFn = Box::new(move |fut| {
-        exec_ctx.child("oracle_run").spawn(move |_ctx| fut);
+    let spawn: SpawnFn = Arc::new(move |kind, fut| {
+        let run = exec_ctx.child("oracle_run");
+        match kind {
+            SpawnKind::Queued => {
+                run.spawn(move |_ctx| fut);
+            }
+            SpawnKind::TeardownOwner => {
+                run.dedicated().spawn(move |_ctx| fut);
+            }
+        }
     });
 
     let deliver: DeliverFn = Arc::new(move |msg| {
@@ -91,5 +103,6 @@ where
     if let Some(provisioner) = provisioner {
         pool = pool.with_provisioner(provisioner);
     }
-    (Box::new(pool), rx)
+    let control = pool.attempt_control();
+    (Box::new(pool), control, rx)
 }

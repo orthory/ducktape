@@ -11,11 +11,11 @@
 //! saga is the deterministic half of the async engine, so this proof leans on
 //! three surfaces beyond the usual reply/root matrix:
 //!
-//! * WORK-ORDER EVENTS: every trigger / retry / accept emits a
-//!   [`WorkerRequest`] EVENT the host-side worker seam decodes out of
-//!   `BlockOutcome::events` to feed executors. both runtimes must surface the
-//!   byte-identical event stream (`decode_worker_request` equality), or the
-//!   reactor would feed workers differently across the cutover.
+//! * WORKER EVENTS: trigger / retry / accept emits a [`WorkerRequest`], while
+//!   terminal transitions may emit a cancellation control. the host-side
+//!   worker seam decodes both out of `BlockOutcome::events`. both runtimes must
+//!   surface the byte-identical event stream, or the reactor would feed workers
+//!   differently across the cutover.
 //! * P6 CALLBACKS: every terminal transition with a `reply_to` emits a
 //!   same-block [`SagaCallback`] msg. a native recorder module ("req") folds
 //!   every callback it receives into its root on BOTH hosts, so a missing,
@@ -32,8 +32,8 @@ use host::{BlockContext, BlockOutcome, Host, MemberOutcome, SubmitError};
 use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_encode_msg};
 use saga::{
     LeasePolicy, SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, WorkerRequest,
-    decode_reply, decode_worker_request, encode_msg, encode_query, MAX_CAPABILITY_BYTES,
-    MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
+    decode_reply, decode_worker_control, decode_worker_request, encode_msg, encode_query,
+    MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use std::collections::BTreeMap;
@@ -272,7 +272,14 @@ fn worker_requests(out: &BlockOutcome) -> Vec<WorkerRequest> {
     out.events
         .iter()
         .filter(|e| e.source == "saga")
-        .map(|e| decode_worker_request(&e.payload).expect("saga events are WorkerRequests"))
+        .filter_map(|e| match decode_worker_request(&e.payload) {
+            Ok(request) => Some(request),
+            Err(_) => {
+                decode_worker_control(&e.payload)
+                    .expect("saga events are worker requests or controls");
+                None
+            }
+        })
         .collect()
 }
 

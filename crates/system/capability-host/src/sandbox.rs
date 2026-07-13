@@ -63,6 +63,52 @@ pub fn wrap_podman(
     rw_dirs: &[PathBuf],
     limits: &BTreeMap<String, u64>,
 ) -> (PathBuf, Vec<String>) {
+    wrap_podman_inner(
+        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None,
+    )
+}
+
+/// The production wrapper adds host-owned lifecycle identity without exposing
+/// the cidfile inside the container. Kept crate-private so the public pure
+/// translation API does not grow a host-lifecycle concern.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_podman_managed(
+    image: &str,
+    bin: &Path,
+    args: &[String],
+    workdir: &Path,
+    envs: &[(String, String)],
+    ro_paths: &[PathBuf],
+    rw_dirs: &[PathBuf],
+    limits: &BTreeMap<String, u64>,
+    cidfile: &Path,
+    labels: &[String],
+) -> (PathBuf, Vec<String>) {
+    wrap_podman_inner(
+        image,
+        workdir,
+        bin,
+        args,
+        envs,
+        ro_paths,
+        rw_dirs,
+        limits,
+        Some((cidfile, labels)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wrap_podman_inner(
+    image: &str,
+    workdir: &Path,
+    bin: &Path,
+    args: &[String],
+    envs: &[(String, String)],
+    ro_paths: &[PathBuf],
+    rw_dirs: &[PathBuf],
+    limits: &BTreeMap<String, u64>,
+    control: Option<(&Path, &[String])>,
+) -> (PathBuf, Vec<String>) {
     // -i keeps stdin open: the prompt is fed on the child's stdin.
     let mut argv: Vec<String> = vec![
         "run".into(),
@@ -70,6 +116,12 @@ pub fn wrap_podman(
         "--network=host".into(),
         "-i".into(),
     ];
+    if let Some((cidfile, labels)) = control {
+        argv.extend(["--cidfile".into(), cidfile.display().to_string()]);
+        for label in labels {
+            argv.extend(["--label".into(), label.clone()]);
+        }
+    }
     if let Some(cores) = limits.get("cores") {
         argv.extend(["--cpus".into(), cores.to_string()]);
     }
@@ -108,7 +160,7 @@ pub fn wrap_podman(
 /// ponytail: a fixed process-wide cap; a host serving Linux guests (no such
 /// limit) could make the cap image-conditional, but v1 is one backend per node.
 pub const TART_MAX_CONCURRENT: usize = 2;
-const TART_MIN_CORES: u64 = 2;
+pub const TART_MIN_CORES: u64 = 2;
 
 /// the process-wide Tart concurrency gate (see [`TART_MAX_CONCURRENT`]).
 pub fn tart_semaphore() -> &'static tokio::sync::Semaphore {
@@ -411,15 +463,23 @@ pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str) -> Vec<String> {
     ]
 }
 
-pub(crate) fn tart_set_argv(vm: &str, limits: &BTreeMap<String, u64>) -> Option<Vec<String>> {
+pub(crate) fn tart_set_argv(
+    vm: &str,
+    limits: &BTreeMap<String, u64>,
+) -> Result<Option<Vec<String>>, String> {
     let mut argv = vec!["set".to_string(), vm.to_string()];
     if let Some(cores) = limits.get("cores") {
-        argv.extend(["--cpu".into(), cores.max(&TART_MIN_CORES).to_string()]);
+        if *cores < TART_MIN_CORES {
+            return Err(format!(
+                "Tart requires at least {TART_MIN_CORES} cores, got {cores}"
+            ));
+        }
+        argv.extend(["--cpu".into(), cores.to_string()]);
     }
     if let Some(mem_gb) = limits.get("mem_gb") {
         argv.extend(["--memory".into(), mem_gb.saturating_mul(1024).to_string()]);
     }
-    (argv.len() > 2).then_some(argv)
+    Ok((argv.len() > 2).then_some(argv))
 }
 
 #[cfg(test)]
@@ -465,6 +525,45 @@ mod tests {
         assert!(
             s.ends_with("docker.io/library/node:22-slim /usr/bin/claude --print"),
             "got: {s}"
+        );
+    }
+
+    #[test]
+    fn managed_podman_identity_stays_in_host_only_flags() {
+        let cidfile = Path::new("/host/ducktape/provider-runs/7.cid");
+        let labels = vec![
+            "io.ducktape.managed=capability-host".to_string(),
+            "io.ducktape.node=6e6f64652d61".to_string(),
+            "io.ducktape.instance=7".to_string(),
+        ];
+        let (_bin, argv) = wrap_podman_managed(
+            "img",
+            Path::new("/bin/x"),
+            &[],
+            Path::new("/work"),
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            cidfile,
+            &labels,
+        );
+        let s = argv.join(" ");
+        assert!(
+            s.contains("--cidfile /host/ducktape/provider-runs/7.cid"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("--label io.ducktape.managed=capability-host")
+                && s.contains("--label io.ducktape.node=6e6f64652d61")
+                && s.contains("--label io.ducktape.instance=7"),
+            "got: {s}"
+        );
+        assert!(
+            !s.contains("-v /host/ducktape")
+                && !s.contains("-e /host/ducktape")
+                && !s.contains("/host/ducktape/provider-runs/7.cid:"),
+            "cidfile must never be mounted or exported: {s}"
         );
     }
 
@@ -611,15 +710,14 @@ mod tests {
     fn tart_resources_are_configured_with_set_not_run_flags() {
         let limits = BTreeMap::from([("cores".into(), 4), ("mem_gb".into(), 8), ("gpu".into(), 1)]);
         assert_eq!(
-            tart_set_argv("vm", &limits).unwrap().join(" "),
+            tart_set_argv("vm", &limits).unwrap().unwrap().join(" "),
             "set vm --cpu 4 --memory 8192"
         );
-        assert_eq!(
+        assert!(
             tart_set_argv("vm", &BTreeMap::from([("cores".into(), 1)]))
-                .unwrap()
-                .join(" "),
-            "set vm --cpu 2"
+                .unwrap_err()
+                .contains("at least 2 cores")
         );
-        assert_eq!(tart_set_argv("vm", &BTreeMap::new()), None);
+        assert_eq!(tart_set_argv("vm", &BTreeMap::new()).unwrap(), None);
     }
 }

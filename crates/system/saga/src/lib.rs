@@ -609,6 +609,28 @@ impl SagaModule {
         }
     }
 
+    /// fence one assigned host attempt before its consensus transition emits
+    /// terminal work or a replacement request. an unassigned request was only
+    /// an announcement, so there is no process to cancel and no control effect.
+    fn cancel_attempt(
+        &self,
+        ctx: &mut dyn Ctx,
+        saga_id: &str,
+        attempt: u32,
+        assignee: Option<&[u8]>,
+    ) {
+        if let Some(assignee) = assignee {
+            ctx.emit_event(Event {
+                source: self.id.clone(),
+                payload: encode_worker_control(&WorkerControl::cancel_attempt(
+                    saga_id.to_string(),
+                    attempt,
+                    assignee.to_vec(),
+                )),
+            });
+        }
+    }
+
     /// grant the current attempt's lease and ask the worker to run it: the
     /// shared tail of trigger, error-retry, and lease-expiry-retry. a pinned
     /// saga leases every attempt to its pinned key; everything else is
@@ -953,6 +975,7 @@ impl Module for SagaModule {
                 }
 
                 let old_assignee = saga.assignee.clone();
+                let old_attempt = saga.attempt;
                 saga.attempt += 1;
                 let next = self
                     .compute_assignee_excluding(
@@ -968,6 +991,12 @@ impl Module for SagaModule {
                 let Some(next) = next else {
                     return Err(Error::Module("no alternate assignee is available".into()));
                 };
+                self.cancel_attempt(
+                    ctx,
+                    &saga_id,
+                    old_attempt,
+                    old_assignee.as_deref(),
+                );
                 self.request_assigned(ctx, saga_id, saga, Some(next));
             }
             SagaMsg::Accept { saga_id, attempt } => {
@@ -1041,18 +1070,38 @@ impl Module for SagaModule {
                     }
                     let mut saga = current.clone();
                     saga.updated_at = now;
+                    let old_attempt = saga.attempt;
+                    let old_assignee = saga.assignee.clone();
                     if deadline_hit {
                         // the whole-saga deadline dominates the lease: no
                         // retry may outlive it.
+                        self.cancel_attempt(
+                            ctx,
+                            &saga_id,
+                            old_attempt,
+                            old_assignee.as_deref(),
+                        );
                         saga.status = SagaStatus::TimedOut;
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::TimedOut);
                         self.stage(saga_id, saga);
                     } else if saga.attempt + 1 < saga.max_attempts {
                         // an expired lease consumes the attempt and re-leases.
+                        self.cancel_attempt(
+                            ctx,
+                            &saga_id,
+                            old_attempt,
+                            old_assignee.as_deref(),
+                        );
                         saga.attempt += 1;
                         self.lease_and_request(ctx, saga_id, saga).await;
                     } else {
                         let error = "lease attempts exhausted".to_string();
+                        self.cancel_attempt(
+                            ctx,
+                            &saga_id,
+                            old_attempt,
+                            old_assignee.as_deref(),
+                        );
                         saga.status = SagaStatus::Failed;
                         saga.error = Some(error.clone());
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Failed(error));
@@ -1074,6 +1123,12 @@ impl Module for SagaModule {
                     return Ok(());
                 }
                 let mut saga = current.clone();
+                self.cancel_attempt(
+                    ctx,
+                    &saga_id,
+                    saga.attempt,
+                    saga.assignee.as_deref(),
+                );
                 saga.status = SagaStatus::Cancelled;
                 saga.updated_at = ctx.env().consensus_time;
                 Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Cancelled);
@@ -1169,7 +1224,10 @@ impl Module for SagaModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode_callback, decode_reply, decode_worker_request, encode_msg, encode_query};
+    use crate::{
+        decode_callback, decode_reply, decode_worker_control, decode_worker_request,
+        encode_msg, encode_query, encode_worker_control,
+    };
     use futures::executor::block_on;
     use sdk::{Env, Event};
 
@@ -1189,6 +1247,7 @@ mod tests {
         capable_providers: Option<Vec<Vec<u8>>>,
         msgs: Vec<Msg>,
         events: Vec<Event>,
+        trace: Vec<&'static str>,
     }
     impl CaptureCtx {
         fn new() -> Self {
@@ -1206,6 +1265,7 @@ mod tests {
                 capable_providers: None,
                 msgs: Vec::new(),
                 events: Vec::new(),
+                trace: Vec::new(),
             }
         }
         fn at(mut self, height: u64) -> Self {
@@ -1242,7 +1302,16 @@ mod tests {
         fn worker_requests(&self) -> Vec<WorkerRequest> {
             self.events
                 .iter()
-                .map(|e| decode_worker_request(&e.payload).expect("worker request payload"))
+                .filter(|event| decode_worker_control(&event.payload).is_err())
+                .map(|event| {
+                    decode_worker_request(&event.payload).expect("worker request payload")
+                })
+                .collect()
+        }
+        fn worker_controls(&self) -> Vec<WorkerControl> {
+            self.events
+                .iter()
+                .filter_map(|event| decode_worker_control(&event.payload).ok())
                 .collect()
         }
     }
@@ -1283,9 +1352,11 @@ mod tests {
             }
         }
         fn emit_msg(&mut self, msg: Msg) {
+            self.trace.push("msg");
             self.msgs.push(msg);
         }
         fn emit_event(&mut self, ev: Event) {
+            self.trace.push("event");
             self.events.push(ev);
         }
     }
@@ -1355,6 +1426,56 @@ mod tests {
     }
     fn commit(m: &mut SagaModule) {
         block_on(m.commit_block()).unwrap();
+    }
+
+    #[test]
+    fn worker_control_codec_is_versioned_and_disjoint_from_worker_requests() {
+        let control = WorkerControl::cancel_attempt("s1".into(), 2, b"node-a".to_vec());
+        let bytes = encode_worker_control(&control);
+        assert_eq!(decode_worker_control(&bytes).unwrap(), control);
+        assert!(
+            decode_worker_request(&bytes).is_err(),
+            "a control can never decode as legacy work"
+        );
+
+        let mut wrong = control.clone();
+        wrong.version += 1;
+        assert!(decode_worker_control(&encode_worker_control(&wrong)).is_err());
+        wrong = control.clone();
+        wrong.kind = "other".into();
+        assert!(decode_worker_control(&encode_worker_control(&wrong)).is_err());
+
+        let legacy = WorkerRequest {
+            saga_id: "s1".into(),
+            attempt: 2,
+            spec: b"work".to_vec(),
+            deadline: None,
+            assignee: Some(b"node-a".to_vec()),
+        };
+        let legacy_bytes = encode_worker_request(&legacy);
+        assert_eq!(decode_worker_request(&legacy_bytes).unwrap(), legacy);
+        assert!(decode_worker_control(&legacy_bytes).is_err());
+    }
+
+    #[test]
+    fn an_unassigned_cancel_emits_no_worker_control() {
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new();
+        exec(&mut m, &mut ctx, &trigger("s1", b"work")).unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().assignee, None);
+
+        let mut ctx = CaptureCtx::new();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: "s1".into(),
+            }),
+        )
+        .unwrap();
+        assert!(ctx.worker_controls().is_empty());
+        assert!(ctx.events.is_empty(), "there is no local process to cancel");
     }
 
     #[test]
@@ -1888,8 +2009,11 @@ mod tests {
 
     #[test]
     fn crank_times_out_a_past_deadline_saga_and_deadline_dominates_lease() {
-        let mut m = SagaModule::new("saga");
-        let mut ctx = CaptureCtx::new().knowing("agent");
+        let validators = vec![b"node-a".to_vec()];
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .knowing("agent")
+            .with_validators(validators.clone());
         exec(
             &mut m,
             &mut ctx,
@@ -1910,6 +2034,7 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
+        let assignee = get(&m, "s1").unwrap().assignee.unwrap();
 
         // before the deadline (and before the lease expires) a crank is a
         // strict no-op: root byte-identical.
@@ -1936,7 +2061,16 @@ mod tests {
             "deadline dominates the lease"
         );
         assert_eq!(v.attempt, 0, "a timeout consumes no attempt");
-        assert!(ctx.events.is_empty(), "no retry past the deadline");
+        assert_eq!(
+            ctx.worker_controls(),
+            vec![WorkerControl::cancel_attempt("s1".into(), 0, assignee)],
+            "the timed-out attempt is stopped without issuing replacement work"
+        );
+        assert_eq!(
+            ctx.trace,
+            vec!["event", "msg"],
+            "attempt control precedes the terminal callback"
+        );
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
@@ -1949,8 +2083,11 @@ mod tests {
 
     #[test]
     fn crank_expires_a_lease_into_a_retry_then_a_failure() {
-        let mut m = SagaModule::new("saga");
-        let mut ctx = CaptureCtx::new();
+        let validators = vec![b"node-a".to_vec()];
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .knowing("agent")
+            .with_validators(validators.clone());
         exec(
             &mut m,
             &mut ctx,
@@ -1958,7 +2095,7 @@ mod tests {
                 pinned_assignee: None,
                 saga_id: "s1".into(),
                 spec: b"w".to_vec(),
-                reply_to: None,
+                reply_to: Some("agent".into()),
                 reply_payload: Vec::new(),
                 deadline: None,
                 max_attempts: 2,
@@ -1969,11 +2106,15 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().lease_expires_at, Some(5));
+        let first = get(&m, "s1").unwrap();
+        assert_eq!(first.lease_expires_at, Some(5));
+        let assignee = first.assignee.unwrap();
 
         // first expiry: attempts remain, so the crank re-leases and re-asks
         // the worker under attempt 1.
-        let mut ctx = CaptureCtx::new().at(5);
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .with_validators(validators.clone());
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
         let v = get(&m, "s1").unwrap();
@@ -1987,6 +2128,17 @@ mod tests {
         let requests = ctx.worker_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].attempt, 1);
+        assert_eq!(
+            ctx.worker_controls(),
+            vec![WorkerControl::cancel_attempt(
+                "s1".into(),
+                0,
+                assignee.clone()
+            )]
+        );
+        assert_eq!(ctx.events.len(), 2);
+        assert!(decode_worker_control(&ctx.events[0].payload).is_ok());
+        assert!(decode_worker_request(&ctx.events[1].payload).is_ok());
 
         // second expiry: no attempts remain — terminally Failed.
         let mut ctx = CaptureCtx::new().at(10);
@@ -1995,7 +2147,12 @@ mod tests {
         let v = get(&m, "s1").unwrap();
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some("lease attempts exhausted".to_string()));
-        assert!(ctx.events.is_empty());
+        assert_eq!(
+            ctx.worker_controls(),
+            vec![WorkerControl::cancel_attempt("s1".into(), 1, assignee)]
+        );
+        assert_eq!(ctx.events.len(), 1, "exhaustion issues no replacement");
+        assert_eq!(ctx.trace, vec!["event", "msg"]);
     }
 
     #[test]
@@ -2075,6 +2232,7 @@ mod tests {
         .unwrap();
         commit(&mut m);
         assert_eq!(m.root(), before, "the assignee cannot reassign itself");
+        assert!(ctx.events.is_empty());
 
         let mut ctx = CaptureCtx::new()
             .at(7)
@@ -2093,11 +2251,37 @@ mod tests {
         let view = get(&m, "s1").unwrap();
         assert_eq!(view.attempt, 1);
         assert_ne!(view.assignee.as_deref(), Some(first.as_slice()));
+        assert_eq!(ctx.events.len(), 2);
+        assert_eq!(
+            decode_worker_control(&ctx.events[0].payload).unwrap(),
+            WorkerControl::cancel_attempt("s1".into(), 0, first.clone())
+        );
+        assert_eq!(
+            decode_worker_request(&ctx.events[1].payload).unwrap().attempt,
+            1
+        );
         assert_eq!(ctx.worker_requests()[0].attempt, 1);
 
         let fenced_root = m.root();
         let mut ctx = CaptureCtx::new()
             .at(8)
+            .with_origin(Origin::Module("dispatch".into()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Reassign {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), fenced_root, "a stale reassign is a no-op");
+        assert!(ctx.events.is_empty());
+
+        let mut ctx = CaptureCtx::new()
+            .at(9)
             .with_origin(Origin::External(first))
             .with_validators(validators);
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stale".to_vec()))).unwrap();
@@ -2161,11 +2345,13 @@ mod tests {
     fn cancel_is_gated_to_the_trigger_origin() {
         let alice = Origin::External(b"alice".to_vec());
         let mallory = Origin::External(b"mallory".to_vec());
+        let validators = vec![b"node-a".to_vec()];
 
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new()
             .with_origin(alice.clone())
-            .knowing("agent");
+            .knowing("agent")
+            .with_validators(validators);
         exec(
             &mut m,
             &mut ctx,
@@ -2185,6 +2371,7 @@ mod tests {
         .unwrap();
         commit(&mut m);
         let pending_root = m.root();
+        let assignee = get(&m, "s1").unwrap().assignee.unwrap();
 
         // a FOREIGN cancel is a no-op, not an error — a finalized foreign
         // cancel must not abort blocks.
@@ -2200,6 +2387,7 @@ mod tests {
         commit(&mut m);
         assert_eq!(m.root(), pending_root, "a foreign cancel is a no-op");
         assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert!(ctx.events.is_empty());
 
         // the trigger origin cancels: terminal + callback.
         let mut ctx = CaptureCtx::new()
@@ -2216,6 +2404,15 @@ mod tests {
         .unwrap();
         commit(&mut m);
         assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Cancelled);
+        assert_eq!(
+            ctx.worker_controls(),
+            vec![WorkerControl::cancel_attempt("s1".into(), 0, assignee)]
+        );
+        assert_eq!(
+            ctx.trace,
+            vec!["event", "msg"],
+            "attempt control precedes the terminal callback"
+        );
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
@@ -2247,6 +2444,7 @@ mod tests {
         commit(&mut m);
         assert_eq!(m.root(), cancelled_root);
         assert!(ctx.msgs.is_empty(), "no second callback");
+        assert!(ctx.events.is_empty(), "no second worker control");
     }
 
     #[test]
