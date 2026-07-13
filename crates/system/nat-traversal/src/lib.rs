@@ -8,6 +8,7 @@ pub mod advert;
 pub mod auth;
 pub mod client;
 pub mod coordinator;
+pub mod invite_store;
 // `punch` depends on `simnat::SimNat` directly in its (non-test) API, so it is
 // gated identically: available under test cfg or the `simnat` feature, never
 // pulled into a plain non-test, non-feature build (e.g. `coordinator-bin`).
@@ -27,6 +28,7 @@ pub use client::{
     run_coordinator, run_coordinator_with, run_coordinator_workers_with_metrics,
 };
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
+pub use invite_store::{InviteStore, PutOutcome, invite_id};
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 #[cfg(any(test, feature = "simnat"))]
