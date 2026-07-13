@@ -13,6 +13,7 @@ import { useContext, useMemo } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
+import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { splitMentions } from "./chat-input";
@@ -232,7 +233,16 @@ function SpanText({
   };
   if (linkHref) {
     return (
-      <a href={linkHref} target="_blank" rel="noreferrer" style={{ ...style, cursor: "pointer" }}>
+      <a
+        href={linkHref}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => {
+          e.preventDefault();
+          openExternal(linkHref);
+        }}
+        style={{ ...style, cursor: "pointer" }}
+      >
         {span.text}
       </a>
     );

@@ -238,6 +238,7 @@ fn main() {
             sandbox::sandbox_preflight,
         ]);
     builder = builder.plugin(tauri_plugin_notification::init());
+    builder = builder.plugin(tauri_plugin_opener::init());
     builder = builder
         // Menu-bar icon + popover, and an app menu with no Cmd+W Close
         // Window so the webview owns the key (macOS only; no-ops elsewhere).

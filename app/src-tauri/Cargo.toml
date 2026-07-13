@@ -61,6 +61,9 @@ tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef"
 cef = { version = "=148.0.0", optional = true }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
+# open external http(s) links in the system browser (external-link.ts routes
+# here; the capability scopes it to open-url only, no open-path/reveal).
+tauri-plugin-opener = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
 # session-token-gated HTTP relay a phone hits over the Wi-Fi LAN to enroll a key.
 tiny_http = "0.12"
