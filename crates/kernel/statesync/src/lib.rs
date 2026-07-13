@@ -363,6 +363,20 @@ pub enum SyncRequest {
     /// re-hashes the bytes and drops a mismatch, so no trust attaches to
     /// which peer answered.
     Blob { digest: [u8; 32] },
+    /// the blob's total length — the discovery half of the RANGED fetch lane
+    /// for host-staged artifacts too large for one mesh frame (wasm module
+    /// components, quack capsules). same host-layer serving and honest-miss
+    /// semantics as [`SyncRequest::Blob`].
+    BlobInfo { digest: [u8; 32] },
+    /// one bounded window of a blob, `[offset, offset+len)` clamped to the
+    /// blob's tail. ranges carry no per-window proof — the requester stages
+    /// the assembled whole and re-hashes it against the digest, dropping a
+    /// mismatch (fail-closed), so no trust attaches to which peer answered.
+    BlobRange {
+        digest: [u8; 32],
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl SyncRequest {
@@ -379,6 +393,8 @@ impl SyncRequest {
             Self::IndexChunk { .. } => "index_chunk",
             Self::TipCoords => "tip_coords",
             Self::Blob { .. } => "blob",
+            Self::BlobInfo { .. } => "blob_info",
+            Self::BlobRange { .. } => "blob_range",
         }
     }
 }
@@ -434,6 +450,13 @@ pub enum SyncResponse {
     /// (the requester's fan-out treats a miss and an old peer's `Error`
     /// identically: try the next peer).
     Blob { bytes: Option<Vec<u8>> },
+    /// the [`SyncRequest::BlobInfo`] answer: the blob's total length when
+    /// held, `None` on an honest miss.
+    BlobInfo { len: Option<u64> },
+    /// the [`SyncRequest::BlobRange`] answer: the window's bytes when held
+    /// (shorter than asked at the blob's tail, empty past it), `None` on an
+    /// honest miss.
+    BlobRange { bytes: Option<Vec<u8>> },
 }
 
 impl SyncResponse {
@@ -447,6 +470,8 @@ impl SyncResponse {
             Self::IndexModules { .. } => "IndexModules",
             Self::TipCoords(_) => "TipCoords",
             Self::Blob { .. } => "Blob",
+            Self::BlobInfo { .. } => "BlobInfo",
+            Self::BlobRange { .. } => "BlobRange",
             Self::Error(_) => "Error",
         }
     }
@@ -509,6 +534,20 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.push(7u8);
             out.extend_from_slice(digest);
         }
+        SyncRequest::BlobInfo { digest } => {
+            out.push(8u8);
+            out.extend_from_slice(digest);
+        }
+        SyncRequest::BlobRange {
+            digest,
+            offset,
+            len,
+        } => {
+            out.push(9u8);
+            out.extend_from_slice(digest);
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
     }
     out
 }
@@ -555,6 +594,14 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
         6 => SyncRequest::TipCoords,
         7 => SyncRequest::Blob {
             digest: wire::take_array::<32>(&mut buf)?,
+        },
+        8 => SyncRequest::BlobInfo {
+            digest: wire::take_array::<32>(&mut buf)?,
+        },
+        9 => SyncRequest::BlobRange {
+            digest: wire::take_array::<32>(&mut buf)?,
+            offset: wire::take_u64(&mut buf)?,
+            len: wire::take_u64(&mut buf)?,
         },
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
@@ -663,6 +710,26 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
         }
         SyncResponse::Blob { bytes } => {
             out.push(8u8);
+            match bytes {
+                Some(b) => {
+                    out.push(1);
+                    wire::put_bytes(&mut out, b);
+                }
+                None => out.push(0),
+            }
+        }
+        SyncResponse::BlobInfo { len } => {
+            out.push(9u8);
+            match len {
+                Some(l) => {
+                    out.push(1);
+                    out.extend_from_slice(&l.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+        SyncResponse::BlobRange { bytes } => {
+            out.push(10u8);
             match bytes {
                 Some(b) => {
                     out.push(1);
@@ -905,6 +972,20 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 0 => None,
                 1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
                 t => return Err(WireError::BadTag("blob presence", t)),
+            },
+        },
+        9 => SyncResponse::BlobInfo {
+            len: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_u64(&mut buf)?),
+                t => return Err(WireError::BadTag("blob info presence", t)),
+            },
+        },
+        10 => SyncResponse::BlobRange {
+            bytes: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
+                t => return Err(WireError::BadTag("blob range presence", t)),
             },
         },
         other => return Err(WireError::BadTag("SyncResponse", other)),
@@ -1249,7 +1330,7 @@ impl SyncServer {
             // the HOST layer answers blob fetches from its node-local store
             // BEFORE requests reach this server; one arriving here means the
             // host did not intercept — answer honestly instead of wedging.
-            SyncRequest::Blob { .. } => {
+            SyncRequest::Blob { .. } | SyncRequest::BlobInfo { .. } | SyncRequest::BlobRange { .. } => {
                 return Err("blob requests are answered by the host layer".into());
             }
             SyncRequest::Frames {

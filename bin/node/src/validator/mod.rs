@@ -139,7 +139,7 @@ pub(crate) async fn run_validator(
     let (
         sync_tx,
         sync_rx,
-        recovery,
+        mut recovery,
         host,
         resumed,
         next_seq,
@@ -180,6 +180,7 @@ pub(crate) async fn run_validator(
         channel_bank,
         gateway_book,
         blob_peers,
+        blob_client,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -242,6 +243,17 @@ pub(crate) async fn run_validator(
         bank_base,
         channel_bank,
     );
+    // with the serve lane wired, realize code-registry swaps through the
+    // FETCHING source for the rest of this validator's life: a committed
+    // component the local store lacks is pulled from peers (ranged, verified)
+    // before a boundary can fail closed on it.
+    recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
+        blobs.clone(),
+        blob_client,
+        crate::constants::MAX_MODULE_CODE_BYTES,
+        crate::constants::BLOB_FETCH_ATTEMPTS,
+    )));
+
     let engine::EngineState {
         node,
         orchestrator,

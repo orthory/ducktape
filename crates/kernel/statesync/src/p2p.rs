@@ -204,6 +204,20 @@ where
     }
 }
 
+impl<S> P2pSyncClient<S>
+where
+    S: Sender,
+{
+    /// advance the serving cursor one candidate. the transport rotates on
+    /// FAILURE by itself ([`Sources::advance_past`], wave-deduped); this is
+    /// for callers whose retry policy also rotates on an HONEST answer — a
+    /// blob fetch's "don't have it" is a valid response the failure path
+    /// never sees.
+    pub fn advance_source(&self) {
+        self.sources.cursor.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl<S> SyncClient for P2pSyncClient<S>
 where
     S: Sender,

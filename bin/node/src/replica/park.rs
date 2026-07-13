@@ -27,7 +27,7 @@ use crate::host_reads::{
     read_valset_residents,
 };
 use crate::host_state::{
-    BlobCodeSource, NetworkBindings, SyncSubstrates, restore_host, run_output_sink,
+    NetworkBindings, SyncSubstrates, restore_host, run_output_sink,
     sync_all_modules,
 };
 use crate::lobby;
@@ -262,9 +262,16 @@ pub(super) async fn park(
     // node drops. every path out of this branch diverges (reboot),
     // so the validator path below never observes the move.
     // the blob-plane code source every recovery/fold instance in this loop
-    // realizes code-registry swaps through (see host_state::BlobCodeSource).
+    // realizes code-registry swaps through: local store first, then a ranged
+    // verified fetch through the park loop's own sync client — a resident
+    // whose binary trails a committed component heals instead of halting.
     let code_source: std::sync::Arc<dyn host::CodeSource> =
-        std::sync::Arc::new(BlobCodeSource(blobs.clone()));
+        std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
+            blobs.clone(),
+            client.clone(),
+            crate::constants::MAX_MODULE_CODE_BYTES,
+            crate::constants::BLOB_FETCH_ATTEMPTS,
+        ));
     let mut recovery_slot = Some(recovery);
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:

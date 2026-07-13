@@ -118,9 +118,13 @@ pub const MODREG_MODULE_ID: &str = modreg::DEFAULT_MODREG_ID;
 /// `fetch` returns `None` when this node does not (yet) hold the bytes for a
 /// hash — a fail-closed miss that stops the boundary, never a fork.
 /// `Send + Sync` because the ordered lane holds its source across an executor.
+/// `fetch` is async (`?Send`, like every host-side future — the host itself is
+/// `!Send`): a node-side source may go to the mesh for bytes its local store
+/// lacks before answering, and only a still-missing digest is a `None`.
+#[async_trait::async_trait(?Send)]
 pub trait CodeSource: Send + Sync {
     /// component bytes for a content hash, or `None` if absent on this node.
-    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
 }
 
 /// the no-source default: a node wired without any code source. every fetch
@@ -128,8 +132,9 @@ pub trait CodeSource: Send + Sync {
 /// than silently running stale code — and a net with no swaps never notices.
 pub struct NoCodeSource;
 
+#[async_trait::async_trait(?Send)]
 impl CodeSource for NoCodeSource {
-    fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
+    async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         None
     }
 }
@@ -755,7 +760,7 @@ impl Host {
             if current == target {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(&target).ok_or_else(|| {
+            let bytes = src.fetch(&target).await.ok_or_else(|| {
                 Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,

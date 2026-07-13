@@ -51,8 +51,9 @@ impl MapSource {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl CodeSource for MapSource {
-    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         self.0.get(code_hash).cloned()
     }
 }

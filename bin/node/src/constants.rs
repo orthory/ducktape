@@ -13,6 +13,16 @@ use std::time::Duration;
 /// 3 — this binary can execute a scheduled `to_version=3` (valset/governance
 /// resident ops, gated below 3) and truthfully `SignalReady`.
 pub(crate) const MAX_PROTOCOL_VERSION: u32 = 3;
+/// the module-code fetch cap: the largest content-addressed code artifact (a
+/// wasm component today, a quack capsule tomorrow) this node will pull over
+/// the ranged blob lane or accept on the code plane. a policy bound, not a
+/// frame size — transfers are ranged/streamed, so no single message ever
+/// approaches it.
+pub(crate) const MAX_MODULE_CODE_BYTES: u64 = 1024 * 1024 * 1024;
+/// how many source conversations a code-blob fetch tries before reporting
+/// the miss (each conversation resumes the staged prefix, so retries only
+/// ever pay for bytes not yet landed).
+pub(crate) const BLOB_FETCH_ATTEMPTS: usize = 3;
 /// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
 /// joiner, a sync-only resident): the genesis mesh at index 0. a VALIDATOR
 /// tracks its epoch's mesh at index = epoch instead — discovery requires

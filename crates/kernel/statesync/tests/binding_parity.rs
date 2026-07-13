@@ -51,7 +51,8 @@ fn boundary() -> BoundaryId {
 }
 
 /// every [`SyncRequest`] variant as it exists today (`Manifest`, `Chunk`,
-/// `Module`, `Frames`, `IndexModules`, `IndexChunk`, `TipCoords`, `Blob`),
+/// `Module`, `Frames`, `IndexModules`, `IndexChunk`, `TipCoords`, `Blob`,
+/// `BlobInfo`, `BlobRange`),
 /// each with field values that would expose a codec bug (non-zero offsets,
 /// a non-trivial body, a non-empty digest), plus one deliberate
 /// PROTOCOL-error probe (an inverted `Frames` range) that both bindings
@@ -99,6 +100,18 @@ fn full_suite() -> Vec<(&'static str, SyncRequest)> {
         ),
         ("TipCoords", SyncRequest::TipCoords),
         ("Blob", SyncRequest::Blob { digest: [7u8; 32] }),
+        (
+            "BlobInfo",
+            SyncRequest::BlobInfo { digest: [8u8; 32] },
+        ),
+        (
+            "BlobRange",
+            SyncRequest::BlobRange {
+                digest: [9u8; 32],
+                offset: 4096,
+                len: 512,
+            },
+        ),
         (
             "FramesInvertedRange (protocol-error probe)",
             SyncRequest::Frames {
@@ -177,6 +190,10 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
         }),
         SyncRequest::Blob { digest } => SyncResponse::Blob {
             bytes: Some(digest.to_vec()),
+        },
+        SyncRequest::BlobInfo { .. } => SyncResponse::BlobInfo { len: Some(4608) },
+        SyncRequest::BlobRange { offset, len, .. } => SyncResponse::BlobRange {
+            bytes: Some(vec![(*offset % 251) as u8; *len as usize]),
         },
     }
 }

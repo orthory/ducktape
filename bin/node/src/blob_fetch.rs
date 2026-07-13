@@ -1,30 +1,54 @@
-//! the blob mesh lane's SERVE half — the host side of
-//! `statesync::SyncRequest::Blob`, plus the demux that keeps a peer's frames
-//! and our own straight.
+//! the blob mesh lane: the SERVE half answering `SyncRequest::Blob` /
+//! `BlobInfo` / `BlobRange` from this node's store, the demux that keeps a
+//! peer's frames and our own straight, and the REQUESTER that assembles a
+//! large blob from ranged windows.
 //!
-//! the REQUESTER half is gone. it existed for exactly one consumer: an agent's
-//! registered prompt, pinned in consensus as `prompt_hash` and staged in ONE
-//! node's blob store, which a run leasing on any other node had to fetch on
-//! miss (the #298 cross-node gap). the persona is a curated SKILL now —
-//! content-addressed in duckfs, consensus-replicated, materialized as a
-//! read-only mount by the provisioner on whichever node runs — so nothing
-//! fetches blobs across the mesh any more and `MeshBlobFetcher` was deleted
-//! with the prompt lane.
+//! the original single-shot requester (`MeshBlobFetcher`, the #298 prompt
+//! lane) was deleted when agent personas became duckfs skills. the requester
+//! is BACK for the wasm code plane: consensus commits a module's component
+//! (or quack capsule) by 32-byte hash, the bytes travel out-of-band, and a
+//! node that lacks the committed bytes at a swap boundary, during replay, or
+//! at state-sync catch-up fetches them here — [`fetch_blob`] discovers the
+//! length ([`SyncRequest::BlobInfo`]), streams bounded windows
+//! ([`SyncRequest::BlobRange`]) into a resumable [`blobstore`] staging slot,
+//! and publishes only when the assembled whole re-hashes to the digest, so
+//! no trust attaches to which peer answered. misses rotate the source and a
+//! failed node stays failed-closed — it can never fork.
 //!
-//! what remains ANSWERS peers: [`serve_blob`] replies to a blob request from
-//! this node's store, and [`classify_mesh_frame`] sorts inbound frames on the
-//! shared rpc lane. ponytail: with no requester left in the network these are
-//! vestigial — nobody asks. they stay because the serve arm is wired into the
-//! statesync loop, and unpicking that loop is a separate change from retiring
-//! the prompt.
+//! two request paths share this machinery: joiners/catch-up own a
+//! [`statesync::p2p::P2pSyncClient`]; a validator's statesync channel
+//! receiver is owned by its serve loop, so it fetches through the
+//! [`ServeLaneBlobClient`] co-client — sends ride a clone of the serve
+//! lane's sender and responses route back through [`classify_mesh_frame`]'s
+//! pending-map demux.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
-/// the serve side answers only blobs up to this size: the mesh channel is
-/// sized for statesync's 256 KiB chunks. an oversized blob answers as an
-/// honest miss.
+use commonware_cryptography::ed25519;
+use commonware_p2p::{Recipients, Sender as P2pSender};
+use commonware_runtime::IoBuf;
+use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
+
+/// the whole-blob serve arm answers only blobs up to this size: the mesh
+/// channel is sized for statesync's 256 KiB chunks. an oversized blob answers
+/// as an honest miss — large blobs are fetched RANGED instead.
 pub const MAX_SERVED_BLOB: usize = 1024 * 1024;
+
+/// one ranged window: request size cap on the client, clamp on the server —
+/// the same bound statesync's snapshot chunks ride, so a range frame never
+/// outgrows the mesh channel either.
+pub const MAX_BLOB_RANGE: u64 = 256 * 1024;
+
+/// the co-client's rpc-id floor. the serve lane multiplexes id spaces (our
+/// fetch ids beside peers' request ids); starting this client's sequential
+/// ids at a high base keeps the spaces disjoint by construction.
+const COCLIENT_ID_BASE: u64 = 1 << 62;
+
+/// how long the co-client waits for one response before failing the request
+/// and rotating — mirrors the p2p binding's 1–2 reaper sweeps (3–6s).
+const COCLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// outstanding fetches keyed by rpc id — the serve loop's demux surface: an
 /// incoming mesh frame whose id is in here is a response to US, everything
@@ -86,9 +110,469 @@ pub fn serve_blob(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> statesync
     statesync::SyncResponse::Blob { bytes }
 }
 
+/// answer the ranged lane's discovery half: the blob's total length, or an
+/// honest miss. no size refusal here — ranges keep every frame bounded.
+pub fn serve_blob_info(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> SyncResponse {
+    SyncResponse::BlobInfo {
+        len: blobs.chunk_len(digest),
+    }
+}
+
+/// answer one bounded window of a blob. the requested length is clamped to
+/// [`MAX_BLOB_RANGE`] server-side, so a greedy (or lying) requester can never
+/// make this node emit an oversized frame.
+pub fn serve_blob_range(
+    blobs: &blobstore::BlobHandle,
+    digest: &[u8; 32],
+    offset: u64,
+    len: u64,
+) -> SyncResponse {
+    let want = len.min(MAX_BLOB_RANGE) as usize;
+    SyncResponse::BlobRange {
+        bytes: blobs.read_range(digest, offset, want),
+    }
+}
+
+// ---- the ranged requester ----------------------------------------------------
+
+/// why one blob fetch conversation failed. `Miss` and `Transport` are
+/// rotate-and-retry; `TooLarge` and `Corrupt` indict the source (or the ask)
+/// and also rotate; `Stage` is local disk trouble.
+#[derive(Debug)]
+pub enum BlobFetchError {
+    Transport(SyncError),
+    /// the source does not hold the digest (or lost it mid-transfer).
+    Miss,
+    TooLarge {
+        len: u64,
+        cap: u64,
+    },
+    Stage(blobstore::StageError),
+    /// the assembled bytes do not hash to the digest — a lying source.
+    Corrupt,
+}
+
+impl std::fmt::Display for BlobFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(e) => write!(f, "blob fetch transport: {e}"),
+            Self::Miss => write!(f, "source does not hold the blob"),
+            Self::TooLarge { len, cap } => {
+                write!(f, "blob length {len} exceeds the fetch cap {cap}")
+            }
+            Self::Stage(e) => write!(f, "blob staging: {e}"),
+            Self::Corrupt => write!(f, "assembled bytes do not hash to the digest"),
+        }
+    }
+}
+
+impl From<SyncError> for BlobFetchError {
+    fn from(e: SyncError) -> Self {
+        Self::Transport(e)
+    }
+}
+
+/// a client whose serving source can be advanced on an HONEST miss (the
+/// transports rotate on failure themselves, but a peer that answers "don't
+/// have it" is not a transport failure — it never trips that path).
+pub trait SourceRotate {
+    fn rotate_source(&self) {}
+}
+
+impl<S: P2pSender> SourceRotate for statesync::p2p::P2pSyncClient<S> {
+    fn rotate_source(&self) {
+        self.advance_source();
+    }
+}
+
+/// fetch one content-addressed blob into the local store via the ranged mesh
+/// lane, retrying across sources up to `attempts` conversations. already
+/// resident (verified) → immediate `Ok`. a partial transfer stays staged, so
+/// the next attempt resumes at its high-water instead of restarting.
+pub async fn fetch_blob<C: SyncClient + SourceRotate>(
+    client: &C,
+    blobs: &blobstore::BlobHandle,
+    digest: &[u8; 32],
+    cap: u64,
+    attempts: usize,
+) -> Result<(), BlobFetchError> {
+    if blobs.has_chunk(digest) {
+        return Ok(());
+    }
+    let mut last = BlobFetchError::Miss;
+    for _ in 0..attempts.max(1) {
+        match fetch_once(client, blobs, digest, cap).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                client.rotate_source();
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// one source conversation: discover the length, stream windows into the
+/// (resumable) staging slot, verify-then-publish.
+async fn fetch_once<C: SyncClient>(
+    client: &C,
+    blobs: &blobstore::BlobHandle,
+    digest: &[u8; 32],
+    cap: u64,
+) -> Result<(), BlobFetchError> {
+    let len = match client.request(SyncRequest::BlobInfo { digest: *digest }).await? {
+        SyncResponse::BlobInfo { len: Some(len) } => len,
+        SyncResponse::BlobInfo { len: None } => return Err(BlobFetchError::Miss),
+        SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
+        other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
+    };
+    if len > cap {
+        return Err(BlobFetchError::TooLarge { len, cap });
+    }
+    let mut slot = blobs.stage(*digest, len).map_err(BlobFetchError::Stage)?;
+    while slot.offset() < len {
+        let window = client
+            .request(SyncRequest::BlobRange {
+                digest: *digest,
+                offset: slot.offset(),
+                len: MAX_BLOB_RANGE,
+            })
+            .await?;
+        match window {
+            SyncResponse::BlobRange { bytes: Some(bytes) } if !bytes.is_empty() => {
+                slot.append(&bytes).map_err(BlobFetchError::Stage)?;
+            }
+            // a miss or an empty window mid-transfer: the source no longer
+            // serves the blob. staging stays for the next source to resume.
+            SyncResponse::BlobRange { .. } => return Err(BlobFetchError::Miss),
+            SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
+            other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
+        }
+    }
+    match slot.finish() {
+        Ok(_) => Ok(()),
+        Err(blobstore::StageError::HashMismatch) => Err(BlobFetchError::Corrupt),
+        Err(e) => Err(BlobFetchError::Stage(e)),
+    }
+}
+
+// ---- the fetching code source -------------------------------------------------
+
+/// a [`host::CodeSource`] that goes to the mesh for bytes the local store
+/// lacks: local hit → serve it; miss → [`fetch_blob`] (ranged, resumable,
+/// verify-then-publish) and re-read. a digest still missing after the
+/// attempts answers `None` — the boundary fails closed exactly as before,
+/// it just tried the network first.
+pub struct FetchingCodeSource<C> {
+    local: blobstore::BlobHandle,
+    client: C,
+    cap: u64,
+    attempts: usize,
+}
+
+impl<C> FetchingCodeSource<C> {
+    pub fn new(local: blobstore::BlobHandle, client: C, cap: u64, attempts: usize) -> Self {
+        Self {
+            local,
+            client,
+            cap,
+            attempts,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
+        let digest: [u8; 32] = code_hash.try_into().ok()?;
+        if let Err(e) = fetch_blob(&self.client, &self.local, &digest, self.cap, self.attempts).await
+        {
+            // an honest report, not a panic: the caller (realize) fails
+            // closed on the None and says which hash it needed.
+            eprintln!(
+                "[blob-fetch] could not obtain code blob {}: {e}",
+                crate::config::hex_bytes(&digest)
+            );
+        }
+        self.local.get_chunk(&digest)
+    }
+}
+
+// ---- the validator's serve-lane co-client ------------------------------------
+
+/// a [`SyncClient`] for the node that already OWNS its statesync channel
+/// receiver (the validator's serve loop): sends ride a clone of the serve
+/// lane's sender, responses route back through [`classify_mesh_frame`]'s
+/// pending map. sources are the live peer book the runtime re-tracks at every
+/// cutover; an honest miss rotates via [`SourceRotate`].
+pub struct ServeLaneBlobClient<S: P2pSender<PublicKey = ed25519::PublicKey>> {
+    sender: S,
+    pending: PendingMap,
+    peers: Arc<RwLock<Vec<ed25519::PublicKey>>>,
+    cursor: Arc<AtomicUsize>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl<S: P2pSender<PublicKey = ed25519::PublicKey>> Clone for ServeLaneBlobClient<S> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            pending: self.pending.clone(),
+            peers: Arc::clone(&self.peers),
+            cursor: Arc::clone(&self.cursor),
+            next_id: Arc::clone(&self.next_id),
+        }
+    }
+}
+
+impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
+    pub fn new(
+        sender: S,
+        pending: PendingMap,
+        peers: Arc<RwLock<Vec<ed25519::PublicKey>>>,
+    ) -> Self {
+        Self {
+            sender,
+            pending,
+            peers,
+            cursor: Arc::new(AtomicUsize::new(0)),
+            next_id: Arc::new(AtomicU64::new(COCLIENT_ID_BASE)),
+        }
+    }
+
+    fn current_peer(&self) -> Option<ed25519::PublicKey> {
+        let peers = self.peers.read().expect("blob peers lock");
+        if peers.is_empty() {
+            return None;
+        }
+        Some(peers[self.cursor.load(Ordering::Relaxed) % peers.len()].clone())
+    }
+}
+
+impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SourceRotate for ServeLaneBlobClient<S> {
+    fn rotate_source(&self) {
+        self.cursor.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobClient<S> {
+    fn request(
+        &self,
+        req: SyncRequest,
+    ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+        let mut sender = self.sender.clone();
+        let pending = self.pending.clone();
+        let peer = self.current_peer();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        async move {
+            let Some(peer) = peer else {
+                return Err(SyncError::Transport("no blob peers tracked".into()));
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.lock().expect("pending blob lock").insert(id, tx);
+            let frame = statesync::encode_rpc(id, &statesync::encode_request(&req));
+            let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
+            if attempted.is_empty() {
+                pending.lock().expect("pending blob lock").remove(&id);
+                return Err(SyncError::Transport(
+                    "blob source unreachable (send attempted no recipients)".into(),
+                ));
+            }
+            match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
+                Ok(Ok(resp)) => Ok(resp),
+                // timed out, or the demux dropped a malformed body: fail the
+                // request so the caller rotates — and clear our slot either way.
+                _ => {
+                    pending.lock().expect("pending blob lock").remove(&id);
+                    Err(SyncError::Transport(format!(
+                        "blob request {id} timed out on the serve lane"
+                    )))
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a test [`SyncClient`] answering the ranged lane from a rotating list of
+    /// per-source stores — the serve functions ARE the server, so every test
+    /// exercises the true serve+fetch pairing.
+    #[derive(Clone)]
+    struct StoreClient {
+        sources: Arc<Vec<blobstore::BlobHandle>>,
+        cursor: Arc<AtomicUsize>,
+    }
+
+    impl StoreClient {
+        fn new(sources: Vec<blobstore::BlobHandle>) -> Self {
+            Self {
+                sources: Arc::new(sources),
+                cursor: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn store(&self) -> &blobstore::BlobHandle {
+            &self.sources[self.cursor.load(Ordering::Relaxed) % self.sources.len()]
+        }
+    }
+
+    impl SourceRotate for StoreClient {
+        fn rotate_source(&self) {
+            self.cursor.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl SyncClient for StoreClient {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let resp = match req {
+                SyncRequest::BlobInfo { digest } => serve_blob_info(self.store(), &digest),
+                SyncRequest::BlobRange {
+                    digest,
+                    offset,
+                    len,
+                } => serve_blob_range(self.store(), &digest, offset, len),
+                other => SyncResponse::Error(format!("unexpected {}", other.kind_name())),
+            };
+            async move { Ok(resp) }
+        }
+    }
+
+    fn payload() -> Vec<u8> {
+        // several windows long, not window-aligned.
+        (0..(2 * MAX_BLOB_RANGE as usize + 12345))
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fetch_assembles_a_multi_window_blob_and_verifies() {
+        let source = blobstore::BlobHandle::default();
+        let digest = source.put_chunk(payload());
+        let local = blobstore::BlobHandle::default();
+        let client = StoreClient::new(vec![source]);
+
+        fetch_blob(&client, &local, &digest, u64::MAX, 1)
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(local.get_chunk(&digest), Some(payload()));
+        // idempotent: already resident answers without a conversation.
+        fetch_blob(&client, &local, &digest, 0, 1)
+            .await
+            .expect("resident short-circuits before the cap check");
+    }
+
+    #[tokio::test]
+    async fn fetch_rotates_past_misses_to_a_serving_source() {
+        let truth = payload();
+        // sources 0 and 1 hold nothing; source 2 serves. two honest misses
+        // must rotate the cursor twice and land the fetch on the third try.
+        let good = blobstore::BlobHandle::default();
+        let digest = good.put_chunk(truth.clone());
+        let local = blobstore::BlobHandle::default();
+        let client = StoreClient::new(vec![
+            blobstore::BlobHandle::default(),
+            blobstore::BlobHandle::default(),
+            good,
+        ]);
+        fetch_blob(&client, &local, &digest, u64::MAX, 3)
+            .await
+            .expect("third source serves");
+        assert_eq!(local.get_chunk(&digest), Some(truth));
+    }
+
+    /// a client that serves plausible info but corrupted windows.
+    #[derive(Clone)]
+    struct LiarClient {
+        bytes: Arc<Vec<u8>>,
+    }
+
+    impl SourceRotate for LiarClient {}
+
+    impl SyncClient for LiarClient {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let resp = match req {
+                SyncRequest::BlobInfo { .. } => SyncResponse::BlobInfo {
+                    len: Some(self.bytes.len() as u64),
+                },
+                SyncRequest::BlobRange { offset, len, .. } => {
+                    let end = (offset as usize + len as usize).min(self.bytes.len());
+                    SyncResponse::BlobRange {
+                        bytes: Some(self.bytes[offset as usize..end].to_vec()),
+                    }
+                }
+                other => SyncResponse::Error(format!("unexpected {}", other.kind_name())),
+            };
+            async move { Ok(resp) }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_drops_corrupt_assembly_fail_closed() {
+        let truth = payload();
+        let digest = {
+            let s = blobstore::BlobHandle::default();
+            s.put_chunk(truth.clone())
+        };
+        let mut lie = truth.clone();
+        lie[3] ^= 0x01;
+        let local = blobstore::BlobHandle::default();
+        let client = LiarClient {
+            bytes: Arc::new(lie),
+        };
+        let err = fetch_blob(&client, &local, &digest, u64::MAX, 2)
+            .await
+            .expect_err("a lying source must never publish");
+        assert!(matches!(err, BlobFetchError::Corrupt), "got {err}");
+        assert!(!local.has_chunk(&digest));
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_blobs_over_the_cap() {
+        let source = blobstore::BlobHandle::default();
+        let digest = source.put_chunk(vec![1u8; 4096]);
+        let local = blobstore::BlobHandle::default();
+        let client = StoreClient::new(vec![source]);
+        let err = fetch_blob(&client, &local, &digest, 4095, 1)
+            .await
+            .expect_err("over-cap must refuse");
+        assert!(matches!(err, BlobFetchError::TooLarge { len: 4096, cap: 4095 }));
+    }
+
+    #[test]
+    fn serve_blob_range_clamps_and_serves_tails() {
+        let blobs = blobstore::BlobHandle::default();
+        let digest = blobs.put_chunk(vec![9u8; 100]);
+        // server-side clamp: an oversized ask answers at most MAX_BLOB_RANGE.
+        match serve_blob_range(&blobs, &digest, 0, u64::MAX) {
+            SyncResponse::BlobRange { bytes: Some(b) } => assert_eq!(b.len(), 100),
+            other => panic!("unexpected {other:?}"),
+        }
+        // tail read past the end is empty-but-present; offset past end is a miss.
+        match serve_blob_range(&blobs, &digest, 100, 10) {
+            SyncResponse::BlobRange { bytes: Some(b) } => assert!(b.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            serve_blob_range(&blobs, &digest, 101, 10),
+            SyncResponse::BlobRange { bytes: None }
+        );
+        assert_eq!(
+            serve_blob_info(&blobs, &digest),
+            SyncResponse::BlobInfo { len: Some(100) }
+        );
+        assert_eq!(
+            serve_blob_info(&blobs, &[0u8; 32]),
+            SyncResponse::BlobInfo { len: None }
+        );
+    }
 
     #[test]
     fn classify_completes_pending_ids_and_serves_requests() {

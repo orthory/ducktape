@@ -69,8 +69,9 @@ const HELLO_WASM_MODULE_ID: &str = "hello";
 /// store lacks is a `None` — the boundary fails closed rather than forking.
 pub(super) struct BlobCodeSource(pub(super) blobstore::BlobHandle);
 
+#[async_trait::async_trait(?Send)]
 impl host::CodeSource for BlobCodeSource {
-    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         let digest: [u8; 32] = code_hash.try_into().ok()?;
         self.0.get_chunk(&digest)
     }
@@ -281,6 +282,34 @@ fn seeded_modreg() -> Modreg {
         sha2::Sha256::digest(RUNS_WASM_COMPONENT).to_vec(),
     );
     modreg
+}
+
+/// seed the blob plane with the genesis components, so this node can serve
+/// (and re-fetch) every wasm tenant's initial code by content hash. runs on
+/// EVERY boot path — genesis, restore, state-sync — because a node's binary
+/// may embed components the committed registry has moved past (or ahead of):
+/// re-putting is idempotent, and having every version this binary knows in
+/// the store is what lets the boot reconciliation and the mesh fetch lane
+/// close a version skew instead of failing closed on it.
+pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
+    blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(VAULTS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(JOBS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(INBOX_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(TAGGING_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(CAPABILITY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(DUCKDNS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(IDENTITY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(GATEWAY_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(GOVERNANCE_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(PAGES_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(CHAT_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(SAGA_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(AGENT_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(AUTOMATIONS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
 }
 
 /// the reference wasm module at its GENESIS code. restarted/synced nodes still
@@ -563,26 +592,7 @@ pub(super) async fn genesis_host(
     // around them changed (and `.with_tagging` moved into the guests).
     let pages = pages_wasm(Box::new(QmdbStore::init(context.child("pages"), "pages").await));
     let chat = chat_wasm(Box::new(QmdbStore::init(context.child("chat"), "chat").await));
-    // seed the blob plane with the genesis components, so this node can serve
-    // (and re-fetch) every wasm tenant's initial code by content hash.
-    blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(VAULTS_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(JOBS_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(INBOX_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(TAGGING_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(CAPABILITY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(DUCKDNS_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(IDENTITY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(GATEWAY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(GOVERNANCE_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(PAGES_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(CHAT_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(SAGA_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(AGENT_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(AUTOMATIONS_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
+    seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -701,6 +711,7 @@ pub(super) async fn restore_host(
     // [`pages_wasm`]).
     let pages = pages_wasm(Box::new(QmdbStore::init(context.child("pages"), "pages").await));
     let chat = chat_wasm(Box::new(QmdbStore::init(context.child("chat"), "chat").await));
+    seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?
@@ -957,6 +968,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         duckfs_dir,
         blobs,
     } = substrates;
+    seed_genesis_components(&blobs);
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
             .entry(module)

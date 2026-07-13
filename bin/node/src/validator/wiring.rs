@@ -53,6 +53,7 @@ pub(super) struct RuntimeWiring {
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -245,6 +246,11 @@ pub(super) async fn finish(
     // bounded state touches crossing `sync_state_tx`; when the loop is
     // busy the serve lane backpressures, never the reverse.
     let (sync_state_tx, sync_state_rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
+    // the serve-lane blob co-client: this validator's own fetch side of the
+    // blob lane (sends ride a sender clone, answers route back through the
+    // pending-map demux the serve loop below runs).
+    let blob_client =
+        blob_fetch::ServeLaneBlobClient::new(sync_tx.clone(), blob_pending.clone(), blob_peers.clone());
     {
         let state_tx = sync_state_tx;
         let mut sync_tx = sync_tx;
@@ -280,6 +286,14 @@ pub(super) async fn finish(
                         statesync::SyncRequest::Blob { digest } => {
                             blob_fetch::serve_blob(&sync_blobs, &digest)
                         }
+                        statesync::SyncRequest::BlobInfo { digest } => {
+                            blob_fetch::serve_blob_info(&sync_blobs, &digest)
+                        }
+                        statesync::SyncRequest::BlobRange {
+                            digest,
+                            offset,
+                            len,
+                        } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
                         req => drive_sync_request(&mut server, &state_tx, req).await,
                     };
                     let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
@@ -346,6 +360,7 @@ pub(super) async fn finish(
         channel_bank,
         gateway_book,
         blob_peers,
+        blob_client,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
