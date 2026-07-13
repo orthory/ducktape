@@ -639,11 +639,19 @@ export function createActions({
   // true, so a transient read never demotes. fixes canVote / canAdmin, which
   // read `member` with no runtime fallback.
   const adoptPromotedMember = (id: string): void =>
-    update((prev) => ({
-      workspaces: prev.workspaces.map((w) =>
-        w.id === id && !w.member ? { ...w, member: true } : w,
-      ),
-    }));
+    update((prev) => {
+      const listHit = prev.workspaces.some((w) => w.id === id && !w.member);
+      const activeHit = prev.workspace?.id === id && !prev.workspace.member;
+      if (!listHit && !activeHit) return {}; // already a member: reference-stable no-op
+      return {
+        // both slices carry `member`: the list feeds re-hydration, but
+        // canVote/canAdmin read the SINGULAR active `workspace` — bump both.
+        workspaces: listHit
+          ? prev.workspaces.map((w) => (w.id === id ? { ...w, member: true } : w))
+          : prev.workspaces,
+        ...(activeHit ? { workspace: { ...prev.workspace!, member: true } } : {}),
+      };
+    });
   const isCurrentNode = (live: NodeTransport): boolean => getNode() === live;
 
   /** The live transport + active workspace the account writes sign against.
