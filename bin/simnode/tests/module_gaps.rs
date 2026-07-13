@@ -11,10 +11,10 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{create_channel, post_message, Sim};
+use harness::{Sim, create_channel, post_message};
 use identity::{
-    add_member_preimage, bind_preimage, remove_member_preimage, unbind_preimage, KeyKind,
     IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
+    KeyKind, add_member_preimage, bind_preimage, remove_member_preimage, unbind_preimage,
 };
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
