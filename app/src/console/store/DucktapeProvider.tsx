@@ -28,6 +28,7 @@ import {
   type NodeStatus,
   type NodeTransport,
 } from "../../domain/transport";
+import { IDENTITY_UNLOCKED_EVENT } from "../../domain/user-identity-client";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
@@ -1037,6 +1038,34 @@ export function DucktapeProvider({
     return () => {
       cancelled = true;
       unlisteners.forEach((un) => un());
+    };
+  }, [actions]);
+
+  // 2g. Re-run the connect-time auto-bind when the shell announces the machine
+  //     key became signable (create/restore/unlock/encrypt/reveal — see
+  //     user_identity.rs). The boot connect always outruns a human typing a
+  //     password, so on an encrypted key the connect-time pass (adopt →
+  //     autoBindUserIdentity) deterministically short-circuits "locked"; this
+  //     listener is what ever lands the bind for those users.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void tauriEventApi()
+      .then(({ listen }) =>
+        listen(IDENTITY_UNLOCKED_EVENT, () => void actions.identityUnlocked()),
+      )
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {
+        // event API unavailable (non-tauri / test stub) — no retry hook, the
+        // next connect's own bind pass still runs.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
   }, [actions]);
 
