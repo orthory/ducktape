@@ -229,33 +229,19 @@ function NodeDetail({ snap, connected, onOpen }: { snap: Snap; connected: boolea
 }
 
 // Software / version readout. The version comes straight from the Tauri app —
-// real, not a placeholder. There is no updater wired up yet, so "Check for
-// update" stays purely cosmetic and never fabricates a check result.
+// real, not a placeholder.
 function SoftwareBlock() {
   const [version, setVersion] = useState("");
-  const [status, setStatus] = useState("");
-  const [checkLabel, setCheckLabel] = useState("Check for update");
 
   useEffect(() => {
     void import("@tauri-apps/api/app").then((m) => m.getVersion()).then(setVersion).catch(() => {});
   }, []);
-
-  const check = () => {
-    setCheckLabel("Checking…");
-    setStatus("");
-    window.setTimeout(() => {
-      setCheckLabel("Check for update");
-      setStatus("No update channel is configured yet");
-    }, 600);
-  };
 
   return (
     <>
       <div style={{ height: 1, background: HAIRLINE, margin: "11px 0 8px" }} />
       <div style={{ font: `600 10.5px ${font.sans}`, color: DIM, marginBottom: 6, letterSpacing: 0.2 }}>SOFTWARE</div>
       <Field k="Version" v={version ? `v${version}` : "—"} mono />
-      <GhostButton label={checkLabel} onClick={check} />
-      {status && <div style={{ font: `400 10.5px ${font.mono}`, color: DIM, marginTop: 7 }}>{status}</div>}
     </>
   );
 }
@@ -370,33 +356,6 @@ function OpenButton({ onClick }: { onClick: () => void }) {
       }}
     >
       Open in console
-    </button>
-  );
-}
-
-// Secondary — compact outlined ghost.
-function GhostButton({ label, onClick }: { label: string; onClick: () => void }) {
-  const [hover, setHover] = useState(false);
-  return (
-    <button
-      onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{
-        all: "unset",
-        cursor: "pointer",
-        display: "inline-block",
-        marginTop: 9,
-        padding: "5px 12px",
-        borderRadius: 7,
-        font: `600 11px ${font.sans}`,
-        color: TEXT,
-        background: hover ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.05)",
-        border: "1px solid rgba(255,255,255,0.16)",
-        transition: "background .12s",
-      }}
-    >
-      {label}
     </button>
   );
 }
