@@ -183,6 +183,14 @@ export interface ConsoleActions {
     label: string | null,
   ): Promise<void>;
   selectChannel(channelId: string): void;
+  /** Load `channelId` on the chat screen and scroll+flash message `seq` once its
+   *  slice lands (jump-to-message from a tag/search hit). Clears any tag filter,
+   *  like `selectChannel`. If `seq` is older than the loaded window, ChatView
+   *  just lands in the channel. */
+  focusMessage(channelId: string, seq: number): void;
+  /** Consume the one-shot `chatFocusSeq` (ChatView calls this once it has acted
+   *  on the jump, or when the target seq isn't in the loaded window). */
+  clearChatFocus(): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
   /** Post `body` into ANY channel (not just the active one) with the same
@@ -1679,6 +1687,15 @@ export function createActions({
     },
 
     selectChannel: enterChannel,
+
+    focusMessage: (channelId, seq) => {
+      enterChannel(channelId); // loads the channel + drops any tag filter
+      landOn("chat", { chatFocusSeq: seq });
+    },
+
+    clearChatFocus: () => {
+      patch({ chatFocusSeq: null });
+    },
 
     createChannel: (name, postPolicy) => {
       const channelId = channelIdOf(name);

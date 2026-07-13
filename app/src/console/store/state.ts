@@ -160,6 +160,10 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
+  /** A one-shot seq to scroll into view and flash once its channel's messages
+   *  load — set by `focusMessage` (tag/search jump-to-message), consumed and
+   *  cleared by ChatView. Null when there's nothing to focus. */
+  chatFocusSeq: number | null;
   /** The active #tag filter (see TagFilter), or null for the live view. */
   tagFilter: TagFilter | null;
   /** The active tag filter's hits (newest first) — query-driven, like
@@ -723,6 +727,7 @@ export const createInitialState = (): ConsoleState => {
     activeChannel: null,
     messages: [],
     activeThread: null,
+    chatFocusSeq: null,
     tagFilter: null,
     tagHits: [],
     tagHitsPending: false,
@@ -813,6 +818,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   activeChannel: null,
   messages: [],
   activeThread: null,
+  chatFocusSeq: null,
   tagFilter: null,
   tagHits: [],
   tagHitsPending: false,
