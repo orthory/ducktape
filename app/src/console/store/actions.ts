@@ -120,8 +120,9 @@ export interface ConsoleActions {
   openExplorerAt(height: number): void;
   /** Jump to a forge item — the screen switch plus the one-shot forgeFocus
    *  hand-off (the explorerFocus idiom). Used by the notification bell; the
-   *  navigate deep-link listener patches the same fields. */
-  openForgeItem(target: ForgeItemTarget): void;
+   *  navigate deep-link listener patches the same fields. `number` null is a
+   *  repo-only focus (a `duck://forge/<repo>` deep link). */
+  openForgeItem(target: ForgeItemTarget | { repo: string; number: null }): void;
   /** Jump to the files browser opened on `path` — the same one-shot hand-off,
    *  used by the agent form to open a skill document in Files. */
   openFiles(path: string): void;
