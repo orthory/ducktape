@@ -555,6 +555,14 @@ export interface ConsoleActions {
 
 interface InternalActions {
   connectActive(target: Workspace): Promise<void>;
+  /** The `ducktape://identity-unlocked` handler: re-run the connect-time
+   *  auto-bind (and the parked display-name hand-off) now that the machine
+   *  key can sign. The connect-time pass fires at provider boot — always
+   *  before a human can have typed a password — so on an encrypted key it
+   *  deterministically short-circuits "locked"; this is the retry that makes
+   *  auto-bind ever land for those users. Fire-and-forget like that pass:
+   *  resolves quietly on every failure. */
+  identityUnlocked(): Promise<void>;
 }
 
 interface CreateActionsDeps {
@@ -594,6 +602,31 @@ export function createActions({
     if (!live || !workspace) throw new Error("not connected to a workspace node");
     return { transport: live, chainId: workspace.chainId, nodePub: workspace.pubkey };
   };
+
+  /** The auto-bind pass plus the first-run display-name hand-off: the name
+   *  chosen while creating the account parks in localStorage (names are
+   *  chain-scoped) and belongs on the ACCOUNT (identity SetAccountName) once
+   *  a bind lands, so it travels with the person across devices. An unbound
+   *  outcome leaves it parked for the next pass; there is no second per-node
+   *  name registry. Shared by adopt() (the connect-time pass) and
+   *  identityUnlocked() (the retry once the machine key can actually sign —
+   *  the connect-time pass always loses the boot-vs-unlock race on an
+   *  encrypted key). */
+  const autoBindAndFlushName = (
+    transport: NodeTransport,
+    target: { chainId: string; pubkey: string },
+  ): Promise<AutoBindResult> =>
+    autoBindUserIdentity(transport, target).then((outcome) => {
+      const pending = loadPendingDisplayName();
+      if (!pending) return outcome;
+      patch({ author: pending });
+      if (outcome !== "bound" && outcome !== "already") return outcome;
+      return identityClient
+        .setAccountName(transport, { displayName: pending, origin: pending })
+        .then(() => clearPendingDisplayName())
+        .catch(() => {}) // a bounced name stays parked for the next pass
+        .then(() => outcome);
+    });
 
   // Monotonic token gating the async search fan-out: each runSearch/clearSearch
   // bumps it, and a resolving fan-out only writes results if its token is still
@@ -1375,27 +1408,7 @@ export function createActions({
     const adopt = (transport: NodeTransport): void => {
       patch({ onboardingPhase: null });
       setNode(transport);
-      autoBindUserIdentity(transport, target)
-        .then((outcome) => {
-          // First-run hand-off: the name chosen while creating the account
-          // parks in localStorage (names are chain-scoped) and lands here, on
-          // the first adopted node. When the bind landed, the name belongs on
-          // the ACCOUNT (identity SetAccountName) so it travels with the
-          // person across devices. An unbound outcome leaves it parked for the
-          // next connect; there is no second per-node name registry.
-          const pending = loadPendingDisplayName();
-          if (!pending) return;
-          patch({ author: pending });
-          if (outcome !== "bound" && outcome !== "already") return;
-          return identityClient
-            .setAccountName(transport, {
-              displayName: pending,
-              origin: pending,
-            })
-            .then(() => clearPendingDisplayName())
-            .catch(() => {});
-        })
-        .catch(() => {});
+      void autoBindAndFlushName(transport, target).catch(() => {});
     };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
@@ -2949,5 +2962,25 @@ export function createActions({
       ),
 
     connectActive,
+
+    identityUnlocked: () =>
+      Promise.resolve()
+        .then(() => {
+          const live = getNode();
+          const { workspace } = getState();
+          // Nothing adopted yet: the adopt() that eventually lands runs its
+          // own bind pass against the now-signable key — no retry needed.
+          if (!live || !workspace) return;
+          return autoBindAndFlushName(live, workspace).then((outcome) =>
+            // A landed bind repaints Owned-by/Members from the refreshed
+            // identity projection now, not on the next block tick.
+            outcome === "bound" || outcome === "already"
+              ? refresh().then(() => undefined)
+              : undefined,
+          );
+        })
+        // Same contract as the connect-time pass: a failed retry is invisible;
+        // the next unlock or connect retries again.
+        .catch(() => {}),
   };
 }

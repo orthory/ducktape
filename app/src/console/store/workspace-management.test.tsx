@@ -22,6 +22,33 @@ import { OnboardingGate } from "../views/onboarding/OnboardingGate";
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
+// The Tauri event plane, mocked so a test can play the Rust side and fire
+// shell events (identity-unlocked) into whatever listeners the provider hung.
+const tauriEvent = vi.hoisted(() => {
+  const handlers = new Map<string, Set<(event: { payload: unknown }) => void>>();
+  return {
+    handlers,
+    /** Fire a Tauri event into every registered listener (the test's Rust). */
+    emitTo(name: string, payload: unknown) {
+      handlers.get(name)?.forEach((handler) => handler({ payload }));
+    },
+    listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+      if (!handlers.has(name)) handlers.set(name, new Set());
+      handlers.get(name)!.add(handler);
+      return Promise.resolve(() => handlers.get(name)?.delete(handler));
+    }),
+    emit: vi.fn(() => Promise.resolve()),
+  };
+});
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: tauriEvent.listen,
+  emit: tauriEvent.emit,
+}));
+// Materialize the mocked module up front: the provider fires several
+// CONCURRENT dynamic imports of the event module on mount, and vitest's lazy
+// mock factory races them — the loser would fall through to the real module.
+import "@tauri-apps/api/event";
+
 const status = (publicKey?: string) => ({
   version: "0.1.0",
   appHash: "aa".repeat(32),
@@ -74,6 +101,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   invokeMock.mockReset();
+  tauriEvent.handlers.clear();
   localStorage.clear();
   actions = null;
 });
@@ -576,5 +604,135 @@ describe("onboarding gate — delete affordance", () => {
     } finally {
       nativeConfirm.mockRestore();
     }
+  });
+});
+
+describe("auto-bind retry on identity unlock", () => {
+  // The founder-never-bound seam: the boot connect always outruns a human
+  // typing a password, so on an encrypted key the connect-time auto-bind
+  // deterministically short-circuits "locked" — and nothing used to retry.
+  // The shell now announces `ducktape://identity-unlocked` the moment the
+  // session password cache holds a verified password; the provider re-runs
+  // the bind (and the parked first-run display name) against the live node.
+
+  const boundMsg = JSON.stringify({
+    bind_node: {
+      authorizer: { key: [1, 2, 3], kind: "ed25519", proof: { signature: { sig: [9, 9, 9] } } },
+    },
+  });
+
+  /** Boot straight into the member workspace over a node whose identity
+   *  module is empty; `identity.current` plays the machine key's state and
+   *  `submits` collects every parsed /v1/submit body, in order. */
+  const bootConnected = async (identity: { current: unknown }) => {
+    markTauri();
+    const submits: Array<{ target?: string; payload?: unknown; origin?: string }> = [];
+    const team = workspace({});
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "workspace_list":
+          return Promise.resolve([team]);
+        case "workspace_active":
+          return Promise.resolve(team);
+        case "workspace_select":
+          return Promise.resolve({ id: "team", httpUrl: "http://127.0.0.1:9001" });
+        case "user_identity_state":
+          return Promise.resolve(identity.current);
+        case "user_sign_bind":
+          return Promise.resolve(boundMsg);
+        default:
+          return Promise.resolve(null);
+      }
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        const u = String(url);
+        if (u.endsWith("/v1/status")) return Promise.resolve(jsonResponse(200, status("ab12")));
+        if (u.endsWith("/v1/submit")) {
+          submits.push(JSON.parse(String(init?.body ?? "{}")));
+          return Promise.resolve(
+            jsonResponse(200, { height: 1, appHash: "bb".repeat(32), ops: [] }),
+          );
+        }
+        if (u.endsWith("/v1/query")) {
+          const body = JSON.parse(String(init?.body ?? "{}")) as { target?: string };
+          if (body.target === "identity") return Promise.resolve(jsonResponse(200, { account: null }));
+          return Promise.resolve(jsonResponse(200, { channels: [] }));
+        }
+        return Promise.resolve(jsonResponse(200, { channels: [] }));
+      }),
+    );
+    render(
+      <DucktapeProvider>
+        <Probe />
+      </DucktapeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("ws").textContent).toBe("Team"));
+    // the connect-time pass has run (and, when locked, short-circuited).
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("user_identity_state"));
+    return submits;
+  };
+
+  it("binds the node once the shell announces the unlocked identity", async () => {
+    const identity = {
+      current: { state: "locked", pubkey: "cd34", mnemonicConfirmed: false },
+    };
+    const submits = await bootConnected(identity);
+    expect(invokeMock).not.toHaveBeenCalledWith("user_sign_bind", expect.anything());
+
+    identity.current = { state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true };
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://identity-unlocked", null);
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("user_sign_bind", {
+        chainId: "team#abcd",
+        nodePub: "ab12",
+        nonce: 0,
+      }),
+    );
+    await waitFor(() =>
+      expect(submits).toContainEqual(
+        expect.objectContaining({ target: "identity", payload: JSON.parse(boundMsg) }),
+      ),
+    );
+  });
+
+  it("lands the parked first-run display name with the unlock-driven bind", async () => {
+    localStorage.setItem("ducktape.pendingDisplayName", "오소리");
+    const identity = {
+      current: { state: "locked", pubkey: "cd34", mnemonicConfirmed: false },
+    };
+    const submits = await bootConnected(identity);
+
+    identity.current = { state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true };
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://identity-unlocked", null);
+    });
+
+    await waitFor(() =>
+      expect(submits).toContainEqual(
+        expect.objectContaining({
+          target: "identity",
+          payload: { set_account_name: { display_name: "오소리" } },
+        }),
+      ),
+    );
+    expect(localStorage.getItem("ducktape.pendingDisplayName")).toBeNull();
+  });
+
+  it("no-ops safely when the unlock lands before any workspace is connected", async () => {
+    await bootGate([workspace({})], {
+      user_identity_state: () => ({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true }),
+    });
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://identity-unlocked", null);
+    });
+
+    expect(invokeMock).not.toHaveBeenCalledWith("user_sign_bind", expect.anything());
+    expect(screen.getByTestId("error").textContent).toBe("none");
   });
 });

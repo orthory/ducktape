@@ -16,6 +16,14 @@ import { isTauri } from "./node-bootstrap";
 
 // ── Wire types (verbatim from user_identity.rs) ─────────
 
+/** The shell→webview event fired whenever the session password cache stores a
+ *  verified password (create/restore/unlock/encrypt/reveal — Touch ID
+ *  included): the moment signing becomes possible. Mirrors
+ *  `IDENTITY_UNLOCKED_EVENT` in user_identity.rs; the console provider listens
+ *  and re-runs the connect-time auto-bind, which the boot connect otherwise
+ *  loses to the human-speed unlock on every launch. */
+export const IDENTITY_UNLOCKED_EVENT = "ducktape://identity-unlocked";
+
 /** The identity gate's state machine value:
  *  - "absent": no `user.key` on disk yet — onboarding must create or restore one.
  *  - "plaintext": a legacy (pre-encryption) key — signs freely, no password.
@@ -104,7 +112,9 @@ export const unlockIdentity = (password: string): Promise<IdentityPubkey> =>
 
 /** Reveal the 24-word mnemonic. ALWAYS re-verifies `password` fresh — the
  *  session cache is never consulted here, by design: this is the one action
- *  that must always re-prompt, however recently the identity was unlocked. */
+ *  that must always re-prompt, however recently the identity was unlocked.
+ *  (A successful reveal still STORES the just-verified password, so finishing
+ *  the resume-create ceremony leaves the session unlocked.) */
 export const revealMnemonic = (password: string): Promise<IdentityMnemonic> =>
   isTauri()
     ? invoke<IdentityMnemonic>("user_identity_reveal", { password })

@@ -7,14 +7,17 @@
 //! on a Tauri runtime worker.
 //!
 //! this module also holds the SESSION PASSWORD CACHE: once the user proves
-//! they know the password (create/restore/unlock/encrypt), the shell keeps it
-//! in process memory for the rest of the app's run so bind/unbind don't
-//! re-prompt on every call. app restart = locked again; there is no disk
-//! persistence of the password, ever.
+//! they know the password (create/restore/unlock/encrypt/reveal), the shell
+//! keeps it in process memory for the rest of the app's run so bind/unbind
+//! don't re-prompt on every call. app restart = locked again; there is no
+//! disk persistence of the password, ever. every store also fires
+//! [`IDENTITY_UNLOCKED_EVENT`] so the webview can re-run the connect-time
+//! auto-bind it lost to the boot/unlock race.
 
 use std::sync::Mutex;
 
 use serde::Serialize;
+use tauri::Emitter as _;
 use zeroize::Zeroize as _;
 
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb, run_verb_with_stdin};
@@ -108,6 +111,24 @@ fn cache_peek() -> Option<SecretString> {
 /// `user_identity_lock` command (a Settings affordance).
 fn cache_clear() {
     session_lock().take();
+}
+
+/// the shell→webview event announcing the session just became signable (the
+/// cache now holds a verified password). the console's provider listens and
+/// re-runs the connect-time auto-bind: the boot connect always outruns a human
+/// typing a password, so on an encrypted key that fire-and-forget pass
+/// deterministically short-circuits "locked" — without this nudge the node
+/// would never auto-bind (and the display-name flow behind it stays gated).
+pub(crate) const IDENTITY_UNLOCKED_EVENT: &str = "ducktape://identity-unlocked";
+
+/// cache the just-verified `password` AND announce the unlock to the webview.
+/// the single choke point every verified-password path funnels through:
+/// create, restore, unlock (password and Touch ID), encrypt, reveal. a failed
+/// emit is deliberately dropped — the announcement is a retry nudge, not a
+/// correctness gate, and the next connect re-runs the bind anyway.
+fn cache_store_and_announce(app: &crate::rt::AppHandle, password: &str) {
+    cache_store(password);
+    let _ = app.emit(IDENTITY_UNLOCKED_EVENT, ());
 }
 
 // ── Wire types ──────────────────────────────────────────
@@ -288,7 +309,7 @@ fn user_identity_create_blocking(
         &[&password],
     )?;
     let (mnemonic, pubkey) = parse_init_output(&out)?;
-    cache_store(&password);
+    cache_store_and_announce(&app, &password);
     Ok(IdentityCreated { pubkey, mnemonic })
 }
 
@@ -329,7 +350,7 @@ fn user_identity_restore_blocking(
         &[&mnemonic, &password],
     )?;
     let pubkey = last_line(&out);
-    cache_store(&password);
+    cache_store_and_announce(&app, &password);
     crate::workspaces::set_mnemonic_confirmed(&app)?;
     Ok(IdentityPubkey { pubkey })
 }
@@ -372,7 +393,7 @@ pub(crate) fn unlock_with_secret(
         &[&password],
     )?;
     let pubkey = last_line(&out);
-    cache_store(&password);
+    cache_store_and_announce(app, &password);
     Ok(IdentityPubkey { pubkey })
 }
 
@@ -386,7 +407,10 @@ fn user_identity_unlock_blocking(
 /// reveal the 24-word mnemonic. ALWAYS uses the password the caller just
 /// supplied -- the session cache is NEVER consulted here, by design: reveal
 /// is the one action the spec says must always re-prompt, however recently
-/// the identity was unlocked.
+/// the identity was unlocked. (that contract is about CONSULTING the cache;
+/// a successful reveal still STORES the just-verified password, so finishing
+/// the interrupted-create resume ceremony leaves the session unlocked instead
+/// of demanding the same password again one screen later.)
 #[tauri::command]
 pub async fn user_identity_reveal(
     app: crate::rt::AppHandle,
@@ -415,6 +439,9 @@ fn user_identity_reveal_blocking(
         ],
         &[&password],
     )?;
+    // the verb just verified `password` by decrypting the key -- the same
+    // trust event as unlock, so the session becomes signable here too.
+    cache_store_and_announce(&app, &password);
     Ok(IdentityMnemonic {
         mnemonic: last_line(&out),
     })
@@ -458,7 +485,7 @@ fn user_identity_encrypt_blocking(
         &[&password],
     )?;
     let pubkey = last_line(&out);
-    cache_store(&password);
+    cache_store_and_announce(&app, &password);
     crate::workspaces::set_mnemonic_confirmed(&app)?;
     Ok(IdentityPubkey { pubkey })
 }
