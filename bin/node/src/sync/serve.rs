@@ -373,6 +373,15 @@ pub(crate) enum SyncStateRequest {
     TipCoords {
         reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
     },
+    /// the fail-closed standing check (ADR §5.1): is `requester` in committed
+    /// standing (validators ∪ residents)? answered from the loop's own
+    /// committed host reads, FRESH per request — a just-committed Redeem grant
+    /// is seen immediately (a cached snapshot would starve a fresh resident
+    /// between its Redeem block and the later transport cutover).
+    Standing {
+        requester: [u8; 32],
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// the [`SyncStateRequest::Boundary`] answer: the served boundary's identity

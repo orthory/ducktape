@@ -177,13 +177,20 @@ pub(super) async fn park(
     }
     // the joiner's sync client: the mesh path, ROTATING across every
     // validator that can serve. no unmatched-frame hook: drop-on-miss
-    // (the blob fetch lane that consumed those frames is retired).
+    // (the blob fetch lane that consumed those frames is retired). the
+    // real-key standing proof (ADR §5.1) is signed ONCE here with the same
+    // `signer` GateMsg uses: pre-admission the server refuses it (key not in
+    // standing), once admitted (key in residents) it serves — the client is
+    // oblivious to its own standing; the server decides.
+    let (sync_requester, sync_proof) = statesync::sign_sync_proof(&signer, &namespace);
     let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
         sync_sources.clone(),
         None,
+        sync_requester,
+        sync_proof,
     );
 
     // the CANDIDATE members the join gate (ADR §3.3) targets — the descriptor's

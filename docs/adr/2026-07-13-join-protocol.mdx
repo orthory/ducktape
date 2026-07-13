@@ -141,6 +141,39 @@ wire-stable identifiers; `detail` is human prose and MAY change freely.
   path, not a join — it syncs as today (guards against whole-net
   bootstrap deadlock).
 
+### 5.1 Enforcement — real-key standing proof (not a transport-key gate)
+
+A transport-key gate is IMPOSSIBLE: a parked joiner and an admitted-but-
+not-yet-rebooted resident present the SAME derived **lobby** key on the
+statesync channel (`boot/mesh.rs` picks the lobby key whenever `joiner`, and
+`joiner` stays true until the promotion reboot). The serve loop cannot tell
+them apart by transport identity — documented at `validator/wiring.rs`.
+
+The node still HOLDS its real signer while transporting under the lobby key
+(exactly as `GateMsg::Request` proves the real joiner key over the lobby
+channel). So enforcement keys off a **request-level proof of possession of
+the real key**, checked against committed standing:
+
+1. Each `SyncRequest` carries `{ requester: real_pubkey, proof: sig }` — the
+   requester signs a binding (genesis namespace ‖ request nonce) with its
+   real signer. Additive to the tag-based `SyncRequest` codec.
+2. The serving validator verifies the PoP, then checks
+   `requester ∈ (read_valset_members ∪ read_valset_residents)` — a members∪
+   residents snapshot refreshed at each epoch cutover (cheap in-loop read,
+   no per-request round-trip). An admitted resident's real key is in
+   `residents` the block after `Redeem` commits; a pre-admission joiner's is
+   not, despite the shared transport key.
+3. Unproven / non-member requests are refused. The restore path needs no
+   exemption: a node with persisted standing dials under its **real** key and
+   that key is already in the committed valset, so the gate admits it
+   naturally. The standing read is against the server's OWN restored host
+   state (a local read), so a simultaneous whole-net restart cannot deadlock.
+
+**Cutover**: the proof FIELD is additive, but ENFORCING fail-closed rejects
+old clients, so turning it on is a coordinated in-place cutover (no compat
+path, standing mandate) — the whole set updates together, same as every
+other flag day in this campaign.
+
 ## 6. Join state — one machine, one RPC
 
 Node-owned, derived ONLY from gate progress + committed chain state:
