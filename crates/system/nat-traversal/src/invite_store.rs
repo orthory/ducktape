@@ -100,6 +100,10 @@ impl InviteStore {
         }
 
         // global backstop: at the cap, evict the soonest-to-expire entry.
+        // ponytail: griefable by ~128 PoP keys spraying max-TTL puts to evict
+        // honest 7d invites — accepted, this is a DoS backstop not a working
+        // limit; the full blob is the universal fallback. upgrade path: evict
+        // the most-recently-inserted owner-cluster instead.
         if self.entries.len() >= MAX_INVITES
             && let Some(stale) = self
                 .entries

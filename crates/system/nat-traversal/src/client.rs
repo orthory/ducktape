@@ -434,6 +434,16 @@ impl NatClient {
         if total == 0 {
             return Ok(None);
         }
+        // `total` is coordinator-claimed: cap it at the largest chunk count a
+        // legal blob can need, so a malicious shelf cannot drive this loop
+        // through 65k round-trips buffering megabytes before the hash check.
+        let max_total = crate::wire::INVITE_BLOB_MAX.div_ceil(crate::wire::INVITE_CHUNK_BYTES) as u16;
+        if total > max_total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "coordinator claimed an impossible chunk count for this short invite",
+            ));
+        }
         let mut whole = first;
         for chunk in 1..total {
             let (bytes, _) = self.fetch_chunk(id, chunk).await?;
