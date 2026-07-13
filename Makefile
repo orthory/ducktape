@@ -9,7 +9,6 @@
 
 CARGO ?= cargo
 BUN ?= bun
-BUILD_WITH ?= $(CURDIR)/ops/build-with.sh
 APP_DEST ?= /Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 # Linux: the app's payload directory lives inside ducktape's own home so the
@@ -32,15 +31,9 @@ export PATH := $(dir $(CEF_CLONE))bin:$(PATH)
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all build-tools dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
+.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
 
 all: node web
-
-## report the optional Rust build accelerators detected on this host. Makefile
-## build entry points use sccache when installed and mold+clang on Linux; both
-## fall back cleanly, so neither is a prerequisite.
-build-tools:
-	@$(BUILD_WITH) --status
 
 ## provision macOS bundling prerequisites (ninja + the pinned upstream
 ## feat/cef tauri CLI checkout); no-op on Linux. idempotent; every
@@ -53,7 +46,7 @@ cef-env:
 ## ducktape-node and restarts the running node in place, which the app re-adopts.
 ## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
 dev: cef-env app/node_modules
-	@$(BUILD_WITH) bash ops/dev.sh
+	@bash ops/dev.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
 ## messages, a tasks board, pages, a registered agent (with a live @mention run),
@@ -62,7 +55,7 @@ dev: cef-env app/node_modules
 ## "demo" workspace in ~/.ducktape and makes it active; just open the app. Builds
 ## ducktape-node if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
 demo-seed: cef-env
-	@$(BUILD_WITH) bash ops/demo-seed.sh
+	@bash ops/demo-seed.sh
 
 ## serve the user-hosted web app behind the demo's app.<id>.duck gateway route
 ## (demo-seed publishes the route; this runs the loopback server it proxies to).
@@ -85,19 +78,19 @@ dogfood-forge:
 
 ## release build of the networked node (serves the app surface)
 node: cef-env
-	$(BUILD_WITH) $(CARGO) build --release -p node-bin
+	$(CARGO) build --release -p node-bin
 
 ## release build of the untrusted UDP coordinator
 coordinator: cef-env
-	$(BUILD_WITH) $(CARGO) build --release -p coordinator-bin
+	$(CARGO) build --release -p coordinator-bin
 
 ## coordinator-only verification gate: CLI/policy tests + live UDP smoke
 coordinator-smoke: cef-env
-	$(BUILD_WITH) $(CARGO) test -p coordinator-bin
+	$(CARGO) test -p coordinator-bin
 
 ## stage the daemon as the desktop app's sidecar (app/src-tauri/binaries)
 sidecar: cef-env app/node_modules
-	cd app && $(BUILD_WITH) $(BUN) run sidecar
+	cd app && $(BUN) run sidecar
 
 ## static web bundle -> app/dist
 web: app/node_modules
@@ -120,13 +113,13 @@ web: app/node_modules
 ## is 2.11.x on both sides.
 ifeq ($(UNAME_S),Darwin)
 app: cef-env app/node_modules
-	cd app && $(BUILD_WITH) $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches
+	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches
 	bash ops/check-macos-cef-bundle.sh target/release/bundle/macos/Ducktape.app
 	bash ops/smoke-macos-app.sh target/release/bundle/macos/Ducktape.app
 	bash ops/fix-dmg.sh
 else
 app: cef-env app/node_modules
-	cd app && $(BUILD_WITH) $(BUN) run tauri build --no-bundle
+	cd app && $(BUN) run tauri build --no-bundle
 	bash ops/stage-linux-app.sh
 endif
 
@@ -141,11 +134,11 @@ install: install-node install-app
 
 ## ducktape-node -> ~/.cargo/bin
 install-node: cef-env
-	$(BUILD_WITH) $(CARGO) install --path bin/node --locked
+	$(CARGO) install --path bin/node --locked
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator: cef-env
-	$(BUILD_WITH) $(CARGO) build --release -p coordinator-bin
+	$(CARGO) build --release -p coordinator-bin
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
@@ -177,7 +170,7 @@ endif
 
 ## regenerate app/src/domain/stream.gen.ts from the stream contract
 stream-types: cef-env
-	$(BUILD_WITH) $(CARGO) test -p noded export_ts_bindings
+	$(CARGO) test -p noded export_ts_bindings
 
 ## the full LOCAL verification gate (no hosted CI by design — run this before
 ## every push): the rust workspace including the process-level e2e suites
@@ -186,10 +179,10 @@ stream-types: cef-env
 ## binary staged so the live-daemon wire-parity e2e RUNS instead of skipping,
 ## and the sim node staged so the provider scenario suite runs too.
 test: cef-env app/node_modules wasm-modules-check
-	$(BUILD_WITH) $(CARGO) test --workspace
+	$(CARGO) test --workspace
 	$(MAKE) stream-types
 	git diff --exit-code -- app/src/domain/stream.gen.ts
-	$(BUILD_WITH) $(CARGO) build -p noded -p simnode
+	$(CARGO) build -p noded -p simnode
 	cd app && $(BUN) run typecheck
 	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) DUCKTAPE_SIMNODE_BIN=$(abspath target/debug/ducktape-simnode) $(BUN) run test
 

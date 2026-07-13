@@ -15,7 +15,7 @@ fi
 
 target_dir="$(cd "$root" && cargo metadata --no-deps --format-version 1 | bun -e 'console.log((await Bun.stdin.json()).target_directory)')"
 triple="$(rustc -vV | sed -n 's/^host: //p')"
-(cd "$root" && ops/build-with.sh cargo build -p node-bin --bin ducktape-node)
+(cd "$root" && cargo build -p node-bin --bin ducktape-node)
 install -d -m 700 "$root/app/src-tauri/binaries"
 install -m 755 "$target_dir/debug/ducktape-node" "$root/app/src-tauri/binaries/ducktape-node-$triple"
 
@@ -37,7 +37,7 @@ artifact_cwd='bin'
 case "$(uname -s)" in
   Darwin)
     bash "$root/ops/cef-probe/setup.sh" "$CEF_CLONE"
-    (cd "$root/app" && VITE_TAURI_AGENT=1 ../ops/build-with.sh bun run tauri build \
+    (cd "$root/app" && VITE_TAURI_AGENT=1 bun run tauri build \
       --debug --bundles app \
       --config '{"build":{"beforeBuildCommand":"bun run build"}}')
     app_bundle="$target_dir/debug/bundle/macos/Ducktape.app"
@@ -93,7 +93,7 @@ case "$(uname -s)" in
     artifact_cwd='app/Ducktape.app/Contents/MacOS'
     ;;
   *)
-    (cd "$root/app" && VITE_TAURI_AGENT=1 ../ops/build-with.sh bun run tauri build --debug --no-bundle \
+    (cd "$root/app" && VITE_TAURI_AGENT=1 bun run tauri build --debug --no-bundle \
       --config '{"build":{"beforeBuildCommand":"bun run build"}}')
     install -m 755 "$target_dir/debug/ducktape-desktop" "$FLEET_ARTIFACT_DIR/bin/ducktape"
     # Hardlink the CEF runtime from the immutable versioned distribution so

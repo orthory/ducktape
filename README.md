@@ -71,34 +71,6 @@ suites, then the app suites against a freshly built daemon):
 make test
 ```
 
-### Optional Rust build acceleration
-
-Makefile build entry points automatically use `sccache` when it is installed.
-On native Linux builds they also use `mold` through `clang` when both are
-installed. Missing helpers are a clean fallback, and `mold` is deliberately not
-enabled on macOS because its upstream Rust integration targets Linux/ELF.
-
-Install `sccache` with `brew install sccache` on macOS. On Linux, install
-`sccache`, `mold`, and `clang` with your package manager (or use the upstream
-prebuilt `sccache` release), then inspect what Ducktape detected:
-
-```sh
-make build-tools
-```
-
-For direct Cargo commands, use the same environment explicitly:
-
-```sh
-ops/build-with.sh cargo check -p files --no-default-features
-sccache --show-stats
-```
-
-The helper preserves existing `RUSTC_WRAPPER`, linker, and Rust flag settings.
-Set `DUCKTAPE_DISABLE_SCCACHE=1` or `DUCKTAPE_DISABLE_MOLD=1` to disable one
-helper for a command. It does not disable Cargo incremental compilation, so
-workspace crates using incremental compilation will bypass `sccache` while
-cacheable dependencies still benefit.
-
 Run and verify only the coordinator operator path:
 
 ```sh

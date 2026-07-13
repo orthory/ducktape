@@ -35,7 +35,7 @@ if [ "$scope" = all ] || [ "$scope" = podman ]; then
   podman_image="${DUCKTAPE_MACOS_PODMAN_IMAGE:-docker.io/library/node:22-slim}"
   retry 3 podman pull "$podman_image"
   retry 2 env DUCKTAPE_MACOS_PODMAN_IMAGE="$podman_image" \
-    ops/build-with.sh cargo test -p capability-host macos_podman_hardware_smoke -- --ignored --nocapture
+    cargo test -p capability-host macos_podman_hardware_smoke -- --ignored --nocapture
 fi
 
 if [ "$scope" = all ] || [ "$scope" = tart ]; then
@@ -43,13 +43,13 @@ if [ "$scope" = all ] || [ "$scope" = tart ]; then
   command -v sshpass >/dev/null || { echo "[sandbox-smoke] sshpass is not installed" >&2; exit 1; }
   tart_image="${DUCKTAPE_MACOS_TART_IMAGE:-ghcr.io/cirruslabs/macos-sonoma-base:latest}"
   retry 2 env DUCKTAPE_MACOS_TART_IMAGE="$tart_image" \
-    ops/build-with.sh cargo test -p capability-host macos_tart_hardware_smoke -- --ignored --nocapture
+    cargo test -p capability-host macos_tart_hardware_smoke -- --ignored --nocapture
 fi
 
 if [ "$scope" = all ] || [ "$scope" = ui ]; then
   fleet="${FLEET:-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js}"
   (cd app && bun install --frozen-lockfile)
-  retry 2 ops/build-with.sh cargo test -p noded shutdown_wakes_every_surface_and_remains_sticky
+  retry 2 cargo test -p noded shutdown_wakes_every_surface_and_remains_sticky
   retry 2 env FLEET="$fleet" bun qa/macos-sandbox-apply-smoke.ts success
   retry 2 env FLEET="$fleet" bun qa/macos-sandbox-apply-smoke.ts rollback
 fi
