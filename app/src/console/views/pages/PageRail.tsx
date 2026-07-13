@@ -167,7 +167,7 @@ export function PageRail({
           padding: "0 10px",
           border: `1px solid ${color.border}`,
           borderRadius: radius.sm,
-          background: `color-mix(in srgb, ${color.paper} 92%, white)`,
+          background: color.sunken,
           color: color.muted2,
         }}
       >
