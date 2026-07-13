@@ -11,10 +11,10 @@ let pid: number
 try { pid = Number((await readFile(pidfile, 'utf8')).trim()) } catch { process.exit(0) }
 if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('workspace node pidfile is invalid')
 
-const expectedExecutable = await realpath(join(required('FLEET_ARTIFACT_DIR'), 'bin', 'ducktape-node'))
-const config = await realpath(configPath)
 const owned = await identity(pid)
 if (!owned) { await rm(pidfile, { force: true }); process.exit(0) }
+const expectedExecutable = await realpath(join(required('FLEET_ARTIFACT_DIR'), 'bin', 'ducktape-node'))
+const config = await realpath(configPath)
 if (owned.pgid !== pid) throw new Error('workspace node is not the leader of its process group')
 const executable = await processExecutable(pid)
 if (executable !== expectedExecutable || !await processUsesConfig(pid, [configPath, config])) {
