@@ -119,9 +119,19 @@ async fn submit_as(
     at: u64,
     payload: Vec<u8>,
 ) -> Result<(), SubmitError> {
+    submit_as_version(host, who, at, 0, payload).await
+}
+
+async fn submit_as_version(
+    host: &mut Host,
+    who: &[u8],
+    at: u64,
+    protocol_version: u32,
+    payload: Vec<u8>,
+) -> Result<(), SubmitError> {
     host.submit_at(
         BlockContext {
-            protocol_version: 0,
+            protocol_version,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -407,6 +417,85 @@ fn a_client_role_token_grants_client_standing_not_residency() {
         let audit = redemptions(&host).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].joiner, key_bytes(&client));
+    });
+}
+
+#[test]
+fn legacy_clients_are_invisible_until_protocol_v1() {
+    block_on(async {
+        let mut valset = Valset::new("valset");
+        valset.insert(key_bytes(&keypair(1)));
+        let mut host = Host::genesis(vec![
+            Box::new(valset),
+            Box::new(Clients::new("clients")),
+            Box::new(
+                Governance::new("governance", "valset", "upgrade", "identity")
+                    .with_invite_binding(BINDING)
+                    .with_clients_after_version("clients", 1),
+            ),
+        ])
+        .expect("genesis");
+        host.defer_module_until("clients", 1).expect("legacy route");
+
+        assert!(
+            matches!(
+                host.query("clients", &clients_query(&ClientsQuery::Clients))
+                    .await,
+                Err(Error::UnknownModule(module)) if module == "clients"
+            ),
+            "clients must not exist on any pre-v1 host surface"
+        );
+        assert!(
+            host.state_schema().iter().all(|(id, _)| id != "clients"),
+            "pre-v1 state manifests retain the legacy 25-module schema"
+        );
+
+        let issuer = keypair(1);
+        let resident = keypair(8);
+        let resident_token = mint_for(&issuer, 7, &resident, InviteRole::Resident, u64::MAX);
+        submit_as_version(
+            &mut host,
+            &key_bytes(&resident),
+            1,
+            0,
+            redeem_msg(&resident_token, &resident),
+        )
+        .await
+        .expect("resident admission stays available before v1");
+
+        let client = keypair(9);
+        let client_token = mint_for(&issuer, 8, &client, InviteRole::Client, u64::MAX);
+        let error = submit_as_version(
+            &mut host,
+            &key_bytes(&client),
+            2,
+            0,
+            redeem_msg(&client_token, &client),
+        )
+        .await
+        .expect_err("client admission is gated before v1");
+        assert!(
+            matches!(error, SubmitError::Rejected(Error::Module(ref message))
+                if message.contains("activates at protocol v1")),
+            "got {error:?}"
+        );
+
+        submit_as_version(
+            &mut host,
+            &key_bytes(&client),
+            3,
+            1,
+            redeem_msg(&client_token, &client),
+        )
+        .await
+        .expect("v1 activates clients before dispatch");
+        assert_eq!(clients(&host).await, vec![key_bytes(&client)]);
+        assert!(host.state_schema().iter().any(|(id, _)| id == "clients"));
+
+        host.set_active_version(0);
+        assert!(host.module_root("clients").is_none());
+        host.set_active_version(1);
+        assert_eq!(clients(&host).await, vec![key_bytes(&client)]);
     });
 }
 

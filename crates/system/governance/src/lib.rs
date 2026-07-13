@@ -118,6 +118,13 @@ pub struct Governance {
     /// id (or none). `None` (a shape without the module) rejects Client redeems
     /// deterministically; Resident redeems are unaffected.
     clients_id: Option<ModuleId>,
+    /// First protocol version allowed to route Client invite redemptions to
+    /// `clients`. Non-hashed genesis/runtime wiring used only by the one
+    /// pre-clients module-set migration; fresh networks keep the default 0.
+    clients_min_version: u32,
+    /// Current deterministic protocol selector supplied by the host. This is
+    /// deliberately not snapshot state: replay derives it from the block.
+    active_version: u32,
     /// the network binding invite tokens sign over (the genesis namespace).
     /// genesis wiring — identical on every node of the same network. `None`
     /// (a shape without a descriptor) refuses every `Redeem` with a clear
@@ -157,6 +164,8 @@ impl Governance {
             modreg_id: None,
             identity_id: identity_id.into(),
             clients_id: None,
+            clients_min_version: 0,
+            active_version: 0,
             invite_binding: None,
             proposals: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -182,6 +191,18 @@ impl Governance {
     /// none), or nodes diverge on whether Client redeems are accepted.
     pub fn with_clients(mut self, clients_id: impl Into<ModuleId>) -> Self {
         self.clients_id = Some(clients_id.into());
+        self
+    }
+
+    /// Wire `clients`, but refuse Client invite redemption until the host has
+    /// activated `version`. Resident redemption remains available throughout.
+    pub fn with_clients_after_version(
+        mut self,
+        clients_id: impl Into<ModuleId>,
+        version: u32,
+    ) -> Self {
+        self.clients_id = Some(clients_id.into());
+        self.clients_min_version = version;
         self
     }
 
@@ -1170,6 +1191,12 @@ impl Governance {
                 }
             }
             invite::InviteRole::Client => {
+                if self.active_version < self.clients_min_version {
+                    return Err(Error::Module(format!(
+                        "client redemption activates at protocol v{}",
+                        self.clients_min_version
+                    )));
+                }
                 let Some(clients_id) = self.clients_id.as_deref() else {
                     return Err(Error::Module(
                         "this network is not wired for client redemption (no clients module)".into(),
@@ -1215,6 +1242,10 @@ impl Governance {
 impl Module for Governance {
     fn id(&self) -> ModuleId {
         self.id.clone()
+    }
+
+    fn set_active_version(&mut self, version: u32) {
+        self.active_version = version;
     }
 
     /// sha256 over the canonical encoding of COMMITTED proposals and
