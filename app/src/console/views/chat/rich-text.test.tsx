@@ -1,6 +1,6 @@
 // What a rendered body's references DO when clicked: a mention mark opens its
-// principal (agent detail / the person in Members), a `[[page:<id>]]` chip
-// opens the page — and neither pretends to resolve something it can't.
+// principal (agent detail / the person in Members), a duck:// chip deep-links
+// through the open plane — and neither pretends to resolve something it can't.
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -39,6 +39,9 @@ const withStore = (node: ReactNode, statePatch: Partial<ConsoleState> = {}) => {
     openMember: vi.fn(),
     openPage: vi.fn(),
     setScreen: vi.fn(),
+    openForgeItem: vi.fn(),
+    selectChannel: vi.fn(),
+    focusMessage: vi.fn(),
   } as unknown as ConsoleActions;
   render(
     <ConsoleContext.Provider
@@ -178,6 +181,83 @@ describe("duck://page chips", () => {
 
     // an https link is an external <a>, never a page chip.
     expect(screen.queryByRole("button", { name: /Open page/ })).toBeNull();
+  });
+});
+
+describe("duck://forge and duck://channel chips", () => {
+  it("faces a forge ref as canonical repo#n (never the authored label) and deep-links", () => {
+    const actions = withStore(
+      <RichText blocks={para({ text: "see [misleading](duck://forge/ducktape/58)" })} names={{}} />,
+    );
+
+    const chip = screen.getByRole("button", { name: "Open ducktape#58 in Forge" });
+    expect(chip.textContent).toContain("ducktape#58");
+    expect(chip.textContent).not.toContain("misleading");
+    fireEvent.click(chip);
+
+    expect(actions.openForgeItem).toHaveBeenCalledWith({ repo: "ducktape", number: 58 });
+  });
+
+  it("a repo-only forge ref focuses the repo", () => {
+    const actions = withStore(
+      <RichText blocks={para({ text: "[r](duck://forge/ducktape)" })} names={{}} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open ducktape in Forge" }));
+
+    expect(actions.openForgeItem).toHaveBeenCalledWith({ repo: "ducktape", number: null });
+  });
+
+  it("faces a channel ref with the live #name and selects it on click", () => {
+    const actions = withStore(
+      <RichText blocks={para({ text: "[chan](duck://channel/ch-1)" })} names={{}} />,
+      { channels: [{ id: "ch-1", name: "general" }] as unknown as ConsoleState["channels"] },
+    );
+
+    const chip = screen.getByRole("button", { name: "Open channel #general" });
+    expect(chip.textContent).toContain("general");
+    expect(chip.textContent).not.toContain("chan");
+    fireEvent.click(chip);
+
+    expect(actions.setScreen).toHaveBeenCalledWith("chat");
+    expect(actions.selectChannel).toHaveBeenCalledWith("ch-1");
+  });
+
+  it("an anchored channel ref jumps to the message", () => {
+    const actions = withStore(
+      <RichText blocks={para({ text: "[m](duck://channel/general#42)" })} names={{}} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open channel #general" }));
+
+    expect(actions.focusMessage).toHaveBeenCalledWith("general", 42);
+  });
+
+  it("routes a hidden forge discussion channel ref to its forge item", () => {
+    const actions = withStore(
+      <RichText blocks={para({ text: "[d](duck://channel/forge:ducktape:58#7)" })} names={{}} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open ducktape#58 in Forge" }));
+
+    expect(actions.openForgeItem).toHaveBeenCalledWith({
+      repo: "ducktape",
+      number: 58,
+      messageSeq: 7,
+    });
+  });
+
+  it("renders inert chips without a store", () => {
+    render(
+      <RichText
+        blocks={para({ text: "[p](duck://forge/duck/1) [c](duck://channel/general)" })}
+        names={{}}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.getByText("duck#1")).toBeTruthy();
+    expect(screen.getByText("general")).toBeTruthy();
   });
 });
 
