@@ -1053,6 +1053,7 @@ impl Governance {
     /// issuer against CURRENT membership, nonce against the redeemed set
     /// (single-use — a second redemption of the same token deterministically
     /// rejects). success emits the observer grant in the same block.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_redeem(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -1061,6 +1062,9 @@ impl Governance {
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
+        target: Vec<u8>,
+        role: u8,
+        expires_unix_secs: u64,
     ) -> Result<(), Error> {
         // the submitter must be an authenticated frame origin, but is NOT
         // required to be a member — the token authorizes the admission, not
@@ -1087,14 +1091,38 @@ impl Governance {
             .map_err(|e| Error::Module(format!("token signature: {e}")))?;
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
+        let target_key = ed25519::PublicKey::decode(target.as_slice())
+            .map_err(|e| Error::Module(format!("target key: {e}")))?;
+        let role = invite::InviteRole::from_u8(role).map_err(Error::Module)?;
         let token = invite::InviteToken {
             issuer: issuer_key,
             nonce: nonce_arr,
+            target: target_key,
+            role,
+            expires_unix_secs,
             sig,
         };
         if !invite::verify_invite_token(&token, binding) {
             return Err(Error::Module(
                 "invite token signature does not verify for this network".into(),
+            ));
+        }
+        // the invite admits exactly ONE key; a blob holder redeeming under a
+        // different key is refused (compares the raw Vec<u8> args — cheap, exact).
+        if joiner != target {
+            return Err(Error::Module("invite is locked to another key".into()));
+        }
+        // agreed block time, NOT wall clock — every validator settles identically.
+        // NOTE: `consensus_time` is stamped as block HEIGHT in this codebase
+        // (crates/kernel/node/src/lib.rs `consensus_time: height`), not unix
+        // seconds; the tests drive matching scales so this gate is exact there.
+        if ctx.env().consensus_time >= token.expires_unix_secs {
+            return Err(Error::Module("invite expired".into()));
+        }
+        if token.role == invite::InviteRole::Client {
+            return Err(Error::Module(
+                "client invites are not redeemable yet — the thin-client plane lands separately"
+                    .into(),
             ));
         }
         if !invite::verify_join_proof(&joiner_key, binding, &token, &proof_sig) {
@@ -1181,9 +1209,22 @@ impl Module for Governance {
                 token_sig,
                 joiner,
                 proof,
+                target,
+                role,
+                expires_unix_secs,
             } => {
-                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof)
-                    .await
+                self.handle_redeem(
+                    ctx,
+                    issuer,
+                    nonce,
+                    token_sig,
+                    joiner,
+                    proof,
+                    target,
+                    role,
+                    expires_unix_secs,
+                )
+                .await
             }
         }
     }
