@@ -899,6 +899,49 @@ async fn files_module_rejection_is_a_verbatim_400_envelope() {
     assert_eq!(body["error"], "files: conflict: /x changed since base");
 }
 
+#[tokio::test]
+async fn upload_pack_have_round_returns_only_plain_nak() {
+    fn pkt(payload: &[u8]) -> Vec<u8> {
+        let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
+        line.extend_from_slice(payload);
+        line
+    }
+
+    let oid = "11".repeat(20);
+    let mut request_body = pkt(
+        format!("want {oid} multi_ack_detailed side-band-64k\n").as_bytes(),
+    );
+    request_body.extend_from_slice(b"0000");
+    request_body.extend_from_slice(&pkt(format!("have {oid}\n").as_bytes()));
+    request_body.extend_from_slice(b"0000");
+
+    let forge_root = tempfile::tempdir().expect("forge root");
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let response = noded::router(handle.with_forge_repo(forge_root.path()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/forge/repo/git-upload-pack")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                )
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/x-git-upload-pack-result"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"0008NAK\n");
+    assert!(!body.windows(4).any(|window| window == b"PACK"));
+}
+
 // ---- duckfs workspace RPC: 503 when unconfigured, slug validation -----------
 
 #[tokio::test]

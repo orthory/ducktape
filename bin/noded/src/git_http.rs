@@ -29,9 +29,10 @@ use crate::{DEFAULT_ORIGIN, NodeCommand, NodeHandle, actor_gone, error_response}
 // FETCH reads forge's git substrate DIRECTLY — the one route that opens the
 // on-disk repo (`<forge_repo>/<name>`, threaded onto the handle) instead of
 // talking to the actor. it builds a packfile of the wanted oids' full closure
-// and streams it back on side-band-64k. the MVP ignores `have`s and always
-// serves a full closure — always correct, just larger than an incremental
-// fetch; `git pull` works, it just refetches.
+// and streams it back on side-band-64k. the MVP uses `have`s only to complete
+// the upload-pack negotiation (it always answers NAK), then serves a full
+// closure once the client sends `done` — always correct, just larger than an
+// incremental fetch; `git pull` works, it just refetches.
 // ============================================================================
 
 /// the capabilities forge's receive-pack advertises. deliberately NO
@@ -102,6 +103,89 @@ fn parse_pkt_lines(buf: &[u8]) -> Result<(Vec<Vec<u8>>, &[u8]), String> {
         lines.push(rest[4..len].to_vec());
         rest = &rest[len..];
     }
+}
+
+/// the parts of a v0 upload-pack request this full-closure server needs. haves
+/// are deliberately not retained: they affect pack size, not correctness, and
+/// this implementation always negotiates "no common base" with NAK.
+struct UploadPackRequest {
+    wants: Vec<String>,
+    side_band: bool,
+    done: bool,
+}
+
+/// parse the complete v0 upload-pack request, including the negotiation tail.
+/// A stateless smart-HTTP client may end a round with a flush instead of `done`;
+/// that round must receive only NAK so it can send another batch of haves.
+fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
+    let (lines, mut rest) = parse_pkt_lines(body)?;
+    let mut wants = Vec::new();
+    let mut side_band = false;
+    let mut first_want = true;
+    for line in &lines {
+        let text = std::str::from_utf8(line)
+            .map_err(|_| "non-utf8 want line".to_string())?
+            .trim_end();
+        let Some(want) = text.strip_prefix("want ") else {
+            return Err("unexpected line in want section".into());
+        };
+        let mut toks = want.split(' ');
+        let oid = toks
+            .next()
+            .filter(|oid| !oid.is_empty())
+            .ok_or_else(|| "want line carried no oid".to_string())?;
+        if git2::Oid::from_str(oid).is_err() {
+            return Err("want line carried an invalid oid".into());
+        }
+        wants.push(oid.to_string());
+        if first_want {
+            side_band = toks.any(|cap| cap == "side-band-64k");
+            first_want = false;
+        }
+    }
+    if wants.is_empty() {
+        return Err("request carried no want lines".into());
+    }
+
+    let mut done = false;
+    while !rest.is_empty() {
+        if done {
+            return Err("upload-pack negotiation continued after done".into());
+        }
+        if rest.len() < 4 {
+            return Err("truncated negotiation pkt-line length header".into());
+        }
+        let hdr = std::str::from_utf8(&rest[..4])
+            .map_err(|_| "non-ascii negotiation pkt-line length".to_string())?;
+        let len = usize::from_str_radix(hdr, 16)
+            .map_err(|_| "invalid negotiation pkt-line length hex".to_string())?;
+        if len == 0 {
+            rest = &rest[4..];
+            continue;
+        }
+        if len < 4 || len > rest.len() {
+            return Err("negotiation pkt-line length out of range".into());
+        }
+        let text = std::str::from_utf8(&rest[4..len])
+            .map_err(|_| "non-utf8 negotiation line".to_string())?
+            .trim_end();
+        if text == "done" {
+            done = true;
+        } else if let Some(oid) = text.strip_prefix("have ") {
+            if git2::Oid::from_str(oid).is_err() {
+                return Err("have line carried an invalid oid".into());
+            }
+        } else {
+            return Err("unexpected upload-pack negotiation line".into());
+        }
+        rest = &rest[len..];
+    }
+
+    Ok(UploadPackRequest {
+        wants,
+        side_band,
+        done,
+    })
 }
 
 /// decode an even-length hex string to raw bytes; `None` on an odd length or any
@@ -477,12 +561,12 @@ pub(crate) async fn git_receive_pack(
 }
 
 /// POST /forge/{repo}/git-upload-pack — serve a fetch/clone. parse the pkt-line
-/// negotiation (`want <oid>` lines, capabilities on the FIRST; `have`/`done`
-/// lines are read but IGNORED — the MVP serves a full closure), open
+/// negotiation (`want <oid>` lines, capabilities on the FIRST; `have`s receive
+/// NAK until `done` — the MVP serves a full closure), open
 /// `<forge_repo>/{repo}` READ-ONLY, build a packfile of the wanted oids' closure,
-/// and reply `NAK` then the pack muxed on side-band-64k band 1. incremental
-/// (`have`-aware) fetch is future work: a full pack is always correct, just
-/// larger, and `git pull` still works (it refetches).
+/// and, after `done`, reply `NAK` then the pack muxed on side-band-64k band 1.
+/// incremental (`have`-aware) fetch is future work: a full pack is always
+/// correct, just larger, and `git pull` still works (it refetches).
 pub(crate) async fn git_upload_pack(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
@@ -508,12 +592,8 @@ pub(crate) async fn git_upload_pack(
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
 
-    // the request opens with the `want` list (caps on the first want), then a
-    // flush-pkt, then have/done lines. parse_pkt_lines returns exactly the want
-    // section; the have/done tail after the flush is deliberately ignored (the
-    // full-closure MVP negotiates no common base).
-    let (lines, _rest) = match parse_pkt_lines(&body) {
-        Ok(parsed) => parsed,
+    let request = match parse_upload_pack_request(&body) {
+        Ok(request) => request,
         Err(msg) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -522,38 +602,28 @@ pub(crate) async fn git_upload_pack(
         }
     };
 
-    let mut wants: Vec<String> = Vec::new();
-    let mut side_band = false;
-    let mut first_want = true;
-    for line in &lines {
-        let text = std::str::from_utf8(line).map(str::trim_end).unwrap_or("");
-        let Some(rest) = text.strip_prefix("want ") else {
-            continue;
-        };
-        // `want <oid>[ <cap> <cap> …]` — the oid then space-separated caps on the
-        // first want line only.
-        let mut toks = rest.split(' ');
-        let Some(oid) = toks.next().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        wants.push(oid.to_string());
-        if first_want {
-            side_band = toks.any(|c| c == "side-band-64k");
-            first_want = false;
-        }
-    }
-    if wants.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "git-upload-pack request carried no want lines",
-        );
+    // A flush-ended have batch is an intermediate negotiation round. Returning
+    // only NAK (and no side-band/PACK bytes) lets stock git send its next batch.
+    if !request.done {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            pkt_line(b"NAK\n"),
+        )
+            .into_response();
     }
 
     // the pack build is blocking git2 IO over a non-Send `Repository`; run it off
     // the async worker, moving only Send data (the dir + hex oids) across.
     let repo_dir = forge_repo.join(&repo);
-    let pack = match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants)).await
-    {
+    let UploadPackRequest {
+        wants, side_band, ..
+    } = request;
+    let pack =
+        match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants)).await {
         Ok(Ok(pack)) => pack,
         Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
         Err(_) => {
@@ -607,4 +677,51 @@ fn build_upload_pack(repo_dir: &std::path::Path, want_hexes: &[String]) -> Resul
         oids.push(git2::Oid::from_str(hex).map_err(|e| format!("bad want oid {hex}: {e}"))?);
     }
     forge::pack_closure_many(&repo, &oids).map_err(|e| format!("build pack: {e}"))
+}
+
+#[cfg(test)]
+mod upload_pack_tests {
+    use super::*;
+
+    const WANT: &str = "1111111111111111111111111111111111111111";
+    const HAVE: &str = "2222222222222222222222222222222222222222";
+
+    fn request_tail(tail: &[u8]) -> Vec<u8> {
+        let mut body = pkt_line(format!("want {WANT} multi_ack_detailed side-band-64k\n").as_bytes());
+        body.extend_from_slice(GIT_FLUSH_PKT);
+        body.extend_from_slice(tail);
+        body
+    }
+
+    #[test]
+    fn flush_ended_have_round_is_not_done() {
+        let mut tail = pkt_line(format!("have {HAVE}\n").as_bytes());
+        tail.extend_from_slice(GIT_FLUSH_PKT);
+
+        let parsed = parse_upload_pack_request(&request_tail(&tail)).expect("valid request");
+
+        assert_eq!(parsed.wants, vec![WANT.to_string()]);
+        assert!(parsed.side_band);
+        assert!(!parsed.done, "a have flush must not authorize pack bytes");
+    }
+
+    #[test]
+    fn explicit_done_completes_negotiation() {
+        let mut tail = pkt_line(format!("have {HAVE}\n").as_bytes());
+        tail.extend_from_slice(&pkt_line(b"done\n"));
+
+        let parsed = parse_upload_pack_request(&request_tail(&tail)).expect("valid request");
+
+        assert!(parsed.done);
+        assert!(parsed.side_band);
+    }
+
+    #[test]
+    fn malformed_negotiation_tail_is_rejected() {
+        let err = parse_upload_pack_request(&request_tail(b"0009wat!\n"))
+            .err()
+            .expect("unknown negotiation line must fail");
+
+        assert!(err.contains("unexpected upload-pack negotiation line"));
+    }
 }
