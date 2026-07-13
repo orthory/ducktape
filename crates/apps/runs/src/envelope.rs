@@ -1026,7 +1026,7 @@ mod tests {
             sink: WireSink::Pr {
                 repo: "app".into(),
                 source_branch: "agent/item-7".into(),
-                target_branch: "main".into(),
+                target_branch: "dev".into(),
                 title: String::new(),
                 body: String::new(),
             },
@@ -1074,7 +1074,7 @@ mod tests {
         assert!(v["result_contract"]["sink"].get("body").is_none());
         assert!(
             payload.contains(
-                r#""result_contract":{"ducktape_runner_result":1,"sink":{"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}}"#
+                r#""result_contract":{"ducktape_runner_result":1,"sink":{"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"dev"}}"#
             ),
             "the requested-sink field order is part of the committed bytes: {payload}"
         );

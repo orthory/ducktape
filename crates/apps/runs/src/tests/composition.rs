@@ -223,15 +223,15 @@ fn compose_forge(
 }
 
 #[test]
-fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
+fn an_issue_run_forks_dev_with_an_unborn_item_branch_and_requests_a_pr() {
     let registry = forge_read_registry();
-    let main_tip = "cd".repeat(20);
+    let dev_tip = "cd".repeat(20);
     let m = forge_module();
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "Fix the gate", "repro inside"))
-        .with_forge_tip("app", "main", &main_tip)
+        .with_forge_tip("app", "dev", &dev_tip)
         .with_files_head(&"aa".repeat(32));
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
 
@@ -240,19 +240,19 @@ fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
     assert_eq!(v["workspace"]["repo"], "app");
     assert_eq!(v["workspace"]["item_title"], "Fix the gate");
     assert_eq!(
-        v["workspace"]["commit"], main_tip,
-        "an issue with an unborn work branch forks the committed main tip"
+        v["workspace"]["commit"], dev_tip,
+        "an issue with an unborn work branch forks the committed dev tip"
     );
     assert_eq!(v["workspace"]["branch"], "agent/item-7");
     assert_eq!(v["workspace"]["branch_born"], false);
-    // the requested sink: a PR of the work branch onto main, no title/body.
+    // the requested sink: a PR of the work branch onto dev, no title/body.
     assert_eq!(v["result_contract"]["sink"]["mode"], "pr");
     assert_eq!(v["result_contract"]["sink"]["repo"], "app");
     assert_eq!(
         v["result_contract"]["sink"]["source_branch"],
         "agent/item-7"
     );
-    assert_eq!(v["result_contract"]["sink"]["target_branch"], "main");
+    assert_eq!(v["result_contract"]["sink"]["target_branch"], "dev");
     assert!(v["result_contract"]["sink"].get("title").is_none());
     assert!(v["result_contract"]["sink"].get("body").is_none());
     // the deterministic item context rides the envelope.
@@ -271,19 +271,19 @@ fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
 #[test]
 fn a_forge_session_continues_from_the_born_work_branch_tip() {
     let registry = forge_read_registry();
-    let main_tip = "cd".repeat(20);
+    let dev_tip = "cd".repeat(20);
     let item_tip = "ef".repeat(20);
     let m = forge_module();
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "Fix the gate", "body"))
-        .with_forge_tip("app", "main", &main_tip)
+        .with_forge_tip("app", "dev", &dev_tip)
         .with_forge_tip("app", "agent/item-7", &item_tip);
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
     assert_eq!(
         v["workspace"]["commit"], item_tip,
-        "a born work branch is the session: later runs fork ITS tip, not main"
+        "a born work branch is the session: later runs fork ITS tip, not dev"
     );
     assert_eq!(v["workspace"]["branch"], "agent/item-7");
     assert_eq!(v["workspace"]["branch_born"], true);
@@ -298,7 +298,7 @@ fn a_pr_item_run_works_the_prs_own_source_branch() {
         .with_registry(&registry)
         .with_transcript("forge:app:8", transcript(2))
         .with_forge_item("app", forge_pr(8, "Wire it", "please", "feature/x", "dev"))
-        .with_forge_tip("app", "main", &"cd".repeat(20))
+        .with_forge_tip("app", "dev", &"cd".repeat(20))
         .with_forge_tip("app", "feature/x", &src_tip);
     let v = compose_forge(&m, &ctx, &registry, "forge:app:8").unwrap();
     // THE pr-item rule: the session pushes the PR's own branch, so the
@@ -445,7 +445,7 @@ fn a_page_ref_in_the_forge_item_body_appends_after_the_item_context() {
             "app",
             forge_issue(7, "Fix the gate", "spec at [Plan](duck://page/plan)"),
         )
-        .with_forge_tip("app", "main", &"cd".repeat(20))
+        .with_forge_tip("app", "dev", &"cd".repeat(20))
         .with_page("plan", page_blocks("plan", "Project Plan"));
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
     let context = v["context"].as_str().unwrap();
@@ -525,7 +525,7 @@ fn page_injection_composes_byte_deterministically() {
             .with_registry(&registry)
             .with_transcript("forge:app:7", transcript(2))
             .with_forge_item("app", forge_issue(7, "Fix", "see [Plan](duck://page/plan)"))
-            .with_forge_tip("app", "main", &"cd".repeat(20))
+            .with_forge_tip("app", "dev", &"cd".repeat(20))
             .with_page("plan", page_blocks("plan", "Project Plan"))
     };
     let agent = registry.get("bot").unwrap();
@@ -560,17 +560,17 @@ fn forge_compose_failures_have_deterministic_reasons() {
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
     assert!(reason.contains("no forge item"), "{reason}");
 
-    // issue with no main branch to fork.
+    // issue with no dev branch to fork.
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "t", "b"));
     let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
-    assert!(reason.contains("main"), "{reason}");
+    assert!(reason.contains("dev"), "{reason}");
 
     // PR whose source branch is not born.
     let ctx = CaptureCtx::new()
@@ -587,7 +587,7 @@ fn forge_compose_failures_have_deterministic_reasons() {
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "t", "b"))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     let reason = compose_forge(&unwired, &ctx, &registry, "forge:app:7").unwrap_err();
     assert!(reason.contains("forge module"), "{reason}");
 }
@@ -634,7 +634,7 @@ fn an_engagement_on_a_forge_channel_without_the_cap_skips_with_a_breadcrumb() {
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "t", "b"))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     exec(&mut m, &mut ctx, &engagement("forge:app:7", 2, vec![])).unwrap();
 
     assert!(
@@ -701,7 +701,7 @@ fn a_forge_engagement_with_the_cap_stages_the_dispatch() {
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "Fix the gate", "body"))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     exec(&mut m, &mut ctx, &engagement("forge:app:7", 2, vec![])).unwrap();
 
     let dispatches = ctx.dispatch_msgs();

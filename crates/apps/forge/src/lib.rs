@@ -70,9 +70,9 @@
 //! independent, identical on every validator REGARDLESS of pack possession.
 //! a branch head advances on every validator the instant its push CASes; the
 //! objects catch up node-locally (see [`refs::RepoState::materialize`]) and
-//! NEVER enter root/accept-reject. `main` is the protected default branch
-//! (never deleted, fast-forward-guarded at materialize); other branches may
-//! force-push and be deleted — the GitHub flow.
+//! NEVER enter root/accept-reject. `main` and the shared `dev` integration
+//! branch are protected (never deleted, fast-forward-guarded at materialize);
+//! feature branches may force-push and be deleted — the GitHub flow.
 //!
 //! ## back-compat: the default repo (no app change)
 //!
@@ -126,7 +126,9 @@ use git2::Oid;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
-use crate::refs::{norm_branch, open_or_init_repo, RepoState, MAIN_BRANCH};
+use crate::refs::{
+    norm_branch, open_or_init_repo, RepoState, INTEGRATION_BRANCH, MAIN_BRANCH,
+};
 use crate::tracker::{author_from_origin, parse_hex_oid, Tracker};
 
 /// the well-known repo an empty/absent `repo` field maps to — the target of the
@@ -627,7 +629,7 @@ impl Module for Forge {
                 let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 let target = if target_branch.is_empty() {
-                    MAIN_BRANCH.to_string()
+                    INTEGRATION_BRANCH.to_string()
                 } else {
                     target_branch
                 };
@@ -1138,8 +1140,8 @@ mod tests {
         let mut forge = Forge::init("forge", base.clone()).unwrap().with_chat("chat");
         let digest = vec![9u8; 32];
 
-        // seed a repo with main + a feature branch (fabricated oids — packs
-        // never gate consensus).
+        // seed a repo with release main, integration dev, and a feature branch
+        // (fabricated oids — packs never gate consensus).
         let mut ctx = TestCtx::at(1);
         exec_commit(
             &mut forge,
@@ -1149,6 +1151,11 @@ mod tests {
                 updates: vec![
                     RefUpdate {
                         ref_name: "main".into(),
+                        prev_oid: None,
+                        new_oid: Some(oid('a').as_bytes().to_vec()),
+                    },
+                    RefUpdate {
+                        ref_name: "dev".into(),
                         prev_oid: None,
                         new_oid: Some(oid('a').as_bytes().to_vec()),
                     },
@@ -1241,7 +1248,7 @@ mod tests {
         futures::executor::block_on(forge.commit_block()).unwrap();
         assert_eq!(ctx.emitted.len(), 1, "approval line emitted");
 
-        // merge: stale target CAS rejects; the real one moves main AND marks
+        // merge: stale target CAS rejects; the real one moves dev AND marks
         // the PR merged in one block.
         let mut ctx = TestCtx::with_origin(6, user_origin(2));
         assert!(exec(
@@ -1276,8 +1283,22 @@ mod tests {
         futures::executor::block_on(forge.commit_block()).unwrap();
         assert_eq!(ctx.emitted.len(), 1, "merged line emitted");
 
-        // committed state: main == merge oid, PR merged with review recorded.
-        assert_eq!(forge.read_head("demo"), Some(oid('c').to_string()));
+        // committed state: release main stays put, dev advances, and the PR is
+        // merged with its review recorded.
+        assert_eq!(forge.read_head("demo"), Some(oid('a').to_string()));
+        let refs = futures::executor::block_on(
+            forge.query(&encode_query(&ForgeQuery::ListRefs {
+                repo: "demo".into(),
+            })),
+        )
+        .unwrap();
+        let ForgeReply::Refs(refs) = decode_reply(&refs).unwrap() else {
+            panic!("refs missing")
+        };
+        assert_eq!(
+            refs.iter().find(|head| head.name == "dev").unwrap().head,
+            oid('c').to_string()
+        );
         let reply = futures::executor::block_on(
             forge.query(&encode_query(&ForgeQuery::GetItem {
                 repo: "demo".into(),

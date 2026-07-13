@@ -101,8 +101,8 @@ describe("ForgeView", () => {
       {
         id: "ducktape",
         name: "ducktape",
-        branch: "main",
-        defaultBranch: "main",
+        branch: "dev",
+        defaultBranch: "dev",
         head: HEAD,
         browsable: true,
       },
@@ -126,7 +126,10 @@ describe("ForgeView", () => {
       nextOffset: null,
       totalBytes: 11,
     });
-    forgeGit.forgeListBranches.mockResolvedValue([{ name: "main", head: HEAD }]);
+    forgeGit.forgeListBranches.mockResolvedValue([
+      { name: "dev", head: HEAD },
+      { name: "main", head: HEAD },
+    ]);
     forgeGit.forgeCompare.mockResolvedValue({
       mergeBase: HEAD,
       files: [],

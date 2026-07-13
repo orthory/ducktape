@@ -11,7 +11,7 @@ TEST_ROOT="$(dirname "$common")/.worktree/.forge-mirror-test-$$"
 SOURCE_REPO="$TEST_ROOT/source"
 DEST_REPO="$TEST_ROOT/destination"
 CONFLICT_REPO="$TEST_ROOT/conflict"
-mkdir "$TEST_ROOT"
+mkdir -p "$TEST_ROOT"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 quiet_git() { git -C "$1" "${@:2}" >/dev/null; }
@@ -20,7 +20,7 @@ configure() {
   quiet_git "$1" config user.email test@example.com
 }
 
-git init -b main "$SOURCE_REPO" >/dev/null
+git init -b dev "$SOURCE_REPO" >/dev/null
 configure "$SOURCE_REPO"
 printf 'base\n' >"$SOURCE_REPO/shared.txt"
 quiet_git "$SOURCE_REPO" add shared.txt
@@ -42,8 +42,8 @@ GIT_COMMITTER_DATE='2026-07-01T04:05:06+09:00' \
   git -C "$SOURCE_REPO" commit -F "$TEST_ROOT/message" >/dev/null
 SOURCE_OID=$(git -C "$SOURCE_REPO" rev-parse HEAD)
 
-quiet_git "$SOURCE_REPO" switch main
-printf 'internal main advanced\n' >"$SOURCE_REPO/internal.txt"
+quiet_git "$SOURCE_REPO" switch dev
+printf 'internal dev advanced\n' >"$SOURCE_REPO/internal.txt"
 quiet_git "$SOURCE_REPO" add internal.txt
 quiet_git "$SOURCE_REPO" commit -m 'internal-only advance'
 quiet_git "$SOURCE_REPO" merge --no-ff agent/item-26 -m 'Merge Forge PR #26'
@@ -54,12 +54,13 @@ git init -b dev "$DEST_REPO" >/dev/null
 configure "$DEST_REPO"
 quiet_git "$DEST_REPO" fetch "$SOURCE_REPO" "$BASE"
 quiet_git "$DEST_REPO" reset --hard FETCH_HEAD
+# One dev fetch supplies the merged PR and its second-parent feature closure.
+quiet_git "$DEST_REPO" fetch "$SOURCE_REPO" refs/heads/dev:refs/mirror-test/forge-dev
+quiet_git "$DEST_REPO" reset --hard "$TARGET_OID"
 printf 'GitHub dev advanced independently\n' >"$DEST_REPO/github.txt"
 quiet_git "$DEST_REPO" add github.txt
 quiet_git "$DEST_REPO" commit -m 'github-only advance'
 GITHUB_BASE=$(git -C "$DEST_REPO" rev-parse HEAD)
-# One main fetch supplies the merged PR and its second-parent feature closure.
-quiet_git "$DEST_REPO" fetch "$SOURCE_REPO" refs/heads/main:refs/mirror-test/forge-main
 
 cd "$DEST_REPO"
 selected_target=$(validate_merged_selection "$MERGE_OID" "$SOURCE_OID")
@@ -79,9 +80,16 @@ cmp \
   <(git show --pretty=format: --binary "$SOURCE_OID" | git patch-id --stable) \
   <(git show --pretty=format: --binary "$MIRROR_OID" | git patch-id --stable)
 [ "$(git show -s --format=%ce "$MIRROR_OID")" = 'node-alpha@nodes.duck' ]
-assert_cutover_mapping "$TARGET_OID" "$GITHUB_BASE" "$GITHUB_BASE"
-if (assert_cutover_mapping "$TARGET_OID" "$GITHUB_BASE" "$BASE") >/dev/null 2>&1; then
-  echo 'incorrect explicit GitHub base was accepted' >&2
+assert_shared_dev_base "$TARGET_OID" "$GITHUB_BASE"
+bridge_tree=$(git rev-parse "$GITHUB_BASE^{tree}")
+BRIDGE=$(printf 'history-only bridge\n' | git commit-tree "$bridge_tree" -p "$GITHUB_BASE")
+assert_shared_dev_base "$BRIDGE" "$GITHUB_BASE"
+if (assert_shared_dev_base "$TARGET_OID" "$BASE") >/dev/null 2>&1; then
+  echo 'Forge-only content outside GitHub dev was accepted' >&2
+  exit 1
+fi
+if (assert_shared_dev_base "$TARGET_OID" "$SOURCE_OID") >/dev/null 2>&1; then
+  echo 'sibling Forge and GitHub histories were accepted' >&2
   exit 1
 fi
 
@@ -141,7 +149,7 @@ quiet_git "$CONFLICT_REPO" reset --hard FETCH_HEAD
 printf 'github conflict\n' >"$CONFLICT_REPO/shared.txt"
 quiet_git "$CONFLICT_REPO" add shared.txt
 quiet_git "$CONFLICT_REPO" commit -m 'conflicting GitHub change'
-quiet_git "$CONFLICT_REPO" fetch "$SOURCE_REPO" refs/heads/main:refs/mirror-test/forge-main
+quiet_git "$CONFLICT_REPO" fetch "$SOURCE_REPO" refs/heads/dev:refs/mirror-test/forge-dev
 mkdir "$TEST_ROOT/conflict-state"
 if (cd "$CONFLICT_REPO" && replay_commit "$CONFLICT_REPO" "$SOURCE_OID" "$TEST_ROOT/conflict-state") \
   >/dev/null 2>&1; then
@@ -149,7 +157,7 @@ if (cd "$CONFLICT_REPO" && replay_commit "$CONFLICT_REPO" "$SOURCE_OID" "$TEST_R
   exit 1
 fi
 
-grep -F 'refs/heads/main:$FORGE_TMP_REF' "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null
+grep -F 'refs/heads/dev:$FORGE_TMP_REF' "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null
 if grep -F 'refs/heads/*' "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null; then
   echo 'Forge wildcard fetch must not be used' >&2
   exit 1

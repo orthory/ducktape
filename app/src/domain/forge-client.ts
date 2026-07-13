@@ -147,7 +147,7 @@ export const openIssue = (
   );
 
 /** Open a PR from `sourceBranch` into `targetBranch` (empty string → the
- *  repo's main). Numbered from the same per-repo sequence as issues. */
+ *  repo's dev). Numbered from the same per-repo sequence as issues. */
 export const openPr = (
   transport: NodeTransport,
   params: {
