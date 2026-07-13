@@ -132,10 +132,10 @@ describe("mentions are click targets", () => {
   });
 });
 
-describe("[[page:<id>]] chips", () => {
+describe("duck://page chips", () => {
   it("shows the page's title and opens it (screen switch included)", () => {
     const actions = withStore(
-      <RichText blocks={para({ text: "see [[page:p1]] first" })} names={{}} />,
+      <RichText blocks={para({ text: "see [Launch plan](duck://page/p1) first" })} names={{}} />,
       { pages: [page("p1", "Launch plan")] },
     );
 
@@ -149,7 +149,9 @@ describe("[[page:<id>]] chips", () => {
   });
 
   it("degrades to the raw id when the page is unknown (deleted, or not hydrated yet)", () => {
-    withStore(<RichText blocks={para({ text: "[[page:ghost]]" })} names={{}} />, { pages: [] });
+    withStore(<RichText blocks={para({ text: "[Ghost](duck://page/ghost)" })} names={{}} />, {
+      pages: [],
+    });
 
     const chip = screen.getByRole("button", { name: "Open page ghost" });
     expect(chip.textContent).toContain("ghost");
@@ -157,28 +159,34 @@ describe("[[page:<id>]] chips", () => {
   });
 
   it("leaves a ref inside a code block literal", () => {
-    withStore(<RichText blocks={[{ code: { text: "[[page:p1]]", lang: null } }]} names={{}} />, {
-      pages: [page("p1", "Launch plan")],
-    });
+    withStore(
+      <RichText
+        blocks={[{ code: { text: "[p](duck://page/p1)", lang: null } }]}
+        names={{}}
+      />,
+      { pages: [page("p1", "Launch plan")] },
+    );
 
     expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.getByText("[[page:p1]]")).toBeTruthy();
+    expect(screen.getByText("[p](duck://page/p1)")).toBeTruthy();
   });
 
-  it("leaves a malformed ref literal", () => {
-    withStore(<RichText blocks={para({ text: "[[page:has space]]" })} names={{}} />, {
+  it("leaves a non-ref markdown link literal", () => {
+    withStore(<RichText blocks={para({ text: "[not a page](https://x.example)" })} names={{}} />, {
       pages: [page("p1", "Launch plan")],
     });
 
-    expect(screen.queryByRole("button")).toBeNull();
+    // an https link is an external <a>, never a page chip.
+    expect(screen.queryByRole("button", { name: /Open page/ })).toBeNull();
   });
 });
 
 describe("CommentText (plain-text comment bodies)", () => {
   it("chips a ref inside otherwise plain text", () => {
-    const actions = withStore(<CommentText text="ties into [[page:p1]] here" names={{}} />, {
-      pages: [page("p1", "Launch plan")],
-    });
+    const actions = withStore(
+      <CommentText text="ties into [Launch plan](duck://page/p1) here" names={{}} />,
+      { pages: [page("p1", "Launch plan")] },
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Open page Launch plan" }));
 
@@ -227,14 +235,14 @@ describe("CommentText (plain-text comment bodies)", () => {
     expect(screen.getByText("@nobody")).toBeTruthy();
   });
 
-  it("keeps an @token glued to a page ref literal — submit never resolved it", () => {
-    withStore(<CommentText text="[[page:p1]]@quackbot ping" names={{}} />, {
+  it("renders a page ref and a mention together in a comment", () => {
+    withStore(<CommentText text="[Launch plan](duck://page/p1) @quackbot ping" names={{}} />, {
       agents: [ROSTERED],
       pages: [page("p1", "Launch plan")],
     });
 
     expect(screen.getByRole("button", { name: "Open page Launch plan" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Open agent quackbot/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Open agent quackbot/ })).toBeTruthy();
   });
 
   it("ignores a mid-word @ (emails are not mentions)", () => {
@@ -246,9 +254,9 @@ describe("CommentText (plain-text comment bodies)", () => {
   });
 });
 
-describe("duck://files attachment chips", () => {
-  const ATTACH = "duck://files/shared/attachments/uuid-1/report.pdf";
-  const IMG = "duck://files/shared/attachments/uuid-2/photo.png";
+describe("duck://files attachment chips (markdown refs)", () => {
+  const ATTACH = "[report.pdf](duck://files/shared/attachments/uuid-1/report.pdf)";
+  const IMG = "![photo.png](duck://files/shared/attachments/uuid-2/photo.png)";
 
   // A store WITH a transport whose files reads are stubbed — enough to prove
   // the chip drives a read against the CONFINED path and nothing else.
@@ -265,24 +273,23 @@ describe("duck://files attachment chips", () => {
     return { filesStat, filesRead };
   };
 
-  it("chips an attachment URI (shows the name, never the raw duck:// text)", () => {
+  it("chips a file ref (shows the name, never the raw markdown/URI text)", () => {
     withStore(<RichText blocks={para({ text: `see ${ATTACH}` })} names={{}} />);
     expect(screen.getByText("report.pdf")).toBeTruthy();
-    // the raw URI is chipped away, not rendered literally.
     expect(screen.queryByText(ATTACH)).toBeNull();
   });
 
-  it("renders an attachment AND a [[page:]] ref in the same message", () => {
+  it("renders a file ref AND a page ref in the same message", () => {
     withStore(
-      <RichText blocks={para({ text: `${ATTACH} for [[page:p1]]` })} names={{}} />,
+      <RichText blocks={para({ text: `${ATTACH} for [Launch plan](duck://page/p1)` })} names={{}} />,
       { pages: [page("p1", "Launch plan")] },
     );
     expect(screen.getByText("report.pdf")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Open page Launch plan" })).toBeTruthy();
   });
 
-  it("leaves a duck://files path OUTSIDE the attachments root as literal text", () => {
-    const home = "duck://files/home/ext:aa/secret.txt";
+  it("leaves a duck://files ref OUTSIDE the attachments root as literal text", () => {
+    const home = "[k](duck://files/home/ext:aa/secret.txt)";
     withStore(<RichText blocks={para({ text: home })} names={{}} />);
     expect(screen.getByText(home)).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
@@ -296,7 +303,7 @@ describe("duck://files attachment chips", () => {
     );
   });
 
-  it("an image preview stats the CONFINED path before fetching bytes", async () => {
+  it("an image embed stats the CONFINED path before fetching bytes", async () => {
     const { filesStat } = withTransport(<RichText blocks={para({ text: IMG })} names={{}} />);
     await waitFor(() =>
       expect(filesStat).toHaveBeenCalledWith(

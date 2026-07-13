@@ -265,7 +265,7 @@ describe("Composer [[ page-ref typeahead", () => {
 
     fireEvent.mouseDown(screen.getAllByRole("option")[0]!);
 
-    expect((textarea as HTMLTextAreaElement).value).toBe("see [[page:p1]] ");
+    expect((textarea as HTMLTextAreaElement).value).toBe("see [Launch plan](duck://page/p1) ");
   });
 
   it("keeps filtering across a SPACE — a page title is not a mention handle", () => {
@@ -283,7 +283,7 @@ describe("Composer [[ page-ref typeahead", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     expect(onSend).not.toHaveBeenCalled();
-    expect((textarea as HTMLTextAreaElement).value).toBe("[[page:p2]] ");
+    expect((textarea as HTMLTextAreaElement).value).toBe("[Roadmap](duck://page/p2) ");
 
     type(textarea, "[[ro");
     fireEvent.keyDown(textarea, { key: "Escape" });

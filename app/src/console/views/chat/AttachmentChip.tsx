@@ -20,8 +20,8 @@ import type { NodeTransport } from "../../../domain/transport";
 import { Icon } from "../../components/Icon";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
-import type { AttachmentRef } from "./attachments";
 import { isImageName } from "./attachments";
+import type { FileRef } from "./duck-ref";
 
 /** Previews load at most this many bytes; a larger image renders as a plain
  *  chip (click still downloads). Keeps a scrollback of pasted screenshots
@@ -52,7 +52,7 @@ const nameStyle: CSSProperties = {
 /** Fetch the attachment and hand it to the browser as a download. The blob is
  *  typed octet-stream regardless of the stored mime — a download must never
  *  become a same-origin document. */
-const download = async (transport: NodeTransport, attachment: AttachmentRef) => {
+const download = async (transport: NodeTransport, attachment: FileRef) => {
   const bytes = await readAll(transport, { path: attachment.path });
   const url = URL.createObjectURL(
     new Blob([bytes as BlobPart], { type: "application/octet-stream" }),
@@ -76,7 +76,7 @@ function ImagePreview({
   attachment,
 }: {
   transport: NodeTransport;
-  attachment: AttachmentRef;
+  attachment: FileRef;
 }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -154,7 +154,7 @@ function FileChip({
   attachment,
 }: {
   transport: NodeTransport | null;
-  attachment: AttachmentRef;
+  attachment: FileRef;
 }) {
   const body = (
     <>
@@ -179,11 +179,13 @@ function FileChip({
   );
 }
 
-/** A `duck://files/shared/attachments/…` reference in message text. */
-export function AttachmentChip({ attachment }: { attachment: AttachmentRef }) {
+/** A `duck://files/…` reference in message text. The `![..]` embed form
+ *  (`attachment.embed`) previews an image inline; a plain `[..]` link — or any
+ *  non-image, or no transport — is a download chip. */
+export function AttachmentChip({ attachment }: { attachment: FileRef }) {
   const store = useContext(ConsoleContext);
   const transport = store?.transport ?? null;
-  if (transport && isImageName(attachment.name)) {
+  if (transport && attachment.embed && isImageName(attachment.name)) {
     return <ImagePreview transport={transport} attachment={attachment} />;
   }
   return <FileChip transport={transport} attachment={attachment} />;

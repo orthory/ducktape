@@ -17,10 +17,9 @@ import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { AttachmentChip } from "./AttachmentChip";
-import { isAttachment, splitAttachments } from "./attachments";
 import { splitMentions } from "./chat-input";
+import { isFileSeg, isPageSeg, splitDuckRefs } from "./duck-ref";
 import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from "./mention";
-import { isPageRef, splitPageRefs } from "./page-ref";
 
 // The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
 // letters/digits/`_`/`-` at a whitespace boundary (parts are already
@@ -82,9 +81,10 @@ function MentionToken({ mention, names }: { mention: AuthorRef; names: AuthorNam
 
 // ── Page ref ────────────────────────────────────────────
 
-/** `[[page:<id>]]` as a chip carrying the page's live title. The title comes
- *  from `state.pages`, which is hydrated at boot and refreshed when the pages
- *  root moves — so a chip never fetches. When the id resolves to nothing (a
+/** A `duck://page/<id>` ref as a chip carrying the page's live title. The
+ *  title comes from `state.pages`, which is hydrated at boot and refreshed
+ *  when the pages root moves — so a chip never fetches. When the id resolves
+ *  to nothing (a
  *  deleted page, a typo, or `pages` not hydrated yet) the chip shows the raw
  *  id: honest about what the text says, never a blank or a guessed title. */
 export function PageRefChip({ pageId }: { pageId: string }) {
@@ -135,11 +135,9 @@ export function PageRefChip({ pageId }: { pageId: string }) {
 /** A pages COMMENT body: plain text on the wire, so every reference is
  *  re-derived at render — @tokens resolve through the SAME resolver + grammar
  *  the submit path used (`splitMentions` over `mentionResolverOf`), then
- *  `[[page:<id>]]` refs chip inside the non-mention runs. Mentions split
- *  FIRST, over the RAW text: that keeps the whitespace boundary identical to
- *  what the submit path saw, so "[[page:p1]]@bot" stays a literal on both
- *  ends of the wire (the '@' is glued to ']') instead of chipping a mention
- *  the module was never told about. An @word the resolver doesn't know stays
+ *  `duck://` refs chip inside the non-mention runs (via `splitDuckRefs`).
+ *  Mentions split FIRST, over the RAW text: that keeps the whitespace boundary
+ *  identical to what the submit path saw. An @word the resolver doesn't know stays
  *  tinted-inert via LiteralRun — an address nobody claimed. Without a store
  *  (bare component tests) nothing resolves, everything tints.
  *
@@ -165,11 +163,13 @@ export function CommentText({ text, names }: { text: string; names: AuthorNames 
           (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
         );
         if (mark) return <MentionToken key={i} mention={mark.mention} names={names} />;
-        return splitPageRefs(span.text).map((segment, j) =>
-          isPageRef(segment) ? (
-            <PageRefChip key={`${i}:${j}`} pageId={segment.pageId} />
+        return splitDuckRefs(span.text).map((seg, j) =>
+          isPageSeg(seg) ? (
+            <PageRefChip key={`${i}:${j}`} pageId={seg.page.id} />
+          ) : isFileSeg(seg) ? (
+            <AttachmentChip key={`${i}:${j}`} attachment={seg.file} />
           ) : (
-            <LiteralRun key={`${i}:${j}`} text={segment.text} />
+            <LiteralRun key={`${i}:${j}`} text={seg.text} />
           ),
         );
       })}
@@ -249,21 +249,17 @@ function SpanText({
       </a>
     );
   }
-  // Attachments split FIRST (a duck://files URI can never contain `[[page:`,
-  // but a literal run around one still page-ref-splits normally).
+  // One tokenizer for every duck:// reference: page chips, file chips, and
+  // image embeds, all from markdown link/image syntax in the plain span text.
   return (
     <span style={style}>
-      {splitAttachments(span.text).map((outer, i) =>
-        isAttachment(outer) ? (
-          <AttachmentChip key={i} attachment={outer.attachment} />
+      {splitDuckRefs(span.text).map((seg, i) =>
+        isPageSeg(seg) ? (
+          <PageRefChip key={i} pageId={seg.page.id} />
+        ) : isFileSeg(seg) ? (
+          <AttachmentChip key={i} attachment={seg.file} />
         ) : (
-          splitPageRefs(outer.text).map((segment, j) =>
-            isPageRef(segment) ? (
-              <PageRefChip key={`${i}-${j}`} pageId={segment.pageId} />
-            ) : (
-              <LiteralRun key={`${i}-${j}`} text={segment.text} onTagClick={onTagClick} />
-            ),
-          )
+          <LiteralRun key={i} text={seg.text} onTagClick={onTagClick} />
         ),
       )}
     </span>
