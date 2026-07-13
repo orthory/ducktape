@@ -191,19 +191,31 @@ describe.skipIf(!bin)("comment scenarios against the sim node", () => {
       act(() => actions().addComment({ target: pageId, text: "fix the title" }));
       await waitFor(() => expect(threads()).toHaveLength(1));
       const threadId = threads()[0]!.thread.id;
-      await waitFor(() =>
-        expect(state().ops[opKey.commentThread(threadId)]?.phase).toBe(
-          "finalized",
-        ),
-      );
+      const opRecord = () => state().ops[opKey.commentThread(threadId)];
+      await waitFor(() => expect(opRecord()?.phase).toBe("finalized"));
+      const addHeight = opRecord()!.height!;
 
+      // the projection paints resolved/resolved_by synchronously — a height
+      // advance on the (re-begun) op record is what proves the COMMIT, and
+      // the reload that follows serves the module's own stamp.
       act(() => actions().resolveThread({ threadId, resolved: true }));
+      await waitFor(() => {
+        expect(opRecord()?.phase).toBe("finalized");
+        expect(opRecord()!.height!).toBeGreaterThan(addHeight);
+      });
+      const resolveHeight = opRecord()!.height!;
+      act(() => actions().loadPageThreads());
       await waitFor(() => {
         expect(threads()[0]!.thread.resolved).toBe(true);
         expect(threads()[0]!.thread.resolved_by).not.toBeNull();
       });
 
       act(() => actions().resolveThread({ threadId, resolved: false }));
+      await waitFor(() => {
+        expect(opRecord()?.phase).toBe("finalized");
+        expect(opRecord()!.height!).toBeGreaterThan(resolveHeight);
+      });
+      act(() => actions().loadPageThreads());
       await waitFor(() => {
         expect(threads()[0]!.thread.resolved).toBe(false);
         expect(threads()[0]!.thread.resolved_by).toBeNull();

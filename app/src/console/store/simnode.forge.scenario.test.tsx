@@ -126,10 +126,43 @@ describe.skipIf(!bin)("forge tracker scenarios against the sim node", () => {
     async () => {
       const { sim } = await boot();
 
+      // against a repo nobody committed to, the refusal is the repo lookup…
+      act(() => {
+        void actions().openForgePr({
+          repo: "ghost",
+          title: "phantom pr",
+          body: "",
+          sourceBranch: "feature",
+          targetBranch: "",
+        });
+      });
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      expect((await sim.step()).committed).toBeNull();
+      await waitFor(() =>
+        expect(state().ops[opKey.forgeItemOpen("ghost")]?.phase).toBe("failed"),
+      );
+      expect(state().ops[opKey.forgeItemOpen("ghost")]?.error).toMatch(
+        /no repo/,
+      );
+
+      // …so bear the repo's main first (a commit births it), and hit the
+      // born-branch guard itself: main exists, the SOURCE branch does not.
+      await sim.peerBlock(
+        "forge",
+        {
+          commit: {
+            repo: REPO,
+            path: "README.md",
+            content: "hello",
+            message: "init",
+          },
+        },
+        "rival",
+      );
       act(() => {
         void actions().openForgePr({
           repo: REPO,
-          title: "phantom pr",
+          title: "eager pr",
           body: "",
           sourceBranch: "feature",
           targetBranch: "",
@@ -142,7 +175,9 @@ describe.skipIf(!bin)("forge tracker scenarios against the sim node", () => {
       await waitFor(() =>
         expect(state().ops[opKey.forgeItemOpen(REPO)]?.phase).toBe("failed"),
       );
-      expect(state().ops[opKey.forgeItemOpen(REPO)]?.error).toMatch(/no repo/);
+      expect(state().ops[opKey.forgeItemOpen(REPO)]?.error).toMatch(
+        /source branch "feature" is not born/,
+      );
     },
   );
 });
