@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use capability_host::{ProviderOutput, ProviderSet};
 use dispatch::{WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 
 mod envelope;
 mod ledger;
@@ -98,16 +98,16 @@ pub(crate) enum Gated {
     Execute(ExecJob),
 }
 
-/// decode + lease-gate one effect against this host's provider surface and
+/// decode + lease-gate one event against this host's provider surface and
 /// its process-local load. `ledger` is the host's [`ResourceLedger`]: an
 /// over-capacity own lease or announcement is a `Skip`, never claimed or run.
 pub(crate) fn gate(
     providers: &ProviderSet,
     node_key: &[u8],
     ledger: &ResourceLedger,
-    effect: &Effect,
+    event: &Event,
 ) -> Gated {
-    let request = match decode_worker_request(&effect.0) {
+    let request = match decode_worker_request(&event.payload) {
         Ok(request) => request,
         Err(_) => return Gated::NotMine,
     };
@@ -276,14 +276,17 @@ format = "text"
         ProviderSet::assemble(capability_host::SpecSet::from_specs(vec![spec]), Vec::new())
     }
 
-    fn effect_for(spec: Vec<u8>, assignee: Option<&[u8]>) -> Effect {
-        Effect(encode_worker_request(&WorkerRequest {
-            saga_id: "s".into(),
-            attempt: 0,
-            spec,
-            deadline: None,
-            assignee: assignee.map(|a| a.to_vec()),
-        }))
+    fn effect_for(spec: Vec<u8>, assignee: Option<&[u8]>) -> Event {
+        Event {
+            source: "saga".into(),
+            payload: encode_worker_request(&WorkerRequest {
+                saga_id: "s".into(),
+                attempt: 0,
+                spec,
+                deadline: None,
+                assignee: assignee.map(|a| a.to_vec()),
+            }),
+        }
     }
 
     fn work_spec() -> Vec<u8> {

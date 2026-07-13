@@ -5,11 +5,20 @@
 //! operation log. the source content covers every record family: channel +
 //! index, message heads, a thread index, an edit revision, reaction sets, and
 //! membership records.
+//!
+//! the source is driven through the real module so the op log carries genuine
+//! chat history (edits, deletes-by-overwrite, index churn). the
+//! handoff-as-resolver form is only reachable on the raw store and a `Chat`
+//! consumes its injected store, so the source module is dropped and its
+//! partitions REOPENED as a bare `QmdbStore` — recovery of a committed store
+//! lands exactly on the committed root, which the test pins before handing
+//! the reopened store to the joiner.
 
 use chat::Chat;
 use chat::{Block, ChatMsg, ChatQuery, PostPolicy, encode_msg, encode_query};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
 
 struct TestCtx {
     env: sdk::Env,
@@ -44,7 +53,6 @@ impl Ctx for TestCtx {
 
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _ev: sdk::Event) {}
-    fn request_effect(&mut self, _eff: sdk::Effect) {}
 }
 
 fn module_msg(payload: ChatMsg) -> Msg {
@@ -54,10 +62,7 @@ fn module_msg(payload: ChatMsg) -> Msg {
     }
 }
 
-async fn apply_commit<E>(module: &mut Chat<E>, at: u64, payload: ChatMsg)
-where
-    E: commonware_storage::Context + commonware_runtime::BufferPooler,
-{
+async fn apply_commit(module: &mut Chat, at: u64, payload: ChatMsg) {
     module
         .execute(&mut TestCtx::at(at), &module_msg(payload))
         .await
@@ -65,17 +70,17 @@ where
     module.commit_block().await.unwrap();
 }
 
-async fn reply_bytes<E>(module: &Chat<E>, query: ChatQuery) -> Vec<u8>
-where
-    E: commonware_storage::Context + commonware_runtime::BufferPooler,
-{
+async fn reply_bytes(module: &Chat, query: ChatQuery) -> Vec<u8> {
     module.query(&encode_query(&query)).await.unwrap()
 }
 
 #[test]
 fn synced_store_reconstructs_source_root_and_history() {
     deterministic::Runner::default().start(|context| async move {
-        let mut src = Chat::init(context.child("src"), "src").await;
+        let mut src = Chat::new(
+            "src",
+            Box::new(QmdbStore::init(context.child("src"), "src").await),
+        );
         apply_commit(
             &mut src,
             10,
@@ -186,10 +191,32 @@ fn synced_store_reconstructs_source_root_and_history() {
         for query in &queries {
             expected.push(reply_bytes(&src, query.clone()).await);
         }
-        let target = src.sync_target().await;
-        let resolver = src.into_resolver();
+        // the module consumed its injected store, so the handoff-as-resolver
+        // form needs the raw store back: drop the module and reopen the same
+        // "src" partitions (deterministic storage is keyed by partition name,
+        // not context label). recovery must land exactly on the committed root
+        // — pinned here before the joiner trusts the reopened store as source.
+        drop(src);
+        let store = QmdbStore::init(context.child("src_serve"), "src").await;
+        assert_eq!(
+            store.root(),
+            src_root,
+            "reopened source store must recover the committed root"
+        );
+        let target = store.sync_boundary_target().await;
+        let resolver = store.into_resolver();
 
-        let synced = Chat::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
+        // JOINER: reconstruct on a fresh namespace by pulling from the
+        // resolver, then wrap the module around the injected store — the exact
+        // shape a joining host uses.
+        let synced = Chat::new(
+            "dst",
+            Box::new(
+                QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
+                    .await
+                    .expect("sync_from"),
+            ),
+        );
 
         assert_eq!(
             synced.root(),

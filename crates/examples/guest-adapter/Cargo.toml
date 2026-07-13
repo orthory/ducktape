@@ -1,0 +1,18 @@
+# The port harness for compiling NATIVE module crates to wasm: generates the
+# `ducktape:module` bindings once (with a public export macro downstream guest
+# crates invoke) and adapts the host imports to the `sdk::Ctx` a native module
+# expects — so ported logic is single-sourced in the native crate. Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+[package]
+name = "guest-adapter"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wit-bindgen = "0.57"
+sdk = { path = "../../kernel/sdk" }
+async-trait = "0.1"
+
+[workspace]

@@ -167,63 +167,89 @@ pub(crate) const MODULE_IDS: [&str; 26] = [
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
 pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
-    ("agent", 1),
-    ("automations", 1),
-    ("capability", 1),
+    // 2: wasm adapter ports — the native canonical snapshot persisted as one
+    // host-KV value, so root()/snapshot bytes changed shape at cutover.
+    ("agent", 2),
+    ("automations", 2),
+    ("capability", 2),
+    // 1 (UNCHANGED at the wasm cutover): chat/pages are STORE-BACKED ports —
+    // the wasm module wraps the SAME host-constructed qmdb store the native
+    // module drove (`WasmModule::with_store`), so root() is the same merkle
+    // root over the same committed op log, byte-for-byte. only the executor
+    // moved into wasm; the canonical state encoding never changed shape, so
+    // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
     ("chat", 1),
     ("clients", 1),
     ("directory", 1),
+    // 1 (UNCHANGED — dispatch stays NATIVE): its read facade serves
+    // COMMITTED-ONLY state by design (runs' mid-block lease_holder read
+    // depends on it), a view the wasm adapter's staged-fold cannot represent.
     ("dispatch", 1),
-    ("duckdns", 1),
+    ("duckdns", 2),
     ("files", 1),
     ("forge", 1),
-    ("gateway", 1),
-    ("governance", 1),
+    // 2: wasm adapter ports — the native canonical snapshot persisted as one
+    // host-KV value, plus the GENESIS-CONFIG `__config` store entry carrying
+    // the per-network parameters (gateway/identity: chain id; governance: the
+    // invite binding), so root()/snapshot bytes changed shape at cutover.
+    ("gateway", 2),
+    ("governance", 2),
     ("hello", 1),
-    ("identity", 1),
-    ("inbox", 1),
-    ("jobs", 1),
+    ("identity", 2),
+    ("inbox", 2),
+    ("jobs", 2),
     ("kv", 1),
     ("modreg", 1),
+    // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
-    ("runs", 2),
-    ("saga", 1),
-    ("tagging", 1),
-    ("tasks", 1),
+    // 3: the wasm adapter port — the native canonical snapshot (itself at
+    // revision 2 since the session section landed) persisted as one host-KV
+    // value, so root()/snapshot bytes changed shape again at cutover.
+    ("runs", 3),
+    // 2: the wasm adapter port (saga's empty-map root coincides with the
+    // empty host-KV root, but every written state re-encodes — a break).
+    ("saga", 2),
+    ("tagging", 2),
+    ("tasks", 2),
     ("upgrade", 1),
     ("valset", 1),
-    ("vaults", 1),
+    // 2: the wasm adapter port — the native canonical snapshot persisted as
+    // one host-KV value, so root()/snapshot bytes changed shape at cutover.
+    ("vaults", 2),
 ];
 
-/// The only historical production registry this binary can migrate in place:
-/// schema 77418f… from before `clients` joined the module set. Everything else
-/// remains fail-closed.
+/// The only registry this binary can migrate in place: the CURRENT schema
+/// minus `clients` — a workspace captured (or restored) with the clients
+/// module still dormant below its activation version. Everything else —
+/// including genuinely historical pre-wasm-cutover workspaces, whose module
+/// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
+/// re-genesis, no shim).
 pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
-    ("agent", 1),
-    ("automations", 1),
-    ("capability", 1),
+    ("agent", 2),
+    ("automations", 2),
+    ("capability", 2),
     ("chat", 1),
     ("directory", 1),
     ("dispatch", 1),
-    ("duckdns", 1),
+    ("duckdns", 2),
     ("files", 1),
     ("forge", 1),
-    ("gateway", 1),
-    ("governance", 1),
+    ("gateway", 2),
+    ("governance", 2),
     ("hello", 1),
-    ("identity", 1),
-    ("inbox", 1),
-    ("jobs", 1),
+    ("identity", 2),
+    ("inbox", 2),
+    ("jobs", 2),
     ("kv", 1),
     ("modreg", 1),
     ("pages", 1),
-    ("runs", 2),
-    ("saga", 1),
-    ("tagging", 1),
-    ("tasks", 1),
+    ("runs", 3),
+    ("saga", 2),
+    ("tagging", 2),
+    ("tasks", 2),
     ("upgrade", 1),
     ("valset", 1),
-    ("vaults", 1),
+    ("vaults", 2),
 ];
 
 pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;

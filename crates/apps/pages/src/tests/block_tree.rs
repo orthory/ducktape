@@ -73,7 +73,7 @@ fn inline_marks_persist_and_rebase_in_utf16() {
 #[test]
 fn create_page_and_insert_blocks_in_order() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         // after None -> first child, so b0 lands before b1.
         apply_commit(
@@ -97,7 +97,7 @@ fn create_page_and_insert_blocks_in_order() {
 #[test]
 fn nested_children_come_back_in_preorder() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         // c1 under b1, d1 under c1: preorder puts b1's whole subtree
         // before its next sibling b2.
@@ -131,7 +131,7 @@ fn nested_children_come_back_in_preorder() {
 #[test]
 fn get_block_by_id_alone_carries_page_context() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
@@ -155,7 +155,7 @@ fn get_block_by_id_alone_carries_page_context() {
 #[test]
 fn block_ids_are_globally_unique_across_pages() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
@@ -205,7 +205,7 @@ fn block_ids_are_globally_unique_across_pages() {
 #[test]
 fn update_text_edits_blocks_and_renames_pages() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
@@ -238,7 +238,7 @@ fn update_text_edits_blocks_and_renames_pages() {
 #[test]
 fn set_kind_and_checked_enforce_their_domains() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         // paragraph -> todo, then check it off.
         apply_commit(
@@ -297,7 +297,7 @@ fn set_kind_and_checked_enforce_their_domains() {
 #[test]
 fn move_reorders_within_a_parent() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         // b1,b2,b3 -> move b1 after b3 -> b2,b3,b1.
         apply_commit(
@@ -347,7 +347,7 @@ fn move_reorders_within_a_parent() {
 #[test]
 fn move_reparents_a_subtree() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
@@ -382,7 +382,7 @@ fn move_reparents_a_subtree() {
 #[test]
 fn illegal_moves_are_rejected() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
@@ -452,7 +452,7 @@ fn illegal_moves_are_rejected() {
 #[test]
 fn remove_deletes_the_whole_subtree() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,

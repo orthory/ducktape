@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn write_moves_root_and_composes_into_global_root() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         let r0 = p.root();
         seed_page(&mut p, "p1").await;
         let r1 = p.root();
@@ -37,7 +37,7 @@ fn write_moves_root_and_composes_into_global_root() {
 #[test]
 fn staged_writes_and_deletes_roll_back_on_abort() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         let r_before = p.root();
 
@@ -73,7 +73,7 @@ fn staged_writes_and_deletes_roll_back_on_abort() {
 #[test]
 fn staged_writes_are_visible_within_one_block() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit(
             &mut p,
             &PageMsg::CreatePage {
@@ -138,7 +138,7 @@ fn staged_writes_are_visible_within_one_block() {
 #[test]
 fn oversized_block_is_rejected_before_staging() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit(
             &mut p,
             &PageMsg::CreatePage {
@@ -177,7 +177,7 @@ fn oversized_block_is_rejected_before_staging() {
 #[test]
 fn corrupt_stored_block_errors_as_corruption_not_absence() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         // commit bytes that are NOT valid Block json under blk1's key
         // (simulating on-disk corruption; unreachable through PageMsg ops).
         p.pending

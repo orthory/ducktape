@@ -31,7 +31,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 
-use statesync::qmdb::RemoteQmdbResolver;
+use statesync::qmdb::{QmdbStore, RemoteQmdbResolver};
 use statesync::{
     ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse, SyncServer,
     decode_response, encode_request, fetch_manifest, fetch_snapshot,
@@ -98,8 +98,8 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
 
     deterministic::Runner::default().start(|context| async move {
         // ---- SOURCE: the full module set behind one Host, real op path ------
-        let kv = Kv::init(context.child("source_kv"), "kv").await;
-        let chat = Chat::init(context.child("source_chat"), "chat").await;
+        let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("source_kv"), "kv").await));
+        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("source_chat"), "chat").await));
         let forge = Forge::init("forge", source_dir.clone()).expect("forge init");
         let mut host = Host::genesis(vec![
             Box::new(kv),
@@ -244,14 +244,19 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 kv_root,
                 "kv target matches manifest"
             );
-            let join_kv = Kv::sync_from(
-                joiner_ctx.child("joiner_kv"),
+            let join_kv = Kv::new(
                 "kv-rebuilt",
-                target,
-                resolver,
-            )
-            .await
-            .expect("sync_from");
+                Box::new(
+                    QmdbStore::sync_from(
+                        joiner_ctx.child("joiner_kv"),
+                        "kv-rebuilt",
+                        target,
+                        resolver,
+                    )
+                    .await
+                    .expect("sync_from"),
+                ),
+            );
             assert_eq!(join_kv.root(), kv_root);
             assert_eq!(
                 join_kv.get(b"motd").await.as_deref(),
@@ -263,14 +268,19 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "chat");
             let target = pinned_target(chat_entry);
             assert_eq!(StateRoot(target.root.0), chat_root);
-            let join_chat = Chat::sync_from(
-                joiner_ctx.child("joiner_chat"),
+            let join_chat = Chat::new(
                 "chat-rebuilt",
-                target,
-                resolver,
-            )
-            .await
-            .expect("sync_from");
+                Box::new(
+                    QmdbStore::sync_from(
+                        joiner_ctx.child("joiner_chat"),
+                        "chat-rebuilt",
+                        target,
+                        resolver,
+                    )
+                    .await
+                    .expect("sync_from"),
+                ),
+            );
             assert_eq!(join_chat.root(), chat_root);
 
             // --- snapshot lane: directory, valset, saga, forge ----------------

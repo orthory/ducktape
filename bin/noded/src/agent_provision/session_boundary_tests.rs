@@ -41,13 +41,14 @@ use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
 use jobs::Jobs;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use tagging::TaggingModule;
 use tasks::Tasks;
 
 use super::plane_tests::{committed_block, files_reply};
 use super::*;
 use crate::NodeCommand;
+use statesync::qmdb::QmdbStore;
 
 /// the agent under test, and the node that will claim its run's lease. the node
 /// key IS the pool's identity — the same bytes `runs` checks the bind's origin
@@ -123,8 +124,7 @@ fn alice() -> Origin {
 /// the genesis set the collaboration loop runs on — chat + the tagging plane +
 /// the dispatch plane + the registry + runs.
 async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
-    let chat = Chat::init(context.child("chat"), "chat")
-        .await
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
         .with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
@@ -154,8 +154,8 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
 
 /// channel → agent → watch → the human's mention. the post block stages the
 /// pending entry, the dispatch, and its saga trigger, and emits the announcement
-/// effect the pool claims.
-async fn mention_run(host: &mut Host) -> Effect {
+/// event the pool claims.
+async fn mention_run(host: &mut Host) -> Event {
     let ops: Vec<Msg> = vec![
         Msg {
             target: "chat".into(),
@@ -213,9 +213,14 @@ async fn mention_run(host: &mut Host) -> Effect {
                 .expect("setup block"),
         );
     }
-    let mut effects = last.expect("the post block").effects;
-    assert_eq!(effects.len(), 1, "the post announces exactly one run");
-    effects.remove(0)
+    let mut requests: Vec<Event> = last
+        .expect("the post block")
+        .events
+        .into_iter()
+        .filter(|e| saga::decode_worker_request(&e.payload).is_ok())
+        .collect();
+    assert_eq!(requests.len(), 1, "the post announces exactly one run");
+    requests.remove(0)
 }
 
 /// serve ONE actor command the live run made.
@@ -318,11 +323,14 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             WorkOutcome::Handled(Some(op)) => op,
             other => panic!("the pool must CLAIM a servable announcement, got {other:?}"),
         };
-        let assigned = host
+        let assigned: Vec<Event> = host
             .submit_at(at(5, Origin::External(WORKER_NODE.to_vec())), accept)
             .await
             .expect("accept block")
-            .effects;
+            .events
+            .into_iter()
+            .filter(|e| saga::decode_worker_request(&e.payload).is_ok())
+            .collect();
         assert_eq!(
             assigned.len(),
             1,

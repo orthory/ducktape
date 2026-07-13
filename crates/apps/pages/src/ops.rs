@@ -1,9 +1,6 @@
-use super::{BufferPooler, Context, Origin, PageError, PageMsg, Pages};
+use super::{Origin, PageError, PageMsg, Pages};
 
-impl<E> Pages<E>
-where
-    E: Context + BufferPooler,
-{
+impl Pages {
     /// apply one decoded [`PageMsg`] to the staged overlay. pure tree surgery
     /// over per-block/-comment records, re-staged on success. errors abort the
     /// block. `origin`/`now` are only consulted by the comment ops (author +

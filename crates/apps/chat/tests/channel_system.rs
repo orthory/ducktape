@@ -10,6 +10,16 @@ use chat::{
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
+
+// build the module the way a host does: concrete store first, injected as
+// `Box<dyn MerkleStore>`. a macro (not an fn) so the tests need no
+// dev-dependency on commonware-storage just to spell the context bounds.
+macro_rules! chat_on {
+    ($context:expr, $id:expr) => {
+        Chat::new($id, Box::new(QmdbStore::init($context, $id).await))
+    };
+}
 
 struct TestCtx {
     env: sdk::Env,
@@ -64,7 +74,6 @@ impl Ctx for TestCtx {
         self.emitted.push(msg);
     }
     fn emit_event(&mut self, _ev: sdk::Event) {}
-    fn request_effect(&mut self, _eff: sdk::Effect) {}
 }
 
 fn user(byte: u8) -> Origin {
@@ -114,10 +123,7 @@ fn post(channel: &str, message_id: &str, text: &str, thread: Option<u64>) -> Cha
     }
 }
 
-async fn query<E>(module: &Chat<E>, req: ChatQuery) -> ChatReply
-where
-    E: commonware_storage::Context + commonware_runtime::BufferPooler,
-{
+async fn query(module: &Chat, req: ChatQuery) -> ChatReply {
     let reply = module.query(&encode_query(&req)).await.unwrap();
     decode_reply(&reply).unwrap()
 }
@@ -133,7 +139,7 @@ fn seqs(reply: &ChatReply) -> Vec<u64> {
 #[test]
 fn assigns_monotonic_sequences_from_the_channel_counter_across_blocks() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         let root0 = module.root();
 
         module
@@ -211,7 +217,7 @@ fn assigns_monotonic_sequences_from_the_channel_counter_across_blocks() {
 #[test]
 fn thread_replies_take_channel_sequences_and_update_the_root_summary() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -290,7 +296,7 @@ fn thread_replies_take_channel_sequences_and_update_the_root_summary() {
 #[test]
 fn delete_tombstones_the_head_but_preserves_thread_integrity() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -410,7 +416,7 @@ fn delete_tombstones_the_head_but_preserves_thread_integrity() {
 #[test]
 fn edits_append_revisions_keep_lww_heads_and_record_base_rev() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -494,7 +500,7 @@ fn edits_append_revisions_keep_lww_heads_and_record_base_rev() {
 #[test]
 fn authorship_derives_from_origin_and_cannot_be_spoofed() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         let root0 = module.root();
 
         // the demo-default empty external origin never passes.
@@ -597,7 +603,7 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
 #[test]
 fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -695,7 +701,7 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
 #[test]
 fn reactions_are_idempotent_sets_per_emoji_and_author() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -870,7 +876,7 @@ fn messages_around_windows_the_history_at_one_sequence() {
 #[test]
 fn pagination_is_correct_at_the_boundaries() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -943,7 +949,7 @@ fn pagination_is_correct_at_the_boundaries() {
 #[test]
 fn oversized_writes_are_rejected_before_staging_anything() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -988,7 +994,7 @@ fn oversized_writes_are_rejected_before_staging_anything() {
 #[test]
 fn members_only_channels_gate_external_posts_and_reactions() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(
                 &mut TestCtx::at(10),
@@ -1094,7 +1100,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
 #[test]
 fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -1225,7 +1231,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
 #[test]
 fn duplicate_message_ids_are_rejected_globally() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("a")))
             .await
@@ -1273,7 +1279,7 @@ fn duplicate_message_ids_are_rejected_globally() {
 #[test]
 fn channel_scoped_keys_do_not_collide_when_ids_contain_separators() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         // "a\0b" vs "a": a 0-byte-separator scheme would collide these once a
         // suffix follows; the length-prefixed components must not.
         module
@@ -1362,7 +1368,7 @@ fn channel_scoped_keys_do_not_collide_when_ids_contain_separators() {
 #[test]
 fn rejects_posts_to_missing_channels_and_aborts_cleanly() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         let root0 = module.root();
 
         let err = module
@@ -1389,8 +1395,8 @@ fn rejects_posts_to_missing_channels_and_aborts_cleanly() {
 #[test]
 fn two_instances_replaying_the_same_ops_produce_identical_roots() {
     deterministic::Runner::default().start(|context| async move {
-        let mut left = Chat::init(context.child("left"), "left").await;
-        let mut right = Chat::init(context.child("right"), "right").await;
+        let mut left = chat_on!(context.child("left"), "left");
+        let mut right = chat_on!(context.child("right"), "right");
 
         // one op sequence, grouped into the same blocks, driven through both
         // stores: every block boundary must land on byte-identical roots.
@@ -1469,7 +1475,7 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
 #[test]
 fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -1581,7 +1587,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
 #[test]
 fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -1647,7 +1653,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
 #[test]
 fn huddle_join_gates_on_members_only_policy_like_posting() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(
                 &mut TestCtx::at(10),
@@ -1705,7 +1711,7 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
 #[test]
 fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -1766,7 +1772,7 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
 #[test]
 fn sweep_huddle_gates_on_members_only_policy_like_posting() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(
                 &mut TestCtx::at(10),
@@ -1809,7 +1815,7 @@ fn sweep_huddle_gates_on_members_only_policy_like_posting() {
 #[test]
 fn sweep_huddle_rejects_module_origin() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -1833,7 +1839,7 @@ fn sweep_huddle_rejects_module_origin() {
 #[test]
 fn external_users_cannot_create_reserved_colon_channel_ids() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
 
         // ':' anywhere in the id is the module namespace — squatting rejected.
         let err = module
@@ -1871,7 +1877,7 @@ fn external_users_cannot_create_reserved_colon_channel_ids() {
 #[test]
 fn module_channels_must_use_the_modules_own_prefix() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
 
         // forge minting under its own namespace is the supported shape.
         module

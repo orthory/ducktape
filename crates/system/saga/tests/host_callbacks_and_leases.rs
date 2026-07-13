@@ -317,8 +317,8 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
             )
             .await
             .expect("trigger");
-        assert_eq!(outcome.effects.len(), 1, "one WorkerRequest effect");
-        let request = decode_worker_request(&outcome.effects[0].0).unwrap();
+        assert_eq!(outcome.events.len(), 1, "one WorkerRequest event");
+        let request = decode_worker_request(&outcome.events[0].payload).unwrap();
         let assignee = request
             .assignee
             .expect("the valset assigned a lease holder");

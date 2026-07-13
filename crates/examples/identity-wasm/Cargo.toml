@@ -1,0 +1,31 @@
+# The wasm port of the `identity` module: compiles the NATIVE identity crate
+# to wasm32 and adapts it to the ducktape:module world through guest-adapter —
+# the module's logic stays single-sourced in `crates/system/identity`. The
+# per-network chain id is NOT compiled in: it arrives via the GENESIS-CONFIG
+# store entry the host installs (see `sdk::genesis_config`). Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+[package]
+name = "identity-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+identity = { path = "../../system/identity" }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]
+
+# identity -> commonware-cryptography (+ p256's rand_core) enables getrandom's
+# "js" backend on wasm32, which bakes unstrippable wasm-bindgen imports into
+# the cdylib and breaks componentization. no consensus path ever calls
+# getrandom (modules are deterministic by contract; the guest only links the
+# pure verify paths), so the guest links a vendored stub whose only backend is
+# a deterministic refusal — see getrandom-stub/Cargo.toml.
+[patch.crates-io]
+getrandom = { path = "getrandom-stub" }

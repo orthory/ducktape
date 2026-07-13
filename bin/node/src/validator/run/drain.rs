@@ -735,12 +735,13 @@ impl ValidatorRuntime<'_> {
             }
         }
 
-        // the reactor seam: offer each finalized block's effects to
+        // the reactor seam: offer each finalized block's events to
         // the host-owned workers; a claiming worker's follow-up op
         // re-enters through the ordered lane as its own block (the
-        // oracle-as-op). unclaimed effects are logged, not silently
-        // dropped — a saga stuck Pending should be visible.
-        for eff in node.take_effects() {
+        // oracle-as-op). events no worker claims are the plain
+        // observability stream — only decodable-but-unhandled worker
+        // requests would indicate a saga stuck Pending.
+        for eff in node.take_events() {
             let mut claimed = false;
             for w in workers.iter() {
                 match w.run(&eff).await {
@@ -767,10 +768,12 @@ impl ValidatorRuntime<'_> {
                     }
                 }
             }
-            if !claimed {
+            // an unclaimed event is normally plain observability; one that
+            // DECODES as a worker request means a saga is stuck Pending.
+            if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
                 println!(
-                    "[node {label}] effect with no worker ({} bytes) — dropped",
-                    eff.0.len()
+                    "[node {label}] WorkerRequest with no worker ({} bytes) — dropped",
+                    eff.payload.len()
                 );
             }
         }

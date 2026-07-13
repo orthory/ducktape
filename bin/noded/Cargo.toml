@@ -16,6 +16,8 @@ name = "ducktape-noded"
 path = "src/main.rs"
 
 [dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }

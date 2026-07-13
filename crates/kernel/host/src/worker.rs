@@ -2,23 +2,24 @@
 //!
 //! the host's within-block drain is the DETERMINISTIC re-entry lane: `emit_msg`
 //! follow-ups re-dispatch inside ONE block, one app-hash. this seam is the
-//! non-deterministic lane: a block may emit [`Effect`]s, and each effect that a
+//! non-deterministic lane: a block may emit [`Event`]s, and each event that a
 //! [`Worker`] claims produces a follow-up op submitted as a SEPARATE block —
 //! because on a real node it is a separate consensus transaction (the
 //! oracle-as-op). that split — deterministic hops stay local and free, only
 //! genuine external edges pay a round — is the whole design.
 //!
-//! this seam is domain-agnostic: it knows `Effect` and `Msg`, nothing about
-//! sagas. a [`Worker`] try-decodes an effect it recognizes and, off to the
+//! this seam is domain-agnostic: it knows `Event` and `Msg`, nothing about
+//! sagas. a [`Worker`] try-decodes an event it recognizes and, off to the
 //! side (non-deterministically, in the real world), computes a result and
 //! returns the op that carries it back. modules stay pure; only the worker is
 //! impure, and the seam lives HERE on the host side, never inside a module
 //! crate — so a module never depends on it. the drive loop itself lives with
 //! each binary (validator drain, noded, simnode), which all follow the same
-//! shape: submit, offer each emitted effect to every worker, submit each
-//! claimed follow-up as its own block.
+//! shape: submit, offer each emitted event to every worker, submit each
+//! claimed follow-up as its own block. events a worker does NOT claim are the
+//! plain observability stream — one lane, two consumer classes.
 
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 
 /// outer-loop non-termination guard — the async sibling of the host's
 /// `MAX_DISPATCHES`. bounds how many worker rounds one settle loop may drive
@@ -68,25 +69,25 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// what a [`Worker`] did with an offered effect. three-way on purpose:
-/// "not my effect" (keep offering) and "mine, deliberately not run" (stop
+/// what a [`Worker`] did with an offered event. three-way on purpose:
+/// "not my event" (keep offering) and "mine, deliberately not run" (stop
 /// offering, nothing to submit) are different outcomes — collapsing them
-/// would misreport an assignment-skipped effect as an unclaimed drop.
+/// would misreport an assignment-skipped request as an unclaimed drop.
 #[derive(Debug)]
 pub enum WorkOutcome {
-    /// try-decode failed: not this worker's effect — offer it to the next.
+    /// try-decode failed: not this worker's event — offer it to the next.
     NotMine,
-    /// this worker's effect, handled: submit the follow-up op if present.
+    /// this worker's event, handled: submit the follow-up op if present.
     /// `None` is a deliberate no-op — e.g. the work is leased to another
     /// node's key and this host must not spawn it.
     Handled(Option<Msg>),
 }
 
-/// a host-owned, NON-DETERMINISTIC worker behind the effect seam. given an
-/// [`Effect`] it recognizes, it does the off-consensus work (an LLM call, a fetch,
+/// a host-owned, NON-DETERMINISTIC worker behind the event seam. given an
+/// [`Event`] it recognizes, it does the off-consensus work (an LLM call, a fetch,
 /// a commit) and returns the follow-up op that carries the result back through the
 /// NORMAL submit path — the oracle-as-transaction. [`WorkOutcome::NotMine`] means
-/// try-decode routing failed, so the caller can offer each effect to every
+/// try-decode routing failed, so the caller can offer each event to every
 /// worker until one claims it.
 ///
 /// the worker never gets a handle to any module: it CANNOT mutate state directly.
@@ -94,5 +95,5 @@ pub enum WorkOutcome {
 /// caller submits as an ordinary op. that is the oracle pattern enforced by type.
 #[async_trait::async_trait(?Send)]
 pub trait Worker {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, Error>;
+    async fn run(&self, event: &Event) -> Result<WorkOutcome, Error>;
 }

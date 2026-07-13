@@ -15,16 +15,20 @@
 //! this crate also carries the deterministic *system api*: the [`Ctx`] a module
 //! touches during state-machine application (own-state r/w lives in `self`;
 //! read-only cross-module [`Ctx::query`]/[`Ctx::module_root`]; the deterministic
-//! [`Env`]; and intent emission via [`Ctx::emit_msg`]/[`Ctx::emit_event`]/
-//! [`Ctx::request_effect`]). the effectful node surface (real network/IO) is a
-//! separate layer and out of scope here.
+//! [`Env`]; and intent emission via [`Ctx::emit_msg`]/[`Ctx::emit_event`] — an
+//! event is ALSO the lane a host-side worker claims off-consensus work from).
+//! the effectful node surface (real network/IO) is a separate layer and out of
+//! scope here.
 //!
 //! keep this crate types + traits with no domain deps (async-trait is the one
 //! greenlit exception): everything here is a shared surface for every module.
 //! [`codec`] carries the shared zero-dep snapshot-codec primitives on the same
-//! everyone-needs-it grounds.
+//! everyone-needs-it grounds, and [`genesis_config`] the tiny codec-based
+//! GENESIS-CONFIG encoding the host and wasm guests share (per-network
+//! parameters installed into a wasm tenant's consensus store at genesis).
 
 pub mod codec;
+pub mod genesis_config;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module
@@ -186,19 +190,17 @@ pub struct Msg {
     pub payload: Vec<u8>,
 }
 
-/// an observability record a module emits via [`Ctx::emit_event`]. it LEAVES the
-/// state machine (handed to the effectful node layer) and never re-enters as a
-/// follow-up.
+/// a record a module emits via [`Ctx::emit_event`]. it LEAVES the state machine
+/// (handed to the effectful node layer) and never re-enters as a follow-up. one
+/// lane, two consumer classes: observability readers, and the host-owned worker
+/// seam, which try-decodes each event and claims the ones that request
+/// off-consensus work (a worker's result returns as an ORDINARY submitted op —
+/// the oracle-as-op pattern).
 #[derive(Clone, Debug)]
 pub struct Event {
     pub source: ModuleId,
     pub payload: Vec<u8>,
 }
-
-/// a request for an effectful, non-deterministic side effect (data channel,
-/// tunnel, transport upgrade). STUB this slice: the host only collects it.
-#[derive(Clone, Debug)]
-pub struct Effect(pub Vec<u8>);
 
 /// who triggered the current dispatch. varies across follow-ups: the root op is
 /// `External`/`System`; an emitted follow-up is `Module(emitter_id)`.
@@ -344,11 +346,40 @@ pub trait Ctx {
     /// executed reentrantly.
     fn emit_msg(&mut self, msg: Msg);
 
-    /// emit an observability event — leaves the state machine.
+    /// emit an event — leaves the state machine (observability, and the lane
+    /// the host-side worker seam claims off-consensus work from).
     fn emit_event(&mut self, ev: Event);
+}
 
-    /// request an effectful side effect — STUB this slice (collected only).
-    fn request_effect(&mut self, eff: Effect);
+/// the deterministic merkle-KV storage surface a disk-backed module touches —
+/// the HOST constructs the concrete store (qmdb today) and INJECTS this handle,
+/// so the module is pure logic over it and never names a storage crate. keys
+/// are the module's own 32-byte digests (the module owns its logical→digest
+/// hashing and its staged overlay); the handle owns durability, the merkle
+/// commitment, and the byte-level sync serve surface.
+#[async_trait::async_trait(?Send)]
+pub trait MerkleStore {
+    /// read one hashed key from COMMITTED state.
+    async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
+
+    /// apply + durably commit ONE batch of hashed-key writes (`None` = delete)
+    /// at a block boundary. after this returns, [`MerkleStore::root`] reflects
+    /// the batch.
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), Error>;
+
+    /// the merkle root over committed state — the module's `root()` verbatim.
+    fn root(&self) -> StateRoot;
+
+    /// the committed resolver sync target (root + op-log bounds) behind
+    /// [`StateSyncHandle::ResolverBacked`].
+    async fn sync_target(&self) -> Result<ResolverSyncTarget, Error>;
+
+    /// serve one byte-level state-sync request against committed state (the
+    /// qmdb sync wire; request/response bytes are handle-defined).
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error>;
 }
 
 /// the host-facing surface of a feature module: identity, authenticated root, the

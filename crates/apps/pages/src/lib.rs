@@ -3,24 +3,29 @@
 //! a page is a TREE of [`Block`]s: the page itself is the root block (kind
 //! `Page`, text == title), every block carries an ordered `children` list, and
 //! every block id is GLOBALLY UNIQUE within the module. unlike the document
-//! module's whole-doc-per-key layout, the qmdb key here is `sha256(block_id)`
+//! module's whole-doc-per-key layout, the store key here is `sha256(block_id)`
 //! and the value is ONE serialized block — so the merkle root commits to every
 //! block individually, and a single block is readable (and one day provable)
 //! by id alone with no page context. that is the addressability contract: any
 //! module can resolve a bare block id via `Ctx::query(pages, GetBlock {
 //! block_id })`.
 //!
+//! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
+//! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
+//! to [`Pages::new`], so this crate never names a storage crate. the module's
+//! authenticated [`StateRoot`] IS the store's merkle root, so it flows
+//! directly into the global app-hash via `host::global_root`.
+//!
 //! ## keys are hashed to a fixed width
 //!
 //! the logical key is the `block_id` string at the interface seam, but the
-//! qmdb key is `sha256(block_id)` — a fixed 32-byte [`commonware_utils`]
-//! `Array`, mirroring the kv/document modules. this is load-bearing:
-//! commonware's state-sync resolvers for the overwriteable variable db are
-//! bounded on `K: Array`.
+//! store key is `sha256(block_id)` — a fixed 32-byte digest, mirroring the
+//! kv/document modules. this is load-bearing: the store's state-sync
+//! resolvers are bounded on fixed-width keys.
 //!
 //! ## enumeration via a reserved index entry
 //!
-//! one extra qmdb entry is reserved: the sentinel logical key
+//! one extra store entry is reserved: the sentinel logical key
 //! [`PAGE_INDEX_KEY`] whose value is the serialized SORTED set of every page
 //! (root block) id. its leading NUL makes it uncollidable with a client-minted
 //! block id, and every op that names it is rejected before any storage touch.
@@ -31,45 +36,35 @@
 //! ## host-lent staging (the kv/document pattern, plus deletes)
 //!
 //! writes made during a block are STAGED in an in-memory `pending` overlay and
-//! flushed to qmdb in ONE batch by `commit_block`; `abort_block` drops the
-//! overlay. the pages twist: `RemoveBlock` deletes a whole subtree, so the
+//! flushed to the store in ONE batch by `commit_block`; `abort_block` drops
+//! the overlay. the pages twist: `RemoveBlock` deletes a whole subtree, so the
 //! overlay value is an `Option<Vec<u8>>` — `Some` stages a write, `None`
-//! stages a DELETE (qmdb's `batch.write(key, None)`), and reads through the
-//! overlay see a staged delete as absence.
+//! stages a DELETE (`commit_batch`'s `None`), and reads through the overlay
+//! see a staged delete as absence.
 //!
 //! ## state-sync
 //!
-//! identical to the document module: [`Pages::sync_target`] /
-//! [`Pages::sync_from`] delegate to commonware's qmdb sync engine, so a joiner
-//! rebuilds a byte-identical root from an untrusted peer, merkle-verified
-//! against the target root.
+//! sync belongs to the injected store, not this module: a joiner (dynamic-
+//! valset catch-up, a fresh full node, crash recovery) rebuilds the CONCRETE
+//! store from a peer (`QmdbStore::sync_from`) and wraps a fresh `Pages` around
+//! it. this module only forwards the trait's serve surface —
+//! [`Module::serve_sync`] and [`Module::resolver_sync_target`] delegate
+//! straight to the store.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the derived-tier materialized view; registered only by serving binaries.
+// the derived-tier materialized view; registered only by serving binaries —
+// native-only (indexer drags fluent31's unix IO), never consensus state, so
+// the wasm guest builds without it.
+#[cfg(feature = "native")]
 pub mod index;
 
 use std::collections::BTreeMap;
-use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
-
-use commonware_codec::RangeCfg;
-use commonware_cryptography::{Hasher, Sha256};
-use commonware_parallel::Sequential;
-use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
-use commonware_storage::{
-    Context, journal, mmr,
-    qmdb::{
-        any::{VariableConfig, unordered::variable::Db},
-        sync::{self, DbResolver, Target, engine::Config as SyncConfig},
-    },
-    translator::TwoCap,
-};
-use commonware_utils::range::NonEmptyRange;
 
 use sdk::{
-    Ctx, Error, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot, StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    StateSyncHandle,
 };
 use tagging::{TagEvent, TaggingMsg};
 
@@ -86,18 +81,19 @@ use error::{PageError, to_page_err};
 use store::hash_key;
 
 /// write-time cap on ONE serialized block record (and on the enumeration
-/// index value — both stage through the same guard). the codec [`RangeCfg`]
-/// bounds a stored value at 1 MiB AT DECODE TIME only, so an oversized value
-/// that staged fine would panic every later read on every validator: a poison
-/// pill. 768 KiB leaves the same 256 KiB framing margin the document module
-/// keeps. a block record carries its text plus its ordered child-id list, so
-/// this also bounds a single parent to tens of thousands of children.
+/// index value — both stage through the same guard). the concrete store's
+/// codec bounds a stored value at 1 MiB AT DECODE TIME only (see
+/// `statesync::qmdb::store_config`), so an oversized value that staged fine
+/// would panic every later read on every validator: a poison pill. 768 KiB
+/// leaves the same 256 KiB framing margin the document module keeps. a block
+/// record carries its text plus its ordered child-id list, so this also
+/// bounds a single parent to tens of thousands of children.
 pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 
 /// the reserved logical key under which the page-enumeration INDEX rides in
-/// the same qmdb. its value is a serialized sorted `Vec<String>` of every page
-/// (root block) id. the leading NUL makes it UNCOLLIDABLE with a real block id
-/// (clients mint uuids), and every op that names it is rejected
+/// the same store. its value is a serialized sorted `Vec<String>` of every
+/// page (root block) id. the leading NUL makes it UNCOLLIDABLE with a real
+/// block id (clients mint uuids), and every op that names it is rejected
 /// ([`PageError::ReservedId`]) before it can reach storage.
 const PAGE_INDEX_KEY: &str = "\u{0}page-index";
 
@@ -107,34 +103,16 @@ const PAGE_INDEX_KEY: &str = "\u{0}page-index";
 /// the cap turns a would-be infinite loop into a loud deterministic error.
 const MAX_DEPTH: usize = 10_000;
 
-/// the qmdb key: a fixed 32-byte sha256 digest of the `block_id`. fixed width
-/// is what lets a store be state-synced (resolvers require `K: Array`).
-type PageKey = <Sha256 as Hasher>::Digest;
-
-/// the concrete qmdb store — identical params to the kv/document modules, so
-/// all qmdb plumbing is shared verbatim.
-type PagesDb<E> = Db<mmr::Family, E, PageKey, Vec<u8>, Sha256, TwoCap, Sequential>;
-
-/// the qmdb configuration — shared by [`Pages::init`] (fresh open) and
-/// [`Pages::sync_from`] (state-sync target) so a synced store's storage layout
-/// is byte-identical to a freshly-opened one.
-type PagesConfig = VariableConfig<TwoCap, ((), (RangeCfg<usize>, ())), Sequential>;
-
-/// a state-sync target: a qmdb merkle root plus the operation range a joiner
-/// must pull to reconstruct a store with an identical root.
-pub type PagesTarget = Target<mmr::Family, PageKey>;
-
-/// a qmdb-backed, block-tree pages module.
-pub struct Pages<E>
-where
-    E: Context + BufferPooler,
-{
+/// a block-tree pages module over a host-injected authenticated store.
+pub struct Pages {
     id: ModuleId,
-    db: PagesDb<E>,
+    /// the host-injected authenticated store: it owns durability, the merkle
+    /// commitment, and the byte-level sync serve surface.
+    store: Box<dyn MerkleStore>,
     /// blocks touched this block-height, keyed by LOGICAL `block_id` bytes.
     /// `Some(bytes)` stages a write, `None` stages a DELETE (subtree removal).
     /// read ahead of committed state by `get` (read-your-writes) and flushed
-    /// to qmdb in one batch by `commit_block`; NOT in `root()` until then.
+    /// to the store in one batch by `commit_block`; NOT in `root()` until then.
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Optional engagement router. Tests/minimal registries may leave it
     /// unwired; production reports each newly-added comment after staging it.

@@ -25,6 +25,8 @@ bytes = "1"
 rand_core = "0.6.4"
 
 [dev-dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 # the N-validator convergence harness: real simplex Engines over one simulated
 # commonware network, each wrapping a host::Host with a qmdb kv module.
 host = { workspace = true }

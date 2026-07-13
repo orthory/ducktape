@@ -41,6 +41,7 @@ use kv::Kv;
 use kv::{KvMsg, encode};
 use node::OrderedNode;
 use sdk::Msg;
+use statesync::qmdb::QmdbStore;
 
 const N: usize = 5;
 const LABELS: [&str; N] = ["v0", "v1", "v2", "v3", "v4"];
@@ -48,7 +49,7 @@ const LABELS: [&str; N] = ["v0", "v1", "v2", "v3", "v4"];
 /// a fresh validator host: one qmdb `kv` module (order-dependent root) on an
 /// ISOLATED child context + one in-memory `directory` module.
 async fn genesis_host(ctx: deterministic::Context) -> Host {
-    let kv = Kv::init(ctx, "kv").await;
+    let kv = Kv::new("kv", Box::new(QmdbStore::init(ctx, "kv").await));
     Host::genesis(vec![Box::new(kv), Box::new(Directory::new("directory"))]).expect("genesis")
 }
 

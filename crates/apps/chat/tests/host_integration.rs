@@ -13,6 +13,15 @@ use chat::{
 use commonware_runtime::{Runner as _, deterministic};
 use host::{BlockContext, Host};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
+
+// build the module the way a host does: concrete store first, injected as
+// `Box<dyn MerkleStore>`.
+macro_rules! chat_on {
+    ($context:expr, $id:expr) => {
+        Chat::new($id, Box::new(QmdbStore::init($context, $id).await))
+    };
+}
 
 fn chat_msg(payload: ChatMsg) -> Msg {
     Msg {
@@ -118,7 +127,7 @@ impl Module for Boom {
 #[test]
 fn host_commits_chat_blocks_and_serves_history_queries() {
     deterministic::Runner::default().start(|context| async move {
-        let chat = Chat::init(context, "chat").await;
+        let chat = chat_on!(context, "chat");
         let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
         let root0 = host.module_root("chat").unwrap();
         let app0 = host.app_hash();
@@ -171,7 +180,7 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
 #[test]
 fn host_rolls_back_failed_chat_blocks() {
     deterministic::Runner::default().start(|context| async move {
-        let chat = Chat::init(context, "chat").await;
+        let chat = chat_on!(context, "chat");
         let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
         let root0 = host.module_root("chat").unwrap();
         let app0 = host.app_hash();
@@ -198,7 +207,7 @@ fn host_rolls_back_failed_chat_blocks() {
 #[test]
 fn default_empty_external_origin_is_rejected() {
     deterministic::Runner::default().start(|context| async move {
-        let chat = Chat::init(context, "chat").await;
+        let chat = chat_on!(context, "chat");
         let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
         let app0 = host.app_hash();
 
@@ -220,7 +229,7 @@ fn default_empty_external_origin_is_rejected() {
 #[test]
 fn hook_notifications_commit_atomically_with_the_post() {
     deterministic::Runner::default().start(|context| async move {
-        let chat = Chat::init(context, "chat").await;
+        let chat = chat_on!(context, "chat");
         let (recorder, recorded) = Recorder::new("recorder");
         let boom = Boom { id: "boom".into() };
         let mut host =

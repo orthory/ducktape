@@ -24,7 +24,7 @@ use std::time::Duration;
 use capability_host::ProviderSet;
 use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 use tokio::sync::Semaphore;
 
 use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
@@ -77,7 +77,7 @@ fn run_key_for(saga_id: &str) -> String {
 /// idempotency key the saga itself dedups results on.
 type AttemptKey = (String, u32);
 
-/// Production worker for dispatch `WorkSpec` saga effects: gate inline,
+/// Production worker for dispatch `WorkSpec` saga work-order events: gate inline,
 /// execute on a spawned task, submit the result through the delivery lane.
 pub struct DispatchPool {
     providers: Arc<ProviderSet>,
@@ -402,8 +402,8 @@ async fn execute(
 
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchPool {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, host::worker::Error> {
-        match gate(&self.providers, &self.node_key, &self.ledger, effect) {
+    async fn run(&self, event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+        match gate(&self.providers, &self.node_key, &self.ledger, event) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
             Gated::Skip => Ok(WorkOutcome::Handled(None)),
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
@@ -600,23 +600,26 @@ format = "text"
         attempt: u32,
         assignee: Option<&[u8]>,
         payload: &[u8],
-    ) -> Effect {
-        Effect(encode_worker_request(&WorkerRequest {
-            saga_id: saga_id.into(),
-            attempt,
-            spec: encode_work_spec(&WorkSpec {
-                kind: WORK_SPEC_KIND.into(),
-                dispatch_id: "d1".into(),
-                capability: "alpha".into(),
-                payload: payload.to_vec(),
-                demands: Default::default(),
+    ) -> Event {
+        Event {
+            source: "saga".into(),
+            payload: encode_worker_request(&WorkerRequest {
+                saga_id: saga_id.into(),
+                attempt,
+                spec: encode_work_spec(&WorkSpec {
+                    kind: WORK_SPEC_KIND.into(),
+                    dispatch_id: "d1".into(),
+                    capability: "alpha".into(),
+                    payload: payload.to_vec(),
+                    demands: Default::default(),
+                }),
+                deadline: None,
+                assignee: assignee.map(|a| a.to_vec()),
             }),
-            deadline: None,
-            assignee: assignee.map(|a| a.to_vec()),
-        }))
+        }
     }
 
-    fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Effect {
+    fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Event {
         effect_with_payload(saga_id, attempt, assignee, &envelope_payload())
     }
 

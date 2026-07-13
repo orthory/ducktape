@@ -17,6 +17,7 @@
 //! claimed and dispatched in the submit cascade, and the delivery block
 //! finalizes the board item with the validated response.
 
+use statesync::qmdb::QmdbStore;
 use agent::AgentModule;
 use agent::{
     ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentMsg,
@@ -51,7 +52,7 @@ use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, decode_reply as saga_decode_reply,
     decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
-use sdk::{Effect, Msg, Origin, StateRoot};
+use sdk::{Event, Msg, Origin, StateRoot};
 use tagging::TaggingModule;
 use tasks::Tasks;
 use tasks::{
@@ -105,11 +106,20 @@ fn job_response(task_id: &str, title: &str) -> Vec<u8> {
     })
 }
 
-/// stand in for the off-consensus worker: decode the effect's WorkerRequest,
+/// the worker-claimable subset of a block's events: everything that decodes
+/// as a `WorkerRequest` (other events on the shared lane are observability).
+fn worker_request_events(events: &[Event]) -> Vec<&Event> {
+    events
+        .iter()
+        .filter(|e| decode_worker_request(&e.payload).is_ok())
+        .collect()
+}
+
+/// stand in for the off-consensus worker: decode the event's WorkerRequest,
 /// kind-gate the dispatch WorkSpec, and answer with `raw` through the normal
 /// oracle-op submit path, echoing the request's idempotency key.
-fn oracle_op_for(effect: &Effect, raw: Vec<u8>) -> Msg {
-    let request = decode_worker_request(&effect.0).expect("a WorkerRequest effect");
+fn oracle_op_for(event: &Event, raw: Vec<u8>) -> Msg {
+    let request = decode_worker_request(&event.payload).expect("a WorkerRequest event");
     let work = decode_work_spec(&request.spec).expect("a dispatch WorkSpec");
     assert_eq!(work.capability, "mock-llm-1");
     Msg {
@@ -232,7 +242,7 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
 }
 
 async fn genesis(context: deterministic::Context) -> Host {
-    let chat = Chat::init(context, "chat").await.with_tagging("tagging");
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context, "chat").await)).with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
         Box::new(TaggingModule::new("tagging")),
@@ -472,11 +482,12 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
             Some(SagaStatus::Pending),
             "the dispatch's saga is pending in the SAME block too"
         );
-        assert_eq!(outcome.effects.len(), 1, "one WorkerRequest effect");
+        let requests = worker_request_events(&outcome.events);
+        assert_eq!(requests.len(), 1, "one WorkerRequest event");
 
-        // the effect's spec is a kind-gated dispatch WorkSpec whose payload
+        // the event's spec is a kind-gated dispatch WorkSpec whose payload
         // is the ENTIRE composed model input — instructions + transcript.
-        let request = decode_worker_request(&outcome.effects[0].0).unwrap();
+        let request = decode_worker_request(&requests[0].payload).unwrap();
         let work = decode_work_spec(&request.spec).unwrap();
         assert_eq!(work.dispatch_id, dispatch_id_for(&run_id));
         assert_eq!(work.capability, "mock-llm-1");
@@ -492,7 +503,7 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         // block 5: the worker's oracle op. the saga settles, the dispatch
         // module judges the Text contract and commits the outcome into its
         // MAILBOX — and the runs module sees NOTHING this block (never pop-stack).
-        let oracle_op = oracle_op_for(&outcome.effects[0], wrap_runner(canned_response(&run_id)));
+        let oracle_op = oracle_op_for(requests[0], wrap_runner(canned_response(&run_id)));
         host.submit_at(
             at(5, Origin::External(b"oracle".to_vec())),
             oracle_op.clone(),
@@ -632,8 +643,9 @@ fn an_agent_job_is_claimed_and_dispatched_in_the_submit_cascade() {
 
         // the submit cascade emitted the dispatch's WorkerRequest effect, and
         // its payload carries the FULL job spec — composed in consensus.
-        assert_eq!(outcome.effects.len(), 1, "one WorkerRequest effect");
-        let request = decode_worker_request(&outcome.effects[0].0).unwrap();
+        let requests = worker_request_events(&outcome.events);
+        assert_eq!(requests.len(), 1, "one WorkerRequest event");
+        let request = decode_worker_request(&requests[0].payload).unwrap();
         let work = decode_work_spec(&request.spec).unwrap();
         assert_eq!(work.dispatch_id, dispatch_id_for(&run_id));
         let payload_text = String::from_utf8(work.payload).unwrap();

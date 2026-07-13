@@ -1060,7 +1060,6 @@ mod tests {
         fn emit_event(&mut self, ev: Event) {
             self.events.push(ev);
         }
-        fn request_effect(&mut self, _eff: sdk::Effect) {}
     }
 
     fn module() -> DispatchModule {

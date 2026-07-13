@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn create_page_is_idempotent_and_preserves_the_title() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
@@ -34,7 +34,7 @@ fn create_page_is_idempotent_and_preserves_the_title() {
 #[test]
 fn list_pages_enumerates_sorted_with_live_titles() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         assert!(
             list_pages(&p).await.is_empty(),
             "a fresh store lists nothing"
@@ -65,7 +65,7 @@ fn list_pages_enumerates_sorted_with_live_titles() {
 #[test]
 fn reserved_index_id_is_rejected() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         let r_before = p.root();
 
@@ -103,7 +103,7 @@ fn reserved_index_id_is_rejected() {
 #[test]
 fn create_with_parent_records_folder_edge() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         apply_commit(
             &mut p,
             &PageMsg::CreatePage {
@@ -133,7 +133,7 @@ fn create_with_parent_records_folder_edge() {
 #[test]
 fn create_under_missing_or_nonpage_parent_is_rejected() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await; // p1 + blocks b1,b2,b3
         // parent does not exist
         apply_expect_err(
@@ -163,7 +163,7 @@ fn create_under_missing_or_nonpage_parent_is_rejected() {
 #[test]
 fn set_page_parent_renests_and_rejects_cycles() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         for id in ["a", "b", "c"] {
             apply_commit(
                 &mut p,
@@ -255,7 +255,7 @@ fn set_page_parent_renests_and_rejects_cycles() {
 #[test]
 fn delete_page_removes_subtree_and_promotes_children() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         // grand -> parent -> child ; parent also has a content block pb1.
         apply_commit(
             &mut p,

@@ -4,33 +4,51 @@ edition.workspace = true
 version.workspace = true
 
 # the chat module: block-based channels, threads, edits, reactions, membership,
-# and hook notifications on one qmdb store.
+# and hook notifications on one host-injected merkle store.
+#
+# the consensus state machine, wire types, and sdk::Module impl always compile
+# (they are the surface the `chat-wasm` guest ports to wasm32). the OFF-
+# consensus submodules ride the `native` feature: the derived index (indexer
+# drags fluent31's unix-only IO), the voice/video media engines (tokio, opus,
+# the data plane), and the call-socket wire codec that only serving binaries
+# speak. `default-features = false` is therefore FULL consensus behavior,
+# minus everything that never touches the app-hash.
+[features]
+default = ["native"]
+native = [
+  "dep:indexer",
+  "dep:unicode-normalization",
+  "dep:data-plane",
+  "dep:opus-rs",
+  "dep:thiserror",
+  "dep:tokio",
+]
+
 [dependencies]
 sdk = { workspace = true }
-indexer = { workspace = true }
-statesync = { workspace = true }
+indexer = { workspace = true, optional = true }
 # types-only: the tag-report edge (chat translates its shapes, the plane routes).
 tagging = { workspace = true }
 async-trait = { workspace = true }
 # NFC label normalization for the derived tag index (src/index/tags.rs).
-unicode-normalization = { workspace = true }
+unicode-normalization = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-commonware-storage = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-cryptography = { workspace = true }
-commonware-parallel = { workspace = true }
-commonware-codec = { workspace = true }
-commonware-utils = { workspace = true }
+# the logical-key -> store-key hash (sha256); the store itself is injected.
+sha2 = { workspace = true }
 # voice submodule (crates/apps/chat/src/voice): real-time media over the data
 # plane's datagram class. Off-consensus — no qmdb, no app-hash.
-data-plane = { workspace = true }
-opus-rs = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+data-plane = { workspace = true, optional = true }
+opus-rs = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"], optional = true }
 
 [dev-dependencies]
 host = { workspace = true }
+# the tests drive the module the way a host does: construct the concrete
+# QmdbStore and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }
 # the voice e2e proofs drive the data plane's deterministic sim transport.

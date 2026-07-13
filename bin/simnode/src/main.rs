@@ -132,9 +132,10 @@ use noded::{
 };
 use pages::Pages;
 use saga::SagaModule;
-use sdk::{Effect, Module, Msg, Origin};
+use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
+use statesync::qmdb::QmdbStore;
 use upgrade::Upgrade;
 use clients::Clients;
 use valset::Valset;
@@ -560,8 +561,7 @@ fn run_sim(
     executor.start(|context| async move {
         // genesis: noded's exact module set (keep in sync with BASE_MODULE_IDS)
         // so app queries and status roots behave like a real daemon's.
-        let chat = Chat::init(context.child("chat"), "chat")
-            .await
+        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
@@ -587,8 +587,7 @@ fn run_sim(
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
         .with_pages_module("pages");
-        let pages = Pages::init(context.child("pages"), "pages")
-            .await
+        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
             .with_tagging("tagging");
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")
@@ -627,7 +626,7 @@ fn run_sim(
         // (UpdateModule proposals stay unwired), and saga's construction is
         // untouched. empty valset_keys => the default set, byte-identical.
         if !valset_keys.is_empty() {
-            let kv = Kv::init(context.child("kv"), "kv").await;
+            let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
             let mut valset = Valset::new("valset");
             for key in &valset_keys {
                 valset.insert(key.clone());
@@ -972,7 +971,7 @@ impl Sim {
         self.stream_hub
             .publish_block(block.height, block.app_hash.clone());
 
-        offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
+        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
         Ok(Committed {
             block,
             op_hash,
@@ -1106,7 +1105,7 @@ impl Sim {
         }
 
         self.stream_hub.publish_block(self.height, app_hash.clone());
-        offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
+        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
 
         Ok(BatchInfo {
             height: self.height,
@@ -1206,10 +1205,10 @@ fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
-    effects: Vec<Effect>,
+    events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
-    for eff in effects {
+    for eff in events {
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
@@ -1226,10 +1225,12 @@ async fn offer_effects(
                 }
             }
         }
-        if !claimed {
+        // an unclaimed event is normally plain observability; one that
+        // DECODES as a worker request means a saga is stuck Pending.
+        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
             println!(
-                "[simnode] effect with no worker ({} bytes) — dropped",
-                eff.0.len()
+                "[simnode] WorkerRequest with no worker ({} bytes) — dropped",
+                eff.payload.len()
             );
         }
     }
@@ -1241,8 +1242,8 @@ struct EchoWorker;
 
 #[async_trait::async_trait(?Send)]
 impl host::worker::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<host::worker::WorkOutcome, host::worker::Error> {
-        let request = match saga::decode_worker_request(&effect.0) {
+    async fn run(&self, event: &Event) -> Result<host::worker::WorkOutcome, host::worker::Error> {
+        let request = match saga::decode_worker_request(&event.payload) {
             Ok(request) => request,
             Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
         };

@@ -13,7 +13,7 @@ use jobs::{
     decode_event as decode_jobs_event, decode_reply, encode_event as encode_jobs_event, encode_msg,
     encode_query,
 };
-use sdk::{Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 
 const JOBS: &str = "jobs";
 
@@ -140,7 +140,6 @@ impl Ctx for TestCtx {
     }
     fn emit_msg(&mut self, _msg: Msg) {}
     fn emit_event(&mut self, _event: Event) {}
-    fn request_effect(&mut self, _effect: Effect) {}
 }
 
 // ---- test helpers ----------------------------------------------------------

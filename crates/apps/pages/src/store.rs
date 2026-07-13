@@ -1,75 +1,22 @@
 use super::{
-    Arc, BTreeMap, Block, BlockKind, BufferPooler, CacheRef, Context, DbResolver, Error, Hasher,
-    MAX_BLOCK_LEN, MAX_DEPTH, ModuleId, NonEmptyRange, NonZeroU16, NonZeroU64, NonZeroUsize,
-    PAGE_INDEX_KEY, PageError, PageKey, Pages, PagesConfig, PagesDb, PagesTarget, RangeCfg,
-    Sequential, Sha256, SyncConfig, Target, TwoCap, VariableConfig, journal, mmr, sync,
-    to_page_err,
+    BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_DEPTH, MerkleStore, ModuleId,
+    PAGE_INDEX_KEY, PageError, Pages, to_page_err,
 };
+use sha2::Digest as _;
 
-/// hash a `block_id` to its fixed-width qmdb key. deterministic, so every
+/// hash a `block_id` to its fixed-width store key. deterministic, so every
 /// validator maps a given block to the same store slot.
-pub(super) fn hash_key(block_id: &[u8]) -> PageKey {
-    let mut h = Sha256::new();
-    h.update(block_id);
-    h.finalize()
+pub(super) fn hash_key(block_id: &[u8]) -> [u8; 32] {
+    sha2::Sha256::digest(block_id).into()
 }
 
-/// build the qmdb [`VariableConfig`] for module `id` on `context`. partitions
-/// are namespaced by `id` so several qmdb-backed modules share one runtime
-/// context without colliding on storage.
-fn pages_config<E>(context: &E, id: &str) -> PagesConfig
-where
-    E: Context + BufferPooler,
-{
-    // a single page-cache handle shared by both sub-configs (cheap to clone).
-    let page_cache = CacheRef::from_pooler(
-        context,
-        NonZeroU16::new(128).unwrap(),
-        NonZeroUsize::new(64).unwrap(),
-    );
-
-    // codec config for Operation<.., PageKey, Vec<u8>>: (key_cfg, value_cfg).
-    // the key is a fixed-width digest so its cfg is `()`; the value is a
-    // Vec<u8> whose <Vec<u8> as Read>::Cfg == (RangeCfg<usize>, ()).
-    let codec_config = ((), (RangeCfg::from(0..=1 << 20), ()));
-
-    VariableConfig {
-        merkle_config: mmr::full::Config {
-            journal_partition: format!("{id}-merkle-journal"),
-            metadata_partition: format!("{id}-merkle-meta"),
-            items_per_blob: NonZeroU64::new(64).unwrap(),
-            write_buffer: NonZeroUsize::new(1024).unwrap(),
-            strategy: Sequential,
-            page_cache: page_cache.clone(),
-        },
-        journal_config: journal::contiguous::variable::Config {
-            partition: format!("{id}-log"),
-            items_per_section: NonZeroU64::new(64).unwrap(),
-            write_buffer: NonZeroUsize::new(1024).unwrap(),
-            compression: None,
-            codec_config,
-            page_cache,
-        },
-        translator: TwoCap,
-    }
-}
-
-impl<E> Pages<E>
-where
-    E: Context + BufferPooler,
-{
-    /// open (or recover) the store on `context` under module identity `id`.
-    /// qmdb partitions are namespaced by `id`, so the pages module shares one
-    /// runtime context with kv/document/other qmdb modules without colliding.
-    pub async fn init(context: E, id: impl Into<ModuleId>) -> Self {
-        let id = id.into();
-        let cfg = pages_config(&context, &id);
-        let db = PagesDb::<E>::init(context, cfg)
-            .await
-            .expect("qmdb init failed");
+impl Pages {
+    /// wrap the host-constructed store under module identity `id`. sync — the
+    /// store arrives already opened (or already synced to a verified root).
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
-            id,
-            db,
+            id: id.into(),
+            store,
             pending: BTreeMap::new(),
             tagging: None,
         }
@@ -87,7 +34,7 @@ where
         if let Some(staged) = self.pending.get(key) {
             return staged.clone();
         }
-        self.db.get(&hash_key(key)).await.expect("get failed")
+        self.store.get(&hash_key(key)).await.expect("get failed")
     }
 
     /// load one block (`None` == absent), through the staged-over-committed
@@ -120,7 +67,7 @@ where
     }
 
     /// stage a DELETE of `block_id` — reads see absence at once; the key is
-    /// dropped from qmdb (and the root) at `commit_block`.
+    /// dropped from the store (and the root) at `commit_block`.
     pub(super) fn delete_block(&mut self, block_id: &str) {
         self.pending.insert(block_id.as_bytes().to_vec(), None);
     }
@@ -256,71 +203,5 @@ where
             out.push(cur);
         }
         Ok(Some(out))
-    }
-
-    // ---- state-sync ---------------------------------------------------------
-    // reconstruct a byte-identical-rooted store from a peer WITHOUT replaying
-    // the op history in application order — commonware's qmdb sync ships the
-    // live op range and merkle-verifies every batch against the target root.
-
-    /// the sync [`PagesTarget`] for this store: its qmdb merkle root plus the
-    /// LIVE operation range `[sync_boundary, end)`. hand it to
-    /// [`Pages::sync_from`] to rebuild a store with an identical root.
-    pub async fn sync_target(&self) -> PagesTarget {
-        let end = self.db.bounds().await.end;
-        let start = self.db.sync_boundary();
-        Target {
-            root: self.db.root(),
-            range: NonEmptyRange::new(start..end)
-                .expect("a committed store has a non-empty op range"),
-        }
-    }
-
-    /// consume this store into an `Arc`-wrapped raw qmdb that serves as a sync
-    /// resolver: it answers a joiner's op-range requests with proof-carrying
-    /// batches.
-    pub fn into_resolver(self) -> Arc<PagesDb<E>> {
-        Arc::new(self.db)
-    }
-
-    /// reconstruct a `Pages` at `id` on `context` whose qmdb root EQUALS
-    /// `target.root`, by pulling `target`'s op range from `resolver`. every
-    /// fetched batch is merkle-verified against `target.root`, so a byzantine
-    /// source cannot forge contents — the root is the trust anchor.
-    pub async fn sync_from<R>(
-        context: E,
-        id: impl Into<ModuleId>,
-        target: PagesTarget,
-        resolver: R,
-    ) -> Result<Self, String>
-    where
-        R: DbResolver<PagesDb<E>>,
-    {
-        let id = id.into();
-        let db_config = pages_config(&context, &id);
-        let config = SyncConfig {
-            context,
-            resolver,
-            target,
-            max_outstanding_requests: 1,
-            fetch_batch_size: NonZeroU64::new(64).unwrap(),
-            apply_batch_size: 1024,
-            db_config,
-            update_rx: None,
-            finish_rx: None,
-            reached_target_tx: None,
-            max_retained_roots: 8,
-        };
-        // a sync failure (transport blip, dropped source) is the caller's
-        // retry loop to own — never a process kill.
-        let db = sync::sync(config)
-            .await
-            .map_err(|e| format!("qmdb sync: {e:?}"))?;
-        Ok(Self {
-            id,
-            db,
-            pending: BTreeMap::new(),
-            tagging: None,
-        })
     }
 }

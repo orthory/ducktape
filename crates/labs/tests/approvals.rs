@@ -8,7 +8,7 @@ use labs::multisig::{
     ExecutableView, Multisig, MultisigEvent, MultisigMsg, MultisigQuery, MultisigReply,
     bind_preimage, decode_event, decode_reply, encode_msg, encode_query, register_preimage,
 };
-use sdk::{Ctx, Effect, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use valset::{ValsetQuery, ValsetReply};
 
 const VAULT: &str = "treasury";
@@ -47,7 +47,6 @@ impl Ctx for TestCtx {
     fn emit_event(&mut self, e: Event) {
         self.events.push(e);
     }
-    fn request_effect(&mut self, _e: Effect) {}
 }
 
 fn ctx(who: &[u8], validators: Vec<Vec<u8>>) -> TestCtx {

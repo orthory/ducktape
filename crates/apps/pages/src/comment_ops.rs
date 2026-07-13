@@ -1,7 +1,7 @@
 use super::{
-    AuthorRef, BufferPooler, Comment, Context, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
-    MAX_COMMENT_TEXT_BYTES, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET,
-    Origin, PageError, PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    AuthorRef, Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
+    MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
+    PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -34,10 +34,7 @@ fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
     }
 }
 
-impl<E> Pages<E>
-where
-    E: Context + BufferPooler,
-{
+impl Pages {
     // ── comment storage (reserved NUL-prefixed keys) ──
 
     pub(super) async fn load_thread(&self, id: &str) -> Result<Option<Thread>, PageError> {

@@ -678,6 +678,44 @@ impl RunsModule {
         self.pending_history.clear();
         Ok(())
     }
+
+    // ---- the delivered-runs ring, as a portable value ------------------------
+    // the ring is DERIVED state — deliberately outside `root()`/`snapshot()`
+    // (a native snapshot join starts empty; replay rebuilds it). the WASM PORT
+    // has no per-node memory to rebuild into: the guest is re-instantiated per
+    // dispatch, so anything not persisted through the host store is lost, and
+    // real consumers (the app's runs client, the dogfood receipt lane) read
+    // `RunsQuery::RecentRuns`. these two methods are that port's lane: the
+    // guest persists the COMMITTED ring as its own host-KV value beside the
+    // canonical snapshot. every `RunRecord` field is already a deterministic
+    // consensus derivation (the executing-node attribution feeds PR-body
+    // breadcrumbs — committed forge state — today), so the ring riding the
+    // wasm module's host-KV root is consensus-safe. NATIVE lifecycles never
+    // call these.
+
+    /// the committed delivered-runs ring (never the staged records), oldest
+    /// first — the exact in-memory order `commit_block` maintains.
+    pub fn history_snapshot(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.history).expect("run records serialize")
+    }
+
+    /// adopt a persisted ring (UNTRUSTED input: never panics on malformed
+    /// bytes, rejects a ring past the cap no honest writer produces). staged
+    /// records are dropped — like [`RunsModule::install`], a persisted ring
+    /// describes a dispatch boundary and nothing half-applied may shadow it.
+    pub fn install_history(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let history: VecDeque<RunRecord> = serde_json::from_slice(bytes)
+            .map_err(|e| Error::Module(format!("run history decode: {e}")))?;
+        if history.len() > RUN_HISTORY_CAP {
+            return Err(Error::Module(format!(
+                "run history carries {} records; the cap is {RUN_HISTORY_CAP}",
+                history.len()
+            )));
+        }
+        self.history = history;
+        self.pending_history.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]

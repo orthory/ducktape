@@ -1,0 +1,19 @@
+# The wasm port of the `directory` module — the first real production tenant
+# of the module runtime. Standalone workspace: guest crates build to
+# `wasm32-unknown-unknown` and are componentized by the module build target,
+# never by the host workspace. The wire types come from the `directory` crate
+# with default-features off (interface only, no sdk), so they cannot drift.
+[package]
+name = "directory-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57"
+directory = { path = "../directory", default-features = false }
+
+[workspace]

@@ -19,6 +19,7 @@ use commonware_runtime::{Runner as _, deterministic};
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
 use tasks::Tasks;
+use statesync::qmdb::QmdbStore;
 
 const AUTO: &str = "automations";
 const CHAT: &str = "chat";
@@ -103,7 +104,7 @@ async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {
 /// genesis a real chat + tasks + automations host with channel "general"
 /// created, the automations hook registered on it, and one rule installed.
 async fn arena(context: deterministic::Context, rule_id: &str, action: Action) -> Host {
-    let chat = Chat::init(context, CHAT).await;
+    let chat = Chat::new(CHAT, Box::new(QmdbStore::init(context, CHAT).await));
     let mut host = Host::genesis(vec![
         Box::new(chat),
         Box::new(Tasks::new(TASKS)),

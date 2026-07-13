@@ -29,7 +29,7 @@ use chat::{
 };
 use futures::executor::block_on;
 use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
-use sdk::{Effect, Env, Event};
+use sdk::{Env, Event};
 use tasks::{
     Task, TaskStatus, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
 };
@@ -191,7 +191,6 @@ impl Ctx for CaptureCtx {
         self.msgs.push(msg);
     }
     fn emit_event(&mut self, _ev: Event) {}
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 // ---- fixtures -----------------------------------------------------------

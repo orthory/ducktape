@@ -8,7 +8,22 @@
 //! never the payload), and an empty set removes the node from the registry.
 //! tags are open-set strings so a new kind of executor is data, not code —
 //! the impl crate validates shape (charset/length/count), not meaning.
+//!
+//! ## capability classes
+//!
+//! a CLASS is a namespace token (`agent`, `ai`, ...) that a MODULE claims:
+//! the wire form of a classed capability is `<class>:<rest>`, and dispatch
+//! addresses classed work as `<node_id>/<class>:<rest>` where `<node_id>` is
+//! a concrete node key (lowercase hex) or `*` (any node). the registry is the
+//! primary router for that address space: class -> claimant module. claims
+//! are first-come-first-served ([`CapabilityMsg::ClaimClass`]), and there is
+//! deliberately NO unclaim op — removing a claim would dangle every address
+//! already routed through it, so a claim is permanent until a future,
+//! explicitly-migrated handoff op exists. the address-parsing helpers below
+//! ([`parse_classed_address`], [`class_of`]) are the single source of truth
+//! for the separators, so later dispatch work cannot drift from the registry.
 
+use sdk::ModuleId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -42,6 +57,37 @@ pub fn validate_tag(tag: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// longest capability class name, in bytes — classes are routing namespace
+/// tokens, deliberately short.
+pub const MAX_CLASS_LEN: usize = 32;
+
+/// the ONE definition of a well-formed capability class: non-empty, at most
+/// [`MAX_CLASS_LEN`] bytes, charset `[a-z0-9-]`. STRICTER than a tag on
+/// purpose: `:` and `/` are the classed-address separators and `.`/`_` are
+/// excluded so a class can never be mistaken for a plain tag's dotted form.
+/// every layer that accepts a class validates through this (the registry's
+/// ClaimClass, the address parser) — no copies to drift.
+pub fn validate_class(class: &str) -> Result<(), String> {
+    if class.is_empty() {
+        return Err("capability class must be non-empty".into());
+    }
+    if class.len() > MAX_CLASS_LEN {
+        return Err(format!(
+            "capability class exceeds {MAX_CLASS_LEN} bytes: {} bytes",
+            class.len()
+        ));
+    }
+    if !class
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(format!(
+            "capability class has invalid characters (want [a-z0-9-]): {class:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// most dimensions one node may announce / one job may demand — a bound, not
 /// a schema (dimensions are open-set data: "cores", "mem_gb", later "gpu").
 pub const MAX_RESOURCE_DIMS: usize = 16;
@@ -65,6 +111,80 @@ pub fn validate_resources(resources: &BTreeMap<String, u64>) -> Result<(), Strin
     Ok(())
 }
 
+/// the node half of a classed address `<node_id>/<class>:<rest>`: a concrete
+/// node key, or `*` — any node the router may pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeSelector {
+    /// `*` — any node serving the class.
+    Any,
+    /// a concrete node key (the registry's announced-key bytes).
+    Node(Vec<u8>),
+}
+
+/// parse a classed dispatch address `<node_id>/<class>:<rest>` into its three
+/// parts. `<node_id>` is `*` or the lowercase-hex encoding of a node key; the
+/// class must satisfy [`validate_class`]; `<rest>` is the free-form remainder
+/// (non-empty — it may itself contain `:` or `/`, only the FIRST `/` and the
+/// first `:` after it are separators). this parser is the single source of
+/// truth for the address grammar: dispatch and the registry both route
+/// through it, so the separators cannot drift.
+pub fn parse_classed_address(addr: &str) -> Result<(NodeSelector, String, String), String> {
+    let Some((node, capability)) = addr.split_once('/') else {
+        return Err(format!(
+            "classed address is missing the '/' node separator: {addr:?}"
+        ));
+    };
+    let selector = if node == "*" {
+        NodeSelector::Any
+    } else {
+        NodeSelector::Node(decode_node_hex(node)?)
+    };
+    let Some((class, rest)) = capability.split_once(':') else {
+        return Err(format!(
+            "classed address is missing the ':' class separator: {addr:?}"
+        ));
+    };
+    validate_class(class)?;
+    if rest.is_empty() {
+        return Err(format!("classed address has an empty rest: {addr:?}"));
+    }
+    Ok((selector, class.to_string(), rest.to_string()))
+}
+
+/// the class of a classed capability `<class>:<rest>`, or `None` when the
+/// string is not classed (no `:`, an ill-formed class before the first `:`,
+/// or an empty rest). routers use this to decide plain-tag vs class routing,
+/// so it must never claim a class the registry could not hold.
+pub fn class_of(capability: &str) -> Option<&str> {
+    let (class, rest) = capability.split_once(':')?;
+    (validate_class(class).is_ok() && !rest.is_empty()).then_some(class)
+}
+
+/// decode a node key from its lowercase-hex address form. strict: non-empty,
+/// even length, `[0-9a-f]` only — uppercase is rejected so every key has
+/// exactly ONE address spelling.
+fn decode_node_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.is_empty() {
+        return Err("classed address has an empty node id".into());
+    }
+    if !s.len().is_multiple_of(2) {
+        return Err(format!("classed address node id has odd hex length: {s:?}"));
+    }
+    let nibble = |b: u8| -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            _ => Err(format!(
+                "classed address node id is not lowercase hex: {s:?}"
+            )),
+        }
+    };
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Ok(nibble(pair[0])? << 4 | nibble(pair[1])?))
+        .collect()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityMsg {
@@ -80,6 +200,14 @@ pub enum CapabilityMsg {
         #[serde(default)]
         resources: BTreeMap<String, u64>,
     },
+    /// claim a capability CLASS for the submitting MODULE — the claimant is
+    /// the verified `Origin::Module` id, never payload data ("a class is
+    /// claimed by the module that serves it"), so External and System origins
+    /// reject. first claim wins: a claim on a class already held by ANOTHER
+    /// module is a deterministic rejection; a re-claim by the OWNING module
+    /// is an idempotent no-op (root unchanged). there is no unclaim — see the
+    /// module doc on dangling routes.
+    ClaimClass { class: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -103,6 +231,11 @@ pub enum CapabilityQuery {
     /// this is the desktop app's registry-enumeration read (the executor
     /// picker and per-member capability display), submitted as wire JSON.
     All,
+    /// the module that claimed `class`, if any — the router's primary read
+    /// for a classed address.
+    ResolveClass { class: String },
+    /// every claimed class with its claimant module, sorted by class.
+    Classes,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -112,6 +245,8 @@ pub enum CapabilityReply {
     Node(Vec<String>),
     Resources(BTreeMap<String, u64>),
     All(Vec<(Vec<u8>, Vec<String>)>),
+    ClassOwner(Option<ModuleId>),
+    Classes(Vec<(String, ModuleId)>),
 }
 
 pub fn encode_msg(m: &CapabilityMsg) -> Vec<u8> {
@@ -158,8 +293,101 @@ mod tests {
     fn announce_without_resources_field_still_decodes() {
         // old wire JSON (pre-resources) must decode with an empty map.
         let old = br#"{"announce":{"capabilities":["codex"]}}"#;
-        let CapabilityMsg::Announce { capabilities, resources } = decode_msg(old).unwrap();
+        let CapabilityMsg::Announce {
+            capabilities,
+            resources,
+        } = decode_msg(old).unwrap()
+        else {
+            panic!("expected an announce");
+        };
         assert_eq!(capabilities, vec!["codex"]);
         assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn parses_concrete_node_addresses() {
+        let (sel, class, rest) = parse_classed_address("ab12/agent:task").unwrap();
+        assert_eq!(sel, NodeSelector::Node(vec![0xab, 0x12]));
+        assert_eq!(class, "agent");
+        assert_eq!(rest, "task");
+
+        // a realistic 32-byte key round-trips through the hex form.
+        let key: Vec<u8> = (0u8..32).collect();
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let (sel, class, rest) = parse_classed_address(&format!("{hex}/a-1:x")).unwrap();
+        assert_eq!(sel, NodeSelector::Node(key));
+        assert_eq!((class.as_str(), rest.as_str()), ("a-1", "x"));
+    }
+
+    #[test]
+    fn parses_the_any_selector() {
+        let (sel, class, rest) = parse_classed_address("*/ai:summarize").unwrap();
+        assert_eq!(sel, NodeSelector::Any);
+        assert_eq!((class.as_str(), rest.as_str()), ("ai", "summarize"));
+    }
+
+    #[test]
+    fn rest_is_free_form_only_the_first_separators_bind() {
+        // only the FIRST '/' and the first ':' after it split — the rest may
+        // itself carry both separators (structured sub-addresses).
+        let (sel, class, rest) = parse_classed_address("*/agent:a:b/c").unwrap();
+        assert_eq!(sel, NodeSelector::Any);
+        assert_eq!((class.as_str(), rest.as_str()), ("agent", "a:b/c"));
+    }
+
+    #[test]
+    fn bad_node_ids_are_rejected() {
+        for (addr, why) in [
+            ("zz/agent:x", "not lowercase hex"),
+            ("AB12/agent:x", "not lowercase hex"),
+            ("abc/agent:x", "odd hex length"),
+            ("/agent:x", "empty node id"),
+        ] {
+            let err = parse_classed_address(addr).unwrap_err();
+            assert!(err.contains(why), "{addr:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn missing_separators_are_rejected() {
+        for (addr, why) in [
+            ("agent:task", "'/' node separator"),
+            ("*/agent", "':' class separator"),
+            ("", "'/' node separator"),
+        ] {
+            let err = parse_classed_address(addr).unwrap_err();
+            assert!(err.contains(why), "{addr:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn empty_parts_and_separator_injection_are_rejected() {
+        let long = format!("*/{}:x", "c".repeat(MAX_CLASS_LEN + 1));
+        for (addr, why) in [
+            ("*/:x", "non-empty"),
+            ("*/agent:", "empty rest"),
+            // a '/' smuggled ahead of the class lands IN the class (only the
+            // first '/' binds) and the class charset rejects it.
+            ("*/def/agent:x", "invalid characters"),
+            ("*/Agent:x", "invalid characters"),
+            ("*/ag.ent:x", "invalid characters"),
+            ("*/ag_ent:x", "invalid characters"),
+            ("*/ag ent:x", "invalid characters"),
+            (long.as_str(), "exceeds 32 bytes"),
+        ] {
+            let err = parse_classed_address(addr).unwrap_err();
+            assert!(err.contains(why), "{addr:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn class_of_classifies_exactly_what_the_registry_could_hold() {
+        assert_eq!(class_of("agent:task"), Some("agent"));
+        assert_eq!(class_of("a-1:x:y"), Some("a-1"), "rest may carry ':'");
+        assert_eq!(class_of("task"), None, "no separator: a plain tag");
+        assert_eq!(class_of(":x"), None, "empty class");
+        assert_eq!(class_of("agent:"), None, "empty rest");
+        assert_eq!(class_of("Agent:x"), None, "ill-formed class");
+        assert_eq!(class_of("ag.ent:x"), None, "tag charset is not a class");
     }
 }

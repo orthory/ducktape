@@ -19,6 +19,8 @@ version.workspace = true
 sdk = { workspace = true }
 host = { workspace = true }
 thiserror = { workspace = true }
+# QmdbStore implements the object-safe `sdk::MerkleStore` (async methods boxed).
+async-trait = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }

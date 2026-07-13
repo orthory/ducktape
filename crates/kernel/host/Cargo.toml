@@ -25,6 +25,8 @@ dispatch = { workspace = true }
 modreg = { workspace = true }
 
 [dev-dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 # the live-code-update proof stands a real wasm module on the host and swaps its
 # component across a code-registry activation boundary (modreg is a normal dep).
 wasm-host = { workspace = true }
@@ -32,13 +34,50 @@ wasm-host = { workspace = true }
 # runtime and drives it through the host.
 kv = { workspace = true }
 directory = { workspace = true }
+# the STORE-BACKED parity proofs drive the SAME op matrix through the native
+# pages/chat modules over QmdbStore and their wasm ports over
+# `WasmModule::with_store(QmdbStore)`, pinning IDENTICAL roots block-by-block
+# (root-continuous cutover — revision stays 1).
+pages = { workspace = true }
+chat = { workspace = true }
+# the adapter-port parity proof drives the SAME op matrix through the native
+# vaults module and its wasm port, asserting identical replies + the declared
+# state-schema break.
+vaults = { workspace = true }
+jobs = { workspace = true }
+inbox = { workspace = true }
+tasks = { workspace = true }
+tagging = { workspace = true }
+capability = { workspace = true }
+duckdns = { workspace = true }
+identity = { workspace = true }
+# the gateway/governance parity proofs stand the native modules (and their
+# native identity/valset/upgrade/modreg siblings) beside the wasm ports.
+gateway = { workspace = true }
+governance = { workspace = true }
 greeter = { workspace = true }
+# the identity parity proof synthesizes WebAuthn passkey assertions exactly as
+# identity's own tests do (deterministic RFC-6979 P-256 signatures — no OS
+# randomness inside a consensus proof).
+p256 = { workspace = true }
+base64 = { workspace = true }
 # the deterministic-activation drain-injection test stands the real upgrade +
 # valset modules on the host and drives a block across an activation boundary.
 valset = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
 # next to a stub receiver.
 saga = { workspace = true }
+# the agent/automations adapter-port parity proofs stand the native modules
+# (and their native saga / chat+tasks+inbox siblings) beside the wasm ports.
+agent = { workspace = true }
+automations = { workspace = true }
+# the runs adapter-port parity proof drives the REAL collaboration loop —
+# chat-over-QmdbStore, pages-over-QmdbStore, tagging, saga, dispatch (native
+# by design), agent, tasks, jobs, files — through the native runs module and
+# its wasm port side by side. files needs an on-disk odb dir (tempfile).
+runs = { workspace = true }
+files = { workspace = true }
+tempfile = "3"
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"

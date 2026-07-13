@@ -3,12 +3,19 @@ name = "directory"
 edition.workspace = true
 version.workspace = true
 
+# the wire surface always compiles; the native sdk Module implementation rides
+# the `native` feature. `default-features = false` is the dependency shape the
+# `directory-wasm` guest takes (wire types single-sourced, no sdk in the guest).
+[features]
+default = ["native"]
+native = ["dep:sdk", "dep:sha2", "dep:async-trait"]
+
 [dependencies]
-sdk = { workspace = true }
+sdk = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-async-trait = { workspace = true }
+sha2 = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = "0.3"

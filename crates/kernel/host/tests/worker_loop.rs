@@ -9,7 +9,7 @@
 use futures::executor::block_on;
 use host::Host;
 use host::worker::{Error, MAX_WORKER_ROUNDS, WorkOutcome, Worker};
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 use saga::{
     SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply,
     decode_worker_request, encode_msg, encode_query,
@@ -17,7 +17,7 @@ use saga::{
 use std::collections::VecDeque;
 
 /// the minimal settle loop every binary reimplements: submit, offer each
-/// emitted effect to every worker, submit each claimed follow-up as its own
+/// emitted event to every worker, submit each claimed follow-up as its own
 /// block, until quiet or the round budget trips.
 async fn settle(host: &mut Host, workers: &[Box<dyn Worker>], msg: Msg) -> Result<(), Error> {
     let mut queue: VecDeque<Msg> = VecDeque::from([msg]);
@@ -28,7 +28,7 @@ async fn settle(host: &mut Host, workers: &[Box<dyn Worker>], msg: Msg) -> Resul
             return Err(Error::BudgetExceeded);
         }
         let outcome = host.submit(op).await?;
-        for eff in &outcome.effects {
+        for eff in &outcome.events {
             for w in workers {
                 match w.run(eff).await? {
                     WorkOutcome::NotMine => continue,
@@ -50,8 +50,8 @@ struct MockOracle;
 
 #[async_trait::async_trait(?Send)]
 impl Worker for MockOracle {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, Error> {
-        let Ok(wr) = decode_worker_request(&effect.0) else {
+    async fn run(&self, event: &Event) -> Result<WorkOutcome, Error> {
+        let Ok(wr) = decode_worker_request(&event.payload) else {
             return Ok(WorkOutcome::NotMine);
         };
         let result: Vec<u8> = wr.spec.iter().rev().copied().collect();
@@ -72,8 +72,8 @@ struct FlakyOracle;
 
 #[async_trait::async_trait(?Send)]
 impl Worker for FlakyOracle {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, Error> {
-        let Ok(wr) = decode_worker_request(&effect.0) else {
+    async fn run(&self, event: &Event) -> Result<WorkOutcome, Error> {
+        let Ok(wr) = decode_worker_request(&event.payload) else {
             return Ok(WorkOutcome::NotMine);
         };
         let outcome = if wr.attempt == 0 {
@@ -137,7 +137,7 @@ fn a_trigger_drives_a_saga_to_done_via_the_mock_oracle() {
 }
 
 /// the negative control: without a worker the saga is STUCK at Pending — the
-/// block emits a WorkerRequest effect nothing drains. this proves the async
+/// block emits a WorkerRequest event nothing drains. this proves the async
 /// boundary is real: the OracleResult re-enters as an op, it is not applied
 /// by the worker directly.
 #[test]
@@ -145,17 +145,17 @@ fn the_worker_is_load_bearing() {
     block_on(async {
         let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
         let out = host.submit(trigger("s1", b"hello", 1)).await.expect("submit");
-        assert_eq!(out.effects.len(), 1, "exactly one WorkerRequest effect");
+        assert_eq!(out.events.len(), 1, "exactly one WorkerRequest event");
         assert_eq!(
             get_saga(&host, "s1").await.unwrap().status,
             SagaStatus::Pending,
             "no worker -> stuck at Pending"
         );
-        // now drain that effect through a worker and settle: Done.
+        // now drain that event through a worker and settle: Done.
         let workers: Vec<Box<dyn Worker>> = vec![Box::new(MockOracle)];
-        let follow = match MockOracle.run(&out.effects[0]).await.unwrap() {
+        let follow = match MockOracle.run(&out.events[0]).await.unwrap() {
             WorkOutcome::Handled(Some(follow)) => follow,
-            other => panic!("worker must claim the effect, got {other:?}"),
+            other => panic!("worker must claim the event, got {other:?}"),
         };
         settle(&mut host, &workers, follow).await.expect("settle");
         assert_eq!(get_saga(&host, "s1").await.unwrap().status, SagaStatus::Done);

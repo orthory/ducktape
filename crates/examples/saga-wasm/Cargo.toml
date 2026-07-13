@@ -1,0 +1,31 @@
+# The wasm port of the `saga` module: compiles the NATIVE saga crate to
+# wasm32 and adapts it to the ducktape:module world through guest-adapter —
+# the module's logic stays single-sourced in `crates/system/saga`. Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+[package]
+name = "saga-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+# default-features = false: saga's `native` feature carries only the
+# node-local usage-ledger mapper (indexer -> unix-only IO), never consensus
+# behavior — the guest ports the FULL consensus state machine without it.
+saga = { path = "../../system/saga", default-features = false }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]
+
+# valset -> commonware-cryptography enables getrandom's "js" backend on wasm32,
+# which bakes unstrippable wasm-bindgen imports into the cdylib and breaks
+# componentization. no consensus path ever calls getrandom (modules are
+# deterministic by contract), so the guest links a vendored stub whose only
+# backend is a deterministic refusal — see getrandom-stub/Cargo.toml.
+[patch.crates-io]
+getrandom = { path = "getrandom-stub" }

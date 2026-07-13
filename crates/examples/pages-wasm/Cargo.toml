@@ -1,0 +1,30 @@
+# The wasm port of the `pages` module: compiles the NATIVE pages crate to
+# wasm32 and adapts it to the ducktape:module world through guest-adapter —
+# the module's logic stays single-sourced in `crates/apps/pages`. Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+# `default-features = false` drops the `native` feature's node-local derived
+# index (its `indexer` dep drags unix-only IO); the consensus state machine
+# and sdk::Module impl compile unconditionally, so the port loses nothing
+# consensus-visible.
+#
+# STORE-BACKED port: unlike the whole-state (`load_state`/`save_state`)
+# tenants, this guest constructs the native module over `WitStore` — the
+# adapter's `sdk::MerkleStore` over the host `state-*` imports — so the REAL
+# qmdb store stays host-side (`WasmModule::with_store`) and the cutover is
+# root-continuous (state schema revision stays 1).
+[package]
+name = "pages-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+pages = { path = "../../apps/pages", default-features = false }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]
