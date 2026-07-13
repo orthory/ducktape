@@ -164,6 +164,15 @@ export interface ConsoleState {
    *  load — set by `focusMessage` (tag/search jump-to-message), consumed and
    *  cleared by ChatView. Null when there's nothing to focus. */
   chatFocusSeq: number | null;
+  /** A jump-to-message landed OUTSIDE the channel's newest-MAX_QUERY_LIMIT
+   *  tail: `messages` then holds the messagesAround window centered on `seq`,
+   *  not the tail. The per-block refresh re-pulls THIS window (so edits and
+   *  reactions on the messages you jumped to stay live) instead of the tail —
+   *  see fetchChatSlices. It ends when the reader leaves it: re-entering the
+   *  channel (rail click / "Jump to latest") or posting drops it and the tail
+   *  comes back. Also ChatView's record that it already asked, so a seq the
+   *  window can't produce is asked for once, not forever. */
+  chatWindow: { channelId: string; seq: number } | null;
   /** The active #tag filter (see TagFilter), or null for the live view. */
   tagFilter: TagFilter | null;
   /** The active tag filter's hits (newest first) — query-driven, like
@@ -733,6 +742,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     chatFocusSeq: null,
+    chatWindow: null,
     tagFilter: null,
     tagHits: [],
     tagHitsPending: false,
@@ -825,6 +835,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   messages: [],
   activeThread: null,
   chatFocusSeq: null,
+  chatWindow: null,
   tagFilter: null,
   tagHits: [],
   tagHitsPending: false,

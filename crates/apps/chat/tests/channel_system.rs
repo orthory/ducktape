@@ -5,8 +5,8 @@
 
 use chat::Chat;
 use chat::{
-    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL, Mark,
-    PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
+    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL,
+    MAX_QUERY_LIMIT, Mark, PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
@@ -802,6 +802,68 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
             .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         module.abort_block().await.unwrap();
+    });
+}
+
+#[test]
+fn messages_around_windows_the_history_at_one_sequence() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        for i in 1..=12u64 {
+            module
+                .execute(
+                    &mut TestCtx::with_origin(20 + i, user(1)),
+                    &module_msg(post("general", &format!("m{i}"), "body", None)),
+                )
+                .await
+                .unwrap();
+        }
+        // a tombstone inside the window must page like any other row: the
+        // jump-to projection has to match what `MessagesLatest` would return.
+        module
+            .execute(
+                &mut TestCtx::with_origin(40, user(1)),
+                &module_msg(ChatMsg::DeleteMessage {
+                    channel_id: "general".into(),
+                    seq: 6,
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let around = |seq, limit| ChatQuery::MessagesAround {
+            channel_id: "general".into(),
+            seq,
+            limit,
+        };
+        // mid-history: half the window before the target, the rest from it on.
+        assert_eq!(seqs(&query(&module, around(7, 4)).await), vec![5, 6, 7, 8]);
+        let ChatReply::Messages(window) = query(&module, around(7, 4)).await else {
+            panic!("messages reply");
+        };
+        assert!(
+            window.iter().any(|m| m.seq == 6 && m.head.deleted),
+            "the tombstoned seq is a row of the window, not a hole"
+        );
+        // clamped at the start: the window slides forward, never below seq 1.
+        assert_eq!(seqs(&query(&module, around(1, 4)).await), vec![1, 2, 3, 4]);
+        assert_eq!(seqs(&query(&module, around(2, 4)).await), vec![1, 2, 3, 4]);
+        // clamped at the head: nothing exists past it, so the window is short.
+        assert_eq!(seqs(&query(&module, around(12, 4)).await), vec![10, 11, 12]);
+        // a seq past the head windows the head rather than answering empty.
+        assert_eq!(seqs(&query(&module, around(99, 4)).await), vec![10, 11, 12]);
+        // limit bounds: 0 pages nothing, and an over-ask clamps to
+        // MAX_QUERY_LIMIT (the whole channel here) like every other page.
+        assert_eq!(seqs(&query(&module, around(7, 0)).await), Vec::<u64>::new());
+        assert_eq!(
+            seqs(&query(&module, around(7, MAX_QUERY_LIMIT + 1_000)).await),
+            (1..=12).collect::<Vec<u64>>()
+        );
     });
 }
 

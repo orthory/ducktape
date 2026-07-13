@@ -185,9 +185,13 @@ export interface ConsoleActions {
   selectChannel(channelId: string): void;
   /** Load `channelId` on the chat screen and scroll+flash message `seq` once its
    *  slice lands (jump-to-message from a tag/search hit). Clears any tag filter,
-   *  like `selectChannel`. If `seq` is older than the loaded window, ChatView
-   *  just lands in the channel. */
+   *  like `selectChannel`. A `seq` older than the channel tail is paged in by
+   *  `loadMessageWindow` — see ChatView. */
   focusMessage(channelId: string, seq: number): void;
+  /** Page in the messagesAround window centered on `seq` and re-arm the focus so
+   *  ChatView scrolls to it. ChatView calls this when a jump-to-message target
+   *  is older than the loaded tail and so has no row to scroll to. */
+  loadMessageWindow(channelId: string, seq: number): void;
   /** Consume the one-shot `chatFocusSeq` (ChatView calls this once it has acted
    *  on the jump, or when the target seq isn't in the loaded window). */
   clearChatFocus(): void;
@@ -997,6 +1001,9 @@ export function createActions({
   // ChatView consumed it would otherwise flash whatever message happens to
   // carry that seq in the channel we land in. focusMessage relies on the
   // ordering — it calls this first, THEN latches its own seq.
+  // Entering a channel is ALSO the way out of a focused history window: this
+  // loads the tail, so clearing `chatWindow` here is what puts the refresh back
+  // on the tail — a rail click on the channel you're in is the "jump to latest".
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
@@ -1010,6 +1017,7 @@ export function createActions({
       channelTags: [],
       channelMembers: [],
       chatFocusSeq: null,
+      chatWindow: null,
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
@@ -1110,6 +1118,11 @@ export function createActions({
     const messageId = crypto.randomUUID();
     const blocks = parseMessageInput(body, mentionResolver());
     const author = getState().author;
+    // Posting is a return to the present: the new message takes the channel's
+    // HEAD sequence, so it belongs to the tail, not to a focused history window
+    // the reader jumped to. Drop the window here — the block's refresh then
+    // re-pulls the tail (holding the window would hide the message just sent).
+    if (getState().chatWindow?.channelId === channelId) patch({ chatWindow: null });
     return ensureMentionWatch(channelId, blocks).then(() =>
       submitTracked(
         opKey.message(channelId, messageId),
@@ -1771,8 +1784,39 @@ export function createActions({
     selectChannel: enterChannel,
 
     focusMessage: (channelId, seq) => {
-      enterChannel(channelId); // loads the channel + drops any tag filter
+      enterChannel(channelId); // loads the channel tail + drops any tag filter
       landOn("chat", { chatFocusSeq: seq });
+    },
+
+    loadMessageWindow: (channelId, seq) => {
+      const live = getNode();
+      if (!live) return;
+      // Mark the window BEFORE the round trip: it is also ChatView's record
+      // that it already asked for this seq, so a target the window can't
+      // produce is requested once instead of on every re-render.
+      patch({ chatWindow: { channelId, seq } });
+      chatClient
+        .messagesAround(live, channelId, seq)
+        .then((messages) =>
+          update((prev) =>
+            isCurrentNode(live) && prev.activeChannel === channelId
+              ? // re-arm the focus: the row exists now, so ChatView's next pass
+                // scrolls and flashes it exactly as it does for a tail hit.
+                { messages, chatFocusSeq: seq }
+              : {},
+          ),
+        )
+        .catch(() => {
+          if (!isCurrentNode(live)) return;
+          // A node too old to know the messages_around variant rejects the
+          // query outright. Stay on the tail enterChannel already loaded and
+          // say so — landing on the newest message with no word is the bug
+          // this whole path exists to fix.
+          patch({
+            chatWindow: null,
+            error: "Couldn't load the history around that message — this node may be too old to page it in.",
+          });
+        });
     },
 
     clearChatFocus: () => {

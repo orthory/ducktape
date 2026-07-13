@@ -311,6 +311,17 @@ pub enum ChatQuery {
         from_seq: u64,
         limit: u64,
     },
+    /// the window of `limit` messages CENTERED on `seq`, ascending — the
+    /// jump-to-message read: a tag/search hit older than the newest `limit`
+    /// is in no [`MessagesLatest`](ChatQuery::MessagesLatest) page. half the
+    /// window sits before `seq`, the rest from `seq` on; both ends clamp to the
+    /// channel's live range and `limit` to [`MAX_QUERY_LIMIT`]. carries every
+    /// sequence (replies, tombstones) like the other pages.
+    MessagesAround {
+        channel_id: String,
+        seq: u64,
+        limit: u64,
+    },
     /// global message-id lookup.
     Message {
         message_id: String,

@@ -362,6 +362,49 @@ function EmptyChannelState() {
   );
 }
 
+// The "you are reading history" bar: a jump-to-message older than the channel's
+// loaded tail replaces the stream with a window centered on that message, so
+// scrolling down inside it dead-ends short of the newest message. Say so, and
+// offer the way back — re-entering the channel drops the window and reloads the
+// tail. Shaped like TagFilterBar, the surface's other "this isn't live" strip.
+function HistoryWindowBar() {
+  const { state, actions } = useDucktape();
+  const focused = state.chatWindow;
+  if (!focused || focused.channelId !== state.activeChannel) return null;
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "7px 18px",
+        borderBottom: `1px solid ${color.borderSoft}`,
+        background: color.sunken,
+        flexShrink: 0,
+        minWidth: 0,
+      }}
+    >
+      <span style={{ font: `400 12px ${font.sans}`, color: color.muted2, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        Older history — around message #{focused.seq}
+      </span>
+      <span style={{ flex: 1 }} />
+      <HoverButton
+        title="Back to the newest messages"
+        onClick={() => actions.selectChannel(focused.channelId)}
+        style={{
+          padding: "3px 8px",
+          borderRadius: 6,
+          color: color.muted3,
+          font: `600 12px ${font.sans}`,
+        }}
+        hoverStyle={{ background: color.hover, color: color.ink }}
+      >
+        Jump to latest
+      </HoverButton>
+    </div>
+  );
+}
+
 // ── The screen ──────────────────────────────────────────
 
 export function ChatView() {
@@ -407,23 +450,37 @@ export function ChatView() {
   // into view and flash it. Wait for the slice — enterChannel swaps messages in
   // async, so an early pass may still see the prior channel's array; acting then
   // would clear the focus before the target row exists.
-  // ponytail: if seq is older than chat's newest-256 `messages_latest` window we
-  // can't render it — land in the channel and clear (needs a node-side
-  // around-seq query to page in older context).
+  //
+  // No row for the seq means the hit is older than the tail slice: page in the
+  // window centered on it (`loadMessageWindow` re-arms the focus when it lands,
+  // so the next pass takes the branch above). `chatWindow` is the record that we
+  // already asked — without it a seq the window can't produce (an impossible
+  // one, or a node too old to answer) would re-request on every render.
   useLayoutEffect(() => {
     const seq = state.chatFocusSeq;
-    if (seq === null) return;
-    const loaded = state.messages.some((m) => m.channel_id === state.activeChannel);
+    const channelId = state.activeChannel;
+    if (seq === null || channelId === null) return;
+    const loaded = state.messages.some((m) => m.channel_id === channelId);
     if (!loaded) return;
     const el = listRef.current?.querySelector<HTMLElement>(`[data-seq="${seq}"]`);
+    const asked =
+      state.chatWindow?.channelId === channelId && state.chatWindow.seq === seq;
     if (el) {
       pinnedRef.current = false; // don't let the tail-pin yank us back down
       el.scrollIntoView({ block: "center" });
       el.classList.add("msg-focus");
       setTimeout(() => el.classList.remove("msg-focus"), 2000);
+    } else if (!asked) {
+      actions.loadMessageWindow(channelId, seq);
     }
     actions.clearChatFocus();
-  }, [state.chatFocusSeq, state.messages, state.activeChannel, actions]);
+  }, [
+    state.chatFocusSeq,
+    state.messages,
+    state.activeChannel,
+    state.chatWindow,
+    actions,
+  ]);
 
   const handleSend = () => {
     if (!draft.trim()) return;
@@ -491,29 +548,32 @@ export function ChatView() {
               // the live slice until the bar's ✕ clears the filter.
               <TagHitList />
             ) : (
-              <MessageList
-                channelName={channel.name}
-                messages={state.messages}
-                names={state.authorNames}
-                ops={state.ops}
-                selfKey={selfKey}
-                workspaceId={workspaceId}
-                archived={archived}
-                hoverMsg={hoverMsg}
-                menuOpenId={msgMenuId}
-                listRef={listRef}
-                onScroll={(event) => {
-                  const el = event.currentTarget;
-                  pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-                }}
-                onHover={setHoverMsg}
-                onMenuToggle={setMsgMenuId}
-                onOpenThread={actions.openThread}
-                onReact={actions.toggleReaction}
-                onEdit={actions.editMessage}
-                onDelete={actions.deleteMessage}
-                onTagClick={actions.setTagFilter}
-              />
+              <>
+                <HistoryWindowBar />
+                <MessageList
+                  channelName={channel.name}
+                  messages={state.messages}
+                  names={state.authorNames}
+                  ops={state.ops}
+                  selfKey={selfKey}
+                  workspaceId={workspaceId}
+                  archived={archived}
+                  hoverMsg={hoverMsg}
+                  menuOpenId={msgMenuId}
+                  listRef={listRef}
+                  onScroll={(event) => {
+                    const el = event.currentTarget;
+                    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+                  }}
+                  onHover={setHoverMsg}
+                  onMenuToggle={setMsgMenuId}
+                  onOpenThread={actions.openThread}
+                  onReact={actions.toggleReaction}
+                  onEdit={actions.editMessage}
+                  onDelete={actions.deleteMessage}
+                  onTagClick={actions.setTagFilter}
+                />
+              </>
             )}
             {archived ? (
               <ArchivedNotice channel={channel} />

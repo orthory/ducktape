@@ -379,7 +379,11 @@ export function DucktapeProvider({
       return Promise.resolve()
         .then(() =>
           Promise.all([
-            fetchChatSlices(live, stateRef.current.activeChannel),
+            fetchChatSlices(
+              live,
+              stateRef.current.activeChannel,
+              stateRef.current.chatWindow,
+            ),
             fetchValsetSlices(live),
             fetchGovernanceSlices(live),
             fetchForgeSlices(live),
@@ -512,7 +516,11 @@ export function DucktapeProvider({
         .then(() =>
           Promise.all([
             scope.has("chat")
-              ? fetchChatSlices(live, stateRef.current.activeChannel)
+              ? fetchChatSlices(
+                  live,
+                  stateRef.current.activeChannel,
+                  stateRef.current.chatWindow,
+                )
               : null,
             scope.has("valset") ? fetchValsetSlices(live) : null,
             scope.has("governance") ? fetchGovernanceSlices(live) : null,

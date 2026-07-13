@@ -1146,6 +1146,28 @@ where
         self.views(&channel, from..=to).await
     }
 
+    /// the window centered on `seq`: half the page before it, the rest from it
+    /// on. no new store walk — this is `messages_range` with the bounds
+    /// computed, so tombstoned and edited rows page exactly as they do for
+    /// `messages_latest`.
+    async fn messages_around(
+        &self,
+        channel_id: &str,
+        seq: u64,
+        limit: u64,
+    ) -> Result<Vec<MessageView>, Error> {
+        let channel = self.require_channel(channel_id).await?;
+        let limit = clamp_limit(limit);
+        if limit == 0 || channel.head_seq == 0 {
+            return Ok(Vec::new());
+        }
+        // a seq of 0 or one past the head names no message: window the nearest
+        // real one instead of answering an empty page.
+        let seq = seq.clamp(1, channel.head_seq);
+        let from = seq.saturating_sub(limit / 2).max(1);
+        self.messages_range(channel_id, from, limit).await
+    }
+
     async fn message_by_id(&self, message_id: &str) -> Result<Option<MessageView>, Error> {
         let Some((channel_id, seq)) = self.load::<(String, u64)>(&msgid_key(message_id)).await?
         else {
@@ -1461,6 +1483,13 @@ where
                 limit,
             } => Ok(encode_reply(&ChatReply::Messages(
                 self.messages_range(&channel_id, from_seq, limit).await?,
+            ))),
+            ChatQuery::MessagesAround {
+                channel_id,
+                seq,
+                limit,
+            } => Ok(encode_reply(&ChatReply::Messages(
+                self.messages_around(&channel_id, seq, limit).await?,
             ))),
             ChatQuery::Message { message_id } => Ok(encode_reply(&ChatReply::Message(
                 self.message_by_id(&message_id).await?,

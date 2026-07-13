@@ -204,3 +204,42 @@ describe("ChatView layout", () => {
     });
   });
 });
+
+describe("ChatView jump-to-message", () => {
+  const focusState = (overrides: Partial<ConsoleState> = {}): ConsoleState => ({
+    ...stateWithMessages([message(900, [{ paragraph: [{ text: "tail", marks: [] }] }])]),
+    // the hit is far older than the loaded tail slice — it has no row.
+    chatFocusSeq: 12,
+    ...overrides,
+  });
+
+  it("pages in the window around a focused seq that is older than the loaded tail", () => {
+    const actions = { ...noopActions, loadMessageWindow: vi.fn(), clearChatFocus: vi.fn() };
+    render(
+      <ConsoleContext.Provider value={{ state: focusState(), actions }}>
+        <ChatView />
+      </ConsoleContext.Provider>,
+    );
+
+    expect(actions.loadMessageWindow).toHaveBeenCalledWith("general", 12);
+  });
+
+  it("asks only once — a window already loaded for that seq is not re-requested", () => {
+    const actions = { ...noopActions, loadMessageWindow: vi.fn(), clearChatFocus: vi.fn() };
+    render(
+      <ConsoleContext.Provider
+        value={{
+          // the window came back but carries no row for the seq (an impossible
+          // one, or a node that could not page it in): asking again would loop.
+          state: focusState({ chatWindow: { channelId: "general", seq: 12 } }),
+          actions,
+        }}
+      >
+        <ChatView />
+      </ConsoleContext.Provider>,
+    );
+
+    expect(actions.loadMessageWindow).not.toHaveBeenCalled();
+    expect(screen.getByText("Jump to latest")).toBeInTheDocument();
+  });
+});
