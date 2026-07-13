@@ -9,7 +9,7 @@ pub(crate) struct Surfaces {
     pub(crate) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
-    pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
     pub(crate) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
@@ -83,12 +83,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(storage, &MODULE_IDS)?;
     stream_hub.prime(index.resume_height()?, String::new());
-    // the voice hub's session lane: /v1/call/ws handlers ask for huddle
-    // audio sessions here. created up front because the app-surface thread
-    // starts before the mesh exists; only the validator path below spawns the
-    // hub that drains it — on every other path the receiver just drops and
-    // the route answers with a refusal.
-    let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::CallSessionRequest>(8);
+    // the realtime hub's session lane: /v1/call/ws and /v1/presence/ws ask for
+    // sessions here. created up front because the app-surface thread starts
+    // before the mesh exists; validator and resident paths drain it, while a
+    // sync-only or overlay-less path drops it so the routes refuse promptly.
+    let (voice_lane, voice_requests) =
+        tokio::sync::mpsc::channel::<noded::RealtimeSessionRequest>(8);
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.

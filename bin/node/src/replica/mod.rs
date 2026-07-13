@@ -104,7 +104,7 @@ pub(crate) async fn run(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
     agent_dirs: &capability_host::AgentDirs,

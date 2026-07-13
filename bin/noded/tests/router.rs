@@ -734,6 +734,19 @@ async fn call_ws_route_is_wired() {
 }
 
 #[tokio::test]
+async fn pages_presence_ws_route_is_wired() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(ws_upgrade("/v1/presence/ws?page=page-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+}
+
+#[tokio::test]
 async fn the_old_voice_ws_route_is_gone() {
     // app and node ship lockstep: `/v1/voice/ws` was replaced by `/v1/call/ws`,
     // so the old path is simply unrouted now — a 404, not a refusal.

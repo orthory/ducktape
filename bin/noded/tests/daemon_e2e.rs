@@ -386,6 +386,10 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
     assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
     assert!(raw.contains("no mesh call hub"), "refusal says WHY: {raw}");
 
+    let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
+    assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
+    assert!(raw.contains("no mesh realtime hub"), "refusal says WHY: {raw}");
+
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
 }

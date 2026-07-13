@@ -45,6 +45,7 @@ pub(super) struct ReplicaChannels {
     /// for the authoritative `GateMsg::Admitted`/`Rejected` (ADR §3.3). NOT a
     /// side printer any more — the reply IS the admission signal.
     pub(super) lobby_rx: discovery::Receiver<ed25519::PublicKey>,
+    pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,7 +75,7 @@ pub(super) async fn wire(
     invite_token: &Option<config::InviteToken>,
     invite_wireguard: &Option<config::StoredInviteWireGuard>,
     invite_fronts: Vec<config::Front>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
@@ -347,11 +348,6 @@ pub(super) async fn wire(
             }
         }
     }
-    // media rides the overlay (Service::Voice/Service::Video), never the
-    // mesh; a parked joiner serves no huddle media, so drop the session
-    // lane to make /v1/call/ws refuse instead of hang (this branch always
-    // ends in the promotion reboot, never main.rs's validator path).
-    drop(voice_requests);
     // the submit-relay lane: once resident standing lands, writes leave
     // here — this node signs its own frames and a validator takes
     // custody. replies (the frame's consensus fate) come back on the
@@ -377,5 +373,6 @@ pub(super) async fn wire(
         relay_rx,
         lobby_tx,
         lobby_rx,
+        voice_requests,
     }
 }
