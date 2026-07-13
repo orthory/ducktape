@@ -2,7 +2,7 @@
 // row's relative box, so it hangs beneath the caret.
 
 import type { BlockKind } from "../../../domain/pages-client";
-import { color, font, radius } from "../../theme/tokens";
+import { color, font, radius, shadow } from "../../theme/tokens";
 import { filterSlashKinds } from "./pages-model";
 
 export function SlashMenu({
@@ -32,7 +32,7 @@ export function SlashMenu({
         border: `1px solid ${color.border}`,
         borderRadius: radius.md,
         background: color.paper,
-        boxShadow: "0 20px 48px rgba(0,0,0,.50)",
+        boxShadow: shadow.card,
         padding: 4,
       }}
     >

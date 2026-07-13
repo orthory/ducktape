@@ -12,7 +12,7 @@ import type { RelativeAnchor, ThreadView } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import type { OpLedger } from "../../store/finalization";
 import { inMentionMenu } from "../chat/use-mention-menu";
-import { color, font, radius } from "../../theme/tokens";
+import { color, font, radius, shadow } from "../../theme/tokens";
 import { DiscussionParticipants, NewThreadComposer, ThreadCard } from "./CommentThread";
 
 /** Where the card anchors, in viewport coordinates (the opener's rect). */
@@ -127,7 +127,7 @@ export function CommentCard({
         border: `1px solid ${color.border}`,
         borderRadius: radius.lg,
         background: color.paper,
-        boxShadow: "0 24px 56px rgba(0,0,0,.55)",
+        boxShadow: shadow.card,
         overflow: "hidden",
       }}
     >

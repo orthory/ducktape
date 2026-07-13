@@ -6,7 +6,7 @@
 // title (with its icon) in PageTitle.tsx.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, SetStateAction } from "react";
+import type { SetStateAction } from "react";
 import type { RelativeAnchor, ThreadView } from "../../../domain/pages-client";
 
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -45,38 +45,6 @@ import { usePagePresence } from "./use-page-presence";
 export { EDIT_BOUNDARY_MS };
 const EMPTY_PRESENCE: PagePresencePeer[] = [];
 const EMPTY_THREADS: ThreadView[] = [];
-const PAGE_THEME = {
-  "--accent": "#6C6BFF",
-  "--c-ink": "#F2F1EF",
-  "--c-ink-soft": "rgba(242,241,239,.86)",
-  "--c-ink-softer": "rgba(242,241,239,.68)",
-  "--c-muted": "rgba(255,255,255,.44)",
-  "--c-muted2": "rgba(255,255,255,.30)",
-  "--c-muted3": "rgba(255,255,255,.58)",
-  "--c-icon-idle": "rgba(255,255,255,.24)",
-  "--c-paper": "#111113",
-  "--c-canvas": "#111113",
-  "--c-sidebar": "#0C0C0E",
-  "--c-titlebar": "#0C0C0E",
-  "--c-hover": "rgba(108,107,255,.16)",
-  "--c-sunken": "#1C1C1F",
-  "--c-panel": "#242428",
-  "--c-window-border": "rgba(255,255,255,.10)",
-  "--c-border": "rgba(255,255,255,.10)",
-  "--c-border-soft": "rgba(255,255,255,.06)",
-  "--c-border-strong": "rgba(255,255,255,.15)",
-  "--c-chip": "#242428",
-  "--c-filled": "#6C6BFF",
-  "--c-on-filled": "#fff",
-  "--c-green": "#5FD98A",
-  "--c-amber": "#E0A63E",
-  "--c-blue": "#7AA8FF",
-  "--c-red": "#E06B5C",
-  "--c-purple": "#A5A4FF",
-  "--c-danger": "#E06B5C",
-  "--c-danger-soft": "#26191A",
-  "--c-danger-border": "#5B2E32",
-} as CSSProperties;
 
 // ── The view ─────────────────────────────────────────────
 
@@ -395,7 +363,6 @@ export function PagesView() {
     <div
       data-screen-label="Pages"
       style={{
-        ...PAGE_THEME,
         flex: 1,
         minWidth: 0,
         minHeight: 0,
