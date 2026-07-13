@@ -483,13 +483,24 @@ fn workspace_join_blocking(
 
 /// the one-line invite blob to hand a friend, refreshed with this member's dial
 /// hint. requires the workspace to have been founded/joined (it reads config).
+///
+/// The short link is the coordinator-hosted `🦆://<name>/<id>` URL; the full
+/// blob is the self-contained fallback that works without any coordinator.
+/// `short` is `None` when the coordinator was unreachable/refused — the blob
+/// still works.
+#[derive(Serialize, Clone)]
+pub struct InviteForms {
+    pub short: Option<String>,
+    pub blob: String,
+}
+
 #[tauri::command]
 pub async fn workspace_invite_blob(
     app: crate::rt::AppHandle,
     window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
-) -> Result<String, String> {
+) -> Result<InviteForms, String> {
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
@@ -497,11 +508,37 @@ pub async fn workspace_invite_blob(
         .await
 }
 
-fn workspace_invite_blob_blocking(app: crate::rt::AppHandle, id: String) -> Result<String, String> {
+fn workspace_invite_blob_blocking(
+    app: crate::rt::AppHandle,
+    id: String,
+) -> Result<InviteForms, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(&["invite", "--config", &cfg.to_string_lossy()]).map(|out| last_line(&out))
+    let cfg_s = cfg.to_string_lossy().to_string();
+    match run_verb(&["invite", "--config", &cfg_s, "--short"]) {
+        Ok(out) => {
+            // `--short` prints the full blob line, then the short URL as the
+            // LAST line. Recover the blob line (`🦆…`, but never the `🦆://` URL).
+            let short = last_line(&out);
+            let blob = out
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with('🦆') && !l.contains("://"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            Ok(InviteForms {
+                short: Some(short),
+                blob,
+            })
+        }
+        // coordinator unreachable/refusing: the full blob must still work.
+        Err(_) => run_verb(&["invite", "--config", &cfg_s]).map(|out| InviteForms {
+            short: None,
+            blob: last_line(&out),
+        }),
+    }
 }
 
 /// the join requests parked joiners delivered to this member's running node

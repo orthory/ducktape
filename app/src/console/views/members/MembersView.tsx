@@ -787,12 +787,14 @@ function PendingJoinRequests({
 function AdminActions({
   canAdmin,
   inviteBlob,
+  inviteShort,
   pendingJoins,
   onRevealInvite,
   onAdmit,
 }: {
   canAdmin: boolean;
   inviteBlob: string | null;
+  inviteShort: string | null;
   pendingJoins: JoinRequest[];
   onRevealInvite: () => void;
   onAdmit: (pubkey: string) => void;
@@ -865,29 +867,105 @@ function AdminActions({
                   background: color.paper,
                 }}
               >
-                <textarea
-                  readOnly
-                  aria-label="Workspace invite blob"
-                  rows={2}
-                  value={inviteBlob}
-                  onFocus={(event) => event.currentTarget.select()}
-                  style={{
-                    width: "100%",
-                    boxSizing: "border-box",
-                    border: `1px solid ${color.borderStrong}`,
-                    borderRadius: radius.sm,
-                    background: color.paper,
-                    color: color.inkSoft,
-                    font: `500 10.5px ${font.mono}`,
-                    padding: "8px 9px",
-                    resize: "vertical",
-                  }}
-                />
-                <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 7 }}>
-                  <HoverButton onClick={() => copyText(inviteBlob)} ariaLabel="Copy invite">
-                    Copy invite
-                  </HoverButton>
-                </div>
+                {inviteShort ? (
+                  <>
+                    <input
+                      readOnly
+                      aria-label="Workspace invite link"
+                      value={inviteShort}
+                      onFocus={(event) => event.currentTarget.select()}
+                      style={{
+                        width: "100%",
+                        boxSizing: "border-box",
+                        border: `1px solid ${color.borderStrong}`,
+                        borderRadius: radius.sm,
+                        background: color.paper,
+                        color: color.inkSoft,
+                        font: `500 11.5px ${font.mono}`,
+                        padding: "8px 9px",
+                      }}
+                    />
+                    <div
+                      style={{
+                        marginTop: 5,
+                        font: `400 10px ${font.sans}`,
+                        color: color.muted2,
+                      }}
+                    >
+                      One person, expires in 7 days. Link dies if the coordinator restarts —
+                      reveal again to refresh.
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 7 }}>
+                      <HoverButton onClick={() => copyText(inviteShort)} ariaLabel="Copy invite link">
+                        Copy link
+                      </HoverButton>
+                    </div>
+                    <details style={{ marginTop: 9 }}>
+                      <summary
+                        style={{
+                          cursor: "pointer",
+                          font: `400 10.5px ${font.sans}`,
+                          color: color.muted2,
+                        }}
+                      >
+                        Full invite (works without the coordinator)
+                      </summary>
+                      <textarea
+                        readOnly
+                        aria-label="Workspace invite blob"
+                        rows={2}
+                        value={inviteBlob}
+                        onFocus={(event) => event.currentTarget.select()}
+                        style={{
+                          width: "100%",
+                          boxSizing: "border-box",
+                          marginTop: 7,
+                          border: `1px solid ${color.borderStrong}`,
+                          borderRadius: radius.sm,
+                          background: color.paper,
+                          color: color.inkSoft,
+                          font: `500 10.5px ${font.mono}`,
+                          padding: "8px 9px",
+                          resize: "vertical",
+                        }}
+                      />
+                      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 7 }}>
+                        <HoverButton
+                          onClick={() => copyText(inviteBlob)}
+                          ariaLabel="Copy full invite"
+                        >
+                          Copy full invite
+                        </HoverButton>
+                      </div>
+                    </details>
+                  </>
+                ) : (
+                  <>
+                    <textarea
+                      readOnly
+                      aria-label="Workspace invite blob"
+                      rows={2}
+                      value={inviteBlob}
+                      onFocus={(event) => event.currentTarget.select()}
+                      style={{
+                        width: "100%",
+                        boxSizing: "border-box",
+                        border: `1px solid ${color.borderStrong}`,
+                        borderRadius: radius.sm,
+                        background: color.paper,
+                        color: color.inkSoft,
+                        font: `500 10.5px ${font.mono}`,
+                        padding: "8px 9px",
+                        resize: "vertical",
+                      }}
+                    />
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 7 }}>
+                      <HoverButton onClick={() => copyText(inviteBlob)} ariaLabel="Copy invite">
+                        Copy invite
+                      </HoverButton>
+                    </div>
+                  </>
+                )}
               </div>
             ) : null}
           </div>
@@ -1406,6 +1484,7 @@ export function MembersView() {
         <AdminActions
           canAdmin={canAdmin}
           inviteBlob={state.inviteBlob}
+          inviteShort={state.inviteShort}
           pendingJoins={pendingJoins}
           onRevealInvite={actions.revealInvite}
           onAdmit={actions.admitMember}

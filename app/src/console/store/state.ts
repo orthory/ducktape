@@ -403,8 +403,11 @@ export interface ConsoleState {
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
-  /** The active workspace's invite blob, once revealed for sharing. */
+  /** The active workspace's full invite blob, once revealed for sharing. */
   inviteBlob: string | null;
+  /** The coordinator-hosted `🦆://<name>/<id>` short link for the revealed
+   *  invite, when the coordinator accepted it; null on the full-blob-only path. */
+  inviteShort: string | null;
 }
 
 export const DEFAULT_ACCENT = "#a05a3c";
@@ -835,6 +838,7 @@ export const createInitialState = (): ConsoleState => {
     deleteNeedsForce: null,
     onboardingPhase: null,
     inviteBlob: null,
+    inviteShort: null,
   };
 };
 

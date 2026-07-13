@@ -10,6 +10,7 @@ use lru::LruCache;
 use crate::AuthRequest;
 use crate::advert::{AdvertBook, AdvertOutcome};
 use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
+use crate::invite_store::{InviteStore, PutOutcome};
 use crate::{Msg, NodeKey};
 
 const AUTH_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -111,6 +112,8 @@ pub struct Coordinator {
     adverts: AdvertBook,
     auth: AuthVerifier,
     rejects: u64,
+    /// the short-invite shelf — bounded, content-addressed, untrusted storage.
+    invites: InviteStore,
 }
 
 impl Default for Coordinator {
@@ -119,6 +122,7 @@ impl Default for Coordinator {
             adverts: AdvertBook::default(),
             auth: AuthVerifier::new(AuthPolicy::default()), // fully-open
             rejects: 0,
+            invites: InviteStore::default(),
         }
     }
 }
@@ -138,6 +142,7 @@ impl Coordinator {
             adverts: AdvertBook::default(),
             auth: AuthVerifier::with_shared_policy(policy),
             rejects: 0,
+            invites: InviteStore::default(),
         }
     }
 
@@ -319,13 +324,55 @@ impl Coordinator {
                     CoordinatorReplies::from_iter([response])
                 }
             }
+            Msg::InvitePut {
+                key,
+                id,
+                expires_unix_secs,
+                blob,
+            } => {
+                // authenticated self-op (subject_key == caller enforced
+                // upstream); on the legacy path `caller` is None — allowed only
+                // under fully-open, the same trust bar as a bare Register.
+                let owner = caller.unwrap_or(key);
+                let ok = matches!(
+                    self.invites.put(owner, id, blob, expires_unix_secs, now),
+                    PutOutcome::Stored | PutOutcome::Replaced
+                );
+                CoordinatorReplies::from_iter([(from, Msg::InvitePutAck { id, ok })])
+            }
+            Msg::InviteGet {
+                id, chunk, pad, ..
+            } => {
+                // structural anti-amplification: the request datagram must be at
+                // least as big as the biggest reply we would send back to a
+                // (possibly spoofed) source, and the per-IP bucket must allow it.
+                if pad < crate::wire::INVITE_GET_PAD || !self.invites.allow_get(from.ip(), now) {
+                    return CoordinatorReplies::new();
+                }
+                let (bytes, total) = self
+                    .invites
+                    .chunk(id, chunk, now)
+                    .unwrap_or((Vec::new(), 0));
+                CoordinatorReplies::from_iter([(
+                    from,
+                    Msg::InviteChunk {
+                        id,
+                        chunk,
+                        total,
+                        bytes,
+                    },
+                )])
+            }
             // The coordinator never routes these through `handle`:
-            // BindResponse/LookupResponse/PunchSync/Punch are node-directed.
-            // Ignore defensively.
+            // BindResponse/LookupResponse/PunchSync/Punch are node-directed, and
+            // InvitePutAck/InviteChunk are the coordinator's own replies coming
+            // back. Ignore defensively.
             Msg::BindResponse { .. }
             | Msg::LookupResponse { .. }
             | Msg::PunchSync { .. }
-            | Msg::Punch { .. } => CoordinatorReplies::new(),
+            | Msg::Punch { .. }
+            | Msg::InvitePutAck { .. }
+            | Msg::InviteChunk { .. } => CoordinatorReplies::new(),
         }
     }
 
@@ -1045,5 +1092,95 @@ mod tests {
             !out.iter().any(|(dst, _)| *dst == attacker_src),
             "nothing is directed at the attacker's source"
         );
+    }
+
+    #[test]
+    fn authenticated_put_then_gets_reassemble_the_blob() {
+        use crate::auth::{AuthPolicy, now_secs, sign_authenticator};
+        use crate::invite_store::invite_id;
+        use commonware_cryptography::{Signer as _, ed25519};
+
+        let node = ed25519::PrivateKey::from_seed(1);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(node.public_key().as_ref());
+        let caller = NodeKey(k);
+        let now = now_secs();
+        let mut c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let src = addr(1, 1111);
+
+        let blob = vec![0xAB; 1500];
+        let id = invite_id(&blob);
+        let put = Msg::InvitePut {
+            key: caller,
+            id,
+            expires_unix_secs: now + 3600,
+            blob: blob.clone(),
+        };
+        let auth = sign_authenticator(&node, &put.encode(), now, None);
+        let out = c.handle_auth(src, AuthRequest { caller, inner: put, auth }, now);
+        assert_eq!(out, vec![(src, Msg::InvitePutAck { id, ok: true })]);
+
+        // the joiner (a DIFFERENT key) fetches both chunks, PoP-authenticated.
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let mut jk = [0u8; 32];
+        jk.copy_from_slice(joiner.public_key().as_ref());
+        let jcaller = NodeKey(jk);
+        let mut whole = Vec::new();
+        for chunk in 0..2u16 {
+            let get = Msg::InviteGet {
+                key: jcaller,
+                id,
+                chunk,
+                pad: crate::wire::INVITE_GET_PAD,
+            };
+            let auth = sign_authenticator(&joiner, &get.encode(), now, None);
+            let out = c.handle_auth(
+                addr(2, 2222),
+                AuthRequest { caller: jcaller, inner: get, auth },
+                now,
+            );
+            let [(_, Msg::InviteChunk { total: 2, bytes, .. })] = out.as_slice() else {
+                panic!("expected one InviteChunk, got {out:?}");
+            };
+            whole.extend_from_slice(bytes);
+        }
+        assert_eq!(whole, blob);
+    }
+
+    #[test]
+    fn an_underpadded_get_and_an_unknown_id_answer_safely() {
+        use crate::auth::{AuthPolicy, now_secs, sign_authenticator};
+        use crate::invite_store::{GET_BURST, invite_id};
+        use commonware_cryptography::{Signer as _, ed25519};
+
+        let joiner = ed25519::PrivateKey::from_seed(9);
+        let mut jk = [0u8; 32];
+        jk.copy_from_slice(joiner.public_key().as_ref());
+        let caller = NodeKey(jk);
+        let now = now_secs();
+        let mut c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let src = addr(3, 3333);
+        let send_get = |c: &mut Coordinator, id: [u8; 16], chunk: u16, pad: u16| {
+            let get = Msg::InviteGet { key: caller, id, chunk, pad };
+            let auth = sign_authenticator(&joiner, &get.encode(), now, None);
+            c.handle_auth(src, AuthRequest { caller, inner: get, auth }, now)
+        };
+
+        // pad below the floor → DROPPED, no reply (no reflection amplification).
+        let id = invite_id(&[1, 2, 3]);
+        assert!(send_get(&mut c, id, 0, crate::wire::INVITE_GET_PAD - 1).is_empty());
+
+        // unknown id, properly padded → total 0: the honest "link is dead" signal.
+        let out = send_get(&mut c, id, 0, crate::wire::INVITE_GET_PAD);
+        assert_eq!(
+            out,
+            vec![(src, Msg::InviteChunk { id, chunk: 0, total: 0, bytes: vec![] })]
+        );
+
+        // rate limit: exhausting the burst from one ip drops the next get.
+        for _ in 0..(GET_BURST - 1) {
+            assert!(!send_get(&mut c, id, 0, crate::wire::INVITE_GET_PAD).is_empty());
+        }
+        assert!(send_get(&mut c, id, 0, crate::wire::INVITE_GET_PAD).is_empty());
     }
 }
