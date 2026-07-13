@@ -85,6 +85,10 @@ describe("HomeView", () => {
 
     renderHome({ workspace: null, nodeUrl: null, connected: false });
 
+    const content = document.querySelector('[data-home-content="full-width"]') as HTMLElement;
+    expect(content).toHaveStyle({ width: "100%" });
+    expect(content.style.maxWidth).toBe("");
+
     // Profile + workspace table are machine-scoped and always render.
     expect(screen.getByDisplayValue("Rae")).toBeInTheDocument();
     expect(screen.getByText("YOUR WORKSPACES")).toBeInTheDocument();

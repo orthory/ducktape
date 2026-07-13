@@ -972,7 +972,7 @@ function PermissionsTab() {
           font: `400 12px ${font.sans}`,
           color: color.muted3,
           lineHeight: 1.55,
-          maxWidth: 680,
+          width: "100%",
         }}
       >
         This panel only distinguishes the roles this app can derive today: an
@@ -989,7 +989,8 @@ function PermissionsTab() {
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
           overflow: "hidden",
-          maxWidth: 680,
+          width: "100%",
+          boxSizing: "border-box",
           background: color.paper,
         }}
       >
@@ -1055,7 +1056,8 @@ function PermissionsTab() {
       <div
         style={{
           marginTop: 14,
-          maxWidth: 680,
+          width: "100%",
+          boxSizing: "border-box",
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
           padding: "15px 17px",

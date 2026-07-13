@@ -381,7 +381,10 @@ export function GatewayView() {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", background: color.sidebar }}>
-        <div style={{ maxWidth: 460, margin: "0 auto", padding: "22px 20px 40px" }}>
+        <div
+          data-gateway-content="full-width"
+          style={{ width: "100%", boxSizing: "border-box", padding: "22px 20px 40px" }}
+        >
           <p style={{ font: `400 11px/1.55 ${font.sans}`, color: color.muted3, margin: "0 0 14px" }}>
             Connect one account address to exact DuckFS content or a local HTTP service.
             The address, reverse proxy, and signed access policy are saved together.

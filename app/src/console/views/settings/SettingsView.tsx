@@ -62,7 +62,7 @@ export function SettingsView() {
         Settings
       </div>
 
-      <div style={{ maxWidth: 600 }}>
+      <div data-settings-content="full-width" style={{ width: "100%" }}>
         <AccountLinkSection />
 
         <PreferencesSection />
