@@ -22,6 +22,9 @@ export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_SITE_BYTES = 1024 * 1024 * 1024;
 export const MAX_MIME_BYTES = 128;
 export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+/** Explicit-audience ceiling. The UI must keep a selection under it — the
+ *  builder's cap below is only a backstop, and silently drops the overflow. */
+export const MAX_AUDIENCE_ACCOUNTS = 32;
 
 export interface RouteName {
   label: string | null;
@@ -252,7 +255,7 @@ export const validatePolicy = (policy: RoutePolicy): void => {
   }
   if (policy.audience.kind === "accounts") {
     const accounts = policy.audience.account_ids;
-    if (!Array.isArray(accounts) || accounts.length === 0 || accounts.length > 32) {
+    if (!Array.isArray(accounts) || accounts.length === 0 || accounts.length > MAX_AUDIENCE_ACCOUNTS) {
       throw new Error("gateway: invalid explicit audience");
     }
     let previousAccount: number[] | null = null;
@@ -269,8 +272,10 @@ export const validatePolicy = (policy: RoutePolicy): void => {
 };
 
 /** Build an explicit `accounts` audience from account-id hexes: decode each to
- * bytes, sort lexicographically, drop duplicates, and cap at 32. The owner is
- * never implicit; `validatePolicy` re-checks these bounds before signing. */
+ * bytes, sort lexicographically, drop duplicates, and cap at MAX_AUDIENCE_ACCOUNTS.
+ * The cap is a defensive backstop only — it drops the overflow silently, so
+ * callers (the picker) must not offer a selection past it. The owner is never
+ * implicit; `validatePolicy` re-checks these bounds before signing. */
 export const accountsAudience = (accountHex: string[]): RouteAudience => {
   const sorted = accountHex.map((hex) => Array.from(hexToBytes(hex))).sort(compareBytes);
   const account_ids: number[][] = [];
@@ -278,7 +283,7 @@ export const accountsAudience = (accountHex: string[]): RouteAudience => {
     const last = account_ids[account_ids.length - 1];
     if (!last || compareBytes(last, id) !== 0) account_ids.push(id);
   }
-  return { kind: "accounts", account_ids: account_ids.slice(0, 32) };
+  return { kind: "accounts", account_ids: account_ids.slice(0, MAX_AUDIENCE_ACCOUNTS) };
 };
 
 /** Mirrors `gateway::validate_manifest`. Content is opaque: no MIME whitelist. */

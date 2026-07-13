@@ -979,7 +979,11 @@ export function createActions({
 
   // switching channels means: new active channel, thread panel closed, any
   // channel-scoped tag filter/catalog dropped, and THAT channel's messages
-  // loaded — every path into a channel goes here
+  // loaded — every path into a channel goes here.
+  // The pending jump-to-message focus is channel-scoped too: leaving before
+  // ChatView consumed it would otherwise flash whatever message happens to
+  // carry that seq in the channel we land in. focusMessage relies on the
+  // ordering — it calls this first, THEN latches its own seq.
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
@@ -992,6 +996,7 @@ export function createActions({
       tagHitsPending: false,
       channelTags: [],
       channelMembers: [],
+      chatFocusSeq: null,
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))

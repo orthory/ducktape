@@ -93,19 +93,22 @@ function Toggle({
   accent,
   onToggle,
   disabled = false,
+  ariaLabel,
 }: {
   checked: boolean;
   name: string;
   accent: string;
   onToggle: () => void;
   disabled?: boolean;
+  /** Override for rows this switch does not gate notifications for. */
+  ariaLabel?: string;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
-      aria-label={`Toggle ${name} notifications`}
+      aria-label={ariaLabel ?? `Toggle ${name} notifications`}
       disabled={disabled}
       onClick={disabled ? undefined : onToggle}
       style={{
@@ -156,6 +159,7 @@ export function PreferencesSection() {
           control={
             <Toggle
               name="theme"
+              ariaLabel="Toggle dark mode"
               checked={state.theme === "dark"}
               accent={state.accent}
               onToggle={actions.toggleTheme}

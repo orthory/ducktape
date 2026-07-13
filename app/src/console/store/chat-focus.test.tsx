@@ -155,4 +155,22 @@ describe("focusMessage", () => {
     });
     expect(screen.getByTestId("focus").textContent).toBe("null");
   });
+
+  it("switching channels drops a focus ChatView never consumed", async () => {
+    await bootConnected();
+
+    // jump to a message, then leave for another channel via the rail before
+    // ChatView acted on the seq — the stale focus must not ride along and
+    // flash whatever message carries seq 7 over there.
+    await act(async () => {
+      actions!.focusMessage("general", 7);
+    });
+    expect(screen.getByTestId("focus").textContent).toBe("7");
+
+    await act(async () => {
+      actions!.selectChannel("random");
+    });
+    expect(screen.getByTestId("channel").textContent).toBe("random");
+    expect(screen.getByTestId("focus").textContent).toBe("null");
+  });
 });
