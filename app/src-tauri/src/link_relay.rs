@@ -17,7 +17,8 @@
 //! approves the response and signs `AddMemberKey` with the account key. A
 //! rogue LAN peer can at most offer a candidate response the user must still
 //! approve. The fragment-carried token, the bind-only-while-the-panel-is-open
-//! lifetime, and strict blob shape checks are defense-in-depth on top.
+//! lifetime, the advertised-interface-only bind, and strict blob shape checks
+//! are defense-in-depth on top.
 
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
@@ -28,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use tiny_http::{Method, Request, Response, Server};
 
 use crate::daemon::require_main_window;
-use crate::lan_http::{html, json, lan_ipv4, random_token, read_json, serve, status, token_matches};
+use crate::lan_http::{
+    html, json, lan_ipv4, lan_server, random_token, read_json, serve, status, token_matches,
+};
 
 // ── blob shapes (mirrors link-device.ts, relay-side checks only) ─────────
 
@@ -166,12 +169,7 @@ pub fn link_relay_start(
     }
     let token = random_token()?;
     let ip = lan_ipv4()?;
-    let server = Arc::new(Server::http("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?);
-    let port = server
-        .server_addr()
-        .to_ip()
-        .ok_or("server has no ip address")?
-        .port();
+    let (server, port) = lan_server(ip)?;
 
     {
         let mut guard = state();
