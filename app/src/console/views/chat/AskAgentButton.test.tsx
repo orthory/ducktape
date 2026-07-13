@@ -87,6 +87,9 @@ describe("AskAgentButton", () => {
     fireEvent.click(screen.getByTitle("Ask an agent to respond"));
     expect(screen.getByText("ASK TO RESPOND")).toBeTruthy();
 
+    // The resource inputs stay tucked behind the disclosure by default.
+    expect(screen.queryByLabelText("CORES")).toBeNull();
+
     fireEvent.click(screen.getByText("@scribe"));
     expect(requestRun).toHaveBeenCalledWith({
       agentId: "scribe",
@@ -100,9 +103,14 @@ describe("AskAgentButton", () => {
     const requestRun = renderRow([agent("scribe")]);
     fireEvent.click(screen.getByTitle("Ask an agent to respond"));
 
+    // Inputs live behind the "Resources" disclosure now — expand it first.
+    fireEvent.click(screen.getByTitle("Set resource limits"));
     fireEvent.change(screen.getByLabelText("CORES"), { target: { value: "4" } });
     // Zero is invalid on the wire — it must be dropped, not sent as mem_gb: 0.
     fireEvent.change(screen.getByLabelText("MEMORY (GB)"), { target: { value: "0" } });
+
+    // The collapsed summary reflects the entered dimension.
+    expect(screen.getByText("· 4 cores")).toBeTruthy();
 
     fireEvent.click(screen.getByText("@scribe"));
     expect(requestRun).toHaveBeenCalledWith({
