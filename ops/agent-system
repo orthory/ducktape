@@ -1,0 +1,287 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const stateFile = path.join(os.homedir(), ".ducktape", "agent-system-url");
+const usage = `usage: ops/agent-system <command> [args]
+
+  use URL                         remember one local node
+  url | status                    show the selected node or compact status
+  q TARGET QUERY_JSON             raw module query
+  s TARGET PAYLOAD_JSON           raw module submit
+  agents [ID]                     list agents or show one
+  pause|resume ID                 change an agent status
+  pending | recent [N]            compact Run state
+  run AGENT CHANNEL SEQ CORES GB  request a bounded Run
+  wait AGENT [SECONDS]            wait until that agent has no pending Run
+  chat CHANNEL [N]                compact channel messages
+  post CHANNEL MESSAGE_ID [TEXT]  post text; read stdin when TEXT is omitted
+  item NUMBER                     show one ducktape Forge item
+  head | find PREFIX | read PATH  DuckFS helpers
+  block ID | block-set ID [TEXT]  Pages block helpers
+  cgroup PID                      show CPU, memory, and swap limits
+`;
+
+const die = (message, code = 1) => {
+  console.error(message);
+  process.exit(code);
+};
+
+const compact = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+const integer = (value, name) => {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) die(`${name} must be a positive integer`);
+  return n;
+};
+
+const rememberedUrl = () => {
+  if (process.env.DUCKTAPE_URL) return process.env.DUCKTAPE_URL;
+  try {
+    return fs.readFileSync(stateFile, "utf8").trim();
+  } catch {
+    // Fall through to the active desktop workspace.
+  }
+  try {
+    const registry = JSON.parse(
+      fs.readFileSync(path.join(os.homedir(), ".ducktape", "registry.json"), "utf8"),
+    );
+    const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
+    if (active?.ports?.http) return `http://127.0.0.1:${active.ports.http}`;
+  } catch {
+    // Fall through to the legacy default.
+  }
+  return "http://127.0.0.1:8844";
+};
+
+let base = rememberedUrl().replace(/\/$/, "");
+
+const request = async (pathname, options = {}) => {
+  const response = await fetch(`${base}${pathname}`, options);
+  const text = await response.text();
+  if (!response.ok) die(text || `${response.status} ${response.statusText}`);
+  return text ? JSON.parse(text) : null;
+};
+
+const post = (pathname, body) =>
+  request(pathname, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+const query = (target, queryBody) => post("/v1/query", { target, query: queryBody });
+const submit = (target, payload) => post("/v1/submit", { target, payload });
+const receipt = (value) =>
+  console.log(`height=${value.height} app=${value.appHash}${value.opHash ? ` op=${value.opHash}` : ""}`);
+
+const stdin = async () => {
+  let text = "";
+  for await (const chunk of process.stdin) text += chunk;
+  return text;
+};
+const textArg = async (args, start) =>
+  args.length > start ? args.slice(start).join(" ") : stdin();
+const author = (value) => {
+  if (value === "system") return "system";
+  if (value.agent) return `${value.agent.agent_id}@agents.duck`;
+  if (value.module) return value.module;
+  if (value.user) return `${Buffer.from(value.user).toString("hex").slice(0, 8)}…`;
+  return "unknown";
+};
+const blockText = (blocks) =>
+  blocks
+    .map((block) => {
+      if (typeof block === "string") return block;
+      if (block.paragraph) return block.paragraph.map((span) => span.text).join("");
+      if (block.quote) return block.quote.map((span) => span.text).join("");
+      return block.code?.text ?? "";
+    })
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
+
+const [command, ...args] = process.argv.slice(2);
+if (!command || command === "help" || command === "--help") {
+  process.stdout.write(usage);
+  process.exit(0);
+}
+
+switch (command) {
+  case "use": {
+    if (!args[0]) die(usage);
+    const selected = new URL(args[0]);
+    if (!["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname))
+      die("the local-trust node URL must be loopback");
+    base = selected.toString().replace(/\/$/, "");
+    await request("/v1/status");
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, `${base}\n`, { mode: 0o600 });
+    console.log(base);
+    break;
+  }
+  case "url":
+    console.log(base);
+    break;
+  case "status": {
+    const value = await request("/v1/status");
+    const key = value.publicKey ?? value.public_key ?? value.node_key ?? "unknown";
+    console.log(`${key}@nodes.duck height=${value.height ?? "?"} app=${value.appHash ?? value.app_hash ?? "?"}`);
+    break;
+  }
+  case "q":
+    compact(await query(args[0], JSON.parse(args[1])));
+    break;
+  case "s":
+    receipt(await submit(args[0], JSON.parse(args[1])));
+    break;
+  case "agents": {
+    const value = args[0]
+      ? (await query("agent", { agent: { agent_id: args[0] } })).agent
+      : (await query("agent", "agents")).agents;
+    if (!Array.isArray(value)) {
+      compact(value);
+    } else {
+      for (const agent of value)
+        console.log(
+          `${agent.agent_id} ${agent.status} ${agent.capability} actions=${agent.allowed_actions.join(",")}`,
+        );
+    }
+    break;
+  }
+  case "pause":
+  case "resume":
+    receipt(await submit("agent", { [`${command}_agent`]: { agent_id: args[0] } }));
+    break;
+  case "pending": {
+    const runs = (await query("runs", "pending_runs")).pending_runs;
+    for (const run of runs) console.log(`${run.agent_id} seq=${run.anchor_seq} ${run.channel_id} ${run.run_id}`);
+    break;
+  }
+  case "recent": {
+    const limit = args[0] ? integer(args[0], "N") : 10;
+    const runs = (await query("runs", "recent_runs")).recent_runs.slice(0, limit);
+    for (const run of runs)
+      console.log(`${run.agent_id} ${run.outcome}${run.degraded ? "/degraded" : ""} ${run.executing_node}@nodes.duck ${run.channel_id}:${run.anchor_seq}`);
+    break;
+  }
+  case "run": {
+    const [agent_id, channel_id, seq, cores, mem] = args;
+    receipt(
+      await submit("runs", {
+        request_run: {
+          agent_id,
+          channel_id,
+          anchor_seq: integer(seq, "SEQ"),
+          demands: { cores: integer(cores, "CORES"), mem_gb: integer(mem, "GB") },
+        },
+      }),
+    );
+    break;
+  }
+  case "wait": {
+    const [agent] = args;
+    const seconds = args[1] ? integer(args[1], "SECONDS") : 120;
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      const runs = (await query("runs", "pending_runs")).pending_runs;
+      if (!runs.some((run) => run.agent_id === agent)) {
+        console.log("done");
+        process.exit(0);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    die("timeout", 124);
+    break;
+  }
+  case "chat": {
+    const limit = args[1] ? integer(args[1], "N") : 20;
+    const messages = (
+      await query("chat", { messages_latest: { channel_id: args[0], limit } })
+    ).messages;
+    for (const message of messages)
+      console.log(`${message.seq} ${author(message.head.author)} ${blockText(message.head.blocks)}`);
+    break;
+  }
+  case "post": {
+    const text = await textArg(args, 2);
+    receipt(
+      await submit("chat", {
+        post_message: {
+          channel_id: args[0],
+          message_id: args[1],
+          blocks: [{ paragraph: [{ text, marks: [] }] }],
+          thread: null,
+          as_agent: null,
+        },
+      }),
+    );
+    break;
+  }
+  case "item": {
+    const value = (
+      await query("forge", {
+        get_item: { repo: "ducktape", number: integer(args[0], "NUMBER") },
+      })
+    ).item;
+    if (!value) die("item not found");
+    console.log(`#${value.number} ${value.kind} ${value.state} ${value.title}`);
+    break;
+  }
+  case "head":
+    console.log((await query("files", { refs: {} })).refs.head ?? "empty");
+    break;
+  case "find": {
+    let after = null;
+    do {
+      const value = await query("files", {
+        find: { prefix: args[0], snapshot: null, after, limit: 256 },
+      });
+      for (const entry of value.find.entries) console.log(`${entry.kind} ${entry.path}`);
+      after = value.find.next;
+    } while (after);
+    break;
+  }
+  case "read": {
+    let offset = 0;
+    for (;;) {
+      const params = new URLSearchParams({
+        path: args[0],
+        offset: String(offset),
+        len: "1048576",
+      });
+      const value = await request(`/v1/files/read?${params}`);
+      const bytes = Buffer.from(value.b64, "base64");
+      process.stdout.write(bytes);
+      if (value.eof) break;
+      if (!bytes.length) die("DuckFS read returned no bytes before eof");
+      offset += bytes.length;
+    }
+    break;
+  }
+  case "block":
+    compact(await query("pages", { get_block: { block_id: args[0] } }));
+    break;
+  case "block-set":
+    receipt(
+      await submit("pages", {
+        update_text: { block_id: args[0], text: await textArg(args, 1) },
+      }),
+    );
+    break;
+  case "cgroup": {
+    const pid = integer(args[0], "PID");
+    const group = fs
+      .readFileSync(`/proc/${pid}/cgroup`, "utf8")
+      .split("\n")
+      .find((line) => line.startsWith("0::"))
+      ?.slice(3);
+    if (!group) die(`no cgroup v2 entry for ${pid}`);
+    console.log(group);
+    for (const name of ["cpu.max", "memory.max", "memory.current", "memory.swap.max", "memory.swap.current"])
+      console.log(`${name}=${fs.readFileSync(path.join("/sys/fs/cgroup", group, name), "utf8").trim()}`);
+    break;
+  }
+  default:
+    die(usage);
+}
