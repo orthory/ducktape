@@ -22,7 +22,7 @@
 //!   an actual trigger → result → callback flow into the agent module.
 
 use agent::{
-    AgentModule, AgentMsg, AgentQuery, AgentReply, LoadMode, ResourceCaps, SkillRef,
+    AgentModule, AgentMsg, AgentQuery, AgentReply, AgentRole, LoadMode, ResourceCaps, SkillRef,
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
     MAX_AGENT_ID_LEN, MAX_SKILLS_PER_AGENT, RECIPE_HASH_LEN,
 };
@@ -453,6 +453,37 @@ async fn same_ops_inner() {
     )
     .await;
 
+    // ---- semantic roles are committed, owner-gated, hook-silent state. The
+    // second assignment is an idempotent no-op on both runtimes.
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        8,
+        owner.clone(),
+        agent_op(&AgentMsg::SetAgentRole {
+            agent_id: "quacksmith".into(),
+            role: AgentRole::ProjectLibrarian,
+        }),
+        true,
+        false,
+    )
+    .await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        9,
+        owner.clone(),
+        agent_op(&AgentMsg::SetAgentRole {
+            agent_id: "quacksmith".into(),
+            role: AgentRole::ProjectLibrarian,
+        }),
+        false,
+        false,
+    )
+    .await;
+
     // ---- the saga DEAD-LETTER lane: a foreign trigger points its callback
     // at the agent module; the terminal result's same-block callback must be
     // swallowed as a no-op breadcrumb on BOTH runtimes (the agent root holds
@@ -460,7 +491,7 @@ async fn same_ops_inner() {
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     for host in [&mut native, &mut wasm] {
         host.submit_at(
-            block(8, stranger.clone()),
+            block(10, stranger.clone()),
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::Trigger {
@@ -482,7 +513,7 @@ async fn same_ops_inner() {
     }
     let n_out = native
         .submit_at(
-            block(9, stranger.clone()),
+            block(11, stranger.clone()),
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
@@ -497,7 +528,7 @@ async fn same_ops_inner() {
         .expect("native result");
     let w_out = wasm
         .submit_at(
-            block(9, stranger.clone()),
+            block(11, stranger.clone()),
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
