@@ -12,6 +12,7 @@ import {
   agentAddress,
   agents,
   hexToBytes,
+  KNOWN_ACTIONS,
   pauseAgent,
   registerAgent,
   resumeAgent,
@@ -34,6 +35,12 @@ describe("hexToBytes", () => {
 
   it("decodes a mixed digest positionally", () => {
     expect(hexToBytes("00ff10")).toEqual([0, 255, 16]);
+  });
+});
+
+describe("KNOWN_ACTIONS", () => {
+  it("includes the DuckFS text write grant surfaced by the agent module", () => {
+    expect(KNOWN_ACTIONS).toContain("duckfs.write_text");
   });
 });
 

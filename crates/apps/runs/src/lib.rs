@@ -134,7 +134,9 @@ use dispatch::{
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
 use duckfs_core::{
-    FilesQuery, FilesReply, decode_reply as files_decode_reply, encode_query as files_encode_query,
+    Change as FilesChange, Content as FilesContent, FilesMsg, FilesQuery, FilesReply,
+    decode_reply as files_decode_reply, encode_msg as files_encode_msg,
+    encode_query as files_encode_query,
 };
 use jobs::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,

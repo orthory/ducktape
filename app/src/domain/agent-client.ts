@@ -113,6 +113,7 @@ export const KNOWN_ACTIONS = [
   "tasks.update_status",
   "pages.comment",
   "pages.set_checked",
+  "duckfs.write_text",
 ] as const;
 
 // ── Hex helper ──────────────────────────────────────────

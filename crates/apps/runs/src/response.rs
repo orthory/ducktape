@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
 
+use agent::{CapRequest, MAX_DUCKFS_WRITE_TEXT_BYTES};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use duckfs_core::paths::canonical as canonical_duckfs_path;
+
 use super::facets::{
     WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, output_ref_of,
     valid_data,
@@ -7,10 +12,12 @@ use super::facets::{
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
     Block, ChatMsg, ChatQuery, ChatReply, Ctx, Error, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
-    MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ResultEvent,
-    RunsModule, SagaOrigin, TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply,
-    chat_encode_msg, chat_encode_query, decode_result_event, page_thread_id, reply_message_id,
-    tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
+    FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply, MAX_REPLY_BLOCKS_BYTES,
+    MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin,
+    TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
+    chat_encode_query, decode_result_event, files_decode_reply, files_encode_msg,
+    files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply, tasks_encode_msg,
+    tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
@@ -598,6 +605,14 @@ impl RunsModule {
                         return Err(format!("unknown task: {task_id}"));
                     }
                 }
+                AgentAction::DuckfsWriteText {
+                    path,
+                    text,
+                    base_snapshot,
+                } => {
+                    validate_duckfs_text_write(&agent, path, text)?;
+                    self.validate_duckfs_write_base(ctx, base_snapshot).await?;
+                }
                 AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
                     unreachable!("pages actions are skipped above")
                 }
@@ -823,6 +838,33 @@ impl RunsModule {
         }
     }
 
+    async fn validate_duckfs_write_base(
+        &self,
+        ctx: &dyn Ctx,
+        base_snapshot: &Option<String>,
+    ) -> Result<(), String> {
+        let files = self
+            .files
+            .as_ref()
+            .ok_or_else(|| "no files module is configured".to_string())?;
+        let reply = ctx
+            .query(files, &files_encode_query(&FilesQuery::Refs {}))
+            .await
+            .map_err(|e| format!("files refs query failed: {e}"))?;
+        let current = match files_decode_reply(&reply) {
+            Ok(FilesReply::Refs(info)) => info.head,
+            Ok(_) => return Err("unexpected files reply for a refs query".into()),
+            Err(e) => return Err(format!("files refs reply failed to decode: {e}")),
+        };
+        if base_snapshot != &current {
+            return Err(format!(
+                "duckfs.write_text base snapshot is stale: signed {:?}, current {:?}",
+                base_snapshot, current
+            ));
+        }
+        Ok(())
+    }
+
     /// surface a failed CHAT run as a threaded reply authored by the agent —
     /// same message id as a success reply would use, so the one-reply-per-run
     /// dedup holds and a redelivered result (entry already pruned) can never
@@ -981,6 +1023,25 @@ impl RunsModule {
                         status: task_status(&status).expect("status was validated"),
                     }),
                 },
+                AgentAction::DuckfsWriteText {
+                    path,
+                    text,
+                    base_snapshot,
+                } => Msg {
+                    target: self.files_target(),
+                    payload: files_encode_msg(&FilesMsg::Commit {
+                        base_snapshot,
+                        message: "agent duckfs.write_text".into(),
+                        changes: vec![FilesChange::Put {
+                            path,
+                            exec: false,
+                            meta: BTreeMap::new(),
+                            content: FilesContent::Inline {
+                                b64: STANDARD.encode(text.as_bytes()),
+                            },
+                        }],
+                    }),
+                },
                 // pages actions were already applied by `emit_pages_effects`
                 // (its own lane: probes, cap gate, per-action degrade).
                 AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => continue,
@@ -993,5 +1054,85 @@ impl RunsModule {
         self.tasks
             .clone()
             .expect("task actions were validated against a configured tasks module")
+    }
+
+    fn files_target(&self) -> super::ModuleId {
+        self.files
+            .clone()
+            .expect("duckfs writes were validated against a configured files module")
+    }
+}
+
+fn validate_duckfs_text_write(
+    agent: &AgentRecord,
+    path: &str,
+    text: &str,
+) -> Result<(), String> {
+    canonical_duckfs_path(path)?;
+    if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
+        return Err(format!(
+            "duckfs.write_text content is {} bytes; the cap is {MAX_DUCKFS_WRITE_TEXT_BYTES}",
+            text.len()
+        ));
+    }
+    if !agent.permits(&CapRequest::DuckfsWrite(path)) {
+        return Err(format!("agent {} may not write duckfs path {path}", agent.agent_id));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::{AgentStatus, ResourceCaps};
+
+    fn agent_with_write(prefix: &str) -> AgentRecord {
+        AgentRecord {
+            agent_id: "bot".into(),
+            owner: SagaOrigin::System,
+            display_name: "Bot".into(),
+            capability: "codex".into(),
+            allowed_actions: vec![agent::ACTION_DUCKFS_WRITE_TEXT.into()],
+            status: AgentStatus::Active,
+            created_at: 0,
+            updated_at: 0,
+            recipe_hash: Vec::new(),
+            caps: ResourceCaps {
+                duckfs_write: vec![prefix.into()],
+                ..Default::default()
+            },
+            skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn duckfs_text_write_validation_is_path_size_and_cap_gated() {
+        let agent = agent_with_write("/shared/agents/qa-fixer");
+        validate_duckfs_text_write(
+            &agent,
+            "/shared/agents/qa-fixer/self-improvement/SKILL.md",
+            "lesson",
+        )
+        .expect("granted path");
+
+        let sibling = validate_duckfs_text_write(
+            &agent,
+            "/shared/agents/qa-fixer-policy/SKILL.md",
+            "lesson",
+        )
+        .unwrap_err();
+        assert!(sibling.contains("may not write duckfs path"), "{sibling}");
+
+        let relative = validate_duckfs_text_write(&agent, "shared/out.txt", "lesson").unwrap_err();
+        assert!(relative.contains("path must be absolute"), "{relative}");
+
+        let too_large = "x".repeat(MAX_DUCKFS_WRITE_TEXT_BYTES + 1);
+        let oversized = validate_duckfs_text_write(
+            &agent,
+            "/shared/agents/qa-fixer/self-improvement/SKILL.md",
+            &too_large,
+        )
+        .unwrap_err();
+        assert!(oversized.contains("the cap is"), "{oversized}");
     }
 }
