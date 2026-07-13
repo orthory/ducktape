@@ -16,6 +16,8 @@ import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/ch
 import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
+import { AttachmentChip } from "./AttachmentChip";
+import { isAttachment, splitAttachments } from "./attachments";
 import { splitMentions } from "./chat-input";
 import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from "./mention";
 import { isPageRef, splitPageRefs } from "./page-ref";
@@ -247,13 +249,21 @@ function SpanText({
       </a>
     );
   }
+  // Attachments split FIRST (a duck://files URI can never contain `[[page:`,
+  // but a literal run around one still page-ref-splits normally).
   return (
     <span style={style}>
-      {splitPageRefs(span.text).map((segment, i) =>
-        isPageRef(segment) ? (
-          <PageRefChip key={i} pageId={segment.pageId} />
+      {splitAttachments(span.text).map((outer, i) =>
+        isAttachment(outer) ? (
+          <AttachmentChip key={i} attachment={outer.attachment} />
         ) : (
-          <LiteralRun key={i} text={segment.text} onTagClick={onTagClick} />
+          splitPageRefs(outer.text).map((segment, j) =>
+            isPageRef(segment) ? (
+              <PageRefChip key={`${i}-${j}`} pageId={segment.pageId} />
+            ) : (
+              <LiteralRun key={`${i}-${j}`} text={segment.text} onTagClick={onTagClick} />
+            ),
+          )
         ),
       )}
     </span>
