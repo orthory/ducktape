@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 import * as browser from "../../../domain/duck-browser";
+import { classifyDuckRef } from "../../../domain/duck-uri";
 import * as gateway from "../../../domain/gateway-client";
 import type { LoadedDuckPage } from "../../../domain/duck-browser";
 import { Icon } from "../../components/Icon";
+import { openDuckRef } from "../../store/open-duck-ref";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, tint } from "../../theme/tokens";
 
@@ -70,7 +72,7 @@ const freshTab = (id: string): BrowserTab => ({
 });
 
 export function BrowserView({ visible = true }: { visible?: boolean }) {
-  const { transport } = useDucktape();
+  const { transport, actions } = useDucktape();
   const nextTab = useRef(2);
   const [tabs, setTabs] = useState<BrowserTab[]>(() => [freshTab("tab-1")]);
   const tabsRef = useRef(tabs);
@@ -125,6 +127,20 @@ export function BrowserView({ visible = true }: { visible?: boolean }) {
   }, [active.id, page, error, updateTab, visible]);
 
   const open = useCallback(async (raw: string, addHistory = true, tabId = activeId) => {
+    // A module-plane URI (`duck://<module>/…`, dotless authority) is an in-app
+    // deep link, not a browsable address — hand it to the protocol's open
+    // plane. Gateway addresses (dotted, `.duck`) fall through untouched, and a
+    // dotless input that doesn't classify keeps parseDuckAddress's error.
+    const trimmed = raw.trim();
+    const moduleRef = classifyDuckRef(
+      /^duck:\/\//i.test(trimmed) ? trimmed : `duck://${trimmed}`,
+      "",
+      false,
+    );
+    if (moduleRef) {
+      openDuckRef(moduleRef, actions);
+      return;
+    }
     if (!transport) {
       updateTab(tabId, (tab) => ({ ...tab, error: "Connect a workspace to browse .duck routes." }));
       return;
@@ -156,7 +172,7 @@ export function BrowserView({ visible = true }: { visible?: boolean }) {
     } finally {
       updateTab(tabId, (tab) => ({ ...tab, loading: false }));
     }
-  }, [activeId, transport, updateTab]);
+  }, [actions, activeId, transport, updateTab]);
 
   const goHistory = (nextIndex: number): void => {
     const address = history[nextIndex];

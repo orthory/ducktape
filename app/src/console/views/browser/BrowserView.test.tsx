@@ -148,3 +148,35 @@ describe("BrowserView security boundary", () => {
     expect(screen.getAllByRole("tab")).toHaveLength(2);
   });
 });
+
+describe("module-plane duck:// handoff", () => {
+  it("hands a module URI to the app's open plane instead of browsing it", () => {
+    const nav = {
+      openPage: vi.fn(),
+      openFiles: vi.fn(),
+      openForgeItem: vi.fn(),
+      selectChannel: vi.fn(),
+      focusMessage: vi.fn(),
+      setScreen: vi.fn(),
+    } as unknown as ConsoleActions;
+    const load = vi.spyOn(duckBrowser, "loadDuckPage");
+    render(
+      <ConsoleContext.Provider
+        value={{
+          state: { ...createInitialState(), connected: true },
+          actions: nav,
+          transport: makeTransportStub(),
+        }}
+      >
+        <BrowserView />
+      </ConsoleContext.Provider>,
+    );
+
+    const box = screen.getByRole("textbox", { name: "Duck address" });
+    fireEvent.change(box, { target: { value: "duck://forge/ducktape/58" } });
+    fireEvent.submit(box.closest("form")!);
+
+    expect(nav.openForgeItem).toHaveBeenCalledWith({ repo: "ducktape", number: 58 });
+    expect(load).not.toHaveBeenCalled();
+  });
+});
