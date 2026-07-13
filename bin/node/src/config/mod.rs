@@ -395,6 +395,26 @@ pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String>
     }
 }
 
+/// Resolve the ambient coordinator to a concrete dial [`SocketAddr`] — the form
+/// the short-invite publish/fetch clients bind against. A hostname coordinator
+/// (the shipped default) is resolved through the system resolver here, once.
+/// `None` when coordination is disabled.
+pub fn coordinator_socket_addr(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    use std::net::ToSocketAddrs as _;
+    let Some(ingress) = coordinator_ingress(raw)? else {
+        return Ok(None);
+    };
+    let addr = match ingress {
+        Ingress::Socket(addr) => addr,
+        Ingress::Dns { host, port } => (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| format!("coordinator {host:?}:{port} did not resolve: {e}"))?
+            .next()
+            .ok_or_else(|| format!("coordinator {host:?}:{port} resolved to no addresses"))?,
+    };
+    Ok(Some(addr))
+}
+
 impl NetworkDescriptor {
     pub fn coordination(&self) -> Coordination {
         match self.coordination.as_deref() {
