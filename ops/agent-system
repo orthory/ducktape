@@ -30,10 +30,34 @@ const die = (message, code = 1) => {
 };
 
 const compact = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+const need = (args, count) => {
+  if (args.length < count || args.slice(0, count).some((value) => !value)) die(usage);
+};
 const integer = (value, name) => {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 1) die(`${name} must be a positive integer`);
   return n;
+};
+const json = (value) => {
+  try {
+    return JSON.parse(value);
+  } catch {
+    die("invalid JSON");
+  }
+};
+const localUrl = (value) => {
+  let selected;
+  try {
+    selected = new URL(value);
+  } catch {
+    die("node URL is invalid");
+  }
+  if (
+    selected.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname)
+  )
+    die("the local-trust node URL must be loopback HTTP");
+  return selected.toString().replace(/\/$/, "");
 };
 
 const rememberedUrl = () => {
@@ -55,10 +79,15 @@ const rememberedUrl = () => {
   return "http://127.0.0.1:8844";
 };
 
-let base = rememberedUrl().replace(/\/$/, "");
+let base = localUrl(rememberedUrl());
 
 const request = async (pathname, options = {}) => {
-  const response = await fetch(`${base}${pathname}`, options);
+  let response;
+  try {
+    response = await fetch(`${base}${pathname}`, options);
+  } catch (error) {
+    die(error instanceof Error ? error.message : String(error));
+  }
   const text = await response.text();
   if (!response.ok) die(text || `${response.status} ${response.statusText}`);
   return text ? JSON.parse(text) : null;
@@ -89,8 +118,8 @@ const author = (value) => {
   if (value.user) return `${Buffer.from(value.user).toString("hex").slice(0, 8)}…`;
   return "unknown";
 };
-const blockText = (blocks) =>
-  blocks
+const blockText = (blocks) => {
+  const text = blocks
     .map((block) => {
       if (typeof block === "string") return block;
       if (block.paragraph) return block.paragraph.map((span) => span.text).join("");
@@ -98,8 +127,9 @@ const blockText = (blocks) =>
       return block.code?.text ?? "";
     })
     .join(" ")
-    .replace(/\s+/g, " ")
-    .slice(0, 240);
+    .replace(/\s+/g, " ");
+  return text.length > 240 ? `${text.slice(0, 239)}…` : text;
+};
 
 const [command, ...args] = process.argv.slice(2);
 if (!command || command === "help" || command === "--help") {
@@ -109,11 +139,8 @@ if (!command || command === "help" || command === "--help") {
 
 switch (command) {
   case "use": {
-    if (!args[0]) die(usage);
-    const selected = new URL(args[0]);
-    if (!["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname))
-      die("the local-trust node URL must be loopback");
-    base = selected.toString().replace(/\/$/, "");
+    need(args, 1);
+    base = localUrl(args[0]);
     await request("/v1/status");
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, `${base}\n`, { mode: 0o600 });
@@ -130,10 +157,12 @@ switch (command) {
     break;
   }
   case "q":
-    compact(await query(args[0], JSON.parse(args[1])));
+    need(args, 2);
+    compact(await query(args[0], json(args[1])));
     break;
   case "s":
-    receipt(await submit(args[0], JSON.parse(args[1])));
+    need(args, 2);
+    receipt(await submit(args[0], json(args[1])));
     break;
   case "agents": {
     const value = args[0]
@@ -151,6 +180,7 @@ switch (command) {
   }
   case "pause":
   case "resume":
+    need(args, 1);
     receipt(await submit("agent", { [`${command}_agent`]: { agent_id: args[0] } }));
     break;
   case "pending": {
@@ -166,6 +196,7 @@ switch (command) {
     break;
   }
   case "run": {
+    need(args, 5);
     const [agent_id, channel_id, seq, cores, mem] = args;
     receipt(
       await submit("runs", {
@@ -180,6 +211,7 @@ switch (command) {
     break;
   }
   case "wait": {
+    need(args, 1);
     const [agent] = args;
     const seconds = args[1] ? integer(args[1], "SECONDS") : 120;
     const deadline = Date.now() + seconds * 1000;
@@ -195,6 +227,7 @@ switch (command) {
     break;
   }
   case "chat": {
+    need(args, 1);
     const limit = args[1] ? integer(args[1], "N") : 20;
     const messages = (
       await query("chat", { messages_latest: { channel_id: args[0], limit } })
@@ -204,6 +237,7 @@ switch (command) {
     break;
   }
   case "post": {
+    need(args, 2);
     const text = await textArg(args, 2);
     receipt(
       await submit("chat", {
@@ -219,6 +253,7 @@ switch (command) {
     break;
   }
   case "item": {
+    need(args, 1);
     const value = (
       await query("forge", {
         get_item: { repo: "ducktape", number: integer(args[0], "NUMBER") },
@@ -232,17 +267,24 @@ switch (command) {
     console.log((await query("files", { refs: {} })).refs.head ?? "empty");
     break;
   case "find": {
+    need(args, 1);
     let after = null;
-    do {
+    const seen = new Set();
+    for (let page = 0; page < 4096; page += 1) {
+      if (seen.has(after)) die("DuckFS find cursor did not advance");
+      seen.add(after);
       const value = await query("files", {
         find: { prefix: args[0], snapshot: null, after, limit: 256 },
       });
       for (const entry of value.find.entries) console.log(`${entry.kind} ${entry.path}`);
       after = value.find.next;
-    } while (after);
+      if (!after) break;
+      if (page === 4095) die("DuckFS find exceeded 4096 pages");
+    }
     break;
   }
   case "read": {
+    need(args, 1);
     let offset = 0;
     for (;;) {
       const params = new URLSearchParams({
@@ -260,9 +302,11 @@ switch (command) {
     break;
   }
   case "block":
+    need(args, 1);
     compact(await query("pages", { get_block: { block_id: args[0] } }));
     break;
   case "block-set":
+    need(args, 1);
     receipt(
       await submit("pages", {
         update_text: { block_id: args[0], text: await textArg(args, 1) },
@@ -270,6 +314,7 @@ switch (command) {
     );
     break;
   case "cgroup": {
+    need(args, 1);
     const pid = integer(args[0], "PID");
     const group = fs
       .readFileSync(`/proc/${pid}/cgroup`, "utf8")
