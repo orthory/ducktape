@@ -6,12 +6,12 @@ use std::time::Duration;
 /// the highest protocol version THIS binary's dual-path modules can execute — a
 /// per-node BUILD constant, NEVER consensus state (a lying value can only
 /// refuse-to-boot or halt this one node, never fork the network). the
-/// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
-/// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
-/// whose `required_min_version` exceeds it. Phase 9 raised this to 2 when the
-/// forge v2 dual path landed; the staged-admission resident tier raised it to
-/// 3 — this binary can execute a scheduled `to_version=3` (valset/governance
-/// resident ops, gated below 3) and truthfully `SignalReady`.
+/// `ReadinessSignaller` truthfully signals readiness iff the numeric version and
+/// any named route commitment are implemented by this binary; the boot preflight
+/// refuses a boundary whose `required_min_version` exceeds it. Phase 9 raised
+/// this to 2 when the forge v2 dual path landed; the staged-admission resident
+/// tier raised it to 3 — this binary can execute a scheduled `to_version=3`
+/// (valset/governance resident ops, gated below 3) and truthfully `SignalReady`.
 pub(crate) const MAX_PROTOCOL_VERSION: u32 = 3;
 /// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
 /// joiner, a sync-only resident): the genesis mesh at index 0. a VALIDATOR
@@ -218,8 +218,59 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     ("vaults", 2),
 ];
 
+/// The only registry this binary can migrate in place: the CURRENT schema
+/// minus `clients` — a workspace captured (or restored) with the clients
+/// module still dormant below its activation version. Everything else —
+/// including genuinely historical pre-wasm-cutover workspaces, whose module
+/// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
+/// re-genesis, no shim).
+pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
+    ("agent", 2),
+    ("automations", 2),
+    ("capability", 2),
+    ("chat", 1),
+    ("directory", 1),
+    ("dispatch", 1),
+    ("duckdns", 2),
+    ("files", 1),
+    ("forge", 1),
+    ("gateway", 2),
+    ("governance", 2),
+    ("hello", 1),
+    ("identity", 2),
+    ("inbox", 2),
+    ("jobs", 2),
+    ("kv", 1),
+    ("modreg", 1),
+    ("pages", 1),
+    ("runs", 3),
+    ("saga", 2),
+    ("tagging", 2),
+    ("tasks", 2),
+    ("upgrade", 1),
+    ("valset", 1),
+    ("vaults", 2),
+];
+
+pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
+
+/// The numeric version is insufficient evidence because older non-bridge
+/// binaries already advertise support through v3. This exact logical artifact
+/// binds readiness to the only accepted source schema, destination schema, and
+/// dormant-registry route.
+pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
+    "commit:clients-v1:",
+    "77418fd66a437b7fa39f09cb6ea731b117502da8afa712c24212add196028c90:",
+    "363608db2d6271c5fba5b2dd55b1de6043aeeb101fb3e0db43d60550c7aca1af:",
+    "dormant-registry-v1"
+);
+
 pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
     host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
+}
+
+pub(crate) fn pre_clients_state_schema_fingerprint() -> [u8; 32] {
+    host::state_schema_fingerprint(PRE_CLIENTS_MODULE_STATE_SCHEMAS.iter().copied())
 }
 
 /// how long an app-surface submit reply may be held awaiting finalization

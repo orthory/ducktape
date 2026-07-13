@@ -184,7 +184,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                      init|invite|admit|\
                      invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
-                     upgrade-status — or \
+                     preflight-state|upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());

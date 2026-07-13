@@ -744,7 +744,7 @@ fn readiness_signaller_emits_exactly_once_when_member_and_supported() {
     let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[]);
     assert_eq!(
         s.decide(&st),
-        Some(("forge-v2".to_string(), MAX_PROTOCOL_VERSION)),
+        Some(("forge-v2".to_string(), MAX_PROTOCOL_VERSION, None)),
         "the first tick signals"
     );
     // a second identical tick is a no-op (in-flight latch) — never spam.
@@ -757,6 +757,38 @@ fn readiness_signaller_emits_exactly_once_when_member_and_supported() {
         &[&me],
     );
     assert_eq!(s.decide(&st_ready), None, "module already holds our signal");
+}
+
+#[test]
+fn readiness_signaller_only_attests_the_compiled_clients_route() {
+    let me = vec![7u8; 32];
+    let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
+    let st = status(
+        Some((
+            crate::constants::CLIENTS_MODULE_UPGRADE_NAME,
+            100,
+            crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION,
+        )),
+        &[&me],
+        &[],
+    );
+    assert_eq!(
+        s.decide(&st),
+        Some((
+            crate::constants::CLIENTS_MODULE_UPGRADE_NAME.into(),
+            crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION,
+            upgrade::required_readiness_commitment(crate::constants::CLIENTS_MODULE_UPGRADE_NAME)
+                .map(|bytes| bytes.to_vec()),
+        ))
+    );
+
+    let mut unknown = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
+    let wrong = status(Some(("commit:unknown-route", 100, 1)), &[&me], &[]);
+    assert_eq!(
+        unknown.decide(&wrong),
+        None,
+        "a numeric version match cannot attest an unknown route"
+    );
 }
 
 #[test]
