@@ -57,10 +57,15 @@ export const pageRefMarkdown = (id: string, title: string): string =>
 export const fileRefMarkdown = (path: string, name: string, embed: boolean): string =>
   `${embed ? "!" : ""}[${mdLabel(name)}](duck://files${path})`;
 
-/** A label safe to sit inside `[...]`: no `]`, no newline (would break the
- *  link), and no bidi/control spoofing. */
+/** A label safe to sit inside `[...]` AND to survive the chat markdown parser
+ *  on the way back out: no `]`/newline (would end the link), no `*` (the
+ *  parser's italic/bold marker — a `*` in the label would split the ref across
+ *  spans and the render-time tokenizer would never see a whole ref), and no
+ *  bidi/control spoofing. The label is decorative — the page chip shows the
+ *  live store title, the file chip the sanitized name — so neutralizing here
+ *  costs nothing visible. */
 const mdLabel = (raw: string): string =>
-  displayName(raw).replace(/[\]\n]/g, " ").trim() || "file";
+  displayName(raw).replace(/[\]\n*]/g, " ").replace(/\s+/g, " ").trim() || "file";
 
 // `!?` embed flag, a label with no `]`/newline, then a duck:// url with no
 // whitespace or `)` (so the closing paren is unambiguous). Matched left to

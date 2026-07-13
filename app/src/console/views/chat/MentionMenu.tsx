@@ -141,8 +141,8 @@ export function MentionMenu({
 }
 
 /** The `[[` page-ref menu. The token it picks is the page ID — the composer
- *  wraps it into `[[page:<id>]]`; the id is what the wire and the runs module
- *  read, the title is only ever a display. */
+ *  wraps it into the markdown ref `[title](duck://page/<id>)`; the id is what
+ *  the wire and (via the follow-up) the runs module read. */
 export function PageMenu({
   pages,
   activeIndex,

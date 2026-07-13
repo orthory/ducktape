@@ -81,9 +81,10 @@ function MentionToken({ mention, names }: { mention: AuthorRef; names: AuthorNam
 
 // ── Page ref ────────────────────────────────────────────
 
-/** `[[page:<id>]]` as a chip carrying the page's live title. The title comes
- *  from `state.pages`, which is hydrated at boot and refreshed when the pages
- *  root moves — so a chip never fetches. When the id resolves to nothing (a
+/** A `duck://page/<id>` ref as a chip carrying the page's live title. The
+ *  title comes from `state.pages`, which is hydrated at boot and refreshed
+ *  when the pages root moves — so a chip never fetches. When the id resolves
+ *  to nothing (a
  *  deleted page, a typo, or `pages` not hydrated yet) the chip shows the raw
  *  id: honest about what the text says, never a blank or a guessed title. */
 export function PageRefChip({ pageId }: { pageId: string }) {
@@ -134,11 +135,9 @@ export function PageRefChip({ pageId }: { pageId: string }) {
 /** A pages COMMENT body: plain text on the wire, so every reference is
  *  re-derived at render — @tokens resolve through the SAME resolver + grammar
  *  the submit path used (`splitMentions` over `mentionResolverOf`), then
- *  `[[page:<id>]]` refs chip inside the non-mention runs. Mentions split
- *  FIRST, over the RAW text: that keeps the whitespace boundary identical to
- *  what the submit path saw, so "[[page:p1]]@bot" stays a literal on both
- *  ends of the wire (the '@' is glued to ']') instead of chipping a mention
- *  the module was never told about. An @word the resolver doesn't know stays
+ *  `duck://` refs chip inside the non-mention runs (via `splitDuckRefs`).
+ *  Mentions split FIRST, over the RAW text: that keeps the whitespace boundary
+ *  identical to what the submit path saw. An @word the resolver doesn't know stays
  *  tinted-inert via LiteralRun — an address nobody claimed. Without a store
  *  (bare component tests) nothing resolves, everything tints.
  *

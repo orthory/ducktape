@@ -269,9 +269,10 @@ export function Composer({
 
   // ── pasted attachments ──
   // A paste whose clipboard carries FILES uploads them into duckfs and
-  // inserts their duck://files URIs; a plain text paste is untouched. The
-  // upload is async, so the URI is APPENDED to the draft as it stands at
-  // resolve time (the caret may have moved mid-upload; appending never
+  // inserts a markdown ref (`![name](duck://files/…)` image / `[name](…)`
+  // file); a plain text paste is untouched. The upload is async, so the ref
+  // is APPENDED to the draft as it stands at resolve time (the caret may have
+  // moved mid-upload; appending never
   // clobbers typing). `valueRef` mirrors the controlled prop for that.
   const [attaching, setAttaching] = useState<string[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);

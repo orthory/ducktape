@@ -22,9 +22,19 @@ describe("pageRefMarkdown / fileRefMarkdown builders", () => {
   });
 
   it("sanitizes a label that would break the `[..]` (no `]`/newline/bidi)", () => {
-    // `\n` (a control char) is dropped, `]` becomes a space, then trim.
+    // `\n` (a control char) is dropped, `]` becomes a space, then collapse.
     expect(pageRefMarkdown("id", "a]b\nc")).toBe("[a bc](duck://page/id)");
     expect(fileRefMarkdown("/shared/attachments/u/f", "a‮b", true)).toContain("[ab]");
+  });
+
+  it("neutralizes `*` in a title so the markdown parser can't split the ref", () => {
+    // a `*x*` / `**x**` in the label would be parsed as italic/bold on send,
+    // splitting the ref across spans — the chip would be lost. Strip `*`.
+    expect(pageRefMarkdown("pg-1", "My *great* plan")).toBe("[My great plan](duck://page/pg-1)");
+    expect(pageRefMarkdown("pg-2", "a**b**c")).toBe("[a b c](duck://page/pg-2)");
+    // and the ref survives the real round-trip now (regression guard).
+    const blocks = parseMessageInput(pageRefMarkdown("pg-3", "load *bearing* title"));
+    expect(splitDuckRefs(blocksToInput(blocks)).filter(isPageSeg)).toHaveLength(1);
   });
 });
 
