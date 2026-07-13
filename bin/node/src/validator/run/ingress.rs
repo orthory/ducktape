@@ -9,9 +9,13 @@ use sdk::Msg;
 
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
-use crate::constants::{MODULE_IDS, SUBMIT_HOLD};
-use crate::host_reads::{read_redemptions_from_host, read_valset_members, read_valset_residents};
-use crate::rpc::{JoinRequestRecord, JoinRequestView, RpcJob, RpcReply, RpcRequest, RpcStatus};
+use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
+use crate::host_reads::{
+    read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
+};
+use crate::rpc::{
+    JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
+};
 use crate::util::{hex, unix_ms};
 use crate::{config, lobby, relay, relay_runtime};
 
@@ -91,6 +95,18 @@ impl ValidatorRuntime<'_> {
                     ..RpcReply::ok()
                 }
             }
+            RpcRequest::JoinState => {
+                // a validator is a full member — the terminal join state. the
+                // node-owned source (ADR §6): no log-marker parsing.
+                RpcReply {
+                    join_state: Some(JoinStateView {
+                        phase: "promoted".into(),
+                        detail: "validator".into(),
+                        height: node.finalized().map(|f| f.height),
+                    }),
+                    ..RpcReply::ok()
+                }
+            }
             RpcRequest::Shutdown => {
                 // best-effort final checkpoint + journal barrier so
                 // the restart replays a minimal suffix; a failure
@@ -125,6 +141,12 @@ impl ValidatorRuntime<'_> {
         }
     }
 
+    /// the join gate (ADR §3): run the V1–V9 checklist on a joiner's
+    /// `GateMsg::Request`, then — on pass — submit `Redeem` and HOLD the
+    /// joiner's reply against that frame until the drain reports its consensus
+    /// fate (`pending_gates`, resolved in `on_drain`). the reply is
+    /// authoritative: `Admitted` means standing is COMMITTED, `Rejected{terminal}`
+    /// means stop. no advisory "recorded" answer exists any more.
     pub(super) async fn on_lobby(&mut self, peer: ed25519::PublicKey, bytes: Vec<u8>) {
         let Self {
             node,
@@ -136,127 +158,144 @@ impl ValidatorRuntime<'_> {
             validators,
             coordination,
             join_requests,
+            gating,
+            pending_gates,
             ..
         } = self;
 
-        // `fatal: true` marks the refusal PERMANENT for this
-        // invite — the joiner stops re-announcing instead of
-        // spinning on a token that can never redeem.
-        let mut send_reply = |recorded: bool, detail: String, cap: Option<Vec<u8>>, fatal: bool| {
-            let msg = lobby::LobbyMsg::JoinReply {
-                recorded,
-                detail,
-                cap,
-                fatal,
-            };
+        let mut answer = |m: lobby::GateMsg| {
             let _ = lobby_tx.send(
                 Recipients::One(peer.clone()),
-                IoBuf::from(lobby::encode_msg(&msg)),
+                IoBuf::from(lobby::encode_msg(&m)),
                 false,
             );
         };
+        let reject = |answer: &mut dyn FnMut(lobby::GateMsg),
+                      code: lobby::RejectCode,
+                      detail: String,
+                      terminal: bool| {
+            answer(lobby::GateMsg::Rejected {
+                code,
+                detail,
+                terminal,
+            });
+        };
+
+        // V1: decode + well-formed.
         let msg = match lobby::decode_msg(&bytes) {
             Ok(m) => m,
-            Err(_) => return, // junk on the doorbell — drop.
+            Err(_) => return, // junk on the doorbell — no coherent peer to answer.
         };
-        // crypto first (pure, cheap): the token must verify for
-        // THIS network and the announced key must prove itself.
+        if !matches!(msg, lobby::GateMsg::Request { .. }) {
+            return; // a reply echoed back, or a member-to-member frame — ignore.
+        }
+        // V2/V3/V5: crypto (token sig / target lock / proof-of-possession),
+        // all terminal. the single error string maps 1:1 to its checklist code.
         let verified = match lobby::verify_join_request(&msg, namespace) {
             Ok(v) => v,
             Err(e) => {
-                send_reply(false, e, None, false);
+                let code = lobby::verify_reject_code(&e);
+                reject(&mut answer, code, e, true);
                 return;
             }
         };
-        // then membership: the issuer must still be a member (a
-        // removed member's outstanding invites die with it), and a
-        // joiner that already holds standing — VALIDATOR or
-        // RESIDENT — has nothing pending.
-        let members = read_valset_members(node.host()).await;
-        let residents_now = read_valset_residents(node.host()).await;
+        // V4: expiry on THIS member's wall clock — the only expiry authority
+        // besides the joiner's decode (consensus_time is block height, so no
+        // deterministic in-consensus wall clock exists). terminal.
+        if nat_traversal::now_secs() >= verified.expires_unix_secs {
+            reject(
+                &mut answer,
+                lobby::RejectCode::Expired,
+                "invite expired — ask the inviter for a fresh one".into(),
+                true,
+            );
+            return;
+        }
+        // V8: role supported. only `Resident` is redeemable this generation;
+        // a `Client` token is signed and carried but not admittable yet.
+        if verified.role != config::InviteRole::Resident {
+            reject(
+                &mut answer,
+                lobby::RejectCode::RoleUnsupported,
+                "this invite role is not redeemable yet — the thin-client plane lands separately"
+                    .into(),
+                true,
+            );
+            return;
+        }
         let joiner_bytes = verified.joiner.as_ref().to_vec();
-        if members.contains(&joiner_bytes) {
-            send_reply(false, "already a validator".into(), None, false);
-            return;
-        }
-        if residents_now.contains(&joiner_bytes) {
-            send_reply(
-                false,
-                "already a resident — a member promotes it into the quorum".into(),
-                None,
-                false,
-            );
-            return;
-        }
-        if !members.contains(&verified.issuer.as_ref().to_vec()) {
-            send_reply(
-                false,
-                "the inviting member is no longer part of this network".into(),
-                None,
-                false,
-            );
-            return;
-        }
-        // SPENT-INVITE check: the token's nonce is the
-        // exactly-once key (governance's Redeem handler). a nonce
-        // already redeemed by ANOTHER key can never redeem again —
-        // resubmitting the op is pointless and the joiner would
-        // spin on "redemption not landed yet" forever. fail it
-        // loudly and permanently on both ends instead. (redeemed
-        // by the SAME key = standing already granted; the
-        // validator/resident checks above answered that.)
+        // V6: nonce unspent in committed redemptions. a nonce redeemed by
+        // ANOTHER key can never redeem again — terminal Spent. (redeemed by
+        // the SAME key = this joiner already has standing; V9 handles it.)
         let redemptions = read_redemptions_from_host(node.host()).await;
         if let Some(spent) = redemptions
             .iter()
             .find(|r| r.nonce == verified.nonce.as_slice() && r.joiner != joiner_bytes)
         {
             println!(
-                "[node {label}] lobby: {} presented an ALREADY-REDEEMED invite \
+                "[node {label}] gate: {} presented an ALREADY-REDEEMED invite \
                          (spent by {} at height {}) — refusing permanently; an invite \
                          admits exactly one person, mint a fresh one per joiner",
                 hex_bytes(&joiner_bytes[..4]),
                 hex_bytes(&spent.joiner[..4.min(spent.joiner.len())]),
                 spent.height,
             );
-            send_reply(
-                false,
+            reject(
+                &mut answer,
+                lobby::RejectCode::Spent,
                 "invite already redeemed — an invite admits exactly one person; \
                          ask the inviter for a fresh invite"
                     .into(),
-                None,
                 true,
             );
             return;
         }
-        // AUTO-REDEMPTION: minting the invite WAS the approval, so
-        // a verified announce submits the governance Redeem op on
-        // the joiner's behalf — no human step. every validator
-        // re-verifies the token in-consensus and the nonce set
-        // makes it single-use, so racing members (the joiner
-        // round-robins its announce) collapse to one grant and
-        // deterministic rejects. the in-memory map only throttles
-        // re-submits across the joiner's ~3s re-announces.
-        let now = unix_ms();
-        let fresh = !join_requests.contains_key(&joiner_bytes);
-        let record = join_requests
-            .entry(joiner_bytes)
-            .or_insert(JoinRequestRecord {
-                issuer: verified.issuer.as_ref().to_vec(),
-                first_seen_ms: now,
-                last_seen_ms: 0,
-            });
-        // MINT the coordinator capability for the joiner, additive
-        // and side-effect-free (a pure ed25519 sign — no consensus,
-        // no valset change). Gated: only a GENESIS validator on a
-        // PRIVATE network issues one — its key is in the
-        // coordinator's pinned genesis set, so the cap it signs
-        // actually admits. A public network needs no cap; a
-        // non-genesis member cannot mint one the coordinator trusts.
-        // The cap cannot ride the invite (the joiner's key did not
-        // exist at invite-mint time), so the JoinReply is its only
-        // delivery channel — re-delivered on every re-announce in
-        // case a reply was lost. Rotation is DEFERRED — the cap is
-        // long-lived (COORD_CAP_TTL_SECS).
+        let members = read_valset_members(node.host()).await;
+        let residents_now = read_valset_residents(node.host()).await;
+        // V7: issuer in committed valset. NON-TERMINAL — this member's local
+        // view cannot distinguish a REMOVED issuer (invite dead) from a
+        // just-admitted one it has not applied yet; a terminal answer here
+        // would let one lagging validator kill a healthy join. the joiner
+        // fails over to another member (§3.1 V7, PR #538 ruling).
+        if !members.contains(&verified.issuer.as_ref().to_vec()) {
+            reject(
+                &mut answer,
+                lobby::RejectCode::IssuerUnknown,
+                "the inviting member is not in this member's current view — if it \
+                 was removed, this invite is dead (ask a current member for a fresh \
+                 one); if it was just admitted, another member will redeem shortly"
+                    .into(),
+                false,
+            );
+            return;
+        }
+        // V9: already holding standing (validator OR resident) → idempotent
+        // SUCCESS. a re-gated joiner is not an error — answer Admitted at the
+        // current committed height.
+        if members.contains(&joiner_bytes) || residents_now.contains(&joiner_bytes) {
+            let height = node.finalized().map(|f| f.height).unwrap_or(0);
+            answer(lobby::GateMsg::Admitted { height, cap: None });
+            return;
+        }
+
+        // V1–V9 pass. ONE in-flight gate per joiner key (§3.2): a duplicate
+        // Request while settling re-arms the same pending reply — no
+        // double-submit (the nonce set would collapse racing submits to one
+        // grant anyway, but a second pending_gate could mis-map the committed
+        // grant's sibling reject onto this joiner, so dedup is load-bearing).
+        if let Some(frame_id) = gating.get(&joiner_bytes) {
+            if let Some(g) = pending_gates.get_mut(frame_id) {
+                g.peer = peer.clone();
+            }
+            return;
+        }
+
+        // MINT the coordinator capability for the joiner (private coordination
+        // only, and only a GENESIS validator's cap is trusted by the
+        // coordinator). additive, side-effect-free (a pure ed25519 sign). the
+        // cap cannot ride the invite (the joiner's key did not exist at
+        // invite-mint time), so the `Admitted` reply is its only delivery
+        // channel. delivered when the gate settles.
         let minted_cap = if *coordination == config::Coordination::Private
             && validators.contains(&signer.public_key())
         {
@@ -271,29 +310,27 @@ impl ValidatorRuntime<'_> {
         } else {
             None
         };
-        const REDEEM_RESUBMIT_MS: u64 = 30_000;
-        if !fresh && now.saturating_sub(record.last_seen_ms) < REDEEM_RESUBMIT_MS {
-            send_reply(
-                true,
-                "redemption in flight — standing lands shortly".into(),
-                minted_cap,
-                false,
-            );
-            return;
-        }
-        record.last_seen_ms = now;
+
+        // SETTLE-THEN-ANSWER (§3.2): submit the Redeem and hold the joiner's
+        // reply against the frame id. `submit` returns the FrameId; the drain
+        // reports its consensus fate on `pending_gates` (Applied → Admitted,
+        // Rejected → mapped code, timeout → Busy) — this handler never blocks.
         let redeem = governance::GovMsg::Redeem {
             issuer: verified.issuer.as_ref().to_vec(),
             nonce: verified.nonce.to_vec(),
             token_sig: match &msg {
-                lobby::LobbyMsg::JoinRequest { token_sig, .. } => token_sig.clone(),
-                _ => unreachable!("verified above"),
+                lobby::GateMsg::Request { token_sig, .. } => token_sig.clone(),
+                _ => unreachable!("matched Request above"),
             },
             joiner: verified.joiner.as_ref().to_vec(),
             proof: match &msg {
-                lobby::LobbyMsg::JoinRequest { proof, .. } => proof.clone(),
-                _ => unreachable!("verified above"),
+                lobby::GateMsg::Request { proof, .. } => proof.clone(),
+                _ => unreachable!("matched Request above"),
             },
+            // verify enforced target == joiner, so the joiner IS the target.
+            target: verified.joiner.as_ref().to_vec(),
+            role: verified.role.as_u8(),
+            expires_unix_secs: verified.expires_unix_secs,
         };
         let seq = *next_seq;
         *next_seq += 1;
@@ -308,23 +345,41 @@ impl ValidatorRuntime<'_> {
             )
             .await
         {
-            Ok(_) => {
+            Ok(frame_id) => {
                 println!(
-                    "[node {label}] invite redemption submitted: {} (invited by {})",
+                    "[node {label}] gate: redemption submitted for {} (invited by {}) — \
+                             awaiting consensus before answering Admitted",
                     hex_bytes(verified.joiner.as_ref()),
                     hex_bytes(verified.issuer.as_ref())
                 );
-                send_reply(
-                    true,
-                    "invite verified — redemption submitted, resident standing \
-                             lands at the next block"
-                        .into(),
-                    minted_cap,
-                    false,
+                let now = unix_ms();
+                join_requests
+                    .entry(joiner_bytes.clone())
+                    .or_insert(JoinRequestRecord {
+                        issuer: verified.issuer.as_ref().to_vec(),
+                        first_seen_ms: now,
+                        last_seen_ms: now,
+                    });
+                gating.insert(joiner_bytes.clone(), frame_id);
+                pending_gates.insert(
+                    frame_id,
+                    super::GatePending {
+                        peer: peer.clone(),
+                        joiner: joiner_bytes,
+                        cap: minted_cap,
+                        deadline: std::time::Instant::now() + GATE_SETTLE_TIMEOUT,
+                    },
                 );
             }
             Err(e) => {
-                send_reply(false, format!("redemption submit failed: {e}"), None, false);
+                // submit failure is transient (§3.2): the joiner tries another
+                // member rather than exiting.
+                reject(
+                    &mut answer,
+                    lobby::RejectCode::Busy,
+                    format!("could not submit redemption: {e}"),
+                    false,
+                );
             }
         }
     }
@@ -346,17 +401,23 @@ impl ValidatorRuntime<'_> {
             msg,
             relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
         );
-        let (members_now, residents_now) = if needs_standing {
+        let (members_now, residents_now, clients_now) = if needs_standing {
             (
                 read_valset_members(node.host()).await,
                 read_valset_residents(node.host()).await,
+                read_clients(node.host()).await,
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
-        let Some(action) =
-            validator_relay.on_message(peer, msg, &members_now, &residents_now, relay_tx)
-        else {
+        let Some(action) = validator_relay.on_message(
+            peer,
+            msg,
+            &members_now,
+            &residents_now,
+            &clients_now,
+            relay_tx,
+        ) else {
             return;
         };
         match action {

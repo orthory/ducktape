@@ -2,7 +2,7 @@
 
 use super::ValidatorRuntime;
 use crate::explorer::ship_index_blobs;
-use crate::host_reads::read_upgrade_version_fields;
+use crate::host_reads::{read_upgrade_version_fields, read_valset_members, read_valset_residents};
 use crate::sync::serve::{SyncBoundary, SyncStateRequest};
 use crate::util::{participant_bytes, resident_bytes};
 
@@ -140,6 +140,23 @@ impl ValidatorRuntime<'_> {
                     }),
                 };
                 let _ = reply.send(answer);
+            }
+            SyncStateRequest::Standing { requester, reply } => {
+                // the fail-closed standing gate (ADR §5.1). read the COMMITTED
+                // valset projection (updates at the Redeem block, unlike the
+                // orchestrator's transport set which lags to the cutover), so a
+                // freshly-admitted resident is servable the instant its grant
+                // commits. these are local in-memory host queries on the loop's
+                // own state — the same read point `read_valset_residents` uses
+                // elsewhere, between drains, no deadlock.
+                let host = node.host();
+                let members = read_valset_members(host).await;
+                let residents = read_valset_residents(host).await;
+                let standing = members
+                    .iter()
+                    .chain(residents.iter())
+                    .any(|k| k.as_slice() == requester);
+                let _ = reply.send(standing);
             }
         }
     }

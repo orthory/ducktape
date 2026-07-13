@@ -10,6 +10,7 @@ fn create_page_is_idempotent_and_preserves_the_title() {
             &PageMsg::UpdateText {
                 block_id: "p1".into(),
                 text: "renamed".into(),
+                marks: None,
             },
         )
         .await;

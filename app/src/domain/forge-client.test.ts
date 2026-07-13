@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   editItem,
+  forgeItemTarget,
   getItem,
   listItems,
   listRefs,
@@ -26,6 +27,24 @@ const OID_A = "a".repeat(40);
 const OID_B = "b".repeat(40);
 const OID_C = "c".repeat(40);
 const PACK = "d".repeat(64);
+
+describe("forgeItemTarget", () => {
+  it("turns a hidden discussion channel into a public anchored item route", () => {
+    expect(
+      forgeItemTarget("forge:team:ducktape:58", { messageId: "m-4", messageSeq: 4 }),
+    ).toEqual({ repo: "team:ducktape", number: 58, messageId: "m-4", messageSeq: 4 });
+    expect(forgeItemTarget("forge:ducktape:58")).not.toHaveProperty("channelId");
+  });
+
+  it("rejects malformed channels and drops malformed anchors", () => {
+    expect(forgeItemTarget("general", { messageSeq: 4 })).toBeNull();
+    expect(forgeItemTarget("forge:ducktape:0")).toBeNull();
+    expect(forgeItemTarget("forge:ducktape:58", { messageId: " ", messageSeq: -1 })).toEqual({
+      repo: "ducktape",
+      number: 58,
+    });
+  });
+});
 
 const summary: ForgeItemSummary = {
   number: 1,
@@ -59,7 +78,7 @@ describe("forge item msgs", () => {
     );
   });
 
-  it("encodes OpenPr with snake_case branches ('' targets main)", async () => {
+  it("encodes OpenPr with snake_case branches ('' targets dev)", async () => {
     const transport = stubTransport();
     await openPr(transport, {
       repo: "ducktape",

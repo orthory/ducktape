@@ -198,6 +198,28 @@ describe("page block projections", () => {
     const out = optimistic.pageBlockPatched(prev, "root", { text: "Launch Plan" });
     expect(out.pages).toEqual([{ id: "root", title: "Launch Plan", parent: null }]);
   });
+
+  it("rebases inline marks and exact comment anchors with optimistic text", () => {
+    const marked = { ...block("a", "root"), text: "a🦆bc", marks: [{ start: 1, end: 3, kind: "bold" as const }] };
+    const prev = base({
+      activePage: "root",
+      activePageBlocks: [block("root", null, ["a"]), marked],
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 1, end: 3 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    const out = optimistic.pageBlockPatched(prev, "a", { text: "++a🦆bc" });
+    expect(out.activePageBlocks![1].marks).toEqual([{ start: 3, end: 5, kind: "bold" }]);
+    expect(out.pageThreads![0].threads[0].thread.anchor).toEqual({ start: 3, end: 5 });
+  });
 });
 
 describe("huddle projections", () => {
@@ -264,6 +286,46 @@ describe("huddle projections", () => {
     expect(out.channels![0].huddle).toEqual([
       { user: liveUser, node: [2, 2, 2], joined_at: 2 },
     ]);
+  });
+});
+
+describe("channelMembershipSet", () => {
+  const jess = [1, 2, 3, 4];
+  const kit = [9, 9];
+
+  it("projects the added member row at once and is idempotent on a double click", () => {
+    const prev = base({ activeChannel: "secret", channelMembers: [kit] });
+    const out = optimistic.channelMembershipSet(prev, {
+      channelId: "secret",
+      user: jess,
+      member: true,
+    });
+    expect(out.channelMembers).toEqual([kit, jess]);
+
+    // a second click re-projects the SAME row, never a duplicate.
+    const again = optimistic.channelMembershipSet(
+      base({ activeChannel: "secret", channelMembers: out.channelMembers! }),
+      { channelId: "secret", user: jess, member: true },
+    );
+    expect(again.channelMembers).toEqual([kit, jess]);
+  });
+
+  it("drops the row on remove, and projects nothing onto another channel's set", () => {
+    const prev = base({ activeChannel: "secret", channelMembers: [kit, jess] });
+    expect(
+      optimistic.channelMembershipSet(prev, {
+        channelId: "secret",
+        user: jess,
+        member: false,
+      }).channelMembers,
+    ).toEqual([kit]);
+    expect(
+      optimistic.channelMembershipSet(prev, {
+        channelId: "general",
+        user: jess,
+        member: false,
+      }),
+    ).toEqual({});
   });
 });
 
@@ -365,5 +427,123 @@ describe("reaction projections", () => {
       true,
     );
     expect(removed.messages![0].reactions).toEqual([]);
+  });
+});
+
+describe("comment projections", () => {
+  const self = Array.from(new TextEncoder().encode("jess"));
+  const addParams = (over: Partial<Parameters<typeof optimistic.commentAdded>[1]> = {}) => ({
+    threadId: "t-1",
+    commentId: "c-1",
+    target: "block-1",
+    text: "hello",
+    authorBytes: self,
+    at: 1_700_000_000,
+    ...over,
+  });
+
+  it("opens a new thread (and group) on an uncommented target", () => {
+    const out = optimistic.commentAdded(base(), addParams());
+    expect(out.pageThreads).toHaveLength(1);
+    const group = out.pageThreads![0];
+    expect(group.target).toBe("block-1");
+    const view = group.threads[0];
+    expect(view.thread).toMatchObject({
+      id: "t-1",
+      target: "block-1",
+      opener: { user: self },
+      resolved: false,
+      comment_ids: ["c-1"],
+    });
+    expect(view.comments).toEqual([
+      {
+        id: "c-1",
+        thread_id: "t-1",
+        author: { user: self },
+        text: "hello",
+        created_at: 1_700_000_000,
+        edited_at: null,
+        deleted: false,
+      },
+    ]);
+  });
+
+  it("joins the target's existing group with a second thread", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams()));
+    const out = optimistic.commentAdded(
+      seeded,
+      addParams({ threadId: "t-2", commentId: "c-2", text: "again" }),
+    );
+    expect(out.pageThreads).toHaveLength(1);
+    expect(out.pageThreads![0].threads.map((v) => v.thread.id)).toEqual(["t-1", "t-2"]);
+  });
+
+  it("appends a reply to an existing thread", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams()));
+    const out = optimistic.commentAdded(
+      seeded,
+      addParams({ commentId: "c-2", text: "reply", at: 1_700_000_100 }),
+    );
+    const view = out.pageThreads![0].threads[0];
+    expect(view.thread.comment_ids).toEqual(["c-1", "c-2"]);
+    expect(view.comments.map((c) => c.text)).toEqual(["hello", "reply"]);
+  });
+
+  it("moves a thread and its exact anchor to another block", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams({
+      anchor: { start: 1, end: 3 },
+    })));
+    const out = optimistic.commentThreadMoved(
+      seeded,
+      "t-1",
+      "block-2",
+      { start: 4, end: 6 },
+    );
+    expect(out.pageThreads![0].threads).toEqual([]);
+    expect(out.pageThreads![1].threads[0].thread).toMatchObject({
+      target: "block-2",
+      anchor: { start: 4, end: 6 },
+    });
+  });
+
+  it("edits a comment in place and stamps edited_at", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams()));
+    const out = optimistic.commentEdited(seeded, "c-1", "fixed", 1_700_000_200);
+    const comment = out.pageThreads![0].threads[0].comments[0];
+    expect(comment.text).toBe("fixed");
+    expect(comment.edited_at).toBe(1_700_000_200);
+  });
+
+  it("delete keeps the thread while live comments remain", () => {
+    let state = base(optimistic.commentAdded(base(), addParams()));
+    state = base(optimistic.commentAdded(state, addParams({ commentId: "c-2" })));
+    const out = optimistic.commentDeleted(state, "c-1");
+    const view = out.pageThreads![0].threads[0];
+    expect(view.comments.map((c) => c.id)).toEqual(["c-2"]);
+    expect(view.thread.comment_ids).toEqual(["c-2"]);
+  });
+
+  it("delete of the last live comment drops the thread and its group", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams()));
+    expect(optimistic.commentDeleted(seeded, "c-1").pageThreads).toEqual([]);
+  });
+
+  it("resolve stamps the resolver; reopen clears it", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams()));
+    const resolved = optimistic.threadResolved(seeded, "t-1", true, self);
+    expect(resolved.pageThreads![0].threads[0].thread).toMatchObject({
+      resolved: true,
+      resolved_by: { user: self },
+    });
+    const reopened = optimistic.threadResolved(
+      base({ pageThreads: resolved.pageThreads }),
+      "t-1",
+      false,
+      self,
+    );
+    expect(reopened.pageThreads![0].threads[0].thread).toMatchObject({
+      resolved: false,
+      resolved_by: null,
+    });
   });
 });

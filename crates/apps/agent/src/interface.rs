@@ -111,6 +111,11 @@ pub const ACTION_PAGES_COMMENT: &str = "pages.comment";
 /// permission to flip a todo block's checked state
 /// ([`AgentAction::SetPageChecked`]).
 pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
+/// permission to write a small UTF-8 text file under a granted duckfs prefix
+/// ([`AgentAction::DuckfsWriteText`]).
+pub const ACTION_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
+/// maximum UTF-8 text payload accepted by [`AgentAction::DuckfsWriteText`].
+pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 
 /// every action name the platform knows. `RegisterAgent`/`UpdateAgent` reject
 /// an `allowed_actions` entry outside this vocabulary, so a granted permission
@@ -120,13 +125,14 @@ pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 /// names, so a NEW name grants nothing to an agent already registered — it can
 /// only arrive through an owner-gated `UpdateAgent`. removing or renaming one,
 /// by contrast, would strand every record that holds it.
-pub const KNOWN_ACTIONS: [&str; 6] = [
+pub const KNOWN_ACTIONS: [&str; 7] = [
     ACTION_CHAT_POST,
     ACTION_CHAT_POST_MESSAGE,
     ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS,
     ACTION_PAGES_COMMENT,
     ACTION_PAGES_SET_CHECKED,
+    ACTION_DUCKFS_WRITE_TEXT,
 ];
 
 // ---- runtime identity ---------------------------------------------------------
@@ -358,17 +364,23 @@ pub struct ReplyBlock {
     pub lang: Option<String>,
 }
 
-/// the formal agent response: reply blocks plus a bounded list of
-/// [`AgentAction`]s. lenient by construction — both fields default, unknown
-/// JSON fields are ignored — so a model answer either IS this shape or the
-/// consumer wraps it as one; validation (grants, caps, probes) is a separate,
-/// strict step.
+/// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,
+/// and an optional workspace commit message. lenient by construction — all
+/// fields default, unknown JSON fields are ignored — so a model answer either
+/// IS this shape or the consumer wraps it as one; validation (grants, caps,
+/// probes) is a separate, strict step.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResponse {
     #[serde(default)]
     pub reply_blocks: Vec<ReplyBlock>,
     #[serde(default)]
     pub actions: Vec<AgentAction>,
+    /// complete Git commit message authored by the agent for uncommitted
+    /// workspace changes. Optional for clean and legacy responses; existing
+    /// agent commits keep their own messages. The host owns only safety
+    /// validation, Git identity, and Forge-title recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
 }
 
 /// one validated cross-module write an agent's response may request.
@@ -410,6 +422,16 @@ pub enum AgentAction {
         block: String,
         checked: bool,
     },
+    /// write a small UTF-8 text file through the files module's commit wire
+    /// ([`ACTION_DUCKFS_WRITE_TEXT`]). `base_snapshot` is the committed DuckFS
+    /// refs head observed by the tool before signing; `None` means the files
+    /// tree was empty.
+    DuckfsWriteText {
+        path: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_snapshot: Option<String>,
+    },
 }
 
 impl AgentAction {
@@ -421,6 +443,7 @@ impl AgentAction {
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
             AgentAction::AddPageComment { .. } => ACTION_PAGES_COMMENT,
             AgentAction::SetPageChecked { .. } => ACTION_PAGES_SET_CHECKED,
+            AgentAction::DuckfsWriteText { .. } => ACTION_DUCKFS_WRITE_TEXT,
         }
     }
 }

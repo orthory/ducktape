@@ -62,8 +62,9 @@ export function HuddleWindow() {
     };
   }, []);
 
-  // A dead session (hard error / replaced) closes the window — Rust's Destroyed
-  // hook then tells main to re-take, so the call falls back to the working dock.
+  // A replaced session closes the window — Rust's Destroyed hook then tells main
+  // to re-take, so the call falls back to the working dock. (A hard error keeps
+  // the window open for in-window Retry instead — see useHuddleWindowSession.)
   const onMediaEnded = useCallback(() => {
     void getCurrentWindow().close();
   }, []);
@@ -219,9 +220,9 @@ export function HuddleWindow() {
                 }}
                 onToggleCamera={() => view.setCamera(!view.cameraOn)}
                 onLeave={() => send({ op: "leave" })}
-                // No in-window retry — a dead session closes the float and the dock
-                // re-takes (see useHuddleWindowSession); the error state never shows.
-                onRetry={() => {}}
+                // A hard error keeps the float open (see useHuddleWindowSession) —
+                // Retry re-dials into the now-free hub slot rather than closing.
+                onRetry={() => view.retry()}
               />
             </div>
           </div>

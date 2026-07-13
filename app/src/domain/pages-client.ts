@@ -30,6 +30,18 @@ export type BlockKind =
   | "callout"
   | "divider";
 
+export type InlineMark = "bold" | "italic" | "underline" | "strikethrough" | "code";
+
+/** Half-open UTF-16 range, matching textarea selectionStart/selectionEnd. */
+export interface RelativeAnchor {
+  start: number;
+  end: number;
+}
+
+export interface SpanMark extends RelativeAnchor {
+  kind: InlineMark;
+}
+
 /** One stored block. `parent` is null only for a page root; `page` names the
  *  root block of the page this block belongs to (a root names itself);
  *  `checked` is only meaningful for kind "todo". */
@@ -39,6 +51,8 @@ export interface PageBlock {
   page: string;
   kind: BlockKind;
   text: string;
+  /** Optional keeps pre-inline-mark fixtures and legacy snapshots readable. */
+  marks?: SpanMark[];
   checked: boolean;
   children: string[];
 }
@@ -100,7 +114,7 @@ export const insertBlock = (
   params: {
     parent: string;
     after: string | null;
-    block: { id: string; kind: BlockKind; text: string };
+    block: { id: string; kind: BlockKind; text: string; marks?: SpanMark[] };
   },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
@@ -113,10 +127,34 @@ export const insertBlock = (
 
 export const updateText = (
   transport: NodeTransport,
-  params: { blockId: string; text: string },
+  params: { blockId: string; text: string; marks?: SpanMark[] },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    update_text: { block_id: params.blockId, text: params.text },
+    update_text: {
+      block_id: params.blockId,
+      text: params.text,
+      ...(params.marks ? { marks: params.marks } : {}),
+    },
+  });
+
+export const setSpanMark = (
+  transport: NodeTransport,
+  params: {
+    blockId: string;
+    start: number;
+    end: number;
+    kind: InlineMark;
+    active: boolean;
+  },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    set_span_mark: {
+      block_id: params.blockId,
+      start: params.start,
+      end: params.end,
+      kind: params.kind,
+      active: params.active,
+    },
   });
 
 export const setKind = (
@@ -231,6 +269,7 @@ export interface Thread {
   target: string;
   opener: AuthorRef;
   created_at: number;
+  anchor?: RelativeAnchor | null;
   resolved: boolean;
   resolved_by: AuthorRef | null;
   comment_ids: string[];
@@ -253,6 +292,7 @@ export const addComment = (
     commentId: string;
     target: string;
     text: string;
+    anchor?: RelativeAnchor;
     mentions?: AuthorRef[];
   },
 ): Promise<BlockEvent> =>
@@ -262,16 +302,33 @@ export const addComment = (
       comment_id: params.commentId,
       target: params.target,
       text: params.text,
+      ...(params.anchor ? { anchor: params.anchor } : {}),
       mentions: params.mentions ?? [],
+    },
+  });
+
+export const moveCommentThread = (
+  transport: NodeTransport,
+  params: { threadId: string; target: string; anchor: RelativeAnchor | null },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    move_comment_thread: {
+      thread_id: params.threadId,
+      target: params.target,
+      anchor: params.anchor,
     },
   });
 
 export const editComment = (
   transport: NodeTransport,
-  params: { commentId: string; text: string },
+  params: { commentId: string; text: string; mentions?: AuthorRef[] },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    edit_comment: { comment_id: params.commentId, text: params.text },
+    edit_comment: {
+      comment_id: params.commentId,
+      text: params.text,
+      mentions: params.mentions ?? [],
+    },
   });
 
 export const deleteComment = (

@@ -1,11 +1,8 @@
-//! Host-side sandbox preflight probes for the Node view's onboarding section.
+//! Host-side sandbox preflight probes and config editing for the Sandbox page.
 //!
-//! Read-only. It inspects the active workspace's `node.toml` for the serving
-//! opt-in + backend mode, then probes the LOCAL host for the platform backend's
-//! readiness (binary present, base image pulled, cgroup v2 delegation). It
-//! never mutates config: turning serving on/off is guided TOML the operator
-//! pastes into `node.toml` (the app has no config-write path — see the Sandbox
-//! tab), matching the "existing patterns only" scope of the onboarding phase.
+//! It inspects the active workspace's `node.toml` for the serving opt-in +
+//! backend mode, probes the LOCAL host for backend readiness, and owns the pure
+//! formatting-preserving config edit used by the guarded workspace apply flow.
 //!
 //! Probing runs subprocesses on the host, the same pattern the workspace and
 //! forge commands already use (`ducktape-node` verbs, `git`). The probes only
@@ -24,6 +21,7 @@ use tauri::Manager as _;
 /// Default rootless-podman base image (spec §5), used when `node.toml` pins
 /// none. Kept in sync with the TS `DEFAULT_SANDBOX_IMAGE`.
 const DEFAULT_SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
+const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:latest";
 
 /// The sandbox-relevant slice of `node.toml`. Every field is optional so a
 /// node predating the capability keys parses cleanly as "serving off, no mode".
@@ -87,9 +85,52 @@ fn config_for(app: &crate::rt::AppHandle, id: &str) -> SandboxConfig {
     }
 }
 
+/// Apply one UI sandbox choice without rewriting unrelated node config or its
+/// comments. `off` only disables announcing, so applying the previous backend
+/// again keeps an operator's custom image/capacity values.
+pub(crate) fn config_with_mode(text: &str, mode: &str) -> Result<String, String> {
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|err| format!("parse node.toml: {err}"))?;
+    if mode == "off" {
+        doc["announce_capabilities"] = toml_edit::value(false);
+        return Ok(doc.to_string());
+    }
+
+    let image = match mode {
+        "direct" => None,
+        "podman" => Some(DEFAULT_SANDBOX_IMAGE),
+        "tart" => Some(DEFAULT_TART_IMAGE),
+        other => return Err(format!("unsupported sandbox mode {other:?}")),
+    };
+    let same_backend = doc.get("sandbox").and_then(|item| item.as_str()) == Some(mode);
+    doc["announce_capabilities"] = toml_edit::value(true);
+    doc["sandbox"] = toml_edit::value(mode);
+    if let Some(default_image) = image {
+        if !same_backend || doc.get("sandbox_image").is_none() {
+            doc["sandbox_image"] = toml_edit::value(default_image);
+        }
+        if !same_backend || doc.get("sandbox_cores").is_none() {
+            doc["sandbox_cores"] = toml_edit::value(2);
+        }
+        if !same_backend || doc.get("sandbox_mem_gb").is_none() {
+            doc["sandbox_mem_gb"] = toml_edit::value(4);
+        }
+    } else {
+        doc.as_table_mut().remove("sandbox_image");
+        doc.as_table_mut().remove("sandbox_cores");
+        doc.as_table_mut().remove("sandbox_mem_gb");
+    }
+    Ok(doc.to_string())
+}
+
 /// `bin --version` → present + version line, or an honest not-found.
 fn probe_binary(bin: &str) -> ProbeResult {
-    match Command::new(bin).arg("--version").output() {
+    probe_binary_arg(bin, "--version")
+}
+
+fn probe_binary_arg(bin: &str, version_arg: &str) -> ProbeResult {
+    match Command::new(bin).arg(version_arg).output() {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let line = stdout.lines().next().unwrap_or("").trim();
@@ -99,8 +140,29 @@ fn probe_binary(bin: &str) -> ProbeResult {
                 ProbeResult::ok(line.to_string())
             }
         }
-        Ok(_) => ProbeResult::fail(format!("{bin} present but `--version` failed")),
+        Ok(_) => ProbeResult::fail(format!("{bin} present but `{version_arg}` failed")),
         Err(_) => ProbeResult::fail(format!("{bin} not found on PATH")),
+    }
+}
+
+fn probe_tart_toolchain() -> ProbeResult {
+    let tart = probe_binary("tart");
+    if !tart.ok {
+        return tart;
+    }
+    let sshpass = probe_binary_arg("sshpass", "-V");
+    if !sshpass.ok {
+        return ProbeResult {
+            ok: false,
+            detail: format!(
+                "{}; sshpass is required for guest execution ({})",
+                tart.detail, sshpass.detail
+            ),
+        };
+    }
+    ProbeResult {
+        ok: true,
+        detail: format!("{}; {}", tart.detail, sshpass.detail),
     }
 }
 
@@ -152,28 +214,39 @@ pub fn sandbox_preflight(
     id: String,
 ) -> Result<SandboxPreflight, String> {
     let cfg = config_for(&app, &id);
-    let image = cfg
-        .sandbox_image
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
     let mode = cfg.sandbox.clone().unwrap_or_default();
-
-    let (os, backend, backend_binary, base_image, cgroup_delegation) =
-        if cfg!(target_os = "linux") {
-            (
-                "linux",
-                "podman",
-                Some(probe_binary("podman")),
-                Some(probe_image("podman", &image)),
-                Some(probe_cgroup_delegation()),
-            )
-        } else if cfg!(target_os = "macos") {
-            // tart is phase 2 (needs a real-Mac pass): probe presence honestly,
-            // leave the podman-shaped image/cgroup checks not-applicable.
-            ("macos", "tart", Some(probe_binary("tart")), None, None)
+    let image = cfg.sandbox_image.clone().unwrap_or_else(|| {
+        if mode == "tart" {
+            DEFAULT_TART_IMAGE
         } else {
-            ("other", "", None, None, None)
-        };
+            DEFAULT_SANDBOX_IMAGE
+        }
+        .to_string()
+    });
+
+    let (os, backend, backend_binary, base_image, cgroup_delegation) = if cfg!(target_os = "linux")
+    {
+        (
+            "linux",
+            "podman",
+            Some(probe_binary("podman")),
+            Some(probe_image("podman", &image)),
+            Some(probe_cgroup_delegation()),
+        )
+    } else if cfg!(target_os = "macos") && mode == "podman" {
+        (
+            "macos",
+            "podman",
+            Some(probe_binary("podman")),
+            Some(probe_image("podman", &image)),
+            None,
+        )
+    } else if cfg!(target_os = "macos") {
+        // Tart uses a VM image and has no cgroup probe.
+        ("macos", "tart", Some(probe_tart_toolchain()), None, None)
+    } else {
+        ("other", "", None, None, None)
+    };
 
     Ok(SandboxPreflight {
         os: os.to_string(),
@@ -185,4 +258,31 @@ pub fn sandbox_preflight(
         base_image,
         cgroup_delegation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_mode_edit_preserves_unrelated_config_and_comments() {
+        let original = "# keep me\nnetwork = \"network.toml\"\nlisten = \"127.0.0.1:1\"\n";
+        let updated = config_with_mode(original, "podman").unwrap();
+        assert!(updated.starts_with("# keep me\n"));
+        assert!(updated.contains("listen = \"127.0.0.1:1\""));
+        assert!(updated.contains("announce_capabilities = true"));
+        assert!(updated.contains("sandbox = \"podman\""));
+        assert!(updated.contains(DEFAULT_SANDBOX_IMAGE));
+        assert!(config_with_mode(original, "docker").is_err());
+    }
+
+    #[test]
+    fn off_keeps_backend_tuning_for_reenable() {
+        let original =
+            "announce_capabilities = true\nsandbox = \"podman\"\nsandbox_image = \"custom\"\n";
+        let off = config_with_mode(original, "off").unwrap();
+        assert!(off.contains("announce_capabilities = false"));
+        let enabled = config_with_mode(&off, "podman").unwrap();
+        assert!(enabled.contains("sandbox_image = \"custom\""));
+    }
 }

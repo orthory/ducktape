@@ -4,7 +4,7 @@
 // On submit the store mints the node key + workspace and connects; a joiner
 // falls through to JoinProgress while its node parks.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
@@ -85,6 +85,14 @@ export function OnboardingGate() {
   const [blob, setBlob] = useState("");
   const [url, setUrl] = useState("");
   const [pendingDelete, setPendingDelete] = useState<{ workspace: Workspace; force: boolean } | null>(null);
+
+  // the invitee's JOIN CODE: fetched once the join tab opens so it is ready to
+  // hand the inviter (every invite is locked to it). keygen semantics — the
+  // staged identity is reused, so a repeat fetch is harmless.
+  useEffect(() => {
+    if (mode === "join" && LIVE_JOIN_SUPPORTED && !state.joinCode) actions.joinCode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   const busy = state.onboardingBusy;
   // live join is enabled (LIVE_JOIN_SUPPORTED); joinGated is the kill-switch
@@ -210,13 +218,64 @@ export function OnboardingGate() {
                     style={inputStyle}
                   />
                   {mode === "join" && (
-                    <textarea
-                      value={blob}
-                      placeholder="Paste invite blob (🦆…)"
-                      onChange={(event) => setBlob(sanitizeInviteBlob(event.target.value))}
-                      rows={3}
-                      style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
-                    />
+                    <>
+                      <div
+                        style={{
+                          padding: "10px 11px",
+                          borderRadius: radius.sm,
+                          border: `1px solid ${color.border}`,
+                          background: color.paper,
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 6,
+                        }}
+                      >
+                        <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted2, letterSpacing: ".04em" }}>
+                          YOUR JOIN CODE
+                        </span>
+                        <span style={{ font: `500 11px ${font.sans}`, color: color.muted }}>
+                          Send this code to whoever is inviting you — invites are locked to it.
+                        </span>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          <code
+                            style={{
+                              flex: 1,
+                              minWidth: 0,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              font: `500 10.5px ${font.mono}`,
+                              color: color.inkSoft,
+                            }}
+                          >
+                            {state.joinCode ?? "generating…"}
+                          </code>
+                          <button
+                            onClick={() => state.joinCode && navigator.clipboard?.writeText(state.joinCode)}
+                            disabled={!state.joinCode}
+                            style={{
+                              all: "unset",
+                              cursor: state.joinCode ? "pointer" : "default",
+                              padding: "5px 10px",
+                              borderRadius: radius.sm,
+                              border: `1px solid ${color.border}`,
+                              background: color.sunken,
+                              font: `600 10.5px ${font.sans}`,
+                              color: state.joinCode ? color.inkSoft : color.muted3,
+                            }}
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </div>
+                      <textarea
+                        value={blob}
+                        placeholder="Paste invite blob (🦆…)"
+                        onChange={(event) => setBlob(sanitizeInviteBlob(event.target.value))}
+                        rows={3}
+                        style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
+                      />
+                    </>
                   )}
                 </>
               )}

@@ -7,11 +7,20 @@ use std::path::PathBuf;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
+use commonware_runtime::{Runner as _, Supervisor as _};
 
-use crate::{MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config, gateway_routes, userkey_cli};
+use crate::{
+    MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config, gateway_routes, host_state, userkey_cli,
+};
 use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreflightPhase {
+    Activate,
+    Roll,
+}
 
 /// Run an operator command, or return `None` when the arguments select the
 /// long-running node path instead.
@@ -31,14 +40,269 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "promote" => cmd_promote(args),
         "resident-remove" => cmd_resident_remove(args),
         "join-requests" => cmd_join_requests(args),
+        "join-state" => cmd_join_state(args),
         "member-remove" => cmd_member_remove(args),
         "member-leave" => cmd_member_leave(args),
         "member-status" => cmd_member_status(args),
         "join" => cmd_join(args),
+        "preflight-state" => cmd_preflight_state(args),
         "upgrade-status" => cmd_upgrade_status(args),
         _ => return None,
     };
     Some(result)
+}
+
+/// Remove the command's private recovery-store copy even when decoding fails.
+struct PreflightScratch(PathBuf);
+
+impl Drop for PreflightScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read the checkpoint through Recovery's canonical decoder without ever
+/// opening the operator's live store. Commonware metadata opens writable, so
+/// preflight copies only its two manifest files to a disk-backed sibling and
+/// lets every oplog/cert side effect land there instead.
+fn read_manifest_without_opening_workspace(
+    storage: &std::path::Path,
+) -> Result<Option<recovery::Manifest>, Box<dyn std::error::Error>> {
+    let source = storage.join("recovery-manifest");
+    if !source.exists() {
+        return Ok(None);
+    }
+    let parent = storage
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let scratch = parent.join(format!(".ducktape-preflight-{}", std::process::id()));
+    std::fs::create_dir(&scratch).map_err(|error| {
+        format!(
+            "create preflight scratch {}: {error} (remove a stale directory and retry)",
+            scratch.display()
+        )
+    })?;
+    let _cleanup = PreflightScratch(scratch.clone());
+    let destination = scratch.join("recovery-manifest");
+    std::fs::create_dir(&destination)?;
+    for entry in std::fs::read_dir(&source)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Err(format!(
+                "unexpected non-file in {}: {}",
+                source.display(),
+                entry.path().display()
+            )
+            .into());
+        }
+        std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+    }
+
+    let runtime = commonware_runtime::tokio::Runner::new(
+        commonware_runtime::tokio::Config::default().with_storage_directory(&scratch),
+    );
+    runtime
+        .start(|context| async move {
+            let recovery = recovery::Recovery::open(context.child("recovery"))
+                .await
+                .map_err(|error| error.to_string())?;
+            recovery.manifest().map_err(|error| error.to_string())
+        })
+        .map_err(Into::into)
+}
+
+fn checkpoint_upgrade_status(
+    manifest: &recovery::Manifest,
+) -> Result<upgrade::UpgradeStatus, Box<dyn std::error::Error>> {
+    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+
+    let mut valset = valset::Valset::new("valset");
+    valset.install(
+        manifest
+            .snapshot("valset")
+            .ok_or("checkpoint has no valset snapshot")?,
+        manifest
+            .root("valset")
+            .ok_or("checkpoint has no valset root")?,
+    )?;
+    let mut upgrade = upgrade::Upgrade::new("upgrade", "valset");
+    upgrade.install(
+        manifest
+            .snapshot("upgrade")
+            .ok_or("checkpoint has no upgrade snapshot")?,
+        manifest
+            .root("upgrade")
+            .ok_or("checkpoint has no upgrade root")?,
+    )?;
+    let host = host::Host::genesis(vec![Box::new(valset), Box::new(upgrade)])?;
+    let runtime =
+        commonware_runtime::tokio::Runner::new(commonware_runtime::tokio::Config::default());
+    runtime
+        .start(|_| async move {
+            let raw = host
+                .query("upgrade", &encode_query(&UpgradeQuery::Status))
+                .await
+                .map_err(|error| error.to_string())?;
+            let UpgradeReply::Status(status) = decode_reply(&raw)?;
+            Ok::<_, String>(status)
+        })
+        .map_err(Into::into)
+}
+
+fn validate_bridge_preflight(
+    phase: PreflightPhase,
+    manifest: &recovery::Manifest,
+    status: &upgrade::UpgradeStatus,
+) -> Result<&'static str, String> {
+    if status.current_version != manifest.current_version {
+        return Err(format!(
+            "upgrade snapshot protocol_v{} disagrees with checkpoint protocol_v{}",
+            status.current_version, manifest.current_version
+        ));
+    }
+    let mirrored_pending = status.pending.as_ref().map(|pending| {
+        (
+            pending.name.as_str(),
+            pending.activation_height,
+            pending.to_version,
+        )
+    });
+    let manifest_pending = manifest.pending_upgrade.as_ref().map(|pending| {
+        (
+            pending.name.as_str(),
+            pending.activation_height,
+            pending.to_version,
+        )
+    });
+    if mirrored_pending != manifest_pending {
+        return Err("upgrade snapshot disagrees with checkpoint pending_upgrade".into());
+    }
+
+    let Some(pending) = manifest.pending_upgrade.as_ref() else {
+        return match phase {
+            PreflightPhase::Roll => Ok("roll-safe; activation remains blocked until v1 is scheduled"),
+            PreflightPhase::Activate => Err(
+                "legacy schema activation is not scheduled; use --phase roll only to predeploy the dormant dual-path binary"
+                    .into(),
+            ),
+        };
+    };
+    if phase == PreflightPhase::Roll {
+        return Err(
+            "a legacy-schema binary roll must finish before scheduling the v1 transition"
+                .into(),
+        );
+    }
+    if pending.to_version != crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION {
+        return Err(format!(
+            "legacy clients route requires pending protocol v{}, found v{}",
+            crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION,
+            pending.to_version
+        ));
+    }
+    if pending.name != crate::constants::CLIENTS_MODULE_UPGRADE_NAME {
+        return Err(format!(
+            "legacy clients route requires upgrade name {:?}, found {:?}",
+            crate::constants::CLIENTS_MODULE_UPGRADE_NAME,
+            pending.name
+        ));
+    }
+    if manifest
+        .height
+        .is_some_and(|height| pending.activation_height <= height)
+    {
+        return Err(format!(
+            "activation height {} is not after checkpoint height {}",
+            pending.activation_height,
+            manifest.height.unwrap_or_default()
+        ));
+    }
+    if status.member_count == 0 || !status.armed {
+        return Err(format!(
+            "legacy schema activation requires R=n readiness, found {} of {}",
+            status.ready_count, status.member_count
+        ));
+    }
+    Ok("activation-ready; scheduled v1 and R=n")
+}
+
+/// `preflight-state [--config node.toml]` — classify the persisted checkpoint
+/// before replacing or starting a node binary. The command is read-only with
+/// respect to the workspace and returns non-zero for every unknown schema.
+fn cmd_preflight_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let phase = match flags.get("phase").map(String::as_str) {
+        None | Some("activate") => PreflightPhase::Activate,
+        Some("roll") => PreflightPhase::Roll,
+        Some(other) => {
+            return Err(format!("unknown preflight phase {other:?} (want activate|roll)").into());
+        }
+    };
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let Some(manifest) = read_manifest_without_opening_workspace(&resolved.storage_dir)? else {
+        println!("state: fresh workspace (no recovery checkpoint)");
+        println!("schema_route: exact current genesis");
+        return Ok(());
+    };
+    manifest.preflight(MAX_PROTOCOL_VERSION)?;
+    let route = host_state::preflight_recovery_schema(&manifest)?;
+    println!(
+        "phase: {}",
+        match phase {
+            PreflightPhase::Activate => "activate",
+            PreflightPhase::Roll => "roll",
+        }
+    );
+    println!(
+        "checkpoint: height={} protocol_v{} required_v{}",
+        manifest
+            .height
+            .map(|height| height.to_string())
+            .unwrap_or_else(|| "genesis".into()),
+        manifest.current_version,
+        manifest.required_min_version
+    );
+    println!(
+        "schema_found: {}",
+        manifest
+            .state_schema
+            .as_ref()
+            .map(|schema| config::hex_bytes(schema))
+            .unwrap_or_else(|| "missing".into())
+    );
+    println!(
+        "schema_expected: {}",
+        config::hex_bytes(&crate::constants::current_state_schema_fingerprint())
+    );
+    match route {
+        host_state::StateSchemaRoute::Exact => println!("schema_route: exact"),
+        host_state::StateSchemaRoute::AddClientsAtV1 => {
+            println!("schema_route: bridge +clients@protocol-v1");
+            println!("schema_delta: + clients (empty state at activation)");
+        }
+    };
+    match manifest.pending_upgrade.as_ref() {
+        Some(upgrade) => println!(
+            "pending_upgrade: name={} activation_height={} to_version={}",
+            upgrade.name, upgrade.activation_height, upgrade.to_version
+        ),
+        None => println!("pending_upgrade: none"),
+    }
+    println!("boundary_members: {}", manifest.participants.len());
+    if route == host_state::StateSchemaRoute::AddClientsAtV1 {
+        let status = checkpoint_upgrade_status(&manifest)?;
+        println!(
+            "readiness: {} of {} (R=n: {})",
+            status.ready_count, status.member_count, status.armed
+        );
+        let verdict = validate_bridge_preflight(phase, &manifest, &status)?;
+        println!("verdict: {verdict}");
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -61,19 +325,29 @@ fn config_path(flags: &std::collections::BTreeMap<String, String>) -> Result<Pat
     ))
 }
 
-/// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
-/// pubkey on stdout (scriptable); provenance on stderr.
+/// `keygen [--out <path>] [--dir <dir>]` — generate (or reuse) a persisted
+/// ed25519 identity. pubkey on stdout (scriptable); provenance on stderr.
+/// `--dir <dir>` mints (or reuses) `<dir>/identity.key`, creating the dir: this
+/// is the JOIN CODE an invitee hands the inviter so the invite can be locked to
+/// this key before the workspace joins anything.
 fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let out = PathBuf::from(
-        flags
-            .get("out")
-            .map(String::as_str)
-            .unwrap_or("identity.key"),
-    );
+    let out = match flags.get("dir") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            dir.join("identity.key")
+        }
+        None => PathBuf::from(
+            flags
+                .get("out")
+                .map(String::as_str)
+                .unwrap_or("identity.key"),
+        ),
+    };
     let (key, generated) = config::load_or_generate_identity(&out)?;
     println!("{}", hex_bytes(key.public_key().as_ref()));
     eprintln!(
@@ -196,7 +470,11 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// this member's identity. the joiner's node redeems the token automatically
 /// (governance `Redeem`) — no member approval step follows.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
+    // `--short` is a boolean flag; parse_flags treats every `--flag` as taking
+    // a value, so lift it out before parsing the rest.
+    let short = args.iter().any(|a| a == "--short");
+    let rest: Vec<String> = args.iter().filter(|a| a.as_str() != "--short").cloned().collect();
+    let (pos, flags) = parse_flags(&rest)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
@@ -207,6 +485,13 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
+    // every invite is locked to the ONE key it admits — no bearer invites.
+    let target = flags.get("target").ok_or(
+        "--target <invitee-pubkey-hex> is required: every invite is locked to \
+         the person it admits. the invitee gets their code from the app's \
+         join screen or `ducktape-node keygen --dir <workspace>`",
+    )?;
+    let target = config::decode_key(target)?;
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
@@ -365,18 +650,60 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .expect("clock is past the epoch")
         .as_secs()
         + ttl_days * 24 * 60 * 60;
-    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
-    println!(
-        "{}",
-        config::encode_invite(
-            &invite_descriptor,
-            &token,
-            wireguard.as_ref(),
-            &fronts,
-            expires,
-            &key
-        )?
+    // the expiry now lives INSIDE the token (signed), not as a separate blob
+    // field; the token is minted against the invitee's key with Resident role.
+    let token = config::mint_invite_token(
+        &key,
+        descriptor.genesis_namespace().as_bytes(),
+        &target,
+        config::InviteRole::Resident,
+        expires,
     );
+    let blob_string = config::encode_invite(
+        &invite_descriptor,
+        &token,
+        wireguard.as_ref(),
+        &fronts,
+        &key,
+    )?;
+    println!("{blob_string}");
+
+    if short {
+        // publish the full signed blob to the ambient coordinator by content
+        // id, then print the short URL as the LAST line (the app reads the last
+        // line). This is the SAME coordinator the reachability plane registers
+        // with — config value or the shipped default.
+        let coord = config::coordinator_socket_addr(raw.primary_coordinator.as_deref())?
+            .ok_or("--short needs a primary coordinator (config or default)")?;
+        let raw_bytes = config::invite_blob_bytes(&blob_string)?;
+        let signer = key.clone();
+        // the shelf id is a RANDOM owner-owned lookup key, not a content hash
+        // (a 4-byte content hash is brute-forceable → invite substitution). The
+        // coordinator refuses an id another owner already holds, so on refusal
+        // we re-mint a fresh id and retry a bounded number of times.
+        let published = tokio::runtime::Runtime::new()?.block_on(async move {
+            let client = nat_traversal::NatClient::bind_multi_auth(
+                nat_traversal::NodeKey(own),
+                vec![coord],
+                signer,
+                None,
+            )
+            .await?;
+            for _ in 0..4 {
+                let id = config::random_invite_id();
+                if client.invite_put(id, expires, raw_bytes.clone()).await? {
+                    return Ok::<Option<_>, std::io::Error>(Some(id));
+                }
+            }
+            Ok(None)
+        })?;
+        let Some(id) = published else {
+            return Err(
+                "coordinator refused the short invite — try again (or share the full blob)".into(),
+            );
+        };
+        println!("{}", config::short_invite_url(&descriptor.chain_id, &id));
+    }
     Ok(())
 }
 
@@ -576,6 +903,36 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .get("join_requests")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]))
+    );
+    Ok(())
+}
+
+/// `join-state [--config node.toml]` — the node's AUTHORITATIVE onboarding
+/// phase over its local rpc: `parked | admitted | synced | promoted`, derived
+/// from committed standing (not log markers), so it is restart-proof. the
+/// desktop app reads this instead of parsing daemon.log, which loses the
+/// admission markers across a restart and mis-reads a re-syncing resident as
+/// unjoined. prints the `join_state` projection as JSON.
+fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let addr = resolved
+        .rpc_listen
+        .ok_or("join-state reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let reply = rpc_call(&addr, &serde_json::json!({ "cmd": "join_state" }))?;
+    if reply["ok"] != true {
+        return Err(format!("join-state: {}", reply["error"]).into());
+    }
+    println!(
+        "{}",
+        reply
+            .get("join_state")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(null))
     );
     Ok(())
 }
@@ -1176,10 +1533,72 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [blob] = pos.as_slice() else {
         return Err("join needs exactly one <invite blob>".into());
     };
-    let invite = config::decode_invite(blob)?;
+    // a `🦆://<name>/<id>` short invite: fetch the full signed blob back from
+    // the ambient coordinator, confirm it is for the network the URL names,
+    // then feed the normal join path. A full blob passes through untouched.
+    let blob: String = match config::parse_short_invite(blob) {
+        Some((name, id)) => {
+            let coord = config::coordinator_socket_addr(
+                flags.get("primary-coordinator").map(String::as_str),
+            )?
+            .ok_or(
+                "this short invite needs a coordinator, but coordination is disabled here — \
+                 paste the full invite blob",
+            )?;
+            let raw = tokio::runtime::Runtime::new()?
+                .block_on(async move {
+                    // a throwaway signed identity: the workspace identity does
+                    // not exist yet and the fetch is read-only.
+                    let signer = config::ephemeral_signer();
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(signer.public_key().as_ref());
+                    let client = nat_traversal::NatClient::bind_multi_auth(
+                        nat_traversal::NodeKey(k),
+                        vec![coord],
+                        signer,
+                        None,
+                    )
+                    .await?;
+                    client.invite_fetch(id).await
+                })?
+                .ok_or(
+                    "this short invite is not on the coordinator (expired, evicted, or a \
+                     coordinator restart) — ask the inviter to reveal it again or paste the \
+                     full blob",
+                )?;
+            let fetched = config::wrap_invite_bytes(&raw);
+            // verify the fetched blob is for the network the URL names before
+            // trusting anything else about it (envelope/token verify follows).
+            let invite = config::decode_invite(&fetched)?;
+            let got_name = invite.descriptor.chain_id.split('#').next().unwrap_or("");
+            if got_name != name {
+                return Err(format!(
+                    "short invite names network {name:?} but the coordinator returned a blob \
+                     for {got_name:?} — refusing"
+                )
+                .into());
+            }
+            fetched
+        }
+        None => blob.clone(),
+    };
+    let invite = config::decode_invite(&blob)?;
     let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
+    // mint (or reuse) the identity FIRST — before touching the directory shape —
+    // so a target mismatch aborts the join loudly, right here, instead of
+    // parking a node that will only ever be refused at the lobby.
+    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+    let me_hex = hex_bytes(key.public_key().as_ref());
+    if invite.token.target != key.public_key() {
+        return Err(format!(
+            "this invite is locked to a different key.\n  invite target: {}\n  this workspace: {me_hex}\n\
+             hand the inviter THIS key (the join code) and ask for a fresh invite.",
+            hex_bytes(invite.token.target.as_ref()),
+        )
+        .into());
+    }
     config::guard_join_descriptor(&dir, &descriptor)?;
     // plumbing merges: explicit flags win, an existing node.toml's values
     // (network- or dev-shape) survive, defaults fill the rest. computed
@@ -1258,8 +1677,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     descriptor.save(&dir.join("network.toml"))?;
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
-    let me_hex = hex_bytes(key.public_key().as_ref());
+    // identity was minted + target-checked at the top of the join.
     config::write_node_toml(&dir, &plumbing)?;
     // the capability the joining node redeems automatically; a re-join with a
     // fresh invite replaces a stale/spent one.
@@ -1301,4 +1719,136 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{me_hex}");
     Ok(())
+}
+
+#[cfg(test)]
+mod preflight_state_tests {
+    use super::{
+        PreflightPhase, read_manifest_without_opening_workspace, validate_bridge_preflight,
+    };
+
+    fn legacy_manifest(pending: Option<sdk::UpgradeCoords>) -> recovery::Manifest {
+        recovery::Manifest {
+            height: Some(10),
+            epoch: 0,
+            view_base: 0,
+            participants: vec![vec![1; 32]],
+            residents: Vec::new(),
+            pending_cutover_view: None,
+            app_hash: sdk::StateRoot::ZERO,
+            roots: Vec::new(),
+            snapshots: Vec::new(),
+            oplog_pos: 0,
+            next_seq: 0,
+            current_version: 0,
+            pending_upgrade: pending,
+            required_min_version: 0,
+            state_schema: Some(crate::constants::pre_clients_state_schema_fingerprint()),
+        }
+    }
+
+    fn status(pending: Option<(&str, u64, u32)>, armed: bool) -> upgrade::UpgradeStatus {
+        upgrade::UpgradeStatus {
+            current_version: 0,
+            pending: pending.map(|(name, activation_height, to_version)| {
+                upgrade::ScheduledUpgrade {
+                    name: name.into(),
+                    activation_height,
+                    to_version,
+                }
+            }),
+            members: vec![vec![1; 32]],
+            ready: if armed { vec![vec![1; 32]] } else { Vec::new() },
+            member_count: 1,
+            ready_count: u64::from(armed),
+            armed,
+        }
+    }
+
+    #[test]
+    fn legacy_activation_fails_closed_until_scheduled_and_fully_ready() {
+        let unscheduled = legacy_manifest(None);
+        assert!(
+            validate_bridge_preflight(PreflightPhase::Activate, &unscheduled, &status(None, false))
+                .is_err()
+        );
+        assert!(
+            validate_bridge_preflight(PreflightPhase::Roll, &unscheduled, &status(None, false))
+                .is_ok(),
+            "an explicit dormant-binary roll is safe before scheduling"
+        );
+
+        let pending = sdk::UpgradeCoords {
+            name: crate::constants::CLIENTS_MODULE_UPGRADE_NAME.into(),
+            activation_height: 20,
+            to_version: 1,
+        };
+        let scheduled = legacy_manifest(Some(pending));
+        assert!(
+            validate_bridge_preflight(
+                PreflightPhase::Roll,
+                &scheduled,
+                &status(
+                    Some((crate::constants::CLIENTS_MODULE_UPGRADE_NAME, 20, 1)),
+                    false,
+                ),
+            )
+            .is_err(),
+            "rollout must finish before the transition is scheduled"
+        );
+        assert!(
+            validate_bridge_preflight(
+                PreflightPhase::Activate,
+                &scheduled,
+                &status(
+                    Some((crate::constants::CLIENTS_MODULE_UPGRADE_NAME, 20, 1)),
+                    false,
+                ),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            validate_bridge_preflight(
+                PreflightPhase::Activate,
+                &scheduled,
+                &status(
+                    Some((crate::constants::CLIENTS_MODULE_UPGRADE_NAME, 20, 1)),
+                    true,
+                ),
+            )
+            .expect("scheduled v1 with R=n"),
+            "activation-ready; scheduled v1 and R=n"
+        );
+    }
+
+    #[test]
+    fn manifest_probe_never_mutates_the_workspace_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = dir.path().join("storage");
+        let manifest = storage.join("recovery-manifest");
+        std::fs::create_dir_all(&manifest).expect("manifest dir");
+        let right = manifest.join("7269676874");
+        let left = manifest.join("6c656674");
+        std::fs::write(&right, b"not-a-manifest").expect("right");
+        std::fs::write(&left, b"also-not-a-manifest").expect("left");
+        let before = (
+            std::fs::read(&right).expect("right before"),
+            std::fs::read(&left).expect("left before"),
+        );
+
+        let _ = read_manifest_without_opening_workspace(&storage);
+
+        assert_eq!(std::fs::read(&right).expect("right after"), before.0);
+        assert_eq!(std::fs::read(&left).expect("left after"), before.1);
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("parent")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ducktape-preflight-")),
+            "the private scratch store is always removed"
+        );
+    }
 }

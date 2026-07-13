@@ -18,6 +18,7 @@ import {
   quantile,
   ratePerSecond,
   syncBlocksLeft,
+  syncParked,
   syncPhase,
   syncProgress,
 } from "./metrics";
@@ -102,6 +103,9 @@ ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="
 ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="chunk"} 21
 ducktape_statesync_serve_requests{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 4
 ducktape_statesync_serve_requests{peer="0011223344556677",kind="tip_coords"} 250
+# TYPE ducktape_statesync_serve_last_request gauge
+ducktape_statesync_serve_last_request{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f",kind="frames"} 1
+ducktape_statesync_serve_last_request{peer="0011223344556677",kind="tip_coords"} 1
 # TYPE ducktape_statesync_serve_boundary_height gauge
 ducktape_statesync_serve_boundary_height{peer="9f3ab2c1d4e5f607a8b9cadbecfd0e1f"} 1500
 # TYPE ducktape_statesync_serve_frame_height gauge
@@ -168,6 +172,7 @@ describe("parseMetrics", () => {
     expect(poller.boundaryHeight).toBeNull();
     expect(poller.servedHeight).toBeNull();
     expect(poller.requests).toEqual({ tip_coords: 250 });
+    expect(poller.lastKind).toBe("tip_coords");
 
     expect(joiner.peer).toBe("9f3ab2c1d4e5f607a8b9cadbecfd0e1f");
     expect(joiner.bytesTx).toBe(5250000);
@@ -175,6 +180,14 @@ describe("parseMetrics", () => {
     expect(joiner.boundaryHeight).toBe(1500);
     expect(joiner.servedHeight).toBe(1540);
     expect(joiner.requests).toEqual({ manifest: 1, chunk: 21, frames: 4 });
+    expect(joiner.lastKind).toBe("frames");
+  });
+
+  it("leaves lastKind null on a node that predates the last_request series", () => {
+    const m = parseMetrics(
+      '# TYPE ducktape_statesync_serve_bytes gauge\nducktape_statesync_serve_bytes{peer="aa"} 64\n',
+    );
+    expect(m.syncPeers[0].lastKind).toBeNull();
   });
 
   it("keeps `present` a block-series fact: plane series alone don't set it", () => {
@@ -259,18 +272,45 @@ describe("derivations", () => {
     expect(syncProgress(joiner, 0)).toBeNull();
   });
 
-  it("phases a sync peer from its request mix", () => {
+  it("phases a sync peer from its most recent request", () => {
     const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
     expect(syncPhase(joiner)).toBe("replaying frames");
     expect(syncPhase(poller)).toBe("polling tip");
+    // the join's earlier phases, keyed by the latest ask.
+    expect(syncPhase({ ...joiner, lastKind: "manifest" })).toBe("manifest served");
+    expect(syncPhase({ ...joiner, lastKind: "chunk" })).toBe("restoring snapshot");
+    expect(syncPhase({ ...joiner, lastKind: "index_chunk" })).toBe("restoring snapshot");
+    expect(syncPhase({ ...joiner, lastKind: "blob" })).toBe("fetching blobs");
+    // a kind this build doesn't know names itself rather than lying.
+    expect(syncPhase({ ...joiner, lastKind: "warp" })).toBe("warp");
+  });
+
+  it("reads a synced joiner that flipped to tip polling as parked", () => {
+    const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
+    // the screenshot bug: frozen heights + routine tip polls must not read
+    // as a replay measured against the advancing goal.
+    const done = { ...joiner, lastKind: "tip_coords" };
+    expect(syncPhase(done)).toBe("parked");
+    expect(syncParked(done)).toBe(true);
+    // still replaying, or polling without ever taking anything
+    // height-shaped: neither is parked.
+    expect(syncParked(joiner)).toBe(false);
+    expect(syncParked(poller)).toBe(false);
+  });
+
+  it("falls back to the lifetime request mix on a node without last_request", () => {
+    const [poller, joiner] = parseMetrics(SCRAPE).syncPeers;
+    const legacy = { ...joiner, lastKind: null };
+    expect(syncPhase(legacy)).toBe("replaying frames");
     // a snapshot restore in flight: manifest served, chunks moving, no frames.
-    expect(syncPhase({ ...joiner, servedHeight: null })).toBe("restoring snapshot");
+    expect(syncPhase({ ...legacy, servedHeight: null })).toBe("restoring snapshot");
     // manifest served but no payload requested yet.
-    expect(syncPhase({ ...joiner, servedHeight: null, requests: { manifest: 1 } })).toBe(
+    expect(syncPhase({ ...legacy, servedHeight: null, requests: { manifest: 1 } })).toBe(
       "manifest served",
     );
+    expect(syncPhase({ ...poller, lastKind: null })).toBe("polling tip");
     // nothing height-shaped at all: the blob fetch-on-miss lane.
-    expect(syncPhase({ ...poller, requests: { blob: 3 } })).toBe("fetching blobs");
+    expect(syncPhase({ ...poller, lastKind: null, requests: { blob: 3 } })).toBe("fetching blobs");
   });
 });
 

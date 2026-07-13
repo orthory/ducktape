@@ -988,6 +988,25 @@ mod tests {
         Origin::External(vec![byte; 32])
     }
 
+    #[test]
+    fn agent_response_commit_message_is_optional_and_round_trips_exactly() {
+        let legacy = decode_response(br#"{"reply_blocks":[],"actions":[]}"#).unwrap();
+        assert_eq!(legacy.commit_message, None);
+
+        let message = "fix: exact subject\n\nExact body.";
+        let response = AgentResponse {
+            commit_message: Some(message.into()),
+            ..AgentResponse::default()
+        };
+        assert_eq!(
+            decode_response(&encode_response(&response))
+                .unwrap()
+                .commit_message
+                .as_deref(),
+            Some(message)
+        );
+    }
+
     fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
         AgentMsg::RegisterAgent {
             agent_id: agent_id.into(),
@@ -1878,6 +1897,31 @@ mod tests {
 
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::PagesWrite("page-1")));
+    }
+
+    #[test]
+    fn duckfs_write_text_is_a_known_action_with_a_duckfs_write_cap() {
+        let action = AgentAction::DuckfsWriteText {
+            path: "/shared/agents/qa-fixer/self-improvement/SKILL.md".into(),
+            text: "lesson".into(),
+            base_snapshot: None,
+        };
+        assert_eq!(action.vocabulary_name(), ACTION_DUCKFS_WRITE_TEXT);
+        assert!(KNOWN_ACTIONS.contains(&ACTION_DUCKFS_WRITE_TEXT));
+
+        let rec = record_with_caps(ResourceCaps {
+            duckfs_write: vec!["/shared/agents/qa-fixer".into()],
+            ..Default::default()
+        });
+        assert!(rec.permits(&CapRequest::DuckfsWrite(
+            "/shared/agents/qa-fixer/self-improvement/SKILL.md"
+        )));
+        assert!(
+            !rec.permits(&CapRequest::DuckfsWrite(
+                "/shared/agents/qa-fixer-policy/SKILL.md"
+            )),
+            "a sibling sharing a textual prefix is denied"
+        );
     }
 
     /// the two pages grants are in the vocabulary: a registration granting

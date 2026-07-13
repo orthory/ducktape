@@ -3,6 +3,7 @@ use super::{
     MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
     PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
+use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
 /// reserved logical-key prefixes for comment records + the per-target thread
 /// index. all lead with NUL, so they can never collide with a client-minted
@@ -131,6 +132,28 @@ impl Pages {
         Ok(())
     }
 
+    /// Keep selection anchors attached while a block's text shifts. This is
+    /// linear in threads on one target (hard-capped at 1024); shard the target
+    /// index only if real documents make that hotspot measurable.
+    pub(super) async fn rebase_comment_anchors(
+        &mut self,
+        target: &str,
+        edit: TextEdit,
+        new_len: u32,
+    ) -> Result<(), PageError> {
+        for thread_id in self.load_target_index(target).await? {
+            let mut thread = self
+                .load_thread(&thread_id)
+                .await?
+                .ok_or(PageError::Corrupt)?;
+            if let Some(anchor) = &mut thread.anchor {
+                rebase_anchor(anchor, edit, new_len);
+                self.store_thread(&thread)?;
+            }
+        }
+        Ok(())
+    }
+
     // ── comments ──
 
     pub(super) async fn apply_comment_op(
@@ -145,6 +168,7 @@ impl Pages {
                 comment_id,
                 target,
                 text,
+                anchor,
                 mentions: _,
                 as_agent,
             } => {
@@ -208,6 +232,16 @@ impl Pages {
                         self.store_thread(&thread)
                     }
                     None => {
+                        if let Some(anchor) = &anchor {
+                            let block = self
+                                .load_block(&target)
+                                .await
+                                .map_err(|_| PageError::Corrupt)?
+                                .ok_or(PageError::BlockNotFound)?;
+                            if !valid_range(&block.text, anchor.start, anchor.end) {
+                                return Err(PageError::InvalidTextRange);
+                            }
+                        }
                         let mut ids = self.load_target_index(&target).await?;
                         if ids.len() >= MAX_THREADS_PER_TARGET {
                             return Err(PageError::TooManyThreads);
@@ -226,6 +260,7 @@ impl Pages {
                             target: target.clone(),
                             opener: author,
                             created_at: now,
+                            anchor,
                             resolved: false,
                             resolved_by: None,
                             comment_ids: vec![comment_id],
@@ -240,7 +275,49 @@ impl Pages {
                     }
                 }
             }
-            PageMsg::EditComment { comment_id, text } => {
+            PageMsg::MoveCommentThread {
+                thread_id,
+                target,
+                anchor,
+            } => {
+                if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(&target) {
+                    return Err(PageError::IdTooLarge);
+                }
+                let block = self
+                    .load_block(&target)
+                    .await
+                    .map_err(|_| PageError::Corrupt)?
+                    .ok_or(PageError::BlockNotFound)?;
+                if let Some(anchor) = &anchor
+                    && !valid_range(&block.text, anchor.start, anchor.end)
+                {
+                    return Err(PageError::InvalidTextRange);
+                }
+                let mut thread = self
+                    .load_thread(&thread_id)
+                    .await?
+                    .ok_or(PageError::ThreadNotFound)?;
+                if thread.target != target {
+                    let mut next = self.load_target_index(&target).await?;
+                    if !next.contains(&thread_id) && next.len() >= MAX_THREADS_PER_TARGET {
+                        return Err(PageError::TooManyThreads);
+                    }
+                    let mut previous = self.load_target_index(&thread.target).await?;
+                    previous.retain(|id| id != &thread_id);
+                    self.stage_target_index(&thread.target, &previous)?;
+                    if !next.contains(&thread_id) {
+                        next.push(thread_id.clone());
+                        next.sort();
+                        self.stage_target_index(&target, &next)?;
+                    }
+                    thread.target = target;
+                }
+                thread.anchor = anchor;
+                self.store_thread(&thread)
+            }
+            PageMsg::EditComment {
+                comment_id, text, ..
+            } => {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }

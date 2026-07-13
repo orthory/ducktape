@@ -1,56 +1,12 @@
-// The `[[page:<id>]]` reference grammar, mirrored from the module that already
-// owns it: crates/apps/runs/src/inject.rs `parse_page_refs`. A run's injected
-// page context is parsed there from the SAME message text a chat body renders
-// here, so the two must accept exactly the same refs — a chip the console shows
-// but the runs module skips (or vice-versa) is a lie about what the agent saw.
-//
-// The rule, verbatim: scan for `[[page:`, take everything up to the FIRST `]]`,
-// and reject the ref when the id is empty or holds whitespace / `[` / `]`.
-// A malformed ref is never an error — it just stays literal text. An
-// unterminated `[[page:` ends the scan (nothing after it can close).
+// The composer's `[[` page typeahead. The `[[` is a shortcut trigger only —
+// the INSERTED form is a markdown reference, `[title](duck://page/<id>)`, the
+// unified duck:// grammar tokenized in `duck-ref.ts` (and, in a follow-up, the
+// same grammar the runs module will parse for page-context injection). The old
+// `[[page:<id>]]` token grammar is retired.
 
 import type { PageMeta } from "../../../domain/pages-client";
 
-const OPEN = "[[page:";
-const CLOSE = "]]";
-
-export type PageRefSegment = { text: string } | { pageId: string };
-
-export const isPageRef = (segment: PageRefSegment): segment is { pageId: string } =>
-  "pageId" in segment;
-
-/** Split `text` into literal runs and accepted page refs, in order. The literal
- *  runs keep malformed refs verbatim, so concatenating every segment's source
- *  text reproduces the input. */
-export const splitPageRefs = (text: string): PageRefSegment[] => {
-  const out: PageRefSegment[] = [];
-  let literalFrom = 0; // start of the pending literal run
-  let scan = 0; // where the next `[[page:` search begins
-  for (;;) {
-    const open = text.indexOf(OPEN, scan);
-    if (open === -1) break;
-    const idFrom = open + OPEN.length;
-    const close = text.indexOf(CLOSE, idFrom);
-    if (close === -1) break; // unterminated — nothing after this can close it
-    const pageId = text.slice(idFrom, close);
-    scan = close + CLOSE.length;
-    // Malformed: fall through WITHOUT moving `literalFrom`, so the raw text
-    // (brackets and all) stays in the literal run — exactly what the runs
-    // module does by skipping the ref and continuing past its close.
-    if (pageId === "" || /[\s[\]]/.test(pageId)) continue;
-    if (open > literalFrom) out.push({ text: text.slice(literalFrom, open) });
-    out.push({ pageId });
-    literalFrom = scan;
-  }
-  if (literalFrom < text.length) out.push({ text: text.slice(literalFrom) });
-  return out;
-};
-
-/** The distinct page ids `text` references, in first-seen order — the same list
- *  the runs module builds for injection. */
-export const parsePageRefs = (text: string): string[] => [
-  ...new Set(splitPageRefs(text).filter(isPageRef).map((segment) => segment.pageId)),
-];
+import { pageRefMarkdown } from "./duck-ref";
 
 // ── The composer's `[[` typeahead ───────────────────────
 
@@ -75,15 +31,16 @@ export const pageRefTokenAt = (text: string, caret: number): PageRefToken | null
   return { start, query };
 };
 
-/** Replace the typed fragment (`token.start` .. `caret`) with `[[page:<id>]] `
- *  and report where the caret lands afterwards — insertMention's contract. */
+/** Replace the typed `[[…` fragment (`token.start` .. `caret`) with the
+ *  markdown page ref `[title](duck://page/<id>)` and report where the caret
+ *  lands afterwards — insertMention's contract. */
 export const insertPageRef = (
   text: string,
   token: PageRefToken,
   caret: number,
-  pageId: string,
+  page: { id: string; title: string },
 ): { text: string; caret: number } => {
-  const inserted = `[[page:${pageId}]] `;
+  const inserted = `${pageRefMarkdown(page.id, page.title)} `;
   return {
     text: text.slice(0, token.start) + inserted + text.slice(caret),
     caret: token.start + inserted.length,

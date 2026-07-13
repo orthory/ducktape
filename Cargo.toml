@@ -34,9 +34,9 @@ members = [
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/wasm-host",
     # system — consensus infrastructure modules
-    "crates/system/kv", 
-    "crates/system/valset", 
-    
+    "crates/system/kv",
+    "crates/system/valset",
+    "crates/system/clients",
     "crates/system/governance",
     "crates/system/identity",
     "crates/system/upgrade", 
@@ -182,6 +182,7 @@ wasm-host = { path = "crates/kernel/wasm-host" }
 # internal — module impl crates
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
+clients = { path = "crates/system/clients" }
 governance = { path = "crates/system/governance" }
 identity = { path = "crates/system/identity" }
 upgrade = { path = "crates/system/upgrade" }

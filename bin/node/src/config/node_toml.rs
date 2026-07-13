@@ -85,19 +85,19 @@ pub struct NodeToml {
     /// how provider runs are spawned (node-local operator policy, like
     /// checkpoint_blocks). absent/`"direct"` = the plain host spawn (default);
     /// `"podman"` = a rootless container that enforces each run's numeric
-    /// limits AND makes this node announce its probed capacity; `"tart"` is
-    /// accepted and reserved (resolves to Direct until a sibling branch lands
-    /// the backend). any other value is a loud config error.
+    /// limits AND makes this node announce its probed capacity; `"tart"` uses
+    /// one ephemeral Apple-Silicon VM per run. any other value is a loud config
+    /// error.
     pub sandbox: Option<String>,
-    /// the container image the `podman` sandbox runs each provider in;
-    /// default `docker.io/library/node:22-slim`. ignored unless `sandbox =
-    /// "podman"`.
+    /// the provider environment image: a container image for Podman or a VM
+    /// image for Tart. defaults to `docker.io/library/node:22-slim` for Podman
+    /// and the Cirrus Labs Sonoma base image for Tart. ignored for Direct.
     pub sandbox_image: Option<String>,
     /// override the probed core count this node announces as sandbox capacity
-    /// (`podman` only). WINS over the `/proc`/sysctl probe.
+    /// (Podman or Tart). WINS over the `/proc`/sysctl probe.
     pub sandbox_cores: Option<u64>,
     /// override the probed total-memory GiB this node announces as sandbox
-    /// capacity (`podman` only). WINS over the probe.
+    /// capacity (Podman or Tart). WINS over the probe.
     pub sandbox_mem_gb: Option<u64>,
 }
 

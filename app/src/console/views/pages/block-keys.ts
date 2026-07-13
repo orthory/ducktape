@@ -72,6 +72,7 @@ export type KeyIntent =
   | { type: "exit-to-paragraph" }
   | { type: "toggle-check" }
   | { type: "toggle-collapse" }
+  | { type: "insert-tab"; value: string; caret: number }
   | { type: "indent" }
   | { type: "outdent" }
   | { type: "move-up" }
@@ -127,7 +128,17 @@ export function resolveKey(ctx: KeyContext): KeyIntent {
     return NONE;
   }
 
-  if (ctx.key === "Tab") return ctx.shiftKey ? { type: "outdent" } : { type: "indent" };
+  if (ctx.key === "Tab") {
+    if (ctx.kind === "code") {
+      if (ctx.shiftKey) return NONE;
+      return {
+        type: "insert-tab",
+        value: `${ctx.value.slice(0, ctx.caretStart)}\t${ctx.value.slice(ctx.caretEnd)}`,
+        caret: ctx.caretStart + 1,
+      };
+    }
+    return ctx.shiftKey ? { type: "outdent" } : { type: "indent" };
+  }
 
   if (ctx.altKey && ctx.key === "ArrowUp") return { type: "move-up" };
   if (ctx.altKey && ctx.key === "ArrowDown") return { type: "move-down" };

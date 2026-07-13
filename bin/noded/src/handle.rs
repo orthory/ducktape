@@ -67,7 +67,7 @@ pub enum NodeCommand {
 pub struct NodeHandle {
     pub(crate) cmds: mpsc::Sender<NodeCommand>,
     pub(crate) hub: StreamHub,
-    pub(crate) shutdown: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) shutdown: tokio::sync::watch::Sender<bool>,
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
@@ -123,7 +123,7 @@ impl NodeHandle {
         let handle = Self {
             cmds: cmd_tx,
             hub: hub.clone(),
-            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            shutdown: tokio::sync::watch::channel(false).0,
             blobs: crate::blobs::BlobHandle::default(),
             forge_repo: None,
             index: None,
@@ -229,11 +229,18 @@ impl NodeHandle {
         self.index.clone()
     }
 
+    /// Publish a durable shutdown state to every current and future surface.
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
-    /// `Notify` stores the permit, so a request that lands before anyone awaits
-    /// is not lost.
     pub async fn shutdown_requested(&self) {
-        self.shutdown.notified().await;
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow() {
+            return;
+        }
+        let _ = shutdown.changed().await;
     }
 
     pub(crate) async fn send(&self, cmd: NodeCommand) -> Result<(), Response> {

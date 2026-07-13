@@ -521,6 +521,53 @@ fn job_finalize_is_a_delivery_receipt_with_data_and_output_ref() {
 }
 
 #[test]
+fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
+    let registry = job_registry();
+    let mut m = module();
+    let mut ctx = CaptureCtx::new()
+        .at(3)
+        .with_jobs_origin()
+        .with_registry(&registry);
+    exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+    commit(&mut m);
+    let run_id = job_run_id_for("job-1", "duck", 3);
+    let response = agent::encode_response(&AgentResponse {
+        reply_blocks: Vec::new(),
+        actions: vec![AgentAction::CreateTask {
+            task_id: "t1".into(),
+            title: "todo".into(),
+        }],
+        commit_message: Some("x".repeat(JOB_FINALIZE_PAYLOAD_BYTES * 2)),
+    });
+    let response = String::from_utf8(response).unwrap();
+    let mut ctx = CaptureCtx::new()
+        .at(10)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_claimed_job("job-1", 3);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(&response, serde_json::json!({}))),
+        ),
+    )
+    .unwrap();
+
+    let finalize = ctx.job_msgs();
+    assert_eq!(finalize.len(), 1);
+    let JobsMsg::Finalize { payload, .. } = &finalize[0] else {
+        panic!("expected a finalize");
+    };
+    assert!(payload.len() <= JOB_FINALIZE_PAYLOAD_BYTES);
+    let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["response"]["actions"].as_array().unwrap().len(), 1);
+    assert!(value["response"].get("commit_message").is_none());
+}
+
+#[test]
 fn job_finalize_output_ref_carries_forge_coordinates() {
     // §5 distillation: a forge receipt (no snapshot, branch + output
     // commit) distills into an output_ref stating branch@oid, so the

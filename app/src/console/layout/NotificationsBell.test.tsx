@@ -27,6 +27,7 @@ const item = (patch: Partial<NotifyItem> = {}): NotifyItem => ({
   title: "Ping",
   body: "hey there",
   channelId: "general",
+  messageId: null,
   at: Date.now(),
   ...patch,
 });
@@ -83,10 +84,20 @@ describe("NotificationsBell", () => {
   it("falls back to the category screen without a channel, and reroutes forge-item channels", async () => {
     markTauri();
     notifyMocks.recent.mockResolvedValueOnce({
-      unread: 2,
+      unread: 3,
       items: [
         item({ title: "Run done", category: "run", channelId: null }),
-        item({ title: "PR reply", category: "reply", channelId: "forge:repo:4" }),
+        item({
+          title: "PR mention",
+          channelId: "forge:repo:3",
+          messageId: "mention-3",
+        }),
+        item({
+          title: "PR reply",
+          category: "reply",
+          channelId: "forge:repo:4",
+          messageId: "reply-4",
+        }),
       ],
     });
 
@@ -94,18 +105,36 @@ describe("NotificationsBell", () => {
     // The boot snapshot carries unread — the badge must show it even though
     // no unread event ever fired (the engine badges before the webview mounts).
     await waitFor(() =>
-      expect(screen.getByLabelText("Notifications")).toHaveTextContent("2"),
+      expect(screen.getByLabelText("Notifications")).toHaveTextContent("3"),
     );
     fireEvent.click(screen.getByLabelText("Notifications"));
 
-    fireEvent.click(await screen.findByText("Run done"));
+    fireEvent.click(await screen.findByRole("button", { name: "Open notification: Run done" }));
     expect(setScreen).toHaveBeenCalledWith("agent");
     expect(selectChannel).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByLabelText("Notifications"));
-    fireEvent.click(await screen.findByText("PR reply"));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open notification: PR mention" }),
+    );
+    expect(openForgeItem).toHaveBeenCalledWith({
+      repo: "repo",
+      number: 3,
+      messageId: "mention-3",
+    });
+    expect(selectChannel).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText("Notifications"));
+    const prReply = await screen.findByRole("button", {
+      name: "Open notification: PR reply",
+    });
+    fireEvent.click(prReply);
     // A forge-item channel jumps to the ITEM, not the repo list.
-    expect(openForgeItem).toHaveBeenCalledWith("repo", 4);
+    expect(openForgeItem).toHaveBeenCalledWith({
+      repo: "repo",
+      number: 4,
+      messageId: "reply-4",
+    });
     expect(selectChannel).not.toHaveBeenCalled();
   });
 

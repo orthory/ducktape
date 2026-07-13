@@ -1,11 +1,11 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { FileEntry, FilePage } from "../../../domain/files-client";
-import type { NodeTransport } from "../../../domain/transport";
+import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
 import { makeTransportStub } from "../../../test/transport-stub";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -113,6 +113,82 @@ describe("FilesView", () => {
     expect(transport.filesLs).toHaveBeenCalledWith(
       expect.objectContaining({ path: "/shared/docs" }),
     );
+    expect(
+      vi.mocked(transport.filesLs).mock.calls.filter(([params]) => params.path === "/shared"),
+    ).toHaveLength(1);
+  });
+
+  it("reloads only the directory touched by a live file change", async () => {
+    let handlers: TopicHandlers | null = null;
+    let docsReads = 0;
+    let finishReload!: (page: FilePage) => void;
+    const transport = makeTransport({
+      filesLs: vi.fn(({ path }: { path: string }) => {
+        if (path === "/shared/docs" && ++docsReads === 2) {
+          return new Promise<FilePage>((resolve) => {
+            finishReload = resolve;
+          });
+        }
+        return Promise.resolve(lsByPath[path] ?? { entries: [], next: null });
+      }),
+      subscribe: vi.fn((_topics, next) => {
+        handlers = next;
+        return () => {};
+      }),
+    });
+    renderView(transport);
+    fireEvent.click(await screen.findByRole("button", { name: /open folder docs/i }));
+    await screen.findByText("plan.md");
+
+    await act(async () => {
+      handlers?.onTail?.({
+        type: "tail",
+        topic: "files:watch",
+        cursor: "op/2/0",
+        item: {
+          height: 2,
+          time: 2,
+          message: "update plan",
+          baseSnapshot: HEAD_ID,
+          paths: ["/shared/docs/plan.md"],
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    });
+
+    expect(screen.getByText("Refreshing…")).toBeInTheDocument();
+    expect(screen.getByText("plan.md")).toBeInTheDocument();
+    expect(
+      vi.mocked(transport.filesLs).mock.calls.filter(([params]) => params.path === "/shared"),
+    ).toHaveLength(1);
+    expect(
+      vi.mocked(transport.filesLs).mock.calls.filter(([params]) => params.path === "/shared/docs"),
+    ).toHaveLength(2);
+
+    await act(async () => finishReload(lsByPath["/shared/docs"]));
+    expect(screen.queryByText("Refreshing…")).not.toBeInTheDocument();
+
+    await act(async () => {
+      handlers?.onTail?.({
+        type: "tail",
+        topic: "files:watch",
+        cursor: "op/3/0",
+        item: {
+          height: 3,
+          time: 3,
+          message: "update readme",
+          baseSnapshot: HEAD_ID,
+          paths: ["/shared/readme.md"],
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    });
+    expect(
+      vi.mocked(transport.filesLs).mock.calls.filter(([params]) => params.path === "/shared"),
+    ).toHaveLength(2);
+    expect(
+      vi.mocked(transport.filesLs).mock.calls.filter(([params]) => params.path === "/shared/docs"),
+    ).toHaveLength(2);
   });
 
   it("opens on a filesFocus hand-off — the agent form pointing at a skill doc", async () => {
@@ -143,14 +219,28 @@ describe("FilesView", () => {
     expect(transport.filesLs).toHaveBeenCalledWith(expect.objectContaining({ path: "/shared/docs" }));
   });
 
-  it("opens a file panel with a text preview and a download control", async () => {
+  it("previews a file range and downloads through the direct object URL", async () => {
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     const transport = makeTransport({
       filesRead: vi.fn().mockResolvedValue({ b64: btoa("hello duckfs"), eof: true }),
+      filesObjectUrl: vi.fn(() => "http://node/v1/files/object/shared/readme.md"),
     });
-    renderView(transport);
-    fireEvent.click(await screen.findByRole("button", { name: /open file readme\.md/i }));
-    expect(await screen.findByText("hello duckfs")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /download readme\.md/i })).toBeInTheDocument();
+    try {
+      renderView(transport);
+      fireEvent.click(await screen.findByRole("button", { name: /open file readme\.md/i }));
+      expect(await screen.findByText("hello duckfs")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /download readme\.md/i }));
+
+      expect(anchorClick).toHaveBeenCalledTimes(1);
+      expect(transport.filesObjectUrl).toHaveBeenCalledWith({
+        path: "/shared/readme.md",
+        snapshot: undefined,
+        size: 4,
+      });
+      expect(transport.filesRead).toHaveBeenCalledTimes(1);
+    } finally {
+      anchorClick.mockRestore();
+    }
   });
 
   it("uploads a chosen file into the current directory, then reloads", async () => {
@@ -320,54 +410,41 @@ describe("FilesView", () => {
     expect(screen.queryByRole("dialog", { name: /drop files to upload/i })).not.toBeInTheDocument();
   });
 
-  it("marks file rows as draggable download sources", async () => {
-    const originalCreateObjectURL = URL.createObjectURL;
-    const originalRevokeObjectURL = URL.revokeObjectURL;
-    const createObjectURL = vi.fn(() => "blob:readme");
-    const revokeObjectURL = vi.fn();
-    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
-    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+  it("uses a direct download URL for drag-out without reading the file", async () => {
     const transport = makeTransport({
       filesRead: vi.fn().mockResolvedValue({ b64: btoa("readme body"), eof: true }),
+      filesObjectUrl: vi.fn(() => "http://node/v1/files/object/shared/readme.md"),
     });
-    try {
-      renderView(transport);
-      const fileRow = await screen.findByRole("button", { name: /open file readme\.md/i });
+    renderView(transport);
+    const fileRow = await screen.findByRole("button", { name: /open file readme\.md/i });
 
-      fireEvent.mouseDown(fileRow);
-      await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    fireEvent.mouseEnter(fileRow);
+    expect(transport.filesRead).not.toHaveBeenCalled();
 
-      const dataTransfer = {
-        setData: vi.fn(),
-        items: { add: vi.fn() },
-        effectAllowed: "none",
-      };
-      fireEvent.dragStart(fileRow, { dataTransfer });
+    const dataTransfer = { setData: vi.fn(), effectAllowed: "none" };
+    fireEvent.dragStart(fileRow, { dataTransfer });
 
-      expect(dataTransfer.effectAllowed).toBe("copy");
-      expect(dataTransfer.items.add).toHaveBeenCalledWith(expect.any(File));
-      const draggedFile = dataTransfer.items.add.mock.calls[0][0] as File;
-      expect(draggedFile.name).toBe("readme.md");
-      expect(draggedFile.type).toBe("text/plain");
-      expect(dataTransfer.setData).toHaveBeenCalledWith(
-        "application/x-ducktape-file-path",
-        "/shared/readme.md",
-      );
-      expect(dataTransfer.setData).toHaveBeenCalledWith("text/plain", "/shared/readme.md");
-      expect(dataTransfer.setData).toHaveBeenCalledWith(
-        "DownloadURL",
-        "text/plain:readme.md:blob:readme",
-      );
-    } finally {
-      Object.defineProperty(URL, "createObjectURL", {
-        configurable: true,
-        value: originalCreateObjectURL,
-      });
-      Object.defineProperty(URL, "revokeObjectURL", {
-        configurable: true,
-        value: originalRevokeObjectURL,
-      });
-    }
+    expect(dataTransfer.effectAllowed).toBe("copy");
+    expect(dataTransfer.setData).toHaveBeenCalledWith(
+      "application/x-ducktape-file-path",
+      "/shared/readme.md",
+    );
+    expect(dataTransfer.setData).toHaveBeenCalledWith("text/plain", "/shared/readme.md");
+    expect(dataTransfer.setData).toHaveBeenCalledWith(
+      "DownloadURL",
+      "text/plain:readme.md:http://node/v1/files/object/shared/readme.md",
+    );
+    expect(transport.filesRead).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch refs until history is opened", async () => {
+    const transport = makeTransport();
+    renderView(transport);
+    await screen.findByText("readme.md");
+    expect(transport.query).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /^history$/i }));
+    await waitFor(() => expect(transport.query).toHaveBeenCalledWith("files", { refs: {} }));
   });
 
   it("creates new folders through an in-app dialog", async () => {

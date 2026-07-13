@@ -278,6 +278,7 @@ fn canned_response(run_id: &str) -> Vec<u8> {
             task_id: "task-1".into(),
             title: "follow up on the mention".into(),
         }],
+        commit_message: None,
     })
 }
 
@@ -1161,6 +1162,7 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
                 task_id: "job-task".into(),
                 title: "complete job".into(),
             }],
+            commit_message: None,
         });
         let oracle = oracle_op(&native, &run_id, wrap_runner(raw)).await;
         roundtrip(

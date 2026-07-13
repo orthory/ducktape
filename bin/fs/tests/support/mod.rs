@@ -163,14 +163,34 @@ fn run_actor(duckfs_dir: std::path::PathBuf, mut cmd_rx: mpsc::Receiver<NodeComm
                     };
                     let _ = reply.send(result);
                 }
-                // the duckfs CLI submits frameless (the daemon's trusted-client
-                // lane); this files-only actor has no agent, no session key, and
-                // nothing that signs — so the frame lane is refused rather than
-                // faked.
-                NodeCommand::SubmitFrame { reply, .. } => {
-                    let _ = reply.send(Err(
-                        "the files test actor serves no signed-frame lane".into()
-                    ));
+                // the signed-frame lane, FAITHFUL to the real daemon's actor
+                // arm: the origin is the frame's VERIFIED signer, never a
+                // caller claim. this is the lane the desktop app's user-signed
+                // files commits ride (signed_frame_e2e drives it end to end).
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    let result = match node::decode_frame(&frame) {
+                        Ok((origin, msg)) => {
+                            let next = height + 1;
+                            let ctx = BlockContext {
+                                protocol_version: 0,
+                                height: next,
+                                consensus_time: next,
+                                origin,
+                            };
+                            match host.submit_at(ctx, msg).await {
+                                Ok(out) => {
+                                    height = next;
+                                    Ok(BlockSummary {
+                                        height,
+                                        app_hash: noded::hex_root(&out.app_hash),
+                                    })
+                                }
+                                Err(err) => Err(err.to_string()),
+                            }
+                        }
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host.query(&target, &req).await.map_err(|e| e.to_string());

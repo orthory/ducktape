@@ -2,12 +2,13 @@ import type { CSSProperties, ReactNode } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { openExternal } from "../../dom/external-link";
 import { color, font, radius } from "../../theme/tokens";
 
 // Rendered preview for .md / .mdx files. react-markdown emits React elements
 // (no innerHTML), styled here with the console's tokens. MDX-specific JSX isn't
 // executed — the prose, code, tables and lists render, which is the intent of a
-// read-only preview. Links don't navigate the webview; images show a caption.
+// read-only preview. Links open in the system browser; images show a caption.
 
 const heading = (size: number, mt: number): CSSProperties => ({
   font: `600 ${size}px ${font.sans}`,
@@ -43,7 +44,10 @@ const COMPONENTS: Components = {
   a: ({ children, href }) => (
     <a
       href={href}
-      onClick={(e) => e.preventDefault()}
+      onClick={(e) => {
+        e.preventDefault();
+        if (href) openExternal(href);
+      }}
       title={href}
       style={{ color: color.accentAlt1, textDecoration: "none", cursor: "pointer", borderBottom: `1px solid ${color.border}` }}
     >

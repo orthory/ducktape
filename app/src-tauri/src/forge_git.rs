@@ -2,7 +2,8 @@
 //!
 //! Writes still go through the node's consensus `forge` module. These commands
 //! only open the active workspace's local repo and project committed refs
-//! (`refs/heads/*`, defaulting to `main`) into browser-friendly shapes. The one
+//! (`refs/heads/*`, preferring `dev` and falling back to `main`) into
+//! browser-friendly shapes. The one
 //! exception is `forge_build_merge`, which builds a CLIENT-COMPUTED merge
 //! commit in a throwaway repo — the node repo itself is never written.
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
 
 const MAIN_REF: &str = "refs/heads/main";
+const DEV_REF: &str = "refs/heads/dev";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,11 +73,12 @@ pub struct FileDiff {
 }
 
 /// one materialized repo under a forge base — its ACTUAL on-disk directory name
-/// (never a hardcoded label) and committed `refs/heads/main`, or `None` if unborn.
+/// (never a hardcoded label) and its integration head, or `None` if unborn.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoMeta {
     name: String,
+    branch: String,
     head: Option<String>,
 }
 
@@ -145,7 +148,7 @@ pub fn forge_head(app: crate::rt::AppHandle, repo: String) -> Result<Option<Stri
     let Some(git) = open_named_repo(&app, &repo)? else {
         return Ok(None);
     };
-    Ok(main_oid(&git)?.map(|oid| oid.to_string()))
+    Ok(integration_oid(&git)?.map(|oid| oid.to_string()))
 }
 
 /// Every local branch (`refs/heads/*`) by SHORT name with its 40-hex head,
@@ -175,8 +178,8 @@ pub fn forge_list_branches(app: crate::rt::AppHandle, repo: String) -> Result<Ve
 }
 
 /// Read a commit log, newest first. `reference` picks the starting point — a
-/// branch short name or 40-hex oid, `None` for main. `after` is an exclusive
-/// commit cursor from the same walk. `limit` is optional: `None` walks the
+/// branch short name or 40-hex oid, `None` for the integration branch. `after`
+/// is an exclusive commit cursor from the same walk. `limit` is optional: `None` walks the
 /// whole reachable history, `Some(n)` caps to the newest `n`.
 #[tauri::command]
 pub fn forge_log(
@@ -671,12 +674,12 @@ fn require_named_repo(app: &crate::rt::AppHandle, repo: &str) -> Result<Reposito
 }
 
 /// Enumerate every repo materialized under the forge base(s), by its REAL on-disk
-/// directory name, with its committed `refs/heads/main` (or `None` if unborn).
+/// directory name, with its integration head (or `None` if unborn).
 /// Sorted by name and de-duplicated (the first base wins) so the list is
 /// deterministic. A missing base is simply empty; a single flaky dir entry is
 /// skipped, not fatal.
 fn list_forge_repos(app: &crate::rt::AppHandle) -> Result<Vec<RepoMeta>, String> {
-    let mut repos: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut repos: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
     for base in forge_base_dirs(app)? {
         let read = match fs::read_dir(&base) {
             Ok(read) => read,
@@ -696,16 +699,17 @@ fn list_forge_repos(app: &crate::rt::AppHandle) -> Result<Vec<RepoMeta>, String>
             }
             // a corrupt/unreadable repo lists with an unborn head rather than
             // failing the whole enumeration.
-            let head = Repository::open(&dir)
+            let (branch, head) = Repository::open(&dir)
                 .ok()
-                .and_then(|repo| main_oid(&repo).ok().flatten())
-                .map(|oid| oid.to_string());
-            repos.insert(name, head);
+                .and_then(|repo| integration_ref(&repo).ok().flatten())
+                .map(|(branch, oid)| (branch.to_owned(), Some(oid.to_string())))
+                .unwrap_or_else(|| ("dev".into(), None));
+            repos.insert(name, (branch, head));
         }
     }
     Ok(repos
         .into_iter()
-        .map(|(name, head)| RepoMeta { name, head })
+        .map(|(name, (branch, head))| RepoMeta { name, branch, head })
         .collect())
 }
 
@@ -777,14 +781,32 @@ fn main_oid(repo: &Repository) -> Result<Option<Oid>, String> {
     }
 }
 
-/// Resolve a caller-supplied `reference` to an oid: `None`/empty/`"main"` ->
-/// committed main, a 40-hex string -> that commit oid verbatim, anything else
+fn integration_ref(repo: &Repository) -> Result<Option<(&'static str, Oid)>, String> {
+    match repo.refname_to_id(DEV_REF) {
+        Ok(oid) => Ok(Some(("dev", oid))),
+        Err(e) if matches!(e.code(), ErrorCode::NotFound | ErrorCode::UnbornBranch) => {
+            main_oid(repo).map(|oid| oid.map(|oid| ("main", oid)))
+        }
+        Err(e) => Err(err(e)),
+    }
+}
+
+fn integration_oid(repo: &Repository) -> Result<Option<Oid>, String> {
+    Ok(integration_ref(repo)?.map(|(_, oid)| oid))
+}
+
+/// Resolve a caller-supplied `reference` to an oid: `None`/empty -> committed
+/// dev with a legacy-main fallback; `"main"` remains the release ref; a
+/// 40-hex string -> that commit oid verbatim, anything else
 /// -> `refs/heads/<reference>`. An unknown branch resolves to `None` rather
 /// than erroring, so the browse commands degrade to their existing empty
 /// shapes (the same way an unborn main does).
 fn resolve_ref_spec(repo: &Repository, reference: Option<&str>) -> Result<Option<Oid>, String> {
     let spec = reference.unwrap_or("").trim();
-    if spec.is_empty() || spec == "main" || spec == MAIN_REF {
+    if spec.is_empty() {
+        return integration_oid(repo);
+    }
+    if spec == "main" || spec == MAIN_REF {
         return main_oid(repo);
     }
     if spec.len() == 40 && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -860,12 +882,12 @@ fn subtree<'repo>(
 fn tree_for_spec<'repo>(
     repo: &'repo Repository,
     spec: Option<&str>,
-    empty_means_main: bool,
+    empty_means_default: bool,
 ) -> Result<Option<Tree<'repo>>, String> {
     let spec = spec.unwrap_or("").trim();
     let oid = if spec.is_empty() {
-        if empty_means_main {
-            main_oid(repo)?
+        if empty_means_default {
+            integration_oid(repo)?
         } else {
             None
         }
@@ -1004,7 +1026,11 @@ fn err(e: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_repo_name, utf8_text_page};
+    use super::{
+        DEV_REF, MAIN_REF, clean_repo_name, integration_oid, integration_ref, resolve_ref_spec,
+        utf8_text_page,
+    };
+    use git2::{Repository, Signature};
 
     #[test]
     fn accepts_real_forge_repo_slugs() {
@@ -1036,6 +1062,38 @@ mod tests {
                 "{name:?} must be rejected as a repo name"
             );
         }
+    }
+
+    #[test]
+    fn default_reads_prefer_dev_and_keep_a_legacy_main_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let signature = Signature::now("test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let main = repo
+            .commit(Some(MAIN_REF), &signature, &signature, "main", &tree, &[])
+            .unwrap();
+        let main_commit = repo.find_commit(main).unwrap();
+        let dev = repo
+            .commit(
+                Some(DEV_REF),
+                &signature,
+                &signature,
+                "dev",
+                &tree,
+                &[&main_commit],
+            )
+            .unwrap();
+
+        assert_eq!(integration_oid(&repo).unwrap(), Some(dev));
+        assert_eq!(integration_ref(&repo).unwrap(), Some(("dev", dev)));
+        assert_eq!(resolve_ref_spec(&repo, None).unwrap(), Some(dev));
+        assert_eq!(resolve_ref_spec(&repo, Some("main")).unwrap(), Some(main));
+
+        repo.find_reference(DEV_REF).unwrap().delete().unwrap();
+        assert_eq!(integration_oid(&repo).unwrap(), Some(main));
+        assert_eq!(integration_ref(&repo).unwrap(), Some(("main", main)));
     }
 
     #[test]

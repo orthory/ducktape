@@ -652,19 +652,28 @@ fn seam_virtual_arm_carries_overlay_connections() {
         let ctx_a = OverlayContext::with_backend(
             context.child("a"),
             router,
-            OverlayBackend::Userspace(a.effect.stack_slot()),
+            OverlayBackend::Userspace {
+                slot: a.effect.stack_slot(),
+                underlay_ingress: true,
+            },
         );
         let ctx_b = OverlayContext::with_backend(
             context,
             router,
-            OverlayBackend::Userspace(b.effect.stack_slot()),
+            OverlayBackend::Userspace {
+                slot: b.effect.stack_slot(),
+                underlay_ingress: true,
+            },
         );
 
         // a context whose tunnel is not up refuses overlay dials loudly.
         let downed = OverlayContext::with_backend(
             downed_inner,
             router,
-            OverlayBackend::Userspace(StackSlot::new()),
+            OverlayBackend::Userspace {
+                slot: StackSlot::new(),
+                underlay_ingress: true,
+            },
         );
         assert!(
             downed
@@ -714,6 +723,101 @@ fn seam_virtual_arm_carries_overlay_connections() {
         .await
         .expect("round trip within deadline");
         assert_eq!(echo.coalesce().as_ref(), b"seam!");
+    });
+}
+
+/// socket mode's wildcard mesh bind WITHOUT underlay ingress (the
+/// overlay-advertised desktop shape): no kernel socket exists — an OS
+/// loopback dial to the port is refused — while the lazy virtual leg still
+/// accepts tunnel-carried connections. the same bind WITH underlay ingress
+/// keeps its kernel leg (the `Dual` arm), so the server posture is intact.
+#[test]
+fn wildcard_bind_without_underlay_ingress_binds_no_kernel_socket() {
+    use commonware_runtime::{
+        Listener as _, Network as _, Runner as _, Sink as _, Stream as _, Supervisor as _,
+    };
+    use overlay_net::{OverlayBackend, OverlayContext, OverlayRouter};
+
+    let executor = commonware_runtime::tokio::Runner::default();
+    executor.start(|context| async move {
+        let (mut a, mut b) = (stand_up(0xe3, 0xa), stand_up(0xf4, 0xb));
+        peer_up(&mut a, &mut b);
+        let router = OverlayRouter::for_prefix48(ula(0));
+
+        const OVERLAY_ONLY_PORT: u16 = 9667;
+        const DUAL_PORT: u16 = 9668;
+        let wildcard = |port| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+        let loopback = |port| SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+
+        let ctx_overlay_only = OverlayContext::with_backend(
+            context.child("overlay_only"),
+            router,
+            OverlayBackend::Userspace {
+                slot: b.effect.stack_slot(),
+                underlay_ingress: false,
+            },
+        );
+        let ctx_dual = OverlayContext::with_backend(
+            context,
+            router,
+            OverlayBackend::Userspace {
+                slot: b.effect.stack_slot(),
+                underlay_ingress: true,
+            },
+        );
+
+        let mut listener = ctx_overlay_only
+            .bind(wildcard(OVERLAY_ONLY_PORT))
+            .await
+            .expect("wildcard bind without underlay ingress");
+        assert_eq!(
+            listener.local_addr().expect("local addr").port(),
+            OVERLAY_ONLY_PORT
+        );
+        // no kernel socket: the OS loopback dial is refused outright...
+        assert!(
+            tokio::net::TcpStream::connect(loopback(OVERLAY_ONLY_PORT))
+                .await
+                .is_err(),
+            "no kernel listener may exist without underlay ingress"
+        );
+        // ...while the same wildcard bind WITH underlay ingress keeps it.
+        let _dual = ctx_dual
+            .bind(wildcard(DUAL_PORT))
+            .await
+            .expect("dual wildcard bind");
+        tokio::net::TcpStream::connect(loopback(DUAL_PORT))
+            .await
+            .expect("the dual bind's kernel leg accepts the loopback dial");
+
+        // the tunnel-carried inbound still lands on the virtual leg.
+        let a_ula = a.ula;
+        let accept = async move {
+            let (remote, mut sink, mut stream) = listener.accept().await.expect("accept");
+            assert_eq!(remote.ip(), IpAddr::V6(a_ula), "authenticated by a's /128");
+            let got = stream.recv(5).await.expect("recv");
+            sink.send(got).await.expect("echo");
+            // hold the halves until the dialer has read the echo.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let stack_a = a.effect.stack().expect("a stack");
+        let b_ula = b.ula;
+        let dial = async move {
+            let mut stream = stack_a
+                .connect_tcp(SocketAddr::new(IpAddr::V6(b_ula), OVERLAY_ONLY_PORT))
+                .await
+                .expect("dial b's wildcard port through the tunnel");
+            stream.write_all(b"quack").await.expect("write");
+            stream.flush().await.expect("flush");
+            let mut echo = [0u8; 5];
+            stream.read_exact(&mut echo).await.expect("read echo");
+            assert_eq!(&echo, b"quack");
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(dial, accept)
+        })
+        .await
+        .expect("round trip within deadline");
     });
 }
 

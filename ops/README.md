@@ -62,6 +62,11 @@ source revision → cached CEF debug artifact → isolated instance(s) → run(s
 
 - Run the deterministic CEF smoke with
   `app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js test cef-smoke`.
+- On an Apple Silicon Mac, run `ops/smoke-macos-sandbox.sh` before changing
+  sandbox config, provider lifecycle, or managed-node restart code. It gates a
+  real Podman run, a real ephemeral Tart run, shutdown broadcast behavior, UI
+  Apply for both modes, and failed-boot rollback. The hook's fixed QA password
+  is opt-in and exists only inside Fleet's throwaway HOME.
 - `status --json` is the authoritative way to find an instance ID, display,
   runtime directory, agent health, and artifact path.
 - On Linux hosts where x11vnc is staged rather than installed, set

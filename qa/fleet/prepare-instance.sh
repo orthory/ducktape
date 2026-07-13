@@ -13,6 +13,16 @@ workspace="$FLEET_HOME/.ducktape/workspaces/$FLEET_INSTANCE_ID"
 registry="$FLEET_HOME/.ducktape/registry.json"
 mkdir -p "$workspace"
 
+# Opt-in only: hardware smoke can start at the normal locked-account gate
+# without walking the one-time mnemonic flow. The key lives under Fleet's
+# throwaway HOME and the password is never printed or persisted by this hook.
+mnemonic_confirmed=false
+if [ -n "${FLEET_QA_IDENTITY_PASSWORD:-}" ]; then
+  printf '%s\n' "$FLEET_QA_IDENTITY_PASSWORD" |
+    "$node" user-key init --out "$FLEET_HOME/.ducktape/user.key" >/dev/null
+  mnemonic_confirmed=true
+fi
+
 read -r listen http rpc < <(bun -e '
   const listeners = Array.from({ length: 3 }, () => Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } }));
   console.log(listeners.map((listener) => listener.port).join(" "));
@@ -25,6 +35,7 @@ chain="$($node init --name "$FLEET_INSTANCE_ID" --dir "$workspace" \
 pubkey="$($node keygen --out "$workspace/identity.key" | tail -1)"
 
 CHAIN="$chain" PUBKEY="$pubkey" LISTEN="$listen" HTTP="$http" RPC="$rpc" \
+  MNEMONIC_CONFIRMED="$mnemonic_confirmed" \
   bun -e '
     const id = process.env.FLEET_INSTANCE_ID;
     await Bun.write(process.argv[1], JSON.stringify({
@@ -42,6 +53,7 @@ CHAIN="$chain" PUBKEY="$pubkey" LISTEN="$listen" HTTP="$http" RPC="$rpc" \
           http: Number(process.env.HTTP),
           rpc: Number(process.env.RPC)
         }
-      }]
+      }],
+      mnemonicConfirmed: process.env.MNEMONIC_CONFIRMED === "true"
     }) + "\n");
   ' "$registry"

@@ -11,10 +11,10 @@ let pid: number
 try { pid = Number((await readFile(pidfile, 'utf8')).trim()) } catch { process.exit(0) }
 if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('workspace node pidfile is invalid')
 
-const expectedExecutable = await realpath(join(required('FLEET_ARTIFACT_DIR'), 'bin', 'ducktape-node'))
-const config = await realpath(configPath)
 const owned = await identity(pid)
 if (!owned) { await rm(pidfile, { force: true }); process.exit(0) }
+const expectedExecutable = await realpath(join(required('FLEET_ARTIFACT_DIR'), 'bin', 'ducktape-node'))
+const config = await realpath(configPath)
 if (owned.pgid !== pid) throw new Error('workspace node is not the leader of its process group')
 const executable = await processExecutable(pid)
 if (executable !== expectedExecutable || !await processUsesConfig(pid, [configPath, config])) {
@@ -93,9 +93,12 @@ async function sameProcess(target: number, startTime: string): Promise<boolean> 
 
 function groupAlive(pgid: number): boolean {
   if (process.platform !== 'linux') {
-    const result = Bun.spawnSync(['ps', '-axo', 'pgid='])
+    const result = Bun.spawnSync(['ps', '-axo', 'pgid=,state='])
     if (result.exitCode !== 0) throw new Error(`could not inspect process groups: ${result.stderr}`)
-    return result.stdout.toString().split('\n').some((line) => Number(line.trim()) === pgid)
+    return result.stdout.toString().split('\n').some((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\S+)/)
+      return Number(match?.[1]) === pgid && !match?.[2]?.startsWith('Z')
+    })
   }
   try { process.kill(-pgid, 0); return true } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
@@ -104,6 +107,12 @@ function groupAlive(pgid: number): boolean {
 }
 
 function signalGroup(pgid: number, signal: NodeJS.Signals): void {
+  if (process.platform === 'darwin') {
+    // macOS can briefly return EPERM while a child is already exiting. The
+    // bounded waits and final groupAlive check below remain authoritative.
+    Bun.spawnSync(['/bin/kill', `-${signal.replace(/^SIG/, '')}`, '--', `-${pgid}`])
+    return
+  }
   try { process.kill(-pgid, signal) } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
   }

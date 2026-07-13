@@ -136,6 +136,7 @@ describe("PullsTab", () => {
         forgeItems: [],
         forgeBranches: [
           { name: "main", head: HEAD },
+          { name: "dev", head: "d".repeat(40) },
           { name: "release", head: "c".repeat(40) },
           { name: "feature", head: FEATURE_HEAD },
         ],
@@ -144,6 +145,7 @@ describe("PullsTab", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "New pull request" }));
+    expect(screen.getByLabelText("Target")).toHaveValue("dev");
     fireEvent.change(screen.getByLabelText("Merge"), { target: { value: "feature" } });
     fireEvent.change(screen.getByLabelText("Target"), { target: { value: "release" } });
     fireEvent.change(screen.getByPlaceholderText("Title"), {

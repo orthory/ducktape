@@ -176,6 +176,7 @@ fn main() {
             duck_set_gateway_base,
             workspaces::workspace_create,
             workspaces::workspace_join,
+            workspaces::workspace_join_code,
             workspaces::workspace_invite_blob,
             workspaces::workspace_join_requests,
             workspaces::workspace_admit,
@@ -185,6 +186,7 @@ fn main() {
             workspaces::workspace_request_leave,
             workspaces::workspace_forget,
             workspaces::workspace_select,
+            workspaces::workspace_sandbox_apply,
             workspaces::workspace_phase,
             workspaces::workspace_log_tail,
             workspaces::workspace_runtime_facts,
@@ -202,6 +204,8 @@ fn main() {
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,
+            user_identity::user_sign_files_frame,
+            user_identity::user_sign_frame,
             touchid::touchid_available,
             touchid::touchid_enroll,
             touchid::touchid_enrolled,
@@ -237,6 +241,7 @@ fn main() {
             sandbox::sandbox_preflight,
         ]);
     builder = builder.plugin(tauri_plugin_notification::init());
+    builder = builder.plugin(tauri_plugin_opener::init());
     builder = builder
         // Menu-bar icon + popover, and an app menu with no Cmd+W Close
         // Window so the webview owns the key (macOS only; no-ops elsewhere).

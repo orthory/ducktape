@@ -83,12 +83,14 @@ function SkillRow({ skill }: { skill: SkillRef }) {
 export function AgentDetail({
   agent,
   capabilities,
+  capabilitiesStatus,
   onPause,
   onResume,
   onUpdate,
 }: {
   agent: AgentRecord | null;
   capabilities: string[];
+  capabilitiesStatus: "loading" | "ready" | "error";
   onPause: (agentId: string) => void;
   onResume: (agentId: string) => void;
   onUpdate: (params: {
@@ -314,6 +316,7 @@ export function AgentDetail({
               key={agent.agent_id}
               agent={agent}
               capabilities={capabilities}
+              capabilitiesStatus={capabilitiesStatus}
               onUpdate={onUpdate}
               onClose={() => setEditing(false)}
             />

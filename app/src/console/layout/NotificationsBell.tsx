@@ -6,12 +6,17 @@
 // docs/superpowers/specs/2026-07-12-notification-bell-design.md). Desktop-only:
 // web builds have no notifier and render nothing.
 
-import { type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
+import {
+  type MouseEvent as ReactMouseEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { isTauri } from "../../domain/node-bootstrap";
 import * as notifyClient from "../../domain/notify-client";
 import type { NotifyItem } from "../../domain/notify-client";
-import { parseItemChannelId } from "../../domain/forge-client";
+import { forgeItemTarget, parseItemChannelId } from "../../domain/forge-client";
 import { relTime } from "../views/forge/ui";
 import { Icon } from "../components/Icon";
 import { accentVar, color, font, radius } from "../theme/tokens";
@@ -164,9 +169,9 @@ export function NotificationsBell() {
       // A hidden forge-item channel is unroutable on the chat surface — jump
       // to the item itself (the provider's navigate listener makes the same
       // detour for toast deep-links).
-      const forgeItem = parseItemChannelId(item.channelId);
+      const forgeItem = forgeItemTarget(item.channelId, { messageId: item.messageId });
       if (forgeItem) {
-        actions.openForgeItem(forgeItem.repo, forgeItem.number);
+        actions.openForgeItem(forgeItem);
         return;
       }
       actions.setScreen("chat");
@@ -302,7 +307,13 @@ const hover = {
 /** Title + relative time on one line, clamped body under it. */
 function ItemRow({ item, onClick }: { item: NotifyItem; onClick: () => void }) {
   return (
-    <button onClick={onClick} style={ROW_STYLE} {...hover}>
+    <button
+      type="button"
+      aria-label={`Open notification: ${item.title}`}
+      onClick={onClick}
+      style={ROW_STYLE}
+      {...hover}
+    >
       <div
         style={{
           display: "flex",

@@ -89,18 +89,30 @@ describe("useHuddleWindowSession", () => {
     expect(result.current?.muted).toBe(false);
   });
 
-  it("signals the fallback (onMediaEnded) on both a hard error and a replaced session", () => {
+  it("keeps the window on a hard error (status 'error', no fallback) but signals it on a replaced session", () => {
     const onError = vi.fn();
     const s1 = makeStub();
-    renderHook(() => useHuddleWindowSession(ctx(), onError, s1.factory));
+    const { result } = renderHook(() => useHuddleWindowSession(ctx(), onError, s1.factory));
     act(() => s1.fire({ kind: "status", status: "error", error: "connection" }));
-    expect(onError).toHaveBeenCalledWith("error");
+    expect(result.current?.status).toBe("error");
+    expect(onError).not.toHaveBeenCalled();
 
     const onClosed = vi.fn();
     const s2 = makeStub();
     renderHook(() => useHuddleWindowSession(ctx(), onClosed, s2.factory));
     act(() => s2.fire({ kind: "status", status: "closed" }));
     expect(onClosed).toHaveBeenCalledWith("closed");
+  });
+
+  it("retry() stops the errored session and dials a fresh one", () => {
+    const stub = makeStub();
+    const { result } = renderHook(() => useHuddleWindowSession(ctx(), vi.fn(), stub.factory));
+    act(() => stub.fire({ kind: "status", status: "error", error: "connection" }));
+    expect(result.current?.status).toBe("error");
+    act(() => result.current?.retry());
+    expect(stub.calls.stopped).toBeGreaterThan(0);
+    expect(stub.calls.start.length).toBe(2);
+    expect(result.current?.status).toBe("connecting");
   });
 
   it("re-pushes the fan-out set when the roster changes", () => {

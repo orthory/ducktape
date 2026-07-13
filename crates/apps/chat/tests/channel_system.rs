@@ -5,8 +5,8 @@
 
 use chat::Chat;
 use chat::{
-    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL, Mark,
-    PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
+    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL,
+    MAX_QUERY_LIMIT, Mark, PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
@@ -96,6 +96,20 @@ fn create_channel(id: &str) -> ChatMsg {
         channel_id: id.into(),
         name: id.to_uppercase(),
         post_policy: PostPolicy::Open,
+    }
+}
+
+fn rename(channel: &str, name: &str) -> ChatMsg {
+    ChatMsg::RenameChannel {
+        channel_id: channel.into(),
+        name: name.into(),
+    }
+}
+
+fn set_archived(channel: &str, archived: bool) -> ChatMsg {
+    ChatMsg::SetChannelArchived {
+        channel_id: channel.into(),
+        archived,
     }
 }
 
@@ -794,6 +808,68 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
             .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         module.abort_block().await.unwrap();
+    });
+}
+
+#[test]
+fn messages_around_windows_the_history_at_one_sequence() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        for i in 1..=12u64 {
+            module
+                .execute(
+                    &mut TestCtx::with_origin(20 + i, user(1)),
+                    &module_msg(post("general", &format!("m{i}"), "body", None)),
+                )
+                .await
+                .unwrap();
+        }
+        // a tombstone inside the window must page like any other row: the
+        // jump-to projection has to match what `MessagesLatest` would return.
+        module
+            .execute(
+                &mut TestCtx::with_origin(40, user(1)),
+                &module_msg(ChatMsg::DeleteMessage {
+                    channel_id: "general".into(),
+                    seq: 6,
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let around = |seq, limit| ChatQuery::MessagesAround {
+            channel_id: "general".into(),
+            seq,
+            limit,
+        };
+        // mid-history: half the window before the target, the rest from it on.
+        assert_eq!(seqs(&query(&module, around(7, 4)).await), vec![5, 6, 7, 8]);
+        let ChatReply::Messages(window) = query(&module, around(7, 4)).await else {
+            panic!("messages reply");
+        };
+        assert!(
+            window.iter().any(|m| m.seq == 6 && m.head.deleted),
+            "the tombstoned seq is a row of the window, not a hole"
+        );
+        // clamped at the start: the window slides forward, never below seq 1.
+        assert_eq!(seqs(&query(&module, around(1, 4)).await), vec![1, 2, 3, 4]);
+        assert_eq!(seqs(&query(&module, around(2, 4)).await), vec![1, 2, 3, 4]);
+        // clamped at the head: nothing exists past it, so the window is short.
+        assert_eq!(seqs(&query(&module, around(12, 4)).await), vec![10, 11, 12]);
+        // a seq past the head windows the head rather than answering empty.
+        assert_eq!(seqs(&query(&module, around(99, 4)).await), vec![10, 11, 12]);
+        // limit bounds: 0 pages nothing, and an over-ask clamps to
+        // MAX_QUERY_LIMIT (the whole channel here) like every other page.
+        assert_eq!(seqs(&query(&module, around(7, 0)).await), Vec::<u64>::new());
+        assert_eq!(
+            seqs(&query(&module, around(7, MAX_QUERY_LIMIT + 1_000)).await),
+            (1..=12).collect::<Vec<u64>>()
+        );
     });
 }
 
@@ -1861,5 +1937,308 @@ fn module_channels_must_use_the_modules_own_prefix() {
             .await
             .unwrap();
         module.commit_block().await.unwrap();
+    });
+}
+
+#[test]
+fn rename_stamps_the_owner_at_create_and_gates_on_it() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        // a user-created channel is owned by its creator.
+        module
+            .execute(
+                &mut TestCtx::with_origin(10, user(1)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.owner, Some(vec![1u8; 32]), "creator is the owner");
+        assert!(!channel.archived);
+
+        // a non-owner user cannot rename an owned channel.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(11, user(2)),
+                &module_msg(rename("general", "Hijacked")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("owner"));
+        module.abort_block().await.unwrap();
+
+        // an empty name is rejected — the reused CreateChannel name validation.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(12, user(1)),
+                &module_msg(rename("general", "")),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+
+        // the owner renames happily.
+        module
+            .execute(
+                &mut TestCtx::with_origin(13, user(1)),
+                &module_msg(rename("general", "General v2")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.name, "General v2");
+    });
+}
+
+#[test]
+fn archived_channels_reject_writes_until_unarchived() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(
+                &mut TestCtx::with_origin(10, user(1)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::with_origin(11, user(1)),
+                &module_msg(post("general", "m1", "before archive", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // the owner archives the channel.
+        module
+            .execute(
+                &mut TestCtx::with_origin(12, user(1)),
+                &module_msg(set_archived("general", true)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // posts, reactions, and huddle joins are all turned away while archived.
+        for op in [
+            post("general", "m2", "blocked", None),
+            ChatMsg::AddReaction {
+                channel_id: "general".into(),
+                seq: 1,
+                emoji: "wave".into(),
+            },
+            ChatMsg::JoinHuddle {
+                channel_id: "general".into(),
+                node: vec![0xa1; 32],
+            },
+        ] {
+            let err = module
+                .execute(&mut TestCtx::with_origin(13, user(2)), &module_msg(op))
+                .await
+                .unwrap_err();
+            assert!(format!("{err:?}").contains("archived"));
+            module.abort_block().await.unwrap();
+        }
+
+        // unarchiving restores posting; the sequence promise survives the pause.
+        module
+            .execute(
+                &mut TestCtx::with_origin(14, user(1)),
+                &module_msg(set_archived("general", false)),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::with_origin(15, user(2)),
+                &module_msg(post("general", "m2", "after unarchive", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let reply = query(
+            &module,
+            ChatQuery::MessagesLatest {
+                channel_id: "general".into(),
+                limit: 16,
+            },
+        )
+        .await;
+        assert_eq!(seqs(&reply), vec![1, 2]);
+    });
+}
+
+#[test]
+fn ownerless_channels_admit_any_user_for_rename_and_archive() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        // a system-minted channel has no owner — also the shape a legacy record
+        // (created before the field existed) decodes to via serde defaults.
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.owner, None, "system-minted channels are unowned");
+
+        // any user may rename and archive an owner-less channel (mirrors the
+        // existing SetMembership permissiveness).
+        module
+            .execute(
+                &mut TestCtx::with_origin(11, user(7)),
+                &module_msg(rename("general", "Renamed")),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::with_origin(12, user(9)),
+                &module_msg(set_archived("general", true)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.name, "Renamed");
+        assert!(channel.archived);
+    });
+}
+
+#[test]
+fn users_cannot_archive_module_namespaced_channels() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        // a module-minted channel is unowned (owner = None), so `check_channel_admin`
+        // alone would admit ANY user — the ':' namespace gate is what keeps them out.
+        module
+            .execute(
+                &mut TestCtx::with_origin(10, Origin::Module("forge".into())),
+                &module_msg(create_channel("forge:demo:1")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // a user may not archive forge's discussion channel: archiving turns away
+        // every posting author, the owning module included — a cross-principal DoS.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(11, user(1)),
+                &module_msg(set_archived("forge:demo:1", true)),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("reserved for modules"));
+        module.abort_block().await.unwrap();
+
+        // the rejected attempt left no mark: the channel is still open and the
+        // owning module can still post to it.
+        module
+            .execute(
+                &mut TestCtx::with_origin(12, Origin::Module("forge".into())),
+                &module_msg(post("forge:demo:1", "m1", "still open", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "forge:demo:1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("module channel must exist");
+        };
+        assert!(!channel.archived, "the user's archive must not have landed");
+
+        // the owning module still administers its own channel: archive...
+        module
+            .execute(
+                &mut TestCtx::with_origin(13, Origin::Module("forge".into())),
+                &module_msg(set_archived("forge:demo:1", true)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "forge:demo:1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("module channel must exist");
+        };
+        assert!(channel.archived, "the module may archive its own channel");
+
+        // ...and unarchive, which restores posting.
+        module
+            .execute(
+                &mut TestCtx::with_origin(14, Origin::Module("forge".into())),
+                &module_msg(set_archived("forge:demo:1", false)),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::with_origin(15, Origin::Module("forge".into())),
+                &module_msg(post("forge:demo:1", "m2", "after unarchive", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let reply = query(
+            &module,
+            ChatQuery::MessagesLatest {
+                channel_id: "forge:demo:1".into(),
+                limit: 16,
+            },
+        )
+        .await;
+        assert_eq!(seqs(&reply), vec![1, 2]);
     });
 }

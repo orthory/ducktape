@@ -51,7 +51,7 @@ tauri = { version = "2", default-features = false, features = [
 # forwards it to tauri-runtime-wry, so an out-of-tree runtime has to be synced
 # by hand or macOS builds fail E0046 (WindowBuilder::transparent required by
 # the trait but cfg'd out of the impl).
-tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "7f8491f220cdc0d5aa955db5d5fa6d6d60c8398d", features = [
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "c215d6e52dd507956d9b8cc868906d690dc477c2", features = [
   "macos-private-api",
 ] }
 # See the default feature above. This resolves to the same package/version the
@@ -61,6 +61,9 @@ tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef"
 cef = { version = "=148.0.0", optional = true }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
+# open external http(s) links in the system browser (external-link.ts routes
+# here; the capability scopes it to open-url only, no open-path/reveal).
+tauri-plugin-opener = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
 # session-token-gated HTTP relay a phone hits over the Wi-Fi LAN to enroll a key.
 tiny_http = "0.12"
@@ -70,6 +73,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 http = "1"
 toml = "0.8"
+toml_edit = "0.22"
 # notify/stream.rs: the async ws client of the node's typed /v1/ws stream.
 # tokio-tungstenite deliberately builds without TLS features — the stream dials
 # the local workspace node over plain localhost http.
@@ -88,10 +92,16 @@ tauri-agent-plugin = { version = "0.0.2", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Touch ID custody (src/touchid.rs): the vault passphrase behind a biometric
-# Keychain ACL. macOS-target-scoped so the Linux/wasm build is untouched.
+# Touch ID custody (src/touchid.rs): the vault passphrase behind a
+# user-presence Keychain ACL, with an LAContext-gated plain-item fallback for
+# builds without keychain entitlements. macOS-target-scoped so the Linux/wasm
+# build is untouched; the objc2 family is already in the graph via tauri.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+block2 = "0.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -42,6 +42,7 @@ function AskAgentPopover({
 }) {
   const [cores, setCores] = useState("");
   const [memGb, setMemGb] = useState("");
+  const [showResources, setShowResources] = useState(false);
 
   const buildDemands = (): Record<string, number> | undefined => {
     const demands: Record<string, number> = {};
@@ -50,6 +51,17 @@ function AskAgentPopover({
     if (c !== null) demands.cores = c;
     if (m !== null) demands.mem_gb = m;
     return Object.keys(demands).length > 0 ? demands : undefined;
+  };
+
+  // The collapsed disclosure summary: the entered dimensions, or "auto" when
+  // both are blank (mirrors the inputs' placeholder — no demands go on the wire).
+  const resourceSummary = (): string => {
+    const c = dimValue(cores);
+    const m = dimValue(memGb);
+    const parts: string[] = [];
+    if (c !== null) parts.push(`${c} cores`);
+    if (m !== null) parts.push(`${m} GB`);
+    return parts.length > 0 ? parts.join(" · ") : "auto";
   };
 
   // Escape + outside-click dismiss, attached one tick late so the click that
@@ -93,6 +105,45 @@ function AskAgentPopover({
       >
         ASK TO RESPOND
       </div>
+      <HoverButton
+        title={showResources ? "Hide resource limits" : "Set resource limits"}
+        onClick={(event) => {
+          event.stopPropagation();
+          setShowResources((prev) => !prev);
+        }}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          width: "100%",
+          boxSizing: "border-box",
+          padding: "5px 8px 6px",
+          borderRadius: radius.sm,
+        }}
+        hoverStyle={{ background: color.hover }}
+      >
+        <svg
+          width={9}
+          height={9}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2.4}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          style={{
+            color: color.muted2,
+            transform: showResources ? "rotate(90deg)" : "none",
+            transition: "transform .12s",
+          }}
+        >
+          <path d="M9 6l6 6-6 6" />
+        </svg>
+        <span style={{ font: `500 11px ${font.sans}`, color: color.inkSoft }}>
+          Resources <span style={{ color: color.muted2 }}>· {resourceSummary()}</span>
+        </span>
+      </HoverButton>
+      {showResources && (
       <div style={{ display: "flex", gap: 6, padding: "0 6px 6px" }}>
         {[
           { label: "Cores", value: cores, set: setCores },
@@ -130,6 +181,7 @@ function AskAgentPopover({
           </label>
         ))}
       </div>
+      )}
       <div style={{ maxHeight: 208, overflowY: "auto" }}>
         {agents.map((agent) => (
           <HoverButton

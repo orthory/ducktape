@@ -15,12 +15,21 @@ fi
 
 target_dir="$(cd "$root" && cargo metadata --no-deps --format-version 1 | bun -e 'console.log((await Bun.stdin.json()).target_directory)')"
 triple="$(rustc -vV | sed -n 's/^host: //p')"
-(cd "$root" && ops/build-with.sh cargo build -p node-bin --bin ducktape-node)
+(cd "$root" && cargo build -p node-bin --bin ducktape-node)
 install -d -m 700 "$root/app/src-tauri/binaries"
 install -m 755 "$target_dir/debug/ducktape-node" "$root/app/src-tauri/binaries/ducktape-node-$triple"
 
 install -d -m 700 "$FLEET_ARTIFACT_DIR/bin"
 install -m 755 "$target_dir/debug/ducktape-node" "$FLEET_ARTIFACT_DIR/bin/ducktape-node"
+
+cef_version="$(cd "$root" && cargo metadata --format-version 1 | bun -e '
+  const metadata = await Bun.stdin.json()
+  const pkg = metadata.packages.find((candidate) => candidate.name === "cef")
+  if (!pkg) throw new Error("cargo metadata contains no cef package")
+  const version = pkg.version.split("+")[1]
+  if (!version) throw new Error(`cef package version has no distribution suffix: ${pkg.version}`)
+  console.log(version)
+')"
 
 artifact_env='{}'
 artifact_executable='bin/ducktape'
@@ -28,20 +37,12 @@ artifact_cwd='bin'
 case "$(uname -s)" in
   Darwin)
     bash "$root/ops/cef-probe/setup.sh" "$CEF_CLONE"
-    (cd "$root/app" && VITE_TAURI_AGENT=1 ../ops/build-with.sh bun run tauri build \
+    (cd "$root/app" && VITE_TAURI_AGENT=1 bun run tauri build \
       --debug --bundles app \
       --config '{"build":{"beforeBuildCommand":"bun run build"}}')
     app_bundle="$target_dir/debug/bundle/macos/Ducktape.app"
     contents="$app_bundle/Contents"
     main_binary="$contents/MacOS/ducktape-desktop"
-    cef_version="$(cd "$root" && cargo metadata --format-version 1 | bun -e '
-      const metadata = await Bun.stdin.json()
-      const pkg = metadata.packages.find((candidate) => candidate.name === "cef")
-      if (!pkg) throw new Error("cargo metadata contains no cef package")
-      const version = pkg.version.split("+")[1]
-      if (!version) throw new Error(`cef package version has no distribution suffix: ${pkg.version}`)
-      console.log(version)
-    ')"
     case "$(uname -m)" in
       arm64) cef_arch=aarch64 ;;
       x86_64) cef_arch=x86_64 ;;
@@ -92,15 +93,29 @@ case "$(uname -s)" in
     artifact_cwd='app/Ducktape.app/Contents/MacOS'
     ;;
   *)
-    (cd "$root/app" && VITE_TAURI_AGENT=1 ../ops/build-with.sh bun run tauri build --debug --no-bundle \
+    (cd "$root/app" && VITE_TAURI_AGENT=1 bun run tauri build --debug --no-bundle \
       --config '{"build":{"beforeBuildCommand":"bun run build"}}')
     install -m 755 "$target_dir/debug/ducktape-desktop" "$FLEET_ARTIFACT_DIR/bin/ducktape"
+    # Hardlink the CEF runtime from the immutable versioned distribution so
+    # every artifact shares one on-disk copy (1.3 GB per copy otherwise).
+    # Fall back to copying when the dist file is missing, stale, or on
+    # another filesystem.
+    cef_dist="$CEF_PATH/$cef_version/cef_linux_$(uname -m)"
     for file in libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
       chrome-sandbox chrome_100_percent.pak chrome_200_percent.pak icudtl.dat \
       resources.pak v8_context_snapshot.bin vk_swiftshader_icd.json; do
-      install -m 755 "$target_dir/debug/$file" "$FLEET_ARTIFACT_DIR/bin/$file"
+      built="$target_dir/debug/$file"
+      if [ -f "$cef_dist/$file" ] \
+        && [ "$(stat -c%s "$cef_dist/$file")" = "$(stat -c%s "$built")" ] \
+        && ln -f "$cef_dist/$file" "$FLEET_ARTIFACT_DIR/bin/$file" 2>/dev/null; then
+        continue
+      fi
+      install -m 755 "$built" "$FLEET_ARTIFACT_DIR/bin/$file"
     done
-    cp -a "$target_dir/debug/locales" "$FLEET_ARTIFACT_DIR/bin/"
+    if ! cp -alf "$cef_dist/locales" "$FLEET_ARTIFACT_DIR/bin/" 2>/dev/null; then
+      rm -rf "$FLEET_ARTIFACT_DIR/bin/locales"
+      cp -a "$target_dir/debug/locales" "$FLEET_ARTIFACT_DIR/bin/"
+    fi
     ;;
 esac
 

@@ -1,12 +1,5 @@
-// Pure logic for the Node view's sandbox onboarding section: mapping a host
-// preflight probe bundle to a detection checklist, and generating the guided
-// node.toml the operator pastes to opt in/out of serving agent work.
-//
-// The app has no node.toml write path (only the node binary writes it, via its
-// init/join verbs), so onboarding degrades to copy-paste guidance rather than a
-// live config write. Serving on/off + backend mode are therefore rendered as
-// exact TOML lines with a copy button — that is the deliberate degradation, not
-// a missing feature.
+// Pure logic for the Sandbox page: map a host preflight bundle to its detection
+// checklist and effective mode.
 
 import type { SandboxPreflight, ProbeResult } from "../../../domain/sandbox-client";
 
@@ -21,6 +14,11 @@ export const MODE_OPTIONS: { id: "off" | SandboxMode; label: string; blurb: stri
 ];
 
 export const modeOptionsFor = (macos: boolean) => MODE_OPTIONS.filter((m) => m.id !== "tart" || macos);
+
+export const currentSandboxMode = (pf: SandboxPreflight | null): "off" | SandboxMode => {
+  if (!pf?.announceCapabilities) return "off";
+  return pf.mode === "podman" || pf.mode === "tart" ? pf.mode : "direct";
+};
 
 export interface ChecklistItem {
   id: "backend" | "image" | "cgroup";
@@ -69,7 +67,7 @@ export function preflightChecklist(pf: SandboxPreflight | null): ChecklistItem[]
       state: image,
       detail:
         pf.baseImage?.detail ??
-        (pf.os === "macos" ? "tart uses VM base images (phase 2)" : UNKNOWN_DETAIL),
+        (pf.os === "macos" ? "tart uses VM base images" : UNKNOWN_DETAIL),
       fixable: image === "fail",
     },
     {
@@ -86,25 +84,11 @@ export function preflightChecklist(pf: SandboxPreflight | null): ChecklistItem[]
   ];
 }
 
-/** The exact node.toml lines to serve agent work in `mode`. Direct announces
- *  tags with no metered capacity (never matches a demand-carrying job);
- *  sandboxed modes carry cores/mem so demand-carrying jobs can match. */
-export function servingTomlLines(mode: SandboxMode, image = DEFAULT_SANDBOX_IMAGE): string {
-  const lines = ["announce_capabilities = true", `sandbox = "${mode}"`];
-  if (mode !== "direct") {
-    lines.push(`sandbox_image = "${image}"`, "sandbox_cores = 2", "sandbox_mem_gb = 4");
-  }
-  return lines.join("\n");
-}
-
-/** node.toml line to stop serving (announce the empty set → leave registry). */
-export const SERVING_OFF_TOML = "announce_capabilities = false";
-
 /** The canned "set up with an agent" run prompt (spec §6): one prewritten
  *  instruction through the existing run pipeline, no new infrastructure. */
 export function setupPrompt(mode: SandboxMode, image = DEFAULT_SANDBOX_IMAGE): string {
   if (mode === "tart") {
-    return "Install and configure the tart sandbox backend for this Ducktape node: install tart (Apple Silicon), create/pull the base VM image, verify `tart run` starts a guest, report results.";
+    return "Install and configure the tart sandbox backend for this Ducktape node: install tart and sshpass (Apple Silicon), create/pull the base VM image, verify `tart run` boots it and SSH reaches the guest, report results.";
   }
   return `Install and configure the podman sandbox backend for this Ducktape node: install rootless podman, pull ${image}, verify cgroup v2 cpu delegation, report results.`;
 }

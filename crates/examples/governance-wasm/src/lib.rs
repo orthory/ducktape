@@ -45,6 +45,7 @@ const VALSET_ID: &str = "valset";
 const UPGRADE_ID: &str = "upgrade";
 const IDENTITY_ID: &str = "identity";
 const MODREG_ID: &str = "modreg";
+const CLIENTS_ID: &str = "clients";
 /// the genesis-config key carrying this network's invite binding.
 const INVITE_PARAM: &str = "invite";
 
@@ -75,6 +76,9 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 fn loaded_module() -> Result<Governance, host::Error> {
     let mut module = Governance::new(MODULE_ID, VALSET_ID, UPGRADE_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
+        // the client-ACL registry: redeem-time client grants ride a follow-up
+        // into it. genesis-constant sibling wiring, compiled in like the rest.
+        .with_clients(CLIENTS_ID)
         .with_modreg(MODREG_ID);
     if let Some((bytes, root)) = load_state() {
         module

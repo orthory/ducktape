@@ -8,7 +8,7 @@ import type { ReactNode } from "react";
 
 import { Icon } from "../components/Icon";
 import { accentVar, color, font, radius } from "../theme/tokens";
-import { hasNodeContext } from "../store/state";
+import { hasNodeContext, isClientMode } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
@@ -267,7 +267,7 @@ function TitleBar() {
               flexShrink: 0,
             }}
           >
-            {state.managed ? "LOCAL" : "REMOTE"}
+            {isClientMode(state) ? "USER" : state.workspace ? "LOCAL" : "OFFLINE"}
           </span>
         </div>
       </div>

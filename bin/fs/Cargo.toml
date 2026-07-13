@@ -11,14 +11,6 @@ version.workspace = true
 name = "ducktape-fs"
 path = "src/main.rs"
 
-[features]
-# the FUSE `mount` verb. OPT-IN so the default workspace build needs no libfuse:
-# `fuser` 0.17's default feature set is empty, so it mounts through the setuid
-# `fusermount3` helper and never links libfuse (this box has the helper but no
-# libfuse-dev). building WITHOUT this feature keeps `mount` as a clear
-# "rebuild with --features fuse" error — the fuser/libc deps stay uncompiled.
-fuse = ["dep:fuser", "dep:libc"]
-
 [dependencies]
 # the checkout/commit engine + the `HttpNode` transport the verbs drive.
 duckfs-client = { workspace = true }
@@ -26,11 +18,6 @@ duckfs-client = { workspace = true }
 # format. the CLI never needs the native module glue for its production code.
 duckfs-core = { workspace = true }
 serde_json = { workspace = true }
-# FUSE mount only (feature `fuse`): the userspace filesystem driver and the libc
-# bindings for errno/uid/gid + SIGINT/SIGTERM handling. both optional so a
-# default build pulls in neither.
-fuser = { version = "0.17", optional = true }
-libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # cli_e2e stands a REAL host with ONLY the files module behind `noded::router`
@@ -38,6 +25,11 @@ libc = { version = "0.2", optional = true }
 noded = { path = "../noded" }
 host = { workspace = true }
 sdk = { workspace = true }
+# signed_frame_e2e: the harness's frame arm decodes exactly like the real
+# daemon (node::decode_frame), and the test signs frames with a fresh user key.
+node = { workspace = true }
+commonware-cryptography = { workspace = true }
+base64 = { workspace = true }
 # the native files module (default features on) the in-process node genesises;
 # path dep so it unifies with the default-features-off dep above (native wins).
 files = { path = "../../crates/apps/files" }

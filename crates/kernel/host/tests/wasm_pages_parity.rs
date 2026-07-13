@@ -53,6 +53,7 @@ fn nb(id: &str, kind: BlockKind, text: &str) -> NewBlock {
         id: id.into(),
         kind,
         text: text.into(),
+        marks: vec![],
     }
 }
 
@@ -223,6 +224,7 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::UpdateText {
                     block_id: "b1".into(),
                     text: "first, edited".into(),
+                    marks: None,
                 },
             ),
             (
@@ -282,6 +284,7 @@ fn same_ops_identical_roots_block_by_block() {
                     text: "looks good".into(),
                     mentions: vec![],
                     as_agent: None,
+                    anchor: None,
                 },
             ),
             (
@@ -293,6 +296,7 @@ fn same_ops_identical_roots_block_by_block() {
                     text: "agreed".into(),
                     mentions: vec![],
                     as_agent: None,
+                    anchor: None,
                 },
             ),
             (
@@ -300,6 +304,7 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::EditComment {
                     comment_id: "c2".into(),
                     text: "agreed!".into(),
+                    mentions: vec![],
                 },
             ),
             (
@@ -513,6 +518,7 @@ fn rejections_match_and_leave_no_trace() {
                 PageMsg::EditComment {
                     comment_id: "nope".into(),
                     text: "x".into(),
+                    mentions: vec![],
                 },
                 "comment not found",
             ),
@@ -604,6 +610,7 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                     text: "mid-block".into(),
                     mentions: vec![],
                     as_agent: None,
+                    anchor: None,
                 }),
             ),
         ];
@@ -662,6 +669,7 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 op(&PageMsg::UpdateText {
                     block_id: "b1".into(),
                     text: "accepted".into(),
+                    marks: None,
                 }),
             ),
             (

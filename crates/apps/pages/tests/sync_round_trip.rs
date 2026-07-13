@@ -64,6 +64,7 @@ fn para(id: &str, text: &str) -> NewBlock {
         id: id.into(),
         kind: BlockKind::Paragraph,
         text: text.into(),
+        marks: Vec::new(),
     }
 }
 
@@ -141,6 +142,7 @@ fn synced_store_reconstructs_source_root() {
             &PageMsg::UpdateText {
                 block_id: "b1".into(),
                 text: "final".into(),
+                marks: None,
             },
         )
         .await; // overwrite: op-log order matters
@@ -153,6 +155,7 @@ fn synced_store_reconstructs_source_root() {
                 comment_id: "cm1".into(),
                 target: "b1".into(),
                 text: "review this".into(),
+                anchor: None,
                 mentions: Vec::new(),
                 as_agent: None,
             },

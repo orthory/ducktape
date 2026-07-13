@@ -372,7 +372,7 @@ ensure_macos_bundle_skeleton() {
   log "building macOS CEF bundle skeleton…"
   (
     cd "$ROOT/app" || exit 1
-    "$BUILD_WITH" "$CARGO" run \
+    "$CARGO" run \
       --manifest-path "$CEF_CLONE/crates/tauri-cli/Cargo.toml" \
       --bin cargo-tauri -- build --debug --bundles app --ignore-version-mismatches \
       --config '{"build":{"beforeBuildCommand":"bun run build && ../ops/stage-debug-sidecar.sh"}}'
@@ -424,7 +424,7 @@ run_tauri_dev() {
         exit 1
       }
       log "launching tauri dev through bundled macOS runner (frontend hot-reload; Ctrl-C to stop)…"
-      "$BUILD_WITH" "$CARGO" run \
+      "$CARGO" run \
         --manifest-path "$CEF_CLONE/crates/tauri-cli/Cargo.toml" \
         --bin cargo-tauri -- dev --target "$target" --features dev-cef \
         --config "$CFG_OVERRIDE" --runner "$ROOT/ops/dev-macos-cargo.sh" \
@@ -443,7 +443,6 @@ main() {
     exit 1
   }
   ROOT="$PWD"
-  BUILD_WITH="${BUILD_WITH:-$ROOT/ops/build-with.sh}"
   NODE_SRC="$ROOT/target/debug/ducktape-node"
   # Pin the dev node OUTSIDE target/ (see the file header): a stable per-worktree
   # path so tauri's externalBin placeholder copy can't truncate the node the app

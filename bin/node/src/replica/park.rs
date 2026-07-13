@@ -3,10 +3,10 @@
 //! pool + optional replica-restart recovery-by-replay), then the park
 //! `loop` itself (serve window, drain pass, detection lane, ascension), and
 //! finally the promotion checkpoint + [`reboot_self`]. one function on
-//! purpose (decision 2 in the plan): the loop's `send_announce`/
-//! `not_serving` closures and its mountain of loop-scoped state never leave
-//! it, so splitting sub-phases into separate functions would just turn them
-//! back into a carrier struct with more steps.
+//! purpose (decision 2 in the plan): the join gate phase (ADR §3.3), the
+//! loop's `not_serving` closure, and its mountain of loop-scoped state never
+//! leave it, so splitting sub-phases into separate functions would just turn
+//! them back into a carrier struct with more steps.
 
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
@@ -17,7 +17,6 @@ use commonware_runtime::{Clock, IoBuf, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
 
-use crate::blob_fetch;
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
@@ -37,7 +36,7 @@ use crate::relay_runtime;
 use crate::replica;
 use crate::resident_announce;
 use crate::resident_dispatch;
-use crate::rpc::{RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
+use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{catch_up_post_reboot_frames, PostRebootCatchupError};
 use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
@@ -105,10 +104,16 @@ pub(super) async fn park(
         mut relay_tx,
         relay_rx,
         mut lobby_tx,
+        mut lobby_rx,
+        voice_requests,
     } = channels;
-    let agent_peers = (wireguard_listen.is_some()
-        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake))
-    .then(|| {
+    // a workspace handle for the gate phase to persist a delivered coord cap
+    // (private coordination) — `workspace` itself is moved into the gateway
+    // plane below, so clone before it leaves.
+    let cap_dir = workspace.clone();
+    let media_peers = if wireguard_listen.is_some()
+        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
+    {
         let tracked = crate::voice_plane::MediaPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
         );
@@ -118,6 +123,13 @@ pub(super) async fn park(
             .as_ref()
             .try_into()
             .expect("ed25519 keys are 32 bytes");
+        crate::voice::spawn_hub(
+            voice_requests,
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(&tracked),
+            me,
+            planes.clone(),
+        );
         crate::agent_plane::spawn(
             label.clone(),
             crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
@@ -127,8 +139,15 @@ pub(super) async fn park(
             planes.clone(),
             stream_hub.run_output(),
         );
-        tracked
-    });
+        Some(tracked)
+    } else {
+        eprintln!(
+            "[node {label}] realtime sessions are DISABLED on this node: the mesh overlay \
+             is unavailable (wireguard_listen unset, or the fake effect)"
+        );
+        drop(voice_requests);
+        None
+    };
     let gateway_book = gateway_requests.map(|requests| {
         let book = crate::gateway_plane::OverlayBook::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -156,40 +175,28 @@ pub(super) async fn park(
         );
         std::process::exit(1);
     }
-    // the resident's mesh blob fetch-on-miss lane (the #298 cross-node
-    // gap, resident side): the oracle pool's resolver asks current peers
-    // for a digest its own store lacks, over this same statesync channel.
-    // the park loop's sync client owns the channel receiver, so OUR fetch
-    // answers route back through its unmatched-frame hook below — blob
-    // rpc ids are top-bit-set random, disjoint from the client's small
-    // sequential ids by construction. residents deliberately run no serve
-    // loop (only validators answer this channel): fetch/client side only.
-    let blob_pending: blob_fetch::PendingMap = Default::default();
-    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(peers.clone()));
     // the joiner's sync client: the mesh path, ROTATING across every
-    // validator that can serve.
+    // validator that can serve. no unmatched-frame hook: drop-on-miss
+    // (the blob fetch lane that consumed those frames is retired). the
+    // real-key standing proof (ADR §5.1) is signed ONCE here with the same
+    // `signer` GateMsg uses: pre-admission the server refuses it (key not in
+    // standing), once admitted (key in residents) it serves — the client is
+    // oblivious to its own standing; the server decides.
+    let (sync_requester, sync_proof) = statesync::sign_sync_proof(&signer, &namespace);
     let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
         sync_sources.clone(),
-        // classify_mesh_frame consumes OUR blob answers into their
-        // oneshot waiters; anything else (a stray, junk) drops — a
-        // resident serves nothing.
-        Some(std::sync::Arc::new(move |id, body: &[u8]| {
-            let _ = blob_fetch::classify_mesh_frame(&blob_pending, id, body);
-        })),
+        None,
+        sync_requester,
+        sync_proof,
     );
 
-    // the announce, built once: this key + the invite token + the
-    // proof-of-possession binding them. re-sent (round-robin over the
-    // known members) until the manifest shows this key admitted —
-    // members keep the request queue in memory, so a member restart
-    // just gets the next re-announce.
-    let announce_frame = invite_token
-        .as_ref()
-        .map(|t| IoBuf::from(lobby::encode_msg(&lobby::join_request(&signer, &namespace, t))));
+    // the CANDIDATE members the join gate (ADR §3.3) targets — the descriptor's
+    // validators (inviter ∪ fronts, as discovered). also the resident relay's
+    // targets once standing lands; the manifest poll refreshes it to the tip's
+    // current members.
     let mut announce_targets: Vec<ed25519::PublicKey> = validators.clone();
 
     let me_bytes = signer.public_key().as_ref().to_vec();
@@ -198,26 +205,10 @@ pub(super) async fn park(
     // role) — one Retarget per observed epoch.
     let mut last_plane_epoch: Option<u64> = None;
     let mut attempt = 0usize;
-    let mut announce_round = 0usize;
     // once resident standing is seen, parking is the STEADY state
     // (awaiting a deliberate promote) — the not-admitted bail below
     // must never fire.
     let mut resident_standing = false;
-    let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
-        let Some(frame) = &announce_frame else { return };
-        if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
-            return;
-        }
-        let target = targets[announce_round % targets.len()].clone();
-        announce_round += 1;
-        let attempted = lobby_tx.send(Recipients::One(target.clone()), frame.clone(), false);
-        if !attempted.is_empty() {
-            println!(
-                "[node {label}] invite announce sent to member {} — redemption follows",
-                hex_bytes(&target.as_ref()[..4])
-            );
-        }
-    };
 
     // ---- the RESIDENT's serving lanes ------------------------------
     //
@@ -512,6 +503,146 @@ pub(super) async fn park(
     );
     let mut resident_dispatch =
         resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
+
+    // ── THE JOIN GATE (ADR §3.3) ──────────────────────────────────────────
+    // a fresh TOKENED joiner runs ONLY this handshake before ANY statesync
+    // (R4): send a `GateMsg::Request` to each candidate member and BLOCK on the
+    // authoritative reply. `Admitted` ⇒ standing is COMMITTED — persist any
+    // coord cap and fall through to the serve loop, which syncs the boundary.
+    // `Rejected{terminal}` ⇒ EXIT (R2). non-terminal / timeout ⇒ next
+    // candidate. three rounds, then fail-stop — no unbounded retry anywhere.
+    // the RESTORE path (persisted standing) and the token-less MANUAL path
+    // (out-of-band pubkey, admitted by `invite-accept`/`promote`) skip the gate
+    // and fall straight into the loop's existing detection.
+    if !resident_standing
+        && let Some(token) = invite_token.as_ref()
+    {
+        let gate_req =
+            IoBuf::from(lobby::encode_msg(&lobby::gate_request(&signer, &namespace, token)));
+        'gate: for round in 1..=3u32 {
+            for cand in &announce_targets {
+                println!(
+                    "[node {label}] invite announce sent to member {} — awaiting the gate \
+                     (round {round})",
+                    hex_bytes(&cand.as_ref()[..4])
+                );
+                // send once now, then RE-SEND on a tick within this candidate's
+                // window: a fresh joiner's mesh link can still be warming, so the
+                // first send may reach no one (`send` returns empty) — retrying
+                // covers the warm-up without burning the round.
+                let _ = lobby_tx.send(Recipients::One(cand.clone()), gate_req.clone(), false);
+                let deadline = context.sleep(GATE_ATTEMPT_TIMEOUT).fuse();
+                let resend = context.sleep(JOINER_POLL).fuse();
+                futures::pin_mut!(deadline, resend);
+                loop {
+                    futures::select_biased! {
+                        _ = deadline => {
+                            println!(
+                                "[node {label}] gate: no reply from member {} in time — \
+                                 trying another candidate",
+                                hex_bytes(&cand.as_ref()[..4])
+                            );
+                            break; // next candidate
+                        }
+                        _ = resend => {
+                            let _ = lobby_tx.send(
+                                Recipients::One(cand.clone()),
+                                gate_req.clone(),
+                                false,
+                            );
+                            resend.set(context.sleep(JOINER_POLL).fuse());
+                        }
+                        reply = lobby_rx.recv().fuse() => {
+                            let Ok((peer, msg)) = reply else { break };
+                            // only a GATING VALIDATOR may move this joiner: a
+                            // forged Admitted would mark standing + DELETE the
+                            // invite token (no gate-rerun path left), a forged
+                            // terminal Rejected is a DoS exit. members answer
+                            // from their real validator key, so drop anything
+                            // off a peer not in the gated set.
+                            if !announce_targets.contains(&peer) {
+                                continue;
+                            }
+                            let bytes: Vec<u8> = msg.into();
+                            match lobby::decode_msg(&bytes) {
+                                // the AUTHORITATIVE admission: standing is
+                                // committed at `height`. persist any coord cap
+                                // (private coordination), mark standing, and go
+                                // sync.
+                                Ok(lobby::GateMsg::Admitted { height, cap }) => {
+                                    println!(
+                                        "[node {label}] ADMITTED at height {height} by member {}",
+                                        hex_bytes(&peer.as_ref()[..4])
+                                    );
+                                    if let Some(cap_bytes) = cap {
+                                        match config::unpack_coord_cap(&cap_bytes) {
+                                            Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
+                                                Ok(()) => println!(
+                                                    "[node {label}] coordinator cap delivered \
+                                                     by member {} — saved (issuer {}, expires {})",
+                                                    hex_bytes(&peer.as_ref()[..4]),
+                                                    hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                    cap.not_after,
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "[node {label}] coordinator cap delivered \
+                                                     but could not be saved: {e}"
+                                                ),
+                                            },
+                                            Err(e) => eprintln!(
+                                                "[node {label}] member {} sent a malformed \
+                                                 coordinator cap: {e}",
+                                                hex_bytes(&peer.as_ref()[..4]),
+                                            ),
+                                        }
+                                    }
+                                    // a CONSUMED credential must not survive to
+                                    // confuse a later boot (ADR §6): the invite
+                                    // did its one job.
+                                    config::delete_invite_token(&cap_dir);
+                                    resident_standing = true;
+                                    break 'gate;
+                                }
+                                // the gate refused. terminal ⇒ this invite can
+                                // NEVER redeem — stop loudly (R2). non-terminal
+                                // (issuer view lag / member busy) ⇒ fail over.
+                                Ok(lobby::GateMsg::Rejected { code, detail, terminal }) => {
+                                    if terminal {
+                                        eprintln!(
+                                            "[node {label}] FATAL: join gate refused \
+                                             ({code:?}): {detail} — this invite cannot be \
+                                             redeemed. ask the inviter for a fresh invite and \
+                                             re-join with the new blob."
+                                        );
+                                        std::process::exit(1);
+                                    }
+                                    println!(
+                                        "[node {label}] member {} declined ({code:?}): {detail} \
+                                         — trying another member",
+                                        hex_bytes(&peer.as_ref()[..4])
+                                    );
+                                    break; // next candidate
+                                }
+                                // a stray reply / echoed Request / junk — keep
+                                // waiting on THIS candidate until its deadline.
+                                Ok(lobby::GateMsg::Request { .. }) | Err(_) => continue,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !resident_standing {
+            eprintln!(
+                "[node {label}] FATAL: no member could settle the join gate after 3 rounds \
+                 — the invite may be spent or expired, or no member is reachable; ask for a \
+                 fresh invite (manual fallback: `ducktape-node invite-accept {}`)",
+                hex_bytes(&me_bytes)
+            );
+            std::process::exit(1);
+        }
+    }
+
     let (boundary, host, floor) = loop {
         attempt += 1;
         if attempt > 900 && !resident_standing {
@@ -620,6 +751,32 @@ pub(super) async fn park(
                                 "this node is not a member — join requests queue on \
                                  validators",
                             ),
+                            // the node-owned join state (ADR §6): derived from
+                            // the gate outcome + committed chain progress this
+                            // loop already holds — never a scattered guess. a
+                            // TERMINAL reject exits the process before the loop,
+                            // so this arm only ever answers the live states.
+                            RpcRequest::JoinState => {
+                                let (phase, detail, height) = match &serving {
+                                    Some((h, _)) if resident_standing => (
+                                        "synced",
+                                        "serving reads from a pre-synced boundary",
+                                        Some(*h),
+                                    ),
+                                    _ if resident_standing => {
+                                        ("admitted", "standing granted — syncing the boundary", None)
+                                    }
+                                    _ => ("parked", "awaiting admission through the join gate", None),
+                                };
+                                RpcReply {
+                                    join_state: Some(JoinStateView {
+                                        phase: phase.into(),
+                                        detail: detail.into(),
+                                        height,
+                                    }),
+                                    ..RpcReply::ok()
+                                }
+                            }
                             RpcRequest::Shutdown => {
                                 // a resident writes no checkpoint — nothing to
                                 // flush; a restart parks straight back here.
@@ -823,10 +980,40 @@ pub(super) async fn park(
                             )
                             .await
                         {
+                            if e.permanent {
+                                // the source pruned the gap: no certificate
+                                // will ever make this range servable again
+                                // (the slept-laptop shape — the chain outran
+                                // the retention window while we were
+                                // suspended). DESCEND, exactly like the
+                                // epoch-cutover branch, so the fallback poll
+                                // re-ascends at a fresh boundary instead of
+                                // retrying the impossible range forever.
+                                println!(
+                                    "[node {label}] replica: backfill ({after_view}, \
+                                     {up_to_view}] pruned at the source ({}) — \
+                                     re-syncing at a fresh boundary",
+                                    e.detail
+                                );
+                                serving = None;
+                                replica_scheme = None;
+                                replica_orchestrator = None;
+                                recovery_slot = Some(
+                                    reopen_recovery(
+                                        &context,
+                                        &mut recovery_reopens,
+                                        &label,
+                                        code_source.clone(),
+                                    )
+                                    .await,
+                                );
+                                break;
+                            }
                             println!(
                                 "[node {label}] replica: backfill ({after_view}, \
-                                 {up_to_view}] unavailable: {e} — retrying on the \
-                                 next certificate"
+                                 {up_to_view}] unavailable: {} — retrying on the \
+                                 next certificate",
+                                e.detail
                             );
                             break;
                         }
@@ -859,10 +1046,35 @@ pub(super) async fn park(
                                 )
                                 .await
                                 {
+                                    if e.permanent {
+                                        // same escalation as the gap branch
+                                        // above: a pruned range cannot heal
+                                        // by waiting.
+                                        println!(
+                                            "[node {label}] replica: unresolvable view \
+                                             {view} pruned at the source ({}) — \
+                                             re-syncing at a fresh boundary",
+                                            e.detail
+                                        );
+                                        serving = None;
+                                        replica_scheme = None;
+                                        replica_orchestrator = None;
+                                        recovery_slot = Some(
+                                            reopen_recovery(
+                                                &context,
+                                                &mut recovery_reopens,
+                                                &label,
+                                                code_source.clone(),
+                                            )
+                                            .await,
+                                        );
+                                        break;
+                                    }
                                     println!(
                                         "[node {label}] replica: unresolvable view \
-                                         {view} backfill failed: {e} — retrying on \
-                                         the next certificate"
+                                         {view} backfill failed: {} — retrying on \
+                                         the next certificate",
+                                        e.detail
                                     );
                                 }
                                 break;
@@ -1025,16 +1237,11 @@ pub(super) async fn park(
                     // the new epoch's mesh must admit its members.
                     let mesh =
                         joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes);
-                    // the blob fetch-on-miss lane fans out to the same
-                    // tracked set — follow the re-track (the validator
-                    // drain's exact discipline).
-                    *blob_peers.write().expect("blob peers lock") =
-                        mesh.iter().cloned().collect();
                     oracle.track(plan.epoch(), mesh);
                     if let Some(book) = &gateway_book {
                         book.set_peers(plan.valset().transport_members().iter());
                     }
-                    if let Some(peers) = &agent_peers {
+                    if let Some(peers) = &media_peers {
                         peers.set_peers(plan.valset().transport_members().iter());
                     }
                     last_tracked = plan.epoch();
@@ -1196,11 +1403,12 @@ pub(super) async fn park(
         let tip = match fetch_tip_coords(&client).await {
             Ok(tip) => tip,
             Err(e) => {
+                // this poll runs POST-admission (the gate already granted
+                // standing, or this is the manual/restore path); a fetch miss
+                // just retries on the next tick — no re-announce, the gate is
+                // done.
                 let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                 println!("{}", retry.log_line);
-                if retry.announce {
-                    send_announce(&announce_targets, attempt);
-                }
                 continue;
             }
         };
@@ -1218,11 +1426,8 @@ pub(super) async fn park(
                 );
             }
             let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
-            // the blob fetch-on-miss lane fans out to the same tracked
-            // set — follow the re-track.
-            *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
             oracle.track(tip.epoch, mesh);
-            if gateway_book.is_some() || agent_peers.is_some() {
+            if gateway_book.is_some() || media_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip
                     .participants
                     .iter()
@@ -1232,7 +1437,7 @@ pub(super) async fn park(
                 if let Some(book) = &gateway_book {
                     book.set_peers(transport.iter());
                 }
-                if let Some(peers) = &agent_peers {
+                if let Some(peers) = &media_peers {
                     peers.set_peers(transport.iter());
                 }
             }
@@ -1604,12 +1809,15 @@ pub(super) async fn park(
                 }
                 continue;
             }
+            // the token-less MANUAL / restore path polling for an out-of-band
+            // grant (`invite-accept`/`promote`): the tokened join gate already
+            // ran to completion above, so there is nothing to re-announce here
+            // — just keep polling for the grant to land.
             println!(
                 "[node {label}] joining: awaiting redemption (epoch {} has {} validators)",
                 tip.epoch,
                 tip.participants.len()
             );
-            send_announce(&announce_targets, attempt);
             continue;
         }
         // in the epoch set: PROMOTION consumes the boundary itself —

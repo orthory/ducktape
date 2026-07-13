@@ -28,8 +28,13 @@
 //   ducktape_statesync_serve_bytes                                  (cumulative)
 //   ducktape_statesync_serve_frames                                 (cumulative)
 //   ducktape_statesync_serve_requests{kind="manifest|chunk|frames|…"} (cumulative)
+//   ducktape_statesync_serve_last_request{kind="…"}  (info gauge: constant 1)
 //   ducktape_statesync_serve_boundary_height   (absent until a manifest is served)
 //   ducktape_statesync_serve_frame_height      (absent until frames are served)
+//
+// The height series freeze once a joiner finishes and parks (its tip polls
+// keep the peer in the scrape), so they are conversation history — the
+// `last_request` kind is the recency signal a peer's phase derives from.
 //
 // A node serving only commonware's runtime series (an older binary that never
 // records its own blocks) exposes none of these — `present` is then false.
@@ -102,6 +107,10 @@ export interface StateSyncPeerMetric {
   servedHeight: number | null;
   /** answered requests by kind (manifest, chunk, frames, tip_coords, …). */
   requests: Record<string, number>;
+  /** the kind of the peer's most recent answered request — what it is asking
+   *  for NOW, where the heights are conversation history; null on a node
+   *  that predates the `last_request` series. */
+  lastKind: string | null;
 }
 
 export interface NodeMetrics {
@@ -161,6 +170,7 @@ const emptySyncPeer = (peer: string): StateSyncPeerMetric => ({
   boundaryHeight: null,
   servedHeight: null,
   requests: {},
+  lastKind: null,
 });
 
 /** `{module="chat",origin="external"}` → `{ module: "chat", origin: "external" }`. */
@@ -316,6 +326,9 @@ export function parseMetrics(text: string): NodeMetrics {
       case "ducktape_statesync_serve_requests":
         syncPeerOf(s.labels).requests[s.labels.kind ?? "?"] = s.value;
         break;
+      case "ducktape_statesync_serve_last_request":
+        syncPeerOf(s.labels).lastKind = s.labels.kind ?? null;
+        break;
       case "ducktape_statesync_serve_boundary_height":
         syncPeerOf(s.labels).boundaryHeight = s.value;
         break;
@@ -430,10 +443,11 @@ export function syncProgress(p: StateSyncPeerMetric, goalHeight: number): number
   return Math.min(1, reach / goalHeight);
 }
 
-/** What the peer is currently doing on the lane, from its request mix —
- *  the phases of a join in order: manifest → snapshot chunks → frame replay;
- *  a peer doing none of these is polling coordinates or fetching blobs. */
-export function syncPhase(p: StateSyncPeerMetric): string {
+/** The legacy phase read for a node that predates the `last_request` series:
+ *  the lifetime request mix. It cannot tell a parked resident (sync done,
+ *  now tip-polling) from a replay in flight — once frames were ever served,
+ *  it says "replaying frames" forever. */
+function legacySyncPhase(p: StateSyncPeerMetric): string {
   const asked = (kind: string) => (p.requests[kind] ?? 0) > 0;
   // heterogeneous predicates per branch (not one discriminant), so if/else.
   if (p.servedHeight !== null) return "replaying frames";
@@ -443,6 +457,39 @@ export function syncPhase(p: StateSyncPeerMetric): string {
   if (p.boundaryHeight !== null) return "manifest served";
   if (asked("tip_coords")) return "polling tip";
   return "fetching blobs";
+}
+
+/** What the peer is currently doing on the lane: its most recent request —
+ *  the phases of a join in order run manifest → snapshot chunks → frame
+ *  replay, and a tip poll AFTER height-shaped serving means the sync is done
+ *  and the peer parked as a resident. */
+export function syncPhase(p: StateSyncPeerMetric): string {
+  if (p.lastKind === null) return legacySyncPhase(p);
+  switch (p.lastKind) {
+    case "manifest":
+      return "manifest served";
+    case "chunk":
+    case "module":
+    case "index_chunk":
+    case "index_modules":
+      return "restoring snapshot";
+    case "frames":
+      return "replaying frames";
+    case "tip_coords":
+      return syncPeerReach(p) === null ? "polling tip" : "parked";
+    case "blob":
+      return "fetching blobs";
+    default:
+      return p.lastKind; // a kind this build doesn't know names itself
+  }
+}
+
+/** Whether the peer's sync conversation is over: it was served something
+ *  height-shaped and its latest ask is a tip poll — a synced, parked
+ *  resident. Its frozen reach must not be measured against the advancing
+ *  goal height (that renders a healthy peer as a regressing sync). */
+export function syncParked(p: StateSyncPeerMetric): boolean {
+  return p.lastKind === "tip_coords" && syncPeerReach(p) !== null;
 }
 
 // ── Formatting ──────────────────────────────────────────

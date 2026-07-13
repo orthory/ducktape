@@ -71,6 +71,10 @@ describe("SettingsView", () => {
   it("renders the thinned surface: account link row, prefs, workspace facts", () => {
     const { spies } = renderSettings();
 
+    const content = document.querySelector('[data-settings-content="full-width"]') as HTMLElement;
+    expect(content).toHaveStyle({ width: "100%" });
+    expect(content.style.maxWidth).toBe("");
+
     // Workspace facts that still live here.
     expect(screen.getByText("WORKSPACE")).toBeInTheDocument();
     expect(screen.getByText("Acme Research")).toBeInTheDocument();
@@ -120,6 +124,21 @@ describe("SettingsView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /open node/i }));
     expect(spies.setScreen).toHaveBeenCalledWith("status");
+  });
+
+  it("shows a remote client no node links at all (ADR A5/A6)", () => {
+    renderSettings({
+      workspace: null,
+      nodeUrl: "https://node.example",
+      managed: false,
+    });
+
+    expect(screen.queryByRole("button", { name: /open members/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("DANGER ZONE")).not.toBeInTheDocument();
+    expect(screen.queryByText("Governance")).not.toBeInTheDocument();
+    // Node control is a conditional surface: a client gets no links into it.
+    expect(screen.queryByRole("button", { name: /open node/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /open metrics/i })).not.toBeInTheDocument();
   });
 
   it("requests an on-chain leave through an in-app dialog, without tearing down", () => {

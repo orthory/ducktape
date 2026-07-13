@@ -349,8 +349,8 @@ export const uploadFile = async (
 };
 
 /** Upload a folder or multi-file selection as one atomic commit. Relative paths
- *  are preserved under `targetDir`; file bodies are staged as chunk references so
- *  many small files cannot breach the module's per-commit inline-byte cap. */
+ *  are preserved under `targetDir`; small file bodies share the commit's inline
+ *  byte budget and the remainder are staged as chunk references. */
 export const uploadFiles = async (
   transport: NodeTransport,
   params: {
@@ -390,11 +390,14 @@ export const uploadFiles = async (
 
   const base = await resolveBase(transport, params.baseSnapshot);
   const changes: FileChange[] = [];
+  let inlineBytes = 0;
   for (const [index, entry] of prepared.entries()) {
     if (entry.kind === "dir") {
       changes.push({ mkdir: { path: entry.path } });
       continue;
     }
+    const canInline =
+      entry.bytes.length > 0 && inlineBytes + entry.bytes.length <= MAX_INLINE_COMMIT_BYTES;
     const content = await buildContent(
       transport,
       entry.bytes,
@@ -406,8 +409,9 @@ export const uploadFiles = async (
           staged,
           total,
         }),
-      "chunks",
+      canInline ? "auto" : "chunks",
     );
+    if (canInline) inlineBytes += entry.bytes.length;
     changes.push({
       put: {
         path: entry.path,

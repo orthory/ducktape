@@ -35,10 +35,14 @@ import { SkillsField } from "./SkillsField";
 
 export function RegisterAgentForm({
   capabilities,
+  capabilitiesStatus,
+  onRetryCapabilities,
   onRegister,
   onDone,
 }: {
   capabilities: string[];
+  capabilitiesStatus: "loading" | "ready" | "error";
+  onRetryCapabilities?: () => void;
   onRegister: (params: {
     displayName: string;
     agentId: string;
@@ -76,7 +80,8 @@ export function RegisterAgentForm({
   const ready =
     displayName.trim() !== "" &&
     agentId !== "" &&
-    capability.trim() !== "" &&
+    capabilitiesStatus === "ready" &&
+    capabilities.includes(capability) &&
     allowedActions.length > 0;
 
   const toggle = (name: string) =>
@@ -165,6 +170,8 @@ export function RegisterAgentForm({
                 id="agent-capability"
                 value={capability}
                 capabilities={capabilities}
+                registryStatus={capabilitiesStatus}
+                onRetry={onRetryCapabilities}
                 onChange={setCapability}
               />
             </div>

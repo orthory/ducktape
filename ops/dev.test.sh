@@ -218,7 +218,7 @@ fi
 
 echo "macOS cargo runner contract:"
 RUNNER_LOG="$TMP/runner.log"
-RUNNER_STUB="$TMP/build-with-stub"
+RUNNER_STUB="$TMP/cargo-stub"
 cat >"$RUNNER_STUB" <<'EOF'
 #!/usr/bin/env bash
 printf 'runner=%s\n' "${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER:-}" >"$RUNNER_LOG"
@@ -226,11 +226,11 @@ printf 'args=%s\n' "$*" >>"$RUNNER_LOG"
 EOF
 chmod +x "$RUNNER_STUB"
 export RUNNER_LOG
-BUILD_WITH="$RUNNER_STUB" CARGO="cargo-test" "$HERE/dev-macos-cargo.sh" run --target aarch64-apple-darwin
+CARGO="$RUNNER_STUB" "$HERE/dev-macos-cargo.sh" run --target aarch64-apple-darwin
 grep -q "runner=$HERE/dev-macos-runner.sh" "$RUNNER_LOG" \
   && ok "points explicit-target Cargo at the bundle runner" \
   || bad "did not export the macOS target runner"
-grep -q 'args=cargo-test run --target aarch64-apple-darwin' "$RUNNER_LOG" \
+grep -q 'args=run --target aarch64-apple-darwin' "$RUNNER_LOG" \
   && ok "preserves the Cargo-compatible runner arguments" \
   || bad "changed the Cargo runner argument contract"
 grep -q -- '--features dev-cef' "$HERE/dev.sh" \

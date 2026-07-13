@@ -147,6 +147,8 @@ describe("StatusView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
 
     const matrix = screen.getByRole("table", { name: /node capability matrix/i });
+    expect(matrix).toHaveStyle({ width: "100%" });
+    expect(matrix.style.maxWidth).toBe("");
     expect(within(matrix).getByText("Validator")).toBeInTheDocument();
     expect(within(matrix).getByText("Guest client")).toBeInTheDocument();
 

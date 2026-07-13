@@ -1,6 +1,76 @@
 use super::*;
 
 #[test]
+fn inline_marks_persist_and_rebase_in_utf16() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        seed_page(&mut p, "p1").await;
+        apply_commit(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "a🦆bc".into(),
+                marks: None,
+            },
+        )
+        .await;
+        apply_expect_err(
+            &mut p,
+            &PageMsg::SetSpanMark {
+                block_id: "b1".into(),
+                start: 1,
+                end: 2,
+                kind: InlineMark::Bold,
+                active: true,
+            },
+            "invalid text range",
+        )
+        .await;
+        apply_commit(
+            &mut p,
+            &PageMsg::SetSpanMark {
+                block_id: "b1".into(),
+                start: 1,
+                end: 3,
+                kind: InlineMark::Bold,
+                active: true,
+            },
+        )
+        .await;
+        apply_commit(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "++a🦆bc".into(),
+                marks: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            get_block(&p, "b1").await.unwrap().marks,
+            vec![SpanMark { start: 3, end: 5, kind: InlineMark::Bold }]
+        );
+        apply_commit(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "merged".into(),
+                marks: Some(vec![SpanMark {
+                    start: 0,
+                    end: 6,
+                    kind: InlineMark::Italic,
+                }]),
+            },
+        )
+        .await;
+        assert_eq!(
+            get_block(&p, "b1").await.unwrap().marks,
+            vec![SpanMark { start: 0, end: 6, kind: InlineMark::Italic }]
+        );
+    });
+}
+
+#[test]
 fn create_page_and_insert_blocks_in_order() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
@@ -142,6 +212,7 @@ fn update_text_edits_blocks_and_renames_pages() {
             &PageMsg::UpdateText {
                 block_id: "b1".into(),
                 text: "edited".into(),
+                marks: None,
             },
         )
         .await;
@@ -153,6 +224,7 @@ fn update_text_edits_blocks_and_renames_pages() {
             &PageMsg::UpdateText {
                 block_id: "p1".into(),
                 text: "renamed".into(),
+                marks: None,
             },
         )
         .await;

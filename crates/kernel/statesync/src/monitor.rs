@@ -18,6 +18,13 @@
 //! served [`SyncResponse::Manifest`] names the boundary the peer restores
 //! from, and each [`SyncResponse::Frames`] batch advances the highest block
 //! height this node has handed that peer.
+//!
+//! progression heights are conversation HISTORY, not current activity: a
+//! joiner that finished replaying parks as a resident and keeps its entry
+//! alive with routine tip polls, so its heights freeze while the chain
+//! advances. [`PeerServeReport::last_kind`] is the recency discriminant that
+//! separates the two — readers phase a peer by what it asked for LAST, never
+//! by which lifetime counters happen to be nonzero.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -57,6 +64,11 @@ pub struct PeerServeReport {
     /// cumulative answered requests by request kind
     /// ([`crate::SyncRequest::kind_name`]), sorted by kind.
     pub requests: Vec<(&'static str, u64)>,
+    /// the kind of the peer's most recent answered request — what the peer
+    /// is asking for NOW, where the height fields only say what it got over
+    /// the conversation's life. `tip_coords` here with heights set means a
+    /// synced, parked resident — not a replay still in flight.
+    pub last_kind: &'static str,
 }
 
 struct PeerEntry {
@@ -67,6 +79,7 @@ struct PeerEntry {
     boundary_height: Option<u64>,
     served_height: Option<u64>,
     requests: BTreeMap<&'static str, u64>,
+    last_kind: &'static str,
 }
 
 /// the registry of recently served peers. cloneable handle; the serve loop
@@ -84,18 +97,18 @@ impl ServeMonitor {
     pub fn record(&self, peer: &str, kind: &'static str, response: &SyncResponse, wire_bytes: u64) {
         let now = Instant::now();
         let mut peers = self.peers.lock().expect("serve monitor lock");
-        let entry = peers
-            .entry(peer.to_string())
-            .or_insert_with(|| PeerEntry {
-                first_active: now,
-                last_active: now,
-                bytes_tx: 0,
-                frames_served: 0,
-                boundary_height: None,
-                served_height: None,
-                requests: BTreeMap::new(),
-            });
+        let entry = peers.entry(peer.to_string()).or_insert_with(|| PeerEntry {
+            first_active: now,
+            last_active: now,
+            bytes_tx: 0,
+            frames_served: 0,
+            boundary_height: None,
+            served_height: None,
+            requests: BTreeMap::new(),
+            last_kind: kind,
+        });
         entry.last_active = now;
+        entry.last_kind = kind;
         entry.bytes_tx += wire_bytes;
         *entry.requests.entry(kind).or_insert(0) += 1;
         match response {
@@ -126,6 +139,7 @@ impl ServeMonitor {
                 boundary_height: entry.boundary_height,
                 served_height: entry.served_height,
                 requests: entry.requests.iter().map(|(k, v)| (*k, *v)).collect(),
+                last_kind: entry.last_kind,
             })
             .collect();
         reports.sort_by(|a, b| a.peer.cmp(&b.peer));
@@ -202,6 +216,40 @@ mod tests {
         assert_eq!(r.boundary_height, Some(100));
         assert_eq!(r.served_height, Some(102));
         assert_eq!(r.requests, vec![("frames", 2), ("manifest", 1)]);
+        assert_eq!(r.last_kind, "frames");
+    }
+
+    /// a joiner that finishes replay parks and flips to tip polling: the
+    /// progression heights freeze (history), while `last_kind` moves to
+    /// `tip_coords` — the signal readers use to stop measuring the frozen
+    /// heights against the advancing chain.
+    #[test]
+    fn parked_resident_flips_last_kind_without_touching_heights() {
+        let monitor = ServeMonitor::default();
+        let manifest = SyncResponse::Manifest(manifest_at(180));
+        monitor.record("aa", SyncRequest::Manifest.kind_name(), &manifest, 512);
+        let batch = SyncResponse::Frames {
+            frames: vec![frame_at(181)],
+        };
+        monitor.record("aa", "frames", &batch, 4096);
+        // sync done; the parked resident's routine detection poll arrives.
+        let coords = SyncResponse::TipCoords(TipCoords {
+            height: 489,
+            app_hash: StateRoot([1u8; 32]),
+            epoch: 0,
+            view_base: 0,
+            participants: vec![],
+            residents: vec![],
+            has_floor: true,
+        });
+        monitor.record("aa", SyncRequest::TipCoords.kind_name(), &coords, 256);
+
+        let reports = monitor.snapshot();
+        let r = &reports[0];
+        assert_eq!(r.last_kind, "tip_coords");
+        assert_eq!(r.boundary_height, Some(180));
+        assert_eq!(r.served_height, Some(181));
+        assert_eq!(r.frames_served, 1);
     }
 
     /// a tip poller never gains progression fields — only utilization.
@@ -222,6 +270,7 @@ mod tests {
         assert_eq!(reports[0].boundary_height, None);
         assert_eq!(reports[0].served_height, None);
         assert_eq!(reports[0].requests, vec![("tip_coords", 1)]);
+        assert_eq!(reports[0].last_kind, "tip_coords");
     }
 
     /// peers are independent entries, snapshot-sorted by label.

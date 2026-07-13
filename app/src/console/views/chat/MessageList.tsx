@@ -18,7 +18,7 @@ function DayDivider({ label }: { label: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 0 8px", minWidth: 0 }}>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
-      <span style={{ font: `500 10.5px ${font.mono}`, color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
+      <span style={{ font: `500 11px ${font.mono}`, color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
     </div>
   );
@@ -53,7 +53,7 @@ function ChannelIntro({ channelName, empty }: { channelName: string; empty: bool
         <Icon name="hash" size={21} color={color.muted2} />
       </div>
       <div style={{ font: `600 18px ${font.sans}`, color: color.ink, minWidth: 0 }}>#{channelName}</div>
-      <div style={{ font: `400 13px ${font.sans}`, color: color.muted2, lineHeight: 1.5, maxWidth: 560 }}>
+      <div style={{ font: `400 13.5px ${font.sans}`, color: color.muted2, lineHeight: 1.5, maxWidth: 560 }}>
         This is the very beginning of the #{channelName} channel.
         {empty ? " Send the first message to start the conversation." : ""}
       </div>
@@ -68,6 +68,7 @@ export function MessageList({
   ops,
   selfKey,
   workspaceId,
+  archived = false,
   hoverMsg,
   menuOpenId,
   listRef,
@@ -90,6 +91,9 @@ export function MessageList({
   ops: OpLedger;
   selfKey: string;
   workspaceId: string | null;
+  /** Archived channel — the module refuses reactions, so each row drops its
+   *  react affordances (edit/delete still land, and stay offered). */
+  archived?: boolean;
   hoverMsg: number | null;
   menuOpenId: number | null;
   listRef: RefObject<HTMLDivElement | null>;
@@ -140,13 +144,14 @@ export function MessageList({
           const linkRef = `ducktape://${workspaceId ?? "local"}/${message.channel_id}/${message.head.message_id}`;
           const refRef = `${message.channel_id}#${message.seq}:${message.head.message_id}`;
           return (
-            <div key={message.seq} style={{ minWidth: 0 }}>
+            <div key={message.seq} data-seq={message.seq} style={{ minWidth: 0 }}>
               {dayDivider && <DayDivider label={dayDivider} />}
               <MessageItem
                 message={message}
                 names={names}
                 groupStart={groupStart}
                 selfKey={selfKey}
+                archived={archived}
                 hovered={hoverMsg === message.seq}
                 menuOpen={menuOpenId === message.seq}
                 replyHint={replyHint}

@@ -123,7 +123,7 @@ pub struct ItemDetail {
     pub channel_id: String,
     /// PR-only: the source branch short name.
     pub source_branch: Option<String>,
-    /// PR-only: the target branch short name (normally "main").
+    /// PR-only: the target branch short name (normally "dev").
     pub target_branch: Option<String>,
     /// PR-only: the merge commit hex once merged.
     pub merge_oid: Option<String>,

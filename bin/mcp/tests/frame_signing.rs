@@ -49,10 +49,13 @@ fn capture_frame(tool: &str, arguments: Value, session: Option<[u8; 32]>) -> Opt
                     stream.set_nonblocking(false).expect("blocking stream");
                     let (path, body) = read_request(&mut stream);
                     let is_frame = path.starts_with("/v1/submit/frame");
+                    let is_refs = path.starts_with("/v1/files/refs");
                     // a receipt for a submit; an empty agent record for any
                     // registry lookup the server makes first.
                     let reply = if is_frame {
                         json!({"height": 1, "app_hash": "00", "op_hash": "00"}).to_string()
+                    } else if is_refs {
+                        json!({"head": "aa".repeat(32), "pins": {}, "window_len": 1}).to_string()
                     } else {
                         json!({"agent": null}).to_string()
                     };
@@ -147,6 +150,41 @@ fn a_write_leaves_as_an_agent_action_frame_signed_by_the_session_key() {
                 agent::AgentAction::CreateTask { title, .. } => assert_eq!(title, "prove it"),
                 other => panic!("expected CreateTask, got {other:?}"),
             }
+        }
+        other => panic!("expected an AgentAction, got {other:?}"),
+    }
+}
+
+#[test]
+fn duckfs_text_write_leaves_as_a_signed_agent_action() {
+    let seed = [11u8; 32];
+    let frame = capture_frame(
+        "ducktape_duckfs_write_text",
+        json!({
+            "path": "/shared/agents/qa-fixer/self-improvement/SKILL.md",
+            "text": "lesson",
+        }),
+        Some(seed),
+    )
+    .expect("the write must reach /v1/submit/frame");
+
+    let (origin, msg) = node::decode_frame(&frame).expect("a frame consensus would accept");
+    assert_eq!(
+        origin,
+        sdk::Origin::External(signer(seed).public_key().as_ref().to_vec())
+    );
+    assert_eq!(msg.target, "runs");
+    match runs::decode_msg(&msg.payload).expect("a RunsMsg") {
+        runs::RunsMsg::AgentAction { run_id, action } => {
+            assert_eq!(run_id, RUN_ID);
+            assert_eq!(
+                action,
+                agent::AgentAction::DuckfsWriteText {
+                    path: "/shared/agents/qa-fixer/self-improvement/SKILL.md".into(),
+                    text: "lesson".into(),
+                    base_snapshot: Some("aa".repeat(32)),
+                }
+            );
         }
         other => panic!("expected an AgentAction, got {other:?}"),
     }

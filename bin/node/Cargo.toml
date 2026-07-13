@@ -25,6 +25,7 @@ kv = { workspace = true }
 directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
 valset = { workspace = true }
+clients = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
 # the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
@@ -124,6 +125,13 @@ zeroize = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Raise the node's inherited open-file soft limit before opening module stores.
 libc = "0.2"
+
+# App Nap opt-out (see main.rs `hold_macos_activity`): a desktop-spawned node
+# lives in the GUI app's coalition and would otherwise be timer-coalesced the
+# moment the app hides to the menu bar. already in the workspace lockfile via
+# tauri — this adds no new supply chain.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 
 # the process-level e2e suite (tests/) spawns REAL `ducktape-node` binaries and
 # drives them through the rpc with TYPED interface-crate payloads — payload

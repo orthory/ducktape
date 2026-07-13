@@ -3,10 +3,9 @@ import { describe, expect, it } from "vitest";
 import type { SandboxPreflight } from "../../../domain/sandbox-client";
 import {
   DEFAULT_SANDBOX_IMAGE,
+  currentSandboxMode,
   modeOptionsFor,
   preflightChecklist,
-  SERVING_OFF_TOML,
-  servingTomlLines,
   setupPrompt,
 } from "./sandbox";
 
@@ -17,6 +16,13 @@ describe("modeOptionsFor", () => {
 
   it("keeps Tart off non-macOS hosts", () => {
     expect(modeOptionsFor(false).map((mode) => mode.id)).toEqual(["off", "direct", "podman"]);
+  });
+});
+
+describe("currentSandboxMode", () => {
+  it("uses the effective serving state instead of stale backend config", () => {
+    expect(currentSandboxMode(linuxPreflight({ announceCapabilities: false, mode: "podman" }))).toBe("off");
+    expect(currentSandboxMode(linuxPreflight({ announceCapabilities: true, mode: "" }))).toBe("direct");
   });
 });
 
@@ -83,34 +89,6 @@ describe("preflightChecklist", () => {
   });
 });
 
-describe("servingTomlLines", () => {
-  it("direct mode: opt-in + mode only, no metered capacity keys", () => {
-    const toml = servingTomlLines("direct");
-    expect(toml).toContain("announce_capabilities = true");
-    expect(toml).toContain('sandbox = "direct"');
-    expect(toml).not.toContain("sandbox_image");
-    expect(toml).not.toContain("sandbox_cores");
-  });
-
-  it("podman mode: carries image + cores + mem", () => {
-    const toml = servingTomlLines("podman");
-    expect(toml).toContain('sandbox = "podman"');
-    expect(toml).toContain(`sandbox_image = "${DEFAULT_SANDBOX_IMAGE}"`);
-    expect(toml).toContain("sandbox_cores = 2");
-    expect(toml).toContain("sandbox_mem_gb = 4");
-  });
-
-  it("honors an image override", () => {
-    expect(servingTomlLines("podman", "docker.io/library/python:3.12-slim")).toContain(
-      'sandbox_image = "docker.io/library/python:3.12-slim"',
-    );
-  });
-
-  it("off toml announces the empty set", () => {
-    expect(SERVING_OFF_TOML).toBe("announce_capabilities = false");
-  });
-});
-
 describe("setupPrompt", () => {
   it("podman prompt names the image + cgroup verification", () => {
     const prompt = setupPrompt("podman");
@@ -120,6 +98,6 @@ describe("setupPrompt", () => {
   });
 
   it("tart prompt targets the macOS backend", () => {
-    expect(setupPrompt("tart")).toContain("tart");
+    expect(setupPrompt("tart")).toContain("sshpass");
   });
 });

@@ -514,6 +514,8 @@ fn canonical_channel(id: &str, head_seq: u64) -> crate::Channel {
         hooks: Vec::new(),
         pinned: Vec::new(),
         huddle: Vec::new(),
+        owner: None,
+        archived: false,
     }
 }
 

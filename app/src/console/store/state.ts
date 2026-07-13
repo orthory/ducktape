@@ -135,10 +135,27 @@ export interface ConnectionDown {
 
 // ── State shape ─────────────────────────────────────────
 
+/** A focused history window (see ConsoleState.chatWindow). Doubles as the
+ *  REQUEST TOKEN for every read taken on the window's behalf: it is patched in
+ *  before the round trip and cleared synchronously when the reader leaves the
+ *  window, so a response is applicable only while the window it was fetched for
+ *  is still the one on screen — compare with `sameChatWindow`. */
+export interface ChatWindow {
+  channelId: string;
+  seq: number;
+}
+
+export const sameChatWindow = (
+  a: ChatWindow | null,
+  b: ChatWindow | null,
+): boolean =>
+  a === b || (!!a && !!b && a.channelId === b.channelId && a.seq === b.seq);
+
 export interface ConsoleState {
   // ── Session / node core ──
   screen: string;
-  /** Which sidebar rail is shown. Persisted across sessions (see loadViewMode).
+  /** Which sidebar rail is shown. The local-workspace choice is persisted (see
+   *  loadViewMode); direct clients start on USER without overwriting it.
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
@@ -160,6 +177,19 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
+  /** A one-shot seq to scroll into view and flash once its channel's messages
+   *  load — set by `focusMessage` (tag/search jump-to-message), consumed and
+   *  cleared by ChatView. Null when there's nothing to focus. */
+  chatFocusSeq: number | null;
+  /** A jump-to-message landed OUTSIDE the channel's newest-MAX_QUERY_LIMIT
+   *  tail: `messages` then holds the messagesAround window centered on `seq`,
+   *  not the tail. The per-block refresh re-pulls THIS window (so edits and
+   *  reactions on the messages you jumped to stay live) instead of the tail —
+   *  see fetchChatSlices. It ends when the reader leaves it: re-entering the
+   *  channel (rail click / "Jump to latest") or posting drops it and the tail
+   *  comes back. Also ChatView's record that it already asked, so a seq the
+   *  window can't produce is asked for once, not forever. */
+  chatWindow: ChatWindow | null;
   /** The active #tag filter (see TagFilter), or null for the live view. */
   tagFilter: TagFilter | null;
   /** The active tag filter's hits (newest first) — query-driven, like
@@ -170,6 +200,11 @@ export interface ConsoleState {
   /** The active channel's tag catalog (count-ordered), loaded on demand for
    *  the header's tag dropdown. Cleared on channel switch. */
   channelTags: ChatTagRow[];
+  /** The active channel's member set (User-author key bytes), loaded on demand
+   *  for the members panel and refetched after a membership op. Only meaningful
+   *  for a members_only channel; cleared on channel switch. Not part of the
+   *  per-block snapshot — a separate query, like `channelTags`. */
+  channelMembers: number[][];
   /** hex(node key bytes) → canonical account display name, projected from
    *  `identity` for author rendering. Unbound nodes deliberately have no
    *  replicated display-name record. */
@@ -253,9 +288,11 @@ export interface ConsoleState {
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
   /** Distinct executor tags announced network-wide (the `capability` registry),
-   *  sorted. Feeds the agent view's "Runs on" picker; empty when no host has
-   *  announced or the node predates the module (best-effort in the snapshot). */
+   *  sorted. Feeds the agent view's "Runs on" picker. */
   capabilities: string[];
+  /** Whether the capability registry is still loading, loaded successfully
+   *  (including a truthful empty list), or failed to load. */
+  capabilitiesStatus: "loading" | "ready" | "error";
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
@@ -305,7 +342,12 @@ export interface ConsoleState {
    *  navigate listener sets it, ForgeView consumes it, and the provider
    *  retires it when the user leaves the forge screen). `number` null means
    *  a repo-only focus. Null when nothing is pending. */
-  forgeFocus: { repo: string; number: number | null } | null;
+  forgeFocus: {
+    repo: string;
+    number: number | null;
+    messageId?: string;
+    messageSeq?: number;
+  } | null;
 
   /** The duckfs path the files browser should open on next render — the same
    *  one-shot hand-off idiom as forgeFocus, used by the agent form to point an
@@ -367,8 +409,14 @@ export interface ConsoleState {
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
-  /** The active workspace's invite blob, once revealed for sharing. */
+  /** The active workspace's full invite blob, once revealed for sharing. */
   inviteBlob: string | null;
+  /** The coordinator-hosted `🦆://<name>/<id>` short link for the revealed
+   *  invite, when the coordinator accepted it; null on the full-blob-only path. */
+  inviteShort: string | null;
+  /** This device's JOIN CODE (a pre-generated identity pubkey) for the
+   *  onboarding join flow — handed to an inviter so the invite locks to it. */
+  joinCode: string | null;
 }
 
 export const DEFAULT_ACCENT = "#a05a3c";
@@ -514,14 +562,15 @@ export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
 
 // ── View-mode persistence ───────────────────────────────
 //
-// The chosen rail survives restarts. The screen itself is NOT persisted, so on
-// boot we land on the persisted rail's default surface. These two ids duplicate
-// the registry's first-in-section screens (chat / members) rather than import
+// The local-workspace rail survives restarts. Direct client sessions start on
+// USER and do not overwrite it. The screen itself is NOT persisted, so local
+// boot lands on the persisted rail's default surface. These two ids duplicate
+// the registry's first-in-section screens (chat / status) rather than import
 // the registry into this low-level state module, keeping the store free of the
 // views graph.
 const VIEW_MODE_KEY = "ducktape.viewMode";
 export const DEFAULT_USER_SCREEN = "chat";
-export const DEFAULT_OPERATOR_SCREEN = "members";
+export const DEFAULT_OPERATOR_SCREEN = "status";
 
 export const loadViewMode = (): ViewMode => {
   try {
@@ -559,6 +608,23 @@ export const docTabsScope = (
 export const hasNodeContext = (
   state: Pick<ConsoleState, "workspace" | "nodeUrl">,
 ): boolean => state.workspace !== null || state.nodeUrl !== null;
+
+/** A direct remote connection has node context without a locally registered
+ *  workspace. It can use client apps and inspect the node, but cannot operate
+ *  the node lifecycle or governance surfaces. */
+export const isClientMode = (
+  state: Pick<ConsoleState, "workspace" | "nodeUrl">,
+): boolean => state.workspace === null && state.nodeUrl !== null;
+
+/** Node control is available (ADR A5, interim form): the active workspace's
+ *  node is a managed local daemon — ours to control even while it is stopped
+ *  (Start lives on the node console, so reachability is deliberately NOT a
+ *  term here). When the public/private RPC split (A2) lands, this grows
+ *  `|| (owner key && private RPC reachable)`; the UI gate moves with it and
+ *  nothing else does. */
+export const nodeControlAvailable = (
+  state: Pick<ConsoleState, "workspace" | "managed">,
+): boolean => state.workspace !== null && state.managed;
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};
@@ -721,10 +787,13 @@ export const createInitialState = (): ConsoleState => {
     activeChannel: null,
     messages: [],
     activeThread: null,
+    chatFocusSeq: null,
+    chatWindow: null,
     tagFilter: null,
     tagHits: [],
     tagHitsPending: false,
     channelTags: [],
+    channelMembers: [],
     authorNames: {},
     nodeUsers: {},
     accountKeys: {},
@@ -764,6 +833,7 @@ export const createInitialState = (): ConsoleState => {
     pageThreads: [],
     agents: [],
     capabilities: [],
+    capabilitiesStatus: "loading",
     watches: [],
     pendingRuns: [],
     capabilitiesByNode: new Map(),
@@ -795,6 +865,8 @@ export const createInitialState = (): ConsoleState => {
     deleteNeedsForce: null,
     onboardingPhase: null,
     inviteBlob: null,
+    inviteShort: null,
+    joinCode: null,
   };
 };
 
@@ -810,10 +882,13 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   activeChannel: null,
   messages: [],
   activeThread: null,
+  chatFocusSeq: null,
+  chatWindow: null,
   tagFilter: null,
   tagHits: [],
   tagHitsPending: false,
   channelTags: [],
+  channelMembers: [],
   authorNames: {},
   nodeUsers: {},
   accountKeys: {},
@@ -833,6 +908,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   pageThreads: [],
   agents: [],
   capabilities: [],
+  capabilitiesStatus: "loading",
   watches: [],
   pendingRuns: [],
   capabilitiesByNode: new Map(),
@@ -870,10 +946,8 @@ export interface ConsoleSnapshot {
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
-  capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
-  capabilitiesByNode: Map<string, string[]>;
   runLease: Map<string, RunLease>;
   files: FileEntry[];
   blocks: BlockRecord[];
@@ -899,10 +973,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
-  capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
-  capabilitiesByNode: snapshot.capabilitiesByNode,
   runLease: snapshot.runLease,
   files: snapshot.files,
   blocks: snapshot.blocks,

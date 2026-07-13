@@ -13,7 +13,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
-import { parseItemChannelId } from "../../domain/forge-client";
+import { forgeItemTarget } from "../../domain/forge-client";
 import {
   isTauri,
   resolveNode,
@@ -28,6 +28,7 @@ import {
   type NodeStatus,
   type NodeTransport,
 } from "../../domain/transport";
+import { IDENTITY_UNLOCKED_EVENT } from "../../domain/user-identity-client";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
@@ -73,7 +74,9 @@ import {
   createInitialState,
   DEFAULT_AUTHOR,
   docTabsScope,
+  isClientMode,
   loadRemoteUrl,
+  sameChatWindow,
   saveDocTabs,
 } from "./state";
 import type { ConsoleState } from "./state";
@@ -112,6 +115,8 @@ export interface NavigateTarget {
   threadRoot?: number;
   repo?: string;
   number?: number;
+  messageId?: string;
+  messageSeq?: number;
 }
 
 /** Defensive parse of an untrusted navigate payload: anything without a
@@ -127,6 +132,8 @@ const parseNavigateTarget = (payload: unknown): NavigateTarget | null => {
     threadRoot: typeof raw.threadRoot === "number" ? raw.threadRoot : undefined,
     repo: typeof raw.repo === "string" && raw.repo.length > 0 ? raw.repo : undefined,
     number: typeof raw.number === "number" ? raw.number : undefined,
+    messageId: typeof raw.messageId === "string" ? raw.messageId : undefined,
+    messageSeq: typeof raw.messageSeq === "number" ? raw.messageSeq : undefined,
   };
 };
 
@@ -192,6 +199,12 @@ export function DucktapeProvider({
   // A newer hydrate against the same transport owns the UI. This prevents a
   // slower, older slice failure from overwriting a snapshot that already won.
   const hydrateGenRef = useRef(0);
+  // Capability reads also run on explicit UI retry. Keep their ordering local
+  // so a retry cannot cancel unrelated chat/pages hydration (or vice versa).
+  const capabilityHydrateGenRef = useRef(0);
+  // Retry requires a fresh identity proof. A normal hydrate whose status read
+  // started before that proof must not fan out a capability query afterward.
+  const capabilityTrustGenRef = useRef(0);
 
   const fail = useCallback(
     (err: unknown) =>
@@ -199,9 +212,9 @@ export function DucktapeProvider({
     [],
   );
 
-  const probeStatus = useCallback((live: NodeTransport): Promise<NodeStatus> => {
+  const probeStatus = useCallback((live: NodeTransport, fresh = false): Promise<NodeStatus> => {
     const existing = statusFlightRef.current;
-    if (existing?.transport === live) return existing.promise;
+    if (!fresh && existing?.transport === live) return existing.promise;
 
     const promise = Promise.resolve()
       .then(() => live.status())
@@ -330,6 +343,25 @@ export function DucktapeProvider({
     [],
   );
 
+  const refreshCapabilitySlices = useCallback(
+    (
+      live: NodeTransport,
+      generation = (capabilityHydrateGenRef.current += 1),
+    ): Promise<void> => {
+      return fetchCapabilitySlices(live).then((capability) => {
+        if (
+          nodeRef.current !== live ||
+          capabilityHydrateGenRef.current !== generation ||
+          rejectedTransportsRef.current.has(live)
+        ) {
+          return;
+        }
+        dispatch({ type: "patch", patch: capability });
+      });
+    },
+    [],
+  );
+
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
@@ -337,6 +369,7 @@ export function DucktapeProvider({
     // Bind this hydrate to the exact transport that started it so a late
     // response from the previous workspace cannot repopulate cleared slices.
     const generation = (hydrateGenRef.current += 1);
+    const capabilityTrustFloor = capabilityTrustGenRef.current;
     const stale = () =>
       nodeRef.current !== live || hydrateGenRef.current !== generation;
     const hadSnapshot = stateRef.current.status !== null;
@@ -347,16 +380,26 @@ export function DucktapeProvider({
     const fetchStartedAt = Date.now();
     const hydrate = (status: NodeStatus) => {
       if (stale() || !acceptsStatus(live, status)) return Promise.resolve();
+      if (capabilityTrustGenRef.current === capabilityTrustFloor) {
+        void refreshCapabilitySlices(live);
+      }
+      // the chat read is taken FOR this window (the tail, when null) — the
+      // request token the apply below re-checks against `state.chatWindow`.
+      const fetchedWindow = stateRef.current.chatWindow;
       return Promise.resolve()
         .then(() =>
           Promise.all([
-            fetchChatSlices(live, stateRef.current.activeChannel),
+            fetchChatSlices(live, stateRef.current.activeChannel, fetchedWindow),
             fetchValsetSlices(live),
-            fetchGovernanceSlices(live),
+            isClientMode(stateRef.current)
+              ? {
+                  proposals: [],
+                  governanceShares: { active: false, allocations: [], total: 0 },
+                }
+              : fetchGovernanceSlices(live),
             fetchForgeSlices(live),
             fetchPagesSlices(live, fetchedPage),
             fetchAgentsSlices(live),
-            fetchCapabilitySlices(live),
             fetchRunsSlices(live),
             fetchPeopleSlices(live),
             fetchFilesSlices(live),
@@ -373,7 +416,6 @@ export function DucktapeProvider({
             forge,
             pagesSlices,
             agents,
-            capability,
             runs,
             people,
             files,
@@ -385,6 +427,16 @@ export function DucktapeProvider({
             // un-render the confirmed write until a later refresh — skip; the
             // next block's hydrate carries a taller status.
             if (status.height < receiptFloor(stateRef.current.ops)) return;
+            // The reader left (or entered) the history window while this read
+            // was in flight, so `chat.messages` is the wrong slice — a window
+            // where the tail is now wanted, or vice versa. Posting is the sharp
+            // case: it clears `chatWindow` and paints the optimistic message,
+            // and applying the window we fetched would erase it. Keep what is on
+            // screen; the write's own refresh (or the next block) re-reads.
+            const holdMessages = !sameChatWindow(
+              stateRef.current.chatWindow,
+              fetchedWindow,
+            );
             const holdPages = shouldHoldPages(fetchedPage, fetchStartedAt);
             const { openTabs, activePage } = holdPages
               ? {
@@ -406,7 +458,9 @@ export function DucktapeProvider({
                   governanceShares: governance.governanceShares,
                   forgeHead: forge.forgeHead,
                   activeChannel: chat.activeChannel,
-                  messages: chat.messages,
+                  messages: holdMessages
+                    ? stateRef.current.messages
+                    : chat.messages,
                   authorNames: people.authorNames,
                   nodeUsers: people.nodeUsers,
                   accountKeys: people.accountKeys,
@@ -416,8 +470,6 @@ export function DucktapeProvider({
                     ? stateRef.current.activePageBlocks
                     : (pagesSlices.pageBlocks ?? []),
                   agents: agents.agents,
-                  capabilities: capability.capabilities,
-                  capabilitiesByNode: capability.capabilitiesByNode,
                   watches: runs.watches,
                   pendingRuns: runs.pendingRuns,
                   runLease: runs.runLease,
@@ -449,6 +501,7 @@ export function DucktapeProvider({
     handleStatusFailure,
     probeStatus,
     reconcileDocTabs,
+    refreshCapabilitySlices,
     shouldHoldPages,
   ]);
 
@@ -462,6 +515,7 @@ export function DucktapeProvider({
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
     const generation = (hydrateGenRef.current += 1);
+    const capabilityTrustFloor = capabilityTrustGenRef.current;
     const stale = () =>
       nodeRef.current !== live || hydrateGenRef.current !== generation;
     const hadSnapshot = stateRef.current.status !== null;
@@ -474,19 +528,27 @@ export function DucktapeProvider({
       const prev = stateRef.current.status;
       if (!prev) return refresh();
       const scope = scopeFor(changedModules(prev, status));
+      if (
+        scope.has("capability") &&
+        capabilityTrustGenRef.current === capabilityTrustFloor
+      ) {
+        void refreshCapabilitySlices(live);
+      }
       const fetchedPage = stateRef.current.activePage;
+      const fetchedWindow = stateRef.current.chatWindow; // request token — see refresh()
       return Promise.resolve()
         .then(() =>
           Promise.all([
             scope.has("chat")
-              ? fetchChatSlices(live, stateRef.current.activeChannel)
+              ? fetchChatSlices(live, stateRef.current.activeChannel, fetchedWindow)
               : null,
             scope.has("valset") ? fetchValsetSlices(live) : null,
-            scope.has("governance") ? fetchGovernanceSlices(live) : null,
+            scope.has("governance") && !isClientMode(stateRef.current)
+              ? fetchGovernanceSlices(live)
+              : null,
             scope.has("forge") ? fetchForgeSlices(live) : null,
             scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
             scope.has("agents") ? fetchAgentsSlices(live) : null,
-            scope.has("capability") ? fetchCapabilitySlices(live) : null,
             scope.has("runs") ? fetchRunsSlices(live) : null,
             scope.has("people") ? fetchPeopleSlices(live) : null,
             scope.has("files") ? fetchFilesSlices(live) : null,
@@ -502,7 +564,6 @@ export function DucktapeProvider({
             forge,
             pagesSlices,
             agents,
-            capability,
             runs,
             people,
             files,
@@ -515,6 +576,12 @@ export function DucktapeProvider({
               !holdPages && pagesSlices
                 ? reconcileDocTabs(pagesSlices.pages)
                 : null;
+            // the window moved under this read (a post, or "jump to latest") —
+            // keep the messages on screen, drop the slice. See refresh().
+            const holdMessages = !sameChatWindow(
+              stateRef.current.chatWindow,
+              fetchedWindow,
+            );
             return dispatch({
               type: "patch",
               patch: {
@@ -524,11 +591,13 @@ export function DucktapeProvider({
                 status,
                 blocks,
                 ...(chat ?? {}),
+                ...(chat && holdMessages
+                  ? { messages: stateRef.current.messages }
+                  : {}),
                 ...(valset ?? {}),
                 ...(governance ?? {}),
                 ...(forge ?? {}),
                 ...(agents ?? {}),
-                ...(capability ?? {}),
                 ...(runs ?? {}),
                 ...(people ?? {}),
                 ...(files ?? {}),
@@ -559,9 +628,42 @@ export function DucktapeProvider({
     handleStatusFailure,
     probeStatus,
     refresh,
+    refreshCapabilitySlices,
     reconcileDocTabs,
     shouldHoldPages,
   ]);
+
+  const refreshCapabilities = useCallback(() => {
+    const live = nodeRef.current;
+    if (!live || !stateRef.current.connected) return;
+    // Reserve ownership before the identity proof: an older capability read
+    // must not land while Retry is waiting for status from this same port.
+    capabilityTrustGenRef.current += 1;
+    const generation = (capabilityHydrateGenRef.current += 1);
+    dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
+    void probeStatus(live, true).then(
+      (status) => {
+        if (nodeRef.current !== live) return;
+        if (!acceptsStatus(live, status)) {
+          if (capabilityHydrateGenRef.current === generation) {
+            dispatch({ type: "patch", patch: { capabilitiesStatus: "error" } });
+          }
+          return;
+        }
+        if (capabilityHydrateGenRef.current !== generation) return;
+        return refreshCapabilitySlices(live, generation);
+      },
+      () => {
+        if (
+          nodeRef.current === live &&
+          capabilityHydrateGenRef.current === generation &&
+          !rejectedTransportsRef.current.has(live)
+        ) {
+          dispatch({ type: "patch", patch: { capabilitiesStatus: "error" } });
+        }
+      },
+    );
+  }, [acceptsStatus, probeStatus, refreshCapabilitySlices]);
 
   const actions = useMemo(
     () =>
@@ -571,6 +673,7 @@ export function DucktapeProvider({
         getNode: () => nodeRef.current,
         setNode,
         refresh,
+        refreshCapabilities,
         fail,
         nextBootGeneration: () => (bootGenRef.current += 1),
         isBootGenerationStale: (generation) => bootGenRef.current !== generation,
@@ -582,9 +685,10 @@ export function DucktapeProvider({
     () =>
       (state.status?.modules ?? [])
         .map((m) => m.id)
+        .filter((id) => !isClientMode(state) || id !== "governance")
         .sort()
         .join("\0"),
-    [state.status?.modules],
+    [state.status?.modules, state.workspace, state.nodeUrl],
   );
 
   // 1. Resolve the node once. Web: dial the configured url. Desktop: resolve
@@ -600,6 +704,8 @@ export function DucktapeProvider({
       dispatch({
         type: "patch",
         patch: {
+          screen: "chat",
+          viewMode: "user",
           nodeUrl: resolution.url,
           managed: false,
           needsOnboarding: false,
@@ -617,7 +723,7 @@ export function DucktapeProvider({
         dispatch({ type: "patch", patch: { workspaces: all } });
         // A remembered remote node supersedes the local active workspace — it
         // was the user's last choice, so reconnect to it. An unreachable one
-        // just reads as disconnected rather than blocking boot.
+        // leaves the workspace gate up instead of opening a dead shell.
         const savedRemote = loadRemoteUrl();
         if (savedRemote) {
           actions.connectRemote(savedRemote);
@@ -711,7 +817,15 @@ export function DucktapeProvider({
             return patch;
           },
         });
-        schedule();
+        // A files putblob frame only stages one upload chunk. It changes the
+        // module root but no visible path, so re-indexing all searchable files
+        // after every remote chunk is pure network churn; the final JSON Commit
+        // event performs the one hydrate that can change the file projection.
+        const filesStage =
+          frame.topic === moduleTopic("files") &&
+          frame.op.payload === undefined &&
+          typeof frame.op.payloadHex === "string";
+        if (!filesStage) schedule();
       },
       onLagged: () => {
         clearFlush();
@@ -927,6 +1041,34 @@ export function DucktapeProvider({
     };
   }, [actions]);
 
+  // 2g. Re-run the connect-time auto-bind when the shell announces the machine
+  //     key became signable (create/restore/unlock/encrypt/reveal — see
+  //     user_identity.rs). The boot connect always outruns a human typing a
+  //     password, so on an encrypted key the connect-time pass (adopt →
+  //     autoBindUserIdentity) deterministically short-circuits "locked"; this
+  //     listener is what ever lands the bind for those users.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void tauriEventApi()
+      .then(({ listen }) =>
+        listen(IDENTITY_UNLOCKED_EVENT, () => void actions.identityUnlocked()),
+      )
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {
+        // event API unavailable (non-tauri / test stub) — no retry hook, the
+        // next connect's own bind pass still runs.
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [actions]);
+
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {
     document.documentElement.style.setProperty("--accent", state.accent);
@@ -976,7 +1118,7 @@ export function DucktapeProvider({
         listen<string | NavigateTarget>("ducktape://navigate", (event) => {
           const payload = event.payload;
           if (typeof payload === "string") {
-            if (payload) dispatch({ type: "patch", patch: { screen: payload } });
+            if (payload) actions.setScreen(payload);
             return;
           }
           let target = parseNavigateTarget(payload);
@@ -987,7 +1129,7 @@ export function DucktapeProvider({
           // Discussion, so route to the forge item view instead.
           const forgeItem =
             target.screen === "chat" && target.channelId
-              ? parseItemChannelId(target.channelId)
+              ? forgeItemTarget(target.channelId, { messageSeq: target.threadRoot })
               : null;
           if (forgeItem) target = { screen: "forge", ...forgeItem };
           const { channelId, threadRoot } = target;
@@ -1015,7 +1157,14 @@ export function DucktapeProvider({
           if (target.repo) {
             dispatch({
               type: "patch",
-              patch: { forgeFocus: { repo: target.repo, number: target.number ?? null } },
+              patch: {
+                forgeFocus: {
+                  repo: target.repo,
+                  number: target.number ?? null,
+                  ...(target.messageId ? { messageId: target.messageId } : {}),
+                  ...(target.messageSeq ? { messageSeq: target.messageSeq } : {}),
+                },
+              },
             });
           }
         }),
@@ -1168,7 +1317,9 @@ export function DucktapeProvider({
       focusedChannel: state.screen === "chat" ? state.activeChannel : null,
       mainWindowFocused: windowFocused,
       authorNames: state.authorNames,
-      prefs: state.notifyPrefs,
+      prefs: isClientMode(state)
+        ? { ...state.notifyPrefs, governance: false }
+        : state.notifyPrefs,
     };
     const fp = JSON.stringify(payload);
     if (fp === notifyConfigFp.current) return;
@@ -1178,6 +1329,7 @@ export function DucktapeProvider({
     state.status?.publicKey,
     state.nodeUsers,
     state.nodeUrl,
+    state.workspace,
     state.screen,
     state.activeChannel,
     state.authorNames,

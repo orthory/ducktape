@@ -164,7 +164,7 @@ describe("notify client", () => {
     markTauri();
     invokeMock.mockResolvedValueOnce({
       unread: 3,
-      items: [{ category: "mention", title: "t", body: "b", channelId: null, at: 1 }],
+      items: [{ category: "mention", title: "t", body: "b", channelId: null, messageId: null, at: 1 }],
     });
 
     const snapshot = await recent();
@@ -183,7 +183,7 @@ describe("notify client", () => {
     const unlisten = vi.fn();
     const cb = vi.fn();
     listenMock.mockImplementation(async (_eventName, handler) => {
-      handler({ payload: { category: "reply", title: "t", body: "b", channelId: "c", at: 2 } });
+      handler({ payload: { category: "reply", title: "t", body: "b", channelId: "c", messageId: "m2", at: 2 } });
       return unlisten;
     });
 

@@ -396,6 +396,11 @@ where
     server: ed25519::PublicKey,
     receiver: std::sync::Arc<tokio::sync::Mutex<Option<R>>>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// the real-key standing proof (ADR §5.1). the restore/promoted-boot node's
+    /// real key IS in the committed valset (validators ∪ residents), so the
+    /// serving peer's fail-closed gate admits it.
+    requester: [u8; 32],
+    proof: [u8; 64],
 }
 
 impl<S, R> Clone for BootP2pSyncClient<S, R>
@@ -409,6 +414,8 @@ where
             server: self.server.clone(),
             receiver: std::sync::Arc::clone(&self.receiver),
             next_id: std::sync::Arc::clone(&self.next_id),
+            requester: self.requester,
+            proof: self.proof,
         }
     }
 }
@@ -427,12 +434,20 @@ where
     S: P2pSender<PublicKey = ed25519::PublicKey>,
     R: P2pReceiver<PublicKey = ed25519::PublicKey>,
 {
-    pub(crate) fn new(sender: S, receiver: R, server: ed25519::PublicKey) -> Self {
+    pub(crate) fn new(
+        sender: S,
+        receiver: R,
+        server: ed25519::PublicKey,
+        requester: [u8; 32],
+        proof: [u8; 64],
+    ) -> Self {
         Self {
             sender,
             server,
             receiver: std::sync::Arc::new(tokio::sync::Mutex::new(Some(receiver))),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            requester,
+            proof,
         }
     }
 
@@ -461,6 +476,8 @@ where
         let mut sender = self.sender.clone();
         let server = self.server.clone();
         let receiver = std::sync::Arc::clone(&self.receiver);
+        let requester = self.requester;
+        let proof = self.proof;
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -469,7 +486,8 @@ where
             let receiver = guard.as_mut().ok_or_else(|| {
                 statesync::SyncError::Transport("boot statesync receiver closed".into())
             })?;
-            let frame = statesync::encode_rpc(id, &statesync::encode_request(&req));
+            let frame =
+                statesync::encode_rpc_authed(&requester, &proof, id, &statesync::encode_request(&req));
             let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
             if attempted.is_empty() {
                 return Err(statesync::SyncError::Transport(
@@ -496,7 +514,9 @@ where
                     continue;
                 }
                 let bytes: Vec<u8> = msg.into();
-                let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                // replies carry zero-filled auth fields; only id + body matter.
+                let Ok((_requester, _proof, rpc_id, body)) = statesync::decode_rpc_authed(&bytes)
+                else {
                     continue;
                 };
                 if rpc_id != id {

@@ -43,9 +43,12 @@ use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 
 use forget::{probe_forget, ForgetVerdict};
 use lifecycle::{node_uptime_secs, pidfile, read_pid, recorded_pid_alive, stop_workspace_node};
-use phase::{classify, PhaseReport};
+use phase::{classify, parse_join_state, PhaseReport};
 use ports::{allocate_ports, reserved_ports};
-use registry::{load_registry, save_registry, workspaces_dir, Ports, Registry, Selection, Workspace};
+use registry::{
+    load_registry, save_registry, workspaces_dir, write_atomic, Ports, Registry, Selection,
+    Workspace,
+};
 
 const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
 
@@ -401,6 +404,14 @@ fn workspace_join_blocking(
     let id = unique_id(&name, &reg.workspaces);
     let dir = workspaces_dir(&app)?.join(&id);
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
+    // adopt the staged join identity (the join code the invitee handed the
+    // inviter) so `cmd_join` reuses it and its target self-check passes. the
+    // staging slot is consumed exactly once.
+    let staged = workspaces_dir(&app)?.join(".pending-join").join("identity.key");
+    if staged.exists() {
+        fs::rename(&staged, dir.join("identity.key"))
+            .map_err(|e| format!("adopt staged join identity: {e}"))?;
+    }
     let ports = allocate_ports(&reserved_ports(&reg))?;
 
     // bind dual-stack, but pass NO --advertised and NO --listen: a joiner
@@ -480,25 +491,93 @@ fn workspace_join_blocking(
 
 /// the one-line invite blob to hand a friend, refreshed with this member's dial
 /// hint. requires the workspace to have been founded/joined (it reads config).
+///
+/// The short link is the coordinator-hosted `🦆://<name>/<id>` URL; the full
+/// blob is the self-contained fallback that works without any coordinator.
+/// `short` is `None` when the coordinator was unreachable/refused — the blob
+/// still works.
+#[derive(Serialize, Clone)]
+pub struct InviteForms {
+    pub short: Option<String>,
+    pub blob: String,
+}
+
 #[tauri::command]
 pub async fn workspace_invite_blob(
     app: crate::rt::AppHandle,
     window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
+    target: String,
+) -> Result<InviteForms, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_invite_blob_blocking(app, id, target))
+        .await
+}
+
+fn workspace_invite_blob_blocking(
+    app: crate::rt::AppHandle,
+    id: String,
+    target: String,
+) -> Result<InviteForms, String> {
+    let target = target.trim().to_string();
+    if target.is_empty() {
+        return Err(
+            "paste the invitee's join code — every invite is locked to the key it admits".into(),
+        );
+    }
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
+    let cfg_s = cfg.to_string_lossy().to_string();
+    match run_verb(&["invite", "--config", &cfg_s, "--target", &target, "--short"]) {
+        Ok(out) => {
+            // `--short` prints the full blob line, then the short URL as the
+            // LAST line. Recover the blob line (`🦆…`, but never the `🦆://` URL).
+            let short = last_line(&out);
+            let blob = out
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with('🦆') && !l.contains("://"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            Ok(InviteForms {
+                short: Some(short),
+                blob,
+            })
+        }
+        // coordinator unreachable/refusing: the full blob must still work.
+        Err(_) => {
+            run_verb(&["invite", "--config", &cfg_s, "--target", &target]).map(|out| InviteForms {
+                short: None,
+                blob: last_line(&out),
+            })
+        }
+    }
+}
+
+/// the invitee's JOIN CODE: pre-mint the identity a future `workspace_join`
+/// will adopt, in a one-slot staging dir, and return its pubkey. the code
+/// handed to the inviter IS the key the invite locks to. repeat calls reuse the
+/// same staged identity (keygen semantics).
+#[tauri::command]
+pub async fn workspace_join_code(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
 ) -> Result<String, String> {
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || workspace_invite_blob_blocking(app, id))
+        .run(move || {
+            let staging = workspaces_dir(&app)?.join(".pending-join");
+            fs::create_dir_all(&staging).map_err(|e| format!("create {staging:?}: {e}"))?;
+            run_verb(&["keygen", "--dir", &staging.to_string_lossy()]).map(|out| last_line(&out))
+        })
         .await
-}
-
-fn workspace_invite_blob_blocking(app: crate::rt::AppHandle, id: String) -> Result<String, String> {
-    let reg = load_registry(&app)?;
-    let ws = find(&reg, &id)?;
-    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(&["invite", "--config", &cfg.to_string_lossy()]).map(|out| last_line(&out))
 }
 
 /// the join requests parked joiners delivered to this member's running node
@@ -866,6 +945,62 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     finish_selection(&app, &mut reg, ws, http_url)
 }
 
+/// Atomically apply one sandbox mode and restart the managed node. A failed
+/// boot restores the old config and attempts to bring the old node back before
+/// returning the error, so a bad apply does not strand the workspace.
+#[tauri::command]
+pub async fn workspace_sandbox_apply(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    mode: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_sandbox_apply_blocking(app, id, mode))
+        .await
+}
+
+fn workspace_sandbox_apply_blocking(
+    app: crate::rt::AppHandle,
+    id: String,
+    mode: String,
+) -> Result<(), String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?.clone();
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let config = node_toml(&dir);
+    let original = fs::read_to_string(&config)
+        .map_err(|err| format!("read {config:?}: {err}"))?;
+    let updated = crate::sandbox::config_with_mode(&original, &mode)?;
+    if updated == original {
+        return Ok(());
+    }
+
+    stop_workspace_node(&dir, &ws.ports, std::time::Duration::from_secs(6))?;
+    if let Err(err) = write_atomic(&config, updated.as_bytes()) {
+        let recovery = workspace_select_blocking(app, id)
+            .map(|_| "the previous node was restarted".to_string())
+            .unwrap_or_else(|restart| format!("the previous node also failed to restart: {restart}"));
+        return Err(format!("apply sandbox config: {err}; {recovery}"));
+    }
+
+    if let Err(apply) = workspace_select_blocking(app.clone(), id.clone()) {
+        let recovery = match write_atomic(&config, original.as_bytes()) {
+            Ok(()) => workspace_select_blocking(app, id)
+                .map(|_| "the previous config was restored and restarted".to_string())
+                .unwrap_or_else(|restart| {
+                    format!("the previous config was restored but failed to restart: {restart}")
+                }),
+            Err(restore) => format!("the previous config could not be restored: {restore}"),
+        };
+        return Err(format!("restart with sandbox mode {mode:?}: {apply}; {recovery}"));
+    }
+    Ok(())
+}
+
 fn finish_selection(
     app: &crate::rt::AppHandle,
     reg: &mut Registry,
@@ -891,31 +1026,49 @@ fn commit_active(app: &crate::rt::AppHandle, reg: &mut Registry, id: &str) -> Re
     Ok(())
 }
 
-/// read this workspace's onboarding phase back from `daemon.log`. a parked
-/// joiner serves no http/rpc, so its log is the only progress signal; the
-/// webview treats a successful `/v1/status` as the authoritative "ready" and
-/// only falls back to this while the surface is still down.
+/// read this workspace's onboarding phase. the AUTHORITATIVE source for the
+/// positive ladder (`parked → admitted → synced → promoted`) is the node's
+/// `join-state` rpc, which derives from committed standing and so is
+/// restart-proof: a re-syncing resident reports `admitted`/`synced` even when
+/// its fresh `daemon.log` has lost the admission markers — the bug where a
+/// joined network read as "admission not claimed". the log + process liveness
+/// remain the source for the two edges the rpc cannot report: `starting`
+/// (rpc not up yet) and `fatal` (a crashed or gate-rejected node that exited
+/// before it could answer).
 #[tauri::command]
-pub fn workspace_phase(
+pub async fn workspace_phase(
     app: crate::rt::AppHandle,
     window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<PhaseReport, String> {
     require_main_window(&window)?;
+    // routed through the node-control actor like every other verb-calling
+    // command: the join-state read spawns a subprocess whose rpc could block
+    // up to the verb timeout, and that must never run on the command-dispatch
+    // thread or wedge a Tauri worker. onboarding contention is low (the join
+    // has already returned before phase polling begins).
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_phase_blocking(app, id))
+        .await
+}
+
+fn workspace_phase_blocking(
+    app: crate::rt::AppHandle,
+    id: String,
+) -> Result<PhaseReport, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let dir = workspaces_dir(&app)?.join(&ws.id);
     let tail = read_tail(&dir.join("daemon.log"), 64 * 1024)?;
-    let report = classify(&tail);
-    // classify only knows the node's stdout markers, so a node that crashed on
-    // boot for a reason it printed no known marker for — a bind conflict, a
-    // config parse error, an abort — reads as "starting"/"parked" FOREVER: a
-    // cheerful spinner over a corpse. cross-check the process. if the pid WE
-    // recorded is gone and neither port is held, the node is dead, not slow;
-    // report fatal with the last log line as the best reason we have. (once the
-    // node answers /v1/status the webview stops polling this, so a live node
-    // never reaches here; a healthy parked joiner keeps its pid + listen port.)
-    if report.phase != "fatal"
+    let log_report = classify(&tail);
+    // a dead process is fatal regardless of any stale phase: if the pid WE
+    // recorded is gone and neither port is held, the node exited (a bind
+    // conflict, a config parse error, a gate-rejected join's exit(1)) — report
+    // fatal with the last log line as the best reason. a healthy node keeps its
+    // pid + a listen port, so a live node never trips this.
+    if log_report.phase != "fatal"
         && recorded_pid_alive(&dir) == Some(false)
         && !port_listening(ws.ports.listen)
         && !port_listening(ws.ports.http)
@@ -931,7 +1084,42 @@ pub fn workspace_phase(
             detail: Some(detail),
         });
     }
+    // a FATAL/panic already in the log is terminal — a rejected or crashed join
+    // exits before the rpc can answer, so trust the log over a stale rpc read.
+    if log_report.phase == "fatal" {
+        return Ok(log_report);
+    }
+    // AUTHORITATIVE positive ladder from the node's rpc (read-only, no lock).
+    // unreachable rpc (still booting, or briefly down mid-resync) falls back to
+    // the log's best guess.
+    let cfg = node_toml(&dir);
+    let report = match crate::daemon::run_verb(&["join-state", "--config", &cfg.to_string_lossy()]) {
+        Ok(out) => parse_join_state(&out).unwrap_or(log_report),
+        Err(_) => log_report,
+    };
+    // the registry's `member` flag was cached from the descriptor snapshot at
+    // join time and never refreshed — so a joiner later PROMOTED to validator
+    // read `member=false` forever (couldn't vote / admin). `phase=="promoted"`
+    // is the authoritative, restart-proof "this node is a validator" signal, so
+    // adopt it here. MONOTONIC-UP: only ever flips false→true on a confirmed
+    // promotion; a transient rpc blip yields a lesser phase and simply doesn't
+    // write, never demoting a validator on a flicker.
+    if report.phase == "promoted" {
+        refresh_member_standing(&app, &id)?;
+    }
     Ok(report)
+}
+
+/// persist that a workspace's node now holds validator standing, idempotently
+/// (no write if already a member) and monotonic-up (never clears the flag) —
+/// mirrors [`set_mnemonic_confirmed`]. keyed off the authoritative `promoted`
+/// join-state phase; the founder path already sets `member` at create.
+fn refresh_member_standing(app: &crate::rt::AppHandle, id: &str) -> Result<(), String> {
+    let mut reg = load_registry(app)?;
+    if registry::mark_member(&mut reg, id) {
+        save_registry(app, &reg)?;
+    }
+    Ok(())
 }
 
 /// the path + tail of a workspace's `daemon.log`, so the ui can show the real

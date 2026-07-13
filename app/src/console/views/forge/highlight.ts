@@ -94,6 +94,14 @@ export function langForFilename(name: string): string | null {
   return LANG_BY_EXT[ext] ?? null;
 }
 
+/** The shiki language id for a code-fence tag (```rust, ```ts, …), or null.
+ *  Accepts the extension aliases above and the loaded language ids themselves. */
+export function langForTag(tag: string): string | null {
+  const t = tag.toLowerCase();
+  if (LANG_BY_EXT[t]) return LANG_BY_EXT[t];
+  return Object.values(LANG_BY_EXT).includes(t) ? t : null;
+}
+
 export interface HlToken {
   content: string;
   /** Per-theme colors as CSS custom properties (`--shiki-light` / `--shiki-dark`),

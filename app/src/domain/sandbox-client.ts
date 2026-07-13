@@ -34,7 +34,14 @@ export interface SandboxPreflight {
   cgroupDelegation: ProbeResult | null;
 }
 
+export type SandboxApplyMode = "off" | "direct" | "podman" | "tart";
+
 /** Probe the local host for one workspace. Resolves `null` off the desktop
  *  build (nothing to probe), so callers render the unknown/guidance state. */
 export const sandboxPreflight = (id: string): Promise<SandboxPreflight | null> =>
   isTauri() ? invoke<SandboxPreflight>("sandbox_preflight", { id }) : Promise.resolve(null);
+
+/** Persist a sandbox choice and restart the managed workspace node. The Rust
+ * command rolls the config back when the new node fails to boot. */
+export const sandboxApply = (id: string, mode: SandboxApplyMode): Promise<void> =>
+  invoke<void>("workspace_sandbox_apply", { id, mode });

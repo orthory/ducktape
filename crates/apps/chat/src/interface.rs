@@ -139,6 +139,18 @@ pub struct Channel {
     /// roster is consensus state (who is in the room); the audio itself rides
     /// the off-consensus voice plane.
     pub huddle: Vec<HuddleMember>,
+    /// the user who created the channel (`AuthorRef::User` bytes). `None` for
+    /// module/system-minted channels and for legacy records created before this
+    /// field existed — the stored codec is serde_json, so the default decodes
+    /// old records without a schema-revision bump. only the owner may
+    /// rename/archive an owned channel; a `None` owner is open to any user.
+    #[serde(default)]
+    pub owner: Option<Vec<u8>>,
+    /// archived channels reject posts, reactions, and huddle joins; membership,
+    /// rename, and unarchive stay allowed. `#[serde(default)]` = false for
+    /// legacy records.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// the mutable head of one message. prior contents live in immutable revision
@@ -201,6 +213,16 @@ pub enum ChatMsg {
         name: String,
         post_policy: PostPolicy,
     },
+    /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
+    /// the reserved `:` namespace gate + the record byte cap). only the
+    /// channel's `owner` (a `User` origin) may rename an owned channel; a legacy
+    /// owner-less channel admits any user, mirroring `SetMembership`. module and
+    /// system origins pass as elsewhere.
+    RenameChannel { channel_id: String, name: String },
+    /// archive or unarchive a channel. an archived channel rejects posts,
+    /// reactions, and huddle joins; membership, rename, and unarchive stay
+    /// allowed. authorization mirrors `RenameChannel`.
+    SetChannelArchived { channel_id: String, archived: bool },
     /// post a message; `thread` = `Some(root_seq)` posts a thread reply, which
     /// is a normal message record consuming its own channel sequence.
     /// `as_agent` refines a MODULE origin into an [`AuthorRef::Agent`] author
@@ -287,6 +309,17 @@ pub enum ChatQuery {
     MessagesRange {
         channel_id: String,
         from_seq: u64,
+        limit: u64,
+    },
+    /// the window of `limit` messages CENTERED on `seq`, ascending — the
+    /// jump-to-message read: a tag/search hit older than the newest `limit`
+    /// is in no [`MessagesLatest`](ChatQuery::MessagesLatest) page. half the
+    /// window sits before `seq`, the rest from `seq` on; both ends clamp to the
+    /// channel's live range and `limit` to [`MAX_QUERY_LIMIT`]. carries every
+    /// sequence (replies, tombstones) like the other pages.
+    MessagesAround {
+        channel_id: String,
+        seq: u64,
         limit: u64,
     },
     /// global message-id lookup.

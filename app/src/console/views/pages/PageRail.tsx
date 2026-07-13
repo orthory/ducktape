@@ -7,7 +7,7 @@ import type { CSSProperties } from "react";
 
 import { Icon } from "../../components/Icon";
 import { color, font, radius } from "../../theme/tokens";
-import { buildForest } from "./page-tree";
+import { ancestorChain, buildForest } from "./page-tree";
 import { PageTree } from "./PageTree";
 
 const TREE_COLLAPSE_KEY = "ducktape.docTreeCollapsed";
@@ -55,7 +55,18 @@ export function PageRail({
   onMove: (id: string, parent: string | null) => void;
   onRefresh: () => void;
 }) {
-  const forest = useMemo(() => buildForest(pages), [pages]);
+  const [query, setQuery] = useState("");
+  const visiblePages = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    if (!needle) return pages;
+    const visible = new Set(
+      pages
+        .filter((page) => page.title.toLocaleLowerCase().includes(needle))
+        .flatMap((page) => ancestorChain(pages, page.id).map((ancestor) => ancestor.id)),
+    );
+    return pages.filter((page) => visible.has(page.id));
+  }, [pages, query]);
+  const forest = useMemo(() => buildForest(visiblePages), [visiblePages]);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(loadTreeCollapsed);
   const toggleCollapse = (id: string) =>
     setCollapsed((prev) => {
@@ -68,7 +79,7 @@ export function PageRail({
   return (
     <aside
       style={{
-        width: 272,
+        width: 224,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
@@ -79,9 +90,9 @@ export function PageRail({
     >
       <div
         style={{
-          height: 56,
+          height: 52,
           flexShrink: 0,
-          padding: "0 15px",
+          padding: "0 14px",
           display: "flex",
           alignItems: "center",
           gap: 9,
@@ -90,9 +101,9 @@ export function PageRail({
       >
         <span
           style={{
-            width: 26,
-            height: 26,
-            borderRadius: 8,
+            width: 24,
+            height: 24,
+            borderRadius: 7,
             background: color.dark,
             color: color.onDark,
             display: "flex",
@@ -103,7 +114,27 @@ export function PageRail({
         >
           <Icon name="pages" size={14} strokeWidth={1.7} />
         </span>
-        <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Pages</div>
+        <div style={{ font: `600 13px ${font.sans}`, color: color.ink }}>Pages</div>
+        <button
+          type="button"
+          aria-label="New page"
+          title="New page"
+          onClick={onNewPage}
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            marginLeft: "auto",
+            width: 26,
+            height: 26,
+            borderRadius: 6,
+            color: color.muted3,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="plus" size={14} strokeWidth={1.9} />
+        </button>
         <button
           type="button"
           aria-label="Refresh pages"
@@ -112,12 +143,10 @@ export function PageRail({
           style={{
             all: "unset",
             cursor: "pointer",
-            marginLeft: "auto",
             width: 26,
             height: 26,
             borderRadius: 6,
-            border: `1px solid ${color.border}`,
-            background: color.paper,
+            background: "transparent",
             color: color.muted3,
             display: "flex",
             alignItems: "center",
@@ -128,32 +157,41 @@ export function PageRail({
         </button>
       </div>
 
-      <button
-        type="button"
-        aria-label="New page"
-        onClick={onNewPage}
+      <label
         style={{
-          all: "unset",
-          cursor: "pointer",
           display: "flex",
           alignItems: "center",
           gap: 8,
-          margin: "12px 12px 6px",
-          padding: "8px 10px",
+          height: 32,
+          margin: "12px 14px 8px",
+          padding: "0 10px",
+          border: `1px solid ${color.border}`,
           borderRadius: radius.sm,
-          background: color.dark,
-          color: color.onDark,
-          font: `600 12.5px ${font.sans}`,
+          background: color.sunken,
+          color: color.muted2,
         }}
       >
-        <Icon name="plus" size={14} strokeWidth={1.9} /> New page
-      </button>
+        <Icon name="search" size={13} strokeWidth={1.7} />
+        <input
+          type="search"
+          aria-label="Search pages"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search"
+          style={{
+            minWidth: 0,
+            width: "100%",
+            color: color.inkSofter,
+            font: `400 12.5px ${font.sans}`,
+          }}
+        />
+      </label>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 0 13px" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "4px 0 13px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px 8px" }}>
-          <div style={sectionLabelStyle}>All pages</div>
+          <div style={sectionLabelStyle}>Workspace</div>
         </div>
-        {pages.length === 0 ? (
+        {forest.length === 0 ? (
           <div
             style={{
               margin: "7px 14px",
@@ -165,13 +203,13 @@ export function PageRail({
               color: color.muted2,
             }}
           >
-            No pages on this node yet. Create one above to start writing.
+            {query ? "No pages match this search." : "No pages yet. Use + to start writing."}
           </div>
         ) : (
           <PageTree
             nodes={forest}
             activeId={activePage}
-            collapsed={collapsed}
+            collapsed={query ? new Set() : collapsed}
             onOpen={onOpen}
             onToggle={toggleCollapse}
             onAddChild={onAddChild}

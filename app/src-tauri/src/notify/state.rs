@@ -19,6 +19,7 @@ pub struct StoredNotification {
     pub title: String,
     pub body: String,
     pub channel_id: Option<String>,
+    pub message_id: Option<String>,
     /// Epoch milliseconds at present time.
     pub at: u64,
 }
@@ -69,6 +70,7 @@ mod tests {
                 title: "t".into(),
                 body: "b".into(),
                 channel_id: Some("general".into()),
+                message_id: Some("m1".into()),
                 at: 1,
             }],
         };
@@ -80,5 +82,14 @@ mod tests {
         let old = load(&path);
         assert_eq!(old.unread, 3);
         assert!(old.recent.is_empty());
+
+        // Rings written before message anchors existed remain readable.
+        std::fs::write(
+            &path,
+            br#"{"unread":1,"recent":[{"category":"mention","title":"t","body":"b","channelId":"general","at":1}]}"#,
+        )
+        .unwrap();
+        let old_ring = load(&path);
+        assert_eq!(old_ring.recent[0].message_id, None);
     }
 }

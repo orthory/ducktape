@@ -356,6 +356,14 @@ impl Chat {
     /// author is a module origin refined by `as_agent`); external users need
     /// membership under `MembersOnly`.
     async fn check_post_policy(&self, channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
+        // an archived channel rejects posts, reactions, and huddle join/sweep:
+        // every posting-class op routes through here, so one guard turns them
+        // all away. edits and deletes deliberately do not call this — redacting
+        // your own message stays possible in a closed channel — and neither do
+        // membership, rename, or unarchive.
+        if channel.archived {
+            return Err(Error::Module(format!("channel {} is archived", channel.id)));
+        }
         match (&channel.post_policy, author) {
             (PostPolicy::MembersOnly, AuthorRef::User(user)) => {
                 if !self.is_member(&channel.id, user).await? {
@@ -400,6 +408,23 @@ impl Chat {
         }
     }
 
+    /// authorize a channel-admin op (rename/archive). an owned channel admits
+    /// only its owner among `User` origins; a legacy owner-less channel admits
+    /// any user, mirroring `SetMembership`'s trust posture; module/agent/system
+    /// origins are genesis-fixed trusted code and always pass.
+    fn check_channel_admin(channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
+        match author {
+            AuthorRef::User(user) => match &channel.owner {
+                Some(owner) if owner != user => Err(Error::Module(format!(
+                    "only the owner may administer channel {}",
+                    channel.id
+                ))),
+                _ => Ok(()),
+            },
+            AuthorRef::Module(_) | AuthorRef::Agent { .. } | AuthorRef::System => Ok(()),
+        }
+    }
+
     async fn stage_channel(
         &mut self,
         author: &AuthorRef,
@@ -417,6 +442,12 @@ impl Chat {
             )));
         }
 
+        // a user-created channel is owned by its creator (only the owner may
+        // later rename/archive it); module/system-minted channels are unowned.
+        let owner = match author {
+            AuthorRef::User(user) => Some(user.clone()),
+            AuthorRef::Module(_) | AuthorRef::Agent { .. } | AuthorRef::System => None,
+        };
         let channel = Channel {
             id: channel_id.clone(),
             name,
@@ -426,6 +457,8 @@ impl Chat {
             hooks: Vec::new(),
             pinned: Vec::new(),
             huddle: Vec::new(),
+            owner,
+            archived: false,
         };
         let mut index = self.channel_index().await?;
         index.insert(channel_id.clone());
@@ -437,6 +470,61 @@ impl Chat {
         )?;
         self.store(CHANNEL_INDEX_KEY.to_vec(), &index);
         Ok(())
+    }
+
+    /// rename a channel. reuses `CreateChannel`'s name validation (non-empty +
+    /// the `:` namespace gate — the id is unchanged, but the gate still keeps a
+    /// user off a module-namespaced channel) and the record byte cap.
+    async fn stage_rename(
+        &mut self,
+        author: &AuthorRef,
+        channel_id: &str,
+        name: String,
+    ) -> Result<(), Error> {
+        Self::validate_non_empty("channel_id", channel_id)?;
+        Self::validate_non_empty("name", &name)?;
+        Self::validate_channel_namespace(author, channel_id)?;
+        let mut channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
+        if channel.name == name {
+            // idempotent: a same-name rename stages nothing, so the op log —
+            // and the root — is byte-identical to no write at all.
+            return Ok(());
+        }
+        channel.name = name;
+        self.store_bounded(
+            channel_key(channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )
+    }
+
+    /// archive or unarchive a channel. authorization mirrors `stage_rename`
+    /// (the same `:` namespace gate keeps a user off a module-namespaced
+    /// channel — otherwise any user could archive a `forge:<repo>:<n>`
+    /// discussion, and an archived channel rejects the owning module's posts
+    /// too); the flag itself is what `check_post_policy` reads to gate writes.
+    async fn stage_set_archived(
+        &mut self,
+        author: &AuthorRef,
+        channel_id: &str,
+        archived: bool,
+    ) -> Result<(), Error> {
+        Self::validate_non_empty("channel_id", channel_id)?;
+        Self::validate_channel_namespace(author, channel_id)?;
+        let mut channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
+        if channel.archived == archived {
+            return Ok(());
+        }
+        channel.archived = archived;
+        self.store_bounded(
+            channel_key(channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )
     }
 
     async fn stage_message(
@@ -1004,6 +1092,31 @@ impl Chat {
         self.views(&channel, from..=to).await
     }
 
+    /// the window centered on `seq`: half the page before it, the rest from it
+    /// on. no new store walk — this is `messages_range` with the bounds
+    /// computed, so tombstoned and edited rows page exactly as they do for
+    /// `messages_latest`.
+    async fn messages_around(
+        &self,
+        channel_id: &str,
+        seq: u64,
+        limit: u64,
+    ) -> Result<Vec<MessageView>, Error> {
+        let channel = self.require_channel(channel_id).await?;
+        let limit = clamp_limit(limit);
+        // KEEP THIS GUARD ABOVE THE CLAMP: `clamp(1, head_seq)` PANICS when
+        // min > max, i.e. on an empty channel (head_seq == 0). The early return
+        // is the only thing keeping a user-supplied query off that panic.
+        if limit == 0 || channel.head_seq == 0 {
+            return Ok(Vec::new());
+        }
+        // a seq of 0 or one past the head names no message: window the nearest
+        // real one instead of answering an empty page.
+        let seq = seq.clamp(1, channel.head_seq);
+        let from = seq.saturating_sub(limit / 2).max(1);
+        self.messages_range(channel_id, from, limit).await
+    }
+
     async fn message_by_id(&self, message_id: &str) -> Result<Option<MessageView>, Error> {
         let Some((channel_id, seq)) = self.load::<(String, u64)>(&msgid_key(message_id)).await?
         else {
@@ -1114,6 +1227,13 @@ impl Module for Chat {
                 self.stage_channel(&author, channel_id, name, post_policy, now)
                     .await
             }
+            ChatMsg::RenameChannel { channel_id, name } => {
+                self.stage_rename(&author, &channel_id, name).await
+            }
+            ChatMsg::SetChannelArchived {
+                channel_id,
+                archived,
+            } => self.stage_set_archived(&author, &channel_id, archived).await,
             ChatMsg::PostMessage {
                 channel_id,
                 message_id,
@@ -1256,6 +1376,13 @@ impl Module for Chat {
                 limit,
             } => Ok(encode_reply(&ChatReply::Messages(
                 self.messages_range(&channel_id, from_seq, limit).await?,
+            ))),
+            ChatQuery::MessagesAround {
+                channel_id,
+                seq,
+                limit,
+            } => Ok(encode_reply(&ChatReply::Messages(
+                self.messages_around(&channel_id, seq, limit).await?,
             ))),
             ChatQuery::Message { message_id } => Ok(encode_reply(&ChatReply::Message(
                 self.message_by_id(&message_id).await?,

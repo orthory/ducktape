@@ -568,9 +568,33 @@ fn cluster_upgrade() {
         (!a.is_empty() && a == app_hash(&cluster, 0)).then_some(())
     });
 
-    // (f) STATE-SYNC ACROSS H: a fresh joiner rebuilds the served boundary (past H)
-    //     over the statesync channel and must compose the IDENTICAL app-hash —
-    //     proving the served snapshots install and root at a post-H boundary.
+    // (f) STATE-SYNC ACROSS H: a state-sync joiner rebuilds the served boundary
+    //     (past H) over the statesync channel and must compose the IDENTICAL
+    //     app-hash — proving the served snapshots install and root at a post-H
+    //     boundary.
+    //
+    //     PR6 (ADR §5.1): the statesync serve gate is now fail-closed — a joiner
+    //     must hold committed standing. grant node 3 RESIDENT standing
+    //     (quorum-exempt, so it does NOT perturb the R=n upgrade-readiness gate
+    //     the legs above exercised) before it syncs; its real key then enters
+    //     committed residents and the gate serves it (an un-admitted key would
+    //     be refused — that is the property `statesync_fail_closed_e2e` pins).
+    run_ceremony(
+        &cluster,
+        "resident-node3",
+        GovAction::AddResident {
+            key: Cluster::identity(3),
+        },
+    );
+    poll_until("node 3 resident standing to commit", CONVERGE, || {
+        cluster
+            .query(0, "valset", &valset::encode_query(&valset::ValsetQuery::Residents))
+            .and_then(|raw| valset::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                valset::ValsetReply::Residents(v) if v.contains(&Cluster::identity(3)) => Some(()),
+                _ => None,
+            })
+    });
     std::thread::sleep(Duration::from_secs(2));
     let served = app_hash(&cluster, 0);
     assert_eq!(app_hash(&cluster, 2), served, "server nodes disagree before sync");

@@ -177,10 +177,14 @@ impl ProvisionedWorkspace for NodedWorkspace {
         self.context_doc.clone()
     }
 
-    async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
+    async fn commit(
+        &self,
+        audit_message: &str,
+        _proposal: Option<&str>,
+    ) -> Result<WorkspaceReceipt, String> {
         let api = ActorNodeApi::new(self.handle.clone());
         let dir = self.dir.clone();
-        let message = message.to_string();
+        let message = audit_message.to_string();
         let result = tokio::task::spawn_blocking(move || {
             // Provider HOME/auth/temp/build state is reserved runtime debris,
             // never an agent output facet. Remove it before duckfs scans.

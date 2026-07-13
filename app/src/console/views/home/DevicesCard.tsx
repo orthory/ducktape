@@ -397,7 +397,7 @@ export function DevicesCard({
           title="Touch ID"
           desc={
             tidOn
-              ? "Unlock your account on this Mac with Touch ID."
+              ? "Unlock your account on this Mac with Touch ID — your Mac's login password stands in when Touch ID can't be used (lid closed)."
               : "Unlock your account on this Mac with Touch ID instead of your password."
           }
           last={!tidEnable && !tidError}

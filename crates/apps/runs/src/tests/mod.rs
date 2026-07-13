@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine as _;
 use crate::facets::{WireSink, decode_run_result_v1};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
@@ -13,7 +14,10 @@ use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
     encode_reply as dispatch_encode_reply, encode_result_event,
 };
-use duckfs_core::{decode_query as files_decode_query, encode_reply as files_encode_reply};
+use duckfs_core::{
+    decode_msg as files_decode_msg, decode_query as files_decode_query,
+    encode_reply as files_encode_reply,
+};
 use futures::executor::block_on;
 use jobs::{
     Claim as JobClaim, Job, encode_event as jobs_encode_event, encode_reply as jobs_encode_reply,
@@ -73,6 +77,9 @@ struct CaptureCtx {
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
+    /// committed attachment bytes served by the "files" Read arm, keyed by
+    /// absolute path (the duck://files injection resolves these).
+    files_content: BTreeMap<String, Vec<u8>>,
     msgs: Vec<Msg>,
     #[allow(dead_code)]
     events: Vec<Event>,
@@ -101,6 +108,7 @@ impl CaptureCtx {
             taken_page_ids: BTreeSet::new(),
             page_target_threads: BTreeMap::new(),
             files_head: None,
+            files_content: BTreeMap::new(),
             msgs: Vec::new(),
             events: Vec::new(),
         }
@@ -166,6 +174,12 @@ impl CaptureCtx {
     /// composer's `source_snapshot`).
     fn with_files_head(mut self, head: &str) -> Self {
         self.files_head = Some(head.into());
+        self
+    }
+    /// serve committed bytes at `path` from the "files" Read arm — the
+    /// duck://files attachment injection reads these.
+    fn with_file(mut self, path: &str, bytes: &[u8]) -> Self {
+        self.files_content.insert(path.into(), bytes.to_vec());
         self
     }
     fn with_origin(mut self, origin: Origin) -> Self {
@@ -285,6 +299,14 @@ impl CaptureCtx {
             .map(|m| pages::decode_msg(&m.payload).expect("pages msg"))
             .collect()
     }
+    /// decoded files msgs emitted this dispatch.
+    fn files_msgs(&self) -> Vec<FilesMsg> {
+        self.msgs
+            .iter()
+            .filter(|m| m.target == "files")
+            .map(|m| files_decode_msg(&m.payload).expect("files msg"))
+            .collect()
+    }
     /// the breadcrumb notes emitted this dispatch, as strings.
     fn notes(&self) -> Vec<String> {
         self.events
@@ -303,6 +325,7 @@ fn dummy_thread_view(id: &str) -> pages::ThreadView {
             target: "elsewhere".into(),
             opener: pages::AuthorRef::System,
             created_at: 0,
+            anchor: None,
             resolved: false,
             resolved_by: None,
             comment_ids: Vec::new(),
@@ -381,6 +404,8 @@ impl Ctx for CaptureCtx {
                         hooks: Vec::new(),
                         pinned: Vec::new(),
                         huddle: Vec::new(),
+                        owner: None,
+                        archived: false,
                     }),
                 ))),
                 _ => Err(Error::QueryUnsupported),
@@ -435,6 +460,26 @@ impl Ctx for CaptureCtx {
                         window_len: 0,
                     },
                 ))),
+                FilesQuery::Read {
+                    path, offset, len, ..
+                } => {
+                    let reply = match self.files_content.get(&path) {
+                        Some(bytes) => {
+                            let start = (offset as usize).min(bytes.len());
+                            let end = (start + len as usize).min(bytes.len());
+                            let slice = &bytes[start..end];
+                            FilesReply::Read {
+                                b64: base64::engine::general_purpose::STANDARD
+                                    .encode(slice),
+                                eof: end == bytes.len(),
+                            }
+                        }
+                        // an absent path answers as a module rejection (a 404
+                        // on the real node) — the injector reads that as absent.
+                        None => return Err(Error::QueryUnsupported),
+                    };
+                    Ok(files_encode_reply(&reply))
+                }
                 _ => Err(Error::QueryUnsupported),
             },
             "forge" => match forge::decode_query(req).map_err(Error::Module)? {
@@ -795,6 +840,7 @@ fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
         page: page_id.into(),
         kind,
         text: text.into(),
+        marks: Vec::new(),
         checked: false,
         children: Vec::new(),
     };
@@ -893,6 +939,7 @@ fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
             })
             .collect(),
         actions,
+        commit_message: None,
     })
 }
 

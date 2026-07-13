@@ -29,9 +29,9 @@ export function DocTabs({
         display: "flex",
         alignItems: "stretch",
         gap: 2,
-        height: 38,
+        height: 34,
         flexShrink: 0,
-        padding: "0 8px",
+        padding: "0 10px",
         borderBottom: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
         overflowX: "auto",
@@ -44,7 +44,7 @@ export function DocTabs({
           display: "flex",
           alignItems: "center",
           gap: 6,
-          padding: "0 8px 0 11px",
+          padding: "0 8px 0 10px",
           maxWidth: 200,
           cursor: "pointer",
           borderTopLeftRadius: radius.sm,
@@ -52,7 +52,7 @@ export function DocTabs({
           borderBottom: isActive ? `2px solid ${color.dark}` : "2px solid transparent",
           background: isActive ? color.paper : "transparent",
           color: isActive ? color.ink : color.inkSofter,
-          font: `${isActive ? 600 : 500} 12px ${font.sans}`,
+          font: `${isActive ? 600 : 500} 11.5px ${font.sans}`,
         };
         return (
           <div

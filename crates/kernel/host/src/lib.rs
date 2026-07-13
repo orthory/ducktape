@@ -440,18 +440,55 @@ impl std::error::Error for SnapshotError {}
 pub struct Host {
     /// deterministic iteration order is load-bearing for snapshot + app-hash.
     registry: BTreeMap<ModuleId, Box<dyn Module>>,
+    /// Modules carried by a legacy workspace but excluded from every host
+    /// surface until an agreed protocol boundary activates them. Keeping them
+    /// outside `registry` makes pre-boundary query/dispatch/root/snapshot
+    /// behavior byte-for-byte identical to the old binary.
+    dormant: BTreeMap<ModuleId, Box<dyn Module>>,
+    /// Per-module activation threshold for the one harder upgrade class that
+    /// changes the registry itself. Empty for ordinary/fresh hosts.
+    activation_versions: BTreeMap<ModuleId, u32>,
+    active_version: u32,
 }
 
 impl Host {
     pub fn new() -> Self {
         Self {
             registry: BTreeMap::new(),
+            dormant: BTreeMap::new(),
+            activation_versions: BTreeMap::new(),
+            active_version: BASELINE_VERSION,
         }
     }
 
     /// register a module under its own [`Module::id`]. genesis-time wiring.
     pub fn register(&mut self, module: Box<dyn Module>) {
         self.registry.insert(module.id(), module);
+    }
+
+    /// Keep one already-registered module invisible until `version` is active.
+    /// This is intentionally explicit and narrow: unknown module-set changes
+    /// remain incompatible instead of acquiring a generic migration escape
+    /// hatch.
+    pub fn defer_module_until(&mut self, id: &str, version: u32) -> Result<(), Error> {
+        if version <= self.active_version {
+            return Err(Error::Module(format!(
+                "module {id} activation version {version} is not above active version {}",
+                self.active_version
+            )));
+        }
+        if self.activation_versions.contains_key(id) {
+            return Err(Error::Module(format!(
+                "module {id} already has an activation version"
+            )));
+        }
+        let module = self
+            .registry
+            .remove(id)
+            .ok_or_else(|| Error::UnknownModule(id.to_string()))?;
+        self.activation_versions.insert(id.to_string(), version);
+        self.dormant.insert(id.to_string(), module);
+        Ok(())
     }
 
     /// Sorted module ids and their canonical-state revisions.
@@ -580,14 +617,44 @@ impl Host {
     /// identical on every honest node, so this is a deterministic self-transition —
     /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
     /// [`Module::set_active_version`] (only dual-path modules do), and
-    /// `version` is a NON-hashed branch selector — it never enters any `root()`
-    /// preimage, so `app_hash()` is unmoved by this call alone (the app-hashed
-    /// reconciliation of the upgrade module's own `current_version` rides the
-    /// in-block System `Advance` the drain injects at the same height).
+    /// `version` itself is a NON-hashed branch selector — it never enters any
+    /// `root()` preimage. Ordinary dual-path modules therefore leave the current
+    /// root unmoved by this call alone. A module explicitly registered through
+    /// [`Host::defer_module_until`] is the narrow exception: it joins/leaves the
+    /// registry (and app-hash) exactly when its version threshold is crossed.
+    /// The upgrade module's own `current_version` still reconciles through the
+    /// in-block System `Advance` injected at the same height.
     pub fn set_active_version(&mut self, version: u32) {
         for m in self.registry.values_mut() {
             m.set_active_version(version);
         }
+        for m in self.dormant.values_mut() {
+            m.set_active_version(version);
+        }
+        let activate: Vec<ModuleId> = self
+            .activation_versions
+            .iter()
+            .filter(|(id, threshold)| version >= **threshold && self.dormant.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let deactivate: Vec<ModuleId> = self
+            .activation_versions
+            .iter()
+            .filter(|(id, threshold)| version < **threshold && self.registry.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in activate {
+            let module = self.dormant.remove(&id).expect("activation source checked");
+            self.registry.insert(id, module);
+        }
+        for id in deactivate {
+            let module = self
+                .registry
+                .remove(&id)
+                .expect("deactivation source checked");
+            self.dormant.insert(id, module);
+        }
+        self.active_version = version;
     }
 
     /// the SYSTEM-ORIGIN `Advance` the drain injects in-block at a finalized
@@ -922,6 +989,7 @@ impl Host {
         ctx: BlockContext,
         msg: Msg,
     ) -> Result<BlockOutcome, SubmitError> {
+        self.set_active_version(ctx.protocol_version);
         // every module dispatched this block, in deterministic order — the set
         // the host commits or aborts at the boundary.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
@@ -1033,6 +1101,7 @@ impl Host {
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
         let protocol_version = ctx.protocol_version;
+        self.set_active_version(protocol_version);
 
         // 1. the once-per-block System injections, computed ONCE against PRE-batch
         // committed state — the "results staged by this very block are invisible

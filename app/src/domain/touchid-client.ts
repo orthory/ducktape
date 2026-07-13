@@ -1,6 +1,7 @@
 // Typed client for native macOS Touch ID custody — the TS mirror of
 // app/src-tauri/src/touchid.rs. Touch ID stores the vault passphrase behind a
-// biometric-ACL Keychain item; these are thin `invoke` wrappers, so the
+// user-presence-ACL Keychain item (Touch ID when the sensor is usable, the
+// Mac's login password when it isn't); these are thin `invoke` wrappers, so the
 // mutators ONLY work in the desktop macOS build. The two presence checks
 // (`touchidAvailable`, `touchidEnrolled`) resolve `false` off-Tauri without
 // invoking, so the UI can gate Touch ID affordances unconditionally.
@@ -33,9 +34,11 @@ export const touchidEnrolled = (): Promise<boolean> =>
 export const touchidEnroll = (passphrase: string): Promise<void> =>
   invoke<void>("touchid_enroll", { passphrase });
 
-/** Prompt Touch ID, retrieve the passphrase, unlock the vault, cache it.
- *  Rejects with the `touchid-unavailable` sentinel when the item is gone —
- *  callers map that to the recovery-phrase path. */
+/** Prompt the OS user-presence sheet (Touch ID when usable, login password
+ *  otherwise), retrieve the passphrase, unlock the vault, cache it. Rejects
+ *  with the `touchid-canceled` sentinel when the user dismisses the sheet
+ *  (not an error) and with `touchid-unavailable` when the item is gone —
+ *  callers map the latter to the password/recovery-phrase paths. */
 export const touchidUnlock = (): Promise<{ pubkey: string }> =>
   invoke<{ pubkey: string }>("touchid_unlock");
 
