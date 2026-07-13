@@ -179,23 +179,26 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
 pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
 
+fn absolute_runtime_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|e| format!("current directory: {e}"))
+}
+
 /// read + resolve a config file into its runnable form. paths inside the file
 /// (network, key_file, storage_dir) resolve relative to the file's directory,
 /// so a workspace directory is relocatable.
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
     let raw: NodeToml = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
-    let launch_cwd = std::env::current_dir().map_err(|e| format!("current directory: {e}"))?;
-    let config_base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-    let base = if config_base.is_absolute() {
-        config_base.to_path_buf()
-    } else {
-        launch_cwd.join(config_base)
-    };
     if raw.network.is_some() {
+        let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
         resolve_network_shape(&base, raw)
     } else {
-        resolve_dev_shape(raw, &launch_cwd)
+        resolve_dev_shape(raw)
     }
 }
 
@@ -490,7 +493,7 @@ fn resolve_advertised(
 
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
-fn resolve_dev_shape(raw: NodeToml, launch_cwd: &Path) -> Result<Resolved, String> {
+fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     // resolved before any field of `raw` is moved out below (it borrows the
     // whole struct).
     let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
@@ -552,17 +555,10 @@ fn resolve_dev_shape(raw: NodeToml, launch_cwd: &Path) -> Result<Resolved, Strin
         &ed25519::PrivateKey::from_seed(id).public_key(),
     )?;
 
-    let storage_dir = raw
-        .storage_dir
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                launch_cwd.join(path)
-            }
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
+    let storage_dir = match raw.storage_dir {
+        Some(path) => absolute_runtime_path(Path::new(&path))?,
+        None => std::env::temp_dir().join(format!("ducktape-node-{id}")),
+    };
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
@@ -621,6 +617,8 @@ fn resolve_dev_shape(raw: NodeToml, launch_cwd: &Path) -> Result<Resolved, Strin
 mod tests {
     use super::*;
     use crate::config::{coordinator_ingress, load_or_generate_identity};
+
+    const DELETED_CWD_CONFIGS: &str = "DUCKTAPE_TEST_DELETED_CWD_CONFIGS";
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -827,14 +825,14 @@ mod tests {
 
     #[test]
     fn dev_shape_relative_storage_is_absolute_from_launch_cwd() {
-        let launch_cwd = tmp("dev-relative-storage");
+        let launch_cwd = std::env::current_dir().expect("current directory");
         let raw: NodeToml = toml::from_str(
             "id = 7\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
              peer_seeds = [7]\nbootstrapper_addr = \"127.0.0.1:52220\"\n\
              storage_dir = \"relative/storage\"\n",
         )
         .expect("parse dev config");
-        let resolved = resolve_dev_shape(raw, &launch_cwd).expect("resolve relative storage");
+        let resolved = resolve_dev_shape(raw).expect("resolve relative storage");
         assert_eq!(resolved.storage_dir, launch_cwd.join("relative/storage"));
         assert!(resolved.storage_dir.is_absolute());
 
@@ -843,12 +841,86 @@ mod tests {
              peer_seeds = [8]\nbootstrapper_addr = \"127.0.0.1:52220\"\n",
         )
         .expect("parse default dev config");
-        let default = resolve_dev_shape(default_raw, &launch_cwd).expect("resolve default storage");
+        let default = resolve_dev_shape(default_raw).expect("resolve default storage");
         assert_eq!(
             default.storage_dir,
             std::env::temp_dir().join("ducktape-node-8")
         );
         assert!(default.storage_dir.is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_configs_resolve_after_launch_cwd_is_deleted() {
+        if let Ok(paths) = std::env::var(DELETED_CWD_CONFIGS) {
+            let mut paths = paths.lines();
+            let network_config = paths.next().expect("network config");
+            let dev_config = paths.next().expect("dev config");
+            let doomed_cwd = paths.next().expect("doomed cwd");
+
+            std::env::set_current_dir(doomed_cwd).expect("enter doomed cwd");
+            std::fs::remove_dir(doomed_cwd).expect("remove launch cwd");
+            assert!(std::env::current_dir().is_err(), "cwd is genuinely unavailable");
+
+            let network = resolve(Path::new(network_config)).expect("absolute network config");
+            assert!(network.storage_dir.is_absolute());
+            let dev = resolve(Path::new(dev_config)).expect("absolute dev config");
+            assert!(dev.storage_dir.is_absolute());
+            return;
+        }
+
+        let network_dir = tmp("deleted-cwd-network");
+        let (me, _) =
+            load_or_generate_identity(&network_dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: "deleted-cwd#11223344".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+        .save(&network_dir.join("network.toml"))
+        .expect("save descriptor");
+        let network_config = network_dir.join("node.toml");
+        std::fs::write(
+            &network_config,
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:52201\"\n",
+        )
+        .expect("write network config");
+
+        let dev_dir = tmp("deleted-cwd-dev");
+        let dev_config = dev_dir.join("node.toml");
+        std::fs::write(
+            &dev_config,
+            "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
+        )
+        .expect("write dev config");
+        let doomed_cwd = tmp("deleted-cwd-launch");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "config::resolve::tests::absolute_configs_resolve_after_launch_cwd_is_deleted",
+                "--nocapture",
+            ])
+            .env(
+                DELETED_CWD_CONFIGS,
+                format!(
+                    "{}\n{}\n{}",
+                    network_config.display(),
+                    dev_config.display(),
+                    doomed_cwd.display()
+                ),
+            )
+            .output()
+            .expect("run isolated deleted-cwd test");
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
