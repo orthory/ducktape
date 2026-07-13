@@ -2,7 +2,7 @@
 // operator surface that owns it — not here.
 
 import { useDucktape } from "../../store/use-ducktape";
-import type { NotifyPrefs } from "../../store/state";
+import { isClientMode, type NotifyPrefs } from "../../store/state";
 import { color } from "../../theme/tokens";
 import { ControlRow, GroupCard, SectionLabel } from "./parts";
 
@@ -145,6 +145,9 @@ function Toggle({
 export function PreferencesSection() {
   const { state, actions } = useDucktape();
   const prefs = state.notifyPrefs;
+  const categories = isClientMode(state)
+    ? NOTIFICATION_CATEGORIES.filter(({ key }) => key !== "governance")
+    : NOTIFICATION_CATEGORIES;
   const activeChannel = state.activeChannel;
   const channelMuted =
     activeChannel !== null && prefs.mutedChannels.includes(activeChannel);
@@ -194,12 +197,12 @@ export function PreferencesSection() {
           }
         />
 
-        {NOTIFICATION_CATEGORIES.map(({ key, title, desc }) => (
+        {categories.map(({ key, title, desc }, index) => (
           <div key={key} style={{ opacity: prefs.enabled ? 1 : 0.55 }}>
             <ControlRow
               title={title}
               desc={desc}
-              last={key === "governance" && activeChannel === null}
+              last={index === categories.length - 1 && activeChannel === null}
               control={
                 <Toggle
                   name={title}

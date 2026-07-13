@@ -154,7 +154,8 @@ export const sameChatWindow = (
 export interface ConsoleState {
   // ── Session / node core ──
   screen: string;
-  /** Which sidebar rail is shown. Persisted across sessions (see loadViewMode).
+  /** Which sidebar rail is shown. The local-workspace choice is persisted (see
+   *  loadViewMode); direct clients start on CLIENT without overwriting it.
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
@@ -561,8 +562,9 @@ export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
 
 // ── View-mode persistence ───────────────────────────────
 //
-// The chosen rail survives restarts. The screen itself is NOT persisted, so on
-// boot we land on the persisted rail's default surface. These two ids duplicate
+// The local-workspace rail survives restarts. Direct client sessions start on
+// CLIENT and do not overwrite it. The screen itself is NOT persisted, so local
+// boot lands on the persisted rail's default surface. These two ids duplicate
 // the registry's first-in-section screens (chat / members) rather than import
 // the registry into this low-level state module, keeping the store free of the
 // views graph.
@@ -606,6 +608,13 @@ export const docTabsScope = (
 export const hasNodeContext = (
   state: Pick<ConsoleState, "workspace" | "nodeUrl">,
 ): boolean => state.workspace !== null || state.nodeUrl !== null;
+
+/** A direct remote connection has node context without a locally registered
+ *  workspace. It can use client apps and inspect the node, but cannot operate
+ *  the node lifecycle or governance surfaces. */
+export const isClientMode = (
+  state: Pick<ConsoleState, "workspace" | "nodeUrl">,
+): boolean => state.workspace === null && state.nodeUrl !== null;
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};

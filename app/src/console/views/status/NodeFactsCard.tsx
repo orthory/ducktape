@@ -95,7 +95,7 @@ export function NodeFactsCard() {
   const portLine = workspace
     ? `p2p ${workspace.ports.listen} · http ${workspace.ports.http} · rpc ${workspace.ports.rpc}`
     : "not available";
-  const nodeKey = workspace?.pubkey ?? "";
+  const nodeKey = workspace?.pubkey ?? state.status?.publicKey ?? "";
   const owner = nodeKey ? state.nodeUsers[normalizeKey(nodeKey)] : undefined;
   // Identity is the sole replicated account-name authority.
   const ownerName = owner?.name ?? null;

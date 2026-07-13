@@ -4,6 +4,7 @@
 // quorum). Settings deliberately does NOT duplicate those controls.
 
 import { useDucktape } from "../../store/use-ducktape";
+import { isClientMode } from "../../store/state";
 import { color, font } from "../../theme/tokens";
 import {
   ControlRow,
@@ -18,6 +19,7 @@ import {
 export function WorkspaceSection() {
   const { state, actions } = useDucktape();
   const workspace = state.workspace;
+  const clientMode = isClientMode(state);
 
   return (
     <>
@@ -41,7 +43,11 @@ export function WorkspaceSection() {
         />
         <ControlRow
           title="Switch workspace"
-          desc="Create, join, or select another local workspace."
+          desc={
+            clientMode
+              ? "Connect to another workspace or remote node."
+              : "Create, join, or select another local workspace."
+          }
           control={
             <HoverButton
               ariaLabel="Workspaces"
@@ -53,24 +59,30 @@ export function WorkspaceSection() {
             </HoverButton>
           }
         />
+        {!clientMode && (
+          <ControlRow
+            title="Members & invites"
+            desc="Invite, admit, and manage members from the Members view."
+            control={
+              <HoverButton
+                ariaLabel="Open Members"
+                onClick={() => actions.setScreen("members")}
+                hoverBg={color.titlebar}
+                style={outlineButton}
+              >
+                Open Members
+              </HoverButton>
+            }
+          />
+        )}
         <ControlRow
-          title="Members & invites"
-          desc="Invite, admit, and manage members from the Members view."
-          control={
-            <HoverButton
-              ariaLabel="Open Members"
-              onClick={() => actions.setScreen("members")}
-              hoverBg={color.titlebar}
-              style={outlineButton}
-            >
-              Open Members
-            </HoverButton>
+          title={clientMode ? "Node overview" : "Node & daemon"}
+          desc={
+            clientMode
+              ? "Inspect the connected node's status, version, and committed roots."
+              : "Start or stop the daemon and inspect ports, data dir, and quorum from the Node view."
           }
-        />
-        <ControlRow
-          title="Node & daemon"
-          desc="Start or stop the daemon and inspect ports, data dir, and quorum from the Node view."
-          last
+          last={!clientMode}
           control={
             <HoverButton
               ariaLabel="Open Node"
@@ -82,6 +94,23 @@ export function WorkspaceSection() {
             </HoverButton>
           }
         />
+        {clientMode && (
+          <ControlRow
+            title="Metrics"
+            desc="Inspect read-only health and performance metrics from the connected node."
+            last
+            control={
+              <HoverButton
+                ariaLabel="Open Metrics"
+                onClick={() => actions.setScreen("metrics")}
+                hoverBg={color.titlebar}
+                style={outlineButton}
+              >
+                Open Metrics
+              </HoverButton>
+            }
+          />
+        )}
       </GroupCard>
     </>
   );

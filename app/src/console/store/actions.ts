@@ -47,6 +47,7 @@ import {
 } from "../views/chat/mention";
 import {
   defaultScreenForSection,
+  moduleAvailable,
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
@@ -73,6 +74,7 @@ import {
   clearRemoteUrl,
   docTabsScope,
   hasNodeContext,
+  isClientMode,
   loadDocTabs,
   loadPendingDisplayName,
   removeTab,
@@ -1372,6 +1374,13 @@ export function createActions({
     // shell (never through the Home layer), and only when the target still
     // exists in the recentmost committed data.
     const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
+    const requestedSection = sectionForScreen(snap.screen);
+    const clientMode = isClientMode(before);
+    const screen =
+      requestedSection && !moduleAvailable(snap.screen, clientMode)
+        ? defaultScreenForSection(requestedSection, clientMode)
+        : snap.screen;
+    const viewMode = sectionForScreen(screen) ?? snap.viewMode;
     const channel =
       scopeMatches && snap.channel && before.channels.some((c) => c.id === snap.channel)
         ? snap.channel
@@ -1381,7 +1390,7 @@ export function createActions({
         ? snap.page
         : null;
     const forge =
-      scopeMatches && snap.screen === "forge" && snap.forgeRepo
+      scopeMatches && screen === "forge" && snap.forgeRepo
         ? {
             repo: snap.forgeRepo,
             number: snap.forgeItem,
@@ -1390,17 +1399,17 @@ export function createActions({
           }
         : null;
     const explorer =
-      scopeMatches && snap.screen === "explorer" ? snap.explorer : null;
-    const agent = scopeMatches && snap.screen === "agent" ? snap.agent : null;
-    const member = scopeMatches && snap.screen === "members" ? snap.member : null;
+      scopeMatches && screen === "explorer" ? snap.explorer : null;
+    const agent = scopeMatches && screen === "agent" ? snap.agent : null;
+    const member = scopeMatches && screen === "members" ? snap.member : null;
 
-    // The entry recorded the LIVE rail, so adopt it verbatim — re-deriving via
-    // sectionForScreen would lose a shell screen's remembered rail.
-    saveViewMode(snap.viewMode);
+    // Shell screens retain the entry's recorded rail. A remote client also
+    // normalizes old operator-only entries to the Observe rail's Node screen.
+    if (!clientMode) saveViewMode(viewMode);
     patch({
       atHome: snap.atHome,
-      screen: snap.screen,
-      viewMode: snap.viewMode,
+      screen,
+      viewMode,
       ...(forge ? { forgeFocus: forge } : {}),
       ...(explorer !== null ? { explorerFocus: explorer } : {}),
       ...(agent ? { agentFocus: agent } : {}),
@@ -1414,8 +1423,8 @@ export function createActions({
     return {
       scope: currentDocTabsScope(),
       atHome: snap.atHome,
-      screen: snap.screen,
-      viewMode: snap.viewMode,
+      screen,
+      viewMode,
       channel: channel ?? before.activeChannel,
       page: page ?? before.activePage,
       forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
@@ -1621,13 +1630,19 @@ export function createActions({
   // Home layer — with the sidebar navigable at Home, every screen move must
   // drop the layer or the shell would change invisibly underneath it.
   const landOn = (screen: string, extra: Partial<ConsoleState> = {}) => {
-    const section = sectionForScreen(screen);
-    if (section) saveViewMode(section);
+    const clientMode = isClientMode(getState());
+    const requestedSection = sectionForScreen(screen);
+    const target =
+      requestedSection && !moduleAvailable(screen, clientMode)
+        ? defaultScreenForSection(requestedSection, clientMode)
+        : screen;
+    const section = sectionForScreen(target);
+    if (section && !clientMode) saveViewMode(section);
     patch({
-      screen,
+      screen: target,
       atHome: false,
       ...(section ? { viewMode: section } : {}),
-      ...extra,
+      ...(target === screen ? extra : {}),
     });
   };
 
@@ -1658,14 +1673,15 @@ export function createActions({
     applyNavSnapshot,
 
     setViewMode: (mode) => {
-      saveViewMode(mode);
+      if (!isClientMode(getState())) saveViewMode(mode);
       update((prev) => {
+        const clientMode = isClientMode(prev);
         // Keep the body on the chosen rail: if the current screen belongs to the
         // other rail (or is a shell screen), land on this rail's default surface.
         const screen =
-          sectionForScreen(prev.screen) === mode
+          sectionForScreen(prev.screen) === mode && moduleAvailable(prev.screen, clientMode)
             ? prev.screen
-            : defaultScreenForSection(mode);
+            : defaultScreenForSection(mode, clientMode);
         return { viewMode: mode, screen };
       });
     },
@@ -3044,6 +3060,8 @@ export function createActions({
             setNode(null);
             patch({
               ...resetForNodeChange(),
+              screen: "chat",
+              viewMode: "user",
               workspace: null,
               openTabs: loadDocTabs(docTabsScope(null, url)),
               onboardingPhase: null,

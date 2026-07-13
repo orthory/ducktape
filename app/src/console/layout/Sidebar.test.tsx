@@ -54,4 +54,30 @@ describe("Sidebar", () => {
     renderSidebar({ screen: "chat", atHome: true });
     expect(railBg()).toBe("transparent");
   });
+
+  it("keeps Forge in the remote client rail", () => {
+    renderSidebar({ workspace: null, nodeUrl: "https://node.example" });
+
+    expect(screen.getByRole("tab", { name: "CLIENT" })).toHaveAttribute("title", "Client apps");
+    expect(screen.getByRole("tab", { name: "OBSERVE" })).toHaveAttribute(
+      "title",
+      "Read-only node observability",
+    );
+    expect(screen.getByRole("button", { name: "Forge" })).toBeInTheDocument();
+  });
+
+  it("limits the remote observe rail to Node and Metrics", () => {
+    renderSidebar({
+      workspace: null,
+      nodeUrl: "https://node.example",
+      viewMode: "operator",
+      screen: "status",
+    });
+
+    expect(screen.getByRole("button", { name: "Node" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Metrics" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Members" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Governance" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sandbox" })).not.toBeInTheDocument();
+  });
 });

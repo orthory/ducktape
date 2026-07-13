@@ -126,6 +126,23 @@ describe("SettingsView", () => {
     expect(spies.setScreen).toHaveBeenCalledWith("status");
   });
 
+  it("shows only read-only node links for a remote client", () => {
+    const { spies } = renderSettings({
+      workspace: null,
+      nodeUrl: "https://node.example",
+      managed: false,
+    });
+
+    expect(screen.queryByRole("button", { name: /open members/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("DANGER ZONE")).not.toBeInTheDocument();
+    expect(screen.queryByText("Governance")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /open node/i }));
+    fireEvent.click(screen.getByRole("button", { name: /open metrics/i }));
+    expect(spies.setScreen).toHaveBeenNthCalledWith(1, "status");
+    expect(spies.setScreen).toHaveBeenNthCalledWith(2, "metrics");
+  });
+
   it("requests an on-chain leave through an in-app dialog, without tearing down", () => {
     const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     // A member of a set of two -> Request leave is enabled (a real majority is

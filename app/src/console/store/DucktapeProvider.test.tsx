@@ -1747,6 +1747,38 @@ describe("DucktapeProvider", () => {
     expect(capturedState!.blocks.length).toBe(0);
   });
 
+  it("enters client mode with Forge available and operator routes constrained", async () => {
+    const { transport } = makeFakeNode();
+    const remote = makeFakeNode().transport;
+    const remoteQuery = vi.mocked(remote.query);
+    nodeBootstrapMocks.remoteTransport = remote;
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.connected).toBe(true));
+    remoteQuery.mockClear();
+
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    await waitFor(() => expect(capturedState!.nodeUrl).toBe("http://127.0.0.1:9999"));
+
+    expect(capturedState!.workspace).toBeNull();
+    expect(capturedState!.viewMode).toBe("user");
+    expect(capturedState!.screen).toBe("chat");
+
+    act(() => capturedActions!.setScreen("forge"));
+    expect(capturedState!.screen).toBe("forge");
+
+    act(() => capturedActions!.setViewMode("operator"));
+    expect(capturedState!.screen).toBe("status");
+
+    act(() => capturedActions!.setScreen("governance"));
+    expect(capturedState!.screen).toBe("status");
+
+    await waitFor(() => expect(remote.query).toHaveBeenCalled());
+    expect(remoteQuery.mock.calls.some(([target]) => target === "forge")).toBe(true);
+    expect(remoteQuery.mock.calls.some(([target]) => target === "governance")).toBe(false);
+  });
+
   it("ignores an old node hydrate that settles after switching nodes", async () => {
     const { transport } = makeFakeNode({ agents: [QUACKBOT] });
     let releaseAgents!: () => void;
