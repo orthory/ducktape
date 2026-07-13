@@ -14,7 +14,9 @@ mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
+use governance::invite::{
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
+};
 use harness::Sim;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -55,15 +57,44 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
     (sim, validators)
 }
 
-/// mint an invite token: the issuer's signature over `binding ‖ nonce` in the
-/// grant namespace — minting IS the admission decision (invite.rs's own shape).
-fn mint(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN]) -> InviteToken {
-    let msg = [binding, nonce.as_slice()].concat();
+/// a far-future expiry for tokens whose test is not about expiry.
+const FAR_FUTURE: u64 = 4_102_444_800; // 2100-01-01
+
+/// mint an invite token locked to `target`: the issuer's signature over
+/// `binding ‖ nonce ‖ target ‖ role ‖ expiry` in the grant namespace —
+/// minting IS the admission decision FOR THAT KEY. the preimage is
+/// deliberately RE-STATED here rather than calling into governance: if the
+/// signed shape ever drifts, this suite fails instead of following along.
+fn mint_as(
+    issuer: &Ed,
+    binding: &[u8],
+    nonce: [u8; INVITE_NONCE_LEN],
+    target: &Ed,
+    role: InviteRole,
+    expires_unix_secs: u64,
+) -> InviteToken {
+    let target = target.public_key();
+    let msg = [
+        binding,
+        nonce.as_slice(),
+        target.as_ref(),
+        &[role.as_u8()],
+        &expires_unix_secs.to_le_bytes(),
+    ]
+    .concat();
     InviteToken {
         issuer: issuer.public_key(),
         nonce,
+        target,
+        role,
+        expires_unix_secs,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
+}
+
+/// the common shape: a Resident invite for `target`, far-future expiry.
+fn mint(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN], target: &Ed) -> InviteToken {
+    mint_as(issuer, binding, nonce, target, InviteRole::Resident, FAR_FUTURE)
 }
 
 /// the `GovMsg::Redeem` wire op — all raw bytes, mirroring the lobby announce.
@@ -74,6 +105,9 @@ fn redeem(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value {
         "token_sig": token.sig.as_ref().to_vec(),
         "joiner": joiner,
         "proof": proof,
+        "target": token.target.as_ref().to_vec(),
+        "role": token.role.as_u8(),
+        "expires_unix_secs": token.expires_unix_secs,
     }})
 }
 
@@ -152,7 +186,7 @@ fn a_redeemed_invite_grants_residency_in_its_own_block_and_audits_the_admission(
     let issuer = &validators[0];
     let joiner = Ed::from_seed(10);
     let nonce = [7u8; INVITE_NONCE_LEN];
-    let token = mint(issuer, BINDING, nonce);
+    let token = mint(issuer, BINDING, nonce, &joiner);
     let proof = sign_join_proof(&joiner, BINDING, &token);
     let receipt = sim.submit_ok(
         "governance",
@@ -196,29 +230,31 @@ fn a_nonce_redeems_exactly_once_even_for_a_different_joiner() {
     let (sim, validators) = governed(storage.path());
     let issuer = &validators[0];
     let nonce = [9u8; INVITE_NONCE_LEN];
-    let token = mint(issuer, BINDING, nonce);
 
-    // first redemption admits joiner-one.
+    // first redemption admits joiner-one via its own token.
     let joiner_one = Ed::from_seed(20);
-    let proof_one = sign_join_proof(&joiner_one, BINDING, &token);
+    let token_one = mint(issuer, BINDING, nonce, &joiner_one);
+    let proof_one = sign_join_proof(&joiner_one, BINDING, &token_one);
     sim.submit_ok(
         "governance",
         redeem(
-            &token,
+            &token_one,
             joiner_one.public_key().as_ref().to_vec(),
             proof_one.as_ref().to_vec(),
         ),
         Some("relay"),
     );
 
-    // a second redemption of the SAME nonce — a wholly valid token + a second
-    // joiner's own valid proof — dies on the exactly-once nonce set.
+    // the issuer re-mints the SAME nonce for a SECOND target — every check
+    // shy of the nonce set passes (valid sig, matching target, valid proof),
+    // isolating the exactly-once property from the target lock.
     let joiner_two = Ed::from_seed(21);
-    let proof_two = sign_join_proof(&joiner_two, BINDING, &token);
+    let token_two = mint(issuer, BINDING, nonce, &joiner_two);
+    let proof_two = sign_join_proof(&joiner_two, BINDING, &token_two);
     let error = sim.submit_rejected(
         "governance",
         redeem(
-            &token,
+            &token_two,
             joiner_two.public_key().as_ref().to_vec(),
             proof_two.as_ref().to_vec(),
         ),
@@ -240,8 +276,8 @@ fn a_token_minted_for_another_network_does_not_verify() {
 
     // minted over a DIFFERENT binding than this network's "sim": the token
     // signature never verifies here, so a replay across networks is refused.
-    let token = mint(issuer, b"other-net", [1u8; INVITE_NONCE_LEN]);
     let joiner = Ed::from_seed(30);
+    let token = mint(issuer, b"other-net", [1u8; INVITE_NONCE_LEN], &joiner);
     let proof = sign_join_proof(&joiner, b"other-net", &token);
     let error = sim.submit_rejected(
         "governance",
@@ -268,8 +304,8 @@ fn a_token_from_a_non_member_issuer_is_refused() {
     // seed 99 is not in the genesis set: its token verifies cryptographically
     // (correct binding, correct proof) but the issuer is no current member.
     let stranger = Ed::from_seed(99);
-    let token = mint(&stranger, BINDING, [2u8; INVITE_NONCE_LEN]);
     let joiner = Ed::from_seed(40);
+    let token = mint(&stranger, BINDING, [2u8; INVITE_NONCE_LEN], &joiner);
     let proof = sign_join_proof(&joiner, BINDING, &token);
     let error = sim.submit_rejected(
         "governance",
@@ -293,13 +329,13 @@ fn a_blob_holder_cannot_redeem_under_a_key_that_never_asked_to_join() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, validators) = governed(storage.path());
     let issuer = &validators[0];
-    let token = mint(issuer, BINDING, [3u8; INVITE_NONCE_LEN]);
 
-    // the announced joiner key is joiner-one, but the proof was signed by
-    // joiner-two — whoever holds a leaked token cannot bind it to a key whose
-    // secret they do not hold.
+    // the announced joiner key is joiner-one (the token's own target), but
+    // the proof was signed by joiner-two — whoever holds a leaked token
+    // cannot bind it to a key whose secret they do not hold.
     let joiner_one = Ed::from_seed(50);
     let joiner_two = Ed::from_seed(51);
+    let token = mint(issuer, BINDING, [3u8; INVITE_NONCE_LEN], &joiner_one);
     let forged_proof = sign_join_proof(&joiner_two, BINDING, &token);
     let error = sim.submit_rejected(
         "governance",
@@ -316,6 +352,117 @@ fn a_blob_holder_cannot_redeem_under_a_key_that_never_asked_to_join() {
     );
 }
 
+// ── B5b: the target lock — the bearer hole is closed ────
+
+#[test]
+fn a_blob_holder_cannot_redeem_under_its_own_key_when_the_invite_names_another() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, validators) = governed(storage.path());
+    let issuer = &validators[0];
+
+    // the invite was minted FOR the target; a thief holding the blob announces
+    // its OWN key with a perfectly valid self-proof — pre-targeting this was
+    // the bearer hole (any holder could join), now it dies on the target lock.
+    let target = Ed::from_seed(52);
+    let thief = Ed::from_seed(53);
+    let token = mint(issuer, BINDING, [6u8; INVITE_NONCE_LEN], &target);
+    let thief_proof = sign_join_proof(&thief, BINDING, &token);
+    let error = sim.submit_rejected(
+        "governance",
+        redeem(
+            &token,
+            thief.public_key().as_ref().to_vec(),
+            thief_proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+    assert!(
+        error.contains("invite is locked to another key"),
+        "target lock: {error}"
+    );
+    // and the thief gained nothing: no standing of any tier.
+    let residents = sim.query("valset", json!("residents"));
+    assert!(
+        !has_key(&residents["residents"], thief.public_key().as_ref()),
+        "thief holds no standing: {residents}"
+    );
+}
+
+// ── B5c: the role gate — Client tokens wait for their plane ──
+
+#[test]
+fn a_client_role_invite_is_not_redeemable_until_the_thin_client_plane_lands() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, validators) = governed(storage.path());
+    let issuer = &validators[0];
+
+    // the role byte is signature-covered (a flipped byte dies at the token
+    // sig), so this is a WELL-FORMED Client invite refused by the role gate.
+    let client = Ed::from_seed(54);
+    let token = mint_as(
+        issuer,
+        BINDING,
+        [7u8; INVITE_NONCE_LEN],
+        &client,
+        InviteRole::Client,
+        FAR_FUTURE,
+    );
+    let proof = sign_join_proof(&client, BINDING, &token);
+    let error = sim.submit_rejected(
+        "governance",
+        redeem(
+            &token,
+            client.public_key().as_ref().to_vec(),
+            proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+    assert!(
+        error.contains("client invites are not redeemable yet"),
+        "role gate: {error}"
+    );
+}
+
+// ── B5d: expiry is NOT a consensus check — pin the absence ──
+
+#[test]
+fn consensus_admits_a_wall_clock_expired_token_expiry_lives_at_the_doorbells() {
+    // consensus_time is BLOCK HEIGHT on this chain: no deterministic wall
+    // clock exists in-consensus, so handle_redeem deliberately does NOT
+    // check expiry. enforcement lives at the joiner's decode and at every
+    // gating member's wall clock (lobby + intro doorbells), with single-use
+    // bounding the residual window. this test pins the ABSENCE so a future
+    // "fix" re-adding a vacuous height-vs-seconds comparison fails loudly.
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, validators) = governed(storage.path());
+    let issuer = &validators[0];
+
+    let joiner = Ed::from_seed(55);
+    let token = mint_as(
+        issuer,
+        BINDING,
+        [8u8; INVITE_NONCE_LEN],
+        &joiner,
+        InviteRole::Resident,
+        1, // 1970 — expired on any wall clock
+    );
+    let proof = sign_join_proof(&joiner, BINDING, &token);
+    sim.submit_ok(
+        "governance",
+        redeem(
+            &token,
+            joiner.public_key().as_ref().to_vec(),
+            proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+    let residents = sim.query("valset", json!("residents"));
+    assert!(
+        has_key(&residents["residents"], joiner.public_key().as_ref()),
+        "consensus admitted the expired token — the doorbells own expiry: {residents}"
+    );
+}
+
 // ── B6: the staged-admission ladder ─────────────────────
 
 #[test]
@@ -327,7 +474,7 @@ fn a_resident_is_promoted_to_validator_then_demoted_by_governance() {
     let joiner_key = joiner.public_key().as_ref().to_vec();
 
     // redeem grants residency (the pre-promotion tier).
-    let token = mint(issuer, BINDING, [4u8; INVITE_NONCE_LEN]);
+    let token = mint(issuer, BINDING, [4u8; INVITE_NONCE_LEN], &joiner);
     let proof = sign_join_proof(&joiner, BINDING, &token);
     sim.submit_ok(
         "governance",
@@ -386,8 +533,8 @@ fn a_resident_is_promoted_to_validator_then_demoted_by_governance() {
 
     // removed-after-minting (B4's other half): a token the now-removed joiner
     // mints dies on the CURRENT-membership check — an ex-member's invites lapse.
-    let stale = mint(&joiner, BINDING, [5u8; INVITE_NONCE_LEN]);
     let latecomer = Ed::from_seed(61);
+    let stale = mint(&joiner, BINDING, [5u8; INVITE_NONCE_LEN], &latecomer);
     let late_proof = sign_join_proof(&latecomer, BINDING, &stale);
     let error = sim.submit_rejected(
         "governance",
