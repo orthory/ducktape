@@ -196,7 +196,8 @@ const makeFakeNode = ({
   agents = [],
   users = [],
   publicKey,
-}: { agents?: AgentRecord[]; users?: AccountView[]; publicKey?: string } = {}) => {
+  files = false,
+}: { agents?: AgentRecord[]; users?: AccountView[]; publicKey?: string; files?: boolean } = {}) => {
   const topicHandlers = new Map<string, Set<TopicHandlers>>();
   const streamListeners = new Set<(signal: StreamSignal) => void>();
   // channel-aware mini-node: CreateChannel grows the list, MessagesLatest
@@ -217,6 +218,7 @@ const makeFakeNode = ({
       { id: "agent", root: "ee".repeat(32) },
       { id: "capability", root: "ca".repeat(32) },
       { id: "identity", root: "11".repeat(32) },
+      ...(files ? [{ id: "files", root: "fa".repeat(32) }] : []),
     ],
   };
   const transport: NodeTransport = makeTransportStub({
@@ -1066,6 +1068,25 @@ describe("DucktapeProvider", () => {
         .length,
     ).toBe(agentCalls);
     expect(capturedState!.lastBlock).toBe(5);
+  });
+
+  it("does not hydrate searchable files for every staged upload chunk", async () => {
+    const { transport, emitOps } = makeFakeNode({ files: true });
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+    vi.mocked(transport.status).mockClear();
+
+    await act(async () => {
+      emitOps("files", [{ height: 5, payloadHex: "00a1" }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    expect(transport.status).not.toHaveBeenCalled();
+
+    await act(async () => {
+      emitOps("files", [{ height: 6, payload: { commit: {} } }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
   });
 
   it("coalesces a scoped status timeout into one retry without disturbing the session", async () => {

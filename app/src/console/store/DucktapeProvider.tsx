@@ -816,7 +816,15 @@ export function DucktapeProvider({
             return patch;
           },
         });
-        schedule();
+        // A files putblob frame only stages one upload chunk. It changes the
+        // module root but no visible path, so re-indexing all searchable files
+        // after every remote chunk is pure network churn; the final JSON Commit
+        // event performs the one hydrate that can change the file projection.
+        const filesStage =
+          frame.topic === moduleTopic("files") &&
+          frame.op.payload === undefined &&
+          typeof frame.op.payloadHex === "string";
+        if (!filesStage) schedule();
       },
       onLagged: () => {
         clearFlush();

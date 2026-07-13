@@ -331,6 +331,10 @@ export interface NodeTransport {
     offset?: number;
     len?: number;
   }): Promise<FileReadRange>;
+  /** A direct raw-byte URL for browser-native downloads and drag-out. Optional
+   *  for injected transports that do not expose the daemon's HTTP surface; the
+   *  remote transport falls back to ranged reads above the 64 MiB facade cap. */
+  filesObjectUrl?(params: { path: string; snapshot?: string; size?: number }): string | undefined;
   /** The bounded commit history, newest-first (GET /v1/files/history). */
   filesHistory(params?: { limit?: number }): Promise<FileSnapshot[]>;
 
@@ -831,6 +835,13 @@ export const remoteTransport = (
       getJson<FileReadRange>(
         `${base}/v1/files/read${queryString({ path, snapshot, offset, len })}`,
       ),
+    filesObjectUrl: ({ path, snapshot, size }) =>
+      size !== undefined && size > 64 * 1024 * 1024
+        ? undefined
+        : `${base}/v1/files/object${path
+            .split("/")
+            .map((segment) => encodeURIComponent(segment))
+            .join("/")}${queryString({ snapshot })}`,
     filesHistory: async (params) => {
       const body = await getJson<{ snapshots: FileSnapshot[] }>(
         `${base}/v1/files/history${queryString({ limit: params?.limit })}`,

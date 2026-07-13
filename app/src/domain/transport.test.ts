@@ -108,6 +108,22 @@ describe("remoteTransport", () => {
     });
   });
 
+  it("builds an encoded raw-object URL for native file downloads", () => {
+    const transport = remoteTransport("http://node.example:8844/");
+    expect(
+      transport.filesObjectUrl?.({
+        path: "/shared/design notes/a#1.md",
+        snapshot: "ab".repeat(32),
+        size: 1024,
+      }),
+    ).toBe(
+      `http://node.example:8844/v1/files/object/shared/design%20notes/a%231.md?snapshot=${"ab".repeat(32)}`,
+    );
+    expect(
+      transport.filesObjectUrl?.({ path: "/shared/archive.bin", size: 64 * 1024 * 1024 + 1 }),
+    ).toBeUndefined();
+  });
+
   it("fetches GET /v1/status including the daemon version", async () => {
     const status = {
       version: "0.1.0",
