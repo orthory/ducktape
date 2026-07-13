@@ -392,6 +392,9 @@ export interface ConsoleActions {
     caps?: agentClient.ResourceCaps;
     skills?: agentClient.SkillRef[];
   }): void;
+  /** Re-read the network capability registry without rebuilding the rest of the
+   *  console snapshot. Used by the create form after a failed registry read. */
+  refreshCapabilities(): void;
   /** Pause / resume an agent (owner-gated). */
   pauseAgent(agentId: string): void;
   resumeAgent(agentId: string): void;
@@ -560,6 +563,7 @@ interface CreateActionsDeps {
   getNode: () => NodeTransport | null;
   setNode(node: NodeTransport | null): void;
   refresh(): Promise<void>;
+  refreshCapabilities(): void;
   fail(err: unknown): void;
   nextBootGeneration(): number;
   isBootGenerationStale(generation: number): boolean;
@@ -571,6 +575,7 @@ export function createActions({
   getNode,
   setNode,
   refresh,
+  refreshCapabilities,
   fail,
   nextBootGeneration,
   isBootGenerationStale,
@@ -2329,6 +2334,8 @@ export function createActions({
     },
 
     // ── Agents ──
+    refreshCapabilities,
+
     registerAgent: ({ displayName, agentId, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       const name = displayName.trim();

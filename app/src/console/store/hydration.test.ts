@@ -10,7 +10,13 @@ import type { NodeStatus } from "../../domain/transport";
 import { makeTransportStub } from "../../test/transport-stub";
 import { receiptFloor } from "./finalization";
 import type { OpLedger } from "./finalization";
-import { changedModules, fetchGovernanceSlices, fetchPeopleSlices, scopeFor } from "./hydration";
+import {
+  changedModules,
+  fetchCapabilitySlices,
+  fetchGovernanceSlices,
+  fetchPeopleSlices,
+  scopeFor,
+} from "./hydration";
 
 // ── Fixtures ────────────────────────────────────────────
 
@@ -154,6 +160,22 @@ describe("fetchGovernanceSlices", () => {
       },
     });
     expect(query.mock.calls.map(([, request]) => request)).toEqual(["proposals", "shares"]);
+  });
+});
+
+describe("fetchCapabilitySlices", () => {
+  it("distinguishes a failed registry read from a successful empty registry", async () => {
+    const failed = await fetchCapabilitySlices(
+      makeTransportStub({ query: vi.fn().mockRejectedValue(new Error("offline")) }),
+    );
+    expect(failed.capabilities).toEqual([]);
+    expect(failed.capabilitiesStatus).toBe("error");
+
+    const empty = await fetchCapabilitySlices(
+      makeTransportStub({ query: vi.fn().mockResolvedValue({ all: [] }) }),
+    );
+    expect(empty.capabilities).toEqual([]);
+    expect(empty.capabilitiesStatus).toBe("ready");
   });
 });
 

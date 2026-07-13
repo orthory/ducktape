@@ -203,6 +203,7 @@ export const fetchAgentsSlices = (
 
 export interface CapabilitySlices {
   capabilities: string[];
+  capabilitiesStatus: "ready" | "error";
   capabilitiesByNode: Map<string, string[]>;
 }
 
@@ -212,14 +213,17 @@ export const fetchCapabilitySlices = (
   Promise.resolve()
     .then(() =>
       Promise.all([
-        capabilityClient.capabilities(live).catch((): string[] => []),
+        capabilityClient.capabilities(live).then(
+          (capabilities) => ({ capabilities, capabilitiesStatus: "ready" as const }),
+          () => ({ capabilities: [], capabilitiesStatus: "error" as const }),
+        ),
         capabilityClient
           .capabilitiesByNode(live)
           .catch((): Map<string, string[]> => new Map()),
       ]),
     )
-    .then(([capabilities, capabilitiesByNode]) => ({
-      capabilities,
+    .then(([registry, capabilitiesByNode]) => ({
+      ...registry,
       capabilitiesByNode,
     }));
 

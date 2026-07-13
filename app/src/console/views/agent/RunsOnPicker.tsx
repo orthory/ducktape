@@ -10,8 +10,8 @@
 //   - any other shape               — opaque: selectable verbatim, no cascade.
 //
 // Degrades by registry size:
-//   - none announced → a labelled text field (never blocks setup before a
-//     host has announced);
+//   - none announced → a disabled, actionable empty state (an arbitrary tag
+//     would register an agent that can never run);
 //   - announced → selects; an empty value defaults to the first announced
 //     tag, so a single-executor node needs no choice at all. Providers with
 //     only a base tag collapse Model/Effort to "Default".
@@ -22,7 +22,13 @@
 import { useEffect } from "react";
 
 import { color, font } from "../../theme/tokens";
-import { FieldLabel, inputStyle, monoInputStyle, titleCase } from "./parts";
+import {
+  FieldLabel,
+  inputStyle,
+  monoInputStyle,
+  secondaryButton,
+  titleCase,
+} from "./parts";
 
 type ParsedTag = {
   /** Cascade group: the provider for base/variant shapes, the whole tag for
@@ -48,6 +54,8 @@ export function RunsOnPicker({
   id,
   value,
   capabilities,
+  registryStatus = "ready",
+  onRetry,
   onChange,
 }: {
   id: string;
@@ -55,6 +63,8 @@ export function RunsOnPicker({
   value: string;
   /** The network's announced executor registry (`state.capabilities`). */
   capabilities: string[];
+  registryStatus?: "loading" | "ready" | "error";
+  onRetry?: () => void;
   onChange: (next: string) => void;
 }) {
   // Adopt a sane default once the registry loads: an empty value with executors
@@ -64,24 +74,32 @@ export function RunsOnPicker({
     if (value === "" && capabilities.length > 0) onChange(capabilities[0]);
   }, [value, capabilities, onChange]);
 
-  // No executors announced: free text so a first-time operator can register
-  // before any host announces. Keyed on the registry alone, never on `value` —
-  // a value-gated guard would flip to the select branch on the first keystroke
-  // (unmounting the input mid-word).
-  if (capabilities.length === 0) {
+  // The registry is the source of truth. Accepting an arbitrary tag here makes
+  // registration look successful but leaves the agent permanently unrunnable.
+  if (registryStatus !== "ready" || capabilities.length === 0) {
+    const failed = registryStatus === "error";
+    const loading = registryStatus === "loading";
     return (
       <>
         <input
           id={id}
           name={id}
           type="text"
-          spellCheck={false}
+          disabled
           value={value}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="e.g. codex"
-          style={monoInputStyle}
+          placeholder={
+            failed
+              ? "Providers unavailable"
+              : loading
+                ? "Loading providers…"
+                : "No provider available"
+          }
+          aria-describedby={`${id}-unavailable`}
+          style={{ ...monoInputStyle, color: color.muted2, cursor: "not-allowed" }}
         />
         <div
+          id={`${id}-unavailable`}
+          role={failed ? "alert" : "status"}
           style={{
             marginTop: 5,
             font: `400 10.5px ${font.sans}`,
@@ -89,8 +107,31 @@ export function RunsOnPicker({
             lineHeight: 1.4,
           }}
         >
-          Name of an executor your node can run (for example codex or claude).
+          {failed ? (
+            <>
+              Could not load the provider registry. Check the node connection, then retry.
+            </>
+          ) : loading ? (
+            <>Loading available LLM providers from the network…</>
+          ) : (
+            <>
+              No LLM provider is available. Under Node → Sandbox, choose an execution mode.
+              Direct uses an executor CLI installed and signed in on the node host. Podman or Tart
+              requires an image or VM that contains and supports that executor. Copy the shown
+              node.toml settings and restart the node. Available providers appear here
+              automatically.
+            </>
+          )}
         </div>
+        {failed && onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            style={{ ...secondaryButton, minHeight: 28, marginTop: 7 }}
+          >
+            Retry
+          </button>
+        )}
       </>
     );
   }

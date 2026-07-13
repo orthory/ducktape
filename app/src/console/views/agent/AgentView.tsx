@@ -234,6 +234,10 @@ export function AgentView() {
               {adding ? (
                 <RegisterAgentForm
                   capabilities={state.capabilities}
+                  capabilitiesStatus={state.capabilitiesStatus}
+                  onRetryCapabilities={
+                    state.connected ? actions.refreshCapabilities : undefined
+                  }
                   onRegister={actions.registerAgent}
                   onDone={() => setAdding(false)}
                 />
@@ -241,6 +245,7 @@ export function AgentView() {
                 <AgentDetail
                   agent={selectedAgent}
                   capabilities={state.capabilities}
+                  capabilitiesStatus={state.capabilitiesStatus}
                   onPause={actions.pauseAgent}
                   onResume={actions.resumeAgent}
                   onUpdate={actions.updateAgent}

@@ -29,11 +29,13 @@ import { SkillsField } from "./SkillsField";
 export function AgentEditForm({
   agent,
   capabilities,
+  capabilitiesStatus,
   onUpdate,
   onClose,
 }: {
   agent: AgentRecord;
   capabilities: string[];
+  capabilitiesStatus: "loading" | "ready" | "error";
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
@@ -118,6 +120,7 @@ export function AgentEditForm({
             id="agent-edit-capability"
             value={capability}
             capabilities={capabilities}
+            registryStatus={capabilitiesStatus}
             onChange={setCapability}
           />
         </div>

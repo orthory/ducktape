@@ -1,7 +1,7 @@
 // Provider contract over a fake transport: hydration projects node state in,
 // writes submit the exact wire msg, and block events trigger a re-query.
 
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentRecord } from "../../domain/agent-client";
@@ -22,6 +22,7 @@ import { DEFAULT_AUTHOR } from "./state";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import { makeTransportStub } from "../../test/transport-stub";
+import { AgentView } from "../views/agent/AgentView";
 
 const nodeBootstrapMocks = vi.hoisted(() => ({
   remoteTransport: null as unknown,
@@ -210,6 +211,7 @@ const makeFakeNode = ({
     modules: [
       { id: "chat", root: "cc".repeat(32) },
       { id: "agent", root: "ee".repeat(32) },
+      { id: "capability", root: "ca".repeat(32) },
       { id: "identity", root: "11".repeat(32) },
     ],
   };
@@ -395,6 +397,406 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("channel").textContent).toBe("general");
       expect(screen.getByTestId("messages").textContent).toBe("1");
     });
+  });
+
+  it("retries a failed provider registry query from the agent create form", async () => {
+    const { transport } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    let registryFails = true;
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target === "capability") {
+        return registryFails
+          ? Promise.reject(new Error("registry unavailable"))
+          : Promise.resolve({ all: [[[1], ["codex"]]] });
+      }
+      return baseQuery(target, request);
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+        failedQueries,
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+
+    const retryFailedQueries = query.mock.calls.filter(
+      ([target]) => target === "capability",
+    ).length;
+    registryFails = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("codex"));
+    expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+      retryFailedQueries,
+    );
+  });
+
+  it("rejects a same-port process swap before retrying provider discovery", async () => {
+    const { transport } = makeFakeNode({ publicKey: "expected" });
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    let process: "expected" | "foreign" = "expected";
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target !== "capability") return baseQuery(target, request);
+      return process === "expected"
+        ? Promise.reject(new Error("registry unavailable"))
+        : Promise.resolve({ all: [[[2], ["foreign-provider"]]] });
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <Probe />
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    process = "foreign";
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status).mockResolvedValueOnce(
+      statusAt(2, { publicKey: "foreign" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(capturedState!.connectionDown?.impostor).toBe(true));
+    expect(transport.status).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls.filter(([target]) => target === "capability")).toHaveLength(
+      failedQueries,
+    );
+    expect(capturedState!.capabilities).toEqual([]);
+    expect(capturedState!.capabilitiesByNode.size).toBe(0);
+  });
+
+  it("makes a failed retry identity probe retryable without querying providers", async () => {
+    const { transport } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    query.mockImplementation((target: string, request: unknown) =>
+      target === "capability"
+        ? Promise.reject(new Error("registry unavailable"))
+        : baseQuery(target, request),
+    );
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <Probe />
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    vi.mocked(transport.status).mockRejectedValueOnce(new Error("status unavailable"));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(capturedState!.capabilitiesStatus).toBe("error");
+    expect(query.mock.calls.filter(([target]) => target === "capability")).toHaveLength(
+      failedQueries,
+    );
+  });
+
+  it("reserves provider retry ordering while its identity probe is pending", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const olderRegistry = deferred<unknown>();
+    const retryStatus = deferred<NodeStatus>();
+    let registry: "fail" | "older" | "retry" = "fail";
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target !== "capability") return baseQuery(target, request);
+      if (registry === "fail") return Promise.reject(new Error("registry unavailable"));
+      if (registry === "older") return olderRegistry.promise;
+      return Promise.resolve({ all: [[[2], ["claude"]]] });
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <Probe />
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    registry = "older";
+    await act(async () => emitOps("capability", [{ height: 5 }]));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+        failedQueries,
+      ),
+    );
+
+    registry = "retry";
+    vi.mocked(transport.status).mockImplementationOnce(() => retryStatus.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(capturedState!.capabilitiesStatus).toBe("loading"));
+
+    await act(async () => {
+      olderRegistry.resolve({ all: [[[1], ["codex"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.capabilities).toEqual([]);
+    expect(capturedState!.capabilitiesStatus).toBe("loading");
+
+    await act(async () => retryStatus.resolve(statusAt(6)));
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("claude"));
+    expect(capturedState!.capabilitiesStatus).toBe("ready");
+  });
+
+  it("does not trust an old normal status after a fresh retry starts", async () => {
+    const { transport, emitOps } = makeFakeNode({ publicKey: "expected" });
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    let registry: "fail" | "old" | "new" = "fail";
+    query.mockImplementation((target: string, request: unknown) =>
+      target === "capability"
+        ? registry === "fail"
+          ? Promise.reject(new Error("registry unavailable"))
+          : Promise.resolve({
+              all: [[[1], [registry === "old" ? "old-provider" : "trusted-provider"]]],
+            })
+        : baseQuery(target, request),
+    );
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <Probe />
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    await waitFor(() => expect(capturedState!.capabilitiesStatus).toBe("error"));
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+
+    const oldStatus = deferred<NodeStatus>();
+    const retryStatus = deferred<NodeStatus>();
+    registry = "old";
+    vi.mocked(transport.status).mockClear();
+    vi.mocked(transport.status)
+      .mockImplementationOnce(() => oldStatus.promise)
+      .mockImplementationOnce(() => retryStatus.promise);
+    await act(async () => emitOps("capability", [{ height: 5 }]));
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(2));
+    const queriesBeforeProof = query.mock.calls.filter(
+      ([target]) => target === "capability",
+    ).length;
+    const chatQueriesBeforeProof = query.mock.calls.filter(
+      ([target]) => target === "chat",
+    ).length;
+    const expectedStatus = {
+      ...capturedState!.status!,
+      height: 5,
+      publicKey: "expected",
+      modules: capturedState!.status!.modules.map((module) =>
+        module.id === "capability" || module.id === "chat"
+          ? { ...module, root: "55".repeat(32) }
+          : module,
+      ),
+    };
+
+    await act(async () => oldStatus.resolve(expectedStatus));
+    await waitFor(() => expect(capturedState!.status?.height).toBe(5));
+    expect(query.mock.calls.filter(([target]) => target === "capability")).toHaveLength(
+      queriesBeforeProof,
+    );
+    expect(query.mock.calls.filter(([target]) => target === "chat").length).toBeGreaterThan(
+      chatQueriesBeforeProof,
+    );
+
+    registry = "new";
+    capturedActions!.refreshCapabilities();
+    await waitFor(() => expect(transport.status).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(capturedState!.capabilities).toContain("trusted-provider"),
+    );
+
+    await act(async () => retryStatus.resolve(statusAt(6, { publicKey: "foreign" })));
+    await waitFor(() => expect(capturedState!.connectionDown?.impostor).toBe(true));
+    expect(capturedState!.capabilities).not.toContain("old-provider");
+  });
+
+  it("lets a pending provider retry finish across an unrelated chat hydrate", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const retry = deferred<unknown>();
+    let registry: "fail" | "defer" = "fail";
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target !== "capability") return baseQuery(target, request);
+      return registry === "fail"
+        ? Promise.reject(new Error("registry unavailable"))
+        : retry.promise;
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <Probe />
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    registry = "defer";
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+        failedQueries,
+      ),
+    );
+
+    await act(async () => emitOps("chat", [{ height: 5 }]));
+    await waitFor(() => expect(screen.getByTestId("height")).toHaveTextContent("5"));
+
+    await act(async () => {
+      retry.resolve({ all: [[[1], ["codex"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("codex"));
+    expect(capturedState!.capabilitiesStatus).toBe("ready");
+    expect(screen.getByTestId("height")).toHaveTextContent("5");
+  });
+
+  it("ignores an older provider retry after a newer scoped hydrate wins", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const oldRetry = deferred<unknown>();
+    let registry: "fail" | "defer" | "newer" = "fail";
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target !== "capability") return baseQuery(target, request);
+      if (registry === "fail") return Promise.reject(new Error("registry unavailable"));
+      if (registry === "defer") return oldRetry.promise;
+      return Promise.resolve({ all: [[[2], ["claude"]]] });
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    registry = "defer";
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+        failedQueries,
+      ),
+    );
+
+    registry = "newer";
+    await act(async () => emitOps("capability", [{ height: 5 }]));
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("claude"));
+
+    await act(async () => {
+      oldRetry.resolve({ all: [[[1], ["codex"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByLabelText("Runs on")).toHaveValue("claude");
+  });
+
+  it("ignores a deferred provider registry after rejecting its transport", async () => {
+    const { transport, emitDown, emitUp } = makeFakeNode({ publicKey: "expected" });
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const registry = deferred<unknown>();
+    query.mockImplementation((target: string, request: unknown) =>
+      target === "capability" ? registry.promise : baseQuery(target, request),
+    );
+
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability")).toHaveLength(2),
+    );
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+
+    await act(async () => emitDown("stream heartbeat timed out"));
+    vi.mocked(transport.status).mockResolvedValueOnce(
+      statusAt(2, { publicKey: "foreign" }),
+    );
+    await act(async () => emitUp());
+    await waitFor(() => expect(capturedState!.connectionDown?.impostor).toBe(true));
+
+    await act(async () => {
+      registry.resolve({ all: [[[1], ["foreign-provider"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.capabilities).toEqual([]);
+    expect(capturedState!.capabilitiesByNode.size).toBe(0);
   });
 
   it("keeps an initial status timeout loud after the one bounded retry", async () => {
