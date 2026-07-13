@@ -1,7 +1,7 @@
 // Provider contract over a fake transport: hydration projects node state in,
 // writes submit the exact wire msg, and block events trigger a re-query.
 
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentRecord } from "../../domain/agent-client";
@@ -22,6 +22,7 @@ import { DEFAULT_AUTHOR } from "./state";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import { makeTransportStub } from "../../test/transport-stub";
+import { AgentView } from "../views/agent/AgentView";
 
 const nodeBootstrapMocks = vi.hoisted(() => ({
   remoteTransport: null as unknown,
@@ -395,6 +396,41 @@ describe("DucktapeProvider", () => {
       expect(screen.getByTestId("channel").textContent).toBe("general");
       expect(screen.getByTestId("messages").textContent).toBe("1");
     });
+  });
+
+  it("retries a failed provider registry query from the agent create form", async () => {
+    const { transport } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    let registryFails = true;
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target === "capability") {
+        return registryFails
+          ? Promise.reject(new Error("registry unavailable"))
+          : Promise.resolve({ all: [[[1], ["codex"]]] });
+      }
+      return baseQuery(target, request);
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    registryFails = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("codex"));
+    expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+      failedQueries,
+    );
   });
 
   it("keeps an initial status timeout loud after the one bounded retry", async () => {

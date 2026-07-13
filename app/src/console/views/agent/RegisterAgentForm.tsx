@@ -36,11 +36,13 @@ import { SkillsField } from "./SkillsField";
 export function RegisterAgentForm({
   capabilities,
   capabilitiesStatus,
+  onRetryCapabilities,
   onRegister,
   onDone,
 }: {
   capabilities: string[];
   capabilitiesStatus: "loading" | "ready" | "error";
+  onRetryCapabilities?: () => void;
   onRegister: (params: {
     displayName: string;
     agentId: string;
@@ -169,6 +171,7 @@ export function RegisterAgentForm({
                 value={capability}
                 capabilities={capabilities}
                 registryStatus={capabilitiesStatus}
+                onRetry={onRetryCapabilities}
                 onChange={setCapability}
               />
             </div>

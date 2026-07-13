@@ -99,15 +99,12 @@ const renderAgents = (
   };
   const spies: Record<string, (...args: unknown[]) => void> = {};
   const noop = vi.fn() as (...args: unknown[]) => void;
-  let updateCapabilityRegistry: (
-    status: ConsoleState["capabilitiesStatus"],
-    capabilities: string[],
-  ) => void;
+  let updateCapabilities: (capabilities: string[]) => void;
 
   function Harness() {
     const [state, setState] = useState(initialState);
-    updateCapabilityRegistry = (capabilitiesStatus, capabilities) =>
-      setState((prev) => ({ ...prev, capabilitiesStatus, capabilities }));
+    updateCapabilities = (capabilities) =>
+      setState((prev) => ({ ...prev, capabilitiesStatus: "ready", capabilities }));
     const actions = new Proxy(
       {},
       {
@@ -128,12 +125,7 @@ const renderAgents = (
   render(<Harness />);
   return {
     spies,
-    setCapabilities: (capabilities: string[]) =>
-      act(() => updateCapabilityRegistry("ready", capabilities)),
-    setCapabilityRegistry: (
-      status: ConsoleState["capabilitiesStatus"],
-      capabilities: string[] = [],
-    ) => act(() => updateCapabilityRegistry(status, capabilities)),
+    setCapabilities: (capabilities: string[]) => act(() => updateCapabilities(capabilities)),
   };
 };
 
@@ -699,7 +691,7 @@ describe("AgentView", () => {
     expect(screen.getByLabelText("Runs on")).toBeDisabled();
     expect(screen.getByPlaceholderText("No provider available")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(
-      /install and sign in to codex or claude.*node.*sandbox.*node.toml.*restart/i,
+      /direct.*node host.*podman or tart.*image or vm.*node.toml.*restart/i,
     );
 
     fireEvent.change(screen.getByLabelText("Agent display name"), {
@@ -709,31 +701,16 @@ describe("AgentView", () => {
     expect(spies.registerAgent).not.toHaveBeenCalled();
   });
 
-  it("distinguishes provider registry failure and recovers when it loads", () => {
-    const { spies, setCapabilityRegistry } = renderAgents({
+  it("offers a real retry action when the provider registry fails", () => {
+    const { spies } = renderAgents({
       capabilities: [],
-      capabilitiesStatus: "loading",
+      capabilitiesStatus: "error",
     });
 
     fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
-    fireEvent.change(screen.getByLabelText("Agent display name"), {
-      target: { value: "Triage" },
-    });
-    expect(screen.getByRole("status")).toHaveTextContent(/loading available llm providers/i);
-    expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
-
-    setCapabilityRegistry("error");
-    expect(screen.getByRole("alert")).toHaveTextContent(/could not load.*reconnect to retry/i);
-    expect(screen.queryByText(/install and sign in/i)).toBeNull();
-    expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
-
-    setCapabilityRegistry("ready", ["codex"]);
-    expect(screen.getByLabelText("Runs on")).toHaveValue("codex");
-    expect(screen.getByRole("button", { name: /register agent/i })).toBeEnabled();
-    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
-    expect(spies.registerAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ capability: "codex" }),
-    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(spies.refreshCapabilities).toHaveBeenCalledTimes(1);
   });
 
   it("blocks registration if the selected provider disappears", () => {

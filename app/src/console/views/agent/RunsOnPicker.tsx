@@ -22,7 +22,13 @@
 import { useEffect } from "react";
 
 import { color, font } from "../../theme/tokens";
-import { FieldLabel, inputStyle, monoInputStyle, titleCase } from "./parts";
+import {
+  FieldLabel,
+  inputStyle,
+  monoInputStyle,
+  secondaryButton,
+  titleCase,
+} from "./parts";
 
 type ParsedTag = {
   /** Cascade group: the provider for base/variant shapes, the whole tag for
@@ -49,6 +55,7 @@ export function RunsOnPicker({
   value,
   capabilities,
   registryStatus = "ready",
+  onRetry,
   onChange,
 }: {
   id: string;
@@ -57,6 +64,7 @@ export function RunsOnPicker({
   /** The network's announced executor registry (`state.capabilities`). */
   capabilities: string[];
   registryStatus?: "loading" | "ready" | "error";
+  onRetry?: () => void;
   onChange: (next: string) => void;
 }) {
   // Adopt a sane default once the registry loads: an empty value with executors
@@ -101,19 +109,29 @@ export function RunsOnPicker({
         >
           {failed ? (
             <>
-              Could not load the provider registry. Check the node connection, then reconnect to
-              retry.
+              Could not load the provider registry. Check the node connection, then retry.
             </>
           ) : loading ? (
             <>Loading available LLM providers from the network…</>
           ) : (
             <>
-              No LLM provider is available. Install and sign in to Codex or Claude on a node.
-              Under Node → Sandbox, choose a mode, copy the shown node.toml settings, and
-              restart the node. Available providers appear here automatically.
+              No LLM provider is available. Under Node → Sandbox, choose an execution mode.
+              Direct uses an executor CLI installed and signed in on the node host. Podman or Tart
+              requires an image or VM that contains and supports that executor. Copy the shown
+              node.toml settings and restart the node. Available providers appear here
+              automatically.
             </>
           )}
         </div>
+        {failed && onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            style={{ ...secondaryButton, minHeight: 28, marginTop: 7 }}
+          >
+            Retry
+          </button>
+        )}
       </>
     );
   }

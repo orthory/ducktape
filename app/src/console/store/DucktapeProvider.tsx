@@ -564,6 +564,16 @@ export function DucktapeProvider({
     shouldHoldPages,
   ]);
 
+  const refreshCapabilities = useCallback(() => {
+    const live = nodeRef.current;
+    if (!live || !stateRef.current.connected) return;
+    dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
+    void fetchCapabilitySlices(live).then((capability) => {
+      if (nodeRef.current !== live || !stateRef.current.connected) return;
+      dispatch({ type: "patch", patch: capability });
+    });
+  }, []);
+
   const actions = useMemo(
     () =>
       createActions({
@@ -572,6 +582,7 @@ export function DucktapeProvider({
         getNode: () => nodeRef.current,
         setNode,
         refresh,
+        refreshCapabilities,
         fail,
         nextBootGeneration: () => (bootGenRef.current += 1),
         isBootGenerationStale: (generation) => bootGenRef.current !== generation,
