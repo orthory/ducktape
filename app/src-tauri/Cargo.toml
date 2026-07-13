@@ -92,10 +92,16 @@ tauri-agent-plugin = { version = "0.0.2", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Touch ID custody (src/touchid.rs): the vault passphrase behind a biometric
-# Keychain ACL. macOS-target-scoped so the Linux/wasm build is untouched.
+# Touch ID custody (src/touchid.rs): the vault passphrase behind a
+# user-presence Keychain ACL, with an LAContext-gated plain-item fallback for
+# builds without keychain entitlements. macOS-target-scoped so the Linux/wasm
+# build is untouched; the objc2 family is already in the graph via tauri.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+block2 = "0.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }
