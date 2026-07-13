@@ -112,10 +112,7 @@ export function TrayPopover() {
   const rail = useMemo(
     () =>
       (snap.client
-        ? [
-            ...modulesInSection("user", true),
-            ...modulesInSection("operator", true),
-          ]
+        ? modulesInSection("user", { nodeControl: false, clientMode: true })
         : [...MODULES].sort((a, b) => a.nav.order - b.nav.order)
       ).filter((m) => m.id !== "status"),
     [snap.client],

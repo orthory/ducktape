@@ -1,13 +1,13 @@
-// The 74px icon rail: brand, a two-section mode toggle, one entry per module of
-// the active rail, and settings. Both local and remote connections label the
-// sections USER / NODE; the registry filters a remote NODE rail to read-only
-// surfaces. Neither rail confers
-// authority; the toggle is purely which surfaces are on screen.
+// The 74px icon rail: brand, the view-mode toggle (only while node control is
+// available — ADR A5/A6: the NODE rail is a conditional surface, absent for
+// clients and non-owners, not disabled), one entry per module of the active
+// rail, and settings. Within a rail, in-view role checks own op-level
+// authority.
 
 import { Icon, type IconName } from "../components/Icon";
 import { modulesInSection } from "../modules/registry";
 import type { NavSection } from "../modules/module-def";
-import { isClientMode } from "../store/state";
+import { isClientMode, nodeControlAvailable } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
 import { initialsOf } from "../views/home/ProfileCard";
@@ -28,18 +28,11 @@ const LOCAL_MODES: ReadonlyArray<ModeEntry> = [
   { id: "operator", icon: "node", label: "NODE", title: "Node operator" },
 ];
 
-const CLIENT_MODES: ReadonlyArray<ModeEntry> = [
-  { id: "user", icon: "members", label: "USER", title: "User apps" },
-  { id: "operator", icon: "node", label: "NODE", title: "Read-only node" },
-];
-
 function ModeToggle({
   mode,
-  modes,
   onSelect,
 }: {
   mode: NavSection;
-  modes: ReadonlyArray<ModeEntry>;
   onSelect: (mode: NavSection) => void;
 }) {
   return (
@@ -58,7 +51,7 @@ function ModeToggle({
         marginBottom: 8,
       }}
     >
-      {modes.map((entry) => {
+      {LOCAL_MODES.map((entry) => {
         const active = mode === entry.id;
         return (
           <button
@@ -104,8 +97,14 @@ export const SIDEBAR_ICON_RAIL_WIDTH = 74;
 
 export function Sidebar() {
   const { state, actions } = useDucktape();
-  const clientMode = isClientMode(state);
-  const rail = modulesInSection(state.viewMode, clientMode);
+  const canControl = nodeControlAvailable(state);
+  // Without node control any persisted "operator" mode falls back to the
+  // account rail — the NODE surface is absent, so it cannot be selected.
+  const mode = canControl ? state.viewMode : "user";
+  const rail = modulesInSection(mode, {
+    nodeControl: canControl,
+    clientMode: isClientMode(state),
+  });
 
   return (
     <div
@@ -139,11 +138,7 @@ export function Sidebar() {
         D
       </div>
 
-      <ModeToggle
-        mode={state.viewMode}
-        modes={clientMode ? CLIENT_MODES : LOCAL_MODES}
-        onSelect={actions.setViewMode}
-      />
+      {canControl && <ModeToggle mode={mode} onSelect={actions.setViewMode} />}
 
       {rail.map((mod) => {
         // at Home the layer covers the routed screen, so no rail entry is the
