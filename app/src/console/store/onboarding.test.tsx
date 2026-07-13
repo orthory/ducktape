@@ -50,6 +50,7 @@ function Probe() {
       <span data-testid="phase">{state.onboardingPhase?.phase ?? "none"}</span>
       <span data-testid="managed">{String(state.managed)}</span>
       <span data-testid="url">{state.nodeUrl ?? "none"}</span>
+      <span data-testid="error">{state.error ?? "none"}</span>
     </div>
   );
 }
@@ -343,6 +344,33 @@ describe("onboarding gate — remote node", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
     // remembered for next launch.
     expect(localStorage.getItem("ducktape.remoteUrl")).toBe("http://10.0.0.5:8844");
+  });
+
+  it("keeps the workspace gate up over an unreachable remote", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
+    );
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("offline"))));
+
+    render(
+      <DucktapeProvider>
+        <OnboardingGate />
+        <Probe />
+      </DucktapeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+
+    fireEvent.click(screen.getByText("Remote"));
+    fireEvent.change(screen.getByPlaceholderText("http://192.168.1.50:8844"), {
+      target: { value: "http://10.0.0.5:8844" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(screen.getByTestId("error").textContent).toContain("offline"));
+    expect(screen.getByTestId("gate").textContent).toBe("true");
+    expect(screen.getByTestId("url").textContent).toBe("none");
+    expect(localStorage.getItem("ducktape.remoteUrl")).toBeNull();
   });
 
   it("boot reconnects a saved remote, superseding the local active workspace", async () => {

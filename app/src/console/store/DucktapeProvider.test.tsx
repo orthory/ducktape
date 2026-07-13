@@ -66,9 +66,8 @@ import "@tauri-apps/api/event";
 import "@tauri-apps/api/core";
 
 // Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
-// so the switch lands on a benign, empty node (its status rejects → the "no
-// running node" surface) with no real network — enough to prove the previous
-// node's chain tip/blocks are dropped, not carried across.
+// so the switch lands on a benign, empty answering node with no real network —
+// enough to prove the previous node's projections are not carried across.
 vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../domain/node-bootstrap")>();
   const emptyNode: NodeTransport = {
@@ -83,7 +82,12 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
     filesLs: vi.fn(),
     filesRead: vi.fn(),
     filesHistory: vi.fn(),
-    status: vi.fn().mockRejectedValue(new Error("empty test node")),
+    status: vi.fn().mockResolvedValue({
+      version: "0.1.0",
+      appHash: "00".repeat(32),
+      height: 0,
+      modules: [],
+    }),
     blocks: vi.fn().mockResolvedValue([]),
     subscribe: vi.fn(() => () => {}),
     onStream: vi.fn(() => () => {}),

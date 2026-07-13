@@ -707,7 +707,7 @@ export function DucktapeProvider({
         dispatch({ type: "patch", patch: { workspaces: all } });
         // A remembered remote node supersedes the local active workspace — it
         // was the user's last choice, so reconnect to it. An unreachable one
-        // just reads as disconnected rather than blocking boot.
+        // leaves the workspace gate up instead of opening a dead shell.
         const savedRemote = loadRemoteUrl();
         if (savedRemote) {
           actions.connectRemote(savedRemote);
