@@ -222,7 +222,7 @@ fn the_probe_rejects_git_without_the_runtime_rebase_options() {
         "#!/bin/sh\n\
          for arg in \"$@\"; do\n\
            case \"$arg\" in\n\
-             --reapply-cherry-picks|--empty=keep)\n\
+             --rebase-merges|--reapply-cherry-picks|--empty=keep)\n\
                echo \"error: unknown option $arg\" >&2\n\
                exit 129\n\
                ;;\n\
@@ -1203,6 +1203,101 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
             attribution_email_local_part(AGENT)
         )
     );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_concurrent_advance_preserves_agent_merge_topology_and_messages() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let bare_repo = git2::Repository::open(&bare).unwrap();
+    let rival = odb_commit(
+        &bare_repo,
+        Some(&bed.head),
+        "rival.txt",
+        "concurrent work\n",
+    );
+    set_ref(&bare_repo, BRANCH, &rival);
+
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, true))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let author_email = format!("{}@agents.duck", attribution_email_local_part(AGENT));
+    let committer_email = format!("{NODE_IDENT}@nodes.duck");
+    let identity = [
+        ("GIT_AUTHOR_NAME", AGENT_DISPLAY_NAME),
+        ("GIT_AUTHOR_EMAIL", author_email.as_str()),
+        ("GIT_COMMITTER_NAME", NODE_IDENT),
+        ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
+    ];
+
+    run_git(&dir, &["switch", "-c", "agent-topic"], &[]).unwrap();
+    std::fs::write(dir.join("topic.txt"), "topic work\n").unwrap();
+    run_git(&dir, &["add", "topic.txt"], &[]).unwrap();
+    run_git(&dir, &["commit", "-m", "Agent topic message"], &identity).unwrap();
+
+    run_git(&dir, &["switch", "--detach", &bed.head], &[]).unwrap();
+    std::fs::write(dir.join("linear.txt"), "linear work\n").unwrap();
+    run_git(&dir, &["add", "linear.txt"], &[]).unwrap();
+    run_git(&dir, &["commit", "-m", "Agent linear message"], &identity).unwrap();
+    run_git(
+        &dir,
+        &[
+            "merge",
+            "--no-ff",
+            "agent-topic",
+            "-m",
+            "Agent merge message",
+        ],
+        &identity,
+    )
+    .unwrap();
+
+    let receipt = ws
+        .commit("agent run s1:0", None)
+        .await
+        .expect("merge-preserving rebase-retry push");
+    assert!(receipt.rebased);
+    let oid = receipt.output_commit.expect("post-rebase oid");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
+    assert_eq!(
+        git_stdout(&dir, &["rev-list", "--parents", "-1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3,
+        "the rebased head remains a two-parent merge"
+    );
+    assert!(
+        run_git(&dir, &["merge-base", "--is-ancestor", &rival, "HEAD"], &[]).is_ok(),
+        "the concurrent remote tip is retained below the recreated merge"
+    );
+    let messages = git_stdout(&dir, &["log", "--format=%s", &format!("{rival}..HEAD")]);
+    for message in [
+        "Agent merge message",
+        "Agent linear message",
+        "Agent topic message",
+    ] {
+        assert_eq!(
+            messages.lines().filter(|line| *line == message).count(),
+            1,
+            "{message:?} is preserved exactly once: {messages}"
+        );
+    }
+    assert_eq!(messages.lines().count(), 3, "no commit was flattened away");
+    for line in git_stdout(
+        &dir,
+        &["log", "--format=%an|%ae|%cn|%ce", &format!("{rival}..HEAD")],
+    )
+    .lines()
+    {
+        assert_eq!(
+            line,
+            format!("{AGENT_DISPLAY_NAME}|{author_email}|{NODE_IDENT}|{committer_email}")
+        );
+    }
     ws.cleanup().await;
 }
 

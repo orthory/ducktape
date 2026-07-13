@@ -167,12 +167,18 @@ fn probe_host_git_with(program: &str) -> Result<(), String> {
         run_git_program(
             program,
             &clone,
-            &["rebase", "--reapply-cherry-picks", "--empty=keep", "HEAD"],
+            &[
+                "rebase",
+                "--rebase-merges",
+                "--reapply-cherry-picks",
+                "--empty=keep",
+                "HEAD",
+            ],
             &identity,
         )
         .map_err(|e| {
             format!(
-                "`git rebase --reapply-cherry-picks --empty=keep` failed — \
+                "`git rebase --rebase-merges --reapply-cherry-picks --empty=keep` failed — \
                  host git lacks the runtime rebase options: {e}"
             )
         })?;
@@ -942,6 +948,7 @@ fn commit_blocking(
                         run_dir,
                         &[
                             "rebase",
+                            "--rebase-merges",
                             "--reapply-cherry-picks",
                             "--empty=keep",
                             "FETCH_HEAD",
