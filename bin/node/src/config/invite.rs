@@ -35,30 +35,53 @@ pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
 // ============================================================================
 
 pub use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof, verify_invite_token,
-    verify_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
+    verify_invite_token, verify_join_proof,
 };
 
-/// mint a token binding an invite to `binding` (the genesis namespace): fresh
-/// OS randomness for the nonce, signed by this member's identity.
-pub fn mint_invite_token(signer: &ed25519::PrivateKey, binding: &[u8]) -> InviteToken {
+/// mint a token binding an invite to `binding` (the genesis namespace) and to
+/// the single `target` key it admits, with `role` and `expires_unix_secs`:
+/// fresh OS randomness for the nonce, signed by this member's identity. minting
+/// IS the admission decision FOR THAT KEY.
+pub fn mint_invite_token(
+    signer: &ed25519::PrivateKey,
+    binding: &[u8],
+    target: &ed25519::PublicKey,
+    role: InviteRole,
+    expires_unix_secs: u64,
+) -> InviteToken {
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let msg = [binding, &nonce].concat();
+    let msg = [
+        binding,
+        &nonce,
+        target.as_ref(),
+        &[role.as_u8()],
+        &expires_unix_secs.to_le_bytes(),
+    ]
+    .concat();
     InviteToken {
         issuer: signer.public_key(),
         nonce,
+        target: target.clone(),
+        role,
+        expires_unix_secs,
         sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
-const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 64;
+/// packed token: `issuer(32) ‖ nonce(16) ‖ target(32) ‖ role(1) ‖ expires_le(8)
+/// ‖ sig(64)` = 153 bytes.
+const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 32 + 1 + 8 + 64;
 
 fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
     let mut out = Vec::with_capacity(INVITE_TOKEN_LEN);
     out.extend_from_slice(t.issuer.as_ref());
     out.extend_from_slice(&t.nonce);
+    out.extend_from_slice(t.target.as_ref());
+    out.push(t.role.as_u8());
+    out.extend_from_slice(&t.expires_unix_secs.to_le_bytes());
     out.extend_from_slice(t.sig.encode().as_ref());
     out
 }
@@ -74,9 +97,24 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
         .map_err(|e| format!("invite token issuer: {e}"))?;
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     nonce.copy_from_slice(&bytes[32..32 + INVITE_NONCE_LEN]);
-    let sig = ed25519::Signature::decode(&bytes[32 + INVITE_NONCE_LEN..])
+    let mut pos = 32 + INVITE_NONCE_LEN;
+    let target = ed25519::PublicKey::decode(&bytes[pos..pos + 32])
+        .map_err(|e| format!("invite token target: {e}"))?;
+    pos += 32;
+    let role = InviteRole::from_u8(bytes[pos])?;
+    pos += 1;
+    let expires_unix_secs = u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
+    pos += 8;
+    let sig = ed25519::Signature::decode(&bytes[pos..])
         .map_err(|e| format!("invite token signature: {e}"))?;
-    Ok(InviteToken { issuer, nonce, sig })
+    Ok(InviteToken {
+        issuer,
+        nonce,
+        target,
+        role,
+        expires_unix_secs,
+        sig,
+    })
 }
 
 /// persist the token a `join` received beside the descriptor (0600 like the
@@ -364,14 +402,13 @@ pub fn encode_invite(
     token: &InviteToken,
     wireguard: Option<&InviteWireGuard>,
     fronts: &[Front],
-    expires_unix_secs: u64,
     signer: &ed25519::PrivateKey,
 ) -> Result<String, String> {
     use base64::Engine as _;
     if signer.public_key() != token.issuer {
         return Err("invite envelope must be signed by the token's issuer".into());
     }
-    let mut out = pack_invite(descriptor, token, wireguard, fronts, expires_unix_secs)?;
+    let mut out = pack_invite(descriptor, token, wireguard, fronts)?;
     let sig = signer.sign(INVITE_ENVELOPE_NAMESPACE, &out);
     out.extend_from_slice(sig.encode().as_ref());
     Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(out)))
@@ -513,7 +550,6 @@ fn pack_invite(
     token: &InviteToken,
     wireguard: Option<&InviteWireGuard>,
     fronts: &[Front],
-    expires_unix_secs: u64,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
 
@@ -574,7 +610,8 @@ fn pack_invite(
         Coordination::Private => 1,
     });
 
-    out.extend_from_slice(&expires_unix_secs.to_le_bytes());
+    // the token now carries its OWN expiry (no separate blob-level field) —
+    // decode enforces it from `token.expires_unix_secs`.
     out.extend_from_slice(&pack_invite_token(token));
 
     // the fronts block rides AFTER the fixed-length token, inside the signed
@@ -681,11 +718,13 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         other => return Err(format!("unknown coordination mode {other} in invite")),
     };
 
-    let expires_unix_secs = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
+    // the token carries its own expiry now (no separate blob-level field);
+    // enforce it against the injected clock right after unpacking.
+    let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
+    let expires_unix_secs = token.expires_unix_secs;
     if now_unix_secs >= expires_unix_secs {
         return Err("this invite has expired — ask for a fresh one".into());
     }
-    let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
 
     // the optional fronts block. A pre-feature blob has nothing after the
     // token (`r.done()`), decoding to an empty set; a feature blob carries a
@@ -823,14 +862,21 @@ mod tests {
         );
     }
 
-    /// mint + encode with the test defaults: issuer-signed, far-future expiry.
+    /// mint + encode with the test defaults: issuer-signed, targeting the
+    /// issuer's own key, Resident role, far-future expiry.
     fn encode_test_invite(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
-        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
-        encode_invite(d, &token, wireguard, &[], u64::MAX, issuer).expect("encode")
+        let token = mint_invite_token(
+            issuer,
+            d.genesis_namespace().as_bytes(),
+            &issuer.public_key(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
+        encode_invite(d, &token, wireguard, &[], issuer).expect("encode")
     }
 
     #[test]
@@ -921,8 +967,14 @@ mod tests {
         wireguard: Option<&InviteWireGuard>,
         fronts: &[Front],
     ) -> String {
-        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
-        encode_invite(d, &token, wireguard, fronts, u64::MAX, issuer).expect("encode")
+        let token = mint_invite_token(
+            issuer,
+            d.genesis_namespace().as_bytes(),
+            &issuer.public_key(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
+        encode_invite(d, &token, wireguard, fronts, issuer).expect("encode")
     }
 
     fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
@@ -1102,10 +1154,17 @@ mod tests {
             reach: vec![],
             coordination: None,
         };
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        // the token carries its OWN expiry now (no separate blob param).
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            &issuer.public_key(),
+            InviteRole::Resident,
+            1_000,
+        );
 
         // expiry is enforced at decode, deterministically via the injected clock.
-        let blob = encode_invite(&d, &token, None, &[], 1_000, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
         assert!(decode_invite_at(&blob, 999).is_ok());
         let err = decode_invite_at(&blob, 1_000).expect_err("expired");
         assert!(err.contains("expired"), "{err}");
@@ -1125,7 +1184,7 @@ mod tests {
         // an envelope signed by someone other than the token's issuer is
         // refused at encode (and would fail decode's issuer verify anyway).
         let outsider = ed25519::PrivateKey::from_seed(8);
-        assert!(encode_invite(&d, &token, None, &[], u64::MAX, &outsider).is_err());
+        assert!(encode_invite(&d, &token, None, &[], &outsider).is_err());
 
         // the old versioned prefixes are gone: a stale paste fails loudly
         // with re-mint guidance.
@@ -1185,7 +1244,13 @@ mod tests {
         // identity (endpoint None) — survive the signed envelope byte-for-byte.
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            &issuer.public_key(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
         let fronts = vec![
             Front {
                 member_key: [11u8; 32],
@@ -1200,8 +1265,7 @@ mod tests {
                 endpoint: None,
             },
         ];
-        let blob =
-            encode_invite(&d, &token, None, &fronts, u64::MAX, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, None, &fronts, &issuer).expect("encode");
         let invite = decode_invite(&blob).expect("decode");
         assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
     }
@@ -1214,10 +1278,15 @@ mod tests {
         // on a "missing" block.
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            &issuer.public_key(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
 
-        let empty_blob =
-            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let empty_blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
         let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
         assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
 
@@ -1233,7 +1302,6 @@ mod tests {
                 mesh_port: 1,
                 endpoint: None,
             }],
-            u64::MAX,
             &issuer,
         )
         .expect("encode");
@@ -1248,7 +1316,13 @@ mod tests {
         let dir = tmp("invitetoken");
         assert_eq!(load_invite_token(&dir).expect("absent is fine"), None);
         let issuer = ed25519::PrivateKey::from_seed(7);
-        let token = mint_invite_token(&issuer, b"net#00000000@feedface");
+        let token = mint_invite_token(
+            &issuer,
+            b"net#00000000@feedface",
+            &issuer.public_key(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
         save_invite_token(&dir, &token).expect("save");
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token));
     }
@@ -1269,20 +1343,20 @@ mod tests {
     fn invite_blob_id_is_the_content_hash_of_the_decoded_bytes() {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
-        let blob = encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let mint = || {
+            mint_invite_token(
+                &issuer,
+                d.genesis_namespace().as_bytes(),
+                &issuer.public_key(),
+                InviteRole::Resident,
+                u64::MAX,
+            )
+        };
+        let blob = encode_invite(&d, &mint(), None, &[], &issuer).expect("encode");
         let id = invite_blob_id(&blob).expect("id");
-        // stable under re-parse, changes when the blob changes.
+        // stable under re-parse, changes when the blob changes (fresh nonce).
         assert_eq!(id, invite_blob_id(&blob).unwrap());
-        let other = encode_invite(
-            &d,
-            &mint_invite_token(&issuer, d.genesis_namespace().as_bytes()),
-            None,
-            &[],
-            u64::MAX,
-            &issuer,
-        )
-        .unwrap();
+        let other = encode_invite(&d, &mint(), None, &[], &issuer).unwrap();
         assert_ne!(id, invite_blob_id(&other).unwrap());
         // the raw bytes re-wrap to the exact original blob (fetch/join path).
         assert_eq!(wrap_invite_bytes(&invite_blob_bytes(&blob).unwrap()), blob);

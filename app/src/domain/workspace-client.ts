@@ -128,17 +128,23 @@ export const workspaceLogTail = (id: string): Promise<LogTail> =>
 export const workspaceRuntimeFacts = (id: string): Promise<RuntimeFacts> =>
   invoke<RuntimeFacts>("workspace_runtime_facts", { id });
 
-/** Both shareable forms of a workspace invite. `short` is the
- *  coordinator-hosted `🦆://<name>/<id>` link (null when the coordinator was
- *  unreachable/refused); `blob` is the self-contained fallback that joins
- *  without any coordinator. */
+/** Both shareable forms of a workspace invite, LOCKED to `target` (the
+ *  invitee's join code / pubkey hex — every invite is targeted, no bearer
+ *  invites). `short` is the coordinator-hosted `🦆://<name>/<id>` link (null
+ *  when the coordinator was unreachable/refused); `blob` is the
+ *  self-contained fallback that joins without any coordinator. */
 export interface InviteForms {
   short: string | null;
   blob: string;
 }
 
-export const inviteBlob = (id: string): Promise<InviteForms> =>
-  invoke<InviteForms>("workspace_invite_blob", { id });
+export const inviteBlob = (id: string, target: string): Promise<InviteForms> =>
+  invoke<InviteForms>("workspace_invite_blob", { id, target });
+
+/** The invitee's JOIN CODE: pre-mint the identity a future join will adopt and
+ *  return its pubkey hex. Hand this to the inviter so the invite locks to it. */
+export const joinCode = (): Promise<string> =>
+  invoke<string>("workspace_join_code", {});
 
 /** The verified join requests parked joiners announced to this member's
  *  running node — what the Members view renders with an Approve button.

@@ -170,6 +170,19 @@ impl ValidatorRuntime<'_> {
                 return;
             }
         };
+        // expiry, on THIS member's wall clock — the gating check for the whole
+        // redemption path (consensus_time is block height on this chain, so no
+        // deterministic in-consensus wall clock exists; the joiner's own decode
+        // check only stops honest joiners). fatal: expiry is permanent.
+        if nat_traversal::now_secs() >= verified.expires_unix_secs {
+            send_reply(
+                false,
+                "invite expired — ask the inviter for a fresh one".into(),
+                None,
+                true,
+            );
+            return;
+        }
         // then membership: the issuer must still be a member (a
         // removed member's outstanding invites die with it), and a
         // joiner that already holds standing — VALIDATOR or
@@ -307,6 +320,10 @@ impl ValidatorRuntime<'_> {
                 lobby::LobbyMsg::JoinRequest { proof, .. } => proof.clone(),
                 _ => unreachable!("verified above"),
             },
+            // verify enforced target == joiner, so the joiner IS the target.
+            target: verified.joiner.as_ref().to_vec(),
+            role: verified.role.as_u8(),
+            expires_unix_secs: verified.expires_unix_secs,
         };
         let seq = *next_seq;
         *next_seq += 1;

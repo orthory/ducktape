@@ -796,10 +796,12 @@ function AdminActions({
   inviteBlob: string | null;
   inviteShort: string | null;
   pendingJoins: JoinRequest[];
-  onRevealInvite: () => void;
+  onRevealInvite: (target: string) => void;
   onAdmit: (pubkey: string) => void;
 }) {
   const [joinerKey, setJoinerKey] = useState("");
+  const [inviteeCode, setInviteeCode] = useState("");
+  const inviteeCodeNorm = normalizeKey(inviteeCode);
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const clean = normalizeKey(joinerKey);
@@ -842,22 +844,52 @@ function AdminActions({
               overflow: "hidden",
             }}
           >
-            <div style={{ padding: "12px 13px", display: "flex", gap: 12, alignItems: "center" }}>
+            <div style={{ padding: "12px 13px", display: "flex", flexDirection: "column", gap: 9 }}>
               <div style={{ minWidth: 0 }}>
                 <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
                   Invite a Member
                 </div>
                 <div style={{ marginTop: 2, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-                  Reveal the workspace invite blob for sharing. One invite admits one
-                  person — mint a fresh one per member.
+                  Every invite is locked to the invitee's join code (their device shows
+                  it on the join screen). Paste it, then reveal a fresh invite for that
+                  one person.
                 </div>
               </div>
-              <div style={{ marginLeft: "auto", flexShrink: 0 }}>
-                <HoverButton onClick={onRevealInvite} variant="dark">
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  aria-label="Invitee join code"
+                  value={inviteeCode}
+                  onChange={(event) => setInviteeCode(event.target.value)}
+                  placeholder="invitee join code (64 hex)"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    boxSizing: "border-box",
+                    border: `1px solid ${color.borderStrong}`,
+                    borderRadius: radius.sm,
+                    background: color.paper,
+                    color: color.inkSoft,
+                    font: `500 10.5px ${font.mono}`,
+                    padding: "8px 9px",
+                  }}
+                />
+                <HoverButton
+                  onClick={() => inviteeCodeNorm && onRevealInvite(inviteeCodeNorm)}
+                  variant="dark"
+                  disabled={!inviteeCodeNorm}
+                >
                   <Icon name="plus" size={13} />
                   {inviteBlob ? "Refresh invite" : "Reveal invite"}
                 </HoverButton>
               </div>
+              {inviteeCode.trim() && !inviteeCodeNorm ? (
+                <div style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>
+                  a join code is 64 hex characters
+                </div>
+              ) : null}
             </div>
             {inviteBlob ? (
               <div

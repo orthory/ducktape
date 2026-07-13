@@ -17,19 +17,25 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{INVITE_NONCE_LEN, InviteToken};
+use crate::config::{INVITE_NONCE_LEN, InviteRole, InviteToken};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LobbyMsg {
     /// "this key asks to join, invited by `issuer`" — the token's fields plus
-    /// the joiner key and its proof-of-possession, all raw bytes.
+    /// the joiner key and its proof-of-possession, all raw bytes. `target`,
+    /// `role`, and `expires_unix_secs` are the token's covered fields; verify
+    /// enforces `target == joiner`, so a blob holder cannot announce under a
+    /// key the invite was not minted for.
     JoinRequest {
         issuer: Vec<u8>,
         nonce: Vec<u8>,
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
+        target: Vec<u8>,
+        role: u8,
+        expires_unix_secs: u64,
     },
     /// a member's answer, purely informational for the parked node's logs:
     /// `recorded` means the request now awaits approval on that member.
@@ -80,6 +86,9 @@ pub fn join_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
+        target: token.target.as_ref().to_vec(),
+        role: token.role.as_u8(),
+        expires_unix_secs: token.expires_unix_secs,
     }
 }
 
@@ -90,6 +99,11 @@ pub struct VerifiedJoinRequest {
     pub joiner: ed25519::PublicKey,
     pub issuer: ed25519::PublicKey,
     pub nonce: [u8; INVITE_NONCE_LEN],
+    /// the token's role — `joiner` IS the target (verify enforced it), so no
+    /// separate target field is carried.
+    pub role: InviteRole,
+    /// the token's unix-seconds expiry, carried through to the redeem op.
+    pub expires_unix_secs: u64,
 }
 
 /// verify a wire join request against this network's binding: token issuer
@@ -103,6 +117,9 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
         token_sig,
         joiner,
         proof,
+        target,
+        role,
+        expires_unix_secs,
     } = msg
     else {
         return Err("not a join request".into());
@@ -111,6 +128,9 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
         .map_err(|e| format!("issuer key: {e}"))?;
     let joiner = ed25519::PublicKey::decode(joiner.as_slice())
         .map_err(|e| format!("joiner key: {e}"))?;
+    let target = ed25519::PublicKey::decode(target.as_slice())
+        .map_err(|e| format!("target key: {e}"))?;
+    let role = InviteRole::from_u8(*role)?;
     if nonce.len() != INVITE_NONCE_LEN {
         return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
     }
@@ -124,11 +144,25 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
     let token = InviteToken {
         issuer: issuer.clone(),
         nonce: nonce_arr,
+        target: target.clone(),
+        role,
+        expires_unix_secs: *expires_unix_secs,
         sig,
     };
+    // signature first (kills a tampered target/role/expiry), THEN the target
+    // lock (named BEFORE the proof check so the error names the real problem:
+    // a blob holder announcing under its own valid self-proof).
     if !crate::config::verify_invite_token(&token, binding) {
         return Err("invite token signature does not verify for this network".into());
     }
+    if target != joiner {
+        return Err(
+            "invite is locked to a different key — this invite was minted for someone else".into(),
+        );
+    }
+    // NO expiry check here: the lobby fn stays pure crypto (same division as
+    // the membership checks) — decode enforces wall-clock expiry, consensus
+    // enforces block-time expiry.
     if !crate::config::verify_join_proof(&joiner, binding, &token, &proof) {
         return Err("joiner proof-of-possession does not verify".into());
     }
@@ -136,6 +170,8 @@ pub fn verify_join_request(msg: &LobbyMsg, binding: &[u8]) -> Result<VerifiedJoi
         joiner,
         issuer,
         nonce: nonce_arr,
+        role,
+        expires_unix_secs: *expires_unix_secs,
     })
 }
 
@@ -164,6 +200,9 @@ pub struct IntroRequest {
     pub token_sig: Vec<u8>,
     pub joiner: Vec<u8>,
     pub proof: Vec<u8>,
+    pub target: Vec<u8>,
+    pub role: u8,
+    pub expires_unix_secs: u64,
     /// the joiner's X25519 WireGuard public key, raw.
     pub wg_public_key: Vec<u8>,
     /// the joiner's signature binding `wg_public_key` to its identity.
@@ -211,6 +250,9 @@ pub fn intro_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
+        target: token.target.as_ref().to_vec(),
+        role: token.role.as_u8(),
+        expires_unix_secs: token.expires_unix_secs,
         wg_public_key: wg_public_key.to_vec(),
         wg_sig: wg_sig.encode().as_ref().to_vec(),
     }
@@ -239,6 +281,9 @@ pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro,
             token_sig: msg.token_sig.clone(),
             joiner: msg.joiner.clone(),
             proof: msg.proof.clone(),
+            target: msg.target.clone(),
+            role: msg.role,
+            expires_unix_secs: msg.expires_unix_secs,
         },
         binding,
     )?;
@@ -272,11 +317,20 @@ mod tests {
 
     const BINDING: &[u8] = b"net#00000000@feedface";
 
+    /// mint targeting `target` with the far-future Resident defaults the lobby
+    /// tests use.
+    fn mint_for(
+        issuer: &ed25519::PrivateKey,
+        target: &ed25519::PublicKey,
+    ) -> InviteToken {
+        mint_invite_token(issuer, BINDING, target, InviteRole::Resident, u64::MAX)
+    }
+
     #[test]
     fn a_join_request_roundtrips_and_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_invite_token(&issuer, BINDING);
+        let token = mint_for(&issuer, &joiner.public_key());
         let msg = join_request(&joiner, BINDING, &token);
         let decoded = decode_msg(&encode_msg(&msg)).expect("roundtrip");
         assert_eq!(decoded, msg);
@@ -285,38 +339,80 @@ mod tests {
         assert_eq!(verified.joiner, joiner.public_key());
         assert_eq!(verified.issuer, issuer.public_key());
         assert_eq!(verified.nonce, token.nonce);
+        assert_eq!(verified.role, InviteRole::Resident);
+        assert_eq!(verified.expires_unix_secs, u64::MAX);
     }
 
     #[test]
-    fn a_foreign_binding_or_forged_key_is_refused() {
+    fn a_non_target_key_is_refused_by_name() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let target = ed25519::PrivateKey::from_seed(2);
+        let thief = ed25519::PrivateKey::from_seed(3);
+        let token = mint_for(&issuer, &target.public_key());
+        // the thief holds the blob and announces under its OWN key with a VALID
+        // self-proof — exactly the bearer hole this feature closes.
+        let msg = join_request(&thief, BINDING, &token);
+        let err = verify_join_request(&msg, BINDING).expect_err("refused");
+        assert!(err.contains("locked to a different key"), "{err}");
+        // the real target still verifies.
+        let msg = join_request(&target, BINDING, &token);
+        assert!(verify_join_request(&msg, BINDING).is_ok());
+    }
+
+    #[test]
+    fn a_non_target_key_is_refused_by_name_over_the_intro() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let target = ed25519::PrivateKey::from_seed(2);
+        let thief = ed25519::PrivateKey::from_seed(3);
+        let token = mint_for(&issuer, &target.public_key());
+        let msg = intro_request(&thief, BINDING, &token, [9u8; 32]);
+        let err = verify_intro(&msg, BINDING).expect_err("refused");
+        assert!(err.contains("locked to a different key"), "{err}");
+        let msg = intro_request(&target, BINDING, &token, [9u8; 32]);
+        assert!(verify_intro(&msg, BINDING).is_ok());
+    }
+
+    #[test]
+    fn a_foreign_binding_or_forged_proof_is_refused() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_invite_token(&issuer, BINDING);
+        let token = mint_for(&issuer, &joiner.public_key());
         let msg = join_request(&joiner, BINDING, &token);
 
         // another network refuses the same announce.
         assert!(verify_join_request(&msg, b"other-net").is_err());
 
-        // a substituted joiner key fails the proof-of-possession.
+        // target == joiner (the lock passes), but a proof signed by a DIFFERENT
+        // key fails the proof-of-possession. (a substituted JOINER key is the
+        // target-lock case, covered by `a_non_target_key_is_refused_by_name`.)
         let LobbyMsg::JoinRequest {
             issuer: i,
             nonce,
             token_sig,
-            proof,
+            joiner: j,
+            target,
+            role,
+            expires_unix_secs,
             ..
         } = msg
         else {
             unreachable!()
         };
+        let bad_proof = crate::config::sign_join_proof(
+            &ed25519::PrivateKey::from_seed(3),
+            BINDING,
+            &token,
+        );
+        use commonware_codec::Encode as _;
         let forged = LobbyMsg::JoinRequest {
             issuer: i,
             nonce,
             token_sig,
-            joiner: ed25519::PrivateKey::from_seed(3)
-                .public_key()
-                .as_ref()
-                .to_vec(),
-            proof,
+            joiner: j,
+            proof: bad_proof.encode().as_ref().to_vec(),
+            target,
+            role,
+            expires_unix_secs,
         };
         let err = verify_join_request(&forged, BINDING).expect_err("refused");
         assert!(err.contains("proof-of-possession"), "{err}");
@@ -337,7 +433,7 @@ mod tests {
     fn an_intro_roundtrips_verifies_and_pins_the_wireguard_key() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_invite_token(&issuer, BINDING);
+        let token = mint_for(&issuer, &joiner.public_key());
         let wg_key = [9u8; 32];
         let msg = intro_request(&joiner, BINDING, &token, wg_key);
         let decoded = decode_intro(&encode_intro(&msg)).expect("roundtrip");

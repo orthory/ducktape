@@ -61,19 +61,29 @@ fn config_path(flags: &std::collections::BTreeMap<String, String>) -> Result<Pat
     ))
 }
 
-/// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
-/// pubkey on stdout (scriptable); provenance on stderr.
+/// `keygen [--out <path>] [--dir <dir>]` — generate (or reuse) a persisted
+/// ed25519 identity. pubkey on stdout (scriptable); provenance on stderr.
+/// `--dir <dir>` mints (or reuses) `<dir>/identity.key`, creating the dir: this
+/// is the JOIN CODE an invitee hands the inviter so the invite can be locked to
+/// this key before the workspace joins anything.
 fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let out = PathBuf::from(
-        flags
-            .get("out")
-            .map(String::as_str)
-            .unwrap_or("identity.key"),
-    );
+    let out = match flags.get("dir") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            dir.join("identity.key")
+        }
+        None => PathBuf::from(
+            flags
+                .get("out")
+                .map(String::as_str)
+                .unwrap_or("identity.key"),
+        ),
+    };
     let (key, generated) = config::load_or_generate_identity(&out)?;
     println!("{}", hex_bytes(key.public_key().as_ref()));
     eprintln!(
@@ -211,6 +221,13 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
+    // every invite is locked to the ONE key it admits — no bearer invites.
+    let target = flags.get("target").ok_or(
+        "--target <invitee-pubkey-hex> is required: every invite is locked to \
+         the person it admits. the invitee gets their code from the app's \
+         join screen or `ducktape-node keygen --dir <workspace>`",
+    )?;
+    let target = config::decode_key(target)?;
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
@@ -369,13 +386,20 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .expect("clock is past the epoch")
         .as_secs()
         + ttl_days * 24 * 60 * 60;
-    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
+    // the expiry now lives INSIDE the token (signed), not as a separate blob
+    // field; the token is minted against the invitee's key with Resident role.
+    let token = config::mint_invite_token(
+        &key,
+        descriptor.genesis_namespace().as_bytes(),
+        &target,
+        config::InviteRole::Resident,
+        expires,
+    );
     let blob_string = config::encode_invite(
         &invite_descriptor,
         &token,
         wireguard.as_ref(),
         &fronts,
-        expires,
         &key,
     )?;
     println!("{blob_string}");
@@ -1260,6 +1284,19 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
+    // mint (or reuse) the identity FIRST — before touching the directory shape —
+    // so a target mismatch aborts the join loudly, right here, instead of
+    // parking a node that will only ever be refused at the lobby.
+    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+    let me_hex = hex_bytes(key.public_key().as_ref());
+    if invite.token.target != key.public_key() {
+        return Err(format!(
+            "this invite is locked to a different key.\n  invite target: {}\n  this workspace: {me_hex}\n\
+             hand the inviter THIS key (the join code) and ask for a fresh invite.",
+            hex_bytes(invite.token.target.as_ref()),
+        )
+        .into());
+    }
     config::guard_join_descriptor(&dir, &descriptor)?;
     // plumbing merges: explicit flags win, an existing node.toml's values
     // (network- or dev-shape) survive, defaults fill the rest. computed
@@ -1338,8 +1375,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     descriptor.save(&dir.join("network.toml"))?;
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
-    let me_hex = hex_bytes(key.public_key().as_ref());
+    // identity was minted + target-checked at the top of the join.
     config::write_node_toml(&dir, &plumbing)?;
     // the capability the joining node redeems automatically; a re-join with a
     // fresh invite replaces a stale/spent one.

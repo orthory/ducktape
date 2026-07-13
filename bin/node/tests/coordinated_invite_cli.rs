@@ -18,6 +18,19 @@ fn command_output(out: &std::process::Output) -> String {
     )
 }
 
+/// mint (or reuse) `<dir>/identity.key` via the `keygen` verb and return its
+/// pubkey hex — the join code every targeted invite locks to. `join --dir <dir>`
+/// reuses this identity, so the join-side target self-check passes.
+fn keygen(dir: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args(["keygen", "--dir"])
+        .arg(dir)
+        .output()
+        .expect("run keygen");
+    assert!(out.status.success(), "keygen failed:\n{}", command_output(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// grab `n` distinct free localhost ports by holding every listener at once
 /// (sequential bind-drop can hand the same port back twice).
 fn alloc_ports(n: usize) -> Vec<u16> {
@@ -156,9 +169,11 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
         command_output(&init)
     );
 
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -250,9 +265,11 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     reachability::store::save(&storage.join("mesh-state.json"), &mesh)
         .expect("seed mesh-state.json");
 
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -328,9 +345,11 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
 
     // a default founder advertises the overlay ULA (not a routable host), so its
     // WireGuard bootstrap is coordinated-only — no underlay endpoint baked in.
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -561,11 +580,14 @@ fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
         .expect("run init");
     assert!(init.status.success(), "init failed:\n{}", command_output(&init));
 
-    // mint a SHORT invite: publishes the blob to A, prints the full blob then
-    // the short URL as the LAST line.
+    // mint a SHORT invite locked to the friend's pre-generated key: publishes
+    // the blob to A, prints the full blob then the short URL as the LAST line.
+    let friend = dir.path().join("friend");
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .arg("--short")
         .output()
         .expect("run invite --short");
@@ -589,8 +611,8 @@ fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
         command_output(&invite)
     );
 
-    // join via the SHORT URL, pointed at A: fetch + materialize the workspace.
-    let friend = dir.path().join("friend");
+    // join via the SHORT URL, pointed at A: fetch + materialize the workspace
+    // (the friend dir already holds the targeted identity from keygen above).
     let join = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args([
             "join",
@@ -645,7 +667,12 @@ fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
 
     // the FULL blob still joins with no coordinator at all — the universal
     // fallback the loud error tells the user about.
+    // invites are targeted: friend3 must present the SAME key the invite was
+    // minted for, so seed it with the friend's identity before joining.
     let friend3 = dir.path().join("friend3");
+    std::fs::create_dir_all(&friend3).expect("create friend3");
+    std::fs::copy(friend.join("identity.key"), friend3.join("identity.key"))
+        .expect("seed friend3 with the targeted identity");
     let join_full = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args([
             "join",

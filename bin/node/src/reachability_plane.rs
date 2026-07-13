@@ -58,6 +58,19 @@ where
             return true;
         }
     };
+    // expiry, on this member's wall clock: an expired token must not obtain a
+    // tunnel either. `msg.expires_unix_secs` is signature-covered (verify just
+    // proved it), so trusting the wire field here is trusting the token.
+    if nat_traversal::now_secs() >= msg.expires_unix_secs {
+        if path == IntroPath::Direct {
+            ack(ack_bytes(
+                false,
+                "invite expired — ask the inviter for a fresh one".into(),
+            ))
+            .await;
+        }
+        return true;
+    }
     let Some(cmds) = cmds.upgrade() else {
         return false;
     };

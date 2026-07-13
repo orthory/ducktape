@@ -404,6 +404,14 @@ fn workspace_join_blocking(
     let id = unique_id(&name, &reg.workspaces);
     let dir = workspaces_dir(&app)?.join(&id);
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
+    // adopt the staged join identity (the join code the invitee handed the
+    // inviter) so `cmd_join` reuses it and its target self-check passes. the
+    // staging slot is consumed exactly once.
+    let staged = workspaces_dir(&app)?.join(".pending-join").join("identity.key");
+    if staged.exists() {
+        fs::rename(&staged, dir.join("identity.key"))
+            .map_err(|e| format!("adopt staged join identity: {e}"))?;
+    }
     let ports = allocate_ports(&reserved_ports(&reg))?;
 
     // bind dual-stack, but pass NO --advertised and NO --listen: a joiner
@@ -500,23 +508,31 @@ pub async fn workspace_invite_blob(
     window: crate::rt::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
     id: String,
+    target: String,
 ) -> Result<InviteForms, String> {
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || workspace_invite_blob_blocking(app, id))
+        .run(move || workspace_invite_blob_blocking(app, id, target))
         .await
 }
 
 fn workspace_invite_blob_blocking(
     app: crate::rt::AppHandle,
     id: String,
+    target: String,
 ) -> Result<InviteForms, String> {
+    let target = target.trim().to_string();
+    if target.is_empty() {
+        return Err(
+            "paste the invitee's join code — every invite is locked to the key it admits".into(),
+        );
+    }
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
     let cfg_s = cfg.to_string_lossy().to_string();
-    match run_verb(&["invite", "--config", &cfg_s, "--short"]) {
+    match run_verb(&["invite", "--config", &cfg_s, "--target", &target, "--short"]) {
         Ok(out) => {
             // `--short` prints the full blob line, then the short URL as the
             // LAST line. Recover the blob line (`🦆…`, but never the `🦆://` URL).
@@ -534,11 +550,34 @@ fn workspace_invite_blob_blocking(
             })
         }
         // coordinator unreachable/refusing: the full blob must still work.
-        Err(_) => run_verb(&["invite", "--config", &cfg_s]).map(|out| InviteForms {
-            short: None,
-            blob: last_line(&out),
-        }),
+        Err(_) => {
+            run_verb(&["invite", "--config", &cfg_s, "--target", &target]).map(|out| InviteForms {
+                short: None,
+                blob: last_line(&out),
+            })
+        }
     }
+}
+
+/// the invitee's JOIN CODE: pre-mint the identity a future `workspace_join`
+/// will adopt, in a one-slot staging dir, and return its pubkey. the code
+/// handed to the inviter IS the key the invite locks to. repeat calls reuse the
+/// same staged identity (keygen semantics).
+#[tauri::command]
+pub async fn workspace_join_code(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            let staging = workspaces_dir(&app)?.join(".pending-join");
+            fs::create_dir_all(&staging).map_err(|e| format!("create {staging:?}: {e}"))?;
+            run_verb(&["keygen", "--dir", &staging.to_string_lossy()]).map(|out| last_line(&out))
+        })
+        .await
 }
 
 /// the join requests parked joiners delivered to this member's running node
