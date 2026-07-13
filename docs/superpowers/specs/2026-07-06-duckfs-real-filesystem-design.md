@@ -462,7 +462,10 @@ Settled in the storage-plane review; these amend the sections above.
      scheduled one).
 - **S3-shaped facade** over the existing module (PUT = one-change commit,
   GET = Read, LIST = Ls) is the sanctioned "replicated S3" surface — new
-  endpoints only, no engine change.
+  endpoints only, no engine change. SHIPPED:
+  `PUT|GET|DELETE /v1/files/object/{path}` (body cap 64 MiB, last-writer-wins
+  like S3, delete idempotent); listing stays `/v1/files/ls`. Rides the
+  local-trust lane like the rest of this surface.
 
 ## Implementation shape (for the planning step)
 
