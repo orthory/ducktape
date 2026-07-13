@@ -674,7 +674,7 @@ impl Host {
         let any_armed = modules.iter().any(|m| {
             m.pending
                 .as_ref()
-                .is_some_and(|p| height >= p.activation_height)
+                .is_some_and(|p| p.ready && height >= p.activation_height)
         });
         any_armed.then(|| Msg {
             target: MODREG_MODULE_ID.into(),
@@ -748,7 +748,9 @@ impl Host {
             // the SAME arm predicate as modreg::handle_advance (height >=
             // activation_height): pending-if-armed, else the committed active hash.
             let target = match m.pending {
-                Some(p) if height >= p.activation_height => p.code_hash,
+                // the SAME arm predicate as modreg: ready (full byte receipt,
+                // latched in committed state) AND the height floor reached.
+                Some(p) if p.ready && height >= p.activation_height => p.code_hash,
                 _ => m.active_code_hash,
             };
             // only reconcile a module this node actually runs AS a hot-swappable

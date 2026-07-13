@@ -27,6 +27,19 @@ pub struct ScheduledSwap {
     pub activation_height: u64,
     /// the 32-byte sha256 of the target component bytes.
     pub code_hash: Vec<u8>,
+    /// validator pubkeys that verified the target BYTES locally and signaled
+    /// (`ModregMsg::SignalReady`), strictly increasing. committed state, in
+    /// the root like everything else here.
+    #[serde(default)]
+    pub readiness: Vec<Vec<u8>>,
+    /// LATCHED true the moment `readiness` covers the whole boundary member
+    /// set (R = n, evaluated at signal time). the arm predicate is
+    /// `ready && activation_height <= height` — a swap never activates onto
+    /// a validator set that has not demonstrably received the bytes. a
+    /// member admitted AFTER the latch heals through the fetch lane
+    /// (fail-closed backstop) rather than blocking the swap.
+    #[serde(default)]
+    pub ready: bool,
 }
 
 /// what an ingested op DOES to modreg. the ORIGIN is the authority, not the
@@ -49,9 +62,14 @@ pub enum ModregMsg {
     },
     /// clear a pending swap before its boundary. `Origin::Module | System` only.
     Cancel { name: String, module_id: String },
+    /// a validator records that it HOLDS (verified locally) the pending
+    /// swap's component bytes. `Origin::External(validator)` only, member-
+    /// gated against the valset; the last covering signal latches the swap
+    /// `ready`.
+    SignalReady { name: String, module_id: String },
     /// the system-injected boundary tick, keyed on `env.height`: activate every
-    /// pending swap whose `activation_height` has been reached. `Origin::System`
-    /// only.
+    /// pending swap that is `ready` and whose `activation_height` has been
+    /// reached. `Origin::System` only.
     Advance,
 }
 

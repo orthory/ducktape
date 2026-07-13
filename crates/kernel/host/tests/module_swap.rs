@@ -58,11 +58,18 @@ impl CodeSource for MapSource {
     }
 }
 
-/// a host with the code registry + the wasm `hello` module (running v1),
-/// with v1 registered as hello's genesis-active code.
+/// the one validator key the readiness gate counts in these proofs.
+const MEMBER: [u8; 32] = [7; 32];
+
+/// a host with the code registry, a real valset (one member — the readiness
+/// denominator), and the wasm `hello` module (running v1), with v1 registered
+/// as hello's genesis-active code.
 fn host_with_wasm() -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Modreg::new(MODREG_MODULE_ID)));
+    host.register(Box::new(Modreg::new(MODREG_MODULE_ID, "valset")));
+    let mut valset = valset::Valset::new("valset");
+    valset.insert(MEMBER.to_vec());
+    host.register(Box::new(valset));
     host.register(Box::new(
         WasmModule::from_bytes("hello", HELLO_V1).expect("load v1"),
     ));
@@ -101,6 +108,15 @@ fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
         module_id: "hello".into(),
         activation_height,
         code_hash,
+    })
+}
+
+/// the member's byte-receipt signal: what `code_announce` self-submits once
+/// the component is verified-resident. latches the swap `ready` (R = n = 1).
+fn signal_ready_msg() -> Msg {
+    modreg_msg(&ModregMsg::SignalReady {
+        name: "hello-v2".into(),
+        module_id: "hello".into(),
     })
 }
 
@@ -145,6 +161,9 @@ fn run_swap_scenario() -> (Host, StateRoot) {
 
     // governance-shaped schedule: swap hello -> v2 at H.
     submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    // the (sole) member verified the bytes and signals — the swap latches
+    // ready; from here activation is the height floor alone.
+    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
 
     // below H nothing arms: realization is a no-op on the running code.
     realize(&mut host, H - 1, &src).expect("below H is Ok");
@@ -207,8 +226,11 @@ fn deterministic_across_nodes() {
 fn fails_closed_on_missing_or_tampered_bytes() {
     let mut host = host_with_wasm();
     submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
 
-    // missing bytes: the source only has v1.
+    // missing bytes: the source only has v1 (this node SIGNALED honestly in
+    // consensus but its local store lost the bytes — the boundary still
+    // refuses rather than forking).
     let missing = MapSource::with(&[HELLO_V1]);
     let err = realize(&mut host, H, &missing).expect_err("absent bytes fail closed");
     assert!(matches!(err, Error::Module(m) if m.contains("absent")));
@@ -239,7 +261,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     // verify-then-adopt state-sync path), wasm module freshly wired from
     // GENESIS (v1) code.
     let modreg_root = source.module_root(MODREG_MODULE_ID).expect("modreg root");
-    let mut joined_modreg = Modreg::new(MODREG_MODULE_ID);
+    let mut joined_modreg = Modreg::new(MODREG_MODULE_ID, "valset");
     // reach the committed snapshot through the module's own state-sync surface,
     // exactly as a joiner would receive it.
     let handle = {
@@ -274,6 +296,24 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     realize(&mut joiner, H + 2, &src).expect("joiner reconciles");
     submit(&mut joiner, H + 2, Origin::External(vec![7; 32]), inc_msg());
     assert_eq!(count(&joiner), 100, "the joiner runs v2 (+100), not stale v1");
+}
+
+/// the receipt gate at the host seam: a scheduled swap whose readiness never
+/// covered the member set does NOT arm past its height — realization is a
+/// clean no-op (never a fail-closed error, never a swap) and the drain
+/// injects no Advance, however far the height runs.
+#[test]
+fn unready_swap_never_arms_past_its_height() {
+    let mut host = host_with_wasm();
+    submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    // no SignalReady: the bytes never provably reached the member set.
+    let src = MapSource::with(&[HELLO_V1, HELLO_V2]);
+    realize(&mut host, H + 100, &src).expect("unready is a no-op, not an error");
+    submit(&mut host, H + 100, Origin::External(vec![7; 32]), inc_msg());
+    assert_eq!(count(&host), 1, "still v1: receipt-gated swaps wait for R=n");
+    let (active, pending) = active_hash(&host);
+    assert_eq!(active, sha(HELLO_V1), "committed active hash untouched");
+    assert!(pending, "the pending swap keeps waiting for its receipts");
 }
 
 /// INERT without the registry: a host with only the wasm module realizes nothing

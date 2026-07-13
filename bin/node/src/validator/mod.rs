@@ -4,6 +4,7 @@
 
 pub(crate) mod announce;
 mod boot;
+pub(crate) mod code_announce;
 mod engine;
 mod run;
 mod wiring;
@@ -262,7 +263,7 @@ pub(crate) async fn run_validator(
     // before a boundary can fail closed on it.
     recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
         blobs.clone(),
-        blob_client,
+        blob_client.clone(),
         crate::constants::MAX_MODULE_CODE_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )));
@@ -297,6 +298,7 @@ pub(crate) async fn run_validator(
         gateway_book,
         media_peers,
         blob_peers,
+        blob_client,
         reach_cmd,
         lobby_tx,
         relay_tx,

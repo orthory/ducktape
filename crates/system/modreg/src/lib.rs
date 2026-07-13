@@ -9,17 +9,21 @@
 //! `Advance` boundary tick activates every swap whose `activation_height` has
 //! been reached.
 //!
-//! ## height-only activation is a pure derivation
+//! ## activation = height floor AND full byte receipt
 //!
-//! unlike `upgrade`'s R=n readiness gate, a code swap arms purely on height:
-//! `activation_height <= env.height`. the new component arrives IN-BAND as the
-//! consensus-committed hash and the runtime is universal + pinned, so there is
-//! no per-node "installed the binary" signal to wait on. the arm set is a pure,
-//! total function of COMMITTED state + height — identical on every node (live,
-//! replay, state-sync). the `handle_cancel` guard (`height < activation_height`)
-//! forbids a same-block cancel of an arming swap, so deciding the arm set over
-//! COMMITTED (frozen end-of-(H-1)) state can never diverge from the host's
-//! out-of-block `ArmedAt` read, which realizes the registry swap.
+//! a swap arms only when `ready && activation_height <= env.height`. `ready`
+//! mirrors `upgrade`'s R=n readiness gate for the BYTES: each validator
+//! verifies the target component locally and self-submits a `SignalReady`;
+//! the signal that completes coverage of the boundary member set LATCHES the
+//! committed `ready` flag (in-block, where the valset is queryable). the arm
+//! set thus stays a pure, total function of COMMITTED modreg state + height —
+//! identical on every node (live, replay, state-sync) — while guaranteeing
+//! no swap ever activates onto a validator set that has not demonstrably
+//! received the code. the `handle_cancel` guard (`height <
+//! activation_height`) forbids a same-block cancel of an arming swap, so
+//! deciding the arm set over COMMITTED (frozen end-of-(H-1)) state can never
+//! diverge from the host's out-of-block `ArmedAt` read, which realizes the
+//! registry swap.
 //!
 //! ## code bytes are out-of-band
 //!
@@ -65,17 +69,27 @@ struct ModregState {
 
 pub struct Modreg {
     id: ModuleId,
+    /// the valset module the readiness denominator (boundary member set)
+    /// comes from, via host-routed queries — exactly like `upgrade`.
+    valset_id: ModuleId,
     committed: ModregState,
     staged: Option<ModregState>,
 }
 
 impl Modreg {
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    pub fn new(id: impl Into<ModuleId>, valset_id: impl Into<ModuleId>) -> Self {
         Self {
             id: id.into(),
+            valset_id: valset_id.into(),
             committed: ModregState::default(),
             staged: None,
         }
+    }
+
+    /// the CURRENT boundary member set: the valset module's staged-over-
+    /// committed projection, via the shared `valset::members` read.
+    async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
+        valset::members(ctx, &self.valset_id).await
     }
 
     /// GENESIS seeding: install a module's initial active code hash directly
@@ -199,6 +213,8 @@ impl Modreg {
             name,
             activation_height,
             code_hash,
+            readiness: Vec::new(),
+            ready: false,
         });
         self.staged = Some(next);
         Ok(())
@@ -236,6 +252,56 @@ impl Modreg {
         Ok(())
     }
 
+    async fn handle_signal_ready(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        name: String,
+        module_id: String,
+    ) -> Result<(), Error> {
+        // validator-origin only: the authenticated frame origin attributes
+        // the signal to exactly one member key (mirrors upgrade).
+        let pubkey = match &ctx.env().origin {
+            Origin::External(key) => key.clone(),
+            other => {
+                return Err(Error::Module(format!(
+                    "SignalReady requires an external validator submitter, got {other:?}"
+                )));
+            }
+        };
+        let members = self.members(ctx).await?;
+        if !members.iter().any(|m| m == &pubkey) {
+            return Err(Error::Module(
+                "SignalReady submitter is not a current validator-set member".into(),
+            ));
+        }
+        let mut next = self.read().clone();
+        let entry = next
+            .modules
+            .get_mut(&module_id)
+            .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
+        let swap = match &mut entry.pending {
+            Some(swap) if swap.name == name => swap,
+            _ => {
+                return Err(Error::Module(
+                    "SignalReady does not match the pending swap (name/module)".into(),
+                ));
+            }
+        };
+        // idempotent per pubkey; the readiness list stays strictly increasing
+        // (one committed state has exactly one encoding).
+        if let Err(at) = swap.readiness.binary_search(&pubkey) {
+            swap.readiness.insert(at, pubkey);
+        }
+        // the covering signal LATCHES ready (R = n at this instant). a member
+        // admitted later heals through the fetch lane, never un-arms a swap.
+        if !members.is_empty() && members.iter().all(|m| swap.readiness.binary_search(m).is_ok())
+        {
+            swap.ready = true;
+        }
+        self.staged = Some(next);
+        Ok(())
+    }
+
     async fn handle_advance(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
         Self::require_system(ctx)?;
         let height = ctx.env().height;
@@ -251,7 +317,7 @@ impl Modreg {
             .filter(|(_, e)| {
                 e.pending
                     .as_ref()
-                    .is_some_and(|p| height >= p.activation_height)
+                    .is_some_and(|p| p.ready && height >= p.activation_height)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -293,7 +359,7 @@ impl Modreg {
             .iter()
             .filter_map(|(id, e)| {
                 e.pending.as_ref().and_then(|p| {
-                    (height >= p.activation_height).then(|| ArmedSwap {
+                    (p.ready && height >= p.activation_height).then(|| ArmedSwap {
                         module_id: id.clone(),
                         code_hash: p.code_hash.clone(),
                     })
@@ -318,6 +384,11 @@ impl Modreg {
                     push_bytes(&mut out, swap.name.as_bytes());
                     out.extend_from_slice(&swap.activation_height.to_le_bytes());
                     push_bytes(&mut out, &swap.code_hash);
+                    out.push(u8::from(swap.ready));
+                    out.extend_from_slice(&(swap.readiness.len() as u64).to_le_bytes());
+                    for key in &swap.readiness {
+                        push_bytes(&mut out, key);
+                    }
                 }
             }
         }
@@ -382,6 +453,9 @@ impl Module for Modreg {
                     .await
             }
             ModregMsg::Cancel { name, module_id } => self.handle_cancel(ctx, name, module_id).await,
+            ModregMsg::SignalReady { name, module_id } => {
+                self.handle_signal_ready(ctx, name, module_id).await
+            }
             ModregMsg::Advance => self.handle_advance(ctx).await,
         }
     }
@@ -475,10 +549,39 @@ fn decode_state(bytes: &[u8]) -> Result<ModregState, Error> {
                 if code_hash.len() != CODE_HASH_LEN {
                     return Err(Error::Module("snapshot: bad pending hash length".into()));
                 }
+                let ready = match take_u8(&mut buf)? {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(Error::Module(format!("snapshot: bad ready tag {other}")));
+                    }
+                };
+                let signals = take_u64(&mut buf)?;
+                // each key costs at least its 8-byte length prefix.
+                if signals > (buf.len() / 8) as u64 {
+                    return Err(Error::Module(
+                        "snapshot readiness count exceeds buffer".into(),
+                    ));
+                }
+                let mut readiness = Vec::with_capacity(signals as usize);
+                let mut prev_key: Option<Vec<u8>> = None;
+                for _ in 0..signals {
+                    let key = take_vec(&mut buf)?;
+                    // strictly increasing keys: one state, one encoding.
+                    if prev_key.as_ref().is_some_and(|p| p >= &key) {
+                        return Err(Error::Module(
+                            "snapshot readiness keys must be strictly increasing".into(),
+                        ));
+                    }
+                    prev_key = Some(key.clone());
+                    readiness.push(key);
+                }
                 Some(ScheduledSwap {
                     name,
                     activation_height,
                     code_hash,
+                    readiness,
+                    ready,
                 })
             }
             other => return Err(Error::Module(format!("snapshot: bad pending tag {other}"))),
@@ -501,6 +604,8 @@ mod tests {
 
     struct TestCtx {
         env: sdk::Env,
+        /// what the stubbed valset answers a Validators query with.
+        members: Vec<Vec<u8>>,
     }
     impl TestCtx {
         fn new(origin: Origin, height: u64) -> Self {
@@ -512,7 +617,12 @@ mod tests {
                     origin,
                     me: "modreg".into(),
                 },
+                members: vec![member(1)],
             }
+        }
+        fn with_members(mut self, members: Vec<Vec<u8>>) -> Self {
+            self.members = members;
+            self
         }
     }
     #[async_trait::async_trait(?Send)]
@@ -523,11 +633,25 @@ mod tests {
         fn module_root(&self, _t: &str) -> Option<StateRoot> {
             None
         }
-        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
+        async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+            if target == "valset"
+                && matches!(
+                    valset::decode_query(req),
+                    Ok(valset::ValsetQuery::Validators)
+                )
+            {
+                return Ok(valset::encode_reply(&valset::ValsetReply::Validators(
+                    self.members.clone(),
+                )));
+            }
             Err(Error::QueryUnsupported)
         }
         fn emit_msg(&mut self, _m: Msg) {}
         fn emit_event(&mut self, _e: sdk::Event) {}
+    }
+
+    fn member(seed: u8) -> Vec<u8> {
+        vec![seed; 32]
     }
 
     fn hash(seed: u8) -> Vec<u8> {
@@ -535,7 +659,7 @@ mod tests {
     }
 
     fn mr() -> Modreg {
-        Modreg::new("modreg")
+        Modreg::new("modreg", "valset")
     }
 
     fn msg(m: ModregMsg) -> Msg {
@@ -596,6 +720,18 @@ mod tests {
             name: name.into(),
             module_id: module_id.into(),
         })
+    }
+    fn signal(module_id: &str, name: &str) -> Msg {
+        msg(ModregMsg::SignalReady {
+            name: name.into(),
+            module_id: module_id.into(),
+        })
+    }
+    /// drive the full single-member readiness latch for a pending swap.
+    fn make_ready(mr: &mut Modreg, module_id: &str, name: &str) {
+        let mut ext = TestCtx::new(Origin::External(member(1)), 0);
+        run(mr, &mut ext, &signal(module_id, name)).unwrap();
+        commit(mr);
     }
     fn advance() -> Msg {
         msg(ModregMsg::Advance)
@@ -741,6 +877,7 @@ mod tests {
         let mut sys = TestCtx::new(Origin::System, 0);
         run(&mut mr, &mut sys, &schedule("hello", "v2", 10, 2)).unwrap();
         commit(&mut mr);
+        make_ready(&mut mr, "hello", "v2");
 
         // below activation: no-op.
         let root_before = mr.root();
@@ -773,6 +910,8 @@ mod tests {
         commit(&mut mr);
         run(&mut mr, &mut sys, &schedule("b", "v2", 20, 2)).unwrap();
         commit(&mut mr);
+        make_ready(&mut mr, "a", "v2");
+        make_ready(&mut mr, "b", "v2");
 
         assert!(armed_at(&mr, 9).is_empty());
         let at10 = armed_at(&mr, 10);
@@ -780,6 +919,92 @@ mod tests {
         assert_eq!(at10[0].module_id, "a");
         assert_eq!(at10[0].code_hash, hash(2));
         assert_eq!(armed_at(&mr, 20).len(), 2, "both armed by height 20");
+    }
+
+    // ---- the readiness gate ---------------------------------------------------
+
+    #[test]
+    fn no_readiness_means_no_arm_however_high_the_height() {
+        let mut mr = mr();
+        register(&mut mr, "hello", 1);
+        let mut sys = TestCtx::new(Origin::System, 0);
+        run(&mut mr, &mut sys, &schedule("hello", "v2", 10, 2)).unwrap();
+        commit(&mut mr);
+
+        assert!(armed_at(&mr, u64::MAX).is_empty(), "unready never arms");
+        let mut late = TestCtx::new(Origin::System, 999);
+        run(&mut mr, &mut late, &advance()).unwrap();
+        commit(&mut mr);
+        assert_eq!(status(&mr)[0].active_code_hash, hash(1), "no swap");
+        assert!(status(&mr)[0].pending.is_some(), "pending survives");
+    }
+
+    #[test]
+    fn partial_coverage_does_not_latch_full_coverage_does() {
+        let mut mr = mr();
+        register(&mut mr, "hello", 1);
+        let mut sys = TestCtx::new(Origin::System, 0);
+        run(&mut mr, &mut sys, &schedule("hello", "v2", 10, 2)).unwrap();
+        commit(&mut mr);
+
+        let two = vec![member(1), member(2)];
+        // first of two members: recorded, not latched.
+        let mut m1 =
+            TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
+        run(&mut mr, &mut m1, &signal("hello", "v2")).unwrap();
+        commit(&mut mr);
+        let pending = status(&mr)[0].pending.clone().unwrap();
+        assert_eq!(pending.readiness, vec![member(1)]);
+        assert!(!pending.ready);
+        assert!(armed_at(&mr, 10).is_empty());
+
+        // re-signal is idempotent.
+        let mut again =
+            TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
+        run(&mut mr, &mut again, &signal("hello", "v2")).unwrap();
+        commit(&mut mr);
+        assert_eq!(status(&mr)[0].pending.clone().unwrap().readiness.len(), 1);
+
+        // the covering signal latches.
+        let mut m2 = TestCtx::new(Origin::External(member(2)), 0).with_members(two);
+        run(&mut mr, &mut m2, &signal("hello", "v2")).unwrap();
+        commit(&mut mr);
+        assert!(status(&mr)[0].pending.clone().unwrap().ready);
+        assert_eq!(armed_at(&mr, 10).len(), 1, "ready + height arms");
+    }
+
+    #[test]
+    fn signal_gates_origin_membership_and_identity() {
+        let mut mr = mr();
+        register(&mut mr, "hello", 1);
+        let mut sys = TestCtx::new(Origin::System, 0);
+        run(&mut mr, &mut sys, &schedule("hello", "v2", 10, 2)).unwrap();
+        commit(&mut mr);
+
+        // system/module origins rejected.
+        assert!(matches!(
+            run(&mut mr, &mut sys, &signal("hello", "v2")),
+            Err(Error::Module(_))
+        ));
+        // a non-member key rejected.
+        let mut stranger = TestCtx::new(Origin::External(member(9)), 0);
+        assert!(matches!(
+            run(&mut mr, &mut stranger, &signal("hello", "v2")),
+            Err(Error::Module(_))
+        ));
+        // a wrong swap name rejected.
+        let mut m1 = TestCtx::new(Origin::External(member(1)), 0);
+        assert!(matches!(
+            run(&mut mr, &mut m1, &signal("hello", "vX")),
+            Err(Error::Module(_))
+        ));
+        // and readiness survives snapshot/install byte-for-byte.
+        make_ready(&mut mr, "hello", "v2");
+        let bytes = mr.snapshot();
+        let mut dst = Modreg::new("modreg", "valset");
+        dst.install(&bytes, mr.root()).unwrap();
+        assert_eq!(dst.committed, mr.committed);
+        assert!(status(&dst)[0].pending.clone().unwrap().ready);
     }
 
     // ---- cancel -------------------------------------------------------------
@@ -840,6 +1065,7 @@ mod tests {
         let mut sys = TestCtx::new(Origin::System, 0);
         run(&mut src, &mut sys, &schedule("hello", "v2", 10, 2)).unwrap();
         commit(&mut src);
+        make_ready(&mut src, "hello", "v2");
         let mut at = TestCtx::new(Origin::System, 10);
         run(&mut src, &mut at, &advance()).unwrap();
         commit(&mut src);

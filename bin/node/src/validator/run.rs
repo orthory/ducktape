@@ -42,6 +42,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) lobby_tx: super::MeshSender,
     pub(super) relay_tx: super::MeshSender,
@@ -83,6 +84,7 @@ struct ValidatorRuntime<'a> {
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     lobby_tx: super::MeshSender,
     relay_tx: super::MeshSender,
@@ -126,6 +128,11 @@ struct ValidatorRuntime<'a> {
     last_nudge: std::time::Instant,
     workers: Vec<Box<dyn host::worker::Worker>>,
     signaller: ReadinessSignaller,
+    code_signaller: super::code_announce::CodeReadinessSignaller,
+    /// completed pending-swap code fetches, reaped at each readiness pump so
+    /// a failed fetch retries next tick (the sender rides in each task).
+    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
+    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
     announcer: CapabilityAnnouncer,
     upgrade_armed_latch: Option<(String, u32)>,
     upgrade_pending_seen: Option<String>,
@@ -144,6 +151,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         gateway_book,
         media_peers,
         blob_peers,
+        blob_client,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -300,6 +308,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // one-shot effect). inert before the module is registered.
     let signaller =
         ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
+    // the CODE readiness self-signaller: the byte-receipt twin of the
+    // above for pending modreg swaps — verifies (or fetches) the committed
+    // component bytes and emits one truthful `SignalReady` per swap.
+    let code_signaller =
+        super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
+    let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
     // the capability self-announcer: publishes this node's discovered
     // provider set into the capability registry once (state-driven,
     // idempotent). inert when this host installed no executor CLIs.
@@ -362,6 +376,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         gateway_book,
         media_peers,
         blob_peers,
+        blob_client,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -398,6 +413,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_nudge,
         workers,
         signaller,
+        code_signaller,
+        fetch_done_tx,
+        fetch_done_rx,
         announcer,
         upgrade_armed_latch,
         upgrade_pending_seen,

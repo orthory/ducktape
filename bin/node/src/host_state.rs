@@ -208,7 +208,7 @@ const CHAT_MODULE_ID: &str = "chat";
 /// preimages). shared by the genesis / restore / state-sync host builders so
 /// all three compose the same registry shape.
 fn seeded_modreg() -> Modreg {
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
+    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset");
     modreg.seed(
         HELLO_WASM_MODULE_ID,
         sha2::Sha256::digest(HELLO_WASM_COMPONENT).to_vec(),
@@ -753,7 +753,7 @@ pub(super) async fn restore_host(
     // is rebuilt on its EMBEDDED genesis component here — recovery's boot-time
     // code reconciliation swaps it to the checkpoint's committed active code
     // (state installs independently of code, so the roots check out either way).
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
+    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset");
     let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID)?;
     modreg
         .install(bytes, root)
@@ -1120,7 +1120,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     // and the joiner's first code reconciliation (before it applies any block)
     // swaps it to the committed component, fetched off the blob plane.
     let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID).await?;
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID);
+    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset");
     modreg
         .install(&bytes, root)
         .map_err(|e| format!("modreg install: {e}"))?;

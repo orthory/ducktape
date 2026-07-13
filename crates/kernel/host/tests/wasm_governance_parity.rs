@@ -97,7 +97,7 @@ fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
 /// a code registry with one seeded tenant, so UpdateModule has a module to
 /// re-code (mirrors bin/node's genesis-seeded registry).
 fn seeded_modreg() -> Modreg {
-    let mut modreg = Modreg::new("modreg");
+    let mut modreg = Modreg::new("modreg", "valset");
     modreg.seed("hello", vec![0xAA; 32]);
     modreg
 }

@@ -607,6 +607,7 @@ impl ValidatorRuntime<'_> {
         // saga crank, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_readiness_signal().await;
+        self.pump_code_readiness().await;
         self.pump_capability_announce().await;
         self.pump_saga_crank().await;
         self.pump_dispatch_nudge().await;
@@ -812,6 +813,88 @@ impl ValidatorRuntime<'_> {
                     // the next tick (the module stays idempotent).
                     signaller.signaled = None;
                     eprintln!("[node {label}] readiness signal submit failed: {e}");
+                }
+            }
+        }
+    }
+
+    // CODE READINESS: the byte-receipt half of a pending modreg swap.
+    // a current boundary member checks the committed pending swaps against
+    // its LOCAL blob store: verified-resident bytes earn one truthful
+    // validator-origin `SignalReady` (the covering signal latches the swap
+    // `ready` in consensus); missing bytes spawn one ranged mesh fetch
+    // (the custodian's data-plane push normally lands first — this heals a
+    // node the push missed). state-driven and idempotent like the upgrade
+    // signaller above; inert while nothing is pending.
+    async fn pump_code_readiness(&mut self) {
+        let Self {
+            node,
+            orchestrator,
+            next_seq,
+            signer,
+            label,
+            code_signaller,
+            blob_client,
+            blobs,
+            fetch_done_tx,
+            fetch_done_rx,
+            ..
+        } = self;
+        // reap finished fetch tasks first, so a failed fetch retries.
+        while let Ok(digest) = fetch_done_rx.try_recv() {
+            code_signaller.fetching.remove(&digest);
+        }
+        if !orchestrator
+            .current_members()
+            .contains(&signer.public_key())
+        {
+            return;
+        }
+        let req = modreg::encode_query(&modreg::ModregQuery::Status);
+        let Ok(bytes) = node.host().query(host::MODREG_MODULE_ID, &req).await else {
+            return; // registry absent: byte-identical drain on a baseline net.
+        };
+        let Ok(modreg::ModregReply::Status { modules }) = modreg::decode_reply(&bytes) else {
+            return;
+        };
+        // residency is a VERIFYING read (content re-hashed on the disk path):
+        // signing ready must mean sha256(local bytes) == committed hash.
+        let actions = code_signaller.decide(&modules, |digest| blobs.has_chunk(digest));
+        for digest in actions.fetches {
+            let client = blob_client.clone();
+            let blobs = blobs.clone();
+            let done = fetch_done_tx.clone();
+            let label = label.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::blob_fetch::fetch_blob(
+                    &client,
+                    &blobs,
+                    &digest,
+                    crate::constants::MAX_MODULE_CODE_BYTES,
+                    crate::constants::BLOB_FETCH_ATTEMPTS,
+                )
+                .await
+                {
+                    eprintln!(
+                        "[node {label}] pending-swap code fetch {} failed: {e}",
+                        crate::config::hex_bytes(&digest)
+                    );
+                }
+                let _ = done.send(digest);
+            });
+        }
+        for (key, msg) in actions.signals {
+            let seq = *next_seq;
+            *next_seq += 1;
+            match node.submit(signer, seq, msg).await {
+                Ok(_) => println!(
+                    "[node {label}] signaled code-ready module={} swap={}",
+                    key.0, key.1
+                ),
+                Err(e) => {
+                    // un-latch so a transient submit failure retries next tick.
+                    code_signaller.unlatch(&key);
+                    eprintln!("[node {label}] code readiness submit failed: {e}");
                 }
             }
         }
