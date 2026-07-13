@@ -28,7 +28,30 @@
 //!     `opHash`, the validator's shape until its ordered-node convergence.
 //!
 //! `POST /sim/peer-block` commits a block owned by no held submit — the
-//! "concurrent writer" for optimistic-projection race scenarios.
+//! "concurrent writer" for optimistic-projection race scenarios. it takes
+//! EITHER the single-op `{target, payload, origin?}` shape OR a multi-op
+//! `{ops: [{target, payload, origin?}, …]}` shape: the ops array commits ONE
+//! block with N members through the host's `submit_block` batch engine (per-op
+//! isolation, one shared app-hash), and the reply carries a per-member
+//! applied/rejected verdict so a test can pin the host's abort-all-and-replay
+//! member isolation.
+//!
+//! signed-frame lane: `POST /v1/submit/frame` verifies exactly as the real
+//! daemon does. it decodes the raw frame bytes with `node::decode_frame` — the
+//! SAME codec every validator uses — and commits under the frame's VERIFIED
+//! signer as `Origin::External`, with the same hold/auto semantics as the
+//! frameless lane (a frame parks like any submit in hold mode; auto commits +
+//! drains). the signer key is self-authenticating: verifying a frame needs no
+//! mesh, no dispatch pool, no provisioner, so this lane is honest here in a way
+//! `/v1/call/ws` (which needs a peer) is not. this is the one lane where
+//! authorship is CRYPTOGRAPHIC rather than the trusted-client string
+//! convention.
+//!
+//! `--node-key <64-hex>` fabricates a mesh identity for consensus-op scenarios
+//! (huddle membership names a node key): `status().public_key` serves it back
+//! instead of the empty default. no mesh sits behind it — the sim routes no
+//! peer traffic; it is a value for state ops to reference. a key that is not
+//! 32 bytes of hex fails loud at startup.
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
 //! separated, and repeatable) appends the kv/valset/governance/upgrade system
@@ -57,11 +80,14 @@
 //!
 //! run: `cargo run -p simnode -- [--listen 127.0.0.1:8845] [--storage <dir>]
 //!       [--auto] [--persona local|networked] [--echo-oracle]
-//!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]`
+//!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]
+//!       [--node-key <64-hex>]`
 //!
-//! v1 limit, by design: a rejected op never becomes a block here
-//! (Host::submit_at aborts it pre-commit; only the ordered validator
-//! journals rejected frames as blocks).
+//! v1 limit, by design: a rejected SINGLE op never becomes a block here
+//! (Host::submit_at aborts it pre-commit; only the ordered validator journals
+//! rejected frames as blocks). a rejected MEMBER of a `submit_block` batch is
+//! different — the batch block commits with the accepted members and the
+//! rejected member is reported (never journaled as its own block).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -93,7 +119,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::select;
 use governance::Governance;
 use host::worker::MAX_WORKER_ROUNDS;
-use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
@@ -205,11 +231,53 @@ struct PersonaRequest {
     persona: Persona,
 }
 
+/// one op inside a `/sim/peer-block` request — the single-op body IS one of
+/// these, and the multi-op body is an array of them.
 #[derive(Deserialize)]
-struct PeerBlockRequest {
+struct PeerOp {
     target: String,
     payload: serde_json::Value,
     origin: Option<String>,
+}
+
+/// a peer op's actor-lane fields: `(target, payload_bytes, origin_bytes)`. the
+/// `hex:` origin escape is still unresolved here — the actor resolves it.
+type PeerOpWire = (String, Vec<u8>, Vec<u8>);
+
+/// `/sim/peer-block` accepts EITHER shape (additive, sim-only wire). untagged:
+/// a body with `ops` is a `Batch` (the only shape that carries it); anything
+/// else falls through to the original `Single` op. ops-wins if both are present.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PeerBlockRequest {
+    Batch { ops: Vec<PeerOp> },
+    Single(PeerOp),
+}
+
+/// one member's verdict in a `/sim/peer-block` batch reply (input order).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberInfo {
+    target: String,
+    /// this member's authored origin, hex or the printable convention — the
+    /// same rendering the block row's `proposer` uses.
+    proposer: String,
+    /// `applied` (mutated state) or `rejected` (isolated, rolled back).
+    disposition: BlockDisposition,
+    /// the module's verbatim rejection reason; absent for an applied member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejection: Option<String>,
+}
+
+/// the multi-op `/sim/peer-block` reply: ONE committed block carrying N members,
+/// each with its own applied/rejected verdict.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchInfo {
+    height: u64,
+    app_hash: String,
+    /// one entry per input op, in input order.
+    members: Vec<MemberInfo>,
 }
 
 // ── Control commands into the actor ─────────────────────
@@ -231,6 +299,13 @@ enum SimCommand {
         payload: Vec<u8>,
         origin: Vec<u8>,
         reply: oneshot::Sender<Result<CommittedInfo, String>>,
+    },
+    /// N ops committed as ONE block via the host's `submit_block` batch engine.
+    /// each tuple is `(target, payload_bytes, origin_bytes)`; the `hex:` origin
+    /// escape resolves in the actor, same as the single-op path.
+    PeerBatch {
+        ops: Vec<PeerOpWire>,
+        reply: oneshot::Sender<Result<BatchInfo, String>>,
     },
     Snapshot {
         reply: oneshot::Sender<SimSnapshot>,
@@ -255,6 +330,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // both are meaningful only together; the binding defaults to "sim".
     let mut valset_keys: Vec<Vec<u8>> = Vec::new();
     let mut invite_binding: Vec<u8> = b"sim".to_vec();
+    // the fabricated mesh identity `status().public_key` serves — empty by
+    // default (no mesh), a canonical 64-hex string under `--node-key`.
+    let mut public_key = String::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -299,10 +377,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--invite-binding needs a string")?
                     .into_bytes();
             }
+            // fabricate a mesh identity for consensus-op scenarios (huddle
+            // membership names a node key). validated to 32 bytes here and
+            // stored canonical (lowercase hex); junk fails loud, never seeds a
+            // malformed key clients would try to route to.
+            "--node-key" => {
+                let hex = args
+                    .next()
+                    .ok_or("--node-key needs a 64-hex ed25519 pubkey")?;
+                let key =
+                    duckfs_core::unhex(&hex).map_err(|e| format!("--node-key {hex:?}: {e}"))?;
+                if key.len() != 32 {
+                    return Err(format!(
+                        "--node-key {hex:?} decodes to {} bytes, want a 32-byte ed25519 pubkey",
+                        key.len()
+                    )
+                    .into());
+                }
+                public_key = hex_bytes(&key);
+            }
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want --listen/--storage/--auto/--persona/\
-                     --echo-oracle/--with-valset/--invite-binding)"
+                     --echo-oracle/--with-valset/--invite-binding/--node-key)"
                 )
                 .into());
             }
@@ -367,6 +464,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 echo_oracle,
                 valset_keys,
                 invite_binding,
+                public_key,
                 module_ids,
                 cmd_rx,
                 control_rx,
@@ -404,7 +502,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// a client submit parked until a step commits it: the retained reply is what
 /// keeps its http request hanging — the held-submit semantics under test.
 struct HeldOp {
-    origin: Vec<u8>,
+    origin: Origin,
     msg: Msg,
     reply: oneshot::Sender<Result<BlockSummary, String>>,
 }
@@ -432,6 +530,9 @@ struct Sim {
     /// the registered module ids, in registry order — the exact set `status`
     /// reports (the default 16, or those plus VALSET_MODULE_IDS under the flag).
     module_ids: Vec<&'static str>,
+    /// the fabricated mesh identity `status` reports (`--node-key`), or empty
+    /// for the default "no peer-routed features here". no mesh sits behind it.
+    public_key: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -445,6 +546,7 @@ fn run_sim(
     echo_oracle: bool,
     valset_keys: Vec<Vec<u8>>,
     invite_binding: Vec<u8>,
+    public_key: String,
     module_ids: Vec<&'static str>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
@@ -563,6 +665,7 @@ fn run_sim(
             index,
             stream_hub,
             module_ids,
+            public_key,
         };
 
         loop {
@@ -578,23 +681,35 @@ fn run_sim(
                         // a hard reject, never a literal-string fall-through.
                         match decode_origin(origin) {
                             Ok(origin) => {
-                                sim.handle_submit(origin, Msg { target, payload }, reply).await;
+                                sim.handle_submit(
+                                    Origin::External(origin),
+                                    Msg { target, payload },
+                                    reply,
+                                )
+                                .await;
                             }
                             Err(err) => {
                                 let _ = reply.send(Err(err));
                             }
                         }
                     }
-                    // the signed-frame lane needs an authorship the sim does not
-                    // have: it fabricates state for the UI, runs no agent (no
-                    // dispatch pool, no provisioner), and mints no session keys,
-                    // so nothing here could ever hold a key worth verifying. an
-                    // honest refusal beats a lane that pretends — the same call
-                    // /v1/call/ws makes where there is no mesh.
-                    Some(NodeCommand::SubmitFrame { reply, .. }) => {
-                        let _ = reply.send(Err(
-                            "the simulator serves no signed-frame lane — use /v1/submit".into(),
-                        ));
+                    // the signed-frame lane, FAITHFUL to the real daemon: decode
+                    // and verify the frame with the same `node::decode_frame` every
+                    // validator uses, then hold/commit under the frame's VERIFIED
+                    // signer as origin. the signer key is self-authenticating — no
+                    // mesh, dispatch pool, or provisioner is needed to check it — so
+                    // this lane is honest here in a way `/v1/call/ws` (which needs a
+                    // peer) is not. junk never reaches the host: the http gate
+                    // already refused it, and this decode is the second wall.
+                    Some(NodeCommand::SubmitFrame { frame, reply }) => {
+                        match node::decode_frame(&frame) {
+                            Ok((origin, msg)) => {
+                                sim.handle_submit(origin, msg, reply).await;
+                            }
+                            Err(err) => {
+                                let _ = reply.send(Err(err.to_string()));
+                            }
+                        }
                     }
                     Some(NodeCommand::Query { target, req, reply }) => {
                         let result = sim.host.query(&target, &req).await.map_err(|err| err.to_string());
@@ -614,9 +729,14 @@ fn run_sim(
 }
 
 impl Sim {
+    /// hold or commit ONE op under an already-resolved `Origin` — the shared
+    /// lane behind both `/v1/submit` (a caller string, or the `hex:` escape) and
+    /// `/v1/submit/frame` (the frame's cryptographically VERIFIED signer). the
+    /// two lanes differ ONLY in how the origin was obtained; hold/auto semantics
+    /// are identical past this point.
     async fn handle_submit(
         &mut self,
-        origin: Vec<u8>,
+        origin: Origin,
         msg: Msg,
         reply: oneshot::Sender<Result<BlockSummary, String>>,
     ) {
@@ -626,7 +746,7 @@ impl Sim {
         }
         // auto mode = noded's submit_and_drain: commit the caller's op, then
         // drain its worker follow-ups to completion, each its own block.
-        let result = self.commit(Origin::External(origin), msg).await;
+        let result = self.commit(origin, msg).await;
         let result = match result {
             Ok(committed) => match self.drain_oracle_budgeted().await {
                 Ok(()) => Ok(committed.block),
@@ -680,6 +800,23 @@ impl Sim {
                 };
                 let _ = reply.send(result);
             }
+            SimCommand::PeerBatch { ops, reply } => {
+                // resolve each member's origin through the SAME `hex:` escape as
+                // the single-op lane; one bad origin rejects the whole request
+                // (before any state moves — nothing has committed yet).
+                let resolved: Result<Vec<(Origin, Msg)>, String> = ops
+                    .into_iter()
+                    .map(|(target, payload, origin)| {
+                        decode_origin(origin)
+                            .map(|o| (Origin::External(o), Msg { target, payload }))
+                    })
+                    .collect();
+                let result = match resolved {
+                    Ok(ops) => self.commit_batch(ops).await,
+                    Err(err) => Err(err),
+                };
+                let _ = reply.send(result);
+            }
             SimCommand::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
             }
@@ -703,7 +840,7 @@ impl Sim {
             };
         }
         let held = self.held.pop_front()?;
-        let result = self.commit(Origin::External(held.origin), held.msg).await;
+        let result = self.commit(held.origin, held.msg).await;
         let info = result
             .as_ref()
             .ok()
@@ -837,6 +974,141 @@ impl Sim {
         })
     }
 
+    /// commit N ops as ONE block through the host's `submit_block` batch engine
+    /// — per-op isolation with a SINGLE shared app-hash. the batch twin of
+    /// [`Self::commit`]: every member's payload is staged (content-addressed
+    /// op_hash), the block index row aggregates ALL members (applied AND
+    /// rejected, each with its disposition — the real validator's multi-op row
+    /// shape, see `drain_actions::block_actions`), one ws frame is published,
+    /// and the reply carries a per-member applied/rejected verdict. an empty
+    /// `ops` is a valid empty block: height advances, no members, no row.
+    async fn commit_batch(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
+        let consensus_time = SIM_EPOCH_MS + (self.height + 1) * SIM_BLOCK_MS;
+        // capture each member's (proposer, target, payload) BEFORE submit_block
+        // consumes the ops — the row and reply need them after the engine returns.
+        let meta: Vec<(String, String, Vec<u8>)> = ops
+            .iter()
+            .map(|(origin, msg)| {
+                (
+                    proposer_hex(origin),
+                    msg.target.clone(),
+                    msg.payload.clone(),
+                )
+            })
+            .collect();
+        let ctx = BlockContext {
+            protocol_version: 0,
+            height: self.height + 1,
+            consensus_time,
+            // apply_block ignores ctx.origin — each member carries its own, and
+            // the once-per-block System injections are System-authored.
+            origin: Origin::System,
+        };
+        let out = match self.host.submit_block(ctx, ops).await {
+            Ok(out) => out,
+            Err(SubmitError::Fatal(err)) => {
+                // same fail-stop as the single-op lane and the real daemons.
+                eprintln!("[simnode] FATAL: {err} — halting");
+                std::process::exit(1);
+            }
+            // a member reject is folded into its MemberOutcome, never here: a
+            // whole-batch Rejected is only a boundary-injection failure — surface
+            // it verbatim (no block committed).
+            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+        };
+        self.height += 1;
+        let app_hash = hex_root(&out.app_hash);
+
+        // build the per-member reply verdicts + the block row's RootOps in input
+        // order, and the per-module AppliedOp feed from the applied members' (and
+        // the System injections') dispatch traces.
+        let mut members = Vec::with_capacity(meta.len());
+        let mut root_ops = Vec::with_capacity(meta.len());
+        let mut applied_ops: Vec<AppliedOp> = Vec::new();
+        for ((proposer, target, payload), outcome) in meta.into_iter().zip(out.members.iter()) {
+            let (disposition, rejection, dispatches): (
+                BlockDisposition,
+                Option<String>,
+                &[DispatchRecord],
+            ) = match outcome {
+                MemberOutcome::Applied { dispatches } => {
+                    (BlockDisposition::Applied, None, dispatches.as_slice())
+                }
+                MemberOutcome::Rejected { reason } => {
+                    (BlockDisposition::Rejected, Some(reason.clone()), &[])
+                }
+            };
+            // an applied member's dispatches feed the per-module index; a rejected
+            // member left no committed writes, so it contributes none.
+            for d in dispatches {
+                applied_ops.push(AppliedOp {
+                    origin: noded::index_origin(&d.origin),
+                    module: d.module.clone(),
+                    payload: d.payload.clone(),
+                });
+            }
+            let operations: Vec<DispatchInfo> = dispatches.iter().map(dispatch_info).collect();
+            // stage every member's payload (idempotent, content-addressed) so the
+            // row's op_hash dereferences via /v1/files/blob/{opHash} — the
+            // validator stages rejected members too (explorer_root_op).
+            let op_hash = hex_bytes(&self.blobs.put_chunk(payload.clone()));
+            root_ops.push(noded::RootOp {
+                proposer: proposer.clone(),
+                disposition,
+                target: target.clone(),
+                operations,
+                payload: payload_preview(&payload),
+                op_hash,
+            });
+            members.push(MemberInfo {
+                target,
+                proposer,
+                disposition,
+                rejection,
+            });
+        }
+        // the once-per-block System injections also mutate module state — feed
+        // their dispatches to the per-module index like the single-op lane.
+        for d in &out.system_dispatches {
+            applied_ops.push(AppliedOp {
+                origin: noded::index_origin(&d.origin),
+                module: d.module.clone(),
+                payload: d.payload.clone(),
+            });
+        }
+
+        let block_ops = BlockOps {
+            height: self.height,
+            time: consensus_time,
+            ops: applied_ops,
+            // a truly empty batch writes no explorer row (drain_actions' rule);
+            // any member — applied or rejected — gives the block its row.
+            record: (!root_ops.is_empty()).then(|| {
+                block_row(&BlockRecord {
+                    height: self.height,
+                    hash: String::new(),
+                    commit_hash: app_hash.clone(),
+                    ops: root_ops,
+                })
+            }),
+        };
+        if let Err(err) = self.index.apply_block(&block_ops) {
+            eprintln!(
+                "[simnode] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
+                self.height
+            );
+        }
+
+        self.stream_hub.publish_block(self.height, app_hash.clone());
+        offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
+
+        Ok(BatchInfo {
+            height: self.height,
+            app_hash,
+            members,
+        })
+    }
+
     fn status(&self) -> NodeStatus {
         let modules = self
             .module_ids
@@ -856,9 +1128,11 @@ impl Sim {
             app_hash: hex_root(&self.host.app_hash()),
             height: self.height,
             modules,
-            // the sim node has no mesh identity — clients treat an empty key
-            // as "no peer-routed features here" (no huddle voice).
-            public_key: String::new(),
+            // empty unless `--node-key` fabricated one: clients treat an empty
+            // key as "no peer-routed features here" (no huddle voice). the
+            // seeded key names an identity for consensus-op scenarios; no mesh
+            // routes behind it.
+            public_key: self.public_key.clone(),
         }
     }
 
@@ -1042,29 +1316,64 @@ async fn sim_persona(State(handle): State<SimHandle>, Json(req): Json<PersonaReq
     }
 }
 
+/// encode one peer op's wire fields for the actor: json payload → bytes, and the
+/// origin string → bytes (the `hex:` escape is resolved later, in the actor).
+/// the default author is `peer`, the concurrent-writer convention. the error is
+/// the raw `(status, message)` (small — the caller turns it into a Response).
+fn encode_peer_op(op: PeerOp) -> Result<PeerOpWire, (StatusCode, String)> {
+    let payload = serde_json::to_vec(&op.payload)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let origin = op
+        .origin
+        .map(String::into_bytes)
+        .unwrap_or_else(|| PEER_ORIGIN.to_vec());
+    Ok((op.target, payload, origin))
+}
+
 async fn sim_peer_block(
     State(handle): State<SimHandle>,
     Json(req): Json<PeerBlockRequest>,
 ) -> Response {
-    let payload = match serde_json::to_vec(&req.payload) {
-        Ok(bytes) => bytes,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let origin = req
-        .origin
-        .map(String::into_bytes)
-        .unwrap_or_else(|| PEER_ORIGIN.to_vec());
-    match control(handle, |reply| SimCommand::PeerBlock {
-        target: req.target,
-        payload,
-        origin,
-        reply,
-    })
-    .await
-    {
-        Ok(Ok(info)) => Json(info).into_response(),
-        Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
-        Err(resp) => resp,
+    match req {
+        // the original single-op path: ONE block, one member (unchanged wire).
+        PeerBlockRequest::Single(op) => {
+            let (target, payload, origin) = match encode_peer_op(op) {
+                Ok(parts) => parts,
+                Err((status, msg)) => return (status, msg).into_response(),
+            };
+            match control(handle, |reply| SimCommand::PeerBlock {
+                target,
+                payload,
+                origin,
+                reply,
+            })
+            .await
+            {
+                Ok(Ok(info)) => Json(info).into_response(),
+                Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
+                Err(resp) => resp,
+            }
+        }
+        // the multi-op path: N members committed as ONE block via submit_block.
+        PeerBlockRequest::Batch { ops } => {
+            let mut encoded = Vec::with_capacity(ops.len());
+            for op in ops {
+                match encode_peer_op(op) {
+                    Ok(parts) => encoded.push(parts),
+                    Err((status, msg)) => return (status, msg).into_response(),
+                }
+            }
+            match control(handle, |reply| SimCommand::PeerBatch {
+                ops: encoded,
+                reply,
+            })
+            .await
+            {
+                Ok(Ok(info)) => Json(info).into_response(),
+                Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
+                Err(resp) => resp,
+            }
+        }
     }
 }
 
