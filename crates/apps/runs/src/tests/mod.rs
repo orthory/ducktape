@@ -634,6 +634,7 @@ fn record(agent_id: &str, actions: &[&str]) -> AgentRecord {
         capability: "model-1".into(),
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         status: AgentStatus::Active,
+        role: agent::AgentRole::General,
         created_at: 0,
         updated_at: 0,
         recipe_hash: Vec::new(),

@@ -78,6 +78,8 @@ struct AgentState {
     /// C4 ordered skill refs — the agent's SOUL (order is significant to the
     /// hash, and to the order `Always` bodies assemble in host-side).
     skills: Vec<SkillRef>,
+    /// owner-assigned semantic role; general is the legacy default.
+    role: AgentRole,
 }
 
 // ---- canonical encoding -------------------------------------------------------
@@ -176,6 +178,22 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         put_bytes(&mut out, &a.recipe_hash);
         put_caps(&mut out, &a.caps);
         put_skills(&mut out, &a.skills);
+    }
+    // Sparse additive role tail. If every record is General, omit it entirely
+    // so legacy snapshots and their roots remain byte-for-byte valid.
+    let roles = agents
+        .iter()
+        .filter(|(_, agent)| agent.role != AgentRole::General)
+        .collect::<Vec<_>>();
+    if !roles.is_empty() {
+        out.extend_from_slice(&(roles.len() as u64).to_le_bytes());
+        for (id, agent) in roles {
+            put_bytes(&mut out, id.as_bytes());
+            out.push(match agent.role {
+                AgentRole::General => 0,
+                AgentRole::ProjectLibrarian => 1,
+            });
+        }
     }
     out
 }
@@ -434,12 +452,37 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
                 recipe_hash,
                 caps,
                 skills,
+                role: AgentRole::General,
             },
         )?;
     }
 
+    // A missing tail is the legacy encoding. A present tail is a canonical,
+    // strictly-ascending sparse map of non-default role assignments.
     if !buf.is_empty() {
-        return Err("snapshot has trailing bytes".into());
+        let role_count = take_count(&mut buf, 8 + 1, "agent role")?;
+        if role_count == 0 {
+            return Err("snapshot has empty agent role tail".into());
+        }
+        let mut last: Option<String> = None;
+        for _ in 0..role_count {
+            let id = take_lp_string(&mut buf)?;
+            if last.as_ref().is_some_and(|previous| previous >= &id) {
+                return Err("snapshot role keys not strictly ascending".into());
+            }
+            let role = match take(&mut buf, 1)?[0] {
+                1 => AgentRole::ProjectLibrarian,
+                d => return Err(format!("snapshot has unknown or default agent role {d}")),
+            };
+            let agent = agents
+                .get_mut(&id)
+                .ok_or_else(|| format!("snapshot role names unknown agent: {id}"))?;
+            agent.role = role;
+            last = Some(id);
+        }
+        if !buf.is_empty() {
+            return Err("snapshot has trailing bytes".into());
+        }
     }
     Ok(agents)
 }
@@ -456,6 +499,11 @@ pub struct AgentModule {
     /// in lockstep. an opaque id: this crate never decodes its interface.
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
+    /// Recovery-only execution mode for the exact protocol-v1 native
+    /// registry. Its snapshot predates roles, so role mutations and
+    /// role-bearing snapshots must remain unavailable while that workspace
+    /// advertises the revision-1 fingerprint.
+    legacy_v1: bool,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
     /// this block's staged writes, read ahead of committed state
@@ -486,9 +534,17 @@ impl AgentModule {
             id,
             saga,
             hook,
+            legacy_v1: false,
             agents: BTreeMap::new(),
             pending_agents: BTreeMap::new(),
         }
+    }
+
+    /// Preserve the exact protocol-v1 snapshot/root contract while rolling a
+    /// newer node binary over an existing native workspace.
+    pub fn with_legacy_v1_state(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
     }
 
     // ---- staged-over-committed reads ---------------------------------------
@@ -523,6 +579,7 @@ impl AgentModule {
             } else {
                 AgentStatus::Paused
             },
+            role: a.role,
             created_at: a.created_at,
             updated_at: a.updated_at,
             recipe_hash: a.recipe_hash.clone(),
@@ -723,6 +780,7 @@ impl AgentModule {
                     recipe_hash,
                     caps,
                     skills,
+                    role: AgentRole::General,
                 };
                 Self::validate_record_size(&agent_id, &state)?;
                 // the hook stages the agent's dispatch recipe in this same
@@ -790,6 +848,22 @@ impl AgentModule {
             }
             AgentMsg::PauseAgent { agent_id } => self.stage_active(ctx, agent_id, false, now),
             AgentMsg::ResumeAgent { agent_id } => self.stage_active(ctx, agent_id, true, now),
+            AgentMsg::SetAgentRole { agent_id, role } => {
+                if self.legacy_v1 {
+                    return Err(Error::Module(
+                        "agent roles are unavailable on the native-v1 state schema".into(),
+                    ));
+                }
+                let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
+                if state.role == role {
+                    return Ok(());
+                }
+                state.role = role;
+                state.updated_at = now;
+                Self::validate_record_size(&agent_id, &state)?;
+                self.pending_agents.insert(agent_id, state);
+                Ok(())
+            }
         }
     }
 
@@ -832,6 +906,15 @@ impl AgentModule {
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let agents = decode_committed(bytes).map_err(Error::Module)?;
+        if self.legacy_v1
+            && agents
+                .values()
+                .any(|agent| agent.role != AgentRole::General)
+        {
+            return Err(Error::Module(
+                "native-v1 agent snapshot contains a role tail".into(),
+            ));
+        }
         if committed_root(&agents) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
@@ -847,6 +930,14 @@ impl AgentModule {
 impl Module for AgentModule {
     fn id(&self) -> ModuleId {
         self.id.clone()
+    }
+
+    fn state_schema_revision(&self) -> u32 {
+        if self.legacy_v1 {
+            1
+        } else {
+            2
+        }
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
@@ -1049,6 +1140,7 @@ mod tests {
             capability: "model-1".into(),
             allowed_actions: vec![],
             status: AgentStatus::Active,
+            role: AgentRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: vec![],
@@ -1818,6 +1910,168 @@ mod tests {
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::SpawnSubagent));
         assert!(!empty.permits(&CapRequest::ForgeRead("r")));
+    }
+
+    #[test]
+    fn read_only_intersection_never_widens_authority() {
+        let parent = ResourceCaps {
+            forge_read: vec!["docs".into()],
+            forge_push: vec!["code".into()],
+            duckfs_read: vec!["/shared/project".into()],
+            duckfs_write: vec!["/shared/project/generated".into()],
+            tools: vec!["ducktape_ask_librarian".into()],
+            secrets: vec!["vault://parent".into()],
+            pages_write: vec!["plan".into()],
+            subagent_budget: 2,
+        };
+        let librarian = ResourceCaps {
+            forge_read: vec!["code".into(), "docs".into(), "foreign".into()],
+            duckfs_read: vec![
+                "/shared/project/reference".into(),
+                "/shared/project/generated/report".into(),
+                "/shared/unrelated".into(),
+            ],
+            duckfs_write: vec!["/shared/project/reference/drafts".into()],
+            tools: vec!["shell".into()],
+            secrets: vec!["vault://librarian".into()],
+            pages_write: vec!["*".into()],
+            subagent_budget: 9,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            parent.read_only_intersection(&librarian),
+            ResourceCaps {
+                forge_read: vec!["code".into(), "docs".into()],
+                duckfs_read: vec![
+                    "/shared/project/generated/report".into(),
+                    "/shared/project/reference".into(),
+                ],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn role_is_owner_assigned_committed_state_with_legacy_defaults() {
+        let legacy: AgentRecord = serde_json::from_value(serde_json::json!({
+            "agent_id": "bot",
+            "owner": { "external": [9] },
+            "display_name": "BOT",
+            "capability": "model-1",
+            "allowed_actions": [],
+            "status": "active",
+            "created_at": 0,
+            "updated_at": 0
+        }))
+        .expect("legacy records omit role");
+        assert_eq!(legacy.role, AgentRole::General);
+        assert!(
+            serde_json::to_value(&legacy).unwrap().get("role").is_none(),
+            "the default role stays absent on the legacy JSON wire"
+        );
+
+        let mut m = module();
+        let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
+        exec(&mut m, &mut owner, &admin(&register("bot", &[]))).unwrap();
+        exec(
+            &mut m,
+            &mut owner,
+            &admin(&AgentMsg::SetAgentRole {
+                agent_id: "bot".into(),
+                role: AgentRole::ProjectLibrarian,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get_agent(&m, "bot").unwrap().role,
+            AgentRole::ProjectLibrarian
+        );
+
+        let (bytes, root) = (m.snapshot(), m.root());
+        let mut joiner = module();
+        joiner.install(&bytes, root).unwrap();
+        assert_eq!(joiner.root(), root);
+        assert_eq!(
+            get_agent(&joiner, "bot").unwrap().role,
+            AgentRole::ProjectLibrarian
+        );
+
+        let mut intruder = CaptureCtx::new().at(4).with_origin(user(8));
+        let err = exec(
+            &mut m,
+            &mut intruder,
+            &admin(&AgentMsg::SetAgentRole {
+                agent_id: "bot".into(),
+                role: AgentRole::General,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        abort(&mut m);
+        assert_eq!(
+            get_agent(&m, "bot").unwrap().role,
+            AgentRole::ProjectLibrarian
+        );
+    }
+
+    #[test]
+    fn native_v1_mode_keeps_revision_one_and_rejects_roles() {
+        let mut legacy = module().with_legacy_v1_state();
+        assert_eq!(Module::state_schema_revision(&legacy), 1);
+        assert_eq!(Module::state_schema_revision(&module()), 2);
+
+        let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
+        exec(
+            &mut legacy,
+            &mut owner,
+            &admin(&register("bot", &[])),
+        )
+        .unwrap();
+        commit(&mut legacy);
+        let (legacy_bytes, legacy_root) = (legacy.snapshot(), legacy.root());
+
+        let err = exec(
+            &mut legacy,
+            &mut owner,
+            &admin(&AgentMsg::SetAgentRole {
+                agent_id: "bot".into(),
+                role: AgentRole::ProjectLibrarian,
+            }),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unavailable on the native-v1 state schema"));
+        assert_eq!(legacy.snapshot(), legacy_bytes);
+        assert_eq!(legacy.root(), legacy_root);
+
+        let mut current = module();
+        exec(
+            &mut current,
+            &mut owner,
+            &admin(&register("bot", &[])),
+        )
+        .unwrap();
+        exec(
+            &mut current,
+            &mut owner,
+            &admin(&AgentMsg::SetAgentRole {
+                agent_id: "bot".into(),
+                role: AgentRole::ProjectLibrarian,
+            }),
+        )
+        .unwrap();
+        commit(&mut current);
+        let err = legacy
+            .install(&current.snapshot(), current.root())
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("native-v1 agent snapshot contains a role tail"));
+        assert_eq!(legacy.snapshot(), legacy_bytes);
+        assert_eq!(legacy.root(), legacy_root);
     }
 
     /// the library grant is an ORDINARY duckfs read cap — no special namespace,

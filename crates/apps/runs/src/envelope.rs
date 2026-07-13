@@ -401,6 +401,7 @@ mod tests {
             capability: "model-1".into(),
             allowed_actions: vec![],
             status: AgentStatus::Active,
+            role: agent::AgentRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),

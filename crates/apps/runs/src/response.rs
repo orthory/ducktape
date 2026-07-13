@@ -1100,6 +1100,7 @@ mod tests {
             capability: "codex".into(),
             allowed_actions: vec![agent::ACTION_DUCKFS_WRITE_TEXT.into()],
             status: AgentStatus::Active,
+            role: agent::AgentRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),

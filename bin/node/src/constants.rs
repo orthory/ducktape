@@ -177,9 +177,9 @@ pub(crate) const MODULE_IDS: [&str; 26] = [
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
 pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
-    // 2: wasm adapter ports — the native canonical snapshot persisted as one
-    // host-KV value, so root()/snapshot bytes changed shape at cutover.
-    ("agent", 2),
+    // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
+    // tail inside the native snapshot persisted as one host-KV value.
+    ("agent", 3),
     ("automations", 2),
     ("capability", 2),
     // 1 (UNCHANGED at the wasm cutover): chat/pages are STORE-BACKED ports —
@@ -269,7 +269,7 @@ pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
 /// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
 /// re-genesis, no shim).
 pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
-    ("agent", 2),
+    ("agent", 3),
     ("automations", 2),
     ("capability", 2),
     ("chat", 1),
@@ -304,8 +304,8 @@ pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
 /// dormant-registry route.
 pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
     "commit:clients-v1:",
-    "2a98f8c74b3ba96be0526b307d5ad6c332988d0e1632bb627b8198afd93c0a59:",
-    "86b954b96af007e2f9b1865d5fc84b2d19b1627b9f018281789994c7b0c5e117:",
+    "2f9bc45b9abc691c65d9f6175f7a3aba39962dc8b6fce27ba207162887a60375:",
+    "c0b1afec448fb8ba7d0be5abf969a52a32d5769bca8701dafa437948126a5595:",
     "dormant-registry-v1"
 );
 
