@@ -45,7 +45,7 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "ducktape_whoami",
-            description: "Who you are in Ducktape: your agent id, display name, owner, the \
+            description: "Who you are in Ducktape: your run id, agent id, display name, owner, the \
                           actions you are allowed to take, your resource caps, your workspace \
                           directory, and where your skills are mounted. Call this first if you \
                           are unsure what you are permitted to do — every write tool is gated on \
@@ -159,8 +159,8 @@ pub(super) fn tools() -> Vec<Tool> {
     ]
 }
 
-/// the agent's own committed record, plus the two host facts it cannot read off
-/// the chain: where its workspace is, and where its skills were mounted.
+/// the agent's own committed record, plus the host facts it cannot read off the
+/// chain: its run id, workspace, and skill mount.
 fn whoami(run: &Run, _args: &Value) -> Result<Value> {
     let record = run.record()?;
     Ok(json!({
@@ -172,6 +172,7 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
         "allowed_actions": record.allowed_actions,
         "caps": record.caps,
         "skills": record.skills,
+        "run_id": run.run_id(),
         "workspace_dir": run.workspace,
         "skills_dir": run.skills,
     }))
