@@ -508,6 +508,7 @@ impl CliProvider {
         self
     }
 
+    #[cfg(test)]
     fn command(
         &self,
         args: &[String],
@@ -2142,10 +2143,52 @@ fn signal_process_group(group: u32, signal: libc::c_int) -> std::io::Result<()> 
 fn process_group_alive(group: u32) -> bool {
     // Signal 0 performs existence/permission checking without delivering a
     // signal. EPERM still means the group exists; ESRCH means it is gone.
-    if unsafe { libc::kill(-(group as libc::pid_t), 0) } == 0 {
-        return true;
+    if unsafe { libc::kill(-(group as libc::pid_t), 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+
+    // Linux keeps an orphaned zombie visible to kill(-pgid, 0) until PID 1
+    // reaps it. A containerized test runner may itself be PID 1 and never reap
+    // grandchildren, but zombies own no compute and cannot spawn descendants.
+    // Treat a group containing only dead members as absent; any unreadable
+    // /proc state stays fail-closed. Other Unix platforms retain kill(0).
+    #[cfg(target_os = "linux")]
+    return linux_process_group_has_live_member(group).unwrap_or(true);
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_member(group: u32) -> Option<bool> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        if entry.file_name().to_str()?.parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let (state, process_group) = linux_process_state_and_group(&stat)?;
+        if process_group == group && !matches!(state, 'Z' | 'X' | 'x') {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state_and_group(stat: &str) -> Option<(char, u32)> {
+    // /proc/<pid>/stat starts `pid (comm) state ppid pgrp`; `comm` may contain
+    // spaces and parentheses, so split after its final closing delimiter.
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    fields.next()?; // ppid
+    let process_group = fields.next()?.parse().ok()?;
+    Some((state, process_group))
 }
 
 #[cfg(unix)]
@@ -3124,8 +3167,9 @@ impl CliProvider {
             Cancelled,
             TimedOut,
         }
+        let label = self.bin.display().to_string();
         let status = match tokio::select! {
-            status = live.wait_complete(&self.bin.display().to_string()) => {
+            status = live.wait_complete(&label) => {
                 WaitOutcome::Exited(status)
             },
             _ = cancellation_requested(ctx.cancellation.as_ref()) => WaitOutcome::Cancelled,
@@ -3940,11 +3984,19 @@ format = "{format}"
             .trim()
             .parse::<libc::pid_t>()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(helper, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{helper}/stat")) {
+            let (state, _) = linux_process_state_and_group(&stat).expect("helper proc stat");
+            assert!(matches!(state, 'Z' | 'X' | 'x'), "helper still computes: {stat}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(unsafe { libc::kill(helper, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
     }
 
     #[tokio::test]
@@ -4018,6 +4070,19 @@ format = "{format}"
             process.child.as_mut().unwrap().try_wait(),
             Ok(Some(_))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parser_handles_parentheses_and_distinguishes_zombies() {
+        assert_eq!(
+            linux_process_state_and_group("42 (agent (worker)) S 7 19 19 0"),
+            Some(('S', 19))
+        );
+        assert_eq!(
+            linux_process_state_and_group("43 (sleep) Z 1 19 19 0"),
+            Some(('Z', 19))
+        );
     }
 
     #[cfg(unix)]
@@ -4155,7 +4220,10 @@ rw_dirs = ["~/.claude"]
             joined.contains(&format!("-v {home}/.claude:{home}/.claude", home = home.display())),
             "rw mount at identical path: {joined}"
         );
-        assert!(joined.contains("-v /usr/bin/pod:/usr/bin/pod:ro"), "{joined}");
+        assert!(
+            joined.contains(&format!("-v {bin}:{bin}:ro", bin = bin.display())),
+            "{joined}"
+        );
         assert!(joined.contains("-e HOME"), "{joined}");
         assert!(joined.contains("-e RUN_SECRET"), "{joined}");
         assert!(
