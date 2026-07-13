@@ -1,7 +1,9 @@
-//! Native macOS Touch ID custody: a biometric-ACL Keychain item holding the
-//! vault passphrase. No Secure-Enclave key generation, no chain member key —
-//! this only changes how `user_identity_unlock`'s passphrase is supplied.
-//! Non-macOS targets compile working stubs.
+//! Native macOS Touch ID custody: a user-presence-ACL Keychain item holding
+//! the vault passphrase — the OS prompts Touch ID when the sensor is usable
+//! and falls back to the Mac's login password when it isn't (lid closed,
+//! clamshell, changed fingerprint set). No Secure-Enclave key generation, no
+//! chain member key — this only changes how `user_identity_unlock`'s
+//! passphrase is supplied. Non-macOS targets compile working stubs.
 //!
 //! macOS note: under the CEF runtime, biometric prompts need a real UI session.
 //! For automated macOS QA the `--use-mock-keychain` Chromium flag is NOT used
@@ -14,15 +16,17 @@ const KEYCHAIN_SERVICE: &str = "com.ducktape.app.userkey";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT: &str = "vault-passphrase";
 
-/// True only on macOS with a usable biometric authenticator. Gates every
-/// piece of Touch ID UI.
+/// True only on macOS where user-presence auth works: Touch ID when the
+/// sensor is usable, the login password when it isn't. Gates every piece of
+/// Touch ID UI.
 #[tauri::command]
 pub async fn touchid_available() -> bool {
     imp::available()
 }
 
-/// Store the vault passphrase behind a biometry-current-set ACL. Called once,
-/// right after the recovery phrase is confirmed.
+/// Store the vault passphrase behind a user-presence ACL (Touch ID when
+/// usable, login password otherwise). Called once, right after the recovery
+/// phrase is confirmed.
 #[tauri::command]
 pub async fn touchid_enroll(passphrase: String) -> Result<(), String> {
     imp::enroll(passphrase)
@@ -36,8 +40,9 @@ pub async fn touchid_enrolled() -> bool {
     imp::enrolled()
 }
 
-/// Retrieve the passphrase (prompts Touch ID), unlock the vault, cache it.
-/// Returns the pubkey, exactly like `user_identity_unlock`.
+/// Retrieve the passphrase (prompts Touch ID, or the login password when the
+/// sensor can't be used), unlock the vault, cache it. Returns the pubkey,
+/// exactly like `user_identity_unlock`.
 #[tauri::command]
 pub async fn touchid_unlock(
     app: crate::rt::AppHandle,
@@ -85,7 +90,7 @@ mod imp {
 // `security-framework-sys::SecItemAdd` with a CFDictionary carrying
 // kSecClass=kSecClassGenericPassword, kSecAttrService/Account, kSecAttrAccessControl
 // (from SecAccessControlCreateWithFlags(kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-// kSecAccessControlBiometryCurrentSet)), kSecUseDataProtectionKeychain=true,
+// kSecAccessControlUserPresence)), kSecUseDataProtectionKeychain=true,
 // kSecValueData=<passphrase bytes>.
 #[cfg(target_os = "macos")]
 mod imp {
@@ -93,18 +98,25 @@ mod imp {
     use security_framework::item::{ItemClass, ItemSearchOptions};
     use security_framework::passwords::{set_generic_password_options, PasswordOptions};
 
-    // kSecAccessControlBiometryCurrentSet = 1 << 3. Enrolling behind this flag
-    // means REMOVING a fingerprint invalidates the item — the passphrase is
-    // never recoverable without the current biometric set (or the 24-word phrase).
-    const BIOMETRY_CURRENT_SET: usize = 1 << 3;
+    // kSecAccessControlUserPresence = 1 << 0: the OS prompts biometry when the
+    // sensor is usable and falls back to the login password when it isn't. The
+    // biometric-only BiometryCurrentSet ACL this replaces made the item
+    // unreadable with the lid closed (clamshell — the sensor is physically
+    // unreachable) and PERMANENTLY invalid after any fingerprint-set change;
+    // user-presence keeps the 24-word phrase as recovery without bricking the
+    // everyday path.
+    const USER_PRESENCE: usize = 1 << 0;
 
-    /// A biometric authenticator is usable iff we can build a
-    /// biometry-current-set access control; that only succeeds on a platform
-    /// with a working biometric ACL.
+    /// errSecUserCanceled — the user dismissed the OS auth sheet.
+    const ERR_SEC_USER_CANCELED: i32 = -128;
+
+    /// User-presence auth is usable iff we can build a user-presence access
+    /// control; biometry drives the prompt when available and the login
+    /// password stands in when it isn't.
     pub fn available() -> bool {
         SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-            BIOMETRY_CURRENT_SET,
+            USER_PRESENCE,
         )
         .is_ok()
     }
@@ -121,12 +133,14 @@ mod imp {
     }
 
     pub fn enroll(passphrase: String) -> Result<(), String> {
-        let _ = disable(); // idempotent re-enroll
+        // Build the ACL before deleting the existing item: an ACL failure must
+        // never leave the user with the old item already gone.
         let ac = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-            BIOMETRY_CURRENT_SET,
+            USER_PRESENCE,
         )
         .map_err(|e| format!("access-control: {e}"))?;
+        let _ = disable(); // idempotent re-enroll
         let mut options =
             PasswordOptions::new_generic_password(super::KEYCHAIN_SERVICE, super::KEYCHAIN_ACCOUNT);
         options.set_access_control(ac);
@@ -153,20 +167,37 @@ mod imp {
         let control = control.inner().clone();
         control
             .run(move || {
-                // Reading the item DATA triggers the OS Touch ID prompt because
-                // the item carries a biometric ACL. "touchid-unavailable" is the
-                // sentinel the frontend maps to "use your recovery phrase."
+                // Reading the item DATA triggers the OS user-presence prompt
+                // (Touch ID when the sensor is usable, the login password
+                // otherwise) because the item carries a user-presence ACL.
+                // "touchid-canceled" is a dismissed sheet — not a failure;
+                // "touchid-unavailable" is the sentinel the frontend maps to
+                // "use your password or recovery phrase."
                 let bytes = security_framework::passwords::get_generic_password(
                     super::KEYCHAIN_SERVICE,
                     super::KEYCHAIN_ACCOUNT,
                 )
-                .map_err(|_| "touchid-unavailable".to_string())?;
+                .map_err(|e| {
+                    if e.code() == ERR_SEC_USER_CANCELED {
+                        "touchid-canceled".to_string()
+                    } else {
+                        "touchid-unavailable".to_string()
+                    }
+                })?;
                 let pass =
                     String::from_utf8(bytes).map_err(|_| "corrupt keychain item".to_string())?;
-                crate::user_identity::unlock_with_secret(
+                let pubkey = crate::user_identity::unlock_with_secret(
                     &app,
-                    crate::user_identity::SecretString::new(pass),
-                )
+                    crate::user_identity::SecretString::new(pass.clone()),
+                )?;
+                // Rewrite the item under the current ACL: items enrolled before
+                // the user-presence switch are biometric-only, and a successful
+                // unlock is the one moment the passphrase is in hand to migrate
+                // them. Deliberately unconditional (every unlock): an item's
+                // ACL can't be read back cheaply, and delete+add never prompts.
+                // Best-effort — the vault is already unlocked either way.
+                let _ = enroll(pass);
+                Ok(pubkey)
             })
             .await
     }
