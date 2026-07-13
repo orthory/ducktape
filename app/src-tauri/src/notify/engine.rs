@@ -125,6 +125,7 @@ impl<S: Sink> Engine<S> {
                     title: notification.title.clone(),
                     body: notification.body.clone(),
                     channel_id: notification.channel_id.clone(),
+                    message_id: notification.message_id.clone(),
                     at: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| duration.as_millis() as u64),
@@ -369,6 +370,7 @@ mod tests {
             title: String::new(),
             body: String::new(),
             channel_id: None,
+            message_id: None,
         }
     }
 
@@ -396,6 +398,7 @@ mod tests {
         assert_eq!(persisted.recent.len(), 1);
         assert_eq!(persisted.recent[0].category, Category::Mention);
         assert_eq!(persisted.recent[0].channel_id.as_deref(), Some("general"));
+        assert_eq!(persisted.recent[0].message_id.as_deref(), Some("m1"));
     }
 
     #[test]

@@ -283,7 +283,10 @@ describe("ForgeView", () => {
 
   it("consumes a forgeFocus hand-off: selects the repo and opens the item", async () => {
     const getForgeItem = vi.fn().mockResolvedValue(null);
-    renderForge({ forgeFocus: { repo: "ducktape", number: 7 } }, { getForgeItem });
+    renderForge(
+      { forgeFocus: { repo: "ducktape", number: 7, messageId: "missing-message" } },
+      { getForgeItem },
+    );
 
     // the deep-linked repo got selected (its tab bar renders) and the detail
     // panel consumed item #7 — a missing item degrades to the honest note.

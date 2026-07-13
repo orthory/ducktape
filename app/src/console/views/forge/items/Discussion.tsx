@@ -16,7 +16,7 @@ import {
 } from "../../../../domain/chat-client";
 import type { MessageView } from "../../../../domain/chat-client";
 import { useDucktape } from "../../../store/use-ducktape";
-import { color, font, radius } from "../../../theme/tokens";
+import { accentVar, color, font, radius } from "../../../theme/tokens";
 import { Composer } from "../../chat/Composer";
 import { RichText } from "../../chat/rich-text";
 import { errMsg, panelLabel, relTime } from "../ui";
@@ -24,7 +24,15 @@ import { errMsg, panelLabel, relTime } from "../ui";
 /** ~100 latest messages is plenty for a tracker thread's v1. */
 const DISCUSSION_LIMIT = 100;
 
-export function Discussion({ channelId }: { channelId: string }) {
+export function Discussion({
+  channelId,
+  messageId,
+  messageSeq,
+}: {
+  channelId: string;
+  messageId?: string;
+  messageSeq?: number;
+}) {
   const { state, actions, transport } = useDucktape();
   const [messages, setMessages] = useState<MessageView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +41,18 @@ export function Discussion({ channelId }: { channelId: string }) {
   const [reloadToken, setReloadToken] = useState(0);
 
   const live = transport ?? null;
+  const anchoredMessage = messages?.find(
+    (message) =>
+      (messageId !== undefined && message.head.message_id === messageId) ||
+      (messageSeq !== undefined && message.seq === messageSeq),
+  );
+
+  useEffect(() => {
+    if (!anchoredMessage) return;
+    const row = document.getElementById(`forge-discussion-message-${anchoredMessage.seq}`);
+    row?.scrollIntoView?.({ block: "center" });
+    row?.focus({ preventScroll: true });
+  }, [anchoredMessage]);
 
   useEffect(() => {
     if (!live || !channelId) return;
@@ -89,14 +109,26 @@ export function Discussion({ channelId }: { channelId: string }) {
           No comments yet — start the discussion below.
         </div>
       )}
+      {messages !== null && (messageId || messageSeq) && !anchoredMessage && (
+        <div role="status" style={{ font: `500 11px ${font.sans}`, color: color.muted3, marginBottom: 8 }}>
+          Referenced message is unavailable. Showing the Forge item instead.
+        </div>
+      )}
       {messages !== null && messages.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {messages.map((message) => (
-            <DiscussionRow
+            <div
               key={`${message.channel_id}:${message.seq}`}
-              message={message}
-              names={state.authorNames}
-            />
+              id={`forge-discussion-message-${message.seq}`}
+              data-message-id={message.head.message_id}
+              tabIndex={-1}
+              style={{
+                outline: message === anchoredMessage ? `2px solid ${accentVar}` : "none",
+                outlineOffset: 2,
+              }}
+            >
+              <DiscussionRow message={message} names={state.authorNames} />
+            </div>
           ))}
         </div>
       )}
