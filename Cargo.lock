@@ -8896,15 +8896,18 @@ dependencies = [
  "commonware-runtime",
  "dispatch",
  "duckdns",
+ "duckfs-core",
  "files",
  "forge",
  "futures",
  "gateway",
+ "governance",
  "host",
  "identity",
  "inbox",
  "indexer",
  "jobs",
+ "kv",
  "noded",
  "pages",
  "runs",
@@ -8916,6 +8919,8 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "upgrade",
+ "valset",
 ]
 
 [[package]]
