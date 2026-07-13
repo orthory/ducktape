@@ -33,8 +33,18 @@ saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
+# the opt-in `--with-valset` governance genesis: the KV store, the membership
+# registry, the sole authorized author of valset change, and the upgrade
+# coordinator whose registration makes the host-injected boundary tick ride.
+kv = { workspace = true }
+valset = { workspace = true }
+governance = { workspace = true }
+upgrade = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
+# variable-length hex decode for the `hex:` origin escape and `--with-valset`
+# genesis keys (raw ed25519 bytes the JSON-string origin lane cannot express).
+duckfs-core = { workspace = true }
 noded = { path = "../noded" }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
 # feeds it block-by-block exactly like the real daemons.

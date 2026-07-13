@@ -30,6 +30,23 @@
 //! `POST /sim/peer-block` commits a block owned by no held submit — the
 //! "concurrent writer" for optimistic-projection race scenarios.
 //!
+//! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
+//! separated, and repeatable) appends the kv/valset/governance/upgrade system
+//! modules AFTER the default 16, seeding the validator set with the given
+//! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
+//! (default `"sim"`, meaningful only with `--with-valset`) sets the network
+//! binding governance verifies invite tokens against. registering the upgrade
+//! module makes the host's once-per-block boundary `Advance` ride every sim
+//! block automatically. the DEFAULT genesis is byte-identical to before —
+//! these modules exist only under the flag.
+//!
+//! origin hex escape (sim lanes only): a `/v1/submit` or `/sim/peer-block`
+//! origin string prefixed `hex:` (e.g. `hex:ab12…`, any even-length hex)
+//! decodes to RAW bytes before becoming `Origin::External` — the only way to
+//! author as a real 32-byte ed25519 key (governance ballots key on it, and raw
+//! pubkey bytes are not valid UTF-8). malformed hex after the prefix is a hard
+//! request reject, never a silent fall-through to the literal string.
+//!
 //! honesty rules: no synthetic-rejection knob (rejection scenarios must use
 //! genuinely rejectable ops, so module semantics stay real), no live LLM
 //! worker (an external llm call in a determinism tool is a contradiction; the
@@ -39,7 +56,8 @@
 //! this tool exists for).
 //!
 //! run: `cargo run -p simnode -- [--listen 127.0.0.1:8845] [--storage <dir>]
-//!       [--auto] [--persona local|networked] [--echo-oracle]`
+//!       [--auto] [--persona local|networked] [--echo-oracle]
+//!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]`
 //!
 //! v1 limit, by design: a rejected op never becomes a block here
 //! (Host::submit_at aborts it pre-commit; only the ordered validator
@@ -51,7 +69,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent::AgentModule;
-use runs::RunsModule;
 use automations::Automations;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -64,33 +81,42 @@ use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use duckdns::DuckDns;
-use gateway::Gateway;
-use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
+use gateway::Gateway;
+use runs::RunsModule;
+use tagging::TaggingModule;
+// the opt-in `--with-valset` governance genesis modules (registered only under
+// the flag; the default genesis stays byte-identical without them).
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
+use governance::Governance;
+use host::worker::MAX_WORKER_ROUNDS;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
+use kv::Kv;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
     payload_preview,
 };
 use pages::Pages;
-use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Effect, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
+use upgrade::Upgrade;
+use valset::Valset;
 
-/// every module registered at genesis, in registry order — noded's exact set,
-/// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+/// the DEFAULT module set registered at genesis, in registry order — noded's
+/// exact set, so status/roots and query targets match what the app expects of a
+/// daemon. the sim-parity conformance lane pins this list against noded; do not
+/// change it without also changing the daemon.
+const BASE_MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -108,6 +134,13 @@ const MODULE_IDS: [&str; 16] = [
     "duckdns",
     "gateway",
 ];
+
+/// the four system modules the opt-in `--with-valset` genesis appends AFTER the
+/// default 16, in registry order: the KV store, the membership registry seeded
+/// with the genesis validators, governance (the sole authorized author of
+/// valset change), and the upgrade coordinator — whose mere registration makes
+/// the host-injected once-per-block boundary `Advance` ride every sim block.
+const VALSET_MODULE_IDS: [&str; 4] = ["kv", "valset", "governance", "upgrade"];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
 
@@ -218,6 +251,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut auto = false;
     let mut persona = Persona::Local;
     let mut echo_oracle = false;
+    // opt-in governance genesis: empty valset_keys => the default 16-module set.
+    // both are meaningful only together; the binding defaults to "sim".
+    let mut valset_keys: Vec<Vec<u8>> = Vec::new();
+    let mut invite_binding: Vec<u8> = b"sim".to_vec();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -229,19 +266,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some("local") => Persona::Local,
                     Some("networked") => Persona::Networked,
                     other => {
-                        return Err(format!("--persona wants local|networked, got {other:?}").into());
+                        return Err(
+                            format!("--persona wants local|networked, got {other:?}").into()
+                        );
                     }
                 }
             }
             "--echo-oracle" => echo_oracle = true,
+            // comma-separated hex ed25519 pubkeys, and repeatable — each 32-byte
+            // key genesis-seeds the validator set. a malformed or wrong-length
+            // key fails loud here, never silently seeds junk.
+            "--with-valset" => {
+                let spec = args
+                    .next()
+                    .ok_or("--with-valset needs comma-separated hex ed25519 pubkeys")?;
+                for hex in spec.split(',').filter(|s| !s.is_empty()) {
+                    let key = duckfs_core::unhex(hex)
+                        .map_err(|e| format!("--with-valset key {hex:?}: {e}"))?;
+                    if key.len() != 32 {
+                        return Err(format!(
+                            "--with-valset key {hex:?} decodes to {} bytes, want a 32-byte ed25519 pubkey",
+                            key.len()
+                        )
+                        .into());
+                    }
+                    valset_keys.push(key);
+                }
+            }
+            "--invite-binding" => {
+                invite_binding = args
+                    .next()
+                    .ok_or("--invite-binding needs a string")?
+                    .into_bytes();
+            }
             other => {
                 return Err(format!(
-                    "unexpected arg {other:?} (want --listen/--storage/--auto/--persona/--echo-oracle)"
+                    "unexpected arg {other:?} (want --listen/--storage/--auto/--persona/\
+                     --echo-oracle/--with-valset/--invite-binding)"
                 )
                 .into());
             }
         }
     }
+    // the status module list and the index tier both extend only under the flag;
+    // the default path stays the exact 16-module set the daemon parity lane pins.
+    let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
+        BASE_MODULE_IDS.to_vec()
+    } else {
+        BASE_MODULE_IDS
+            .iter()
+            .chain(VALSET_MODULE_IDS.iter())
+            .copied()
+            .collect()
+    };
     let storage = storage.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("ducktape-simnode-{}", std::process::id()))
     });
@@ -251,7 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the durable block index: /v1/blocks and /v1/index/* read it, the sim
     // actor feeds it block-by-block — same wiring as the real daemons.
     let index_dir = storage.join("index");
-    let index = IndexStore::open(&index_dir, &MODULE_IDS)
+    let index = IndexStore::open(&index_dir, &module_ids)
         .map(|store| {
             Arc::new(
                 store
@@ -288,6 +365,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_persona,
                 auto,
                 echo_oracle,
+                valset_keys,
+                invite_binding,
+                module_ids,
                 cmd_rx,
                 control_rx,
                 stream_hub,
@@ -349,6 +429,9 @@ struct Sim {
     blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
+    /// the registered module ids, in registry order — the exact set `status`
+    /// reports (the default 16, or those plus VALSET_MODULE_IDS under the flag).
+    module_ids: Vec<&'static str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,6 +443,9 @@ fn run_sim(
     persona: Arc<Mutex<Persona>>,
     auto: bool,
     echo_oracle: bool,
+    valset_keys: Vec<Vec<u8>>,
+    invite_binding: Vec<u8>,
+    module_ids: Vec<&'static str>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
     stream_hub: StreamHub,
@@ -369,8 +455,8 @@ fn run_sim(
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: noded's exact module set (keep in sync with MODULE_IDS) so
-        // app queries and status roots behave like a real daemon's.
+        // genesis: noded's exact module set (keep in sync with BASE_MODULE_IDS)
+        // so app queries and status roots behave like a real daemon's.
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -411,7 +497,7 @@ fn run_sim(
         let identity = Identity::new("identity", None, String::new());
         let duckdns = DuckDns::new("duckdns", "identity", None);
         let gateway = Gateway::new("gateway", "identity", None, "local");
-        let host = Host::genesis(vec![
+        let mut modules: Vec<Box<dyn Module>> = vec![
             Box::new(chat),
             Box::new(saga),
             Box::new(dispatch),
@@ -428,8 +514,30 @@ fn run_sim(
             Box::new(identity),
             Box::new(duckdns),
             Box::new(gateway),
-        ])
-        .expect("genesis");
+        ];
+        // opt-in governance genesis, AFTER the default 16 in registry order:
+        // kv, valset (seeded with the given genesis validators exactly like
+        // bin/node), governance (the sole authorized author of valset change,
+        // bound to the invite namespace), and the upgrade coordinator — whose
+        // registration alone makes the host's once-per-block boundary `Advance`
+        // ride every sim block. modreg/capability are deliberately left out
+        // (UpdateModule proposals stay unwired), and saga's construction is
+        // untouched. empty valset_keys => the default set, byte-identical.
+        if !valset_keys.is_empty() {
+            let kv = Kv::init(context.child("kv"), "kv").await;
+            let mut valset = Valset::new("valset");
+            for key in &valset_keys {
+                valset.insert(key.clone());
+            }
+            let governance = Governance::new("governance", "valset", "upgrade", "identity")
+                .with_invite_binding(invite_binding);
+            let upgrade = Upgrade::new("upgrade", "valset");
+            modules.push(Box::new(kv));
+            modules.push(Box::new(valset));
+            modules.push(Box::new(governance));
+            modules.push(Box::new(upgrade));
+        }
+        let host = Host::genesis(modules).expect("genesis");
 
         println!("[simnode] genesis app_hash={}", hex_root(&host.app_hash()));
 
@@ -454,6 +562,7 @@ fn run_sim(
             blobs,
             index,
             stream_hub,
+            module_ids,
         };
 
         loop {
@@ -464,7 +573,17 @@ fn run_sim(
                 },
                 cmd = cmds.next() => match cmd {
                     Some(NodeCommand::Submit { target, payload, origin, reply }) => {
-                        sim.handle_submit(origin, Msg { target, payload }, reply).await;
+                        // the `hex:` origin escape resolves to raw bytes here, so a
+                        // client can author as a real ed25519 key; malformed hex is
+                        // a hard reject, never a literal-string fall-through.
+                        match decode_origin(origin) {
+                            Ok(origin) => {
+                                sim.handle_submit(origin, Msg { target, payload }, reply).await;
+                            }
+                            Err(err) => {
+                                let _ = reply.send(Err(err));
+                            }
+                        }
                     }
                     // the signed-frame lane needs an authorship the sim does not
                     // have: it fabricates state for the UI, runs no agent (no
@@ -550,10 +669,15 @@ impl Sim {
                 origin,
                 reply,
             } => {
-                let result = self
-                    .commit(Origin::External(origin), Msg { target, payload })
-                    .await
-                    .map(|committed| committed_info(&committed, "peer"));
+                // same `hex:` origin escape as /v1/submit — a concurrent writer
+                // can also author as a raw ed25519 key; bad hex rejects the block.
+                let result = match decode_origin(origin) {
+                    Ok(origin) => self
+                        .commit(Origin::External(origin), Msg { target, payload })
+                        .await
+                        .map(|committed| committed_info(&committed, "peer")),
+                    Err(err) => Err(err),
+                };
                 let _ = reply.send(result);
             }
             SimCommand::Snapshot { reply } => {
@@ -604,9 +728,7 @@ impl Sim {
                 }
                 self.oracle_queue.push_back(Msg {
                     target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
-                    payload: dispatch::encode_msg(
-                        &dispatch::DispatchMsg::Nudge {},
-                    ),
+                    payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
                 });
                 continue;
             };
@@ -716,7 +838,8 @@ impl Sim {
     }
 
     fn status(&self) -> NodeStatus {
-        let modules = MODULE_IDS
+        let modules = self
+            .module_ids
             .iter()
             .map(|id| ModuleStatus {
                 id: (*id).into(),
@@ -757,6 +880,22 @@ fn committed_info(committed: &Committed, kind: &'static str) -> CommittedInfo {
         op_hash: committed.op_hash.clone(),
         target: committed.target.clone(),
         kind,
+    }
+}
+
+/// resolve a submit/peer-block origin string's raw bytes: an origin prefixed
+/// `hex:` decodes the (any even-length) hex remainder to raw bytes — the only
+/// way a JSON-string origin lane can name a real 32-byte ed25519 key. malformed
+/// hex is an error, never a silent fall-through to the literal `hex:…` bytes.
+/// any other origin passes through verbatim (the trusted-client string convention).
+fn decode_origin(origin: Vec<u8>) -> Result<Vec<u8>, String> {
+    match origin.strip_prefix(b"hex:") {
+        Some(rest) => {
+            let hex = std::str::from_utf8(rest)
+                .map_err(|_| "hex: origin escape is not valid utf-8".to_string())?;
+            duckfs_core::unhex(hex).map_err(|e| format!("hex: origin escape: {e}"))
+        }
+        None => Ok(origin),
     }
 }
 
