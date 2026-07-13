@@ -113,12 +113,32 @@ assert_shared_dev_base() {
     git diff --quiet "$github_dev" "$forge_target"; then
     return
   fi
-  local forge_tree candidate_tree
-  forge_tree=$(git rev-parse "$forge_target^{tree}")
-  while IFS= read -r candidate_tree; do
-    [ "$candidate_tree" = "$forge_tree" ] && return
-  done < <(git log --format=%T "$github_dev")
-  die "Forge dev target $forge_target contains content not represented by GitHub dev $github_dev; mirror earlier Forge work or reconcile dev first"
+  local github_trees represented_base candidate_commit candidate_tree
+  github_trees=$(git log --format=%T "$github_dev")
+  represented_base=
+  while read -r candidate_commit candidate_tree; do
+    if grep -Fqx -- "$candidate_tree" <<<"$github_trees"; then
+      represented_base=$candidate_commit
+      break
+    fi
+  done < <(git log --topo-order --format='%H %T' "$forge_target")
+  [ -n "$represented_base" ] ||
+    die "Forge dev target $forge_target has no snapshot represented in GitHub dev $github_dev"
+  if git diff --quiet "$represented_base" "$forge_target"; then
+    return
+  fi
+
+  # GitHub may have advanced on the same files after an earlier Forge PR was
+  # mirrored. Merge its current tree with the Forge target from the exact
+  # shared snapshot. The Forge delta is already represented only when that
+  # location-preserving three-tree merge is clean and changes nothing on GitHub.
+  local merged_tree github_tree
+  merged_tree=$(git merge-tree --write-tree --no-messages \
+    --merge-base "$represented_base" "$github_dev" "$forge_target") ||
+    die "Forge dev target $forge_target conflicts with GitHub dev $github_dev after their represented snapshot"
+  github_tree=$(git rev-parse "$github_dev^{tree}")
+  [ "$merged_tree" = "$github_tree" ] ||
+    die "Forge dev target $forge_target contains changes missing from GitHub dev $github_dev"
 }
 
 validate_merged_selection() {

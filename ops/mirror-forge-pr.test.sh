@@ -81,6 +81,7 @@ cmp \
   <(git show --pretty=format: --binary "$MIRROR_OID" | git patch-id --stable)
 [ "$(git show -s --format=%ce "$MIRROR_OID")" = 'node-alpha@nodes.duck' ]
 assert_shared_dev_base "$TARGET_OID" "$GITHUB_BASE"
+assert_shared_dev_base "$MERGE_OID" "$MIRROR_OID"
 bridge_tree=$(git rev-parse "$GITHUB_BASE^{tree}")
 BRIDGE=$(printf 'history-only bridge\n' | git commit-tree "$bridge_tree" -p "$GITHUB_BASE")
 assert_shared_dev_base "$BRIDGE" "$GITHUB_BASE"
@@ -98,6 +99,50 @@ if (assert_shared_dev_base "$TARGET_OID" "$SOURCE_OID") >/dev/null 2>&1; then
   echo 'sibling Forge and GitHub histories were accepted' >&2
   exit 1
 fi
+
+# GitHub may add an unrelated change elsewhere in a file that already carries
+# the Forge delta. The three-tree proof accepts it without requiring whole-file
+# identity.
+quiet_git "$DEST_REPO" reset --hard "$BASE"
+printf 'alpha\nold\nomega\nextra-old\n' >"$DEST_REPO/represented.txt"
+quiet_git "$DEST_REPO" add represented.txt
+quiet_git "$DEST_REPO" commit -m 'represented fixture base'
+REPRESENTED_BASE=$(git -C "$DEST_REPO" rev-parse HEAD)
+printf 'alpha\nforge\nomega\nextra-old\n' >"$DEST_REPO/represented.txt"
+quiet_git "$DEST_REPO" add represented.txt
+quiet_git "$DEST_REPO" commit -m 'Forge changes one hunk'
+REPRESENTED_FORGE=$(git -C "$DEST_REPO" rev-parse HEAD)
+quiet_git "$DEST_REPO" reset --hard "$REPRESENTED_BASE"
+printf 'alpha\nforge\nomega\ngithub\n' >"$DEST_REPO/represented.txt"
+quiet_git "$DEST_REPO" add represented.txt
+quiet_git "$DEST_REPO" commit -m 'GitHub keeps Forge and changes another hunk'
+REPRESENTED_GITHUB=$(git -C "$DEST_REPO" rev-parse HEAD)
+assert_shared_dev_base "$REPRESENTED_FORGE" "$REPRESENTED_GITHUB"
+
+# Identical patch context at another location must not let a missing Forge
+# change relocate and pass. GitHub changed only the second repeated block.
+quiet_git "$DEST_REPO" reset --hard "$BASE"
+printf 'a\nb\nc\nold\nd\ne\nf\nmiddle\na\nb\nc\nold\nd\ne\nf\n' \
+  >"$DEST_REPO/repeated.txt"
+quiet_git "$DEST_REPO" add repeated.txt
+quiet_git "$DEST_REPO" commit -m 'repeated context base'
+REPEATED_BASE=$(git -C "$DEST_REPO" rev-parse HEAD)
+printf 'a\nb\nc\nforge\nd\ne\nf\nmiddle\na\nb\nc\nold\nd\ne\nf\n' \
+  >"$DEST_REPO/repeated.txt"
+quiet_git "$DEST_REPO" add repeated.txt
+quiet_git "$DEST_REPO" commit -m 'Forge changes the first repeated block'
+REPEATED_FORGE=$(git -C "$DEST_REPO" rev-parse HEAD)
+quiet_git "$DEST_REPO" reset --hard "$REPEATED_BASE"
+printf 'a\nb\nc\nold\nd\ne\nf\nmiddle\na\nb\nc\nforge\nd\ne\nf\n' \
+  >"$DEST_REPO/repeated.txt"
+quiet_git "$DEST_REPO" add repeated.txt
+quiet_git "$DEST_REPO" commit -m 'GitHub changes only the second repeated block'
+REPEATED_GITHUB=$(git -C "$DEST_REPO" rev-parse HEAD)
+if (assert_shared_dev_base "$REPEATED_FORGE" "$REPEATED_GITHUB") >/dev/null 2>&1; then
+  echo 'a Forge hunk missing at its original location was accepted' >&2
+  exit 1
+fi
+quiet_git "$DEST_REPO" reset --hard "$GITHUB_BASE"
 
 printf '%s\n' \
   'Closes #49. This fixes #12 and RESOLVED #13.' \
