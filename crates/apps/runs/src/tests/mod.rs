@@ -327,6 +327,7 @@ fn dummy_thread_view(id: &str) -> pages::ThreadView {
             target: "elsewhere".into(),
             opener: pages::AuthorRef::System,
             created_at: 0,
+            anchor: None,
             resolved: false,
             resolved_by: None,
             comment_ids: Vec::new(),
@@ -843,6 +844,7 @@ fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
         page: page_id.into(),
         kind,
         text: text.into(),
+        marks: Vec::new(),
         checked: false,
         children: Vec::new(),
     };

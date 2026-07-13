@@ -4,7 +4,7 @@
 // shortcut detection, and the {parent, after} targets for indent/outdent and
 // sibling moves — the exact shapes MoveBlock takes on the wire.
 
-import type { BlockKind, PageBlock } from "../../../domain/pages-client";
+import type { BlockKind, PageBlock, SpanMark } from "../../../domain/pages-client";
 
 /** A pause this long while typing is one edit boundary — one consensus op.
  *  Shared by the block rows and the title input; exported for the tests that
@@ -227,6 +227,7 @@ export interface DuplicateOp extends MoveTarget {
   blockId: string;
   kind: BlockKind;
   text: string;
+  marks?: SpanMark[];
   checked: boolean;
 }
 
@@ -257,6 +258,7 @@ function planSubtree(
       after,
       kind: block.kind,
       text: block.text,
+      ...(block.marks?.length ? { marks: block.marks } : {}),
       // `checked` only means anything on a to-do. SetKind does NOT reset the bit
       // in the module, so a to-do that was checked and later converted still
       // carries checked=true — and replaying that as SetChecked on a paragraph

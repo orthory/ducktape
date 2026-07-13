@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SetStateAction } from "react";
+import type { RelativeAnchor, ThreadView } from "../../../domain/pages-client";
 
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
@@ -43,6 +44,7 @@ import { usePagePresence } from "./use-page-presence";
 
 export { EDIT_BOUNDARY_MS };
 const EMPTY_PRESENCE: PagePresencePeer[] = [];
+const EMPTY_THREADS: ThreadView[] = [];
 
 // ── The view ─────────────────────────────────────────────
 
@@ -80,6 +82,7 @@ export function PagesView() {
     target: string;
     label: string;
     anchor: CommentAnchor;
+    range?: RelativeAnchor;
   } | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
@@ -163,10 +166,11 @@ export function PagesView() {
     if (page) setDeleteUndo({ page, ops });
   }, []);
 
-  // live thread count keyed by target (block id or page id).
+  // live threads keyed by target (block id or page id); rows need anchors as
+  // well as counts so exact selections can be painted behind the textarea.
   const threadsByTarget = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const group of state.pageThreads) map.set(group.target, group.threads.length);
+    const map = new Map<string, ThreadView[]>();
+    for (const group of state.pageThreads) map.set(group.target, group.threads);
     return map;
   }, [state.pageThreads]);
 
@@ -289,6 +293,7 @@ export function PagesView() {
         after: op.after,
         kind: op.kind,
         text: op.text,
+        ...(op.marks ? { marks: op.marks } : {}),
         quiet: index === 0,
       });
       // the rest of the plan only anchors onto blocks the root brought back, so
@@ -301,8 +306,12 @@ export function PagesView() {
     }
   };
 
-  const openBlockComments = useCallback((blockId: string, anchor: CommentAnchor) => {
-    setCommentCard({ target: blockId, label: "this block", anchor });
+  const openBlockComments = useCallback((
+    blockId: string,
+    anchor: CommentAnchor,
+    range?: RelativeAnchor,
+  ) => {
+    setCommentCard({ target: blockId, label: range ? "selected text" : "this block", anchor, range });
   }, []);
 
   // row intents -> store ops + caret placement. `handlers` is referentially
@@ -311,6 +320,7 @@ export function PagesView() {
     actions,
     rows,
     blocks,
+    pageThreads: state.pageThreads,
     root,
     activePage,
     drag,
@@ -522,7 +532,7 @@ export function PagesView() {
                       caret={focus?.id === row.block.id ? focus.caret : null}
                       expanded={!collapsed.has(row.block.id)}
                       op={state.ops[opKey.pageBlock(row.block.id)]}
-                      threadCount={threadsByTarget.get(row.block.id) ?? 0}
+                      threads={threadsByTarget.get(row.block.id) ?? EMPTY_THREADS}
                       presence={presenceByBlock.get(row.block.id) ?? EMPTY_PRESENCE}
                       onCursor={onCursor}
                       // the indicator only appears where the drop would ACTUALLY
@@ -594,6 +604,8 @@ export function PagesView() {
           target={commentCard.target}
           label={commentCard.label}
           anchor={commentCard.anchor}
+          selection={commentCard.range}
+          targetText={blocks.find((block) => block.id === commentCard.target)?.text ?? ""}
           threads={
             state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? []
           }
@@ -602,7 +614,9 @@ export function PagesView() {
           selfName={selfName}
           ops={state.ops}
           onClose={() => setCommentCard(null)}
-          onSubmitNew={(target, text) => actions.addComment({ target, text })}
+          onSubmitNew={(target, text, range) =>
+            actions.addComment({ target, text, ...(range ? { anchor: range } : {}) })
+          }
           onReply={replyToThread}
           onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
           onEdit={(commentId, text) => actions.editComment({ commentId, text })}

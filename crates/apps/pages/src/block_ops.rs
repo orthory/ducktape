@@ -1,4 +1,5 @@
 use super::{Block, BlockKind, BufferPooler, Context, PageError, PageMsg, Pages, to_page_err};
+use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
 
 /// resolve an `after` sibling anchor to the insert index within `children`:
 /// `None` -> first child (0); `Some(id)` -> one past the anchor's position,
@@ -39,6 +40,7 @@ where
                 {
                     return Err(PageError::DuplicateBlock);
                 }
+                let marks = validate_marks(&block.text, block.marks)?;
                 let mut parent_blk = self
                     .require_block(&parent, PageError::ParentNotFound)
                     .await?;
@@ -50,18 +52,51 @@ where
                     page: parent_blk.page.clone(),
                     kind: block.kind,
                     text: block.text,
+                    marks,
                     checked: false,
                     children: Vec::new(),
                 })?;
                 self.store_block(&parent_blk)
             }
-            PageMsg::UpdateText { block_id, text } => {
+            PageMsg::UpdateText {
+                block_id,
+                text,
+                marks,
+            } => {
                 // works on any block INCLUDING a page root — that is the
                 // rename path (the title is the root's text).
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
+                // Validate the client-supplied atomic replacement before
+                // staging any rebased comment records.
+                let marks = marks
+                    .map(|marks| validate_marks(&text, marks))
+                    .transpose()?;
+                if let Some(edit) = edit_between(&blk.text, &text) {
+                    if marks.is_none() {
+                        rebase_marks(&mut blk.marks, edit, utf16_len(&text));
+                    }
+                    self.rebase_comment_anchors(&block_id, edit, utf16_len(&text))
+                        .await?;
+                }
+                if let Some(marks) = marks {
+                    blk.marks = marks;
+                }
                 blk.text = text;
+                self.store_block(&blk)
+            }
+            PageMsg::SetSpanMark {
+                block_id,
+                start,
+                end,
+                kind,
+                active,
+            } => {
+                let mut blk = self
+                    .require_block(&block_id, PageError::BlockNotFound)
+                    .await?;
+                set_span_mark(&mut blk.marks, &blk.text, start, end, kind, active)?;
                 self.store_block(&blk)
             }
             PageMsg::SetKind { block_id, kind } => {

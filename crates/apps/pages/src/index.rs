@@ -221,7 +221,7 @@ impl ModuleIndexer for PagesIndex {
                 parent_row.children.push(block.id);
                 put_row(out, &parent_row)
             }
-            PageMsg::UpdateText { block_id, text } => {
+            PageMsg::UpdateText { block_id, text, .. } => {
                 let Some(mut row) = read_row(ctx, &block_id)? else {
                     return Ok(());
                 };
@@ -284,10 +284,11 @@ impl ModuleIndexer for PagesIndex {
                 delete_subtree(ctx, out, row)
             }
             // checked state carries no searchable text.
-            PageMsg::SetChecked { .. } => Ok(()),
+            PageMsg::SetChecked { .. } | PageMsg::SetSpanMark { .. } => Ok(()),
             // comments live in a reserved keyspace, not the block tree — no
             // searchable block row changes (a future pass could index them).
             PageMsg::AddComment { .. }
+            | PageMsg::MoveCommentThread { .. }
             | PageMsg::EditComment { .. }
             | PageMsg::DeleteComment { .. }
             | PageMsg::ResolveThread { .. } => Ok(()),
@@ -417,6 +418,7 @@ mod tests {
                 id: id.into(),
                 kind: BlockKind::Paragraph,
                 text: text.into(),
+                marks: Vec::new(),
             },
         })
     }
@@ -604,6 +606,7 @@ mod tests {
             vec![op(&PageMsg::UpdateText {
                 block_id: "p1".into(),
                 text: "gamma".into(),
+                marks: None,
             })],
         );
         assert!(search(&store, serde_json::json!({"search": {"text": "alpha"}})).is_empty());
@@ -651,6 +654,7 @@ mod tests {
             kind,
             text: text.into(),
             checked: false,
+            marks: Vec::new(),
             children: children.iter().map(|c| (*c).into()).collect(),
         }
     }

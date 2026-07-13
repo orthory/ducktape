@@ -816,6 +816,7 @@ impl RunsModule {
                 comment_id,
                 target: view.thread.target,
                 text,
+                anchor: None,
                 mentions: Vec::new(),
                 as_agent: Some(entry.agent_id.clone()),
             }),

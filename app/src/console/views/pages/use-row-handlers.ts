@@ -14,7 +14,8 @@
 import { useCallback, useMemo, useRef } from "react";
 import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 
-import type { PageBlock } from "../../../domain/pages-client";
+import type { PageBlock, RelativeAnchor, TargetThreads } from "../../../domain/pages-client";
+import { mergeMarks, rebaseMarks, rebaseRange, splitMarks } from "../../../domain/pages-ranges";
 import type { ConsoleActions } from "../../store/actions";
 import { caretOffset, mergeText } from "./block-keys";
 import type { Caret, FocusIntent } from "./block-keys";
@@ -44,6 +45,7 @@ export interface RowHandlersDeps {
   actions: ConsoleActions;
   rows: Row[];
   blocks: PageBlock[];
+  pageThreads: TargetThreads[];
   /** The page root — its children are the top-level blocks. */
   root: PageBlock | null;
   activePage: string | null;
@@ -53,7 +55,11 @@ export interface RowHandlersDeps {
   setFocus: Dispatch<SetStateAction<FocusIntent | null>>;
   setCollapsed: Dispatch<SetStateAction<ReadonlySet<string>>>;
   setDrag: Dispatch<SetStateAction<DragState | null>>;
-  openComments: (blockId: string, anchor: { x: number; y: number }) => void;
+  openComments: (
+    blockId: string,
+    anchor: { x: number; y: number },
+    range?: RelativeAnchor,
+  ) => void;
   /** Deleting a block WITH CHILDREN takes its whole subtree with it, so it asks
    *  first. The view owns the dialog. */
   confirmRemove: (blockId: string) => void;
@@ -76,6 +82,7 @@ export function useRowHandlers({
   actions,
   rows,
   blocks,
+  pageThreads,
   root,
   activePage,
   drag,
@@ -89,8 +96,8 @@ export function useRowHandlers({
   onPasteCapped,
   onDeleted,
 }: RowHandlersDeps): RowHandlersApi {
-  const live = useRef({ rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped, onDeleted });
-  live.current = { rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped, onDeleted };
+  const live = useRef({ rows, blocks, pageThreads, root, actions, activePage, drag, confirmRemove, onPasteCapped, onDeleted });
+  live.current = { rows, blocks, pageThreads, root, actions, activePage, drag, confirmRemove, onPasteCapped, onDeleted };
 
   const appendBlock = useCallback(() => {
     const { root, actions } = live.current;
@@ -175,8 +182,8 @@ export function useRowHandlers({
 
   const handlers: RowHandlers = useMemo(
     () => ({
-      commitText: (blockId, text) => {
-      live.current.actions.updatePageBlockText({ blockId, text });
+      commitText: (blockId, text, marks) => {
+        live.current.actions.updatePageBlockText({ blockId, text, marks });
       },
       // Enter at the caret: this block keeps the left half, a new sibling takes
       // the right half. Two ops, and a failed op is never rolled back — it is
@@ -187,23 +194,75 @@ export function useRowHandlers({
       // restoring the whole text. Worst case is a visible duplicate, never a
       // silent loss.
       split: (row, left, right) => {
-      const cur = row.block;
-      if (!cur.parent) return;
-      const blockId = crypto.randomUUID();
-      const inserted = live.current.actions.insertPageBlock({
-        blockId,
-        parent: cur.parent,
-        after: cur.id,
-        kind: continuationKind(cur.kind),
-        text: right,
-      });
-      live.current.actions.updatePageBlockText({ blockId: cur.id, text: left });
-      void inserted.then((ok) => {
-        // only an explicit false is a known failure; never compensate on a
-        // merely absent answer.
-        if (ok === false) live.current.actions.updatePageBlockText({ blockId: cur.id, text: left + right });
-      });
-      setFocus({ id: blockId, caret: "start" });
+        const cur = row.block;
+        if (!cur.parent) return;
+        const marks = splitMarks(
+          rebaseMarks(cur.text, left + right, cur.marks),
+          left.length,
+        );
+        const blockId = crypto.randomUUID();
+        const inserted = live.current.actions.insertPageBlock({
+          blockId,
+          parent: cur.parent,
+          after: cur.id,
+          kind: continuationKind(cur.kind),
+          text: right,
+          ...(marks.right.length ? { marks: marks.right } : {}),
+        });
+        const update = () => live.current.actions.updatePageBlockText({
+          blockId: cur.id,
+          text: left,
+          ...(cur.marks?.length ? { marks: marks.left } : {}),
+        });
+        const anchoredThreads = (live.current.pageThreads
+          .find((group) => group.target === cur.id)?.threads ?? [])
+          .flatMap(({ thread }) => {
+            if (!thread.anchor) return [];
+            return [{
+              threadId: thread.id,
+              anchor: rebaseRange(cur.text, left + right, thread.anchor),
+            }];
+          });
+        const movedThreads = anchoredThreads.flatMap(({ threadId, anchor }) =>
+          anchor.start >= left.length
+            ? [{
+                threadId,
+                anchor: { start: anchor.start - left.length, end: anchor.end - left.length },
+              }]
+            : []);
+        if (anchoredThreads.some(({ anchor }) => anchor.end > left.length)) {
+          const migrated = movedThreads.reduce<Promise<boolean>>(
+            (chain, move) => chain.then((ok) =>
+              ok
+                ? live.current.actions.moveCommentThread({
+                    ...move,
+                    target: blockId,
+                  })
+                : false),
+            inserted,
+          );
+          void migrated.then((ok) => {
+            // If either the new block or a thread move failed, keep the whole
+            // original text. A duplicate right block is visible; lost
+            // commented text is not recoverable.
+            if (ok) void update();
+          });
+          setFocus({ id: blockId, caret: "start" });
+          return;
+        }
+        void update();
+        void inserted.then((ok) => {
+          // only an explicit false is a known failure; never compensate on a
+          // merely absent answer.
+          if (ok === false) live.current.actions.updatePageBlockText({
+            blockId: cur.id,
+            text: left + right,
+            ...(cur.marks?.length
+              ? { marks: mergeMarks(marks.left, marks.right, left.length) }
+              : {}),
+          });
+        });
+        setFocus({ id: blockId, caret: "start" });
       },
       // Backspace at offset 0: this block's text joins the one above and this
       // one goes away. Same hazard as the split, mirrored — here the *update* is
@@ -239,11 +298,51 @@ export function useRowHandlers({
       const cur = live.current.blocks.find((b) => b.id === row.block.id) ?? row.block;
       const parent = cur.parent;
       if (!parent) return;
-      const { text: joined, seam } = mergeText(liveText(prev.block), text);
-      const merged = live.current.actions.updatePageBlockText({ blockId: prev.block.id, text: joined });
+      const previousText = liveText(prev.block);
+      const { text: joined, seam } = mergeText(previousText, text);
+      const joinedMarks = mergeMarks(
+        rebaseMarks(prev.block.text, previousText, prev.block.marks),
+        rebaseMarks(cur.text, text, cur.marks),
+        seam,
+      );
+      const threadMoves = (live.current.pageThreads
+        .find((group) => group.target === cur.id)?.threads ?? [])
+        .map(({ thread }) => {
+          if (!thread.anchor) return { threadId: thread.id, anchor: null };
+          const anchor = rebaseRange(cur.text, text, thread.anchor);
+          return {
+            threadId: thread.id,
+            anchor: anchor.start < anchor.end
+              ? { start: anchor.start + seam, end: anchor.end + seam }
+              : null,
+          };
+        });
+      const merged = live.current.actions.updatePageBlockText({
+        blockId: prev.block.id,
+        text: joined,
+        ...((prev.block.marks?.length || cur.marks?.length) ? { marks: joinedMarks } : {}),
+      });
+      const commentsMoved = threadMoves.reduce<Promise<boolean>>(
+        (chain, move) => chain.then((ok) =>
+          ok
+            ? live.current.actions.moveCommentThread({
+                ...move,
+                target: prev.block.id,
+              })
+            : false),
+        merged,
+      );
       setFocus({ id: prev.block.id, caret: seam });
 
       if (cur.children.length === 0) {
+        if (threadMoves.length > 0) {
+          void commentsMoved.then((ok) => {
+            // The source block owns the only fallback copy until every thread
+            // has followed its text into the adopter.
+            if (ok) void live.current.actions.removePageBlock(cur.id);
+          });
+          return;
+        }
         // Nothing to adopt: the row must vanish under the caret NOW. A failed
         // merge puts the block back — the wire FIFO keeps that re-insert behind
         // this remove, so the id is free by the time it lands. Worst case is a
@@ -257,6 +356,9 @@ export function useRowHandlers({
               after: prev.block.id,
               kind: cur.kind,
               text,
+              ...(cur.marks?.length
+                ? { marks: rebaseMarks(cur.text, text, cur.marks) }
+                : {}),
             });
           }
         });
@@ -285,7 +387,7 @@ export function useRowHandlers({
               })
             : false,
         );
-      }, merged);
+      }, commentsMoved);
 
       void adopted.then((ok) => {
         // a child did not make it across — it is still under `cur`, and
@@ -321,6 +423,8 @@ export function useRowHandlers({
       live.current.actions.setPageBlockKind({ blockId, kind });
       setFocus({ id: blockId, caret: "end" });
       },
+      setMark: (blockId, range, kind, active) =>
+        live.current.actions.setPageBlockSpanMark({ blockId, ...range, kind, active }),
       setChecked: (blockId, checked) =>
       live.current.actions.setPageBlockChecked({ blockId, checked }),
       // the menu's Delete — the same guarded path as Backspace-on-empty and
@@ -356,6 +460,7 @@ export function useRowHandlers({
           after: op.after,
           kind: op.kind,
           text: op.text,
+          ...(op.marks ? { marks: op.marks } : {}),
         });
         // InsertBlock carries no `checked` bit, so a checked to-do needs a
         // second op to come back checked.
@@ -379,7 +484,44 @@ export function useRowHandlers({
       const [first, ...rest] = plan.blocks;
       const head = before + first.text + (rest.length === 0 ? after : "");
 
-      live.current.actions.updatePageBlockText({ blockId: cur.id, text: head });
+      // Existing rich text on either side of the replaced selection stays
+      // with that text. The pasted document is plain; when it creates several
+      // blocks, the original tail (and its marks) moves to the final block.
+      const source = liveText(cur);
+      const sourceMarks = rebaseMarks(cur.text, source, cur.marks);
+      const aroundSelection = splitMarks(sourceMarks, before.length);
+      const tailMarks = splitMarks(
+        aroundSelection.right,
+        Math.max(0, source.length - before.length - after.length),
+      ).right;
+      const headMarks = rest.length === 0
+        ? mergeMarks(aroundSelection.left, tailMarks, before.length + first.text.length)
+        : aroundSelection.left;
+      const tailStart = source.length - after.length;
+      const tailThreads = rest.length === 0
+        ? []
+        : (live.current.pageThreads
+            .find((group) => group.target === cur.id)?.threads ?? [])
+            .flatMap(({ thread }) => {
+              if (!thread.anchor) return [];
+              const anchor = rebaseRange(cur.text, source, thread.anchor);
+              return anchor.start >= tailStart && anchor.start < anchor.end
+                ? [{
+                    threadId: thread.id,
+                    anchor: {
+                      start: anchor.start - tailStart,
+                      end: anchor.end - tailStart,
+                    },
+                  }]
+                : [];
+            });
+
+      const updateHead = () => live.current.actions.updatePageBlockText({
+        blockId: cur.id,
+        text: head,
+        ...(cur.marks?.length ? { marks: headMarks } : {}),
+      });
+      if (tailThreads.length === 0) void updateHead();
       // an EMPTY paragraph adopts the first line's kind — pasting a document
       // into a fresh block must not leave "# Title" sitting as a paragraph.
       if (cur.kind === "paragraph" && before === "" && first.kind !== "paragraph") {
@@ -387,10 +529,13 @@ export function useRowHandlers({
       }
 
       let afterId = cur.id;
-      rest.forEach((block, i) => {
+      let finalBlockId: string | null = null;
+      let finalTextLength = 0;
+      let inserted: Promise<boolean> = Promise.resolve(true);
+      for (const [i, block] of rest.entries()) {
         const blockId = crypto.randomUUID();
         const last = i === rest.length - 1;
-        live.current.actions.insertPageBlock({
+        const landed = live.current.actions.insertPageBlock({
           blockId,
           parent: cur.parent as string,
           after: afterId,
@@ -398,11 +543,39 @@ export function useRowHandlers({
           // the text the caret was sitting in front of rides on the last
           // pasted block, exactly where a plain paste would have left it.
           text: last ? block.text + after : block.text,
+          ...(last && tailMarks.length
+            ? { marks: mergeMarks([], tailMarks, block.text.length) }
+            : {}),
         });
+        inserted = inserted.then((ok) => (ok ? landed : false));
         // the caret lands at the END of the pasted content — before the tail.
-        if (last) setFocus({ id: blockId, caret: block.text.length });
+        if (last) {
+          finalBlockId = blockId;
+          finalTextLength = block.text.length;
+          setFocus({ id: blockId, caret: block.text.length });
+        }
         afterId = blockId;
-      });
+      }
+      if (finalBlockId && tailThreads.length > 0) {
+        const targetBlockId = finalBlockId;
+        const migrated = tailThreads.reduce<Promise<boolean>>(
+          (chain, move) => chain.then((ok) =>
+            ok
+              ? live.current.actions.moveCommentThread({
+                  threadId: move.threadId,
+                  target: targetBlockId,
+                  anchor: {
+                    start: move.anchor.start + finalTextLength,
+                    end: move.anchor.end + finalTextLength,
+                  },
+                })
+              : false),
+          inserted,
+        );
+        void migrated.then((ok) => {
+          if (ok) void updateHead();
+        });
+      }
 
       if (plan.dropped > 0) live.current.onPasteCapped(plan.dropped);
       return head;

@@ -90,6 +90,15 @@ describe("CommentCard", () => {
     expect(queryByLabelText("New comment text")).toBeNull();
   });
 
+  it("shows the live text covered by an exact thread anchor", () => {
+    const anchored: ThreadView = {
+      ...thread,
+      thread: { ...thread.thread, anchor: { start: 6, end: 11 } },
+    };
+    const { getByLabelText } = renderCard({ threads: [anchored], targetText: "hello world" });
+    expect(getByLabelText("Commented text").textContent).toBe("world");
+  });
+
   it("relays reply and resolve to the thread card", () => {
     const { getByLabelText, getByRole, props } = renderCard({ threads: [thread] });
     fireEvent.change(getByLabelText("Reply to thread"), {

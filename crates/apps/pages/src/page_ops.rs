@@ -35,6 +35,7 @@ where
                             page: page_id,
                             kind: BlockKind::Page,
                             text: title,
+                            marks: Vec::new(),
                             checked: false,
                             children: Vec::new(),
                         })

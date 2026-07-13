@@ -529,6 +529,7 @@ mod tests {
             page: "root".into(),
             kind,
             text: text.into(),
+            marks: Vec::new(),
             checked: false,
             children: Vec::new(),
         }

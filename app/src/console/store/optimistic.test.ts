@@ -198,6 +198,28 @@ describe("page block projections", () => {
     const out = optimistic.pageBlockPatched(prev, "root", { text: "Launch Plan" });
     expect(out.pages).toEqual([{ id: "root", title: "Launch Plan", parent: null }]);
   });
+
+  it("rebases inline marks and exact comment anchors with optimistic text", () => {
+    const marked = { ...block("a", "root"), text: "a🦆bc", marks: [{ start: 1, end: 3, kind: "bold" as const }] };
+    const prev = base({
+      activePage: "root",
+      activePageBlocks: [block("root", null, ["a"]), marked],
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 1, end: 3 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    const out = optimistic.pageBlockPatched(prev, "a", { text: "++a🦆bc" });
+    expect(out.activePageBlocks![1].marks).toEqual([{ start: 3, end: 5, kind: "bold" }]);
+    expect(out.pageThreads![0].threads[0].thread.anchor).toEqual({ start: 3, end: 5 });
+  });
 });
 
 describe("huddle projections", () => {
@@ -465,6 +487,23 @@ describe("comment projections", () => {
     const view = out.pageThreads![0].threads[0];
     expect(view.thread.comment_ids).toEqual(["c-1", "c-2"]);
     expect(view.comments.map((c) => c.text)).toEqual(["hello", "reply"]);
+  });
+
+  it("moves a thread and its exact anchor to another block", () => {
+    const seeded = base(optimistic.commentAdded(base(), addParams({
+      anchor: { start: 1, end: 3 },
+    })));
+    const out = optimistic.commentThreadMoved(
+      seeded,
+      "t-1",
+      "block-2",
+      { start: 4, end: 6 },
+    );
+    expect(out.pageThreads![0].threads).toEqual([]);
+    expect(out.pageThreads![1].threads[0].thread).toMatchObject({
+      target: "block-2",
+      anchor: { start: 4, end: 6 },
+    });
   });
 
   it("edits a comment in place and stamps edited_at", () => {
