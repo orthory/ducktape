@@ -16,10 +16,10 @@ import { act, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { blocksText } from "../../domain/chat-client";
-import { simnodeBinary } from "../../test/simnode-harness";
-import { useSimScenario } from "../../test/sim-scenario";
-import { opKey } from "./finalization";
-import { selfAuthorBytes } from "./state";
+import { simnodeBinary } from "../simnode-harness";
+import { useSimScenario } from "../sim-scenario";
+import { opKey } from "../../console/store/finalization";
+import { selfAuthorBytes } from "../../console/store/state";
 
 const bin = simnodeBinary();
 if (!bin) {

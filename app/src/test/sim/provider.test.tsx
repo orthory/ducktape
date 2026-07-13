@@ -18,10 +18,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import { blocksText } from "../../domain/chat-client";
 import type { SubmitReceipt } from "../../domain/transport";
-import { simnodeBinary } from "../../test/simnode-harness";
-import { useSimScenario } from "../../test/sim-scenario";
-import { ExplorerView } from "../views/explorer/ExplorerView";
-import { OP_STALE_MS, opKey } from "./finalization";
+import { simnodeBinary } from "../simnode-harness";
+import { useSimScenario } from "../sim-scenario";
+import { ExplorerView } from "../../console/views/explorer/ExplorerView";
+import { OP_STALE_MS, opKey } from "../../console/store/finalization";
 
 const bin = simnodeBinary();
 if (!bin) {
