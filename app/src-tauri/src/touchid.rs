@@ -25,27 +25,24 @@
 const KEYCHAIN_SERVICE: &str = "com.ducktape.app.userkey";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT: &str = "vault-passphrase";
-// The entitlement-less fallback item (rung 2). A separate account name is the
-// discriminator: its presence tells `unlock` to run the LAContext gate, since
-// a plain item's read is silent — the OS enforces nothing on it. That gate is
-// app-enforced only: a debugger or another local process could read this item
-// without it (subject to the login keychain's own per-app ACL prompt). The
-// deliberate tradeoff for unentitled builds — the ACL rung is simply
-// unavailable to them, and the 24-word phrase remains the custody backstop.
+// The entitlement-less fallback item (rung 2 — see the module header). The
+// account name is the discriminator: its presence is what tells `unlock` to
+// run the LAContext gate. That gate is app-enforced only: a debugger or
+// another local process could read this item without it (subject to the
+// login keychain's own per-app ACL prompt) — the deliberate tradeoff for
+// unentitled builds, with the 24-word phrase as the custody backstop.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT_PLAIN: &str = "vault-passphrase.plain";
 
-/// True only on macOS where user-presence auth works: Touch ID when the
-/// sensor is usable, the login password when it isn't. Gates every piece of
-/// Touch ID UI.
+/// True only on macOS where user-presence auth (see the module header) works.
+/// Gates every piece of Touch ID UI.
 #[tauri::command]
 pub async fn touchid_available() -> bool {
     imp::available()
 }
 
-/// Store the vault passphrase behind a user-presence ACL (Touch ID when
-/// usable, login password otherwise). Called once, right after the recovery
-/// phrase is confirmed.
+/// Store the vault passphrase behind user-presence custody. Called once,
+/// right after the recovery phrase is confirmed.
 #[tauri::command]
 pub async fn touchid_enroll(passphrase: String) -> Result<(), String> {
     imp::enroll(passphrase)
@@ -59,9 +56,8 @@ pub async fn touchid_enrolled() -> bool {
     imp::enrolled()
 }
 
-/// Retrieve the passphrase (prompts Touch ID, or the login password when the
-/// sensor can't be used), unlock the vault, cache it. Returns the pubkey,
-/// exactly like `user_identity_unlock`.
+/// Retrieve the passphrase behind the user-presence prompt, unlock the vault,
+/// cache it. Returns the pubkey, exactly like `user_identity_unlock`.
 #[tauri::command]
 pub async fn touchid_unlock(
     app: crate::rt::AppHandle,
@@ -115,15 +111,16 @@ mod imp {
 mod imp {
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
     use security_framework::item::{ItemClass, ItemSearchOptions};
-    use security_framework::passwords::{set_generic_password_options, PasswordOptions};
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+        set_generic_password_options, PasswordOptions,
+    };
 
-    // kSecAccessControlUserPresence = 1 << 0: the OS prompts biometry when the
-    // sensor is usable and falls back to the login password when it isn't. The
-    // biometric-only BiometryCurrentSet ACL this replaces made the item
-    // unreadable with the lid closed (clamshell — the sensor is physically
-    // unreachable) and PERMANENTLY invalid after any fingerprint-set change;
-    // user-presence keeps the 24-word phrase as recovery without bricking the
-    // everyday path.
+    // kSecAccessControlUserPresence = 1 << 0. The biometric-only
+    // BiometryCurrentSet ACL this replaced made the item unreadable with the
+    // lid closed (clamshell — the sensor is physically unreachable) and
+    // PERMANENTLY invalid after any fingerprint-set change; user-presence
+    // keeps the 24-word phrase as recovery without bricking the everyday path.
     const USER_PRESENCE: usize = 1 << 0;
 
     /// errSecUserCanceled — the user dismissed the OS auth sheet.
@@ -137,15 +134,18 @@ mod imp {
     /// LAErrorUserCancel — the user dismissed the LAContext sheet.
     const LA_ERROR_USER_CANCEL: isize = -2;
 
-    /// User-presence auth is usable iff we can build a user-presence access
-    /// control; biometry drives the prompt when available and the login
-    /// password stands in when it isn't.
-    pub fn available() -> bool {
+    /// The rung-1 access control: user presence, this-device-only.
+    fn user_presence_ac() -> Result<SecAccessControl, String> {
         SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
             USER_PRESENCE,
         )
-        .is_ok()
+        .map_err(|e| format!("access-control: {e}"))
+    }
+
+    /// User-presence auth is usable iff we can build its access control.
+    pub fn available() -> bool {
+        user_presence_ac().is_ok()
     }
 
     /// Non-prompting: search for the item WITHOUT loading its data (no
@@ -166,11 +166,7 @@ mod imp {
     pub fn enroll(passphrase: String) -> Result<(), String> {
         // Build the ACL before deleting the existing item: an ACL failure must
         // never leave the user with the old item already gone.
-        let ac = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-            USER_PRESENCE,
-        )
-        .map_err(|e| format!("access-control: {e}"))?;
+        let ac = user_presence_ac()?;
         let _ = disable(); // idempotent re-enroll (clears both item kinds)
         let mut options =
             PasswordOptions::new_generic_password(super::KEYCHAIN_SERVICE, super::KEYCHAIN_ACCOUNT);
@@ -180,14 +176,12 @@ mod imp {
             // Rung 2: this build can't touch the data-protection keychain, so
             // store a plain login-keychain item; `unlock` compensates by
             // demanding user presence through LAContext before reading it.
-            Err(e) if e.code() == ERR_SEC_MISSING_ENTITLEMENT => {
-                security_framework::passwords::set_generic_password(
-                    super::KEYCHAIN_SERVICE,
-                    super::KEYCHAIN_ACCOUNT_PLAIN,
-                    passphrase.as_bytes(),
-                )
-                .map_err(|e| format!("keychain add (plain): {e}"))
-            }
+            Err(e) if e.code() == ERR_SEC_MISSING_ENTITLEMENT => set_generic_password(
+                super::KEYCHAIN_SERVICE,
+                super::KEYCHAIN_ACCOUNT_PLAIN,
+                passphrase.as_bytes(),
+            )
+            .map_err(|e| format!("keychain add (plain): {e}")),
             Err(e) => Err(format!("keychain add: {e}")),
         }
     }
@@ -195,17 +189,31 @@ mod imp {
     pub fn disable() -> Result<(), String> {
         // not-found is success for a disable.
         for account in [super::KEYCHAIN_ACCOUNT, super::KEYCHAIN_ACCOUNT_PLAIN] {
-            let _ = security_framework::passwords::delete_generic_password(
-                super::KEYCHAIN_SERVICE,
-                account,
-            );
+            let _ = delete_generic_password(super::KEYCHAIN_SERVICE, account);
         }
         Ok(())
     }
 
+    /// Obtain the passphrase bytes, demanding user presence on whichever rung
+    /// the item lives at: an ACL item's read makes the OS prompt itself; the
+    /// plain fallback item is gated through `user_presence_check`. The
+    /// non-prompting `has_item` comes first so "not enrolled at all" never
+    /// pops an auth sheet.
+    fn read_passphrase() -> Result<Vec<u8>, String> {
+        match get_generic_password(super::KEYCHAIN_SERVICE, super::KEYCHAIN_ACCOUNT) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.code() == ERR_SEC_USER_CANCELED => Err("touchid-canceled".to_string()),
+            Err(_) if has_item(super::KEYCHAIN_ACCOUNT_PLAIN) => {
+                user_presence_check()?;
+                get_generic_password(super::KEYCHAIN_SERVICE, super::KEYCHAIN_ACCOUNT_PLAIN)
+                    .map_err(|_| "touchid-unavailable".to_string())
+            }
+            Err(_) => Err("touchid-unavailable".to_string()),
+        }
+    }
+
     /// The rung-2 user-presence gate: block on an LAContext
-    /// `deviceOwnerAuthentication` sheet — Touch ID when the sensor is
-    /// usable, the login password when it isn't. The reply block fires on
+    /// `deviceOwnerAuthentication` sheet. The reply block fires on
     /// LocalAuthentication's own queue; we're on a NodeControl worker thread,
     /// so blocking on the channel is safe.
     fn user_presence_check() -> Result<(), String> {
@@ -249,37 +257,10 @@ mod imp {
         let control = control.inner().clone();
         control
             .run(move || {
-                // Rung 1: reading an ACL item's DATA triggers the OS
-                // user-presence prompt itself (Touch ID when the sensor is
-                // usable, the login password otherwise). "touchid-canceled"
-                // is a dismissed sheet — not a failure; "touchid-unavailable"
-                // is the sentinel the frontend maps to "use your password or
-                // recovery phrase."
-                let bytes = match security_framework::passwords::get_generic_password(
-                    super::KEYCHAIN_SERVICE,
-                    super::KEYCHAIN_ACCOUNT,
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(e) if e.code() == ERR_SEC_USER_CANCELED => {
-                        return Err("touchid-canceled".to_string());
-                    }
-                    // Rung 2: no readable ACL item — the plain fallback item.
-                    // The OS enforces nothing on it, so demand user presence
-                    // ourselves before touching it. The non-prompting presence
-                    // check comes first: "not enrolled at all" must not pop an
-                    // auth sheet.
-                    Err(_) => {
-                        if !has_item(super::KEYCHAIN_ACCOUNT_PLAIN) {
-                            return Err("touchid-unavailable".to_string());
-                        }
-                        user_presence_check()?;
-                        security_framework::passwords::get_generic_password(
-                            super::KEYCHAIN_SERVICE,
-                            super::KEYCHAIN_ACCOUNT_PLAIN,
-                        )
-                        .map_err(|_| "touchid-unavailable".to_string())?
-                    }
-                };
+                // "touchid-canceled" is a dismissed sheet — not a failure;
+                // "touchid-unavailable" is the sentinel the frontend maps to
+                // "use your password or recovery phrase."
+                let bytes = read_passphrase()?;
                 let pass =
                     String::from_utf8(bytes).map_err(|_| "corrupt keychain item".to_string())?;
                 let pubkey = crate::user_identity::unlock_with_secret(
