@@ -94,7 +94,9 @@ describe("splitDuckRefs — the unified tokenizer", () => {
           ? pageRefMarkdown(s.page.id, s.page.label)
           : isFileSeg(s)
             ? fileRefMarkdown(s.file.path, s.file.name, s.file.embed)
-            : s.text,
+            : "text" in s
+              ? s.text
+              : "",
       )
       .join("");
     // the page ref re-emits identically; the rest is untouched literal text.

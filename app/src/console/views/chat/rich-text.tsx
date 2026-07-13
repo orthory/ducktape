@@ -4,7 +4,8 @@
 // used to flatten the blocks to a string and threw the marks away.
 //
 // Three things in a body are click targets: a #tag (filter), a mention mark
-// (open the agent or the person), and a `[[page:<id>]]` ref (open the page).
+// (open the agent or the person), and a `duck://` ref (a chip that deep-links
+// through the protocol's open plane — page/files/forge/channel alike).
 // Everything else is inert text. Navigation goes through the store from here
 // rather than through props: the renderer is used from three views and the
 // context is optional, so a bare component test just gets inert affordances.
@@ -13,13 +14,24 @@ import { useContext, useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import type { AuthorNames, AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
+import { parseItemChannelId } from "../../../domain/forge-client";
 import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
+import { openDuckRef } from "../../store/open-duck-ref";
 import type { HlToken } from "../forge/highlight";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { AttachmentChip } from "./AttachmentChip";
 import { splitMentions } from "./chat-input";
-import { isFileSeg, isPageSeg, splitDuckRefs } from "./duck-ref";
+import {
+  isChannelSeg,
+  isFileSeg,
+  isForgeSeg,
+  isPageSeg,
+  splitDuckRefs,
+  type ChannelRef,
+  type DuckSegment,
+  type ForgeRef,
+} from "./duck-ref";
 import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from "./mention";
 
 // The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
@@ -104,18 +116,25 @@ function MentionToken({ mention, names }: { mention: AuthorRef; names: AuthorNam
   );
 }
 
-// ── Page ref ────────────────────────────────────────────
+// ── duck:// ref chips ───────────────────────────────────
 
-/** A `duck://page/<id>` ref as a chip carrying the page's live title. The
- *  title comes from `state.pages`, which is hydrated at boot and refreshed
- *  when the pages root moves — so a chip never fetches. When the id resolves
- *  to nothing (a
- *  deleted page, a typo, or `pages` not hydrated yet) the chip shows the raw
- *  id: honest about what the text says, never a blank or a guessed title. */
-export function PageRefChip({ pageId }: { pageId: string }) {
-  const store = useContext(ConsoleContext);
-  const page = store?.state.pages.find((meta) => meta.id === pageId) ?? null;
-  const title = page?.title.trim() || null;
+/** The one chip body every duck:// ref renders through: a small glyph, a
+ *  canonical face (NEVER the authored markdown label — labels can lie), and a
+ *  click-through when a store is present. `mono` marks an unresolved raw-id
+ *  face — honest about what the text says, never a blank or a guessed name. */
+function RefChip({
+  glyph,
+  face,
+  mono,
+  description,
+  onOpen,
+}: {
+  glyph: string;
+  face: string;
+  mono: boolean;
+  description: string;
+  onOpen: (() => void) | null;
+}) {
   const style: CSSProperties = {
     display: "inline-flex",
     alignItems: "baseline",
@@ -125,19 +144,18 @@ export function PageRefChip({ pageId }: { pageId: string }) {
     border: `1px solid ${color.borderSoft}`,
     background: color.sunken,
     font: `500 13.5px ${font.sans}`,
-    color: title ? accentVar : color.muted3,
+    color: mono ? color.muted3 : accentVar,
     verticalAlign: "baseline",
   };
   const body = (
     <>
       <span aria-hidden style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>
-        ¶
+        {glyph}
       </span>
-      <span style={{ font: title ? undefined : `400 13px ${font.mono}` }}>{title ?? pageId}</span>
+      <span style={{ font: mono ? `400 13px ${font.mono}` : undefined }}>{face}</span>
     </>
   );
-  if (!store) return <span style={style}>{body}</span>;
-  const description = `Open page ${title ?? pageId}`;
+  if (!onOpen) return <span style={style}>{body}</span>;
   return (
     <button
       type="button"
@@ -145,16 +163,79 @@ export function PageRefChip({ pageId }: { pageId: string }) {
       aria-label={description}
       onClick={(event) => {
         event.stopPropagation();
-        // openPage loads the tree but does NOT navigate — the pages screen has
-        // to be entered too (SearchModal pairs them the same way).
-        store.actions.openPage(pageId);
-        store.actions.setScreen("pages");
+        onOpen();
       }}
       style={{ all: "unset", cursor: "pointer", ...style }}
     >
       {body}
     </button>
   );
+}
+
+/** A `duck://page/<id>` ref carrying the page's live title. The title comes
+ *  from `state.pages`, which is hydrated at boot and refreshed when the pages
+ *  root moves — so a chip never fetches; a deleted/unknown id shows raw. */
+export function PageRefChip({ pageId }: { pageId: string }) {
+  const store = useContext(ConsoleContext);
+  const page = store?.state.pages.find((meta) => meta.id === pageId) ?? null;
+  const title = page?.title.trim() || null;
+  return (
+    <RefChip
+      glyph="¶"
+      face={title ?? pageId}
+      mono={!title}
+      description={`Open page ${title ?? pageId}`}
+      onOpen={
+        store ? () => openDuckRef({ page: { id: pageId, label: "" } }, store.actions) : null
+      }
+    />
+  );
+}
+
+/** A `duck://forge/<repo>[/<n>]` ref. The face is the canonical `repo#n`
+ *  coordinate itself — no store lookup needed to be honest. */
+export function ForgeRefChip({ forge }: { forge: ForgeRef }) {
+  const store = useContext(ConsoleContext);
+  const face = forge.number === null ? forge.repo : `${forge.repo}#${forge.number}`;
+  return (
+    <RefChip
+      glyph="⑂"
+      face={face}
+      mono={false}
+      description={`Open ${face} in Forge`}
+      onOpen={store ? () => openDuckRef({ forge }, store.actions) : null}
+    />
+  );
+}
+
+/** A `duck://channel/<id>[#seq]` ref, faced with the live channel name. A
+ *  forge item's hidden discussion channel (`forge:<repo>:<n>`) faces — and
+ *  deep-links — as its forge item, where that discussion actually lives. */
+export function ChannelRefChip({ channel }: { channel: ChannelRef }) {
+  const store = useContext(ConsoleContext);
+  const item = parseItemChannelId(channel.id);
+  const name = store?.state.channels.find((c) => c.id === channel.id)?.name ?? null;
+  const face = item ? `${item.repo}#${item.number}` : `#${name ?? channel.id}`;
+  const description = item ? `Open ${face} in Forge` : `Open channel ${face}`;
+  return (
+    <RefChip
+      glyph={item ? "⑂" : "#"}
+      face={item ? face : (name ?? channel.id)}
+      mono={!item && !name}
+      description={description}
+      onOpen={store ? () => openDuckRef({ channel }, store.actions) : null}
+    />
+  );
+}
+
+/** One duck segment → its surface: a chip for every valid ref kind, a literal
+ *  run for the rest. The single mapping both body surfaces share. */
+function DuckSeg({ seg, onTagClick }: { seg: DuckSegment; onTagClick?: (tag: string) => void }) {
+  if (isPageSeg(seg)) return <PageRefChip pageId={seg.page.id} />;
+  if (isFileSeg(seg)) return <AttachmentChip attachment={seg.file} />;
+  if (isForgeSeg(seg)) return <ForgeRefChip forge={seg.forge} />;
+  if (isChannelSeg(seg)) return <ChannelRefChip channel={seg.channel} />;
+  return <LiteralRun text={seg.text} onTagClick={onTagClick} />;
 }
 
 /** A pages COMMENT body: plain text on the wire, so every reference is
@@ -188,15 +269,9 @@ export function CommentText({ text, names }: { text: string; names: AuthorNames 
           (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
         );
         if (mark) return <MentionToken key={i} mention={mark.mention} names={names} />;
-        return splitDuckRefs(span.text).map((seg, j) =>
-          isPageSeg(seg) ? (
-            <PageRefChip key={`${i}:${j}`} pageId={seg.page.id} />
-          ) : isFileSeg(seg) ? (
-            <AttachmentChip key={`${i}:${j}`} attachment={seg.file} />
-          ) : (
-            <LiteralRun key={`${i}:${j}`} text={seg.text} />
-          ),
-        );
+        return splitDuckRefs(span.text).map((seg, j) => (
+          <DuckSeg key={`${i}:${j}`} seg={seg} />
+        ));
       })}
     </>
   );
@@ -285,15 +360,9 @@ function SpanText({
         /^`[^`\n]+`$/.test(chunk) ? (
           <InlineCode key={c} text={chunk.slice(1, -1)} />
         ) : (
-          splitDuckRefs(chunk).map((seg, i) =>
-            isPageSeg(seg) ? (
-              <PageRefChip key={`${c}:${i}`} pageId={seg.page.id} />
-            ) : isFileSeg(seg) ? (
-              <AttachmentChip key={`${c}:${i}`} attachment={seg.file} />
-            ) : (
-              <LiteralRun key={`${c}:${i}`} text={seg.text} onTagClick={onTagClick} />
-            ),
-          )
+          splitDuckRefs(chunk).map((seg, i) => (
+            <DuckSeg key={`${c}:${i}`} seg={seg} onTagClick={onTagClick} />
+          ))
         ),
       )}
     </span>
