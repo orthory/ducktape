@@ -267,6 +267,46 @@ describe("huddle projections", () => {
   });
 });
 
+describe("channelMembershipSet", () => {
+  const jess = [1, 2, 3, 4];
+  const kit = [9, 9];
+
+  it("projects the added member row at once and is idempotent on a double click", () => {
+    const prev = base({ activeChannel: "secret", channelMembers: [kit] });
+    const out = optimistic.channelMembershipSet(prev, {
+      channelId: "secret",
+      user: jess,
+      member: true,
+    });
+    expect(out.channelMembers).toEqual([kit, jess]);
+
+    // a second click re-projects the SAME row, never a duplicate.
+    const again = optimistic.channelMembershipSet(
+      base({ activeChannel: "secret", channelMembers: out.channelMembers! }),
+      { channelId: "secret", user: jess, member: true },
+    );
+    expect(again.channelMembers).toEqual([kit, jess]);
+  });
+
+  it("drops the row on remove, and projects nothing onto another channel's set", () => {
+    const prev = base({ activeChannel: "secret", channelMembers: [kit, jess] });
+    expect(
+      optimistic.channelMembershipSet(prev, {
+        channelId: "secret",
+        user: jess,
+        member: false,
+      }).channelMembers,
+    ).toEqual([kit]);
+    expect(
+      optimistic.channelMembershipSet(prev, {
+        channelId: "general",
+        user: jess,
+        member: false,
+      }),
+    ).toEqual({});
+  });
+});
+
 // The preconf ↔ committed timestamp seam: a just-sent echo must never
 // day-split a same-day stream, whatever timebase the node stamps (noded:
 // unix ms; the networked validator: a height counter). Crosses into the
