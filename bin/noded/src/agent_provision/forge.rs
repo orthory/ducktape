@@ -319,6 +319,7 @@ pub(super) async fn provision(
         repo,
         commit,
         branch,
+        forge_push,
         ..
     } = &spec.source
     else {
@@ -405,6 +406,7 @@ pub(super) async fn provision(
         run_dir: workspace_args.run_dir,
         ro_dir,
         push_url,
+        forge_push: *forge_push,
         source: spec.source.clone(),
         agent_id: spec.agent_id.clone(),
         agent_display_name: spec.agent_display_name.clone(),
@@ -473,6 +475,12 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
             "git detached checkout for forge repo {repo:?} at {commit} failed: {e}"
         ));
     }
+    if let Err(e) = run_git(run_dir, &["remote", "remove", "origin"], &[]) {
+        cleanup_blocking(run_dir);
+        return Err(format!(
+            "removing the canonical origin from forge repo {repo:?} failed: {e}"
+        ));
+    }
     Ok(args)
 }
 
@@ -485,6 +493,8 @@ struct ForgeWorkspace {
     /// (it lives outside the worktree, so git cannot see it either).
     ro_dir: Option<PathBuf>,
     push_url: String,
+    /// compose-height `forge_push` verdict; false for old envelopes.
+    forge_push: bool,
     source: WorkspaceSource,
     agent_id: Option<String>,
     agent_display_name: Option<String>,
@@ -861,11 +871,13 @@ struct CommitIdentity {
     committer_name: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_blocking(
     run_dir: &Path,
     pinned_commit: &str,
     branch: &str,
     push_url: &str,
+    forge_push: bool,
     response_proposal: Option<&str>,
     item_title: Option<&str>,
     identity: &CommitIdentity,
@@ -898,6 +910,13 @@ fn commit_blocking(
     let head_tree = run_git(run_dir, &["rev-parse", "HEAD^{tree}"], &[])?;
     if head == pinned_commit && final_tree == head_tree {
         return Ok(CommitOutcome::NoChanges);
+    }
+    // the run produced something to push — an agent-authored commit, a
+    // working-tree change, or both. the compose-height `forge_push` verdict is
+    // the last gate: a run without the grant may read and mutate its own clone
+    // but never move the shared branch. absent on old envelopes ⇒ false.
+    if !forge_push {
+        return Err("forge workspace changed, but this run has no forge_push grant".into());
     }
     if final_tree != head_tree {
         let message = select_commit_message(response_proposal, item_title)?;
@@ -1006,6 +1025,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let (pinned_commit, branch, item_title) = self.coords();
         let run_dir = self.run_dir.clone();
         let push_url = self.push_url.clone();
+        let forge_push = self.forge_push;
         let agent_id = self.agent_id.clone().unwrap_or_else(|| "agent".into());
         let agent_display_name = self
             .agent_display_name
@@ -1024,6 +1044,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &pinned_commit,
                 &branch,
                 &push_url,
+                forge_push,
                 proposal.as_deref(),
                 item_title.as_deref(),
                 &identity,

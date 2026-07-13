@@ -293,6 +293,7 @@ impl RunsModule {
                 commit,
                 branch,
                 branch_born,
+                forge_push: agent.permits(&CapRequest::ForgePush(repo)),
             },
             skills: envelope::resolve_skills(agent, extra, &head),
             sink,

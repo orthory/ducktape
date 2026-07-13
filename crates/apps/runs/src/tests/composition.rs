@@ -248,6 +248,10 @@ fn an_issue_run_forks_dev_with_an_unborn_item_branch_and_requests_a_pr() {
     );
     assert_eq!(v["workspace"]["branch"], "agent/item-7");
     assert_eq!(v["workspace"]["branch_born"], false);
+    assert_eq!(
+        v["workspace"]["forge_push"], false,
+        "forge_read alone must compose a read-only workspace"
+    );
     // the requested sink: a PR of the work branch onto dev, no title/body.
     assert_eq!(v["result_contract"]["sink"]["mode"], "pr");
     assert_eq!(v["result_contract"]["sink"]["repo"], "app");
@@ -269,6 +273,21 @@ fn an_issue_run_forks_dev_with_an_unborn_item_branch_and_requests_a_pr() {
     assert_eq!(v["thread_key"], "forge:app:7#2");
     // skills machinery is the duckfs lane's: the duckfs head still pins.
     assert_eq!(v["skills"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn a_forge_push_grant_is_pinned_into_the_workspace() {
+    let mut registry = forge_read_registry();
+    registry.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
+    let m = forge_module();
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript("forge:app:7", transcript(2))
+        .with_forge_item("app", forge_issue(7, "Fix", "body"))
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
+
+    let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
+    assert_eq!(v["workspace"]["forge_push"], true);
 }
 
 #[test]
