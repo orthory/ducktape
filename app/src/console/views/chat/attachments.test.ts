@@ -9,6 +9,7 @@ import {
   sanitizeAttachmentName,
   splitAttachments,
 } from "./attachments";
+import { blocksToInput, parseMessageInput } from "./chat-input";
 
 const uri = (rest: string) => `duck://files${ATTACHMENTS_ROOT}/${rest}`;
 
@@ -149,5 +150,33 @@ describe("displayName", () => {
     // NOT the upload sanitizer: a slash is left alone (the tokenizer guarantees
     // the display segment has none, and this must not invent path structure).
     expect(displayName("plain name.png")).toBe("plain name.png");
+  });
+});
+
+describe("URI survives the message round-trip", () => {
+  // The whole design hinges on the URI riding as PLAIN span text: the markdown
+  // parser must not linkify or mangle duck://files (it only knows https?://),
+  // so it comes back out of parse→blocks→input for the renderer to chip.
+  it("parseMessageInput keeps a duck://files URI as plain, chippable text", () => {
+    const uri = `duck://files${ATTACHMENTS_ROOT}/d1/cat.png`;
+    const draft = `look ${uri} !`;
+    const blocks = parseMessageInput(draft);
+    // one paragraph, and the URI is a plain (unmarked) span — not a link mark.
+    const para = (blocks[0] as { paragraph: { text: string; marks: unknown[] }[] }).paragraph;
+    const joined = para.map((s) => s.text).join("");
+    expect(joined).toContain(uri);
+    const uriSpan = para.find((s) => s.text.includes(uri));
+    expect(uriSpan?.marks).toEqual([]); // no link/bold — plain text
+
+    // and the renderer's tokenizer still sees it after the round-trip.
+    const rebuilt = blocksToInput(blocks);
+    expect(splitAttachments(rebuilt).filter(isAttachment)).toHaveLength(1);
+  });
+
+  it("does not linkify duck://files the way it does https://", () => {
+    const blocks = parseMessageInput(`duck://files${ATTACHMENTS_ROOT}/d/a.png`);
+    const para = (blocks[0] as { paragraph: { marks: unknown[] }[] }).paragraph;
+    // no span carries a link mark (contrast: an https:// URL would).
+    expect(para.every((s) => s.marks.length === 0)).toBe(true);
   });
 });

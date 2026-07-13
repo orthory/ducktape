@@ -2,13 +2,14 @@
 // principal (agent detail / the person in Members), a `[[page:<id>]]` chip
 // opens the page — and neither pretends to resolve something it can't.
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { AuthorRef, ChatBlock } from "../../../domain/chat-client";
 import type { PageMeta } from "../../../domain/pages-client";
+import type { NodeTransport } from "../../../domain/transport";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
@@ -242,5 +243,65 @@ describe("CommentText (plain-text comment bodies)", () => {
     });
 
     expect(screen.queryByRole("button")).toBeNull();
+  });
+});
+
+describe("duck://files attachment chips", () => {
+  const ATTACH = "duck://files/shared/attachments/uuid-1/report.pdf";
+  const IMG = "duck://files/shared/attachments/uuid-2/photo.png";
+
+  // A store WITH a transport whose files reads are stubbed — enough to prove
+  // the chip drives a read against the CONFINED path and nothing else.
+  const withTransport = (node: ReactNode) => {
+    const filesStat = vi.fn().mockResolvedValue(null);
+    const filesRead = vi.fn().mockResolvedValue({ b64: "", eof: true });
+    const transport = { filesStat, filesRead } as unknown as NodeTransport;
+    const actions = { openAgent: vi.fn(), openMember: vi.fn(), openPage: vi.fn(), setScreen: vi.fn() } as unknown as ConsoleActions;
+    render(
+      <ConsoleContext.Provider value={{ state: createInitialState(), actions, transport }}>
+        {node}
+      </ConsoleContext.Provider>,
+    );
+    return { filesStat, filesRead };
+  };
+
+  it("chips an attachment URI (shows the name, never the raw duck:// text)", () => {
+    withStore(<RichText blocks={para({ text: `see ${ATTACH}` })} names={{}} />);
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+    // the raw URI is chipped away, not rendered literally.
+    expect(screen.queryByText(ATTACH)).toBeNull();
+  });
+
+  it("renders an attachment AND a [[page:]] ref in the same message", () => {
+    withStore(
+      <RichText blocks={para({ text: `${ATTACH} for [[page:p1]]` })} names={{}} />,
+      { pages: [page("p1", "Launch plan")] },
+    );
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open page Launch plan" })).toBeTruthy();
+  });
+
+  it("leaves a duck://files path OUTSIDE the attachments root as literal text", () => {
+    const home = "duck://files/home/ext:aa/secret.txt";
+    withStore(<RichText blocks={para({ text: home })} names={{}} />);
+    expect(screen.getByText(home)).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("a non-image download reads the CONFINED path, nothing else", () => {
+    const { filesRead } = withTransport(<RichText blocks={para({ text: ATTACH })} names={{}} />);
+    fireEvent.click(screen.getByRole("button", { name: /Download attachment report.pdf/ }));
+    expect(filesRead).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "/shared/attachments/uuid-1/report.pdf" }),
+    );
+  });
+
+  it("an image preview stats the CONFINED path before fetching bytes", async () => {
+    const { filesStat } = withTransport(<RichText blocks={para({ text: IMG })} names={{}} />);
+    await waitFor(() =>
+      expect(filesStat).toHaveBeenCalledWith(
+        expect.objectContaining({ path: "/shared/attachments/uuid-2/photo.png" }),
+      ),
+    );
   });
 });
