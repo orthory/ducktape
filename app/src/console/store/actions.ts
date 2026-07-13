@@ -3023,30 +3023,39 @@ export function createActions({
     connectRemote: (rawUrl) => {
       const url = bootstrap.normalizeNodeUrl(rawUrl);
       if (!url) return;
-      // Supersede any in-flight workspace connect/poll loop (joiner tick).
-      nextBootGeneration();
-      // Drop the old node + its projections so the switch shows no stale state
-      // (mirrors selectWorkspace's reset).
-      setNode(null);
-      patch({
-        ...resetForNodeChange(),
-        workspace: null,
-        openTabs: loadDocTabs(docTabsScope(null, url)),
-        onboardingPhase: null,
-        onboardingBusy: false,
-        inviteBlob: null,
-        // A remote node is unmanaged — dialed directly, never spawned here.
-        nodeUrl: url,
-        managed: false,
-        needsOnboarding: false,
-        atHome: false,
-        error: null,
-      });
-      // Remember it for next launch, then dial. The hydrate effect (keyed on the
-      // node) runs refresh(); an unreachable remote simply reads as disconnected
-      // (the "no running node" surface) instead of throwing.
-      saveRemoteUrl(url);
-      setNode(bootstrap.connectRemote(url).transport);
+      const gen = nextBootGeneration();
+      const transport = bootstrap.connectRemote(url).transport;
+      patch({ onboardingBusy: true, error: null });
+      Promise.resolve()
+        .then(() => transport.status())
+        .then(
+          () => {
+            if (isBootGenerationStale(gen)) return;
+            // Commit the switch only after the remote proves it is a Ducktape
+            // node. A failed dial leaves the current workspace/picker intact.
+            setNode(null);
+            patch({
+              ...resetForNodeChange(),
+              workspace: null,
+              openTabs: loadDocTabs(docTabsScope(null, url)),
+              onboardingPhase: null,
+              onboardingBusy: false,
+              inviteBlob: null,
+              nodeUrl: url,
+              managed: false,
+              needsOnboarding: false,
+              atHome: false,
+              error: null,
+            });
+            saveRemoteUrl(url);
+            setNode(transport);
+          },
+          (err) => {
+            if (isBootGenerationStale(gen)) return;
+            patch({ onboardingBusy: false, needsOnboarding: true });
+            fail(err);
+          },
+        );
     },
 
     revealInvite: (targetCode) => {
