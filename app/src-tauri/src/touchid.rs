@@ -25,11 +25,12 @@
 const KEYCHAIN_SERVICE: &str = "com.ducktape.app.userkey";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT: &str = "vault-passphrase";
-// The entitlement-less fallback item (rung 2 — see the module header). Its
-// LAContext gate is app-enforced only: a debugger or another local process
-// could read this item without it (subject to the login keychain's own
-// per-app ACL prompt) — the deliberate tradeoff for unentitled builds, with
-// the 24-word phrase as the custody backstop.
+// The entitlement-less fallback item (rung 2 — see the module header). The
+// account name is the discriminator: its presence is what tells `unlock` to
+// run the LAContext gate. That gate is app-enforced only: a debugger or
+// another local process could read this item without it (subject to the
+// login keychain's own per-app ACL prompt) — the deliberate tradeoff for
+// unentitled builds, with the 24-word phrase as the custody backstop.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT_PLAIN: &str = "vault-passphrase.plain";
 
