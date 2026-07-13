@@ -3034,7 +3034,7 @@ export function createActions({
       if (!target) return;
       Promise.resolve()
         .then(() => ws.inviteBlob(target.id))
-        .then((blob) => patch({ inviteBlob: blob }))
+        .then((forms) => patch({ inviteBlob: forms.blob, inviteShort: forms.short }))
         .catch(fail);
     },
 

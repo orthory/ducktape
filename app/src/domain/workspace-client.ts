@@ -128,8 +128,17 @@ export const workspaceLogTail = (id: string): Promise<LogTail> =>
 export const workspaceRuntimeFacts = (id: string): Promise<RuntimeFacts> =>
   invoke<RuntimeFacts>("workspace_runtime_facts", { id });
 
-export const inviteBlob = (id: string): Promise<string> =>
-  invoke<string>("workspace_invite_blob", { id });
+/** Both shareable forms of a workspace invite. `short` is the
+ *  coordinator-hosted `🦆://<name>/<id>` link (null when the coordinator was
+ *  unreachable/refused); `blob` is the self-contained fallback that joins
+ *  without any coordinator. */
+export interface InviteForms {
+  short: string | null;
+  blob: string;
+}
+
+export const inviteBlob = (id: string): Promise<InviteForms> =>
+  invoke<InviteForms>("workspace_invite_blob", { id });
 
 /** The verified join requests parked joiners announced to this member's
  *  running node — what the Members view renders with an Approve button.
