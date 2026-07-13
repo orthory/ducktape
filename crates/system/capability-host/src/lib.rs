@@ -2030,6 +2030,65 @@ format = "text"
         .unwrap()
     }
 
+    async fn hardware_sandbox_smoke(name: &str, backend: SandboxBackend) {
+        let root = scratch(name);
+        let bin_dir = root.join("bin");
+        let workdir = root.join("workspace");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        let bin = fake_cli(
+            &bin_dir,
+            "sandbox-smoke",
+            r#"prompt=$(cat)
+printf '%s' "$prompt" > sandbox-marker.txt
+printf 'sandbox-ok:%s' "$prompt""#,
+        );
+        let provider =
+            CliProvider::from_spec(sandbox_spec("hardware-smoke"), bin).with_backend(backend);
+        let ctx = RunContext {
+            workdir_override: Some(workdir.clone()),
+            limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            ..RunContext::default()
+        };
+
+        let answer = provider
+            .run("hardware-prompt", &ctx)
+            .await
+            .expect("real sandbox provider cycle");
+        assert_eq!(answer, "sandbox-ok:hardware-prompt");
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("sandbox-marker.txt")).unwrap(),
+            "hardware-prompt",
+            "the sandbox must sync its writable workspace back to the host"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Real Podman gate for macOS hardware. Kept ignored because it requires a
+    /// running Podman machine and a pulled image; ops/smoke-macos-sandbox.sh
+    /// owns those prerequisites and invokes this exact test.
+    #[tokio::test]
+    #[ignore = "requires a live Podman machine"]
+    async fn macos_podman_hardware_smoke() {
+        let image = std::env::var("DUCKTAPE_MACOS_PODMAN_IMAGE")
+            .unwrap_or_else(|_| "docker.io/library/node:22-slim".into());
+        hardware_sandbox_smoke("macos-podman-hardware", SandboxBackend::Podman { image }).await;
+    }
+
+    /// Real Tart gate for Apple Silicon hardware. The provider owns the full
+    /// clone → configure → boot → SSH → rsync → stop → delete lifecycle.
+    #[tokio::test]
+    #[ignore = "requires Apple Silicon, Tart, sshpass, and a pulled macOS image"]
+    async fn macos_tart_hardware_smoke() {
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            eprintln!("skipping Tart hardware smoke off Apple Silicon macOS");
+            return;
+        }
+        let image = std::env::var("DUCKTAPE_MACOS_TART_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/cirruslabs/macos-sonoma-base:latest".into());
+        hardware_sandbox_smoke("macos-tart-hardware", SandboxBackend::Tart { image }).await;
+    }
+
     #[test]
     fn a_sandboxed_run_mounts_its_skills_tree_read_only_when_it_has_one() {
         // W6 skills live at a SIBLING of the rw checkout (outside the workdir, so
