@@ -235,6 +235,50 @@ pub struct WorkerRequest {
     pub assignee: Option<Vec<u8>>,
 }
 
+/// fixed self-description for host-local worker control effects. controls are
+/// deliberately a SEPARATE wire shape from [`WorkerRequest`], so legacy work
+/// requests keep their byte contract and an older host simply leaves an
+/// unknown control effect unclaimed.
+pub const WORKER_CONTROL_KIND: &str = "ducktape_worker_control";
+
+/// the first host-local worker control protocol. bump before changing the
+/// meaning of any existing command.
+pub const WORKER_CONTROL_VERSION: u32 = 1;
+
+/// a versioned host-local control effect for one already-issued attempt.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WorkerControl {
+    pub kind: String,
+    pub version: u32,
+    pub command: WorkerControlCommand,
+}
+
+impl WorkerControl {
+    pub fn cancel_attempt(saga_id: SagaId, attempt: u32, assignee: Vec<u8>) -> Self {
+        Self {
+            kind: WORKER_CONTROL_KIND.into(),
+            version: WORKER_CONTROL_VERSION,
+            command: WorkerControlCommand::CancelAttempt {
+                saga_id,
+                attempt,
+                assignee,
+            },
+        }
+    }
+}
+
+/// commands carried by [`WorkerControl`]. the assignee makes cancellation
+/// node-scoped; every other host treats it as a claimed no-op.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerControlCommand {
+    CancelAttempt {
+        saga_id: SagaId,
+        attempt: u32,
+        assignee: Vec<u8>,
+    },
+}
+
 /// where a saga is in its (deterministic) lifecycle. `Pending` until an
 /// ordered op resolves it into one of the four terminal states — the ledger
 /// only advances via ordered ops, never node-local.
@@ -350,6 +394,22 @@ pub fn encode_worker_request(w: &WorkerRequest) -> Vec<u8> {
 }
 pub fn decode_worker_request(b: &[u8]) -> Result<WorkerRequest, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+pub fn encode_worker_control(c: &WorkerControl) -> Vec<u8> {
+    serde_json::to_vec(c).expect("serializable")
+}
+pub fn decode_worker_control(b: &[u8]) -> Result<WorkerControl, String> {
+    let control: WorkerControl = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+    if control.kind != WORKER_CONTROL_KIND {
+        return Err(format!("not a worker control (kind {:?})", control.kind));
+    }
+    if control.version != WORKER_CONTROL_VERSION {
+        return Err(format!(
+            "unsupported worker control version {}",
+            control.version
+        ));
+    }
+    Ok(control)
 }
 pub fn encode_callback(c: &SagaCallback) -> Vec<u8> {
     serde_json::to_vec(c).expect("serializable")

@@ -304,6 +304,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
     let providers = capability_host::discover(
+        signer.public_key().as_ref(),
         agent_dirs.clone(),
         Some(run_output_sink(stream_hub.run_output())),
         // the operator's `node.toml sandbox` choice: Direct (default) or a
@@ -319,7 +320,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // `oracle_results` (an ingress arm below) and re-enter the ordered
     // lane as ordinary signed submits, so a minutes-long run never
     // stalls the drain/rpc/heartbeat arms of this loop.
-    let (oracle_worker, mut oracle_results) = oracle_pool::build(
+    let (oracle_worker, _oracle_control, mut oracle_results) = oracle_pool::build(
         context,
         providers,
         signer.public_key().as_ref().to_vec(),

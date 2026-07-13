@@ -32,13 +32,17 @@
 //! so a single read that momentarily fails to name a live attempt — whatever
 //! its source — must not drop it and re-offer the SAME attempt as fresh work
 //! (a second child, and a computed-but-unsent result silently lost). real
-//! retirements stay absent forever, so confirmation costs one serve-window
-//! tick. a restart re-runs at worst once; the saga module's P5
+//! retirements proven by the saga's authoritative per-id view cancel on the
+//! first missing subset read; only an unreadable or older view needs a second
+//! read. retirement also cancels a non-settled host attempt before its latch
+//! is removed; settled work needs no cancellation. a restart re-runs at
+//! worst once; the saga module's P5
 //! result-singularity collapses the duplicate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use dispatch_oracle::AttemptControl;
 use host::Host;
 use host::worker::{WorkOutcome, Worker};
 use saga::{SagaMsg, SagaQuery, SagaReply, WorkerRequest};
@@ -52,6 +56,11 @@ const RESULT_RETRY: Duration = Duration::from_secs(15);
 
 /// one attempt's idempotency key — what the worker echoes into its result.
 type AttemptKey = (String, u32);
+
+enum AttemptProjection {
+    Active,
+    Retired,
+}
 
 /// where one assigned attempt sits in the execute-then-relay lifecycle.
 enum Stage {
@@ -85,6 +94,8 @@ pub(crate) struct ResidentDispatch {
     /// the off-loop execution pool (`DispatchPool` behind the shared
     /// `Worker` seam): gate inline, spawn the provider, return immediately.
     pool: Box<dyn Worker>,
+    /// cloneable control for attempts already handed to the off-loop pool.
+    control: AttemptControl,
     /// this node's external submit key — the lease identity queried for.
     me: Vec<u8>,
     /// every attempt this pump has acted on, keyed by `(saga_id, attempt)`;
@@ -93,9 +104,10 @@ pub(crate) struct ResidentDispatch {
 }
 
 impl ResidentDispatch {
-    pub(crate) fn new(pool: Box<dyn Worker>, me: Vec<u8>) -> Self {
+    pub(crate) fn new(pool: Box<dyn Worker>, control: AttemptControl, me: Vec<u8>) -> Self {
         Self {
             pool,
+            control,
             me,
             work: HashMap::new(),
         }
@@ -113,7 +125,31 @@ impl ResidentDispatch {
         let Some(assigned) = assigned_pending(host, &self.me).await else {
             return Vec::new();
         };
-        self.plan(assigned, now).await
+        let live: HashSet<AttemptKey> = assigned
+            .iter()
+            .map(|request| (request.saga_id.clone(), request.attempt))
+            .collect();
+        let missing: Vec<_> = self
+            .work
+            .keys()
+            .filter(|key| !live.contains(*key))
+            .cloned()
+            .collect();
+        let mut retired = HashSet::new();
+        let mut active = HashSet::new();
+        for key in missing {
+            match attempt_projection(host, &self.me, &key).await {
+                Some(AttemptProjection::Retired) => {
+                    retired.insert(key);
+                }
+                Some(AttemptProjection::Active) => {
+                    active.insert(key);
+                }
+                None => {}
+            }
+        }
+        self.plan_with_projection(assigned, &retired, &active, now)
+            .await
     }
 
     /// a completed off-loop run arrived on the result lane: queue its op for
@@ -140,26 +176,63 @@ impl ResidentDispatch {
     }
 
     /// the pump core, separated from the host read so it is unit-testable:
-    /// retire entries committed state stopped naming (confirmed over two
-    /// consecutive reads), offer newly assigned attempts to the pool ONCE,
-    /// and surface every due (or re-send-due) op.
+    /// retire entries committed state proves obsolete (or an inconclusive
+    /// absence confirms over two reads), offer newly assigned attempts to the
+    /// pool ONCE, and surface every due (or re-send-due) op.
+    #[cfg(test)]
     async fn plan(&mut self, assigned: Vec<WorkerRequest>, now: Instant) -> Vec<(AttemptKey, Msg)> {
+        self.plan_with_projection(assigned, &HashSet::new(), &HashSet::new(), now)
+            .await
+    }
+
+    async fn plan_with_projection(
+        &mut self,
+        assigned: Vec<WorkerRequest>,
+        retired: &HashSet<AttemptKey>,
+        active: &HashSet<AttemptKey>,
+        now: Instant,
+    ) -> Vec<(AttemptKey, Msg)> {
         // retire: an attempt absent from the committed projection settled,
         // moved on (retry under a new attempt), or expired — its entry (and
         // any un-sent result, now a guaranteed no-op) has nothing left to do.
-        // but only CONFIRMED absence retires: a first miss arms the entry and
-        // keeps it — dropping a live attempt on one flapped read would
-        // re-offer the SAME attempt as fresh work (the exactly-once break).
-        // a still-running child's late result is dropped by `completed`.
-        let live: std::collections::HashSet<AttemptKey> = assigned
+        // authoritative terminal/reassigned state retires immediately; an
+        // inconclusive absence needs a confirming second read. dropping a
+        // live attempt on one flapped read would re-offer the SAME attempt as
+        // fresh work (the exactly-once break). retirement cancels a
+        // non-settled host attempt before removing its latch; a still-running
+        // child's late result is then dropped by `completed`.
+        let live: HashSet<AttemptKey> = assigned
             .iter()
             .map(|r| (r.saga_id.clone(), r.attempt))
             .collect();
+        let newest = assigned.iter().fold(
+            std::collections::HashMap::<String, u32>::new(),
+            |mut newest, request| {
+                newest
+                    .entry(request.saga_id.clone())
+                    .and_modify(|attempt| *attempt = (*attempt).max(request.attempt))
+                    .or_insert(request.attempt);
+                newest
+            },
+        );
+        let control = self.control.clone();
+        let me = &self.me;
         self.work.retain(|key, entry| {
-            if live.contains(key) {
+            if live.contains(key) || active.contains(key) {
+                entry.missed = false;
                 return true;
             }
-            if !entry.missed {
+            // A higher committed attempt of the same saga, including one
+            // assigned to another node and confirmed by `SagaQuery::Get`, is
+            // proof of supersession rather than a flapped projection. Cancel
+            // it before any local replacement is offered below. Plain absence
+            // still needs a confirming read so a transient flap cannot
+            // duplicate a run.
+            let superseded = retired.contains(key)
+                || newest
+                    .get(&key.0)
+                    .is_some_and(|attempt| *attempt > key.1);
+            if !superseded && !entry.missed {
                 entry.missed = true;
                 if !matches!(entry.stage, Stage::Settled) {
                     // mid-work absence is the flap signature — worth eyes if
@@ -170,6 +243,9 @@ impl ResidentDispatch {
                     );
                 }
                 return true;
+            }
+            if !matches!(entry.stage, Stage::Settled) {
+                control.cancel(&key.0, key.1, me);
             }
             false
         });
@@ -299,6 +375,43 @@ async fn assigned_pending(host: &Host, me: &[u8]) -> Option<Vec<WorkerRequest>> 
     }
 }
 
+/// Confirm why an assigned attempt disappeared from this resident's subset.
+/// `AssignedPending` cannot show a retry that moved to another node, while the
+/// per-saga view can: terminal state, a higher attempt, or a changed assignee
+/// all prove the old local process must stop on this first read. An unreadable
+/// or older view is inconclusive and preserves the two-read flap tolerance.
+async fn attempt_projection(
+    host: &Host,
+    me: &[u8],
+    key: &AttemptKey,
+) -> Option<AttemptProjection> {
+    let reply = host
+        .query(
+            "saga",
+            &saga::encode_query(&SagaQuery::Get {
+                saga_id: key.0.clone(),
+            }),
+        )
+        .await
+        .ok()?;
+    match saga::decode_reply(&reply).ok()? {
+        SagaReply::Saga(None) => Some(AttemptProjection::Retired),
+        SagaReply::Saga(Some(view))
+            if view.status.is_terminal()
+                || view.attempt > key.1
+                || (view.attempt == key.1 && view.assignee.as_deref() != Some(me)) =>
+        {
+            Some(AttemptProjection::Retired)
+        }
+        SagaReply::Saga(Some(view))
+            if view.attempt == key.1 && view.assignee.as_deref() == Some(me) =>
+        {
+            Some(AttemptProjection::Active)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +429,20 @@ mod tests {
     struct SlowProvider {
         delay: Duration,
         executions: Arc<AtomicUsize>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    struct RunGuard {
+        cancellations: Arc<AtomicUsize>,
+        completed: bool,
+    }
+
+    impl Drop for RunGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.cancellations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -326,10 +453,24 @@ mod tests {
         async fn run(
             &self,
             prompt: &str,
-            _ctx: &capability_host::RunContext,
+            ctx: &capability_host::RunContext,
         ) -> Result<String, String> {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
+            let mut guard = RunGuard {
+                cancellations: self.cancellations.clone(),
+                completed: false,
+            };
+            if let Some(cancellation) = &ctx.cancellation {
+                tokio::select! {
+                    _ = tokio::time::sleep(self.delay) => {}
+                    _ = cancellation.cancelled() => {
+                        return Err("mock resident provider cancelled".into());
+                    }
+                }
+            } else {
+                tokio::time::sleep(self.delay).await;
+            }
+            guard.completed = true;
             Ok(format!("answer to: {prompt}"))
         }
     }
@@ -365,11 +506,24 @@ format = "text"
         futures::channel::mpsc::UnboundedReceiver<Msg>,
         Arc<AtomicUsize>,
     ) {
+        pump_with_cancellations(delay, installed, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn pump_with_cancellations(
+        delay: Duration,
+        installed: bool,
+        cancellations: Arc<AtomicUsize>,
+    ) -> (
+        ResidentDispatch,
+        futures::channel::mpsc::UnboundedReceiver<Msg>,
+        Arc<AtomicUsize>,
+    ) {
         let executions = Arc::new(AtomicUsize::new(0));
         let providers: Vec<Box<dyn capability_host::Provider>> = if installed {
             vec![Box::new(SlowProvider {
                 delay,
                 executions: executions.clone(),
+                cancellations: cancellations.clone(),
             })]
         } else {
             Vec::new()
@@ -390,8 +544,9 @@ format = "text"
         });
         let pool =
             DispatchPool::with_limit(providers, ME.to_vec(), spawn, deliver, 4, Default::default());
+        let control = pool.attempt_control();
         (
-            ResidentDispatch::new(Box::new(pool), ME.to_vec()),
+            ResidentDispatch::new(Box::new(pool), control, ME.to_vec()),
             rx,
             executions,
         )
@@ -568,19 +723,19 @@ format = "text"
 
     #[tokio::test]
     async fn a_late_result_for_a_retired_attempt_is_dropped() {
-        // the lease expired (or settled elsewhere) while the provider ran:
-        // committed state stops naming the attempt across two consecutive
-        // reads, the tick retires the entry, and the late result must NOT
-        // resurrect it.
-        let (mut pump, mut rx, _executions) = pump_with(Duration::from_millis(50), true);
+        // The result is already computed when the confirmed absence retires
+        // its resident latch. Delivering that queued result afterwards must
+        // not resurrect the entry.
+        let (mut pump, mut rx, _executions) = pump_with(Duration::from_millis(10), true);
         let now = Instant::now();
 
         assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
         assert!(pump.plan(Vec::new(), now).await.is_empty(), "first miss");
+        let result = next_result(&mut rx).await;
         assert!(pump.plan(Vec::new(), now).await.is_empty(), "retired");
         assert!(pump.work.is_empty());
 
-        pump.completed(next_result(&mut rx).await);
+        pump.completed(result);
         assert!(pump.work.is_empty(), "a late result does not resurrect");
         assert!(pump.plan(Vec::new(), now).await.is_empty());
     }
@@ -637,20 +792,142 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn confirmed_absence_still_retires_an_unfinished_attempt() {
-        // absence that PERSISTS is a real retirement (settled elsewhere,
-        // lease moved on): after two consecutive ticks without the attempt
-        // the entry must go, and a late result must not resurrect it.
-        let (mut pump, mut rx, _executions) = pump_with(Duration::from_millis(50), true);
+    async fn confirmed_absence_cancels_a_running_attempt_once_on_the_second_read() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let (mut pump, _rx, executions) =
+            pump_with_cancellations(Duration::from_secs(5), true, cancellations.clone());
         let now = Instant::now();
 
         assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
-        assert!(pump.plan(Vec::new(), now).await.is_empty());
-        assert!(pump.plan(Vec::new(), now).await.is_empty(), "confirmed");
-        assert!(pump.work.is_empty(), "two absent reads retire the entry");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the provider starts");
 
-        pump.completed(next_result(&mut rx).await);
-        assert!(pump.work.is_empty(), "a late result does not resurrect");
+        assert!(pump.plan(Vec::new(), now).await.is_empty(), "first miss");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cancellations.load(Ordering::SeqCst),
+            0,
+            "one missing projection is flap-tolerant"
+        );
+
+        assert!(pump.plan(Vec::new(), now).await.is_empty(), "confirmed");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("confirmed absence cancels the provider");
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        assert!(pump.work.is_empty(), "the cancelled attempt retires");
+
+        assert!(pump.plan(Vec::new(), now).await.is_empty());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            cancellations.load(Ordering::SeqCst),
+            1,
+            "retirement cannot cancel the same attempt twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_higher_attempt_cancels_its_running_predecessor_on_first_sight() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let (mut pump, _rx, executions) =
+            pump_with_cancellations(Duration::from_secs(5), true, cancellations.clone());
+        let now = Instant::now();
+
+        assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first attempt starts");
+
+        assert!(
+            pump.plan(vec![request("job", 1)], now).await.is_empty(),
+            "the replacement starts off-loop"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellations.load(Ordering::SeqCst) == 0
+                || executions.load(Ordering::SeqCst) < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the predecessor is cancelled and the replacement starts");
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        assert!(!pump.work.contains_key(&("job".into(), 0)));
+        assert!(pump.work.contains_key(&("job".into(), 1)));
+    }
+
+    #[tokio::test]
+    async fn an_authoritative_remote_retry_cancels_on_the_first_missing_read() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let (mut pump, _rx, executions) =
+            pump_with_cancellations(Duration::from_secs(5), true, cancellations.clone());
+        let now = Instant::now();
+        let old = ("job".to_string(), 0);
+
+        assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old local attempt starts");
+
+        assert!(
+            pump.plan_with_projection(
+                Vec::new(),
+                &HashSet::from([old.clone()]),
+                &HashSet::new(),
+                now,
+            )
+                .await
+                .is_empty()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the committed remote retry cancels immediately");
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        assert!(!pump.work.contains_key(&old));
+    }
+
+    #[tokio::test]
+    async fn authoritative_active_state_resets_projection_misses() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let (mut pump, _rx, executions) =
+            pump_with_cancellations(Duration::from_secs(5), true, cancellations.clone());
+        let now = Instant::now();
+        let key = ("job".to_string(), 0);
+        let active = HashSet::from([key.clone()]);
+
+        assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        for _ in 0..3 {
+            assert!(
+                pump.plan_with_projection(Vec::new(), &HashSet::new(), &active, now)
+                    .await
+                    .is_empty()
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(cancellations.load(Ordering::SeqCst), 0);
+        assert!(pump.work.contains_key(&key));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

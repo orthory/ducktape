@@ -37,7 +37,9 @@ mod provision;
 mod soul;
 mod workspace_source;
 pub use ledger::{ReservationGuard, ResourceLedger};
-pub use pool::{DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env};
+pub use pool::{
+    AttemptControl, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
+};
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
     WorkspaceSpec,
@@ -99,8 +101,8 @@ pub(crate) enum Gated {
 }
 
 /// decode + lease-gate one event against this host's provider surface and
-/// its process-local load. `ledger` is the host's [`ResourceLedger`]: an
-/// over-capacity own lease or announcement is a `Skip`, never claimed or run.
+/// its process-local load. Announcements require current free capacity; an
+/// assigned lease may queue when it fits the node's total capacity.
 pub(crate) fn gate(
     providers: &ProviderSet,
     node_key: &[u8],
@@ -113,10 +115,14 @@ pub(crate) fn gate(
     };
     // the kind-gated decode: foreign spec shapes are NotMine, never a
     // guessed execution.
-    let work = match decode_work_spec(&request.spec) {
+    let mut work = match decode_work_spec(&request.spec) {
         Ok(work) => work,
         Err(_) => return Gated::NotMine,
     };
+    // A missing sandbox dimension is unrestricted, not free. Normalize once
+    // so announcement admission, own-lease admission, reservation, and the
+    // backend's hard flags all consume the exact same upper-bound map.
+    work.demands = ledger.accounted_demands(&work.demands);
     match &request.assignee {
         // the lease gate, host side: someone else's assignment is a
         // claimed skip — it IS our effect type, but the assignee submits
@@ -162,13 +168,10 @@ fn gate_own_lease(
             ));
         }
     };
-    // ledger fits next, BEFORE provider resolve: an own lease over capacity
-    // is a Skip, deliberately NOT an inline error — the lease expires and
-    // the next attempt rendezvouses to another provider. an error result
-    // would consume the attempt with a lie (this node was never able to run
-    // it). ponytail: costs one lease window; a Decline op for instant
-    // rotation is the upgrade path if that window hurts.
-    if !ledger.fits(&work.demands) {
+    // Total capacity next, BEFORE provider resolve: temporary occupancy queues
+    // in the pool, while a lease this node can never fit is a Skip so it can
+    // rotate. An error result would consume the attempt with a lie.
+    if !ledger.within_capacity(&work.demands) {
         return Gated::Skip;
     }
     if let Err(e) = providers.resolve(&work.capability) {
@@ -496,6 +499,30 @@ format = "text"
     }
 
     #[test]
+    fn assigned_work_queues_behind_occupancy_but_announcements_do_not_claim() {
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 4)]));
+        let _running = ledger
+            .try_reserve("running", &demands(&[("cores", 4)]))
+            .expect("first run fills capacity");
+        let spec = work_spec_with_demands(demands(&[("cores", 4)]));
+
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for(spec.clone(), Some(b"me"))
+            ),
+            Gated::Execute(_)
+        ));
+        assert!(matches!(
+            gate(&providers, b"me", &ledger, &effect_for(spec, None)),
+            Gated::Skip
+        ));
+    }
+
+    #[test]
     fn demandless_jobs_bypass_capacity_even_on_a_bare_ledger() {
         // empty demands + empty capacity -> Gated::Execute as today.
         let providers = servable_providers();
@@ -509,5 +536,32 @@ format = "text"
             ),
             Gated::Execute(_)
         ));
+    }
+
+    #[test]
+    fn omitted_sandbox_dimensions_become_full_capacity_demands() {
+        let providers = servable_providers();
+        let capacity = demands(&[("cores", 8), ("mem_gb", 16)]);
+        let ledger = ResourceLedger::new(capacity.clone());
+        let Gated::Execute(job) = gate(
+            &providers,
+            b"me",
+            &ledger,
+            &effect_for(work_spec(), Some(b"me")),
+        ) else {
+            panic!("a demandless sandbox run should execute with full accounting")
+        };
+        assert_eq!(job.demands, capacity);
+
+        let partial = work_spec_with_demands(demands(&[("cores", 2)]));
+        let Gated::Execute(job) = gate(
+            &providers,
+            b"me",
+            &ledger,
+            &effect_for(partial, Some(b"me")),
+        ) else {
+            panic!("a partial sandbox run should fill its omitted dimensions")
+        };
+        assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 16)]));
     }
 }

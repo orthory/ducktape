@@ -65,6 +65,7 @@ where
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
     let providers = capability_host::discover(
+        ORACLE_ORIGIN,
         agent_dirs,
         Some(run_output_sink(run_output)),
         // the embedded daemon stays Direct this phase: it exposes no operator

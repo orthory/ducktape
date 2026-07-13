@@ -479,6 +479,7 @@ pub(super) async fn park(
     // never stalls the serve window, boundary follow, or promotion
     // detection.
     let resident_provider_set = capability_host::discover(
+        &me_bytes,
         agent_dirs.clone(),
         Some(run_output_sink(stream_hub.run_output())),
         // the operator's `node.toml sandbox` choice (Direct or Podman), same
@@ -492,7 +493,7 @@ pub(super) async fn park(
         resident_capabilities,
         sandbox_capacity.clone(),
     );
-    let (resident_pool, mut resident_oracle_results) = oracle_pool::build(
+    let (resident_pool, resident_control, mut resident_oracle_results) = oracle_pool::build(
         &context,
         resident_provider_set,
         me_bytes.clone(),
@@ -501,8 +502,11 @@ pub(super) async fn park(
         // the validator path.
         sandbox_capacity,
     );
-    let mut resident_dispatch =
-        resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
+    let mut resident_dispatch = resident_dispatch::ResidentDispatch::new(
+        resident_pool,
+        resident_control,
+        me_bytes.clone(),
+    );
 
     // ── THE JOIN GATE (ADR §3.3) ──────────────────────────────────────────
     // a fresh TOKENED joiner runs ONLY this handshake before ANY statesync
