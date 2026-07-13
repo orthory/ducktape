@@ -77,6 +77,34 @@ pub(super) fn classify(log: &str) -> PhaseReport {
     }
 }
 
+/// parse the `join-state` verb's JSON (`{"phase","detail","height"?}`, or the
+/// literal `null` when the node has no join-state projection) into a
+/// [`PhaseReport`]. `None` when the output is not a phase object — the caller
+/// then falls back to the log classification. Only the node's four
+/// positive-ladder phases (`parked|admitted|synced|promoted`) come from here;
+/// `starting`/`fatal` have no RPC source and stay log/pid-derived.
+pub(super) fn parse_join_state(out: &str) -> Option<PhaseReport> {
+    let value: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+    let phase = value.get("phase")?.as_str()?;
+    if !matches!(phase, "parked" | "admitted" | "synced" | "promoted") {
+        return None;
+    }
+    let detail = value
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            match value.get("height").and_then(|h| h.as_u64()) {
+                Some(h) => format!("{d} (height {h})"),
+                None => d.to_string(),
+            }
+        });
+    Some(PhaseReport {
+        phase: phase.to_string(),
+        detail,
+    })
+}
+
 /// the last `max` bytes of a file as lossy utf-8; empty string if absent.
 pub(crate) fn read_tail(path: &Path, max: u64) -> Result<String, String> {
     let mut file = match fs::File::open(path) {
@@ -238,6 +266,27 @@ mod tests {
             "detail: {:?}",
             report.detail
         );
+    }
+
+    #[test]
+    fn parse_join_state_reads_the_positive_ladder_and_rejects_the_rest() {
+        // the four rpc phases parse, with height folded into the detail.
+        let synced = r#"{"phase":"synced","detail":"serving reads","height":9}"#;
+        let r = parse_join_state(synced).expect("synced parses");
+        assert_eq!(r.phase, "synced");
+        assert_eq!(r.detail.as_deref(), Some("serving reads (height 9)"));
+
+        let admitted = r#"{"phase":"admitted","detail":"standing granted — syncing"}"#;
+        assert_eq!(parse_join_state(admitted).unwrap().phase, "admitted");
+        assert_eq!(parse_join_state(r#"{"phase":"parked","detail":"awaiting"}"#).unwrap().phase, "parked");
+        assert_eq!(parse_join_state(r#"{"phase":"promoted","detail":"validator","height":3}"#).unwrap().phase, "promoted");
+
+        // starting/fatal have no rpc source — never accepted from here;
+        // null (no projection) and junk fall back to the log classification.
+        assert!(parse_join_state(r#"{"phase":"starting"}"#).is_none());
+        assert!(parse_join_state(r#"{"phase":"fatal"}"#).is_none());
+        assert!(parse_join_state("null").is_none());
+        assert!(parse_join_state("not json").is_none());
     }
 
     #[test]

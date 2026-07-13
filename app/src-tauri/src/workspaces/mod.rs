@@ -43,7 +43,7 @@ use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 
 use forget::{probe_forget, ForgetVerdict};
 use lifecycle::{node_uptime_secs, pidfile, read_pid, recorded_pid_alive, stop_workspace_node};
-use phase::{classify, PhaseReport};
+use phase::{classify, parse_join_state, PhaseReport};
 use ports::{allocate_ports, reserved_ports};
 use registry::{
     load_registry, save_registry, workspaces_dir, write_atomic, Ports, Registry, Selection,
@@ -1026,10 +1026,15 @@ fn commit_active(app: &crate::rt::AppHandle, reg: &mut Registry, id: &str) -> Re
     Ok(())
 }
 
-/// read this workspace's onboarding phase back from `daemon.log`. a parked
-/// joiner serves no http/rpc, so its log is the only progress signal; the
-/// webview treats a successful `/v1/status` as the authoritative "ready" and
-/// only falls back to this while the surface is still down.
+/// read this workspace's onboarding phase. the AUTHORITATIVE source for the
+/// positive ladder (`parked → admitted → synced → promoted`) is the node's
+/// `join-state` rpc, which derives from committed standing and so is
+/// restart-proof: a re-syncing resident reports `admitted`/`synced` even when
+/// its fresh `daemon.log` has lost the admission markers — the bug where a
+/// joined network read as "admission not claimed". the log + process liveness
+/// remain the source for the two edges the rpc cannot report: `starting`
+/// (rpc not up yet) and `fatal` (a crashed or gate-rejected node that exited
+/// before it could answer).
 #[tauri::command]
 pub fn workspace_phase(
     app: crate::rt::AppHandle,
@@ -1041,16 +1046,13 @@ pub fn workspace_phase(
     let ws = find(&reg, &id)?;
     let dir = workspaces_dir(&app)?.join(&ws.id);
     let tail = read_tail(&dir.join("daemon.log"), 64 * 1024)?;
-    let report = classify(&tail);
-    // classify only knows the node's stdout markers, so a node that crashed on
-    // boot for a reason it printed no known marker for — a bind conflict, a
-    // config parse error, an abort — reads as "starting"/"parked" FOREVER: a
-    // cheerful spinner over a corpse. cross-check the process. if the pid WE
-    // recorded is gone and neither port is held, the node is dead, not slow;
-    // report fatal with the last log line as the best reason we have. (once the
-    // node answers /v1/status the webview stops polling this, so a live node
-    // never reaches here; a healthy parked joiner keeps its pid + listen port.)
-    if report.phase != "fatal"
+    let log_report = classify(&tail);
+    // a dead process is fatal regardless of any stale phase: if the pid WE
+    // recorded is gone and neither port is held, the node exited (a bind
+    // conflict, a config parse error, a gate-rejected join's exit(1)) — report
+    // fatal with the last log line as the best reason. a healthy node keeps its
+    // pid + a listen port, so a live node never trips this.
+    if log_report.phase != "fatal"
         && recorded_pid_alive(&dir) == Some(false)
         && !port_listening(ws.ports.listen)
         && !port_listening(ws.ports.http)
@@ -1066,7 +1068,19 @@ pub fn workspace_phase(
             detail: Some(detail),
         });
     }
-    Ok(report)
+    // a FATAL/panic already in the log is terminal — a rejected or crashed join
+    // exits before the rpc can answer, so trust the log over a stale rpc read.
+    if log_report.phase == "fatal" {
+        return Ok(log_report);
+    }
+    // AUTHORITATIVE positive ladder from the node's rpc (read-only, no lock).
+    // unreachable rpc (still booting, or briefly down mid-resync) falls back to
+    // the log's best guess.
+    let cfg = node_toml(&dir);
+    match crate::daemon::run_verb(&["join-state", "--config", &cfg.to_string_lossy()]) {
+        Ok(out) => Ok(parse_join_state(&out).unwrap_or(log_report)),
+        Err(_) => Ok(log_report),
+    }
 }
 
 /// the path + tail of a workspace's `daemon.log`, so the ui can show the real

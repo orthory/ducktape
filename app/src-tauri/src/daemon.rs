@@ -181,6 +181,7 @@ const ALLOWED_VERBS: &[&str] = &[
     "join",
     "invite",
     "join-requests",
+    "join-state",
     "invite-accept",
     "member-remove",
     "promote",
