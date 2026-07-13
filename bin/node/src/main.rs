@@ -415,6 +415,7 @@ fn run_node(
                 network,
                 oracle,
                 quota,
+                &signer,
                 mesh_participants,
                 sync_sources,
                 storage_for_sync,

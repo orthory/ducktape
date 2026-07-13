@@ -236,8 +236,12 @@ pub(super) async fn post_reboot_catchup<'a>(
             std::process::exit(1);
         };
         // like the parked joiner's client: the mesh path, over the channel
-        // halves handed back to the serve loop once catch-up completes.
-        let client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone());
+        // halves handed back to the serve loop once catch-up completes. carry
+        // the real-key standing proof (ADR §5.1): this restore/promoted-boot
+        // node's key is in the committed valset, so the serving peer admits it.
+        let (sync_requester, sync_proof) = statesync::sign_sync_proof(&signer, &namespace);
+        let client =
+            BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone(), sync_requester, sync_proof);
         let mut attempts = 0usize;
         loop {
             attempts += 1;

@@ -232,16 +232,46 @@ pub(super) async fn finish(
         let state_tx = sync_state_tx;
         let mut sync_tx = sync_tx;
         let mut ingress = sync_ingress;
+        // the genesis namespace the standing proof is bound to (ADR §5.1).
+        let serve_namespace = namespace.clone();
         context
             .child("statesync_serve")
             .spawn(move |_ctx| async move {
                 let mut server = SyncServer::new();
                 while let Some((peer, bytes)) = ingress.next().await {
-                    // mesh frames ride an rpc envelope (multiplexed
-                    // channel — the id correlates).
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                    // mesh frames ride the AUTHENTICATED rpc envelope
+                    // (requester ‖ proof ‖ id ‖ body — the id correlates).
+                    let Ok((requester, proof, rpc_id, body)) =
+                        statesync::decode_rpc_authed(&bytes)
+                    else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
+                    // FAIL-CLOSED (ADR §5.1). a transport-key standing gate is
+                    // IMPOSSIBLE at this seam: a pre-admission joiner and an
+                    // admitted resident share the derived LOBBY key on this
+                    // channel (boot/mesh.rs), so their peer identity is the
+                    // SAME. enforcement is a REQUEST-LEVEL real-key proof:
+                    //  (1) the proof must verify — the requester signed
+                    //      SYNC_AUTH_NAMESPACE over the genesis namespace with a
+                    //      key it holds. sound as a STATIC per-session proof: the
+                    //      mesh transport is authenticated+encrypted, so the
+                    //      proof is not wire-capturable, and a pre-admission
+                    //      joiner can only sign for its own non-standing key.
+                    //  (2) that key must be in COMMITTED standing (validators ∪
+                    //      residents), read fresh per request through the loop
+                    //      seam. a valid targeted invite alone yields no standing
+                    //      key ⇒ leaks ZERO chain state (R4). the restore path
+                    //      and validator backfill dial under their real keys —
+                    //      which ARE in the valset — so they still sync; an
+                    //      admitted resident's key enters residents at its Redeem
+                    //      block, so it syncs the instant it is admitted, still
+                    //      under the shared lobby transport key.
+                    // a failed check DROPS the request (deny-by-default, like the
+                    // malformed/non-request drops), never a reply.
+                    if !statesync::verify_sync_proof(requester, proof, &serve_namespace) {
+                        continue;
+                    }
+                    let requester = *requester;
                     // only a decodable REQUEST proceeds. everything else —
                     // a stray response, version skew, junk — is DROPPED,
                     // never answered: answering non-requests is how two
@@ -249,22 +279,34 @@ pub(super) async fn finish(
                     let Ok(req) = statesync::decode_request(body) else {
                         continue;
                     };
+                    // the COMMITTED-standing check, via the loop-owned seam
+                    // (fresh per request — a just-Redeemed resident is admitted
+                    // immediately; see SyncStateRequest::Standing).
+                    let (standing_tx, standing_rx) = tokio::sync::oneshot::channel();
+                    let mut probe = state_tx.clone();
+                    if futures::SinkExt::send(
+                        &mut probe,
+                        SyncStateRequest::Standing {
+                            requester,
+                            reply: standing_tx,
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        continue; // state owner shutting down.
+                    }
+                    if !standing_rx.await.unwrap_or(false) {
+                        continue; // not in committed standing: refuse (drop).
+                    }
                     let req_kind = req.kind_name();
-                    // NOTE (ADR §5 server-side fail-closed — NOT enforceable at
-                    // this seam): a transport-key standing gate cannot live here.
-                    // joiners AND residents transport under the SHARED derived
-                    // lobby identity (boot/mesh.rs — their real key is untracked
-                    // pre-promotion), so an admitted resident and a pre-admission
-                    // joiner are the SAME peer key on this channel; refusing the
-                    // lobby identity breaks resident sync, and exempting it
-                    // re-admits pre-admission joiners. R4 is enforced CLIENT-side
-                    // (the gate phase blocks all statesync until Admitted) plus
-                    // by lobby-identity-gated transport (a non-invite key is
-                    // bounced at the mesh handshake). a true server-side gate
-                    // needs a real-key standing proof ON the statesync request —
-                    // a follow-up protocol change (see the PR body).
                     let resp = drive_sync_request(&mut server, &state_tx, req).await;
-                    let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
+                    let framed = statesync::encode_rpc_authed(
+                        &[0u8; 32],
+                        &[0u8; 64],
+                        rpc_id,
+                        &statesync::encode_response(&resp),
+                    );
                     // the serve-lane observation (`ducktape_statesync_serve_*`):
                     // who pulled what, and the progression the response
                     // itself proves (served boundary / frame heights).
