@@ -335,6 +335,29 @@ export function ChatView() {
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
   }, [state.messages.length, state.activeChannel]);
 
+  // Jump-to-message: `focusMessage` (tag/search hit) sets chatFocusSeq and
+  // enters its channel. Once that channel's own slice has landed, scroll the row
+  // into view and flash it. Wait for the slice — enterChannel swaps messages in
+  // async, so an early pass may still see the prior channel's array; acting then
+  // would clear the focus before the target row exists.
+  // ponytail: if seq is older than chat's newest-256 `messages_latest` window we
+  // can't render it — land in the channel and clear (needs a node-side
+  // around-seq query to page in older context).
+  useLayoutEffect(() => {
+    const seq = state.chatFocusSeq;
+    if (seq === null) return;
+    const loaded = state.messages.some((m) => m.channel_id === state.activeChannel);
+    if (!loaded) return;
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-seq="${seq}"]`);
+    if (el) {
+      pinnedRef.current = false; // don't let the tail-pin yank us back down
+      el.scrollIntoView({ block: "center" });
+      el.classList.add("msg-focus");
+      setTimeout(() => el.classList.remove("msg-focus"), 2000);
+    }
+    actions.clearChatFocus();
+  }, [state.chatFocusSeq, state.messages, state.activeChannel, actions]);
+
   const handleSend = () => {
     if (!draft.trim()) return;
     pinnedRef.current = true;

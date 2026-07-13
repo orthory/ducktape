@@ -140,7 +140,7 @@ export function MessageList({
           const linkRef = `ducktape://${workspaceId ?? "local"}/${message.channel_id}/${message.head.message_id}`;
           const refRef = `${message.channel_id}#${message.seq}:${message.head.message_id}`;
           return (
-            <div key={message.seq} style={{ minWidth: 0 }}>
+            <div key={message.seq} data-seq={message.seq} style={{ minWidth: 0 }}>
               {dayDivider && <DayDivider label={dayDivider} />}
               <MessageItem
                 message={message}

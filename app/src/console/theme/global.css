@@ -204,3 +204,18 @@ button:focus-visible,
     transform: none;
   }
 }
+
+/* Transient flash on a jump-to-message target (tag/search hit). Accent wash that
+   fades over ~2s; ChatView also strips the class once it settles. */
+@keyframes msg-focus-flash {
+  from {
+    background: color-mix(in srgb, var(--accent, #a05a3c) 22%, transparent);
+  }
+  to {
+    background: transparent;
+  }
+}
+.msg-focus {
+  border-radius: 7px;
+  animation: msg-focus-flash 2s ease-out;
+}

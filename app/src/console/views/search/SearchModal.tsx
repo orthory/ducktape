@@ -231,9 +231,8 @@ export function SearchModal() {
   const searching = query !== "" && !matched;
   const total = chatHits.length + docHits.length + memberHits.length + fileHits.length;
 
-  const openChat = (channelId: string) => {
-    actions.selectChannel(channelId);
-    actions.setScreen("chat");
+  const openChat = (channelId: string, seq: number) => {
+    actions.focusMessage(channelId, seq); // lands on chat + jumps to the hit
     actions.closeSearch();
   };
   const openDoc = (pageId: string) => {
@@ -316,7 +315,7 @@ export function SearchModal() {
                   key={`${hit.channelId}/${hit.seq}`}
                   meta={`#${hit.channelId} · ${resolveHitAuthor(hit.author, state.authorNames)}${hit.edited ? " · edited" : ""}`}
                   text={hit.text}
-                  onOpen={() => openChat(hit.channelId)}
+                  onOpen={() => openChat(hit.channelId, hit.seq)}
                 />
               ))}
             </Group>
