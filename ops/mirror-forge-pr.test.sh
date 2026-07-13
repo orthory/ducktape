@@ -85,6 +85,29 @@ if (assert_cutover_mapping "$TARGET_OID" "$GITHUB_BASE" "$BASE") >/dev/null 2>&1
   exit 1
 fi
 
+printf '%s\n' \
+  'Closes #49. This fixes #12 and RESOLVED #13.' \
+  'A plain #77 stays unchanged.' \
+  '````markdown' \
+  'Closes #98 inside a fence.' \
+  '```' \
+  'Fixes #99 after a short fence marker.' \
+  '````' \
+  'This fixed #14 outside the fence.' \
+  >"$TEST_ROOT/body"
+neutralize_github_closing_keywords "$TEST_ROOT/body" ducktape
+printf '%s\n' \
+  'Addresses Forge ducktape item 49. This addresses Forge ducktape item 12 and addresses Forge ducktape item 13.' \
+  'A plain #77 stays unchanged.' \
+  '````markdown' \
+  'Closes #98 inside a fence.' \
+  '```' \
+  'Fixes #99 after a short fence marker.' \
+  '````' \
+  'This addresses Forge ducktape item 14 outside the fence.' \
+  >"$TEST_ROOT/expected-body"
+cmp "$TEST_ROOT/expected-body" "$TEST_ROOT/body"
+
 if (validate_merged_selection "$MERGE_OID" "$BASE") >/dev/null 2>&1; then
   echo 'explicit source mismatch was accepted' >&2
   exit 1
