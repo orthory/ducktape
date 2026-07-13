@@ -446,10 +446,7 @@ export function PagesView() {
               authorNames={state.authorNames}
               selfKey={selfKey}
               ops={state.ops}
-              composer={null}
               onClose={() => setPanelOpen(false)}
-              onSubmitNew={(target, text) => actions.addComment({ target, text })}
-              onCancelNew={() => {}}
               onReply={replyToThread}
               onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
               onEdit={(commentId, text) => actions.editComment({ commentId, text })}

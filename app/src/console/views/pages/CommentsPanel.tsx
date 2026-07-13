@@ -3,24 +3,20 @@ import type { TargetThreads } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import type { OpLedger } from "../../store/finalization";
 import { color, font, radius } from "../../theme/tokens";
-import { NewThreadComposer, ThreadCard } from "./CommentThread";
-import type { ComposerTarget } from "./CommentThread";
+import { ThreadCard } from "./CommentThread";
 
 export type { ComposerTarget } from "./CommentThread";
 
 /** The right-hand comments panel: every thread on the open page (grouped
  *  flat), each with its comments, a reply composer, resolve/reopen, and
- *  edit/delete (the module enforces author-only). When `composer` is set, a
- *  new-thread composer for that target renders above the thread list. */
+ *  edit/delete (the module enforces author-only). New threads are composed in
+ *  the floating CommentCard, not here. */
 export function CommentsPanel({
   threads,
   authorNames,
   selfKey,
   ops,
-  composer,
   onClose,
-  onSubmitNew,
-  onCancelNew,
   onReply,
   onResolve,
   onEdit,
@@ -32,10 +28,7 @@ export function CommentsPanel({
   selfKey: string;
   /** Finalization ledger, handed through to each thread's marks. */
   ops?: OpLedger;
-  composer: ComposerTarget | null;
   onClose: () => void;
-  onSubmitNew: (target: string, text: string) => void;
-  onCancelNew: () => void;
   onReply: (threadId: string, text: string) => void;
   onResolve: (threadId: string, resolved: boolean) => void;
   onEdit: (commentId: string, text: string) => void;
@@ -94,15 +87,7 @@ export function CommentsPanel({
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "10px 0" }}>
-        {composer ? (
-          <NewThreadComposer
-            key={composer.target}
-            composer={composer}
-            onSubmit={onSubmitNew}
-            onCancel={onCancelNew}
-          />
-        ) : null}
-        {flat.length === 0 && !composer ? (
+        {flat.length === 0 ? (
           <div
             style={{
               margin: "10px 16px",
