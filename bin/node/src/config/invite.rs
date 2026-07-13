@@ -1343,20 +1343,20 @@ mod tests {
     fn invite_blob_id_is_the_content_hash_of_the_decoded_bytes() {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
-        let blob = encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let mint = || {
+            mint_invite_token(
+                &issuer,
+                d.genesis_namespace().as_bytes(),
+                &issuer.public_key(),
+                InviteRole::Resident,
+                u64::MAX,
+            )
+        };
+        let blob = encode_invite(&d, &mint(), None, &[], &issuer).expect("encode");
         let id = invite_blob_id(&blob).expect("id");
-        // stable under re-parse, changes when the blob changes.
+        // stable under re-parse, changes when the blob changes (fresh nonce).
         assert_eq!(id, invite_blob_id(&blob).unwrap());
-        let other = encode_invite(
-            &d,
-            &mint_invite_token(&issuer, d.genesis_namespace().as_bytes()),
-            None,
-            &[],
-            u64::MAX,
-            &issuer,
-        )
-        .unwrap();
+        let other = encode_invite(&d, &mint(), None, &[], &issuer).unwrap();
         assert_ne!(id, invite_blob_id(&other).unwrap());
         // the raw bytes re-wrap to the exact original blob (fetch/join path).
         assert_eq!(wrap_invite_bytes(&invite_blob_bytes(&blob).unwrap()), blob);

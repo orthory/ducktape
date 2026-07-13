@@ -580,11 +580,14 @@ fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
         .expect("run init");
     assert!(init.status.success(), "init failed:\n{}", command_output(&init));
 
-    // mint a SHORT invite: publishes the blob to A, prints the full blob then
-    // the short URL as the LAST line.
+    // mint a SHORT invite locked to the friend's pre-generated key: publishes
+    // the blob to A, prints the full blob then the short URL as the LAST line.
+    let friend = dir.path().join("friend");
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .arg("--short")
         .output()
         .expect("run invite --short");
@@ -608,8 +611,8 @@ fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
         command_output(&invite)
     );
 
-    // join via the SHORT URL, pointed at A: fetch + materialize the workspace.
-    let friend = dir.path().join("friend");
+    // join via the SHORT URL, pointed at A: fetch + materialize the workspace
+    // (the friend dir already holds the targeted identity from keygen above).
     let join = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args([
             "join",
@@ -664,7 +667,12 @@ fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
 
     // the FULL blob still joins with no coordinator at all — the universal
     // fallback the loud error tells the user about.
+    // invites are targeted: friend3 must present the SAME key the invite was
+    // minted for, so seed it with the friend's identity before joining.
     let friend3 = dir.path().join("friend3");
+    std::fs::create_dir_all(&friend3).expect("create friend3");
+    std::fs::copy(friend.join("identity.key"), friend3.join("identity.key"))
+        .expect("seed friend3 with the targeted identity");
     let join_full = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args([
             "join",

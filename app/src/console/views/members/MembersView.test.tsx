@@ -90,8 +90,13 @@ describe("MembersView", () => {
     });
     const { spies } = renderMembers();
 
+    // every invite is locked to the invitee's join code: the Reveal button is
+    // gated until a valid 64-hex code is pasted.
+    fireEvent.change(screen.getByLabelText("Invitee join code"), {
+      target: { value: joinerKey },
+    });
     fireEvent.click(screen.getByRole("button", { name: /refresh invite/i }));
-    expect(spies.revealInvite).toHaveBeenCalled();
+    expect(spies.revealInvite).toHaveBeenCalledWith(joinerKey);
 
     fireEvent.click(screen.getByRole("button", { name: /copy invite/i }));
     expect(writeText).toHaveBeenCalledWith("ducktape-invite-blob");
