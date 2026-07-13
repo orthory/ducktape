@@ -1093,10 +1093,33 @@ fn workspace_phase_blocking(
     // unreachable rpc (still booting, or briefly down mid-resync) falls back to
     // the log's best guess.
     let cfg = node_toml(&dir);
-    match crate::daemon::run_verb(&["join-state", "--config", &cfg.to_string_lossy()]) {
-        Ok(out) => Ok(parse_join_state(&out).unwrap_or(log_report)),
-        Err(_) => Ok(log_report),
+    let report = match crate::daemon::run_verb(&["join-state", "--config", &cfg.to_string_lossy()]) {
+        Ok(out) => parse_join_state(&out).unwrap_or(log_report),
+        Err(_) => log_report,
+    };
+    // the registry's `member` flag was cached from the descriptor snapshot at
+    // join time and never refreshed — so a joiner later PROMOTED to validator
+    // read `member=false` forever (couldn't vote / admin). `phase=="promoted"`
+    // is the authoritative, restart-proof "this node is a validator" signal, so
+    // adopt it here. MONOTONIC-UP: only ever flips false→true on a confirmed
+    // promotion; a transient rpc blip yields a lesser phase and simply doesn't
+    // write, never demoting a validator on a flicker.
+    if report.phase == "promoted" {
+        refresh_member_standing(&app, &id)?;
     }
+    Ok(report)
+}
+
+/// persist that a workspace's node now holds validator standing, idempotently
+/// (no write if already a member) and monotonic-up (never clears the flag) —
+/// mirrors [`set_mnemonic_confirmed`]. keyed off the authoritative `promoted`
+/// join-state phase; the founder path already sets `member` at create.
+fn refresh_member_standing(app: &crate::rt::AppHandle, id: &str) -> Result<(), String> {
+    let mut reg = load_registry(app)?;
+    if registry::mark_member(&mut reg, id) {
+        save_registry(app, &reg)?;
+    }
+    Ok(())
 }
 
 /// the path + tail of a workspace's `daemon.log`, so the ui can show the real

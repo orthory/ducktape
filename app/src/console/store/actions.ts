@@ -632,6 +632,18 @@ export function createActions({
   const patch = (p: Partial<ConsoleState>) => dispatch({ type: "patch", patch: p });
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
+  // a joiner PROMOTED to validator: the registry cached `member=false` from
+  // join time. `phase === "promoted"` is the authoritative "this node is a
+  // validator" signal, so flip the cached flag in-session (the Rust side
+  // persists the same, so it survives relaunch) — MONOTONIC-UP, only false→
+  // true, so a transient read never demotes. fixes canVote / canAdmin, which
+  // read `member` with no runtime fallback.
+  const adoptPromotedMember = (id: string): void =>
+    update((prev) => ({
+      workspaces: prev.workspaces.map((w) =>
+        w.id === id && !w.member ? { ...w, member: true } : w,
+      ),
+    }));
   const isCurrentNode = (live: NodeTransport): boolean => getNode() === live;
 
   /** The live transport + active workspace the account writes sign against.
@@ -1558,6 +1570,7 @@ export function createActions({
           ws.workspacePhase(target.id).then((report) => {
             if (stale()) return;
             patch({ onboardingPhase: report });
+            if (report.phase === "promoted") adoptPromotedMember(target.id);
             if (report.phase === "fatal") {
               fail(report.detail ?? "the node failed to join");
               return;
@@ -3027,6 +3040,7 @@ export function createActions({
       Promise.resolve()
         .then(() => ws.workspacePhase(target.id))
         .then((report) => {
+          if (report.phase === "promoted") adoptPromotedMember(target.id);
           if (report.phase === "fatal") {
             fail(report.detail ?? `"${target.name}" failed to join its network`);
             return;
