@@ -529,7 +529,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
 }
 
 /// End to end through the REAL binary: `invite --short` publishes the full
-/// signed blob to the coordinator by content id and prints a `🦆://<name>/<id>`
+/// signed blob to the coordinator under a random owner-owned id and prints a `🦆://<name>/<id>`
 /// short URL; `join <url>` fetches it back and materializes the workspace. When
 /// the joiner points at a coordinator that does NOT hold the link (a restart
 /// dropped the in-memory shelf), the short join fails LOUDLY — and the full

@@ -413,8 +413,11 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let coord = config::coordinator_socket_addr(raw.primary_coordinator.as_deref())?
             .ok_or("--short needs a primary coordinator (config or default)")?;
         let raw_bytes = config::invite_blob_bytes(&blob_string)?;
-        let id = config::invite_blob_id(&blob_string)?;
         let signer = key.clone();
+        // the shelf id is a RANDOM owner-owned lookup key, not a content hash
+        // (a 4-byte content hash is brute-forceable → invite substitution). The
+        // coordinator refuses an id another owner already holds, so on refusal
+        // we re-mint a fresh id and retry a bounded number of times.
         let published = tokio::runtime::Runtime::new()?.block_on(async move {
             let client = nat_traversal::NatClient::bind_multi_auth(
                 nat_traversal::NodeKey(own),
@@ -423,14 +426,19 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 None,
             )
             .await?;
-            client.invite_put(id, expires, raw_bytes).await
+            for _ in 0..4 {
+                let id = config::random_invite_id();
+                if client.invite_put(id, expires, raw_bytes.clone()).await? {
+                    return Ok::<Option<_>, std::io::Error>(Some(id));
+                }
+            }
+            Ok(None)
         })?;
-        if !published {
+        let Some(id) = published else {
             return Err(
-                "coordinator refused the short invite (quota or size) — share the full blob"
-                    .into(),
+                "coordinator refused the short invite — try again (or share the full blob)".into(),
             );
-        }
+        };
         println!("{}", config::short_invite_url(&descriptor.chain_id, &id));
     }
     Ok(())

@@ -1,8 +1,11 @@
-//! the coordinator's short-invite shelf: content-addressed, TTL'd, bounded.
-//! UNTRUSTED STORAGE by design — the blob authenticates itself (issuer
-//! envelope signature; the id is its content hash), the coordinator only
-//! shelves bytes. in-memory only: a restart drops links, republishing is the
-//! recovery (same statelessness posture as `AdvertBook`).
+//! the coordinator's short-invite shelf: keyed by a caller-chosen RANDOM id,
+//! TTL'd, bounded. UNTRUSTED STORAGE by design — the blob authenticates itself
+//! (issuer envelope signature, which the fetching client verifies via
+//! `decode_invite`), the coordinator only shelves bytes. The id is a random
+//! PoP-owned LOOKUP KEY, not a content hash: there is no hash to brute-force, so
+//! a colliding blob cannot substitute a victim's shelved invite — a cross-owner
+//! put to an occupied id is refused. in-memory only: a restart drops links,
+//! republishing is the recovery (same statelessness posture as `AdvertBook`).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -22,27 +25,17 @@ pub const GET_BURST: u64 = 20;
 /// distinct source IPs tracked; at the cap the stalest bucket is evicted.
 const MAX_GET_BUCKETS: usize = 1024;
 
-/// the id IS the first 16 bytes of sha256(blob) — content addressing makes
-/// the shelf tamper-evident without trusting the coordinator.
-pub fn invite_id(blob: &[u8]) -> [u8; INVITE_ID_LEN] {
-    use commonware_cryptography::{Hasher as _, Sha256};
-    let mut h = Sha256::default();
-    h.update(blob);
-    let digest = h.finalize();
-    let mut id = [0u8; INVITE_ID_LEN];
-    id.copy_from_slice(&digest.as_ref()[..INVITE_ID_LEN]);
-    id
-}
-
 /// the outcome of a `put` — the coordinator answers Stored/Replaced with
 /// `InvitePutAck { ok: true }`, everything else with `ok: false`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutOutcome {
     Stored,
     Replaced,
+    /// the id is already shelved by a DIFFERENT owner — refused (never
+    /// overwritten). The caller re-mints under a fresh random id and retries.
+    Taken,
     QuotaExceeded,
     TooLarge,
-    BadId,
     BadExpiry,
 }
 
@@ -59,9 +52,13 @@ pub struct InviteStore {
 }
 
 impl InviteStore {
-    /// shelve `blob` under its content `id`. Self-authenticating: the id must
-    /// be the blob's content hash. The stored shelf life is capped at
-    /// `MAX_INVITE_TTL_SECS` (a far-future expiry is clamped, not rejected).
+    /// shelve `blob` under `id`, a caller-chosen RANDOM lookup key. The id is
+    /// PoP-owned: only the owner that first shelved an id may overwrite it
+    /// (republish → `Replaced`); a put to an id held by a different owner is
+    /// refused (`Taken`). Integrity is NOT the id — it is the blob's envelope
+    /// signature, which the fetching client verifies via `decode_invite`. The
+    /// stored shelf life is capped at `MAX_INVITE_TTL_SECS` (a far-future expiry
+    /// is clamped, not rejected).
     pub fn put(
         &mut self,
         owner: NodeKey,
@@ -73,9 +70,6 @@ impl InviteStore {
         if blob.len() > INVITE_BLOB_MAX {
             return PutOutcome::TooLarge;
         }
-        if invite_id(&blob) != id {
-            return PutOutcome::BadId;
-        }
         if expires_unix_secs <= now {
             return PutOutcome::BadExpiry;
         }
@@ -85,8 +79,13 @@ impl InviteStore {
         // drop anything already dead so it never counts against quota or the cap.
         self.entries.retain(|_, e| e.expires > now);
 
-        // re-putting an existing id is idempotent republish — never quota'd.
+        // an occupied id: only its OWNER may overwrite (idempotent republish,
+        // never quota'd). A different owner is refused — this is what stops a
+        // brute-forced random-id guess from substituting a victim's invite.
         if let Some(slot) = self.entries.get_mut(&id) {
+            if slot.owner != owner {
+                return PutOutcome::Taken;
+            }
             *slot = Entry { blob, expires, owner };
             return PutOutcome::Replaced;
         }
@@ -168,10 +167,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn put_verifies_the_content_hash_and_chunks_roundtrip() {
+    fn put_shelves_under_a_random_id_and_chunks_roundtrip() {
         let mut s = InviteStore::default();
         let blob = vec![7u8; 2500]; // 3 chunks: 1000+1000+500
-        let id = invite_id(&blob);
+        let id = [1u8; INVITE_ID_LEN]; // a random lookup key, not a content hash
         assert_eq!(s.put(NodeKey([1; 32]), id, blob.clone(), 100, 0), PutOutcome::Stored);
         let (c0, total) = s.chunk(id, 0, 0).unwrap();
         assert_eq!((c0.len(), total), (1000, 3));
@@ -183,10 +182,24 @@ mod tests {
             whole.extend(s.chunk(id, i, 0).unwrap().0);
         }
         assert_eq!(whole, blob);
-        // wrong id refused; unknown id is None; expiry kills it
-        assert_eq!(s.put(NodeKey([1; 32]), [9; 16], vec![1, 2, 3], 100, 0), PutOutcome::BadId);
-        assert!(s.chunk([9; 16], 0, 0).is_none());
+        // an unknown id is None; expiry kills the shelved one
+        assert!(s.chunk([9u8; INVITE_ID_LEN], 0, 0).is_none());
         assert!(s.chunk(id, 0, 101).is_none(), "expired ids resolve to None");
+    }
+
+    #[test]
+    fn a_cross_owner_put_is_refused_but_the_owner_may_republish() {
+        let mut s = InviteStore::default();
+        let id = [3u8; INVITE_ID_LEN];
+        let alice = NodeKey([1; 32]);
+        let bob = NodeKey([2; 32]);
+        assert_eq!(s.put(alice, id, vec![0xAA; 10], u64::MAX, 0), PutOutcome::Stored);
+        // bob cannot overwrite alice's id, and alice's blob is untouched.
+        assert_eq!(s.put(bob, id, vec![0xBB; 10], u64::MAX, 0), PutOutcome::Taken);
+        assert_eq!(s.chunk(id, 0, 0).unwrap().0, vec![0xAA; 10]);
+        // alice republishing her own id is an idempotent Replaced.
+        assert_eq!(s.put(alice, id, vec![0xCC; 10], u64::MAX, 0), PutOutcome::Replaced);
+        assert_eq!(s.chunk(id, 0, 0).unwrap().0, vec![0xCC; 10]);
     }
 
     #[test]
@@ -194,14 +207,15 @@ mod tests {
         let mut s = InviteStore::default();
         let owner = NodeKey([1; 32]);
         for i in 0..MAX_INVITES_PER_OWNER as u8 {
-            let blob = vec![i; 10];
-            assert_eq!(s.put(owner, invite_id(&blob), blob, u64::MAX, 0), PutOutcome::Stored);
+            let id = [i; INVITE_ID_LEN];
+            assert_eq!(s.put(owner, id, vec![i; 10], u64::MAX, 0), PutOutcome::Stored);
         }
-        let over = vec![0xFF; 10];
-        assert_eq!(s.put(owner, invite_id(&over), over, u64::MAX, 0), PutOutcome::QuotaExceeded);
+        assert_eq!(
+            s.put(owner, [0xFF; INVITE_ID_LEN], vec![0xFF; 10], u64::MAX, 0),
+            PutOutcome::QuotaExceeded
+        );
         // re-putting an EXISTING id never counts against quota (idempotent republish)
-        let again = vec![0u8; 10];
-        assert_eq!(s.put(owner, invite_id(&again), again, u64::MAX, 0), PutOutcome::Replaced);
+        assert_eq!(s.put(owner, [0u8; INVITE_ID_LEN], vec![0u8; 10], u64::MAX, 0), PutOutcome::Replaced);
     }
 
     #[test]
