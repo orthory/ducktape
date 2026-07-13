@@ -408,6 +408,9 @@ export interface ConsoleState {
   /** The coordinator-hosted `🦆://<name>/<id>` short link for the revealed
    *  invite, when the coordinator accepted it; null on the full-blob-only path. */
   inviteShort: string | null;
+  /** This device's JOIN CODE (a pre-generated identity pubkey) for the
+   *  onboarding join flow — handed to an inviter so the invite locks to it. */
+  joinCode: string | null;
 }
 
 export const DEFAULT_ACCENT = "#a05a3c";
@@ -839,6 +842,7 @@ export const createInitialState = (): ConsoleState => {
     onboardingPhase: null,
     inviteBlob: null,
     inviteShort: null,
+    joinCode: null,
   };
 };
 

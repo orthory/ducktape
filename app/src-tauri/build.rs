@@ -49,6 +49,7 @@ fn main() {
         "duck_set_gateway_base",
         "workspace_create",
         "workspace_join",
+        "workspace_join_code",
         "workspace_invite_blob",
         "workspace_join_requests",
         "workspace_admit",

@@ -176,6 +176,7 @@ fn main() {
             duck_set_gateway_base,
             workspaces::workspace_create,
             workspaces::workspace_join,
+            workspaces::workspace_join_code,
             workspaces::workspace_invite_blob,
             workspaces::workspace_join_requests,
             workspaces::workspace_admit,

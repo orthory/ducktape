@@ -548,8 +548,12 @@ export interface ConsoleActions {
   /** Connect to a node running on another device over http/https. Unmanaged —
    *  we only dial it; the url is remembered and reconnected on next launch. */
   connectRemote(url: string): void;
-  /** Fetch the active workspace's invite blob into state for sharing. */
-  revealInvite(): void;
+  /** Fetch the active workspace's invite blob into state for sharing. Every
+   *  invite is LOCKED to `target` (the invitee's join code / pubkey hex). */
+  revealInvite(target: string): void;
+  /** Fetch (or reuse) this device's JOIN CODE into state — the pubkey an
+   *  invitee hands the inviter so the invite locks to it. */
+  joinCode(): void;
   /** Admit a joiner by pubkey through the active (member) workspace — grants
    *  RESIDENT standing (staged admission's first step); promote seats it. */
   admitMember(pubkey: string): void;
@@ -3029,12 +3033,24 @@ export function createActions({
       setNode(bootstrap.connectRemote(url).transport);
     },
 
-    revealInvite: () => {
-      const target = getState().workspace;
-      if (!target) return;
+    revealInvite: (targetCode) => {
+      const active = getState().workspace;
+      if (!active) return;
+      const code = targetCode.trim();
+      if (!code) {
+        fail("paste the invitee's join code — every invite is locked to it");
+        return;
+      }
       Promise.resolve()
-        .then(() => ws.inviteBlob(target.id))
+        .then(() => ws.inviteBlob(active.id, code))
         .then((forms) => patch({ inviteBlob: forms.blob, inviteShort: forms.short }))
+        .catch(fail);
+    },
+
+    joinCode: () => {
+      Promise.resolve()
+        .then(() => ws.joinCode())
+        .then((code) => patch({ joinCode: code }))
         .catch(fail);
     },
 
