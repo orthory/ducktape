@@ -160,11 +160,13 @@ impl ValidatorRuntime<'_> {
             Err(_) => return, // junk on the doorbell — drop.
         };
         // crypto first (pure, cheap): the token must verify for
-        // THIS network and the announced key must prove itself.
+        // THIS network and the announced key must prove itself. a
+        // verify failure is PERMANENT for this blob (tampered,
+        // foreign, or malformed) — fail it loudly.
         let verified = match lobby::verify_join_request(&msg, namespace) {
             Ok(v) => v,
             Err(e) => {
-                send_reply(false, e, None, false);
+                send_reply(false, e, None, true);
                 return;
             }
         };
@@ -189,9 +191,20 @@ impl ValidatorRuntime<'_> {
             return;
         }
         if !members.contains(&verified.issuer.as_ref().to_vec()) {
+            // deliberately NON-fatal: this check reads THIS validator's
+            // committed valset, which cannot distinguish a REMOVED issuer
+            // (invite dead forever) from a just-admitted one this view has
+            // not applied yet. a fatal here would let one lagging validator
+            // kill a healthy join on the joiner's first round-robin hit;
+            // the joiner keeps announcing and an up-to-date member redeems.
+            // a genuinely removed issuer is caught by the parking bail.
             send_reply(
                 false,
-                "the inviting member is no longer part of this network".into(),
+                "the inviting member is not in this validator's current view — \
+                 if it was removed, this invite is dead (ask a current member \
+                 for a fresh one); if it was just admitted, another member \
+                 will redeem shortly"
+                    .into(),
                 None,
                 false,
             );
