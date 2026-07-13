@@ -71,7 +71,28 @@ describe("SearchModal", () => {
     expect(hit).toBeInTheDocument();
     expect(screen.queryByText("budget.csv")).not.toBeInTheDocument();
     fireEvent.click(hit);
-    expect(spies.setScreen).toHaveBeenCalledWith("files");
+    expect(spies.openFiles).toHaveBeenCalledWith("/roadmap.md");
+    expect(spies.closeSearch).toHaveBeenCalled();
+  });
+
+  it("opens a member hit at its bound account, else falls back to navigate", () => {
+    const alice = "aa".repeat(32);
+    const { spies } = renderModal({
+      // nodeUsers is keyed by the normalized (lowercase) node key; the account
+      // id round-trips lower-cased for MembersView's memberFocus match.
+      nodeUsers: { [alice]: { accountId: "ACC-1", name: "Alice" } },
+    });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "ali" } });
+    fireEvent.click(screen.getByText("Alice"));
+    expect(spies.openMember).toHaveBeenCalledWith("acc-1");
+    expect(spies.closeSearch).toHaveBeenCalled();
+  });
+
+  it("falls back to navigate for a member hit with no bound account", () => {
+    const { spies } = renderModal(); // nodeUsers empty
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "bob" } });
+    fireEvent.click(screen.getByText("Bob"));
+    expect(spies.setScreen).toHaveBeenCalledWith("members");
     expect(spies.closeSearch).toHaveBeenCalled();
   });
 
