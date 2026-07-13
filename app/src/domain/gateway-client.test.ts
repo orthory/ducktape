@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   ROUTE_FORMAT_VERSION,
+  accountsAudience,
   bytesToHex,
   listRoutes,
   probeRouteHealth,
@@ -139,6 +140,21 @@ describe("gateway wire contract", () => {
       },
       body: new Uint8Array(0),
     });
+  });
+
+  it("builds a sorted, unique, capped explicit-account audience from hex ids", () => {
+    expect(accountsAudience(["02", "01", "01", "03"])).toEqual({
+      kind: "accounts",
+      account_ids: [[1], [2], [3]],
+    });
+
+    const capped = accountsAudience(Array.from({ length: 40 }, (_, index) => bytesToHex([index])));
+    expect(capped.kind).toBe("accounts");
+    if (capped.kind === "accounts") {
+      expect(capped.account_ids).toHaveLength(32);
+      expect(capped.account_ids[0]).toEqual([0]);
+      expect(capped.account_ids[31]).toEqual([31]);
+    }
   });
 
   it("does not probe a route whose signed policy omits HEAD", async () => {
