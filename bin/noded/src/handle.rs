@@ -101,6 +101,9 @@ pub struct NodeHandle {
     /// like `forge_repo`; `None` on a handle that never serves the seam (the
     /// router tests' fake handle), which makes `/v1/fs/workspaces` a clean 503.
     pub(crate) duckfs_workspaces: Option<PathBuf>,
+    /// the node's code-plane stage lane (module-code fan-out). `None` on a
+    /// daemon without a mesh — the admin stage route answers 503 there.
+    pub(crate) code_stage: Option<crate::module_code::CodeStageLane>,
 }
 
 impl NodeHandle {
@@ -128,6 +131,7 @@ impl NodeHandle {
             gateway: None,
             browser_gateway: None,
             duckfs_workspaces: None,
+            code_stage: None,
         };
         (handle, cmd_rx, hub)
     }
@@ -166,6 +170,14 @@ impl NodeHandle {
     /// wires one — it owns the mesh the audio/video rides.
     pub fn with_call(mut self, call: CallLane) -> Self {
         self.call = Some(call);
+        self
+    }
+
+    /// point this handle at the node's code-plane stage lane so the
+    /// module-code admin route can fan staged artifacts out to members.
+    /// only the p2p validator wires one — it owns the overlay the plane rides.
+    pub fn with_code_stage(mut self, lane: crate::module_code::CodeStageLane) -> Self {
+        self.code_stage = Some(lane);
         self
     }
 

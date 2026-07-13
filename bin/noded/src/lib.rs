@@ -60,6 +60,9 @@ pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
 pub use handle::{NodeCommand, NodeHandle};
+
+mod module_code;
+pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
 // the derived-index tier: store construction, rebuilds, /v1/index/* + /v1/blocks.
 mod index;
 pub use index::{
@@ -360,6 +363,14 @@ pub fn router(handle: NodeHandle) -> Router {
             post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
+        .route(
+            "/v1/admin/module-code/stage",
+            post(module_code::stage_module_code),
+        )
+        .route(
+            "/v1/admin/module-code/{digest}",
+            get(module_code::module_code_status),
+        )
         // ---- duckfs product surface ----
         // thin convenience wrappers over the files module's ops/queries: each
         // encodes the duckfs wire server-side and threads it through the SAME

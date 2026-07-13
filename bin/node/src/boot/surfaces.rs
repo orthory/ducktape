@@ -10,6 +10,7 @@ pub(crate) struct Surfaces {
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
     pub(crate) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
@@ -89,6 +90,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // hub that drains it — on every other path the receiver just drops and
     // the route answers with a refusal.
     let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::CallSessionRequest>(8);
+    // the module-code stage lane: POST /v1/admin/module-code/stage fans an
+    // artifact out through the node's code plane. same shape as the voice
+    // lane — created up front, drained only where the validator spawns the
+    // plane; elsewhere the receiver drops and the route answers 503.
+    let (code_stage_lane, code_stage_requests) =
+        tokio::sync::mpsc::channel::<noded::CodeStageRequest>(4);
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
@@ -99,6 +106,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
         .with_call(voice_lane)
+        .with_code_stage(code_stage_lane)
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
@@ -209,6 +217,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         stream_hub,
         index,
         voice_requests,
+        code_stage_requests,
         blobs,
         agent_provisioner,
         gateway_requests: gateway_enabled.then_some(gateway_requests),

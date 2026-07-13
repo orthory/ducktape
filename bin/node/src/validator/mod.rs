@@ -57,6 +57,7 @@ pub(crate) async fn run_validator(
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
     agent_dirs: capability_host::AgentDirs,
@@ -228,9 +229,21 @@ pub(crate) async fn run_validator(
             crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
             std::sync::Arc::clone(peers),
             me,
-            bulk_pacer,
+            bulk_pacer.clone(),
             planes.clone(),
             stream_hub.run_output(),
+        );
+        // the module-code plane: serves push/pull transfers and drains the
+        // admin RPC's stage fan-outs. same overlay book as the agent plane.
+        crate::code_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(peers),
+            me,
+            bulk_pacer,
+            planes.clone(),
+            blobs.clone(),
+            code_stage_requests,
         );
     }
 
