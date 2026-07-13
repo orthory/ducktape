@@ -317,9 +317,9 @@ fn the_push_base_rewrites_wildcard_binds_to_loopback() {
 // ---- provision ------------------------------------------------------------
 
 #[tokio::test]
-async fn provisions_a_worktree_at_the_pinned_commit_from_an_odb_only_repo() {
+async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only_repo() {
     // the substrate repo has NO checkout (forge materialization shape) — the
-    // worktree must still materialize the pinned tree.
+    // clone must still materialize the pinned tree.
     let bed = bed();
     let ws = bed
         .provisioner()
@@ -328,6 +328,28 @@ async fn provisions_a_worktree_at_the_pinned_commit_from_an_odb_only_repo() {
         .expect("provision");
     let dir = ws.workdir();
     assert!(dir.starts_with(&bed.runs_root), "run dir under the W1 root");
+    assert!(
+        dir.join(".git").is_dir(),
+        ".git travels inside the sandbox mount"
+    );
+    assert!(
+        !dir.join(".git/objects/info/alternates").exists(),
+        "the run clone never points back at the canonical object store"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let object = format!("{}/{}", &bed.head[..2], &bed.head[2..]);
+        let source =
+            std::fs::metadata(bed.repo_dir.join(".git/objects").join(&object)).unwrap();
+        let cloned = std::fs::metadata(dir.join(".git/objects").join(object)).unwrap();
+        assert_ne!(
+            source.ino(),
+            cloned.ino(),
+            "the sandbox cannot mutate a canonical object through a hardlink"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(dir.join("readme.md")).unwrap(),
         "hello\n"
