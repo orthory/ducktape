@@ -222,4 +222,101 @@ describe.skipIf(!bin)("comment scenarios against the sim node", () => {
       });
     },
   );
+
+  // ── D2: comment @mention → agent engagement (and the edit asymmetry) ──
+
+  /** Register the echo agent (peer block, committed) and open a fresh page in
+   *  NON-auto mode so the oracle follow-up can be observed parked. */
+  const registerAgentAndOpenPage = async (
+    sim: Awaited<ReturnType<typeof boot>>["sim"],
+    agentId: string,
+  ): Promise<string> => {
+    await sim.peerBlock("agent", {
+      register_agent: {
+        agent_id: agentId,
+        display_name: "Quackbot",
+        capability: "echo",
+        allowed_actions: ["pages.comment"],
+      },
+    });
+    await waitFor(() =>
+      expect(state().agents.some((a) => a.agent_id === agentId)).toBe(true),
+    );
+    act(() => actions().createPage("Notes"));
+    await waitFor(async () => expect((await sim.state()).held).toBe(1));
+    await sim.step();
+    await waitFor(() => expect(state().activePage).not.toBeNull());
+    const pageId = state().activePage!;
+    await waitFor(() =>
+      expect(state().activePageBlocks.map((b) => b.id)).toEqual([pageId]),
+    );
+    return pageId;
+  };
+
+  it(
+    "a comment @mention of an agent engages it — the mention rides the tagging plane",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot({ echoOracle: true });
+      const pageId = await registerAgentAndOpenPage(sim, "quackbot");
+
+      // addComment parses mentions with the live resolver, so "@quackbot"
+      // resolves to the registered agent and rides AddComment.mentions.
+      act(() =>
+        actions().addComment({ target: pageId, text: "please review @quackbot" }),
+      );
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      const added = await sim.step();
+      expect(added.committed?.target).toBe("pages");
+
+      // the comment mention reached the tagging plane (module_impl emits a Tag
+      // event for AddComment) and engaged the echo worker — unlike chat, no
+      // channel watch is needed: an entity mention reaches the agent owner
+      // directly. Its follow-up parked as oracle work.
+      await waitFor(async () => expect((await sim.state()).oracleQueued).toBe(1));
+      const oracle = await sim.step();
+      expect(oracle.committed?.kind).toBe("oracle");
+    },
+  );
+
+  it(
+    "editing a comment to ADD an @mention engages nothing — edit_comment has no mentions plane",
+    { timeout: 30_000 },
+    async () => {
+      // #426's asymmetry, pinned: AddComment carries mentions (and emits a Tag
+      // event); EditComment does not even carry a mentions field on the wire, so
+      // a mention introduced by an edit is inert text — the agent is never
+      // engaged. If this ever "fixes itself" (edits start engaging), this test
+      // fails loudly and the asymmetry is revisited on purpose.
+      const { sim } = await boot({ echoOracle: true });
+      const pageId = await registerAgentAndOpenPage(sim, "quackbot");
+
+      // a mention-FREE comment first — nothing to engage.
+      act(() => actions().addComment({ target: pageId, text: "initial thoughts" }));
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      await sim.step();
+      await waitFor(() => expect(threads()).toHaveLength(1));
+      const commentId = threads()[0]!.comments[0]!.id;
+      expect((await sim.state()).oracleQueued).toBe(0);
+
+      // edit it to add "@quackbot" — the text updates, but no Tag event fires.
+      act(() =>
+        actions().editComment({
+          commentId,
+          text: "actually @quackbot please look",
+        }),
+      );
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      const edited = await sim.step();
+      expect(edited.committed?.target).toBe("pages");
+      await waitFor(() =>
+        expect(threads()[0]!.comments[0]!.text).toBe(
+          "actually @quackbot please look",
+        ),
+      );
+
+      // the edit committed a block but engaged NO agent: still zero oracle work.
+      expect((await sim.state()).oracleQueued).toBe(0);
+    },
+  );
 });
