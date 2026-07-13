@@ -1359,3 +1359,92 @@ describe("drag to reorder", () => {
     expect(spies.movePageBlock).not.toHaveBeenCalled();
   });
 });
+
+// RemoveBlock takes the whole subtree and consensus has no undo of its own, so
+// the view keeps a snapshot and replays it as inserts. Three ways that goes
+// wrong, all of them found in review, none of them corrupting state:
+describe("the delete-undo toast", () => {
+  const openMenu = (n: number) =>
+    fireEvent.click(screen.getByRole("button", { name: `Block ${n} actions` }));
+  const deleteBlock = (n: number) => {
+    openMenu(n);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+  };
+  const undo = () => fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+  it("replays the subtree with its ids, kind and position", async () => {
+    const { spies } = renderPagesView();
+    deleteBlock(2); // the childless to-do
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+
+    undo();
+    await settle();
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "b", parent: "p1", after: "a", kind: "todo", text: "Ship it" }),
+    );
+  });
+
+  // SetKind leaves `checked` set in the module, so a to-do that was ticked and
+  // then converted to text still carries the bit. Replaying it is a SetChecked
+  // on a paragraph — NotTodo, an error toast on a restore that WORKED.
+  it("does not replay `checked` on a block that is no longer a to-do", async () => {
+    const converted: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a"] }),
+      blockOf({ id: "a", kind: "paragraph", text: "was a to-do", checked: true }),
+    ];
+    const { spies, materialize } = renderPagesView({ activePageBlocks: converted });
+    materialize("setPageBlockChecked");
+    deleteBlock(1);
+
+    undo();
+    await settle();
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "a", kind: "paragraph" }),
+    );
+    expect(spies.setPageBlockChecked).not.toHaveBeenCalled();
+  });
+
+  // this view survives a doc switch, and InsertBlock is page-agnostic: the undo
+  // used to restore the subtree into the other document, off-screen, so the
+  // click read as a no-op.
+  it("goes back to the page the block was deleted from before restoring", async () => {
+    const { spies, rerender } = renderPagesView();
+    deleteBlock(2);
+    rerender({ activePage: "p2", activePageBlocks: [] });
+
+    undo();
+    await settle();
+    expect(spies.openPage).toHaveBeenCalledWith("p1");
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "b", parent: "p1" }),
+    );
+  });
+
+  // the anchor or the parent can be gone by the time Undo is clicked (someone
+  // else deleted it). Every op in the batch then rejects, and each rejection
+  // used to raise its own toast while nothing came back.
+  it("reports a restore that cannot land ONCE, instead of one toast per block", async () => {
+    const nested: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a"] }),
+      blockOf({ id: "a", kind: "toggle", text: "Parent", children: ["a1"] }),
+      blockOf({ id: "a1", parent: "a", text: "Child" }),
+    ];
+    const { spies, fails } = renderPagesView({ activePageBlocks: nested });
+    fails("insertPageBlock");
+    deleteBlock(1); // has a child, so it asks first
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: /delete this block/i })).getByRole("button", {
+        name: /delete block/i,
+      }),
+    );
+
+    undo();
+    await settle();
+    // the root op did not land, so the two ops chained behind it never went out
+    // (they would each have been rejected, and each have raised its own toast).
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(1);
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(expect.objectContaining({ quiet: true }));
+    // …and the failure is reported, once, in the reader's words.
+    within(screen.getByRole("alert")).getByText(/couldn't restore the block/i);
+  });
+});

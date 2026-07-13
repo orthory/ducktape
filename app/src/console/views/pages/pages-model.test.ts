@@ -234,6 +234,17 @@ describe("subtreePlan", () => {
     ]);
   });
 
+  // SetKind does not reset `checked` in the module, so a to-do that was ticked
+  // and later converted to text still reads checked=true. Replaying that bit is
+  // a SetChecked on a non-todo — NotTodo, one spurious error toast per block.
+  it("drops the module's stale checked bit on a block that is no longer a to-do", () => {
+    const converted: PageBlock[] = [
+      block({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a"] }),
+      block({ id: "a", kind: "paragraph", text: "was a to-do", checked: true }),
+    ];
+    expect(subtreePlan(converted, "a")[0].checked).toBe(false);
+  });
+
   it("anchors a first-child root at the front (after null)", () => {
     expect(subtreePlan(TREE, "a")[0]).toMatchObject({ blockId: "a", parent: "p1", after: null });
   });
