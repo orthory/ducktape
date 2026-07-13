@@ -1036,12 +1036,28 @@ fn commit_active(app: &crate::rt::AppHandle, reg: &mut Registry, id: &str) -> Re
 /// (rpc not up yet) and `fatal` (a crashed or gate-rejected node that exited
 /// before it could answer).
 #[tauri::command]
-pub fn workspace_phase(
+pub async fn workspace_phase(
     app: crate::rt::AppHandle,
     window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
     id: String,
 ) -> Result<PhaseReport, String> {
     require_main_window(&window)?;
+    // routed through the node-control actor like every other verb-calling
+    // command: the join-state read spawns a subprocess whose rpc could block
+    // up to the verb timeout, and that must never run on the command-dispatch
+    // thread or wedge a Tauri worker. onboarding contention is low (the join
+    // has already returned before phase polling begins).
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_phase_blocking(app, id))
+        .await
+}
+
+fn workspace_phase_blocking(
+    app: crate::rt::AppHandle,
+    id: String,
+) -> Result<PhaseReport, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let dir = workspaces_dir(&app)?.join(&ws.id);
