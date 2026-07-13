@@ -524,6 +524,48 @@ describe("DucktapeProvider", () => {
     expect(screen.getByLabelText("Runs on")).toHaveValue("claude");
   });
 
+  it("ignores a deferred provider registry after rejecting its transport", async () => {
+    const { transport, emitDown, emitUp } = makeFakeNode({ publicKey: "expected" });
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const registry = deferred<unknown>();
+    query.mockImplementation((target: string, request: unknown) =>
+      target === "capability" ? registry.promise : baseQuery(target, request),
+    );
+
+    renderConsole(transport);
+    await waitFor(() => expect(capturedState!.status?.height).toBe(1));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability")).toHaveLength(2),
+    );
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+
+    await act(async () => emitDown("stream heartbeat timed out"));
+    vi.mocked(transport.status).mockResolvedValueOnce(
+      statusAt(2, { publicKey: "foreign" }),
+    );
+    await act(async () => emitUp());
+    await waitFor(() => expect(capturedState!.connectionDown?.impostor).toBe(true));
+
+    await act(async () => {
+      registry.resolve({ all: [[[1], ["foreign-provider"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(capturedState!.capabilities).toEqual([]);
+    expect(capturedState!.capabilitiesByNode.size).toBe(0);
+  });
+
   it("keeps an initial status timeout loud after the one bounded retry", async () => {
     const { transport } = makeFakeNode();
     vi.mocked(transport.status)

@@ -342,7 +342,8 @@ export function DucktapeProvider({
       return fetchCapabilitySlices(live).then((capability) => {
         if (
           nodeRef.current !== live ||
-          capabilityHydrateGenRef.current !== generation
+          capabilityHydrateGenRef.current !== generation ||
+          rejectedTransportsRef.current.has(live)
         ) {
           return;
         }
