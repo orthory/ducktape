@@ -41,6 +41,10 @@ pub(super) struct ReplicaChannels {
     pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
     pub(super) lobby_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
+    /// the joiner's gate-reply lane: the park loop's gate phase blocks on this
+    /// for the authoritative `GateMsg::Admitted`/`Rejected` (ADR §3.3). NOT a
+    /// side printer any more — the reply IS the admission signal.
+    pub(super) lobby_rx: discovery::Receiver<ed25519::PublicKey>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -71,7 +75,6 @@ pub(super) async fn wire(
     invite_wireguard: &Option<config::StoredInviteWireGuard>,
     invite_fronts: Vec<config::Front>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
-    workspace: std::path::PathBuf,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
@@ -355,81 +358,11 @@ pub(super) async fn wire(
     // same lane. `relay_rx` is bridged into the serve window below (a
     // torn-down select must never drop its `recv()` mid-flight).
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
-    // the lobby lane: where this parked node announces its key. member
-    // replies are drained by a printer task — purely informational.
-    let (lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
-    {
-        let label = label.clone();
-        // the parked joiner persists a coord.cap delivered over a
-        // JoinReply into its workspace, so a later boot presents it to
-        // the private coordinator (loaded via `load_coord_cap`).
-        let cap_dir = workspace.clone();
-        context.child("lobby_replies").spawn(move |_ctx| async move {
-            while let Ok((peer, msg)) = lobby_rx.recv().await {
-                let bytes: Vec<u8> = msg.into();
-                match lobby::decode_msg(&bytes) {
-                    // the AUTHORITATIVE admission (ADR §3): standing is
-                    // granted at `height`. persist any coord.cap the
-                    // member delivered (private coordination); the park
-                    // loop discovers the granted standing on its next poll.
-                    Ok(lobby::GateMsg::Admitted { height, cap }) => {
-                        println!(
-                            "[node {label}] member {} ADMITTED us at height {height}",
-                            hex_bytes(&peer.as_ref()[..4]),
-                        );
-                        if let Some(cap_bytes) = cap {
-                            match config::unpack_coord_cap(&cap_bytes) {
-                                Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
-                                    Ok(()) => println!(
-                                        "[node {label}] coordinator cap delivered by \
-                                         member {} — saved (issuer {}, expires {})",
-                                        hex_bytes(&peer.as_ref()[..4]),
-                                        hex_bytes(&cap.issuer.as_ref()[..4]),
-                                        cap.not_after,
-                                    ),
-                                    Err(e) => eprintln!(
-                                        "[node {label}] coordinator cap delivered but \
-                                         could not be saved: {e}"
-                                    ),
-                                },
-                                Err(e) => eprintln!(
-                                    "[node {label}] member {} sent a malformed \
-                                     coordinator cap: {e}",
-                                    hex_bytes(&peer.as_ref()[..4]),
-                                ),
-                            }
-                        }
-                    }
-                    // the gate refused. a TERMINAL reject can never redeem
-                    // (spent, foreign, expired, …) — stop loudly instead of
-                    // spinning (ADR R2). a non-terminal reject (issuer view
-                    // lag, member busy) leaves the round-robin to another
-                    // member; just log it.
-                    Ok(lobby::GateMsg::Rejected {
-                        code,
-                        detail,
-                        terminal,
-                    }) => {
-                        if terminal {
-                            eprintln!(
-                                "[node {label}] FATAL: gate refused ({code:?}): {detail} — \
-                                 this invite cannot be redeemed. ask the inviter for a \
-                                 fresh invite and re-join with the new blob."
-                            );
-                            std::process::exit(1);
-                        }
-                        println!(
-                            "[node {label}] member {} declined ({code:?}): {detail} — \
-                             trying another member",
-                            hex_bytes(&peer.as_ref()[..4]),
-                        );
-                    }
-                    // a Request echoed back or junk — ignore.
-                    Ok(lobby::GateMsg::Request { .. }) | Err(_) => {}
-                }
-            }
-        });
-    }
+    // the lobby lane: the joiner speaks `GateMsg::Request` here and the park
+    // loop's gate phase (ADR §3.3) blocks on the authoritative reply — no side
+    // printer, the reply IS the admission signal, so `lobby_rx` is handed to
+    // `park` verbatim.
+    let (lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
     network.start();
 
     ReplicaChannels {
@@ -443,5 +376,6 @@ pub(super) async fn wire(
         relay_tx,
         relay_rx,
         lobby_tx,
+        lobby_rx,
     }
 }
