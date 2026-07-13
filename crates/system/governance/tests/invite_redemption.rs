@@ -324,7 +324,7 @@ fn a_network_without_a_binding_refuses_redemption() {
 }
 
 #[test]
-fn a_targeted_token_admits_only_its_target_and_only_before_expiry() {
+fn a_targeted_token_admits_only_its_target() {
     block_on(async {
         let mut host = gov_host();
         let issuer = keypair(1);
@@ -338,18 +338,25 @@ fn a_targeted_token_admits_only_its_target_and_only_before_expiry() {
             .expect_err("locked");
         assert!(format!("{err:?}").contains("locked to another key"), "{err:?}");
 
-        // the TARGET redeems before expiry → resident standing.
+        // the TARGET redeems → resident standing.
         submit_as(&mut host, &key_bytes(&target), 10, redeem_msg(&token, &target))
             .await
             .expect("target redeems");
         assert!(residents(&host).await.contains(&key_bytes(&target)));
 
-        // a second targeted token already past consensus_time → expired.
+        // expiry is deliberately NOT consensus-enforced: consensus_time is
+        // block height on this chain (no deterministic wall clock exists
+        // in-consensus), so a wall-clock-expired token still settles here.
+        // enforcement lives at the joiner's decode and at every gating
+        // member's wall clock before Redeem submission (lobby + intro
+        // doorbells); single-use bounds any residual window. this pins the
+        // ABSENCE of the check so nobody re-adds a vacuous height-vs-seconds
+        // comparison and calls it enforcement.
         let stale = mint_for(&issuer, 2, &thief, InviteRole::Resident, 1_000);
-        let err = submit_as(&mut host, &key_bytes(&thief), 1_000, redeem_msg(&stale, &thief))
+        submit_as(&mut host, &key_bytes(&thief), 1_000_000, redeem_msg(&stale, &thief))
             .await
-            .expect_err("expired at consensus_time == expiry");
-        assert!(format!("{err:?}").contains("expired"), "{err:?}");
+            .expect("an expired token is not rejected in-consensus");
+        assert!(residents(&host).await.contains(&key_bytes(&thief)));
     });
 }
 

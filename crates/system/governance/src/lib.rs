@@ -1112,13 +1112,13 @@ impl Governance {
         if joiner != target {
             return Err(Error::Module("invite is locked to another key".into()));
         }
-        // agreed block time, NOT wall clock — every validator settles identically.
-        // NOTE: `consensus_time` is stamped as block HEIGHT in this codebase
-        // (crates/kernel/node/src/lib.rs `consensus_time: height`), not unix
-        // seconds; the tests drive matching scales so this gate is exact there.
-        if ctx.env().consensus_time >= token.expires_unix_secs {
-            return Err(Error::Module("invite expired".into()));
-        }
+        // expiry is NOT enforced here: `consensus_time` is block height on
+        // this chain, so no deterministic wall clock exists in-consensus.
+        // enforcement lives at the joiner's decode and at every gating
+        // member's wall clock before it submits this Redeem (lobby + intro
+        // doorbells), and single-use bounds any residual window. the field
+        // stays in the op because it is signature-covered — members need it
+        // to check expiry against the same bytes the issuer signed.
         if token.role == invite::InviteRole::Client {
             return Err(Error::Module(
                 "client invites are not redeemable yet — the thin-client plane lands separately"

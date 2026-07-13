@@ -145,6 +145,41 @@ async fn a_failed_verification_acks_direct_and_stays_silent_coordinated() {
 }
 
 #[tokio::test]
+async fn an_expired_token_neither_installs_nor_tunnels() {
+    // a cryptographically VALID intro whose token expired: verify passes (the
+    // expiry is signature-covered, not signature-breaking), but the member's
+    // wall-clock gate must refuse the tunnel — this is the enforcement point,
+    // since consensus_time is block height and the joiner's decode check only
+    // stops honest joiners.
+    let issuer = ed25519::PrivateKey::from_seed(1);
+    let joiner = ed25519::PrivateKey::from_seed(2);
+    let token = mint_invite_token(
+        &issuer,
+        BINDING,
+        &joiner.public_key(),
+        crate::config::InviteRole::Resident,
+        1, // 1970 — long expired
+    );
+    let bytes = lobby::encode_intro(&lobby::intro_request(&joiner, BINDING, &token, [9u8; 32]));
+
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
+    let weak = cmd_tx.downgrade();
+    let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let store = acked.clone();
+    let alive = handle_intro(&bytes, src(), BINDING, "test", IntroPath::Direct, &weak, |b| {
+        store.lock().unwrap().push(b);
+        async {}
+    })
+    .await;
+    assert!(alive);
+    assert!(cmd_rx.try_recv().is_err(), "no tunnel install for an expired token");
+    let acked = acked.lock().unwrap();
+    let ack = lobby::decode_intro_ack(&acked[0]).expect("the refusal is acked");
+    assert!(!ack.installed);
+    assert!(ack.detail.contains("expired"), "{}", ack.detail);
+}
+
+#[tokio::test]
 async fn a_dead_plane_channel_stops_the_loop() {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
     let weak = cmd_tx.downgrade();
