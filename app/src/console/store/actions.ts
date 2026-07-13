@@ -38,10 +38,11 @@ import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
 import {
-  agentMentions,
+  addedStructuredMentions,
   hasAgentMention,
   mentionableUsers,
   mentionResolverOf,
+  structuredMentions,
 } from "../views/chat/mention";
 import {
   defaultScreenForSection,
@@ -2427,7 +2428,7 @@ export function createActions({
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
-      const mentions = agentMentions(parseMessageInput(clean, mentionResolver()));
+      const mentions = structuredMentions(parseMessageInput(clean, mentionResolver()));
       submitTracked(
         opKey.commentThread(tid),
         (live) =>
@@ -2453,9 +2454,20 @@ export function createActions({
     editComment: ({ commentId, text }) => {
       const clean = text.trim();
       if (!clean) return;
+      const previous = getState().pageThreads
+        .flatMap((group) => group.threads)
+        .flatMap((view) => view.comments)
+        .find((comment) => comment.id === commentId)?.text;
+      const resolver = mentionResolver();
+      const mentions = previous
+        ? addedStructuredMentions(
+            parseMessageInput(previous, resolver),
+            parseMessageInput(clean, resolver),
+          )
+        : structuredMentions(parseMessageInput(clean, resolver));
       submitTracked(
         opKey.comment(commentId),
-        (live) => pagesClient.editComment(live, { commentId, text: clean }),
+        (live) => pagesClient.editComment(live, { commentId, text: clean, mentions }),
         (prev) =>
           optimistic.commentEdited(prev, commentId, clean, Date.now()),
       ).then(() => loadPageThreads());

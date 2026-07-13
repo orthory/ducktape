@@ -39,6 +39,7 @@ import { EDIT_BOUNDARY_MS, filterSlashKinds, shortcutFor } from "./pages-model";
 import { BlockGutter } from "./BlockGutter";
 import { BlockMarker, BlockShell } from "./BlockShell";
 import { SlashMenu } from "./SlashMenu";
+import { SelectionToolbar } from "./SelectionToolbar";
 import type { Row } from "./pages-model";
 import { DRAG_MIME } from "./page-drag";
 import type { DropEdge } from "./page-drag";
@@ -135,6 +136,7 @@ function BlockRowInner({
   const [slashIndex, setSlashIndex] = useState(0);
   const [focused, setFocused] = useState(false);
   const [hover, setHover] = useState(false);
+  const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
   const localCaretRef = useRef<number | null>(null);
   // focus mirrored into a ref so the draft-sync effect below reads the live
@@ -218,6 +220,7 @@ function BlockRowInner({
   };
 
   const onChange = (next: string) => {
+    setSelectionAnchor(null);
     if (!next.startsWith("/")) setSlashDismissed(false);
     if (slashOpen || next.startsWith("/")) {
       setSlashIndex(0);
@@ -254,6 +257,11 @@ function BlockRowInner({
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     const el = event.currentTarget;
+
+    if (event.key === "Escape" && selectionAnchor) {
+      setSelectionAnchor(null);
+      return;
+    }
 
     if (slashOpen && slashOptions.length > 0) {
       if (event.key === "ArrowDown") {
@@ -367,6 +375,15 @@ function BlockRowInner({
       rows={1}
       onChange={(event) => onChange(event.target.value)}
       onPaste={onPaste}
+      onSelect={(event) => {
+        const el = event.currentTarget;
+        if (el.selectionStart === el.selectionEnd) {
+          setSelectionAnchor(null);
+          return;
+        }
+        const rect = el.getBoundingClientRect();
+        setSelectionAnchor({ x: rect.left + rect.width / 2, y: rect.top });
+      }}
       onFocus={() => {
         focusedRef.current = true;
         setFocused(true);
@@ -477,19 +494,23 @@ function BlockRowInner({
           left: "100%",
           marginLeft: 8,
           top: ROW_PAD_Y,
-          width: GUTTER_WIDTH,
-          height: 24,
+          width: Math.max(GUTTER_WIDTH, 72),
+          height: 28,
           display: "flex",
           alignItems: "center",
           gap: 3,
         }}
       >
-        <FinalizationMark op={op} />
+        <FinalizationMark op={op} size={15} />
         {threadCount > 0 || hover ? (
           <button
             type="button"
             aria-label={`Comment on block ${blockNumber}`}
-            title={threadCount > 0 ? `${threadCount} comment thread(s)` : "Comment"}
+            title={
+              threadCount > 0
+                ? `${threadCount} discussion${threadCount === 1 ? "" : "s"}`
+                : "Comment"
+            }
             onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               handlers.openComments(block.id, { x: rect.left, y: rect.bottom });
@@ -499,18 +520,36 @@ function BlockRowInner({
               cursor: "pointer",
               display: "inline-flex",
               alignItems: "center",
-              gap: 2,
-              padding: "2px 4px",
-              borderRadius: 5,
+              justifyContent: "center",
+              gap: 4,
+              minWidth: 30,
+              height: 28,
+              padding: "0 7px",
+              borderRadius: 7,
+              background: threadCount > 0 ? color.hover : "transparent",
               color: threadCount > 0 ? accentVar : color.muted2,
-              font: `600 9.5px ${font.mono}`,
+              font: `650 11px ${font.mono}`,
             }}
           >
-            <Icon name="chat" size={12} strokeWidth={1.8} />
+            <Icon name="chat" size={16} strokeWidth={1.9} />
             {threadCount > 0 ? threadCount : null}
           </button>
         ) : null}
       </div>
+
+      {selectionAnchor ? (
+        <SelectionToolbar
+          blockId={block.id}
+          kind={block.kind}
+          anchor={selectionAnchor}
+          onStyle={(kind) => handlers.setKind(block.id, kind)}
+          onComment={(anchor) => {
+            setSelectionAnchor(null);
+            handlers.openComments(block.id, anchor);
+          }}
+          onDismiss={() => setSelectionAnchor(null)}
+        />
+      ) : null}
 
       {dropEdge ? (
         <div

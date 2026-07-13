@@ -268,10 +268,14 @@ export const addComment = (
 
 export const editComment = (
   transport: NodeTransport,
-  params: { commentId: string; text: string },
+  params: { commentId: string; text: string; mentions?: AuthorRef[] },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    edit_comment: { comment_id: params.commentId, text: params.text },
+    edit_comment: {
+      comment_id: params.commentId,
+      text: params.text,
+      mentions: params.mentions ?? [],
+    },
   });
 
 export const deleteComment = (

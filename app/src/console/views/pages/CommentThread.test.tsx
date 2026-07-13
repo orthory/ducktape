@@ -115,6 +115,7 @@ describe("comment composer @mention typeahead", () => {
         view={view()}
         authorNames={{}}
         selfKey="user:1"
+        selfName="Alice"
         onReply={onReply}
         onResolve={vi.fn()}
         onEdit={vi.fn()}
@@ -131,6 +132,31 @@ describe("comment composer @mention typeahead", () => {
 
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onReply).toHaveBeenCalledWith("t1", "@quackbot ");
+  });
+
+  it("offers the same mention picker while editing a comment", () => {
+    const onEdit = vi.fn();
+    withStore(
+      <ThreadCard
+        view={view()}
+        authorNames={{}}
+        selfKey="user:1"
+        selfName="Alice"
+        onReply={vi.fn()}
+        onResolve={vi.fn()}
+        onEdit={onEdit}
+        onDelete={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit comment" }));
+    const input = screen.getByLabelText("Edit comment text") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "@qu" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(input.value).toBe("@quackbot ");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(onEdit).toHaveBeenCalledWith("c1", "@quackbot ");
   });
 
   it("closes when the textarea loses focus — no orphaned menu over other composers", () => {
@@ -174,6 +200,7 @@ describe("thread card texture", () => {
         view={view({}, at)}
         authorNames={{}}
         selfKey="user:1"
+        selfName="Alice"
         onReply={vi.fn()}
         onResolve={vi.fn()}
         onEdit={vi.fn()}
@@ -189,6 +216,7 @@ describe("thread card texture", () => {
         view={view({}, 1)}
         authorNames={{}}
         selfKey="user:1"
+        selfName="Alice"
         onReply={vi.fn()}
         onResolve={vi.fn()}
         onEdit={vi.fn()}
@@ -204,6 +232,7 @@ describe("thread card texture", () => {
         view={view({ resolved: true, resolved_by: alice })}
         authorNames={{ "01": "Alice" }}
         selfKey="user:1"
+        selfName="Alice"
         onReply={vi.fn()}
         onResolve={vi.fn()}
         onEdit={vi.fn()}

@@ -280,14 +280,9 @@ describe.skipIf(!bin)("comment scenarios against the sim node", () => {
   );
 
   it(
-    "editing a comment to ADD an @mention engages nothing — edit_comment has no mentions plane",
+    "editing a comment to add an @mention engages the newly mentioned agent",
     { timeout: 30_000 },
     async () => {
-      // #426's asymmetry, pinned: AddComment carries mentions (and emits a Tag
-      // event); EditComment does not even carry a mentions field on the wire, so
-      // a mention introduced by an edit is inert text — the agent is never
-      // engaged. If this ever "fixes itself" (edits start engaging), this test
-      // fails loudly and the asymmetry is revisited on purpose.
       const { sim } = await boot({ echoOracle: true });
       const pageId = await registerAgentAndOpenPage(sim, "quackbot");
 
@@ -299,7 +294,8 @@ describe.skipIf(!bin)("comment scenarios against the sim node", () => {
       const commentId = threads()[0]!.comments[0]!.id;
       expect((await sim.state()).oracleQueued).toBe(0);
 
-      // edit it to add "@quackbot" — the text updates, but no Tag event fires.
+      // The edit path diffs structured refs against the previous comment, so
+      // this newly introduced mention rides EditComment.mentions.
       act(() =>
         actions().editComment({
           commentId,
@@ -315,8 +311,9 @@ describe.skipIf(!bin)("comment scenarios against the sim node", () => {
         ),
       );
 
-      // the edit committed a block but engaged NO agent: still zero oracle work.
-      expect((await sim.state()).oracleQueued).toBe(0);
+      await waitFor(async () => expect((await sim.state()).oracleQueued).toBe(1));
+      const oracle = await sim.step();
+      expect(oracle.committed?.kind).toBe("oracle");
     },
   );
 });

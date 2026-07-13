@@ -58,6 +58,38 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
 }
 
 #[test]
+fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await.with_tagging("tagging");
+        apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("eddy")).await;
+        let edit = PageMsg::EditComment {
+            comment_id: "c1".into(),
+            text: "@qa-luna please review".into(),
+            mentions: vec![AuthorRef::Agent {
+                module: "runs".into(),
+                agent_id: "qa-luna".into(),
+            }],
+        };
+        let mut ctx = ctx_as(user("eddy"));
+        p.execute(&mut ctx, &msg(&edit)).await.unwrap();
+
+        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs[0].payload).unwrap()
+        else {
+            panic!("expected tag event")
+        };
+        assert_eq!(event.container, "t1");
+        assert_eq!(event.content_seq, 1);
+        assert_eq!(
+            event.tags,
+            vec![tagging::EntityRef {
+                module: "runs".into(),
+                entity: "qa-luna".into(),
+            }]
+        );
+    });
+}
+
+#[test]
 fn add_comment_rejects_over_length_ids_before_staging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = Pages::init(context, "pages").await;
@@ -295,6 +327,7 @@ fn comment_edit_and_delete_are_author_only() {
             &PageMsg::EditComment {
                 comment_id: "m1".into(),
                 text: "hax".into(),
+                mentions: Vec::new(),
             },
             user("bob"),
             "not the comment author",
@@ -314,6 +347,7 @@ fn comment_edit_and_delete_are_author_only() {
             &PageMsg::EditComment {
                 comment_id: "m1".into(),
                 text: "edited".into(),
+                mentions: Vec::new(),
             },
             user("alice"),
         )

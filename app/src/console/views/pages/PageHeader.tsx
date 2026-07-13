@@ -1,4 +1,4 @@
-// The document header: the TRUE breadcrumb, plus the comment affordances.
+// The document header: the TRUE breadcrumb, plus the page comment affordance.
 //
 // It used to print a hardcoded "Pages / <title>" — a page nested three deep
 // looked exactly like a top-level one, and no segment went anywhere. The chain
@@ -14,17 +14,13 @@ import type { CommentAnchor } from "./CommentCard";
 
 export function PageHeader({
   chain,
-  panelOpen,
   onOpen,
   onComment,
-  onTogglePanel,
 }: {
   /** Root-first ancestry INCLUDING the open page, or empty with no page open. */
   chain: PageMeta[];
-  panelOpen: boolean;
   onOpen: (pageId: string) => void;
   onComment: (anchor: CommentAnchor) => void;
-  onTogglePanel: () => void;
 }) {
   return (
     <header
@@ -89,16 +85,7 @@ export function PageHeader({
             }}
             style={headerBtn}
           >
-            <Icon name="chat" size={13} strokeWidth={1.8} /> Comment
-          </button>
-          <button
-            type="button"
-            aria-label={panelOpen ? "Hide comments" : "Show comments"}
-            aria-pressed={panelOpen}
-            onClick={onTogglePanel}
-            style={{ ...headerBtn, background: panelOpen ? color.hover : color.paper }}
-          >
-            Comments
+            <Icon name="chat" size={15} strokeWidth={1.9} /> Comment
           </button>
         </div>
       ) : (
@@ -118,10 +105,11 @@ const headerBtn: CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   gap: 5,
-  padding: "5px 10px",
+  minHeight: 30,
+  padding: "4px 11px",
   borderRadius: radius.sm,
   border: `1px solid ${color.border}`,
   background: color.paper,
   color: color.muted3,
-  font: `500 11.5px ${font.sans}`,
+  font: `600 12px ${font.sans}`,
 };

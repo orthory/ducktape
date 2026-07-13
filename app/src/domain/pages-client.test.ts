@@ -3,6 +3,7 @@ import {
   addComment,
   createPage,
   deletePage,
+  editComment,
   resolveThread,
   setPageParent,
   threadsForTargets,
@@ -65,6 +66,24 @@ describe("pages-client comments", () => {
     const sink: { target: string; payload: unknown }[] = [];
     await resolveThread(fakeTransport(sink), { threadId: "t1", resolved: true });
     expect(sink[0].payload).toEqual({ resolve_thread: { thread_id: "t1", resolved: true } });
+  });
+  it("editComment carries newly introduced structured mentions", async () => {
+    const sink: { target: string; payload: unknown }[] = [];
+    await editComment(fakeTransport(sink), {
+      commentId: "c1",
+      text: "hello @alice",
+      mentions: [{ user: [1, 2] }],
+    });
+    expect(sink[0]).toEqual({
+      target: "pages",
+      payload: {
+        edit_comment: {
+          comment_id: "c1",
+          text: "hello @alice",
+          mentions: [{ user: [1, 2] }],
+        },
+      },
+    });
   });
   it("threadsForTargets decodes the comment_threads reply", async () => {
     const sink: unknown[] = [];

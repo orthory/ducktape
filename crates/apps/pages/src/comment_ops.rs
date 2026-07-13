@@ -243,7 +243,9 @@ where
                     }
                 }
             }
-            PageMsg::EditComment { comment_id, text } => {
+            PageMsg::EditComment {
+                comment_id, text, ..
+            } => {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }

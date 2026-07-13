@@ -11,7 +11,11 @@ import type { SetStateAction } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
-import { selfAuthorBytes } from "../../store/state";
+import {
+  DEFAULT_AUTHOR,
+  loadPendingDisplayName,
+  selfAuthorBytes,
+} from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { selfAuthorKeyOf } from "../chat/chat-helpers";
 import { color, font, radius } from "../../theme/tokens";
@@ -33,7 +37,6 @@ import { PageHeader } from "./PageHeader";
 import { PageNotice } from "./PageNotice";
 import { PageRail } from "./PageRail";
 import { PageTitle } from "./PageTitle";
-import { CommentsPanel } from "./CommentsPanel";
 import { Subpages } from "./Subpages";
 
 export { EDIT_BOUNDARY_MS };
@@ -51,7 +54,6 @@ export function PagesView() {
   // which block to focus next, and WHERE in it. This used to be a bare block
   // id, so every focus hop slammed the caret to the end of the text.
   const [focus, setFocus] = useState<FocusIntent | null>(null);
-  const [panelOpen, setPanelOpen] = useState(false);
   const [pendingPageDelete, setPendingPageDelete] = useState<string | null>(null);
   const [pendingBlockDelete, setPendingBlockDelete] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -69,8 +71,8 @@ export function PagesView() {
   const [undoFailed, setUndoFailed] = useState(false);
   // the floating comment card's aim: ONE target (a block id or the page id),
   // the label naming it, and the viewport anchor of the affordance that
-  // opened it. Null = no card. The aside panel stays as the all-threads
-  // overview behind the header toggle; composing happens in the card.
+  // opened it. Null = no card. Threads live beside their page/block target;
+  // there is no second, duplicate all-comments list to get lost inside.
   const [commentCard, setCommentCard] = useState<{
     target: string;
     label: string;
@@ -92,6 +94,10 @@ export function PagesView() {
   // committed authorship for OUR writes — a comment's Edit/Delete only exist
   // for the author, because the module rejects anyone else's.
   const selfKey = selfAuthorKeyOf(selfAuthorBytes(state.status, state.author));
+  const selfName =
+    state.author === DEFAULT_AUTHOR
+      ? loadPendingDisplayName() ?? state.author
+      : state.author;
 
   const activePage = state.activePage;
   // the persisted set belongs to the page that was open when it changed, so the
@@ -286,7 +292,7 @@ export function PagesView() {
 
   // a reply must carry the THREAD's target (a block id or the page id) — the
   // module rejects an append whose target differs from the thread's. Never
-  // assume the page here. Shared by the card and the panel.
+  // assume the page here.
   const replyToThread = (threadId: string, text: string) => {
     const target =
       state.pageThreads
@@ -336,10 +342,8 @@ export function PagesView() {
           <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
             <PageHeader
               chain={chain}
-              panelOpen={panelOpen}
               onOpen={actions.openPage}
               onComment={commentOnPage}
-              onTogglePanel={() => setPanelOpen((open) => !open)}
             />
 
             {pasteNotice !== null ? (
@@ -538,19 +542,6 @@ export function PagesView() {
             </div>
           </div>
 
-          {panelOpen && root ? (
-            <CommentsPanel
-              threads={state.pageThreads}
-              authorNames={state.authorNames}
-              selfKey={selfKey}
-              ops={state.ops}
-              onClose={() => setPanelOpen(false)}
-              onReply={replyToThread}
-              onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
-              onEdit={(commentId, text) => actions.editComment({ commentId, text })}
-              onDelete={(commentId) => actions.deleteComment(commentId)}
-            />
-          ) : null}
         </div>
       </main>
       {commentCard ? (
@@ -563,6 +554,7 @@ export function PagesView() {
           }
           authorNames={state.authorNames}
           selfKey={selfKey}
+          selfName={selfName}
           ops={state.ops}
           onClose={() => setCommentCard(null)}
           onSubmitNew={(target, text) => actions.addComment({ target, text })}

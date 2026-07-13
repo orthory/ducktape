@@ -1,7 +1,6 @@
 // The floating comment card: Notion-style popover anchored at the affordance
-// that opened it, scoped to ONE target (a block id or the page id) — unlike
-// the CommentsPanel, which lists every thread on the page. A target with no
-// threads opens straight into the composer; otherwise the threads render with
+// that opened it, scoped to ONE target (a block id or the page id). A target
+// with no threads opens straight into the composer; otherwise threads render with
 // the composer behind an "Add comment" affordance. Dismissed by Escape, an
 // outside press, or any outside scroll (the anchor coordinates go stale the
 // moment the document moves).
@@ -14,7 +13,7 @@ import { Icon } from "../../components/Icon";
 import type { OpLedger } from "../../store/finalization";
 import { inMentionMenu } from "../chat/use-mention-menu";
 import { color, font, radius, shadow } from "../../theme/tokens";
-import { NewThreadComposer, ThreadCard } from "./CommentThread";
+import { DiscussionParticipants, NewThreadComposer, ThreadCard } from "./CommentThread";
 
 /** Where the card anchors, in viewport coordinates (the opener's rect). */
 export interface CommentAnchor {
@@ -22,7 +21,7 @@ export interface CommentAnchor {
   y: number;
 }
 
-const CARD_WIDTH = 340;
+const CARD_WIDTH = 380;
 
 export function CommentCard({
   target,
@@ -31,6 +30,7 @@ export function CommentCard({
   threads,
   authorNames,
   selfKey,
+  selfName,
   ops,
   onClose,
   onSubmitNew,
@@ -48,6 +48,7 @@ export function CommentCard({
   authorNames: AuthorNames;
   /** The local author's key — Edit/Delete render only on our own comments. */
   selfKey: string;
+  selfName: string;
   /** Finalization ledger, handed through to each thread's marks. */
   ops?: OpLedger;
   onClose: () => void;
@@ -108,7 +109,7 @@ export function CommentCard({
         left,
         top,
         width: CARD_WIDTH,
-        maxHeight: "min(480px, 70vh)",
+        maxHeight: "min(560px, 76vh)",
         display: "flex",
         flexDirection: "column",
         border: `1px solid ${color.border}`,
@@ -124,15 +125,21 @@ export function CommentCard({
           display: "flex",
           alignItems: "center",
           gap: 8,
-          padding: "9px 14px",
+          minHeight: 48,
+          padding: "8px 14px 8px 16px",
           borderBottom: `1px solid ${color.borderSoft}`,
         }}
       >
-        <div style={{ font: `600 12px ${font.sans}`, color: color.ink }}>
+        <div style={{ font: `650 13px ${font.sans}`, color: color.ink }}>
           Comments on {label}
         </div>
-        <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
-          {threads.length || ""}
+        <div style={{ marginLeft: "auto" }}>
+          <DiscussionParticipants
+            threads={threads}
+            authorNames={authorNames}
+            selfKey={selfKey}
+            selfName={selfName}
+          />
         </div>
         <button
           type="button"
@@ -141,8 +148,8 @@ export function CommentCard({
           style={{
             all: "unset",
             cursor: "pointer",
-            width: 22,
-            height: 22,
+            width: 28,
+            height: 28,
             borderRadius: 6,
             display: "flex",
             alignItems: "center",
@@ -150,17 +157,18 @@ export function CommentCard({
             color: color.muted3,
           }}
         >
-          <Icon name="close" size={12} />
+          <Icon name="close" size={14} />
         </button>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "2px 0 6px" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
         {threads.map((view) => (
           <ThreadCard
             key={view.thread.id}
             view={view}
             authorNames={authorNames}
             selfKey={selfKey}
+            selfName={selfName}
             ops={ops}
             onReply={onReply}
             onResolve={onResolve}
@@ -191,11 +199,11 @@ export function CommentCard({
               display: "flex",
               alignItems: "center",
               gap: 6,
-              margin: "6px 12px 4px",
-              padding: "5px 8px",
-              borderRadius: radius.sm,
+              margin: 0,
+              padding: "12px 16px",
+              borderTop: `1px solid ${color.borderSoft}`,
               color: color.muted3,
-              font: `500 11.5px ${font.sans}`,
+              font: `600 12px ${font.sans}`,
             }}
           >
             <Icon name="plus" size={12} strokeWidth={1.9} /> Add comment

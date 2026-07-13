@@ -51,11 +51,45 @@ pub fn match_topic(
 ) -> Option<Notification> {
     match topic {
         "module:chat" => match_chat(op, ctx, state),
+        "module:pages" => match_pages(op, ctx),
         "module:runs" => match_run(op),
         "module:forge" => match_forge(op),
         "module:governance" => match_governance(op),
         _ => None,
     }
+}
+
+fn match_pages(op: &OpRow, ctx: &MatcherCtx<'_>) -> Option<Notification> {
+    if op.origin.kind != OriginKind::External {
+        return None;
+    }
+    let author = op.origin.id.as_deref()?;
+    if is_me(ctx, author) {
+        return None;
+    }
+
+    let payload = op.payload.as_ref()?;
+    let comment = decode::variant(payload, "add_comment")
+        .or_else(|| decode::variant(payload, "edit_comment"))?;
+    let my_user = ctx.self_user_key_hex?;
+    let mentioned = comment.get("mentions")?.as_array()?.iter().any(|mention| {
+        mention
+            .get("user")
+            .and_then(decode::bytes_hex)
+            .is_some_and(|user| user.eq_ignore_ascii_case(my_user))
+    });
+    mentioned.then(|| Notification {
+        category: Category::Mention,
+        title: format!("{} mentioned you in Pages", display_name(ctx, author)),
+        body: truncate(
+            comment
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            140,
+        ),
+        channel_id: None,
+    })
 }
 
 fn match_chat(op: &OpRow, ctx: &MatcherCtx<'_>, state: &mut MatchState) -> Option<Notification> {
@@ -377,6 +411,57 @@ mod tests {
     }
 
     #[test]
+    fn matches_structured_pages_user_mentions_from_other_people_only() {
+        let ctx = ctx(&no_root);
+        let mention = op(
+            OriginKind::External,
+            "cccc",
+            json!({
+                "add_comment": {
+                    "thread_id": "t1",
+                    "comment_id": "c1",
+                    "target": "page-1",
+                    "text": "please review this",
+                    "mentions": [{ "user": [18, 52] }]
+                }
+            }),
+        );
+        let notification = once("module:pages", &mention, &ctx).unwrap();
+        assert_eq!(notification.category, Category::Mention);
+        assert_eq!(notification.title, "Casey mentioned you in Pages");
+        assert_eq!(notification.body, "please review this");
+
+        let own = op(
+            OriginKind::External,
+            "AAAA",
+            mention.payload.clone().unwrap(),
+        );
+        assert!(once("module:pages", &own, &ctx).is_none());
+        let agent_only = op(
+            OriginKind::External,
+            "cccc",
+            json!({ "add_comment": { "text": "hi", "mentions": [{ "agent": { "module": "runs", "agent_id": "bot" } }] } }),
+        );
+        assert!(once("module:pages", &agent_only, &ctx).is_none());
+
+        let edit = op(
+            OriginKind::External,
+            "cccc",
+            json!({
+                "edit_comment": {
+                    "comment_id": "c1",
+                    "text": "adding you now",
+                    "mentions": [{ "user": [18, 52] }]
+                }
+            }),
+        );
+        assert_eq!(
+            once("module:pages", &edit, &ctx).unwrap().body,
+            "adding you now"
+        );
+    }
+
+    #[test]
     fn tracks_huddle_rosters_and_renotifies_after_they_empty() {
         let ctx = ctx(&no_root);
         let mut state = MatchState::default();
@@ -516,6 +601,6 @@ mod tests {
     #[test]
     fn ignores_unknown_topics() {
         let row = op(OriginKind::External, "cccc", json!({}));
-        assert!(once("module:pages", &row, &ctx(&no_root)).is_none());
+        assert!(once("module:unknown", &row, &ctx(&no_root)).is_none());
     }
 }

@@ -38,6 +38,7 @@ const renderCard = (over: Partial<Parameters<typeof CommentCard>[0]> = {}) => {
     authorNames: {},
     // alice IS us: authorKey({ user: [1] }) === "user:1".
     selfKey: "user:1",
+    selfName: "Alice",
     onClose: vi.fn(),
     onSubmitNew: vi.fn(),
     onReply: vi.fn(),
@@ -139,6 +140,24 @@ describe("CommentCard", () => {
     const { queryByRole } = renderCard({ threads: [thread], selfKey: "user:99" });
     expect(queryByRole("button", { name: "Edit comment" })).toBeNull();
     expect(queryByRole("button", { name: "Delete comment" })).toBeNull();
+  });
+
+  it("shows the people participating in this target's discussion", () => {
+    const bob: AuthorRef = { user: [2] };
+    const mixed: ThreadView = {
+      ...thread,
+      comments: [
+        thread.comments[0],
+        { ...thread.comments[0], id: "c2", author: bob, text: "second voice" },
+      ],
+    };
+    const { getByLabelText } = renderCard({
+      threads: [mixed],
+      authorNames: { "01": "Alice", "02": "Bob" },
+    });
+    expect(getByLabelText("2 discussion participants").getAttribute("title")).toBe(
+      "Alice, Bob",
+    );
   });
 
   it("replies through a multi-line textarea, like the new-thread composer", () => {
