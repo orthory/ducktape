@@ -32,17 +32,26 @@ impl ReadinessSignaller {
     }
 
     /// the PURE decision core: given the committed status, decide whether to emit a
-    /// `SignalReady` and latch it. returns the `(name, to_version)` to signal, or
-    /// `None`. truthful (binary can execute `to_version`), member-gated (self is a
-    /// current boundary member), and idempotent (module already holds our signal, or
-    /// one is already in flight).
-    pub(crate) fn decide(&mut self, status: &upgrade::UpgradeStatus) -> Option<(String, u32)> {
+    /// `SignalReady` and latch it. returns the `(name, to_version, commitment)` to
+    /// signal, or `None`. truthful (binary can execute the numeric version and any
+    /// named route), member-gated, and idempotent.
+    pub(crate) fn decide(
+        &mut self,
+        status: &upgrade::UpgradeStatus,
+    ) -> Option<(String, u32, Option<Vec<u8>>)> {
         let pending = status.pending.as_ref()?;
         // never lie: a binary that cannot execute the target version stays silent so
         // the boundary cleanly aborts rather than arming onto an under-versioned node.
         if pending.to_version > self.max_version {
             return None;
         }
+        let commitment = match upgrade::required_readiness_commitment(&pending.name) {
+            Some(expected) if pending.name == crate::constants::CLIENTS_MODULE_UPGRADE_NAME => {
+                Some(expected.to_vec())
+            }
+            Some(_) => return None,
+            None => None,
+        };
         // only a CURRENT boundary member is in the readiness denominator (R = n).
         if !status.members.iter().any(|m| m == &self.me) {
             return None;
@@ -57,7 +66,7 @@ impl ReadinessSignaller {
             return None;
         }
         self.signaled = Some((pending.name.clone(), pending.to_version));
-        Some((pending.name.clone(), pending.to_version))
+        Some((pending.name.clone(), pending.to_version, commitment))
     }
 
     /// query committed upgrade state and, when a signal is due, build the
@@ -72,13 +81,13 @@ impl ReadinessSignaller {
             .await
             .ok()?;
         let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
-        let (name, to_version) = self.decide(&status)?;
+        let (name, to_version, commitment) = self.decide(&status)?;
         let msg = Msg {
             target: "upgrade".into(),
             payload: encode_msg(&UpgradeMsg::SignalReady {
                 name: name.clone(),
                 to_version,
-                commitment: None,
+                commitment,
             }),
         };
         Some((msg, name, to_version))

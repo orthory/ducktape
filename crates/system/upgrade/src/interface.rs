@@ -60,13 +60,29 @@ pub struct UpgradeStatus {
     /// the boundary member set the verdict was computed against, sorted. lets a
     /// caller (e.g. the host stamping seam) re-run the shared `effective_version`.
     pub members: Vec<Vec<u8>>,
-    /// readiness keys, sorted.
+    /// commitment-valid readiness keys for the pending upgrade, sorted.
     pub ready: Vec<Vec<u8>>,
     pub member_count: u64,
     pub ready_count: u64,
-    /// `pending.is_some() && members non-empty && every boundary member ∈ ready`,
-    /// derived from the shared `effective_version` predicate (no hand-copied logic).
+    /// `pending.is_some() && members non-empty && every boundary member has a
+    /// commitment-valid entry in `ready`, derived from the shared
+    /// `effective_version` predicate (no hand-copied logic).
     pub armed: bool,
+}
+
+/// Upgrade names beginning with this prefix bind readiness to the remaining
+/// bytes. Binaries that do not implement the named route keep emitting
+/// `commitment: None`, so they cannot arm a committed-route upgrade merely by
+/// advertising the same numeric protocol ceiling.
+pub const READINESS_COMMITMENT_PREFIX: &str = "commit:";
+
+pub fn required_readiness_commitment(name: &str) -> Option<&[u8]> {
+    name.strip_prefix(READINESS_COMMITMENT_PREFIX)
+        .map(str::as_bytes)
+}
+
+pub fn readiness_commitment_matches(name: &str, commitment: Option<&[u8]>) -> bool {
+    required_readiness_commitment(name).is_none_or(|expected| commitment == Some(expected))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

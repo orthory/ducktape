@@ -90,6 +90,29 @@ impl Module for Dual {
     }
 }
 
+/// A stateless stand-in for a module that joins the registry at a protocol
+/// boundary. Its zero state is still app-hash-visible once the id is active.
+struct DormantMarker;
+
+#[async_trait::async_trait(?Send)]
+impl Module for DormantMarker {
+    fn id(&self) -> ModuleId {
+        "clients".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::Stateless)
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 fn install_dual(bytes: &[u8], expected: StateRoot, active_version: u32) -> Dual {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(&bytes[..8]);
@@ -313,6 +336,119 @@ fn replay_recomputes_the_identical_app_hash_across_an_armed_boundary() {
             "recovery must recompute the v1 root across H — a stale-version replay would mismatch"
         );
         assert_eq!(host.app_hash(), tip_hash);
+    });
+}
+
+#[test]
+fn replay_adds_a_dormant_module_at_the_exact_activation_height() {
+    const H: u64 = 2;
+    const V: u32 = 1;
+
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let signer = sk(7);
+        let me = {
+            use commonware_cryptography::Signer as _;
+            signer.public_key().as_ref().to_vec()
+        };
+
+        let recovery = Recovery::open(context.child("registry_live"))
+            .await
+            .expect("open");
+        let mut host = Host::genesis(vec![
+            Box::new(Dual::new()),
+            Box::new(upgrade_mock(&me, H, V)),
+            Box::new(DormantMarker),
+        ])
+        .expect("genesis");
+        host.defer_module_until("clients", V)
+            .expect("defer clients");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+
+        for seq in 0..2 {
+            node.submit(&signer, seq, op()).await.expect("submit pre-H");
+            node.flush_batch().await.expect("flush pre-H");
+        }
+        assert_eq!(node.drain_delivered().await.expect("drain pre-H"), 2);
+        let checkpoint_height = node.finalized().expect("checkpoint boundary").height;
+        assert!(checkpoint_height < H);
+        assert!(node.host().module_root("clients").is_none());
+        assert!(
+            node.host()
+                .state_schema()
+                .iter()
+                .all(|(id, _)| id != "clients")
+        );
+        let checkpoint_hash = node.app_hash();
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            0,
+            Some(UpgradeCoords {
+                name: "forge-v2".into(),
+                activation_height: H,
+                to_version: V,
+            }),
+            pos,
+            2,
+        )
+        .expect("capture pre-H registry");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        node.submit(&signer, 2, op()).await.expect("submit at H");
+        node.flush_batch().await.expect("flush at H");
+        assert_eq!(node.drain_delivered().await.expect("drain at H"), 1);
+        assert_eq!(node.finalized().expect("tip").height, H);
+        assert_eq!(node.host().module_root("clients"), Some(StateRoot::ZERO));
+        assert!(
+            node.host()
+                .state_schema()
+                .iter()
+                .any(|(id, _)| id == "clients")
+        );
+        let tip_hash = node.app_hash();
+        assert_ne!(tip_hash, checkpoint_hash);
+        node.sink_mut().sync().await.expect("sync live state");
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("registry_replay"))
+            .await
+            .expect("reopen");
+        let manifest = recovery.manifest().expect("decode").expect("manifest");
+        let dual = install_dual(
+            manifest.snapshot("dual").expect("dual snapshot"),
+            manifest.root("dual").expect("dual root"),
+            0,
+        );
+        let mut restored = Host::genesis(vec![
+            Box::new(dual),
+            Box::new(upgrade_mock(&me, H, V)),
+            Box::new(DormantMarker),
+        ])
+        .expect("restore genesis");
+        restored
+            .defer_module_until("clients", V)
+            .expect("restore dormant clients");
+        assert_eq!(restored.app_hash(), checkpoint_hash);
+        assert!(restored.module_root("clients").is_none());
+
+        let recovered = recovery
+            .recover(&mut restored, &manifest)
+            .await
+            .expect("replay registry activation");
+        assert_eq!(recovered.height, Some(H));
+        assert_eq!(recovered.app_hash, tip_hash);
+        assert_eq!(restored.app_hash(), tip_hash);
+        assert_eq!(restored.module_root("clients"), Some(StateRoot::ZERO));
     });
 }
 

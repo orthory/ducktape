@@ -231,7 +231,10 @@ impl Upgrade {
                 ));
             }
         }
-        // idempotent per pubkey, last-write-wins.
+        // Preserve the pre-commitment execution contract: older binaries accept
+        // and store any commitment bytes. Filtering happens only in the readable
+        // ready set / arming predicate below, so mixed binaries keep identical
+        // pre-H roots while a wrong artifact still cannot activate.
         next.readiness.insert(pubkey, ReadySignal { commitment });
         self.staged = Some(next);
         Ok(())
@@ -266,7 +269,14 @@ impl Upgrade {
                     self.committed.current_version,
                     Some(&up),
                     &members,
-                    |member| self.committed.readiness.contains_key(member),
+                    |member| {
+                        self.committed.readiness.get(member).is_some_and(|signal| {
+                            crate::readiness_commitment_matches(
+                                &up.name,
+                                signal.commitment.as_deref(),
+                            )
+                        })
+                    },
                 );
             // apply the reconciliation over staged-over-committed (published at
             // commit_block): ARM flips current_version + clears the slot; ABORT
@@ -381,7 +391,19 @@ impl Module for Upgrade {
             UpgradeQuery::Status => {
                 let members = self.members(ctx).await?;
                 let state = self.read();
-                let ready: Vec<Vec<u8>> = state.readiness.keys().cloned().collect();
+                let ready: Vec<Vec<u8>> = state
+                    .readiness
+                    .iter()
+                    .filter(|(_, signal)| {
+                        state.pending.as_ref().is_none_or(|pending| {
+                            crate::readiness_commitment_matches(
+                                &pending.name,
+                                signal.commitment.as_deref(),
+                            )
+                        })
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
                 // `armed` (readiness complete) is derived from the ONE shared
                 // predicate evaluated AT the activation height (where the height
                 // gate always passes), so it can never drift from the arm check
@@ -394,7 +416,7 @@ impl Module for Upgrade {
                                 state.current_version,
                                 Some(up),
                                 &members,
-                                |member| state.readiness.contains_key(member),
+                                |member| ready.iter().any(|key| key == member),
                             )
                     }
                     None => false,
@@ -403,7 +425,7 @@ impl Module for Upgrade {
                     current_version: state.current_version,
                     pending: state.pending.clone(),
                     member_count: members.len() as u64,
-                    ready_count: state.readiness.len() as u64,
+                    ready_count: ready.len() as u64,
                     members,
                     ready,
                     armed,
@@ -554,12 +576,15 @@ mod tests {
         }
     }
     fn signal(name: &str, tv: u32) -> Msg {
+        signal_with(name, tv, None)
+    }
+    fn signal_with(name: &str, tv: u32, commitment: Option<Vec<u8>>) -> Msg {
         Msg {
             target: "upgrade".into(),
             payload: encode_msg(&UpgradeMsg::SignalReady {
                 name: name.into(),
                 to_version: tv,
-                commitment: None,
+                commitment,
             }),
         }
     }
@@ -757,6 +782,64 @@ mod tests {
         run(&mut u, &mut c2, &signal("a", 2)).unwrap();
         commit(&mut u);
         assert_eq!(u.committed.readiness.len(), 2);
+    }
+
+    #[test]
+    fn commitment_bound_upgrade_ignores_old_or_wrong_artifacts() {
+        let member = valid_key(1);
+        let members = vec![member.clone()];
+        let name = "commit:clients-route-a";
+
+        let mut legacy = up();
+        let mut sys = TestCtx::new(Origin::System, 0, members.clone());
+        run(&mut legacy, &mut sys, &schedule(name, 10, 1)).unwrap();
+        commit(&mut legacy);
+        legacy
+            .committed
+            .readiness
+            .insert(member.clone(), ReadySignal { commitment: None });
+        let legacy_status = status(&legacy, &sys);
+        assert_eq!(legacy_status.ready_count, 0);
+        assert!(!legacy_status.armed, "old commitment: None must not arm");
+        let legacy_none_root = legacy.root();
+        let mut boundary = TestCtx::new(Origin::System, 10, members.clone());
+        run(&mut legacy, &mut boundary, &advance()).unwrap();
+        commit(&mut legacy);
+        assert_eq!(legacy.committed.current_version, 0, "wrong artifact aborts");
+
+        let mut current = up();
+        run(&mut current, &mut sys, &schedule(name, 10, 1)).unwrap();
+        commit(&mut current);
+        let mut validator = TestCtx::new(Origin::External(member), 0, members);
+        run(&mut current, &mut validator, &signal(name, 1))
+            .expect("old-compatible None acceptance");
+        commit(&mut current);
+        assert_eq!(
+            current.root(),
+            legacy_none_root,
+            "old and bridge binaries must commit the same pre-H root"
+        );
+        run(
+            &mut current,
+            &mut validator,
+            &signal_with(name, 1, Some(b"wrong-route".to_vec())),
+        )
+        .expect("old-compatible signal acceptance");
+        commit(&mut current);
+        assert_eq!(current.committed.readiness.len(), 1);
+        let wrong_status = status(&current, &validator);
+        assert_eq!(wrong_status.ready_count, 0);
+        assert!(!wrong_status.armed);
+        run(
+            &mut current,
+            &mut validator,
+            &signal_with(name, 1, Some(b"clients-route-a".to_vec())),
+        )
+        .expect("exact route commitment");
+        commit(&mut current);
+        let current_status = status(&current, &validator);
+        assert_eq!(current_status.ready_count, 1);
+        assert!(current_status.armed);
     }
 
     // ---- cancel -------------------------------------------------------------
