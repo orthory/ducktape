@@ -40,6 +40,7 @@ import { BlockGutter } from "./BlockGutter";
 import { BlockMarker, BlockShell } from "./BlockShell";
 import { SlashMenu } from "./SlashMenu";
 import { SelectionToolbar } from "./SelectionToolbar";
+import { RemoteCursors, type PagePresencePeer } from "./PagePresence";
 import type { Row } from "./pages-model";
 import { DRAG_MIME } from "./page-drag";
 import type { DropEdge } from "./page-drag";
@@ -110,6 +111,8 @@ function BlockRowInner({
   op,
   threadCount,
   dropEdge,
+  presence,
+  onCursor,
   handlers,
 }: {
   row: Row;
@@ -128,6 +131,9 @@ function BlockRowInner({
   threadCount: number;
   /** A drag is hovering this row and would land on this edge. */
   dropEdge: DropEdge | null;
+  /** Live, off-consensus peers whose caret is in this block. */
+  presence: PagePresencePeer[];
+  onCursor: (blockId: string | null, anchor: number, head: number) => void;
   handlers: RowHandlers;
 }) {
   const { block, depth } = row;
@@ -138,6 +144,7 @@ function BlockRowInner({
   const [hover, setHover] = useState(false);
   const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  const rowRef = useRef<HTMLDivElement | null>(null);
   const localCaretRef = useRef<number | null>(null);
   // focus mirrored into a ref so the draft-sync effect below reads the live
   // value without re-running on focus flips.
@@ -242,6 +249,8 @@ function BlockRowInner({
     }
     setDraft(next);
   };
+  const publishCursor = (el: HTMLTextAreaElement) =>
+    onCursor(block.id, el.selectionStart, el.selectionEnd);
 
   // A pasted DOCUMENT is blocks, not one wall of literal newlines. A single
   // line is left to the browser (it is just text at the caret).
@@ -373,10 +382,14 @@ function BlockRowInner({
       aria-label={`Edit ${block.kind} block ${blockNumber}`}
       value={draft}
       rows={1}
-      onChange={(event) => onChange(event.target.value)}
+      onChange={(event) => {
+        onChange(event.target.value);
+        publishCursor(event.currentTarget);
+      }}
       onPaste={onPaste}
       onSelect={(event) => {
         const el = event.currentTarget;
+        publishCursor(el);
         if (el.selectionStart === el.selectionEnd) {
           setSelectionAnchor(null);
           return;
@@ -384,13 +397,15 @@ function BlockRowInner({
         const rect = el.getBoundingClientRect();
         setSelectionAnchor({ x: rect.left + rect.width / 2, y: rect.top });
       }}
-      onFocus={() => {
+      onFocus={(event) => {
         focusedRef.current = true;
         setFocused(true);
+        publishCursor(event.currentTarget);
       }}
       onBlur={() => {
         focusedRef.current = false;
         setFocused(false);
+        onCursor(null, 0, 0);
         maybeCommit();
       }}
       onKeyDown={onKeyDown}
@@ -421,6 +436,7 @@ function BlockRowInner({
 
   return (
     <div
+      ref={rowRef}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onDragOver={(event) => {
@@ -551,6 +567,8 @@ function BlockRowInner({
         />
       ) : null}
 
+      <RemoteCursors peers={presence} areaRef={areaRef} rowRef={rowRef} text={draft} />
+
       {dropEdge ? (
         <div
           data-testid={`drop-${dropEdge}`}
@@ -606,6 +624,8 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.op === b.op &&
     a.threadCount === b.threadCount &&
     a.dropEdge === b.dropEdge &&
+    a.presence === b.presence &&
+    a.onCursor === b.onCursor &&
     a.handlers === b.handlers
   );
 });

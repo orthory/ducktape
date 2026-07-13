@@ -39,11 +39,13 @@ mod workspaces;
 // the D7 root). public so BOTH node binaries can build one and wire it into
 // their DispatchPool via `with_provisioner`.
 pub mod agent_provision;
-// the huddle websocket lane: session/control types + the /v1/call/ws handler.
+// realtime overlay websocket lanes: huddle and Pages-presence session/control types.
 mod call;
 pub use call::{
     CallClientControl, CallControlIn, CallControlOut, CallLane, CallParams, CallServerControl,
-    CallSession, CallSessionRequest,
+    CallSession, CallSessionRequest, PageCursor, PresenceClientControl, PresenceControlIn,
+    PresenceControlOut, PresenceParams, PresenceServerControl, PresenceSession,
+    PresenceSessionRequest, RealtimeSessionRequest,
 };
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
@@ -83,7 +85,7 @@ use futures::channel::oneshot;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 
-use crate::call::call_ws;
+use crate::call::{call_ws, presence_ws};
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
 use crate::git_http::{GIT_PACK_BODY_LIMIT, git_info_refs, git_receive_pack, git_upload_pack};
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
@@ -346,6 +348,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
+        .route("/v1/presence/ws", get(presence_ws))
         .route(
             "/v1/gateway/proxy",
             post(gateway_proxy).layer(DefaultBodyLimit::max(

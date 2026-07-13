@@ -368,7 +368,7 @@ pub(super) async fn wire(
     wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
 ) -> PreWiring {

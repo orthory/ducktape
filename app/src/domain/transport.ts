@@ -499,6 +499,11 @@ const wsBase = (baseUrl: string): string =>
 export const callSocketUrl = (baseUrl: string, channel: string): string =>
   `${wsBase(baseUrl)}/v1/call/ws?channel=${encodeURIComponent(channel)}`;
 
+/** The off-consensus Pages presence socket. It shares the node's authenticated
+ * overlay runtime with calls, but carries only page caret beacons. */
+export const pagePresenceSocketUrl = (baseUrl: string, page: string): string =>
+  `${wsBase(baseUrl)}/v1/presence/ws?page=${encodeURIComponent(page)}`;
+
 /** Optional capabilities a host environment can graft onto [`remoteTransport`]. */
 export interface RemoteTransportOptions {
   /**

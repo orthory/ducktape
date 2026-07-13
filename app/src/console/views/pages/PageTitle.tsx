@@ -14,6 +14,7 @@ import { EmojiPicker } from "../chat/EmojiPicker";
 import { color, font, radius } from "../../theme/tokens";
 import { EDIT_BOUNDARY_MS } from "./pages-model";
 import { composeTitle, splitTitleEmoji } from "./page-icon";
+import { RemoteCursors, type PagePresencePeer } from "./PagePresence";
 
 export function PageTitle({
   pageId,
@@ -21,6 +22,8 @@ export function PageTitle({
   titleRef,
   onCommit,
   onDescend,
+  presence,
+  onCursor,
 }: {
   /** The open page's id — a switch resets the draft unconditionally. */
   pageId: string;
@@ -31,12 +34,17 @@ export function PageTitle({
   onCommit: (raw: string) => void;
   /** Enter / ArrowDown out of the title, into the body. */
   onDescend: () => void;
+  presence: PagePresencePeer[];
+  onCursor: (blockId: string | null, anchor: number, head: number) => void;
 }) {
   const { icon, title } = splitTitleEmoji(raw);
   const [draft, setDraft] = useState(title);
   const [picking, setPicking] = useState(false);
   const [hover, setHover] = useState(false);
   const focusedRef = useRef(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const publishCursor = (el: HTMLInputElement) =>
+    onCursor(pageId, el.selectionStart ?? 0, el.selectionEnd ?? 0);
 
   // adopt the store title only while the input is not being edited — the same
   // draft-protection contract as a block row...
@@ -85,9 +93,10 @@ export function PageTitle({
 
   return (
     <div
+      ref={rootRef}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      style={{ marginBottom: 18 }}
+      style={{ position: "relative", marginBottom: 18 }}
     >
       <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 6, height: 30 }}>
         <button
@@ -148,12 +157,18 @@ export function PageTitle({
         ref={titleRef}
         aria-label="Page title"
         value={draft}
-        onChange={(event) => setDraft(event.target.value)}
-        onFocus={() => {
+        onChange={(event) => {
+          setDraft(event.target.value);
+          publishCursor(event.currentTarget);
+        }}
+        onSelect={(event) => publishCursor(event.currentTarget)}
+        onFocus={(event) => {
           focusedRef.current = true;
+          publishCursor(event.currentTarget);
         }}
         onBlur={() => {
           focusedRef.current = false;
+          onCursor(null, 0, 0);
           commit();
           // an emoji the user typed at the front IS the icon now (commit just
           // wrote it as one), and the input holds the title WITHOUT the icon. The
@@ -181,6 +196,7 @@ export function PageTitle({
           font: `650 30px/1.2 ${font.sans}`,
         }}
       />
+      <RemoteCursors peers={presence} areaRef={titleRef} rowRef={rootRef} text={draft} />
     </div>
   );
 }
