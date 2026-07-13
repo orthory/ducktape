@@ -292,7 +292,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         // run's terminal result down the deliver lane; the node submits both. we
         // never read the lane — the run's result is another test's subject.
         let (deliver_tx, _deliver_rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let spawn: SpawnFn = Box::new(|fut| {
+        let spawn: SpawnFn = Arc::new(|_, fut| {
             tokio::spawn(fut);
         });
         let deliver: DeliverFn = Arc::new(move |msg| {

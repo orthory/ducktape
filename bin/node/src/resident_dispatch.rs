@@ -533,7 +533,7 @@ format = "text"
             providers,
         ));
         let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let spawn: SpawnFn = Box::new(|fut| {
+        let spawn: SpawnFn = Arc::new(|_, fut| {
             tokio::spawn(fut);
         });
         let deliver: DeliverFn = Arc::new(move |msg| {
