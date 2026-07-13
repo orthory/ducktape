@@ -30,6 +30,7 @@ import { CommentCard } from "./CommentCard";
 import type { CommentAnchor } from "./CommentCard";
 import { DocTabs } from "./DocTabs";
 import { PageHeader } from "./PageHeader";
+import { PageNotice } from "./PageNotice";
 import { PageRail } from "./PageRail";
 import { PageTitle } from "./PageTitle";
 import { CommentsPanel } from "./CommentsPanel";
@@ -55,10 +56,17 @@ export function PagesView() {
   const [pendingBlockDelete, setPendingBlockDelete] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [pasteNotice, setPasteNotice] = useState<number | null>(null);
-  // the just-deleted subtree, snapshotted for Undo. null = no toast; [] = a
-  // toast without the button (the subtree was over the op cap to restore); a
-  // non-empty plan = the ops to re-insert. Superseded by a newer delete.
-  const [deleteUndo, setDeleteUndo] = useState<DuplicateOp[] | null>(null);
+  // the just-deleted subtree, snapshotted for Undo, BOUND TO THE PAGE it came
+  // from: this view survives a doc switch, and InsertBlock is parent/after-
+  // anchored and page-agnostic, so a replay fired from another doc restores the
+  // subtree into the original page — off-screen, looking like nothing happened.
+  // null = no toast; `ops` [] = a toast without the button (the subtree was over
+  // the op cap); a non-empty plan = the ops to re-insert. A newer delete wins.
+  const [deleteUndo, setDeleteUndo] = useState<{ page: string; ops: DuplicateOp[] } | null>(
+    null,
+  );
+  // a restore that could not land — see `undoDelete`.
+  const [undoFailed, setUndoFailed] = useState(false);
   // the floating comment card's aim: ONE target (a block id or the page id),
   // the label naming it, and the viewport anchor of the affordance that
   // opened it. Null = no card. The aside panel stays as the all-threads
@@ -100,6 +108,14 @@ export function PagesView() {
       }),
     [],
   );
+
+  // the snapshot belongs to the page that was open when the block was deleted,
+  // so the page id comes from the ref, never a stale closure — and `noteDeleted`
+  // stays referentially stable, which the row handlers want.
+  const noteDeleted = useCallback((ops: DuplicateOp[]) => {
+    const page = pageRef.current;
+    if (page) setDeleteUndo({ page, ops });
+  }, []);
 
   // live thread count keyed by target (block id or page id).
   const threadsByTarget = useMemo(() => {
@@ -186,30 +202,57 @@ export function PagesView() {
   }, [pasteNotice]);
 
   // the delete-undo toast lingers a little longer than the paste notice — undo
-  // is an action, not just an FYI — then dismisses itself.
+  // is an action, not just an FYI — then dismisses itself. So does the failure
+  // that a click on it can leave behind.
   useEffect(() => {
     if (deleteUndo === null) return;
     const timer = setTimeout(() => setDeleteUndo(null), 8000);
     return () => clearTimeout(timer);
   }, [deleteUndo]);
 
+  useEffect(() => {
+    if (!undoFailed) return;
+    const timer = setTimeout(() => setUndoFailed(false), 6000);
+    return () => clearTimeout(timer);
+  }, [undoFailed]);
+
   // Replay the snapshot as plain inserts: the wire FIFO (actions.ts) keeps them
   // in plan order, so the subtree comes back exactly as it was. A checked to-do
-  // needs a second op — InsertBlock carries no `checked` bit. Comments on the
-  // deleted blocks were purged in consensus and cannot be restored.
-  const undoDelete = () => {
-    if (!deleteUndo) return;
-    for (const op of deleteUndo) {
-      actions.insertPageBlock({
+  // needs a second op — InsertBlock carries no `checked` bit (only ever set on a
+  // to-do: subtreePlan drops the module's stale bit, so this never fires a
+  // NotTodo-rejected SetChecked on a converted block). Comments on the deleted
+  // blocks were purged in consensus and cannot be restored.
+  //
+  // The ROOT op is the only one anchored to blocks this batch does not re-insert
+  // itself: its parent and previous sibling belong to the live document and can
+  // have been removed under us, and the module then rejects it (ParentNotFound /
+  // AnchorNotFound) — and every child op chained behind it too, one error toast
+  // each, while nothing comes back. So the batch is GATED on the root landing,
+  // and the root goes out `quiet`: a failed restore says so ONCE, here.
+  const undoDelete = async () => {
+    const snapshot = deleteUndo;
+    if (!snapshot || snapshot.ops.length === 0) return;
+    setDeleteUndo(null);
+    // Undo clicked after a doc switch restores into the page it came from, so
+    // go back there first — a restore the user cannot see is not a restore.
+    if (snapshot.page !== activePage) actions.openPage(snapshot.page);
+    for (const [index, op] of snapshot.ops.entries()) {
+      const insert = actions.insertPageBlock({
         blockId: op.blockId,
         parent: op.parent,
         after: op.after,
         kind: op.kind,
         text: op.text,
+        quiet: index === 0,
       });
+      // the rest of the plan only anchors onto blocks the root brought back, so
+      // waiting on the root once is enough to know the restore has a floor.
+      if (index === 0 && !(await insert)) {
+        setUndoFailed(true);
+        return;
+      }
       if (op.checked) actions.setPageBlockChecked({ blockId: op.blockId, checked: true });
     }
-    setDeleteUndo(null);
   };
 
   const openBlockComments = useCallback((blockId: string, anchor: CommentAnchor) => {
@@ -233,7 +276,7 @@ export function PagesView() {
     openComments: openBlockComments,
     confirmRemove: setPendingBlockDelete,
     onPasteCapped: setPasteNotice,
-    onDeleted: setDeleteUndo,
+    onDeleted: noteDeleted,
   });
 
   const commentOnPage = (anchor: CommentAnchor) => {
@@ -300,38 +343,17 @@ export function PagesView() {
             />
 
             {pasteNotice !== null ? (
-              <div
-                role="status"
-                style={{
-                  padding: "7px 22px",
-                  borderBottom: `1px solid ${color.borderSoft}`,
-                  background: color.sunken,
-                  color: color.muted3,
-                  font: `500 11.5px ${font.sans}`,
-                }}
-              >
+              <PageNotice>
                 Pasted the first {MAX_PASTE_BLOCKS} blocks — {pasteNotice} more line
                 {pasteNotice === 1 ? "" : "s"} were dropped. Each block is one write, so a
                 paste is capped.
-              </div>
+              </PageNotice>
             ) : null}
 
             {deleteUndo !== null ? (
-              <div
-                role="status"
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "7px 22px",
-                  borderBottom: `1px solid ${color.borderSoft}`,
-                  background: color.sunken,
-                  color: color.muted3,
-                  font: `500 11.5px ${font.sans}`,
-                }}
-              >
+              <PageNotice>
                 <span>Block deleted.</span>
-                {deleteUndo.length > 0 ? (
+                {deleteUndo.ops.length > 0 ? (
                   <>
                     <button
                       type="button"
@@ -349,7 +371,14 @@ export function PagesView() {
                     <span>Comments on it are not restored.</span>
                   </>
                 ) : null}
-              </div>
+              </PageNotice>
+            ) : null}
+
+            {undoFailed ? (
+              <PageNotice role="alert" tone="danger">
+                Couldn't restore the block — the place it sat in is gone. Someone else
+                deleted or moved what it hung from.
+              </PageNotice>
             ) : null}
 
             <div
@@ -563,7 +592,7 @@ export function PagesView() {
           onCancel={() => setPendingBlockDelete(null)}
           onConfirm={() => {
             // Snapshot for Undo before the subtree is gone (empty if too big).
-            setDeleteUndo(subtreePlan(blocks, pendingBlockDelete));
+            noteDeleted(subtreePlan(blocks, pendingBlockDelete));
             actions.removePageBlock(pendingBlockDelete);
             setPendingBlockDelete(null);
           }}

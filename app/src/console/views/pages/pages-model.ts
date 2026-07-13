@@ -257,7 +257,12 @@ function planSubtree(
       after,
       kind: block.kind,
       text: block.text,
-      checked: block.checked,
+      // `checked` only means anything on a to-do. SetKind does NOT reset the bit
+      // in the module, so a to-do that was checked and later converted still
+      // carries checked=true — and replaying that as SetChecked on a paragraph
+      // is a NotTodo rejection (a spurious error toast on an otherwise clean
+      // duplicate or undo). Drop it here, once, for both plans.
+      checked: block.kind === "todo" && block.checked,
     });
     let prev: string | null = null;
     for (const child of block.children) prev = emit(child, id, prev) ?? prev;

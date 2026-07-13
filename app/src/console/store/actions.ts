@@ -368,6 +368,12 @@ export interface ConsoleActions {
     after: string | null;
     kind: PageBlockKind;
     text: string;
+    /** Keep a rejection out of the global error surface — the caller reports it
+     *  instead. The delete-undo replay sets it: its ops are anchor-chained, so a
+     *  parent or anchor removed under it rejects EVERY op in the batch, one
+     *  error toast each. The failure still resolves false and still lands in the
+     *  op ledger; it is not swallowed. */
+    quiet?: boolean;
   }): Promise<boolean>;
   /** Replace a block's text; on the page root this renames the page.
    *  Resolves true once the op commits — see `insertPageBlock`. */
@@ -913,10 +919,17 @@ export function createActions({
   // with the inclusion height + addressable op hash, or failed. Committed
   // truth replaces the projection on the refresh that follows either way (a
   // failed submit's refresh is the rollback).
+  //
+  // `quiet` keeps a rejection out of the global error surface — the caller
+  // reports it instead. It is for a BATCH whose ops are anchor-chained, where
+  // one bad anchor rejects every op behind it and the raw per-op reasons are
+  // noise. It never swallows the failure: the ledger still records it and the
+  // promise still resolves false.
   const submitTracked = (
     key: string,
     submit: (live: NodeTransport) => Promise<unknown>,
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
+    quiet = false,
   ) => {
     const live = getNode();
     if (!live) return Promise.resolve(false);
@@ -937,7 +950,7 @@ export function createActions({
       .catch((err) => {
         if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: failOp(prev.ops, key, String(err), Date.now()) }));
-        fail(err);
+        if (!quiet) fail(err);
         // resolve false rather than reject: a failed op is already surfaced to
         // the user here, and rejecting would turn every caller that ignores the
         // result into an unhandled rejection. `false` therefore means "this op
@@ -2390,7 +2403,7 @@ export function createActions({
 
     // Every page-block write goes out through `inPageOrder` — the editor's ops
     // are anchor-chained and the wire has no ordering of its own.
-    insertPageBlock: ({ blockId, parent, after, kind, text }) => {
+    insertPageBlock: ({ blockId, parent, after, kind, text, quiet }) => {
       const page = getState().activePage;
       if (!page) return Promise.resolve(false);
       return submitTracked(
@@ -2409,6 +2422,7 @@ export function createActions({
             after,
             block: { id: blockId, parent, page, kind, text, checked: false, children: [] },
           }),
+        quiet,
       );
     },
 
