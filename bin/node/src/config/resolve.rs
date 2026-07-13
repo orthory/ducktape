@@ -63,8 +63,12 @@ pub struct Resolved {
     pub wireguard_listen: Option<SocketAddr>,
     /// which `WireGuardEffect` the plane drives when it is on.
     pub wireguard_effect: WireGuardEffectKind,
-    /// the invite intro listener endpoint (`invite_listen`, defaulted from
-    /// `wireguard_listen` + 1); `None` when the plane is off.
+    /// the DIRECT invite intro listener endpoint (`invite_listen`, defaulted
+    /// from `wireguard_listen` + 1); `None` when the plane is off — or when
+    /// this config can never mint a direct intro endpoint (no dialable
+    /// underlay host), where binding it would only leave an unreachable
+    /// wildcard socket. coordinated intros ride the plane's shared underlay
+    /// socket regardless (see `reachability_plane.rs`).
     pub invite_listen: Option<SocketAddr>,
     /// where the node's X25519 WireGuard keypair persists (beside
     /// identity.key in the network shape).
@@ -269,9 +273,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
-    let invite_listen = wireguard_listen
-        .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
-        .transpose()?;
+    let invite_listen = resolved_intro_listener(&raw, wireguard_listen)?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
     let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
     // Existing workspaces predate `gateway_listen`. Any node already exposing
@@ -349,6 +351,33 @@ fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, Stri
             .map(Some)
             .ok_or_else(|| format!("wireguard_advertised addr {a:?} is not dialable")),
     }
+}
+
+/// the DIRECT invite intro listener the plane binds: [`resolved_invite_listen`],
+/// but only when this config can mint an invite that carries a direct intro
+/// endpoint ([`endpoint_host`] — the exact predicate the minting side uses).
+/// a node with no dialable underlay host (the desktop shape: `advertised =
+/// "overlay"`, unspecified binds) hands joiners only the coordinated path, so
+/// a kernel intro listener would sit unreachable by construction — while
+/// tripping host firewall prompts (macOS asks about every wildcard bind).
+fn resolved_intro_listener(
+    raw: &NodeToml,
+    wireguard_listen: Option<SocketAddr>,
+) -> Result<Option<SocketAddr>, String> {
+    let Some(wg) = wireguard_listen else {
+        return Ok(None);
+    };
+    if endpoint_host(
+        raw.advertised.as_deref(),
+        &raw.listen,
+        wg,
+        raw.wireguard_advertised.as_deref(),
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    resolved_invite_listen(raw.invite_listen.as_deref(), wg).map(Some)
 }
 
 /// the invite intro listener endpoint: explicit `invite_listen`, else the
@@ -494,9 +523,11 @@ fn resolve_advertised(
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
-    // resolved before any field of `raw` is moved out below (it borrows the
+    // resolved before any field of `raw` is moved out below (they borrow the
     // whole struct).
     let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
+    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
+    let invite_listen = resolved_intro_listener(&raw, wireguard_listen)?;
     let id = raw
         .id
         .ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
@@ -559,7 +590,6 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         Some(path) => absolute_runtime_path(Path::new(&path))?,
         None => std::env::temp_dir().join(format!("ducktape-node-{id}")),
     };
-    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
     let gateway_listen = raw
@@ -592,9 +622,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         gateway_listen,
         wireguard_listen,
         wireguard_effect,
-        invite_listen: wireguard_listen
-            .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
-            .transpose()?,
+        invite_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
@@ -1180,6 +1208,72 @@ mod tests {
             ),
             "wireguard_advertised stays a hostname: {:?}",
             resolved.wireguard_advertised
+        );
+    }
+
+    /// the desktop shape's kernel-socket posture: a config with no dialable
+    /// underlay host (advertised = "overlay", unspecified binds) mints no
+    /// direct intro endpoint (`cmd_invite`), so the resolved DIRECT intro
+    /// listener is None — the plane binds no wildcard UDP socket (a macOS
+    /// firewall prompt trigger) and joins ride the coordinated path. any
+    /// mintable host keeps the listener.
+    #[test]
+    fn intro_listener_resolves_only_when_a_direct_endpoint_is_mintable() {
+        let dir = tmp("intro-listener");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let d = NetworkDescriptor {
+            chain_id: "net#55555555".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.save(&dir.join("network.toml")).expect("save");
+
+        // the desktop shape: overlay-advertised, unspecified binds.
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"[::]:52320\"\nadvertised = \"overlay\"\n\
+             wireguard_listen = \"0.0.0.0:52323\"\ninvite_listen = \"0.0.0.0:52324\"\n\
+             wireguard_effect = \"socket\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve desktop shape");
+        assert_eq!(
+            r.invite_listen, None,
+            "no dialable underlay host → no direct intro listener"
+        );
+
+        // the port-forwarded NAT shape: wireguard_advertised keeps it.
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"[::]:52320\"\nadvertised = \"overlay\"\n\
+             wireguard_listen = \"0.0.0.0:52323\"\ninvite_listen = \"0.0.0.0:52324\"\n\
+             wireguard_effect = \"socket\"\nwireguard_advertised = \"203.0.113.9:41820\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve port-forwarded shape");
+        assert_eq!(
+            r.invite_listen,
+            Some("0.0.0.0:52324".parse().unwrap()),
+            "a dialable WG endpoint keeps the direct intro listener"
+        );
+
+        // the server shape: a concrete advertised keeps it, with the
+        // wireguard_listen + 1 default.
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"[::]:52320\"\n\
+             advertised = \"203.0.113.9:52320\"\nwireguard_listen = \"0.0.0.0:52323\"\n\
+             wireguard_effect = \"socket\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve server shape");
+        assert_eq!(
+            r.invite_listen,
+            Some("0.0.0.0:52324".parse().unwrap()),
+            "a dialable advertised keeps the intro default (wireguard_listen + 1)"
         );
     }
 

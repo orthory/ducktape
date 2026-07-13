@@ -466,13 +466,16 @@ async fn reachability_plane(
         }
         WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => None,
     };
-    let (invite_intro_tx, mut invite_intro_rx) =
-        if socket_underlay.is_some() && intro_listen.is_some() {
-            let (tx, rx) = tokio::sync::mpsc::channel(32);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    // the coordinated intro lane rides the shared underlay socket, so it
+    // exists whenever that socket does — INCLUDING on a node that binds no
+    // direct intro listener below (a NAT'd desktop's only join door is
+    // this lane).
+    let (invite_intro_tx, mut invite_intro_rx) = if socket_underlay.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
     // carries the genesis-issued cap. A fully-open coordinator ignores the
@@ -598,6 +601,15 @@ async fn reachability_plane(
     // membership is NOT checked here (this task has no state access) — the
     // in-consensus redemption enforces it; a revoked member's token can at
     // worst open a tunnel that admits nothing.
+    if intro_listen.is_none() {
+        // resolve.rs already decided this config can never mint a direct
+        // intro endpoint — say so once at boot instead of binding a
+        // wildcard socket no joiner could ever reach.
+        println!(
+            "[node {label}] no direct invite intro listener (this config mints no direct \
+             intro endpoint) — intros arrive via the coordinated path"
+        );
+    }
     if let Some(intro_addr) = intro_listen {
         let intro_cmds = nudges.clone().downgrade();
         let intro_label = label.clone();
