@@ -15,6 +15,7 @@ use commonware_utils::ordered::Set;
 
 use host::Host;
 
+use crate::blob_fetch;
 use crate::config;
 use crate::constants::*;
 use crate::explorer::heal_index;
@@ -52,6 +53,8 @@ pub(super) struct RuntimeWiring {
     pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
+    pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -79,6 +82,7 @@ pub(super) async fn finish(
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
+    blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
     mut mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
@@ -228,10 +232,36 @@ pub(super) async fn finish(
     // bounded state touches crossing `sync_state_tx`; when the loop is
     // busy the serve lane backpressures, never the reverse.
     let (sync_state_tx, sync_state_rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
+    // the blob code lane (wasm code distribution): the pending map is the
+    // serve loop's demux for THIS validator's own fetches, and the peer book
+    // follows every cutover re-track beside the other planes' books.
+    let blob_pending: blob_fetch::PendingMap = Default::default();
+    let blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
+        Arc::new(std::sync::RwLock::new(
+            initial_member_keys
+                .iter()
+                .chain(initial_resident_keys.iter())
+                .cloned()
+                .collect(),
+        ));
+    let sync_blobs = blobs.clone();
+    // the serve-lane blob co-client: this validator's own fetch side of the
+    // blob lane. sends ride a sender clone under this node's OWN standing
+    // proof (a validator's key is in the committed valset); answers route
+    // back through the pending-map demux the serve loop below runs.
+    let (blob_requester, blob_proof) = statesync::sign_sync_proof(&signer, &namespace);
+    let blob_client = blob_fetch::ServeLaneBlobClient::new(
+        sync_tx.clone(),
+        blob_pending.clone(),
+        blob_peers.clone(),
+        blob_requester,
+        blob_proof,
+    );
     {
         let state_tx = sync_state_tx;
         let mut sync_tx = sync_tx;
         let mut ingress = sync_ingress;
+        let blob_pending = blob_pending.clone();
         // the genesis namespace the standing proof is bound to (ADR §5.1).
         let serve_namespace = namespace.clone();
         context
@@ -246,6 +276,22 @@ pub(super) async fn finish(
                     else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
+                    // OUR blob-fetch answers ride the same authed envelope with
+                    // ZEROED auth fields (the transport authenticates replies):
+                    // complete the pending waiter by id BEFORE the proof gate
+                    // below, which would otherwise drop them. a malformed body
+                    // on a matched id drops the waiter — that fetch times out
+                    // and rotates, never misreads as a peer's request.
+                    if let Some(waiter) = blob_pending
+                        .lock()
+                        .expect("pending blob lock")
+                        .remove(&rpc_id)
+                    {
+                        if let Ok(resp) = statesync::decode_response(body) {
+                            let _ = waiter.send(resp);
+                        }
+                        continue; // ours — never a request to serve.
+                    }
                     // FAIL-CLOSED (ADR §5.1). a transport-key standing gate is
                     // IMPOSSIBLE at this seam: a pre-admission joiner and an
                     // admitted resident share the derived LOBBY key on this
@@ -312,7 +358,24 @@ pub(super) async fn finish(
                         }
                     }
                     let req_kind = req.kind_name();
-                    let resp = drive_sync_request(&mut server, &state_tx, req).await;
+                    let resp = match req {
+                        // blob fetches are host state — answered from the
+                        // node-local store, never routed into SyncServer.
+                        // standing-gated above like every state lane (code
+                        // components are consensus-pinned content).
+                        statesync::SyncRequest::Blob { digest } => {
+                            blob_fetch::serve_blob(&sync_blobs, &digest)
+                        }
+                        statesync::SyncRequest::BlobInfo { digest } => {
+                            blob_fetch::serve_blob_info(&sync_blobs, &digest)
+                        }
+                        statesync::SyncRequest::BlobRange {
+                            digest,
+                            offset,
+                            len,
+                        } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
+                        req => drive_sync_request(&mut server, &state_tx, req).await,
+                    };
                     let framed = statesync::encode_rpc_authed(
                         &[0u8; 32],
                         &[0u8; 64],
@@ -381,6 +444,8 @@ pub(super) async fn finish(
         mesh_oracle,
         channel_bank,
         gateway_book,
+        blob_peers,
+        blob_client,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,

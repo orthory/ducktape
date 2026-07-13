@@ -77,6 +77,11 @@ pub enum Service {
     /// Live agent run output between member nodes. Observability only: final
     /// run state and usage remain consensus facts.
     AgentTelemetry = 7,
+    /// Module-code distribution: content-addressed code artifacts (wasm
+    /// components, quack capsules) pushed to members before a governance
+    /// code-swap proposal and pulled on miss. Consensus pins the 32-byte
+    /// hash; this plane only ever moves the self-verifying bytes.
+    ModuleCode = 8,
 }
 
 impl Service {
@@ -93,6 +98,7 @@ impl Service {
             Service::Video => 45803,
             Service::Gateway => 45806,
             Service::AgentTelemetry => 45807,
+            Service::ModuleCode => 45808,
         }
     }
 
@@ -105,6 +111,7 @@ impl Service {
             Service::Video => 45903,
             Service::Gateway => 45906,
             Service::AgentTelemetry => 45907,
+            Service::ModuleCode => 45908,
         }
     }
 }
@@ -119,6 +126,7 @@ impl TryFrom<u8> for Service {
             3 => Ok(Service::Video),
             6 => Ok(Service::Gateway),
             7 => Ok(Service::AgentTelemetry),
+            8 => Ok(Service::ModuleCode),
             other => Err(other),
         }
     }

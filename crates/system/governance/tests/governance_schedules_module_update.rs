@@ -45,7 +45,7 @@ async fn gov_host_with_modreg() -> Host {
     let mut host = Host::genesis(vec![
         Box::new(valset),
         Box::new(Governance::new("governance", "valset", "upgrade", "identity").with_modreg("modreg")),
-        Box::new(Modreg::new("modreg")),
+        Box::new(Modreg::new("modreg", "valset")),
     ])
     .expect("genesis");
     // genesis-bootstrap the swappable module's initial code (System origin).

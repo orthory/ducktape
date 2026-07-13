@@ -4,6 +4,7 @@
 
 pub(crate) mod announce;
 mod boot;
+pub(crate) mod code_announce;
 mod engine;
 mod run;
 mod wiring;
@@ -57,6 +58,7 @@ pub(crate) async fn run_validator(
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
     agent_dirs: capability_host::AgentDirs,
@@ -139,7 +141,7 @@ pub(crate) async fn run_validator(
     let (
         sync_tx,
         sync_rx,
-        recovery,
+        mut recovery,
         host,
         resumed,
         next_seq,
@@ -179,6 +181,8 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         channel_bank,
         gateway_book,
+        blob_peers,
+        blob_client,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -202,6 +206,7 @@ pub(crate) async fn run_validator(
         gateway_requests,
         gateway_commands,
         gateway_workspace,
+        blobs.clone(),
         initial_member_keys,
         initial_resident_keys,
         mesh_oracle,
@@ -225,9 +230,21 @@ pub(crate) async fn run_validator(
             crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
             std::sync::Arc::clone(peers),
             me,
-            bulk_pacer,
+            bulk_pacer.clone(),
             planes.clone(),
             stream_hub.run_output(),
+        );
+        // the module-code plane: serves push/pull transfers and drains the
+        // admin RPC's stage fan-outs. same overlay book as the agent plane.
+        crate::code_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(peers),
+            me,
+            bulk_pacer,
+            planes.clone(),
+            blobs.clone(),
+            code_stage_requests,
         );
     }
 
@@ -240,6 +257,17 @@ pub(crate) async fn run_validator(
         bank_base,
         channel_bank,
     );
+    // with the serve lane wired, realize code-registry swaps through the
+    // FETCHING source for the rest of this validator's life: a committed
+    // component the local store lacks is pulled from peers (ranged, verified)
+    // before a boundary can fail closed on it.
+    recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
+        blobs.clone(),
+        blob_client.clone(),
+        crate::constants::MAX_MODULE_CODE_BYTES,
+        crate::constants::BLOB_FETCH_ATTEMPTS,
+    )));
+
     let engine::EngineState {
         node,
         orchestrator,
@@ -269,6 +297,8 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         gateway_book,
         media_peers,
+        blob_peers,
+        blob_client,
         reach_cmd,
         lobby_tx,
         relay_tx,

@@ -53,7 +53,9 @@ use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
 mod agent_plane;
+mod blob_fetch;
 mod boot;
+mod code_plane;
 mod cli;
 mod cli_flags;
 mod config;
@@ -322,6 +324,7 @@ fn run_node(
         stream_hub,
         index,
         voice_requests,
+        code_stage_requests,
         blobs,
         agent_provisioner,
         gateway_requests,
@@ -576,6 +579,7 @@ fn run_node(
             stream_hub,
             index,
             voice_requests,
+            code_stage_requests,
             blobs,
             agent_provisioner,
             agent_dirs,

@@ -242,6 +242,16 @@ pub(super) async fn post_reboot_catchup<'a>(
         let (sync_requester, sync_proof) = statesync::sign_sync_proof(&signer, &namespace);
         let client =
             BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone(), sync_requester, sync_proof);
+        // while catch-up replays, realize code-registry swaps through a source
+        // that can FETCH a missing committed component from the serve peer
+        // (ranged, verified) instead of failing closed on the local store —
+        // this binary's embedded components may trail (or lead) the registry.
+        recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
+            blobs.clone(),
+            client.clone(),
+            crate::constants::MAX_MODULE_CODE_BYTES,
+            crate::constants::BLOB_FETCH_ATTEMPTS,
+        )));
         let mut attempts = 0usize;
         loop {
             attempts += 1;
@@ -480,6 +490,13 @@ pub(super) async fn post_reboot_catchup<'a>(
                 }
             }
         }
+        // restore the local-only source BEFORE reclaiming the channel: the
+        // fetching source above holds a clone of the client, and into_parts
+        // refuses while clones live. the runtime wiring installs the serve-
+        // lane fetching source right after boot.
+        recovery.set_code_source(std::sync::Arc::new(crate::host_state::BlobCodeSource(
+            blobs.clone(),
+        )));
         match client.into_parts() {
             Ok((tx, rx)) => {
                 sync_tx = tx;

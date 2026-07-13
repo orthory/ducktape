@@ -19,6 +19,9 @@
 //! module, the prompt-blob mesh lane) were both deleted after converging on
 //! duckfs. don't start a third.
 
+mod staging;
+pub use staging::{LARGE_BLOB_CACHE_BYTES, StageError, StagedBlob};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -51,27 +54,75 @@ impl BlobStore {
         // write-through BEFORE the memory insert, always (re-putting heals a
         // corrupt file on disk). a disk failure degrades to memory-only with
         // a warning — put stays infallible, exactly the old semantics.
-        if let Some(root) = &self.root
-            && let Err(why) = write_through(root, &digest, &bytes)
-        {
-            eprintln!(
-                "[blobstore] cannot persist blob {} under {}: {why}; kept in memory only",
-                hex(&digest),
-                root.display()
-            );
+        if let Some(root) = &self.root {
+            match write_through(root, &digest, &bytes) {
+                // a persisted LARGE blob lives on disk only: parking it in the
+                // map would grow resident memory by the blob size for the
+                // process lifetime (the map never evicts).
+                Ok(()) if bytes.len() > LARGE_BLOB_CACHE_BYTES => return digest,
+                Ok(()) => {}
+                Err(why) => eprintln!(
+                    "[blobstore] cannot persist blob {} under {}: {why}; kept in memory only",
+                    hex(&digest),
+                    root.display()
+                ),
+            }
         }
         self.chunks.insert(digest, bytes);
         digest
     }
 
-    /// memory first, then the persistence root; a verified disk hit is cached
-    /// back into memory so the borrow it returns lives in the map either way.
-    pub fn get_chunk(&mut self, digest: &[u8; 32]) -> Option<&[u8]> {
-        if !self.chunks.contains_key(digest) {
-            let bytes = self.disk_chunk(digest)?;
-            self.chunks.insert(*digest, bytes);
+    /// memory first, then the persistence root. a verified disk hit is cached
+    /// back into memory only when small — the map never evicts, so a large
+    /// blob would otherwise stay resident for the process lifetime.
+    pub fn get_chunk(&mut self, digest: &[u8; 32]) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.chunks.get(digest) {
+            return Some(bytes.clone());
         }
-        self.chunks.get(digest).map(Vec::as_slice)
+        let bytes = self.disk_chunk(digest)?;
+        if bytes.len() <= LARGE_BLOB_CACHE_BYTES {
+            self.chunks.insert(*digest, bytes.clone());
+        }
+        Some(bytes)
+    }
+
+    /// the blob's total length: memory hit, else the published file's size.
+    /// range serving trusts publish-time verification (the atomic rename is
+    /// the receipt) — the requester re-verifies the assembled whole.
+    pub fn chunk_len(&self, digest: &[u8; 32]) -> Option<u64> {
+        if let Some(bytes) = self.chunks.get(digest) {
+            return Some(bytes.len() as u64);
+        }
+        let path = self.root.as_ref()?.join(hex(digest));
+        std::fs::metadata(path).ok().map(|m| m.len())
+    }
+
+    /// one bounded window of a blob, without reading the whole file: memory
+    /// hit slices, disk hit seeks. `None` when the blob is absent or `offset`
+    /// lies past its end. ranged bytes are NOT re-verified per read (that
+    /// would read the whole blob every range) — the assembling requester
+    /// verifies the whole against the digest, fail-closed.
+    pub fn read_range(&self, digest: &[u8; 32], offset: u64, len: usize) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.chunks.get(digest) {
+            let total = bytes.len() as u64;
+            if offset > total {
+                return None;
+            }
+            let end = (offset as usize).saturating_add(len).min(bytes.len());
+            return Some(bytes[offset as usize..end].to_vec());
+        }
+        let path = self.root.as_ref()?.join(hex(digest));
+        let mut file = std::fs::File::open(path).ok()?;
+        let total = file.metadata().ok()?.len();
+        if offset > total {
+            return None;
+        }
+        use std::io::{Read as _, Seek as _};
+        file.seek(std::io::SeekFrom::Start(offset)).ok()?;
+        let want = len.min((total - offset) as usize);
+        let mut buf = vec![0u8; want];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
     }
 
     pub fn has_chunk(&self, digest: &[u8; 32]) -> bool {
@@ -113,7 +164,6 @@ impl BlobHandle {
             .lock()
             .expect("blob store poisoned")
             .get_chunk(digest)
-            .map(<[u8]>::to_vec)
     }
 
     pub fn has_chunk(&self, digest: &[u8; 32]) -> bool {
@@ -121,6 +171,36 @@ impl BlobHandle {
             .lock()
             .expect("blob store poisoned")
             .has_chunk(digest)
+    }
+
+    /// see [`BlobStore::chunk_len`].
+    pub fn chunk_len(&self, digest: &[u8; 32]) -> Option<u64> {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .chunk_len(digest)
+    }
+
+    /// see [`BlobStore::read_range`].
+    pub fn read_range(&self, digest: &[u8; 32], offset: u64, len: usize) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .read_range(digest, offset, len)
+    }
+
+    /// the write-through root, when persistent — where staging slots live.
+    pub(crate) fn persistence_root(&self) -> Option<PathBuf> {
+        self.0.lock().expect("blob store poisoned").root.clone()
+    }
+
+    /// publish a VERIFIED staging file under its content-addressed name. the
+    /// rename is atomic: the blob is either fully addressable or absent.
+    pub(crate) fn publish_staged(&self, digest: &[u8; 32], staged: &Path) -> std::io::Result<()> {
+        let root = self
+            .persistence_root()
+            .expect("publish_staged is only reachable from a disk staging sink");
+        std::fs::rename(staged, root.join(hex(digest)))
     }
 }
 
@@ -141,7 +221,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn hex(digest: &[u8; 32]) -> String {
+pub(crate) fn hex(digest: &[u8; 32]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 

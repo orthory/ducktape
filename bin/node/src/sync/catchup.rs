@@ -420,6 +420,15 @@ where
     }
 }
 
+// the boot client is PINNED to its one sync source, so an honest blob miss
+// has nowhere to rotate to — retries re-ask the same (manifest-serving) peer.
+impl<S, R> crate::blob_fetch::SourceRotate for BootP2pSyncClient<S, R>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey>,
+{
+}
+
 impl<S, R> BootP2pSyncClient<S, R>
 where
     S: P2pSender<PublicKey = ed25519::PublicKey>,

@@ -23,6 +23,7 @@ fn service_name(service: Service) -> &'static str {
         Service::Video => "video",
         Service::Gateway => "gateway",
         Service::AgentTelemetry => "agent-telemetry",
+        Service::ModuleCode => "module-code",
     }
 }
 

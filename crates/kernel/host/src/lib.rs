@@ -118,9 +118,13 @@ pub const MODREG_MODULE_ID: &str = modreg::DEFAULT_MODREG_ID;
 /// `fetch` returns `None` when this node does not (yet) hold the bytes for a
 /// hash — a fail-closed miss that stops the boundary, never a fork.
 /// `Send + Sync` because the ordered lane holds its source across an executor.
+/// `fetch` is async (`?Send`, like every host-side future — the host itself is
+/// `!Send`): a node-side source may go to the mesh for bytes its local store
+/// lacks before answering, and only a still-missing digest is a `None`.
+#[async_trait::async_trait(?Send)]
 pub trait CodeSource: Send + Sync {
     /// component bytes for a content hash, or `None` if absent on this node.
-    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
 }
 
 /// the no-source default: a node wired without any code source. every fetch
@@ -128,8 +132,9 @@ pub trait CodeSource: Send + Sync {
 /// than silently running stale code — and a net with no swaps never notices.
 pub struct NoCodeSource;
 
+#[async_trait::async_trait(?Send)]
 impl CodeSource for NoCodeSource {
-    fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
+    async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         None
     }
 }
@@ -736,7 +741,7 @@ impl Host {
         let any_armed = modules.iter().any(|m| {
             m.pending
                 .as_ref()
-                .is_some_and(|p| height >= p.activation_height)
+                .is_some_and(|p| p.ready && height >= p.activation_height)
         });
         any_armed.then(|| Msg {
             target: MODREG_MODULE_ID.into(),
@@ -810,7 +815,9 @@ impl Host {
             // the SAME arm predicate as modreg::handle_advance (height >=
             // activation_height): pending-if-armed, else the committed active hash.
             let target = match m.pending {
-                Some(p) if height >= p.activation_height => p.code_hash,
+                // the SAME arm predicate as modreg: ready (full byte receipt,
+                // latched in committed state) AND the height floor reached.
+                Some(p) if p.ready && height >= p.activation_height => p.code_hash,
                 _ => m.active_code_hash,
             };
             // only reconcile a module this node actually runs AS a hot-swappable
@@ -822,7 +829,7 @@ impl Host {
             if current == target {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(&target).ok_or_else(|| {
+            let bytes = src.fetch(&target).await.ok_or_else(|| {
                 Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,
