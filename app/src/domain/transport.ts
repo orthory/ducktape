@@ -499,7 +499,40 @@ const wsBase = (baseUrl: string): string =>
 export const callSocketUrl = (baseUrl: string, channel: string): string =>
   `${wsBase(baseUrl)}/v1/call/ws?channel=${encodeURIComponent(channel)}`;
 
-export const remoteTransport = (baseUrl: string): NodeTransport => {
+/** Optional capabilities a host environment can graft onto [`remoteTransport`]. */
+export interface RemoteTransportOptions {
+  /**
+   * Sign a files-module op payload (hex in) into a raw signed op frame (hex
+   * out) with the USER key — the desktop shell's `user_sign_files_frame`
+   * command. When present, `filesCommit` rides the authenticated
+   * `POST /v1/submit/frame` lane so the commit's author is the user
+   * (`ext:<user-pubkey>`, real `/home/<user>` authority) instead of the
+   * daemon's shared `ext:noded`. Throwing the exact string `identity-locked`
+   * falls back to the unsigned convenience lane (status-quo authorship);
+   * any other failure propagates.
+   */
+  signFilesPayload?: (payloadHex: string) => Promise<string>;
+}
+
+const bytesToHexString = (bytes: Uint8Array): string =>
+  Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+const hexStringToBytes = (hex: string): Uint8Array<ArrayBuffer> => {
+  const clean = hex.trim();
+  if (clean.length % 2 !== 0 || /[^0-9a-fA-F]/.test(clean)) {
+    throw new Error("transport: signer returned invalid frame hex");
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+};
+
+export const remoteTransport = (
+  baseUrl: string,
+  opts?: RemoteTransportOptions,
+): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
   const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
@@ -739,7 +772,42 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         throw new NodeError("badBody", "/v1/files/stage returned an invalid response");
       }
     },
-    filesCommit: (body) => postJson<BlockEvent>(`${base}/v1/files/commit`, body),
+    filesCommit: async (body) => {
+      const sign = opts?.signFilesPayload;
+      if (sign) {
+        // the exact FilesMsg the convenience route would build server-side
+        // (externally-tagged serde enum, snake_case) — signed by the user key
+        // so the commit's author is the user, not the daemon.
+        const payload = new TextEncoder().encode(JSON.stringify({ commit: body }));
+        try {
+          const frameHex = await sign(bytesToHexString(payload));
+          const res = await fetchDeadline(`${base}/v1/submit/frame`, {
+            method: "POST",
+            headers: { "content-type": "application/octet-stream" },
+            body: hexStringToBytes(frameHex),
+          });
+          if (!res.ok) {
+            throw new NodeError(
+              "httpError",
+              (await errorDetail(res)) || `node replied ${res.status}`,
+              res.status,
+            );
+          }
+          return (await res.json()) as SubmitReceipt;
+        } catch (err) {
+          // a locked identity falls back to the unsigned lane — the commit
+          // still lands, with the daemon's status-quo authorship. anything
+          // else (a real signer or node failure) propagates. tauri invoke
+          // rejects with the raw string, not an Error — accept both shapes.
+          const detail = err instanceof Error ? err.message : String(err);
+          if (detail !== "identity-locked") throw err;
+          console.warn(
+            "[transport] user key locked; files commit rides the unsigned lane as ext:noded",
+          );
+        }
+      }
+      return postJson<BlockEvent>(`${base}/v1/files/commit`, body);
+    },
     filesStat: async ({ path, snapshot }) => {
       try {
         return await getJson<FileEntry>(

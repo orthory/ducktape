@@ -53,6 +53,19 @@ export const isMacDesktop = (): boolean =>
 const webUrl = (): string =>
   import.meta.env.VITE_DUCKTAPE_NODE_URL || `http://${DEFAULT_LISTEN}`;
 
+/** The desktop shell's files-frame signer, or undefined outside Tauri (web
+ *  build: no user-key custody, writes ride the unsigned convenience lane).
+ *  The shell command pins the target module to `files` and rejects with the
+ *  exact string `identity-locked` on an encrypted, uncached key — which the
+ *  transport maps to its unsigned-lane fallback. */
+const filesFrameSigner = (): ((payloadHex: string) => Promise<string>) | undefined =>
+  isTauri()
+    ? async (payloadHex: string) => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        return invoke<string>("user_sign_files_frame", { payloadHex });
+      }
+    : undefined;
+
 /** Web build: dial the configured node url. Nothing to manage. */
 export const resolveNode = (): NodeResolution => {
   const url = webUrl();
@@ -62,7 +75,7 @@ export const resolveNode = (): NodeResolution => {
 /** Desktop build: wrap a selected workspace's node url as a managed
  *  resolution. The Rust side already spawned/adopted the process. */
 export const connectWorkspace = (httpUrl: string): NodeResolution => ({
-  transport: remoteTransport(httpUrl),
+  transport: remoteTransport(httpUrl, { signFilesPayload: filesFrameSigner() }),
   url: httpUrl,
   managed: true,
 });
@@ -73,7 +86,10 @@ export const connectWorkspace = (httpUrl: string): NodeResolution => ({
  *  same as the web build). The transport is already url-agnostic; this is just
  *  the lifecycle label. */
 export const connectRemote = (httpUrl: string): NodeResolution => ({
-  transport: remoteTransport(httpUrl),
+  // the user key signs here too: identity is the member's, not the node's,
+  // so a commit sent to another device's node still carries this user's
+  // authenticated authorship.
+  transport: remoteTransport(httpUrl, { signFilesPayload: filesFrameSigner() }),
   url: httpUrl,
   managed: false,
 });

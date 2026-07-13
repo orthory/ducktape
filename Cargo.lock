@@ -3854,11 +3854,14 @@ dependencies = [
 name = "fs-bin"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "commonware-cryptography",
  "duckfs-client",
  "duckfs-core",
  "files",
  "futures",
  "host",
+ "node",
  "noded",
  "sdk",
  "serde_json",

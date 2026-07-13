@@ -25,6 +25,11 @@ serde_json = { workspace = true }
 noded = { path = "../noded" }
 host = { workspace = true }
 sdk = { workspace = true }
+# signed_frame_e2e: the harness's frame arm decodes exactly like the real
+# daemon (node::decode_frame), and the test signs frames with a fresh user key.
+node = { workspace = true }
+commonware-cryptography = { workspace = true }
+base64 = { workspace = true }
 # the native files module (default features on) the in-process node genesises;
 # path dep so it unifies with the default-features-off dep above (native wins).
 files = { path = "../../crates/apps/files" }

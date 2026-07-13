@@ -712,6 +712,71 @@ pub async fn user_sign_remove_member(
         .await
 }
 
+// ── files op-frame signing ──────────────────────────
+
+/// this shell process's frame `seq`, seeded from wall-clock millis so an app
+/// restart never reuses a `(seq, payload)` pair an earlier run submitted — a
+/// byte-identical frame is swallowed by the consensus lane's content-digest
+/// replay guard instead of re-applying. `seq` is a tie-breaker, not tracked
+/// in state, so millis + increment is all the coordination needed.
+fn next_frame_seq() -> u64 {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: OnceLock<AtomicU64> = OnceLock::new();
+    SEQ.get_or_init(|| {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        AtomicU64::new(millis)
+    })
+    .fetch_add(1, Ordering::Relaxed)
+}
+
+/// sign ONE files-module op frame with the user key: `payload_hex` is the
+/// module payload (`FilesMsg` JSON, or the `0x00` putblob frame) as hex, the
+/// return is the raw signed frame as hex, ready for `POST /v1/submit/frame`,
+/// whose verified signer becomes the op's authenticated authorship
+/// (`ext:<user-pubkey>` — real `/home/<user>` authority instead of the
+/// daemon's shared `ext:noded`). The target module is pinned to `files`
+/// HERE, shell-side: the webview never gets a generic signing oracle over
+/// arbitrary modules (the gateway-route precedent). `identity-locked`
+/// (exact string) on an encrypted, uncached key.
+#[tauri::command]
+pub async fn user_sign_files_frame(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    payload_hex: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            // stdin: password first when the key is locked (signing_stdin's
+            // contract), then the payload hex line the verb reads after it.
+            let mut stdin_lines = signing_stdin(&app)?;
+            stdin_lines.push(SecretString::new(payload_hex));
+            let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
+            let key = user_key_path(&app)?.to_string_lossy().into_owned();
+            let seq = next_frame_seq().to_string();
+            let out = run_verb_with_stdin(
+                &[
+                    "user-sign-frame",
+                    "--key",
+                    &key,
+                    "--target",
+                    "files",
+                    "--seq",
+                    &seq,
+                ],
+                &stdin_refs,
+            )?;
+            Ok(last_line(&out))
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
