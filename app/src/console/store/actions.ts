@@ -310,7 +310,7 @@ export interface ConsoleActions {
   getForgeItem(repo: string, number: number): Promise<ForgeItemDetail | null>;
   /** Open an issue on `repo`; reloads the repo's item list once committed. */
   openForgeIssue(params: { repo: string; title: string; body: string }): Promise<void>;
-  /** Open a PR from `sourceBranch` into `targetBranch` ("" → the repo's main). */
+  /** Open a PR from `sourceBranch` into `targetBranch` ("" → the repo's dev). */
   openForgePr(params: {
     repo: string;
     title: string;

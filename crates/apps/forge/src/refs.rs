@@ -2,10 +2,10 @@
 //! single-`main` [`RepoState`].
 //!
 //! consensus state per repo is now a sorted map of born branches
-//! (`short_name -> head oid`); `main` is the protected default (never deleted,
-//! fast-forward-guarded at materialize time), every other branch is a plain
-//! CAS-guarded ref that may force-push or be deleted — the GitHub flow
-//! (`git push origin feature/x`, open a PR from it).
+//! (`short_name -> head oid`); `main` and the shared `dev` integration branch
+//! are protected (never deleted, fast-forward-guarded at materialize time),
+//! while feature branches are plain CAS-guarded refs that may force-push or be
+//! deleted — the GitHub flow (`git push origin feature/x`, open a PR from it).
 //!
 //! the phase-1 determinism invariant carries over PER BRANCH: consensus only
 //! ever gates on a compare-and-swap against a branch's COMMITTED head; packs,
@@ -22,6 +22,13 @@ use crate::tracker_iface::MAX_BRANCH_BYTES;
 
 /// the protected default branch's SHORT name.
 pub const MAIN_BRANCH: &str = "main";
+/// The shared development branch. Task PRs target this branch; `main` remains
+/// the protected, explicit-release branch.
+pub const INTEGRATION_BRANCH: &str = "dev";
+
+fn is_protected_branch(branch: &str) -> bool {
+    branch == MAIN_BRANCH || branch == INTEGRATION_BRANCH
+}
 
 /// a branch short name to its full refname.
 pub fn full_ref(short: &str) -> String {
@@ -142,9 +149,9 @@ impl RepoState {
         }
         let fate = match new {
             None => {
-                if branch == MAIN_BRANCH {
+                if is_protected_branch(branch) {
                     return Err(Error::Module(
-                        "forge: the main branch cannot be deleted".into(),
+                        format!("forge: protected branch {branch:?} cannot be deleted"),
                     ));
                 }
                 if prev.is_none() {
@@ -207,9 +214,9 @@ impl RepoState {
 
     /// node-local catch-up for THIS repo: per pending branch, fetch the pack
     /// by digest, install + verify the FULL closure, then move the on-disk
-    /// ref. `main` additionally requires a fast-forward (merges satisfy it —
-    /// the merge commit's first parent is the old main); other branches may
-    /// force-push, so their ref moves unconditionally once the closure
+    /// ref. protected branches additionally require a fast-forward (merges
+    /// satisfy it); feature branches may force-push, so their ref moves
+    /// unconditionally once the closure
     /// verifies. absent/corrupt packs are SAFE no-ops (root already reflects
     /// the committed head) that warn once. NEVER touches `refs`/`root()`.
     pub fn materialize(
@@ -248,7 +255,7 @@ impl RepoState {
                 *head,
                 prior,
                 &pack,
-                branch == MAIN_BRANCH,
+                is_protected_branch(branch),
             ) {
                 if self.warned.insert(branch.clone()) {
                     eprintln!(
@@ -269,8 +276,8 @@ impl RepoState {
 }
 
 /// the pure git side of one branch's materialize attempt: install the pack,
-/// require the full closure of `head`, optionally require fast-forward (main
-/// only), then move the ref. any failure is returned so the caller can turn
+/// require the full closure of `head`, optionally require fast-forward, then
+/// move the ref. any failure is returned so the caller can turn
 /// it into a safe no-op.
 fn install_and_advance(
     repo: &Repository,
@@ -344,11 +351,13 @@ mod tests {
         assert!(st.stage_update("main", Some(b), Some(a), None).is_err());
         st.stage_update("main", Some(a), Some(b), None).unwrap();
 
-        // main cannot be deleted; unborn branches cannot be deleted.
+        // Protected branches cannot be deleted; neither can unborn branches.
         let mut st2 = RepoState::default();
         st2.refs.insert("main".into(), a);
+        st2.refs.insert("dev".into(), a);
         st2.refs.insert("feat".into(), a);
         assert!(st2.stage_update("main", Some(a), None, None).is_err());
+        assert!(st2.stage_update("dev", Some(a), None, None).is_err());
         assert!(st2.stage_update("ghost", None, None, None).is_err());
         st2.stage_update("feat", Some(a), None, None).unwrap();
         assert_eq!(st2.effective_head("feat"), None, "staged delete shadows");

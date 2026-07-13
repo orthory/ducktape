@@ -54,7 +54,7 @@ const fail = message => { throw new Error(message); };
 if (!item) fail(`Forge PR #${numberText} does not exist`);
 if (item.number !== Number(numberText)) fail("Forge returned a different item number");
 if (item.kind !== "pr" || item.state !== "merged") fail("only merged Forge PRs can be mirrored");
-if (item.target_branch !== "main") fail("Forge PR target must be main");
+if (item.target_branch !== "dev") fail("Forge PR target must be dev");
 if (typeof item.source_branch !== "string" || !item.source_branch) fail("Forge PR has no source branch");
 if (!/^[0-9a-f]{40}$/i.test(item.merge_oid || "")) fail("Forge PR has no valid merge oid");
 if (!/^[0-9a-f]{40}$/i.test(sourceOid)) fail("source commit must be 40 hex characters");
@@ -103,11 +103,17 @@ assert_clean() {
     die "generated mirror worktree is dirty: $dir"
 }
 
-assert_cutover_mapping() {
-  local forge_target=$1 github_actual=$2 github_expected=$3
-  is_oid "$forge_target" && is_oid "$github_expected" || die "cutover mapping contains an invalid oid"
-  [ "$github_actual" = "$github_expected" ] ||
-    die "origin/dev is $github_actual, not the explicit cutover base $github_expected"
+assert_shared_dev_base() {
+  local forge_target=$1 github_dev=$2
+  is_oid "$forge_target" && is_oid "$github_dev" || die "dev sync check contains an invalid oid"
+  if git merge-base --is-ancestor "$forge_target" "$github_dev"; then
+    return
+  fi
+  if git merge-base --is-ancestor "$github_dev" "$forge_target" &&
+    git diff --quiet "$github_dev" "$forge_target"; then
+    return
+  fi
+  die "Forge dev target $forge_target contains content not represented by GitHub dev $github_dev; mirror earlier Forge work or reconcile dev first"
 }
 
 validate_merged_selection() {
@@ -258,14 +264,12 @@ cleanup() {
 }
 
 main() {
-  [ "$#" -eq 3 ] ||
-    die "usage: ops/mirror-forge-pr.sh <forge-pr-number> <source-head-oid> <github-dev-oid-for-forge-target>"
+  [ "$#" -eq 2 ] ||
+    die "usage: ops/mirror-forge-pr.sh <forge-pr-number> <source-head-oid>"
   PR_NUMBER=$1
   SOURCE_OID=${2,,}
-  EXPECTED_GITHUB_OID=${3,,}
   [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || die "Forge PR number must be a positive integer"
   is_oid "$SOURCE_OID" || die "source commit must be 40 hex characters"
-  is_oid "$EXPECTED_GITHUB_OID" || die "expected GitHub dev commit must be 40 hex characters"
   command -v curl >/dev/null || die "curl is required"
   command -v git >/dev/null || die "git is required"
   command -v node >/dev/null || die "node is required to parse Forge metadata"
@@ -289,7 +293,7 @@ main() {
   token="$PR_NUMBER-$short-$$"
   RUN_DIR="$primary/.worktree/.forge-mirror-$token"
   MIRROR_WORKTREE="$RUN_DIR/worktree"
-  FORGE_TMP_REF="refs/mirror-tmp/$token/forge-main"
+  FORGE_TMP_REF="refs/mirror-tmp/$token/forge-dev"
   ORIGIN_TMP_REF="refs/mirror-tmp/$token/origin-dev"
   MIRROR_BRANCH="mirror/forge-pr-$PR_NUMBER-$short"
   mkdir -p "$primary/.worktree"
@@ -311,12 +315,12 @@ main() {
 
   # The live Forge upload-pack reliably serves one wanted branch. Do not turn
   # this into a wildcard/all-refs fetch: its multi-want path is not supported.
-  log "fetching Forge main at one unique temporary ref"
-  git fetch --no-tags "$FORGE_URL" "refs/heads/main:$FORGE_TMP_REF"
-  local forge_main
-  forge_main=$(git rev-parse "$FORGE_TMP_REF^{commit}")
-  git merge-base --is-ancestor "$MERGE_OID" "$forge_main" ||
-    die "Forge merge $MERGE_OID is not in canonical Forge main"
+  log "fetching Forge dev at one unique temporary ref"
+  git fetch --no-tags "$FORGE_URL" "refs/heads/dev:$FORGE_TMP_REF"
+  local forge_dev
+  forge_dev=$(git rev-parse "$FORGE_TMP_REF^{commit}")
+  git merge-base --is-ancestor "$MERGE_OID" "$forge_dev" ||
+    die "Forge merge $MERGE_OID is not in canonical Forge dev"
   local forge_target
   forge_target=$(validate_merged_selection "$MERGE_OID" "$SOURCE_OID")
   validate_commit_range "$forge_target" "$SOURCE_OID"
@@ -325,11 +329,8 @@ main() {
   git fetch --no-tags origin "refs/heads/dev:$ORIGIN_TMP_REF"
   local origin_oid
   origin_oid=$(git rev-parse "$ORIGIN_TMP_REF^{commit}")
-  # Reparenting destroys ancestry, so Git cannot infer this relationship. The
-  # third required argument is the operator's explicit cutover assertion that
-  # this Forge target's prerequisites are represented by this exact GitHub dev.
-  assert_cutover_mapping "$forge_target" "$origin_oid" "$EXPECTED_GITHUB_OID"
-  log "explicit cutover mapping: Forge target $forge_target -> GitHub dev $origin_oid"
+  assert_shared_dev_base "$forge_target" "$origin_oid"
+  log "shared dev history: Forge target $forge_target is represented by GitHub $origin_oid"
   git worktree add --detach "$MIRROR_WORKTREE" "$origin_oid" >/dev/null
   WORKTREE_ADDED=1
   assert_clean "$MIRROR_WORKTREE"

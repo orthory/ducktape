@@ -1,6 +1,7 @@
 // Desktop-only local git reader for the node's on-disk forge repository.
 // Writes stay on the consensus wire in forge-client.ts; these calls only
-// project committed refs (refs/heads/*, defaulting to main) through Tauri
+// project committed refs (refs/heads/*, preferring dev and falling back to
+// main on pre-migration repos) through Tauri
 // commands — plus forge_build_merge, which builds the client-computed merge
 // commit for MergePr in a throwaway repo without touching the node repo.
 
@@ -11,8 +12,8 @@ import { isTauri } from "./node-bootstrap";
 export interface RepoInfo {
   id: string;
   name: string;
-  branch: "main";
-  defaultBranch: "main";
+  branch: string;
+  defaultBranch: string;
   head: string | null;
   browsable: boolean;
 }
@@ -106,6 +107,7 @@ const desktopInvoke = <T>(command: string, args?: Record<string, unknown>): Prom
 /** One repo the node materialized under its forge base — its real on-disk name. */
 interface RepoMeta {
   name: string;
+  branch: string;
   head: string | null;
 }
 
@@ -115,8 +117,8 @@ export const forgeListRepos = (): Promise<RepoInfo[]> =>
     repos.map((repo) => ({
       id: repo.name,
       name: repo.name,
-      branch: "main",
-      defaultBranch: "main",
+      branch: repo.branch,
+      defaultBranch: repo.branch,
       head: repo.head,
       browsable: repo.head !== null,
     })),
@@ -131,7 +133,7 @@ export const forgeListBranches = (repo: string): Promise<BranchInfo[]> =>
 
 /**
  * Commit log, newest first. `reference` is a branch short name or 40-hex oid
- * (omit for main); omit `limit` for the full history.
+ * (omit for the integration branch); omit `limit` for the full history.
  */
 export const forgeLog = (
   repo: string,

@@ -78,7 +78,7 @@ describe("forge item msgs", () => {
     );
   });
 
-  it("encodes OpenPr with snake_case branches ('' targets main)", async () => {
+  it("encodes OpenPr with snake_case branches ('' targets dev)", async () => {
     const transport = stubTransport();
     await openPr(transport, {
       repo: "ducktape",

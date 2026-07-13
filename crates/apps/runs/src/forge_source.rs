@@ -4,7 +4,7 @@
 //! this module owns the three compose rules that make a forge item a SESSION:
 //! the per-item work branch (`agent/item-<n>` for issues, the PR's own source
 //! branch for PRs — that one rule IS the PR=session feature), the pinned base
-//! commit (the work-branch tip when born, else the main tip an issue forks
+//! commit (the work-branch tip when born, else the dev tip an issue forks
 //! from), and the requested `Pr` sink. everything here reads committed state
 //! at compose height (I1): item lookup and refs go through the ctx query lane
 //! with local serde MIRRORS of forge's wire types — `forge` stays a DEV-ONLY
@@ -21,10 +21,9 @@ use crate::facets::WireSink;
 use crate::sink::ForgeSinkQuery;
 use crate::{RunsModule, inject};
 
-/// the branch an issue run forks from and PRs default-target. forge has no
-/// per-repo default-branch state — "main" is its constant
-/// (`forge::refs::MAIN_BRANCH`, pinned by a dev-only conformance test).
-pub(crate) const MAIN_BRANCH: &str = "main";
+/// The branch an issue run forks from and task PRs target. `main` remains the
+/// explicit-release branch.
+pub(crate) const INTEGRATION_BRANCH: &str = "dev";
 
 /// the channel-id prefix of a forge item's hidden discussion channel
 /// (`forge::channel_id_for`): `forge:<repo>:<n>`.
@@ -241,11 +240,11 @@ impl RunsModule {
             // the branch is born: the session continues — fork ITS tip.
             Some(tip) => (tip, true),
             None => match item.kind {
-                // first run for an issue: fork the main tip; the provisioner
+                // first run for an issue: fork the dev tip; the provisioner
                 // creates the branch (zero-oid CAS base).
                 ForgeItemKind::Issue => (
-                    tip(MAIN_BRANCH).ok_or_else(|| {
-                        format!("repo {repo} has no {MAIN_BRANCH} branch to fork")
+                    tip(INTEGRATION_BRANCH).ok_or_else(|| {
+                        format!("repo {repo} has no {INTEGRATION_BRANCH} branch to fork")
                     })?,
                     false,
                 ),
@@ -261,15 +260,15 @@ impl RunsModule {
             },
         };
         // 5. the requested sink: a PR of the work branch onto the item's
-        //    target (issues target main). title/body stay empty — delivery
+        //    target (issues target dev). title/body stay empty — delivery
         //    derives them from the message facet.
         let target_branch = match item.kind {
             ForgeItemKind::Pr => item
                 .target_branch
                 .clone()
                 .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| MAIN_BRANCH.to_string()),
-            ForgeItemKind::Issue => MAIN_BRANCH.to_string(),
+                .unwrap_or_else(|| INTEGRATION_BRANCH.to_string()),
+            ForgeItemKind::Issue => INTEGRATION_BRANCH.to_string(),
         };
         let sink = WireSink::Pr {
             repo: repo.to_string(),
@@ -402,8 +401,8 @@ mod tests {
     // ---- mirror conformance (dev-only, against the real forge codec) ----------
 
     #[test]
-    fn main_branch_const_matches_forge() {
-        assert_eq!(MAIN_BRANCH, forge::refs::MAIN_BRANCH);
+    fn integration_branch_const_matches_forge() {
+        assert_eq!(INTEGRATION_BRANCH, forge::refs::INTEGRATION_BRANCH);
     }
 
     #[test]
@@ -541,7 +540,7 @@ mod tests {
                 head: "ab".repeat(20),
             },
             forge::RefHead {
-                name: "main".into(),
+                name: "dev".into(),
                 head: "cd".repeat(20),
             },
         ]));
@@ -549,7 +548,7 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].name, "agent/item-7");
         assert_eq!(refs[0].head, "ab".repeat(20));
-        assert_eq!(refs[1].name, "main");
+        assert_eq!(refs[1].name, "dev");
         assert_eq!(refs[1].head, "cd".repeat(20));
     }
 }

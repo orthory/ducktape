@@ -9,7 +9,7 @@ import { ActionButton, CenterNote, inputStyle } from "../ui";
 import { ItemDetailPanel } from "./ItemDetailPanel";
 import { ItemRow, StateFilterTabs } from "./shared";
 
-const TARGET_BRANCH = "main";
+const TARGET_BRANCH = "dev";
 
 function preferredTarget(branches: { name: string }[], sourceBranch: string): string {
   const candidates = branches.filter((branch) => branch.name !== sourceBranch);
