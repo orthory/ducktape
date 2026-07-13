@@ -426,8 +426,10 @@ impl NatClient {
 
     /// Fetch and reassemble a shelved blob. `Ok(None)` = the coordinator
     /// answered "unknown id" (the link is dead — expired, evicted, or a
-    /// coordinator restart). The reassembled bytes are verified against `id`
-    /// (content addressing), so a tampered shelf is a hard error.
+    /// coordinator restart). The id is a random lookup key, not a content hash,
+    /// so there is nothing to check the bytes against here — integrity rests on
+    /// the blob's envelope signature, which the caller verifies by running
+    /// `decode_invite` on the reassembled bytes.
     pub async fn invite_fetch(&self, id: [u8; INVITE_ID_LEN]) -> std::io::Result<Option<Vec<u8>>> {
         // chunk 0 first: it carries the real `total` (0 means unknown id).
         let (first, total) = self.fetch_chunk(id, 0).await?;
@@ -448,12 +450,6 @@ impl NatClient {
         for chunk in 1..total {
             let (bytes, _) = self.fetch_chunk(id, chunk).await?;
             whole.extend_from_slice(&bytes);
-        }
-        if crate::invite_store::invite_id(&whole) != id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "coordinator returned tampered bytes for this short invite",
-            ));
         }
         Ok(Some(whole))
     }
@@ -1285,7 +1281,7 @@ mod tests {
             NodeKey(k)
         };
 
-        // the inviter publishes a multi-chunk blob under its content id.
+        // the inviter publishes a multi-chunk blob under a random lookup id.
         let inviter_signer = ed25519::PrivateKey::from_seed(11);
         let inviter = NatClient::bind_multi_auth(
             node_key(&inviter_signer),
@@ -1296,7 +1292,7 @@ mod tests {
         .await
         .unwrap();
         let blob = (0..2500u32).map(|i| i as u8).collect::<Vec<u8>>();
-        let id = crate::invite_store::invite_id(&blob);
+        let id = [0x11; INVITE_ID_LEN];
         assert!(
             timeout(
                 Duration::from_secs(5),
@@ -1323,7 +1319,7 @@ mod tests {
             .expect("fetch");
         assert_eq!(fetched, Some(blob));
         // an unknown id is the honest "link is dead" None.
-        let missing = timeout(Duration::from_secs(5), joiner.invite_fetch([0xEE; 16]))
+        let missing = timeout(Duration::from_secs(5), joiner.invite_fetch([0xEE; INVITE_ID_LEN]))
             .await
             .expect("no timeout")
             .expect("fetch");

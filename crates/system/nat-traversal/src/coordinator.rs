@@ -1097,7 +1097,7 @@ mod tests {
     #[test]
     fn authenticated_put_then_gets_reassemble_the_blob() {
         use crate::auth::{AuthPolicy, now_secs, sign_authenticator};
-        use crate::invite_store::invite_id;
+        use crate::wire::INVITE_ID_LEN;
         use commonware_cryptography::{Signer as _, ed25519};
 
         let node = ed25519::PrivateKey::from_seed(1);
@@ -1109,7 +1109,7 @@ mod tests {
         let src = addr(1, 1111);
 
         let blob = vec![0xAB; 1500];
-        let id = invite_id(&blob);
+        let id = [0xCD; INVITE_ID_LEN]; // a random lookup key, not a content hash
         let put = Msg::InvitePut {
             key: caller,
             id,
@@ -1150,7 +1150,8 @@ mod tests {
     #[test]
     fn an_underpadded_get_and_an_unknown_id_answer_safely() {
         use crate::auth::{AuthPolicy, now_secs, sign_authenticator};
-        use crate::invite_store::{GET_BURST, invite_id};
+        use crate::invite_store::GET_BURST;
+        use crate::wire::INVITE_ID_LEN;
         use commonware_cryptography::{Signer as _, ed25519};
 
         let joiner = ed25519::PrivateKey::from_seed(9);
@@ -1160,14 +1161,14 @@ mod tests {
         let now = now_secs();
         let mut c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
         let src = addr(3, 3333);
-        let send_get = |c: &mut Coordinator, id: [u8; 16], chunk: u16, pad: u16| {
+        let send_get = |c: &mut Coordinator, id: [u8; INVITE_ID_LEN], chunk: u16, pad: u16| {
             let get = Msg::InviteGet { key: caller, id, chunk, pad };
             let auth = sign_authenticator(&joiner, &get.encode(), now, None);
             c.handle_auth(src, AuthRequest { caller, inner: get, auth }, now)
         };
 
         // pad below the floor → DROPPED, no reply (no reflection amplification).
-        let id = invite_id(&[1, 2, 3]);
+        let id = [0x2b; INVITE_ID_LEN];
         assert!(send_get(&mut c, id, 0, crate::wire::INVITE_GET_PAD - 1).is_empty());
 
         // unknown id, properly padded → total 0: the honest "link is dead" signal.

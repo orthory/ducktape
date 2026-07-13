@@ -496,27 +496,27 @@ pub const SHORT_INVITE_SCHEME: &str = "🦆://";
 
 /// `🦆://<name>/<base64url(id)>` — `name` is the chain_id's human half (the
 /// part before `#<salt>`).
-pub fn short_invite_url(chain_id: &str, id: &[u8; 16]) -> String {
+pub fn short_invite_url(chain_id: &str, id: &[u8; nat_traversal::INVITE_ID_LEN]) -> String {
     use base64::Engine as _;
     let name = chain_id.split('#').next().unwrap_or(chain_id);
     format!("{SHORT_INVITE_SCHEME}{name}/{}", INVITE_B64.encode(id))
 }
 
 /// parse a short url -> `(name, id)`. `None` when `s` is not the short scheme
-/// or the id is not exactly 16 base64url bytes.
-pub fn parse_short_invite(s: &str) -> Option<(String, [u8; 16])> {
+/// or the id is not exactly [`nat_traversal::INVITE_ID_LEN`] base64url bytes.
+pub fn parse_short_invite(s: &str) -> Option<(String, [u8; nat_traversal::INVITE_ID_LEN])> {
     use base64::Engine as _;
     let rest = s.trim().strip_prefix(SHORT_INVITE_SCHEME)?;
     let (name, id_b64) = rest.split_once('/')?;
     if name.is_empty() {
         return None;
     }
-    let id: [u8; 16] = INVITE_B64.decode(id_b64).ok()?.try_into().ok()?;
+    let id: [u8; nat_traversal::INVITE_ID_LEN] = INVITE_B64.decode(id_b64).ok()?.try_into().ok()?;
     Some((name.to_string(), id))
 }
 
 /// the decoded (raw) bytes of an encoded `🦆<base64>` blob — what the
-/// coordinator shelves and what [`invite_blob_id`] hashes.
+/// coordinator shelves under a random lookup id.
 pub fn invite_blob_bytes(blob: &str) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
     let body = blob
@@ -536,11 +536,15 @@ pub fn wrap_invite_bytes(raw: &[u8]) -> String {
     format!("{INVITE_PREFIX}{}", INVITE_B64.encode(raw))
 }
 
-/// the content id of an encoded `🦆<base64>` blob: the coordinator's own
-/// `invite_id` (sha256 of the decoded bytes, first 16). Using the shelf's
-/// hasher guarantees the published id matches what the coordinator indexes.
-pub fn invite_blob_id(blob: &str) -> Result<[u8; 16], String> {
-    Ok(nat_traversal::invite_id(&invite_blob_bytes(blob)?))
+/// a fresh OS-random lookup id for shelving an invite on the coordinator. The
+/// id is NOT derived from the blob — a content hash this short (4 bytes) is
+/// brute-forceable, so a random key + owner-gated puts is what keeps an
+/// attacker from substituting a victim's shelved invite. Integrity of the
+/// fetched blob rests on its envelope signature (`decode_invite`), not the id.
+pub fn random_invite_id() -> [u8; nat_traversal::INVITE_ID_LEN] {
+    let mut id = [0u8; nat_traversal::INVITE_ID_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    id
 }
 
 /// a throwaway OS-random signer for read-only coordinator fetches (the short
@@ -1341,7 +1345,7 @@ mod tests {
 
     #[test]
     fn short_invite_url_roundtrips_and_rejects_junk() {
-        let id = [0x5a; 16];
+        let id = [0x5a; nat_traversal::INVITE_ID_LEN];
         let url = short_invite_url("ducktape#a1b2c3d4", &id);
         assert!(url.starts_with("🦆://ducktape/"), "{url}");
         assert_eq!(parse_short_invite(&url), Some(("ducktape".into(), id)));
@@ -1352,25 +1356,21 @@ mod tests {
     }
 
     #[test]
-    fn invite_blob_id_is_the_content_hash_of_the_decoded_bytes() {
+    fn random_invite_id_is_fresh_and_blob_bytes_roundtrip() {
+        // the lookup id is random, not derived from the blob: two draws differ.
+        assert_ne!(random_invite_id(), random_invite_id());
+
+        // the fetch/join path re-wraps the raw shelved bytes to the exact blob.
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let mint = || {
-            mint_invite_token(
-                &issuer,
-                d.genesis_namespace().as_bytes(),
-                &issuer.public_key(),
-                InviteRole::Resident,
-                u64::MAX,
-            )
-        };
-        let blob = encode_invite(&d, &mint(), None, &[], &issuer).expect("encode");
-        let id = invite_blob_id(&blob).expect("id");
-        // stable under re-parse, changes when the blob changes (fresh nonce).
-        assert_eq!(id, invite_blob_id(&blob).unwrap());
-        let other = encode_invite(&d, &mint(), None, &[], &issuer).unwrap();
-        assert_ne!(id, invite_blob_id(&other).unwrap());
-        // the raw bytes re-wrap to the exact original blob (fetch/join path).
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            &issuer.public_key(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
+        let blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
         assert_eq!(wrap_invite_bytes(&invite_blob_bytes(&blob).unwrap()), blob);
     }
 }

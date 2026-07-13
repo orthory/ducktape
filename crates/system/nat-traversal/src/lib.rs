@@ -28,7 +28,7 @@ pub use client::{
     run_coordinator, run_coordinator_with, run_coordinator_workers_with_metrics,
 };
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
-pub use invite_store::{InviteStore, PutOutcome, invite_id};
+pub use invite_store::{InviteStore, PutOutcome};
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 #[cfg(any(test, feature = "simnat"))]
