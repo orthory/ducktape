@@ -1160,7 +1160,7 @@ mod tests {
         let now = now_secs();
         let mut c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
         let src = addr(3, 3333);
-        let mut send_get = |c: &mut Coordinator, id: [u8; 16], chunk: u16, pad: u16| {
+        let send_get = |c: &mut Coordinator, id: [u8; 16], chunk: u16, pad: u16| {
             let get = Msg::InviteGet { key: caller, id, chunk, pad };
             let auth = sign_authenticator(&joiner, &get.encode(), now, None);
             c.handle_auth(src, AuthRequest { caller, inner: get, auth }, now)

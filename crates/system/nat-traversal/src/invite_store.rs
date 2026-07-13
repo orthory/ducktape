@@ -86,8 +86,8 @@ impl InviteStore {
         self.entries.retain(|_, e| e.expires > now);
 
         // re-putting an existing id is idempotent republish — never quota'd.
-        if self.entries.contains_key(&id) {
-            self.entries.insert(id, Entry { blob, expires, owner });
+        if let Some(slot) = self.entries.get_mut(&id) {
+            *slot = Entry { blob, expires, owner };
             return PutOutcome::Replaced;
         }
 
@@ -100,15 +100,14 @@ impl InviteStore {
         }
 
         // global backstop: at the cap, evict the soonest-to-expire entry.
-        if self.entries.len() >= MAX_INVITES {
-            if let Some(stale) = self
+        if self.entries.len() >= MAX_INVITES
+            && let Some(stale) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.expires)
                 .map(|(k, _)| *k)
-            {
-                self.entries.remove(&stale);
-            }
+        {
+            self.entries.remove(&stale);
         }
 
         self.entries.insert(id, Entry { blob, expires, owner });
@@ -136,15 +135,15 @@ impl InviteStore {
     /// silently. A fresh IP starts with a full burst.
     pub fn allow_get(&mut self, src_ip: IpAddr, now: u64) -> bool {
         // at the bucket cap, make room by evicting the stalest tracked IP.
-        if !self.gets.contains_key(&src_ip) && self.gets.len() >= MAX_GET_BUCKETS {
-            if let Some(stalest) = self
+        if !self.gets.contains_key(&src_ip)
+            && self.gets.len() >= MAX_GET_BUCKETS
+            && let Some(stalest) = self
                 .gets
                 .iter()
                 .min_by_key(|(_, (_, last))| *last)
                 .map(|(k, _)| *k)
-            {
-                self.gets.remove(&stalest);
-            }
+        {
+            self.gets.remove(&stalest);
         }
         let bucket = self.gets.entry(src_ip).or_insert((GET_BURST as f64, now));
         let refill = now.saturating_sub(bucket.1) as f64 * GET_RATE_PER_SEC as f64;
