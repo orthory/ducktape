@@ -371,8 +371,9 @@ pub(crate) fn tart_plan(
     setup.push("set +e".into());
     setup.push(command);
     setup.push("status=$?".into());
+    // Tart virtiofs rejects mtime updates on the shared root (-O).
     setup.push(format!(
-        "rsync -a --delete {}/ {}/ >/dev/null 2>&1 || sync_status=$?",
+        "rsync -aO --delete {}/ {}/ >/dev/null 2>&1 || sync_status=$?",
         shell_quote(&guest_workdir.display().to_string()),
         shell_quote(&mounted_workdir.display().to_string())
     ));
@@ -562,7 +563,7 @@ mod tests {
 
         let script = &plan.guest_script;
         assert!(script.contains("cp -R"), "{script}");
-        assert!(script.contains("rsync -a --delete"), "{script}");
+        assert!(script.contains("rsync -aO --delete"), "{script}");
         assert!(
             script.contains("/Volumes/My Shared Files/dt1/claude"),
             "{script}"
