@@ -53,7 +53,6 @@ use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
 mod agent_plane;
-mod blob_fetch;
 mod boot;
 mod cli;
 mod cli_flags;

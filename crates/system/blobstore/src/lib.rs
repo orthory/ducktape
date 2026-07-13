@@ -11,6 +11,13 @@
 //! bytes no longer hash to its name is a miss (plus a warning), never bad
 //! bytes served. persistence is additive durability only — blobs stay
 //! node-local staging, and nothing consensus-visible changes.
+//!
+//! SCOPE IS FROZEN (2026-07-13 storage-plane review): this crate stays a
+//! dumb node-local receipt store. anything needing replication, GC,
+//! authority, or auditability belongs in duckfs (module id `files`) — two
+//! prior attempts to grow shared-byte planes beside duckfs (the `memory`
+//! module, the prompt-blob mesh lane) were both deleted after converging on
+//! duckfs. don't start a third.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -17,7 +17,6 @@ use commonware_runtime::{Clock, IoBuf, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
 
-use crate::blob_fetch;
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
@@ -156,30 +155,15 @@ pub(super) async fn park(
         );
         std::process::exit(1);
     }
-    // the resident's mesh blob fetch-on-miss lane (the #298 cross-node
-    // gap, resident side): the oracle pool's resolver asks current peers
-    // for a digest its own store lacks, over this same statesync channel.
-    // the park loop's sync client owns the channel receiver, so OUR fetch
-    // answers route back through its unmatched-frame hook below — blob
-    // rpc ids are top-bit-set random, disjoint from the client's small
-    // sequential ids by construction. residents deliberately run no serve
-    // loop (only validators answer this channel): fetch/client side only.
-    let blob_pending: blob_fetch::PendingMap = Default::default();
-    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(peers.clone()));
     // the joiner's sync client: the mesh path, ROTATING across every
-    // validator that can serve.
+    // validator that can serve. no unmatched-frame hook: drop-on-miss
+    // (the blob fetch lane that consumed those frames is retired).
     let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
         sync_sources.clone(),
-        // classify_mesh_frame consumes OUR blob answers into their
-        // oneshot waiters; anything else (a stray, junk) drops — a
-        // resident serves nothing.
-        Some(std::sync::Arc::new(move |id, body: &[u8]| {
-            let _ = blob_fetch::classify_mesh_frame(&blob_pending, id, body);
-        })),
+        None,
     );
 
     // the announce, built once: this key + the invite token + the
@@ -1073,11 +1057,6 @@ pub(super) async fn park(
                     // the new epoch's mesh must admit its members.
                     let mesh =
                         joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes);
-                    // the blob fetch-on-miss lane fans out to the same
-                    // tracked set — follow the re-track (the validator
-                    // drain's exact discipline).
-                    *blob_peers.write().expect("blob peers lock") =
-                        mesh.iter().cloned().collect();
                     oracle.track(plan.epoch(), mesh);
                     if let Some(book) = &gateway_book {
                         book.set_peers(plan.valset().transport_members().iter());
@@ -1266,9 +1245,6 @@ pub(super) async fn park(
                 );
             }
             let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
-            // the blob fetch-on-miss lane fans out to the same tracked
-            // set — follow the re-track.
-            *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
             oracle.track(tip.epoch, mesh);
             if gateway_book.is_some() || agent_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip

@@ -13,8 +13,8 @@ generic storage. Every node holds every byte as consensus state (full
 replication — bytes travel through blocks). CoW snapshots define byte-exact
 inputs for sandboxed workloads; commits define atomic output diffs; the history
 answers what a job saw, what it changed, and how to reproduce or audit it. A
-checkout/commit engine materializes subtrees onto the real OS filesystem; a
-FUSE mount fronts a working copy. The `memory` module's filesystem-shaped verb
+checkout/commit engine materializes subtrees onto the real OS filesystem. The
+`memory` module's filesystem-shaped verb
 surface (ls / stat / read / find / grep, watches, generations, citable URIs) is
 absorbed into duckfs and `memory` is deleted.
 
@@ -89,7 +89,7 @@ over it is the product decision that sandboxed agent workspaces are real.
 | History model | CoW snapshots (immutable, git/ZFS-like); no in-place mutation |
 | Relationship to `memory` | duckfs absorbs it; `memory` deleted in the same wave |
 | Size envelope | Disk-limited — no designed total ceiling; caps protect liveness, not capacity |
-| Wave scope | Consensus module + checkout/commit engine + FUSE mount |
+| Wave scope | Consensus module + checkout/commit engine (FUSE mount cut in the 2026-07-13 revision below) |
 | Write authority | Owner-gated home subtrees: `/home/<owner>/**` (owner only), `/shared/**` (any member), system writes anywhere |
 | Name | duckfs (module id `files` unchanged) |
 | Product identity | Reproducible execution filesystem: snapshot inputs, atomic output diffs, citable history; not NAS, Git, or a generic blob store |
@@ -121,7 +121,7 @@ version-pinned into the node binary (the forge/libgit2 precedent); disk
 persistence sits *below* the root computation (the root hashes logical
 content, never storage layout — the kv/qmdb precedent).
 
-OS-specific code (checkout/commit materialization, FUSE) lives strictly on the
+OS-specific code (checkout/commit materialization) lives strictly on the
 client side of the wire. The only thing that crosses the wire is an op with
 explicit bytes and canonical paths, applied identically by every validator.
 Cross-OS quirks (APFS case-insensitivity, NFD normalization, mtime
@@ -217,8 +217,8 @@ never enters the root preimage (unchanged house discipline).
 
 ### Read queries (committed state; all snapshot-addressable)
 
-`Stat`, `Ls` (cursor-paged), `Read { path, offset, len }` (byte-range,
-FUSE-ready), `Find`, `Grep` (budgeted scan, cursor-paged), `History`,
+`Stat`, `Ls` (cursor-paged), `Read { path, offset, len }` (byte-range),
+`Find`, `Grep` (budgeted scan, cursor-paged), `History`,
 `Diff { from, to, prefix }`, `Refs`. Query pages clamp at 256 entries with a
 cursor for continuation (fixes the old un-paginatable `List`). Grep hits carry
 `duck://files/<path>@<snapshot>#L<line>` evidence URIs (continuing memory's
@@ -356,19 +356,22 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
 - Daemon RPC: sandbox lifecycle — create-workspace (managed checkout under the
   node data dir), commit-and-close. This is the seam the jobs/agent modules
   use to give a sandbox a reproducible, isolated workspace on any node.
-- CLI: `ducktape fs ls|cat|stat|checkout|status|commit|history|diff|pin|mount`.
+- CLI: `ducktape fs ls|cat|stat|checkout|status|commit|history|diff|pin`.
 
-### FUSE mount
+### Mount surface — CUT (2026-07-13 revision)
 
-`ducktape fs mount <prefix> <dir> [--snapshot X] [--rw] [--auto-commit=Ns]`.
-
-- Reads serve from the local odb: any snapshot, instant, no network.
-- `--rw` fronts a working copy: writes land locally and become cluster truth
-  only on commit (explicit by default; interval auto-commit opt-in).
-- Built on the `fuser` crate behind a `fuse` cargo feature; fuse3 on Linux
-  (CI-tested), macFUSE on macOS (best-effort, manual).
-- Documented non-goals: cross-node lock coherence, mmap coherence, POSIX
-  permissions fidelity.
+The FUSE `mount` verb was built to smoke level in wave 1 (`bin/fs`, opt-in
+`fuse` feature, e2e at e7b4e1d1) and REMOVED in this revision; no
+watch/auto-commit daemon replaces it. Both consumers a mount would serve are
+already covered without kernel surface: agent workspaces get explicit
+checkout → run → commit (run boundary = commit boundary, which is better for
+reproducibility than background auto-commit snapshotting mid-run noise), and
+human sharing goes through FilesView/HTTP upload. Lazy reads buy nothing
+under full replication (bytes are already local), and macFUSE's kext
+approval flow is a product-killer on macOS. The `NodeApi` trait seam in
+`duckfs-client` stays — it is the adapter point if genuine mount demand ever
+appears (NFS loopback or FSKit before resurrecting FUSE; a folder-sync watch
+daemon is a ~day of work on top of the existing scan/status/commit engine).
 
 ## Caps (execute-time rejection)
 
@@ -391,7 +394,7 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
 
 ## Operational realities (read before being surprised)
 
-1. A `--rw` FUSE mount is not a shared disk: writes are invisible cluster-wide
+1. A working copy is not a shared disk: writes are invisible cluster-wide
    until commit; concurrent same-path edits meet as commit conflicts. duckfs
    is an execution workspace with commit discipline, not NFS.
 2. Ingest speed is consensus speed: capacity is disk-limited but throughput is
@@ -418,8 +421,6 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
   possession; app-hash continuity across all of the above.
 - **Client:** checkout/commit round-trip; conflict + auto-rebase + genuine
   conflict report; cross-OS path edges (NFC forms, simulated case collision).
-- **FUSE:** Linux CI smoke behind the `fuse` feature — mount, write, commit,
-  read back from a second node.
 - **App:** FilesView + files-client vitest suites.
 
 ## Out of scope (deferred, seams reserved)
@@ -429,8 +430,33 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
   replication-policy change later. Full replication is the wave-1 policy.
 - **Content-defined chunking (FastCDC):** fixed 1 MiB chunks for wave 1;
   CDC would improve dedup for in-place edits of large files.
-- **FUSE beyond smoke:** locks, mmap coherence, permission fidelity.
 - **Auto-merge of conflicting commits.**
+- **Partial replication / attestation:** if some content should NOT live on
+  every node, the answer is the pointer pattern first (a small consensus
+  manifest referencing node-local bytes, the forge-objects precedent);
+  possession attestation only if that proves insufficient.
+
+## Revision 2026-07-13 (post-review deltas)
+
+Settled in the storage-plane review; these amend the sections above.
+
+- **FUSE mount: cut** (see Mount surface) — the wave-1 smoke-level
+  implementation is deleted from `bin/fs`. A folder-sync watch daemon is also
+  not built — demand-gated, cheap to add later on the existing client engine.
+- **Prerequisites for exposing duckfs beyond a trusted team network** (not
+  wave-1 blockers, but named so nobody ships public without them):
+  1. **Auth on the noded `/v1/files` lane.** Everything rides
+     `DEFAULT_ORIGIN` today; the lane must authenticate callers and stamp the
+     real origin (reuse the agent session-key plane) before `/home/<owner>`
+     authority means anything over HTTP.
+  2. **Per-owner committed-storage quota.** Staging has a 1 GiB/owner cap but
+     committed state has none; an owner can grow the replicated tree without
+     bound. Enforcing a committed-bytes budget per owner at execute time
+     changes op admission = **flag day** (named here so it can ride the next
+     scheduled one).
+- **S3-shaped facade** over the existing module (PUT = one-change commit,
+  GET = Read, LIST = Ls) is the sanctioned "replicated S3" surface — new
+  endpoints only, no engine change.
 
 ## Implementation shape (for the planning step)
 

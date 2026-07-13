@@ -23,7 +23,7 @@ use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::reachability_plane::wire_reachability_plane;
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
-use crate::{blob_fetch, voice, voice_plane};
+use crate::{voice, voice_plane};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -52,7 +52,6 @@ pub(super) struct RuntimeWiring {
     pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
-    pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -80,7 +79,6 @@ pub(super) async fn finish(
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
-    blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
     mut mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
@@ -180,21 +178,6 @@ pub(super) async fn finish(
     // flood degrades to retries instead of unbounded memory.
     let (bridge_tx, sync_ingress) =
         futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-    // the blob fetch-on-miss lane (the #298 prompt-blob cross-node gap):
-    // the oracle pool's resolver asks current peers for a digest its own
-    // store lacks, over this same statesync channel. the pending map is
-    // the serve loop's demux — frames answering OUR fetches never enter
-    // the request path — and the peer set follows every cutover re-track
-    // beside the other planes' books.
-    let blob_pending: blob_fetch::PendingMap = Default::default();
-    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(
-            initial_member_keys
-                .iter()
-                .chain(initial_resident_keys.iter())
-                .cloned()
-                .collect(),
-        ));
     context.child("sync_ingress").spawn(move |_ctx| {
         let mut receiver = sync_rx;
         let mut bridge_tx = bridge_tx;
@@ -249,8 +232,6 @@ pub(super) async fn finish(
         let state_tx = sync_state_tx;
         let mut sync_tx = sync_tx;
         let mut ingress = sync_ingress;
-        let blob_pending = blob_pending.clone();
-        let sync_blobs = blobs.clone();
         context
             .child("statesync_serve")
             .spawn(move |_ctx| async move {
@@ -261,27 +242,15 @@ pub(super) async fn finish(
                     let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
-                    // the mesh demux: OUR fetch answers are consumed,
-                    // stray responses (a blob answer landing after its
-                    // fan-out's sweep) and unparseable frames are
-                    // DROPPED — answering either is how two serve
-                    // loops bounce Error frames forever. only a real
-                    // request proceeds.
-                    let req = match blob_fetch::classify_mesh_frame(&blob_pending, rpc_id, body) {
-                        blob_fetch::MeshFrame::OurResponse
-                        | blob_fetch::MeshFrame::StrayResponse
-                        | blob_fetch::MeshFrame::Junk => continue,
-                        blob_fetch::MeshFrame::Request(req) => req,
+                    // only a decodable REQUEST proceeds. everything else —
+                    // a stray response, version skew, junk — is DROPPED,
+                    // never answered: answering non-requests is how two
+                    // serve loops bounce Error frames forever.
+                    let Ok(req) = statesync::decode_request(body) else {
+                        continue;
                     };
                     let req_kind = req.kind_name();
-                    let resp = match req {
-                        // blob fetches are host state — answered from the
-                        // node-local store, never routed into SyncServer.
-                        statesync::SyncRequest::Blob { digest } => {
-                            blob_fetch::serve_blob(&sync_blobs, &digest)
-                        }
-                        req => drive_sync_request(&mut server, &state_tx, req).await,
-                    };
+                    let resp = drive_sync_request(&mut server, &state_tx, req).await;
                     let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
                     // the serve-lane observation (`ducktape_statesync_serve_*`):
                     // who pulled what, and the progression the response
@@ -345,7 +314,6 @@ pub(super) async fn finish(
         mesh_oracle,
         channel_bank,
         gateway_book,
-        blob_peers,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
