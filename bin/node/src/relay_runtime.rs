@@ -437,6 +437,7 @@ impl ValidatorRelay {
         msg: relay::RelayMsg,
         members: &[Vec<u8>],
         residents: &[Vec<u8>],
+        clients: &[Vec<u8>],
         relay_tx: &mut S,
     ) -> Option<ValidatorAction>
     where
@@ -552,7 +553,7 @@ impl ValidatorRelay {
                 })
             }
             relay::RelayMsg::Submit { frame } => {
-                let frame_id = match relay::verify_relay_submit(&frame, residents) {
+                let frame_id = match relay::verify_relay_submit(&frame, residents, clients) {
                     Ok(id) => id,
                     Err(detail) => {
                         send_reply(

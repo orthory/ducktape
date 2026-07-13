@@ -10,7 +10,9 @@ use sdk::Msg;
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
-use crate::host_reads::{read_redemptions_from_host, read_valset_members, read_valset_residents};
+use crate::host_reads::{
+    read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
+};
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
 };
@@ -399,17 +401,23 @@ impl ValidatorRuntime<'_> {
             msg,
             relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
         );
-        let (members_now, residents_now) = if needs_standing {
+        let (members_now, residents_now, clients_now) = if needs_standing {
             (
                 read_valset_members(node.host()).await,
                 read_valset_residents(node.host()).await,
+                read_clients(node.host()).await,
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
-        let Some(action) =
-            validator_relay.on_message(peer, msg, &members_now, &residents_now, relay_tx)
-        else {
+        let Some(action) = validator_relay.on_message(
+            peer,
+            msg,
+            &members_now,
+            &residents_now,
+            &clients_now,
+            relay_tx,
+        ) else {
             return;
         };
         match action {

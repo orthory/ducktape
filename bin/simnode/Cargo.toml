@@ -38,6 +38,7 @@ files = { workspace = true }
 # coordinator whose registration makes the host-injected boundary tick ride.
 kv = { workspace = true }
 valset = { workspace = true }
+clients = { workspace = true }
 governance = { workspace = true }
 upgrade = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.

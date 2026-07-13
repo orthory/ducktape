@@ -1789,6 +1789,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clients"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "futures",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4333,6 +4347,7 @@ name = "governance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clients",
  "commonware-codec",
  "commonware-cryptography",
  "futures",
@@ -5960,6 +5975,7 @@ dependencies = [
  "capability-host",
  "chacha20poly1305",
  "chat",
+ "clients",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
@@ -8892,6 +8908,7 @@ dependencies = [
  "axum",
  "blobstore",
  "chat",
+ "clients",
  "commonware-cryptography",
  "commonware-runtime",
  "dispatch",

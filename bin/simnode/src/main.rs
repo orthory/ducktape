@@ -136,6 +136,7 @@ use sdk::{Effect, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
 use upgrade::Upgrade;
+use clients::Clients;
 use valset::Valset;
 
 /// the DEFAULT module set registered at genesis, in registry order — noded's
@@ -166,7 +167,7 @@ const BASE_MODULE_IDS: [&str; 16] = [
 /// with the genesis validators, governance (the sole authorized author of
 /// valset change), and the upgrade coordinator — whose mere registration makes
 /// the host-injected once-per-block boundary `Advance` ride every sim block.
-const VALSET_MODULE_IDS: [&str; 4] = ["kv", "valset", "governance", "upgrade"];
+const VALSET_MODULE_IDS: [&str; 5] = ["kv", "valset", "clients", "governance", "upgrade"];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
 
@@ -631,11 +632,16 @@ fn run_sim(
             for key in &valset_keys {
                 valset.insert(key.clone());
             }
+            // the client ACL, seeded empty — a redeemed role=Client invite
+            // records a key here (governance emits ClientsMsg::Grant).
+            let clients = Clients::new("clients");
             let governance = Governance::new("governance", "valset", "upgrade", "identity")
-                .with_invite_binding(invite_binding);
+                .with_invite_binding(invite_binding)
+                .with_clients("clients");
             let upgrade = Upgrade::new("upgrade", "valset");
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));
+            modules.push(Box::new(clients));
             modules.push(Box::new(governance));
             modules.push(Box::new(upgrade));
         }
