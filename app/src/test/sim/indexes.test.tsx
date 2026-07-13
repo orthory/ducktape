@@ -9,8 +9,8 @@
 import { act, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import { simnodeBinary } from "../../test/simnode-harness";
-import { useSimScenario } from "../../test/sim-scenario";
+import { simnodeBinary } from "../simnode-harness";
+import { useSimScenario } from "../sim-scenario";
 
 const bin = simnodeBinary();
 if (!bin) {
