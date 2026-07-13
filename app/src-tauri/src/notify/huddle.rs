@@ -40,6 +40,7 @@ pub(super) fn match_huddle_join(
         format!("Huddle started in #{channel}"),
         format!("{} started a huddle", display_name(ctx, joiner)),
         channel,
+        None,
     ))
 }
 

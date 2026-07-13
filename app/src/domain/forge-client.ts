@@ -86,6 +86,34 @@ export const parseItemChannelId = (
   return { repo, number };
 };
 
+/** A user-facing Forge destination. Hidden discussion-channel ids are accepted
+ * only at this boundary and never escape in the returned route. */
+export interface ForgeItemTarget {
+  repo: string;
+  number: number;
+  messageId?: string;
+  messageSeq?: number;
+}
+
+/** Build the one public route used by notification clicks and stable `@seq`
+ * anchors such as Agent History. */
+export const forgeItemTarget = (
+  channelId: string,
+  anchor: { messageId?: string | null; messageSeq?: number | null } = {},
+): ForgeItemTarget | null => {
+  const item = parseItemChannelId(channelId);
+  if (!item) return null;
+  const messageId = anchor.messageId?.trim();
+  const messageSeq = anchor.messageSeq;
+  return {
+    ...item,
+    ...(messageId ? { messageId } : {}),
+    ...(Number.isInteger(messageSeq) && (messageSeq ?? 0) > 0
+      ? { messageSeq: messageSeq as number }
+      : {}),
+  };
+};
+
 // ── Msgs (writes — one commit per submit) ───────────────
 
 export const commit = (

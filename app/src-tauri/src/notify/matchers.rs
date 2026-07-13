@@ -29,6 +29,10 @@ pub struct Notification {
     /// Channel used for focus suppression and mute filtering. Runs, forge, and
     /// governance notifications have no channel and use `None`.
     pub channel_id: Option<String>,
+    /// The posted message that caused a Chat mention/reply. Kept separately
+    /// from the hidden Forge discussion channel so the UI can focus the public
+    /// item's matching discussion row.
+    pub message_id: Option<String>,
 }
 
 pub struct MatcherCtx<'a> {
@@ -124,6 +128,7 @@ fn match_message(
     }
 
     let channel = message.get("channel_id")?.as_str()?;
+    let message_id = message.get("message_id")?.as_str()?;
     let blocks = message.get("blocks")?;
     blocks.as_array()?;
     let thread = match message.get("thread")? {
@@ -143,6 +148,7 @@ fn match_message(
             format!("{name} mentioned you in #{channel}"),
             decode::blocks_preview(blocks, 140),
             channel,
+            Some(message_id),
         ));
     }
 
@@ -157,6 +163,7 @@ fn match_message(
         format!("{name} replied to your thread in #{channel}"),
         decode::blocks_preview(blocks, 140),
         channel,
+        Some(message_id),
     ))
 }
 
@@ -185,6 +192,7 @@ fn match_run(op: &OpRow) -> Option<Notification> {
         title: title.to_string(),
         body,
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -201,6 +209,7 @@ fn match_forge(op: &OpRow) -> Option<Notification> {
         title: format!("PR #{number} merged in {repo}"),
         body: String::new(),
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -220,6 +229,7 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
             title: "New admission proposal".to_string(),
             body: format!("proposal {proposal_id}"),
             channel_id: None,
+            message_id: None,
         });
     }
 
@@ -230,6 +240,7 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
         title: "New member admitted".to_string(),
         body: format!("{} joined via invite", short_hex(&joiner)),
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -259,12 +270,14 @@ pub(super) fn chat_notification(
     title: String,
     body: String,
     channel: &str,
+    message_id: Option<&str>,
 ) -> Notification {
     Notification {
         category,
         title,
         body,
         channel_id: Some(channel.to_string()),
+        message_id: message_id.map(str::to_string),
     }
 }
 
@@ -372,6 +385,7 @@ mod tests {
         assert_eq!(notification.category, Category::Mention);
         assert_eq!(notification.title, "Casey mentioned you in #general");
         assert_eq!(notification.body, "hello");
+        assert_eq!(notification.message_id.as_deref(), Some("m1"));
 
         let own = op(
             OriginKind::External,
