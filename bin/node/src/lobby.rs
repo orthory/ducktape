@@ -265,7 +265,7 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
 pub const INTRO_WG_NAMESPACE: &[u8] = b"ducktape-invite-intro-v1";
 
 /// the joiner's first-contact datagram. carries the whole lobby
-/// [`LobbyMsg::JoinRequest`] payload plus the WireGuard half.
+/// [`GateMsg::Request`] payload plus the WireGuard half.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IntroRequest {
     pub issuer: Vec<u8>,

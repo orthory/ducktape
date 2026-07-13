@@ -919,7 +919,7 @@ mod tests {
     /// joiner unpacks it (`unpack_coord_cap`) and presents it on an
     /// authenticated request — and the coordinator's private `verify_request`
     /// admits the joiner off that delivered cap. Proves the cap the member
-    /// hands over its `JoinReply` actually authorizes the holder.
+    /// hands over its `GateMsg::Admitted` reply actually authorizes the holder.
     #[test]
     fn delivered_cap_admits_the_joiner_under_private_policy() {
         use commonware_cryptography::Signer as _;

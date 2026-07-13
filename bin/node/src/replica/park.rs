@@ -3,10 +3,10 @@
 //! pool + optional replica-restart recovery-by-replay), then the park
 //! `loop` itself (serve window, drain pass, detection lane, ascension), and
 //! finally the promotion checkpoint + [`reboot_self`]. one function on
-//! purpose (decision 2 in the plan): the loop's `send_announce`/
-//! `not_serving` closures and its mountain of loop-scoped state never leave
-//! it, so splitting sub-phases into separate functions would just turn them
-//! back into a carrier struct with more steps.
+//! purpose (decision 2 in the plan): the join gate phase (ADR §3.3), the
+//! loop's `not_serving` closure, and its mountain of loop-scoped state never
+//! leave it, so splitting sub-phases into separate functions would just turn
+//! them back into a carrier struct with more steps.
 
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;

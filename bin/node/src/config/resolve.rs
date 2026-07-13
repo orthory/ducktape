@@ -115,8 +115,8 @@ pub struct Resolved {
     /// the workspace base directory — where `identity.key`, `network.toml`,
     /// `wireguard.key` and `coord.cap` live (the network shape's config
     /// directory; the dev shape's `storage_dir`). Threaded so a parked
-    /// joiner's lobby-reply task can persist a `coord.cap` delivered over its
-    /// `JoinReply` via `save_coord_cap`.
+    /// joiner's gate phase can persist a `coord.cap` delivered over its
+    /// `GateMsg::Admitted` reply via `save_coord_cap`.
     pub workspace: PathBuf,
     /// how provider runs are spawned (`NodeToml::sandbox`). `Direct` (the
     /// default) is the plain host spawn; `Podman` sandboxes every run AND
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(r.signer.public_key(), me.public_key());
         assert_eq!(r.storage_dir, dir.join("storage"));
         // the workspace base is the config directory — where a joiner would
-        // persist a `coord.cap` delivered over its JoinReply.
+        // persist a `coord.cap` delivered over its Admitted gate reply.
         assert_eq!(r.workspace, dir);
     }
 

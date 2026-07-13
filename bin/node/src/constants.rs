@@ -103,9 +103,9 @@ pub(crate) const CHANNEL_LOBBY: u64 = 5;
 /// EVERY mode — an unregistered channel is a protocol violation that kills
 /// the sender's connection — and black-holed where the plane does not run.
 pub(crate) const CHANNEL_REACHABILITY: u64 = 6;
-/// the park loop's poll cadence while the joiner still knocks for standing or
-/// has no served boundary yet: fast, because this tick is all that paces the
-/// first sync and the `LOBBY_ANNOUNCE_EVERY` knock counter.
+/// the park loop's poll cadence while the joiner has standing but no served
+/// boundary yet, and the join gate's per-candidate re-send tick (ADR §3.3):
+/// fast, because this tick paces the first sync and the gate's warm-up resend.
 pub(crate) const JOINER_POLL: Duration = Duration::from_secs(2);
 /// a standing, SERVING resident's fallback poll. head-following is wake-driven
 /// (cert-lane traffic nudges the park loop the moment a boundary seals), so
