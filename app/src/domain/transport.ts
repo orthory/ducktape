@@ -517,6 +517,20 @@ export interface RemoteTransportOptions {
    * any other failure propagates.
    */
   signFilesPayload?: (payloadHex: string) => Promise<string>;
+  /**
+   * Sign an arbitrary CONTENT-module op payload (hex in) into a raw signed op
+   * frame (hex out) with the USER key — the shell's `user_sign_frame` command
+   * (gated to content modules). When present, every `submit` rides the
+   * authenticated `POST /v1/submit/frame` lane so the op is authored as the
+   * connecting user (`ext:<user-pubkey>`) and authorized by the remote node's
+   * client-standing door, instead of the frameless lane where the remote node
+   * discards the origin and re-signs with its OWN key. Only wired for REMOTE
+   * connections (a local workspace's own node signing is correct as-is).
+   * Unlike `signFilesPayload`, a locked identity here FAILS LOUD: a silent
+   * frameless fallback would mis-author the op as the remote node's key and be
+   * refused by the door anyway.
+   */
+  signPayload?: (target: string, payloadHex: string) => Promise<string>;
 }
 
 const bytesToHexString = (bytes: Uint8Array): string =>
@@ -714,10 +728,47 @@ export const remoteTransport = (
   };
 
   return {
-    // JSON.stringify drops an undefined origin, so the field only crosses the
-    // wire when a caller set one
-    submit: (target, payload, origin) =>
-      postJson<SubmitReceipt>(`${base}/v1/submit`, { target, payload, origin }),
+    // With a user-key signer (remote connections), every op is user-authored
+    // over the authenticated frame lane. Without one (local workspace / web),
+    // the frameless lane rides — JSON.stringify drops an undefined origin, so
+    // the field only crosses the wire when a caller set one.
+    submit: async (target, payload, origin) => {
+      const sign = opts?.signPayload;
+      if (sign) {
+        // the frame payload bytes match what the frameless lane would encode
+        // server-side (`serde_json::to_vec(payload)` === `JSON.stringify`).
+        const payloadHex = bytesToHexString(new TextEncoder().encode(JSON.stringify(payload)));
+        let frameHex: string;
+        try {
+          frameHex = await sign(target, payloadHex);
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          // fail loud, no frameless fallback: a locked identity must not
+          // silently re-author the op as the remote node's key.
+          if (detail === "identity-locked") {
+            throw new NodeError(
+              "httpError",
+              "unlock your identity to act on a remote node — remote ops are signed by your key",
+            );
+          }
+          throw err;
+        }
+        const res = await fetchDeadline(`${base}/v1/submit/frame`, {
+          method: "POST",
+          headers: { "content-type": "application/octet-stream" },
+          body: hexStringToBytes(frameHex),
+        });
+        if (!res.ok) {
+          throw new NodeError(
+            "httpError",
+            (await errorDetail(res)) || `node replied ${res.status}`,
+            res.status,
+          );
+        }
+        return (await res.json()) as SubmitReceipt;
+      }
+      return postJson<SubmitReceipt>(`${base}/v1/submit`, { target, payload, origin });
+    },
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
     view: (module, request) =>

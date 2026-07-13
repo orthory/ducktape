@@ -66,6 +66,23 @@ const filesFrameSigner = (): ((payloadHex: string) => Promise<string>) | undefin
       }
     : undefined;
 
+/** The desktop shell's generic content-op signer, or undefined outside Tauri.
+ *  Used for REMOTE connections so every op is authored as the connecting
+ *  user's key (`ext:<user-pubkey>`) — authorized by the remote node's
+ *  client-standing door — instead of the remote node re-signing with its own
+ *  key. The shell command gates the target to content modules and rejects a
+ *  locked key with `identity-locked` (the transport surfaces it, no silent
+ *  fallback). */
+const contentFrameSigner = ():
+  | ((target: string, payloadHex: string) => Promise<string>)
+  | undefined =>
+  isTauri()
+    ? async (target: string, payloadHex: string) => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        return invoke<string>("user_sign_frame", { target, payloadHex });
+      }
+    : undefined;
+
 /** Web build: dial the configured node url. Nothing to manage. */
 export const resolveNode = (): NodeResolution => {
   const url = webUrl();
@@ -86,10 +103,14 @@ export const connectWorkspace = (httpUrl: string): NodeResolution => ({
  *  same as the web build). The transport is already url-agnostic; this is just
  *  the lifecycle label. */
 export const connectRemote = (httpUrl: string): NodeResolution => ({
-  // the user key signs here too: identity is the member's, not the node's,
-  // so a commit sent to another device's node still carries this user's
-  // authenticated authorship.
-  transport: remoteTransport(httpUrl, { signFilesPayload: filesFrameSigner() }),
+  // every op is authored by THIS user's key, not the remote node's: `submit`
+  // rides the authenticated frame lane (`signPayload`) so the remote node's
+  // client-standing door authorizes the connecting user as their own bounded
+  // identity, and files commits stay user-signed too (`signFilesPayload`).
+  transport: remoteTransport(httpUrl, {
+    signFilesPayload: filesFrameSigner(),
+    signPayload: contentFrameSigner(),
+  }),
   url: httpUrl,
   managed: false,
 });
