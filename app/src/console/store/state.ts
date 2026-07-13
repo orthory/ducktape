@@ -565,12 +565,12 @@ export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
 // The local-workspace rail survives restarts. Direct client sessions start on
 // USER and do not overwrite it. The screen itself is NOT persisted, so local
 // boot lands on the persisted rail's default surface. These two ids duplicate
-// the registry's first-in-section screens (chat / members) rather than import
+// the registry's first-in-section screens (chat / status) rather than import
 // the registry into this low-level state module, keeping the store free of the
 // views graph.
 const VIEW_MODE_KEY = "ducktape.viewMode";
 export const DEFAULT_USER_SCREEN = "chat";
-export const DEFAULT_OPERATOR_SCREEN = "members";
+export const DEFAULT_OPERATOR_SCREEN = "status";
 
 export const loadViewMode = (): ViewMode => {
   try {
@@ -615,6 +615,16 @@ export const hasNodeContext = (
 export const isClientMode = (
   state: Pick<ConsoleState, "workspace" | "nodeUrl">,
 ): boolean => state.workspace === null && state.nodeUrl !== null;
+
+/** Node control is available (ADR A5, interim form): the active workspace's
+ *  node is a managed local daemon — ours to control even while it is stopped
+ *  (Start lives on the node console, so reachability is deliberately NOT a
+ *  term here). When the public/private RPC split (A2) lands, this grows
+ *  `|| (owner key && private RPC reachable)`; the UI gate moves with it and
+ *  nothing else does. */
+export const nodeControlAvailable = (
+  state: Pick<ConsoleState, "workspace" | "managed">,
+): boolean => state.workspace !== null && state.managed;
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};
