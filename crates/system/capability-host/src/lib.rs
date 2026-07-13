@@ -526,7 +526,8 @@ impl CliProvider {
             &ctx.limits,
         );
         let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(argv);
+        cmd.args(argv)
+            .envs(envs.iter().map(|(key, value)| (key, value)));
         Ok(cmd)
     }
 
@@ -787,7 +788,7 @@ impl CliProvider {
     /// the run's auth env, backend-independent: the fresh config home (so the
     /// CLI cannot read the operator's real one) and the broker's opaque per-run
     /// bearer. `set` is how the caller applies one binding — a `Command` env for
-    /// Direct, a `-e K=V` entry for a sandbox.
+    /// Direct, or the Podman process environment behind a value-free `-e K`.
     ///
     /// NOTE what is NOT here: the credential itself. that is the whole point —
     /// the host holds it and the broker spends it, so there is nothing to pass.
@@ -970,7 +971,7 @@ impl CliProvider {
 
     /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
     /// or `None` when the run adds no entries. shared by both backends (Direct
-    /// sets it as the child's PATH env; Podman exports it via `-e PATH=`).
+    /// sets it as the child's PATH env; Podman exports it via `-e PATH`).
     fn run_path(&self, ctx: &RunContext) -> Result<Option<OsString>, String> {
         if ctx.path_entries.is_empty() {
             return Ok(None);
@@ -1936,6 +1937,7 @@ rw_dirs = ["~/.claude"]
                 image: "img".into(),
             });
         let ctx = RunContext {
+            env: BTreeMap::from([("RUN_SECRET".to_string(), "not-in-argv".to_string())]),
             limits: BTreeMap::from([("cores".to_string(), 2u64)]),
             ..RunContext::default()
         };
@@ -1962,7 +1964,24 @@ rw_dirs = ["~/.claude"]
             "rw mount at identical path: {joined}"
         );
         assert!(joined.contains("-v /usr/bin/pod:/usr/bin/pod:ro"), "{joined}");
-        assert!(joined.contains(&format!("-e HOME={home}")), "{joined}");
+        assert!(joined.contains("-e HOME"), "{joined}");
+        assert!(joined.contains("-e RUN_SECRET"), "{joined}");
+        assert!(
+            !joined.contains("not-in-argv"),
+            "secret value leaked in argv: {joined}"
+        );
+        assert_eq!(
+            std.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("RUN_SECRET"))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("not-in-argv"))
+        );
+        assert_eq!(
+            std.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("HOME"))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new(&home))
+        );
         assert!(joined.contains("--cpus 2"), "{joined}");
         assert!(joined.ends_with("img /usr/bin/pod --go"), "{joined}");
     }
@@ -2120,7 +2139,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
             "the skills root mounts ro at its identical path: {joined}"
         );
         assert!(
-            joined.contains(&format!("-e {SKILLS_ROOT_ENV}=/var/run/ducktape/agent-7-ro")),
+            joined.contains(&format!("-e {SKILLS_ROOT_ENV}")),
             "and the env still points at it: {joined}"
         );
     }

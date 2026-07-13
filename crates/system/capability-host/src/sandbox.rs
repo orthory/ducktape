@@ -43,7 +43,8 @@ pub enum SandboxBackend {
 /// container path (nothing upstream translates paths): the workdir rw, the
 /// executor bin ro, each `ro_paths` entry ro (the run's PATH-entry dirs and its
 /// W6 skills tree — see `CliProvider::sandbox_ro_paths`), each `rw_dirs`
-/// entry rw (the spec's CLI auth/state dirs). only the limit dimensions this
+/// entry rw (the spec's CLI auth/state dirs). Environment values live on the
+/// Podman process and argv carries names only. Only the limit dimensions this
 /// backend knows how to enforce (`cores` → `--cpus`, `mem_gb` → `--memory` and
 /// `--memory-swap` with the same value) become flags; an unknown dimension
 /// (e.g. `gpu`) is silently ignored — the scheduler already matched it, the
@@ -86,8 +87,10 @@ pub fn wrap_podman(
     for d in rw_dirs {
         argv.extend(["-v".into(), format!("{d}:{d}", d = d.display())]);
     }
-    for (k, v) in envs {
-        argv.extend(["-e".into(), format!("{k}={v}")]);
+    for (k, _) in envs {
+        // Podman reads the value from its own environment. Keep run-scoped
+        // values out of argv, where process listings and error logs expose them.
+        argv.extend(["-e".into(), k.clone()]);
     }
     argv.push(image.to_string());
     argv.push(bin.display().to_string());
@@ -457,7 +460,8 @@ mod tests {
             s.contains("-v /home/u/.claude:/home/u/.claude"),
             "auth state rw, got: {s}"
         );
-        assert!(s.contains("-e FOO=bar"), "got: {s}");
+        assert!(s.contains("-e FOO"), "got: {s}");
+        assert!(!s.contains("bar"), "environment values stay out of argv: {s}");
         assert!(
             s.ends_with("docker.io/library/node:22-slim /usr/bin/claude --print"),
             "got: {s}"
