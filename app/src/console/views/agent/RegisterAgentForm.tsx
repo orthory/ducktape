@@ -35,10 +35,12 @@ import { SkillsField } from "./SkillsField";
 
 export function RegisterAgentForm({
   capabilities,
+  capabilitiesStatus,
   onRegister,
   onDone,
 }: {
   capabilities: string[];
+  capabilitiesStatus: "loading" | "ready" | "error";
   onRegister: (params: {
     displayName: string;
     agentId: string;
@@ -76,6 +78,7 @@ export function RegisterAgentForm({
   const ready =
     displayName.trim() !== "" &&
     agentId !== "" &&
+    capabilitiesStatus === "ready" &&
     capabilities.includes(capability) &&
     allowedActions.length > 0;
 
@@ -165,6 +168,7 @@ export function RegisterAgentForm({
                 id="agent-capability"
                 value={capability}
                 capabilities={capabilities}
+                registryStatus={capabilitiesStatus}
                 onChange={setCapability}
               />
             </div>

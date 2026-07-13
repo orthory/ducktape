@@ -253,9 +253,11 @@ export interface ConsoleState {
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
   /** Distinct executor tags announced network-wide (the `capability` registry),
-   *  sorted. Feeds the agent view's "Runs on" picker; empty when no host has
-   *  announced or the node predates the module (best-effort in the snapshot). */
+   *  sorted. Feeds the agent view's "Runs on" picker. */
   capabilities: string[];
+  /** Whether the capability registry is still loading, loaded successfully
+   *  (including a truthful empty list), or failed to load. */
+  capabilitiesStatus: "loading" | "ready" | "error";
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
@@ -764,6 +766,7 @@ export const createInitialState = (): ConsoleState => {
     pageThreads: [],
     agents: [],
     capabilities: [],
+    capabilitiesStatus: "loading",
     watches: [],
     pendingRuns: [],
     capabilitiesByNode: new Map(),
@@ -833,6 +836,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   pageThreads: [],
   agents: [],
   capabilities: [],
+  capabilitiesStatus: "loading",
   watches: [],
   pendingRuns: [],
   capabilitiesByNode: new Map(),

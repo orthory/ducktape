@@ -48,6 +48,7 @@ export function RunsOnPicker({
   id,
   value,
   capabilities,
+  registryStatus = "ready",
   onChange,
 }: {
   id: string;
@@ -55,6 +56,7 @@ export function RunsOnPicker({
   value: string;
   /** The network's announced executor registry (`state.capabilities`). */
   capabilities: string[];
+  registryStatus?: "loading" | "ready" | "error";
   onChange: (next: string) => void;
 }) {
   // Adopt a sane default once the registry loads: an empty value with executors
@@ -66,7 +68,9 @@ export function RunsOnPicker({
 
   // The registry is the source of truth. Accepting an arbitrary tag here makes
   // registration look successful but leaves the agent permanently unrunnable.
-  if (capabilities.length === 0) {
+  if (registryStatus !== "ready" || capabilities.length === 0) {
+    const failed = registryStatus === "error";
+    const loading = registryStatus === "loading";
     return (
       <>
         <input
@@ -75,13 +79,19 @@ export function RunsOnPicker({
           type="text"
           disabled
           value={value}
-          placeholder="No provider available"
+          placeholder={
+            failed
+              ? "Providers unavailable"
+              : loading
+                ? "Loading providers…"
+                : "No provider available"
+          }
           aria-describedby={`${id}-unavailable`}
           style={{ ...monoInputStyle, color: color.muted2, cursor: "not-allowed" }}
         />
         <div
           id={`${id}-unavailable`}
-          role="status"
+          role={failed ? "alert" : "status"}
           style={{
             marginTop: 5,
             font: `400 10.5px ${font.sans}`,
@@ -89,9 +99,20 @@ export function RunsOnPicker({
             lineHeight: 1.4,
           }}
         >
-          No LLM provider is available. Install and sign in to Codex or Claude on a node.
-          Under Node → Sandbox, choose a mode, copy the shown node.toml settings, and restart
-          the node. Available providers appear here automatically.
+          {failed ? (
+            <>
+              Could not load the provider registry. Check the node connection, then reconnect to
+              retry.
+            </>
+          ) : loading ? (
+            <>Loading available LLM providers from the network…</>
+          ) : (
+            <>
+              No LLM provider is available. Install and sign in to Codex or Claude on a node.
+              Under Node → Sandbox, choose a mode, copy the shown node.toml settings, and
+              restart the node. Available providers appear here automatically.
+            </>
+          )}
         </div>
       </>
     );

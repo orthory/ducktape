@@ -234,6 +234,7 @@ export function AgentView() {
               {adding ? (
                 <RegisterAgentForm
                   capabilities={state.capabilities}
+                  capabilitiesStatus={state.capabilitiesStatus}
                   onRegister={actions.registerAgent}
                   onDone={() => setAdding(false)}
                 />

@@ -424,6 +424,7 @@ export function DucktapeProvider({
                   files: files.files,
                   blocks,
                 }),
+                capabilitiesStatus: capability.capabilitiesStatus,
                 ...(streamDown ? {} : { connectionDown: null }),
                 openTabs,
                 activePage,

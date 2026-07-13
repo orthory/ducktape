@@ -50,6 +50,7 @@ const renderAgents = (
     channels,
     activeChannel: "general",
     capabilities: ["beta"],
+    capabilitiesStatus: "ready" as const,
     agents: [
       {
         agent_id: "summarizer",
@@ -98,11 +99,15 @@ const renderAgents = (
   };
   const spies: Record<string, (...args: unknown[]) => void> = {};
   const noop = vi.fn() as (...args: unknown[]) => void;
-  let updateCapabilities: (capabilities: string[]) => void;
+  let updateCapabilityRegistry: (
+    status: ConsoleState["capabilitiesStatus"],
+    capabilities: string[],
+  ) => void;
 
   function Harness() {
     const [state, setState] = useState(initialState);
-    updateCapabilities = (capabilities) => setState((prev) => ({ ...prev, capabilities }));
+    updateCapabilityRegistry = (capabilitiesStatus, capabilities) =>
+      setState((prev) => ({ ...prev, capabilitiesStatus, capabilities }));
     const actions = new Proxy(
       {},
       {
@@ -123,7 +128,12 @@ const renderAgents = (
   render(<Harness />);
   return {
     spies,
-    setCapabilities: (capabilities: string[]) => act(() => updateCapabilities(capabilities)),
+    setCapabilities: (capabilities: string[]) =>
+      act(() => updateCapabilityRegistry("ready", capabilities)),
+    setCapabilityRegistry: (
+      status: ConsoleState["capabilitiesStatus"],
+      capabilities: string[] = [],
+    ) => act(() => updateCapabilityRegistry(status, capabilities)),
   };
 };
 
@@ -697,6 +707,33 @@ describe("AgentView", () => {
     });
     expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
     expect(spies.registerAgent).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes provider registry failure and recovers when it loads", () => {
+    const { spies, setCapabilityRegistry } = renderAgents({
+      capabilities: [],
+      capabilitiesStatus: "loading",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage" },
+    });
+    expect(screen.getByRole("status")).toHaveTextContent(/loading available llm providers/i);
+    expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
+
+    setCapabilityRegistry("error");
+    expect(screen.getByRole("alert")).toHaveTextContent(/could not load.*reconnect to retry/i);
+    expect(screen.queryByText(/install and sign in/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /register agent/i })).toBeDisabled();
+
+    setCapabilityRegistry("ready", ["codex"]);
+    expect(screen.getByLabelText("Runs on")).toHaveValue("codex");
+    expect(screen.getByRole("button", { name: /register agent/i })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ capability: "codex" }),
+    );
   });
 
   it("blocks registration if the selected provider disappears", () => {
