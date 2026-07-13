@@ -113,6 +113,11 @@ assert_shared_dev_base() {
     git diff --quiet "$github_dev" "$forge_target"; then
     return
   fi
+  local forge_tree candidate_tree
+  forge_tree=$(git rev-parse "$forge_target^{tree}")
+  while IFS= read -r candidate_tree; do
+    [ "$candidate_tree" = "$forge_tree" ] && return
+  done < <(git log --format=%T "$github_dev")
   die "Forge dev target $forge_target contains content not represented by GitHub dev $github_dev; mirror earlier Forge work or reconcile dev first"
 }
 
