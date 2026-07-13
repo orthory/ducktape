@@ -14,12 +14,15 @@ import type { AuthorNames, Channel, ChatThread } from "../../../domain/chat-clie
 import { opForMessage } from "../../store/finalization";
 import type { OpLedger } from "../../store/finalization";
 import { Icon } from "../../components/Icon";
+import { PanelResizer } from "../../layout/PanelResizer";
 import { ArchivedNotice } from "./ArchivedNotice";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
 import { color, font, radius } from "../../theme/tokens";
 
 const THREAD_COMPOSER_MAX_HEIGHT = 120;
+const THREAD_PANEL_WIDTH = 328;
+const THREAD_PANEL_WIDTH_VAR = "--chat-thread-w";
 
 export function ThreadPanel({
   thread,
@@ -83,7 +86,8 @@ export function ThreadPanel({
   return (
     <div
       style={{
-        width: 328,
+        position: "relative",
+        width: `var(${THREAD_PANEL_WIDTH_VAR}, ${THREAD_PANEL_WIDTH}px)`,
         flexShrink: 0,
         borderLeft: `1px solid ${color.borderSoft}`,
         display: "flex",
@@ -91,9 +95,15 @@ export function ThreadPanel({
         background: color.sidebar,
         minHeight: 0,
         minWidth: 0,
-        overflow: "hidden",
       }}
     >
+      <PanelResizer
+        varName={THREAD_PANEL_WIDTH_VAR}
+        defaultWidth={THREAD_PANEL_WIDTH}
+        min={280}
+        max={600}
+        side="left"
+      />
       <div
         style={{
           display: "flex",
@@ -106,7 +116,7 @@ export function ThreadPanel({
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 1, minWidth: 0 }}>
-          <span style={{ font: `600 13px ${font.sans}`, color: color.ink }}>Thread</span>
+          <span style={{ font: `600 14px ${font.sans}`, color: color.ink }}>Thread</span>
           <span
             style={{
               font: `400 11px ${font.sans}`,

@@ -196,10 +196,13 @@ describe("ChatView layout", () => {
       maxWidth: "100%",
     });
 
+    // Code fences WRAP long lines (Slack behavior) — a horizontal scrollbar
+    // inside a chat row hides content.
     const codeBlock = screen.getByText(longCode);
     expect(codeBlock.tagName).toBe("PRE");
     expect(codeBlock).toHaveStyle({
-      overflowX: "auto",
+      whiteSpace: "pre-wrap",
+      overflowWrap: "anywhere",
       maxWidth: "100%",
     });
   });

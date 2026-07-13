@@ -254,6 +254,46 @@ describe("CommentText (plain-text comment bodies)", () => {
   });
 });
 
+describe("inline code", () => {
+  it("renders a backtick run literal — refs inside are source, not chips", () => {
+    withStore(
+      <RichText blocks={para({ text: "see `[x](duck://page/p1)` now" })} names={{}} />,
+      { pages: [page("p1", "Launch plan")] },
+    );
+
+    expect(screen.getByText("[x](duck://page/p1)")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Open page/ })).toBeNull();
+  });
+
+  it("leaves an unclosed backtick as plain text", () => {
+    const { container } = render(<RichText blocks={para({ text: "a ` b" })} names={{}} />);
+
+    expect(container.textContent).toBe("a ` b");
+  });
+
+  it("leaves a bare ``` run as plain text — not a one-backtick chip", () => {
+    const { container } = render(<RichText blocks={para({ text: "a ``` b" })} names={{}} />);
+
+    expect(container.textContent).toBe("a ``` b");
+    expect(container.querySelector("code")).toBeNull();
+  });
+});
+
+describe("fenced code highlighting", () => {
+  it("a known fence tag lazily gains shiki tokens; the text stays intact", async () => {
+    const { container } = render(
+      <RichText blocks={[{ code: { lang: "rust", text: 'fn main() { println!("hi"); }' } }]} names={{}} />,
+    );
+
+    // plain first paint, tokens after the lazy highlighter resolves
+    expect(container.textContent).toContain("fn main()");
+    await waitFor(() => expect(container.querySelector(".code-tok")).toBeTruthy(), {
+      timeout: 5000,
+    });
+    expect(container.textContent).toContain('fn main() { println!("hi"); }');
+  });
+});
+
 describe("duck://files attachment chips (markdown refs)", () => {
   const ATTACH = "[report.pdf](duck://files/shared/attachments/uuid-1/report.pdf)";
   const IMG = "![photo.png](duck://files/shared/attachments/uuid-2/photo.png)";

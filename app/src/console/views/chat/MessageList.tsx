@@ -18,7 +18,7 @@ function DayDivider({ label }: { label: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 0 8px", minWidth: 0 }}>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
-      <span style={{ font: `500 10.5px ${font.mono}`, color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
+      <span style={{ font: `500 11px ${font.mono}`, color: color.muted2, whiteSpace: "nowrap" }}>{label}</span>
       <div style={{ flex: 1, height: 1, background: color.borderSoft }} />
     </div>
   );
@@ -53,7 +53,7 @@ function ChannelIntro({ channelName, empty }: { channelName: string; empty: bool
         <Icon name="hash" size={21} color={color.muted2} />
       </div>
       <div style={{ font: `600 18px ${font.sans}`, color: color.ink, minWidth: 0 }}>#{channelName}</div>
-      <div style={{ font: `400 13px ${font.sans}`, color: color.muted2, lineHeight: 1.5, maxWidth: 560 }}>
+      <div style={{ font: `400 13.5px ${font.sans}`, color: color.muted2, lineHeight: 1.5, maxWidth: 560 }}>
         This is the very beginning of the #{channelName} channel.
         {empty ? " Send the first message to start the conversation." : ""}
       </div>
