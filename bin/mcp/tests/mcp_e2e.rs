@@ -51,6 +51,23 @@ const SEED: [u8; 32] = [77u8; 32];
 const UNBOUND_RUN: &str = "no-such-saga:0";
 
 #[test]
+fn whoami_reports_the_run_id_without_exposing_the_session_key() {
+    let h = Harness::start(&[]);
+
+    let sessionless = payload(&h.call(h.mcp(), "ducktape_whoami", json!({})));
+    assert!(sessionless["run_id"].is_null());
+
+    let bound = payload(&h.call(
+        h.mcp_with_session(SEED, UNBOUND_RUN),
+        "ducktape_whoami",
+        json!({}),
+    ));
+    assert_eq!(bound["run_id"], UNBOUND_RUN);
+    assert!(bound.get("session_key").is_none());
+    assert!(!bound.to_string().contains(&"4d".repeat(32)));
+}
+
+#[test]
 fn a_write_is_refused_by_consensus_not_by_the_tool_server() {
     // the agent holds tasks.create — so if anything refuses this, it is NOT the
     // grant. it is `runs`, in consensus, observing that the session key signing

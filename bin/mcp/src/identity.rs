@@ -120,6 +120,12 @@ impl Run {
         }
     }
 
+    /// the run this MCP session is bound to. The signer stays private; callers
+    /// that only need an evidence id never get access to the session key.
+    pub fn run_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|session| session.run_id.as_str())
+    }
+
     /// apply one action, mid-run: sign a `RunsMsg::AgentAction` with this run's
     /// session key and submit it as an op frame.
     ///
