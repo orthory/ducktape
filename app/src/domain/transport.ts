@@ -735,8 +735,10 @@ export const remoteTransport = (
     submit: async (target, payload, origin) => {
       const sign = opts?.signPayload;
       if (sign) {
-        // the frame payload bytes match what the frameless lane would encode
-        // server-side (`serde_json::to_vec(payload)` === `JSON.stringify`).
+        // sign the JSON-encoded payload; module decoders are key-order /
+        // whitespace-insensitive, and each lane content-addresses its own
+        // bytes, so the signed frame need not be byte-identical to the
+        // frameless lane's server-side encoding.
         const payloadHex = bytesToHexString(new TextEncoder().encode(JSON.stringify(payload)));
         let frameHex: string;
         try {

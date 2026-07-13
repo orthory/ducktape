@@ -195,6 +195,7 @@ const ALLOWED_VERBS: &[&str] = &[
     "user-sign-add-member",
     "user-sign-remove-member",
     "user-sign-gateway-route",
+    "user-sign-frame",
     "gateway-route-bind",
     "gateway-route-unbind",
     "gateway-route-list",
@@ -260,6 +261,7 @@ fn validate_invocation(args: &[&str], stdin_lines: &[&str]) -> Result<(), String
                 | "user-sign-add-member"
                 | "user-sign-remove-member"
                 | "user-sign-gateway-route"
+                | "user-sign-frame"
         )
     {
         return Err(format!(
@@ -971,6 +973,16 @@ mod tests {
             assert!(validate_invocation(&["user-key"], &[injected]).is_err());
         }
         assert!(validate_invocation(&["user-key"], &["bounded secret"]).is_ok());
+    }
+
+    #[test]
+    fn user_sign_frame_verb_is_allowed_with_secret_stdin() {
+        // the shell's user_sign_frame / user_sign_files_frame commands both
+        // shell `user-sign-frame` with a (possibly secret) payload/password on
+        // stdin — the verb AND its stdin arm must be allowlisted or every
+        // user-signed submit hard-fails before the node runs.
+        assert!(validate_invocation(&["user-sign-frame", "--target", "chat", "--seq", "1"], &["deadbeef"]).is_ok());
+        assert!(validate_invocation(&["user-sign-frame", "--target", "files", "--seq", "1"], &["pw", "deadbeef"]).is_ok());
     }
 
     #[test]

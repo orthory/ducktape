@@ -786,8 +786,7 @@ pub async fn user_sign_files_frame(
 /// ACL — this list is defense-in-depth so a compromised console webview
 /// cannot even ATTEMPT a control-plane op as the user.
 const CLIENT_SIGNABLE_TARGETS: &[&str] = &[
-    "chat", "pages", "files", "forge", "tasks", "kv", "directory", "tagging", "inbox", "duckdns",
-    "gateway",
+    "chat", "pages", "files", "forge", "tasks", "kv", "directory", "tagging", "inbox",
 ];
 
 /// whether a remote user may sign a frame for `target` — the content-module
@@ -858,6 +857,11 @@ mod tests {
         // signer is never a blanket oracle even as one command.
         for t in ["identity", "valset", "governance", "upgrade", "modreg", "clients"] {
             assert!(!client_target_allowed(t), "{t} must NOT be signable by a client");
+        }
+        // gateway/duckdns require validator/resident standing at their own
+        // module ACL — never grantable to a client, so not in the list.
+        for t in ["gateway", "duckdns"] {
+            assert!(!client_target_allowed(t), "{t} is control-plane for a client");
         }
         assert!(!client_target_allowed("not-a-module"));
     }
