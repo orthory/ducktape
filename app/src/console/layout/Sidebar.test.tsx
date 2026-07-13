@@ -55,15 +55,19 @@ describe("Sidebar", () => {
     expect(railBg()).toBe("transparent");
   });
 
-  it("keeps Forge in the remote client rail", () => {
+  it("shows a remote client the account rail only — no view-mode toggle", () => {
     renderSidebar({ workspace: null, nodeUrl: "https://node.example" });
 
-    expect(screen.getByRole("tab", { name: "USER" })).toHaveAttribute("title", "User apps");
-    expect(screen.getByRole("tab", { name: "NODE" })).toHaveAttribute("title", "Read-only node");
+    expect(screen.queryByRole("tab", { name: "USER" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "NODE" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Forge" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Explorer" })).toBeInTheDocument();
+    // A3-pending surfaces stay off the client rail for now.
+    expect(screen.queryByRole("button", { name: "Members" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Governance" })).not.toBeInTheDocument();
   });
 
-  it("limits the remote observe rail to Node and Metrics", () => {
+  it("a persisted operator mode falls back to the account rail without node control", () => {
     renderSidebar({
       workspace: null,
       nodeUrl: "https://node.example",
@@ -71,10 +75,19 @@ describe("Sidebar", () => {
       screen: "status",
     });
 
-    expect(screen.getByRole("button", { name: "Node" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Metrics" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Members" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Governance" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Sandbox" })).not.toBeInTheDocument();
+    // The NODE surface is absent, not disabled (ADR A5/A6).
+    expect(screen.queryByRole("button", { name: "Node" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Metrics" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Chat" })).toBeInTheDocument();
+  });
+
+  it("reveals the USER/NODE toggle only with node control", () => {
+    renderSidebar({
+      workspace: { id: "w" } as unknown as ConsoleState["workspace"],
+      managed: true,
+    });
+
+    expect(screen.getByRole("tab", { name: "USER" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "NODE" })).toHaveAttribute("title", "Node operator");
   });
 });

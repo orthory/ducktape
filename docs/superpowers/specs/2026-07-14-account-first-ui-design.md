@@ -64,9 +64,9 @@ moduleAvailable(id, opts: { nodeControl: boolean; clientMode: boolean })
   client-mode data plane for those projections isn't wired yet (the A3
   "client needs no node status" work); they return to the client rail then;
 - everything else in the user section is always available. `explorer` stays
-  on the client rail **iff** the block projection populates on a pure client
-  connection — verified during implementation; if it doesn't, it joins the
-  client exclusion with a note pointing at A3.
+  on the client rail: the provider's refresh fetches `live.blocks(BLOCKS_KEEP)`
+  unconditionally (best-effort, `DucktapeProvider.tsx`), so the block
+  projection populates on a pure client connection too.
 
 `modulesInSection` / `defaultScreenForSection` take the same opts. A remote
 client therefore sees **zero node chrome**; connection health stays with the
@@ -112,7 +112,8 @@ unreachable even from persisted nav history.
 
 ## Testing
 
-- New `app/src/test/sim/nav.test.tsx` (short name per repo test layout):
+- New `app/src/test/nav.test.ts` (short name per repo test layout; pure unit,
+  no simnode):
   gate truth table (managed workspace → true; client mode → false; no
   context → false), operator section empty when gate off, client rail
   excludes members/governance, USER rail contains explorer/members/
