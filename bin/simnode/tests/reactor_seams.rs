@@ -121,8 +121,15 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
         json!({ "run_history": { "rule_id": "echo", "limit": 10 } }),
     );
     let records = history["history"].as_array().expect("history array");
-    assert_eq!(records.len(), 1, "the guard stops the loop at one fire: {history}");
-    assert_eq!(records[0]["action_ok"], true, "the one fire emitted its action");
+    assert_eq!(
+        records.len(),
+        1,
+        "the guard stops the loop at one fire: {history}"
+    );
+    assert_eq!(
+        records[0]["action_ok"], true,
+        "the one fire emitted its action"
+    );
 
     // the channel holds exactly two messages: the user's ping and the SINGLE
     // module-authored reply — the guard, not the budget, capped the cascade.
@@ -158,22 +165,34 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let b2 = sim.peer_block("saga", saga_trigger("s2", &spec), "peer");
     assert_eq!(b2["height"], 2, "second trigger committed: {b2}");
     assert_eq!(
-        sim.sim_state()["oracleQueued"], 2,
+        sim.sim_state()["oracleQueued"],
+        2,
         "follow-ups queue behind each other — they never coalesce"
     );
 
     // a step drains EXACTLY ONE follow-up as its own oracle block.
     let r = sim.step();
-    assert_eq!(r["committed"]["kind"], "oracle", "step drained an oracle follow-up: {r}");
+    assert_eq!(
+        r["committed"]["kind"], "oracle",
+        "step drained an oracle follow-up: {r}"
+    );
     assert_eq!(r["committed"]["height"], 3);
-    assert_eq!(sim.sim_state()["oracleQueued"], 1, "one drained, one still queued");
+    assert_eq!(
+        sim.sim_state()["oracleQueued"],
+        1,
+        "one drained, one still queued"
+    );
 
     // a peer block wedged between two drains commits fine and leaves the queue
     // — and its order — untouched.
     let wedge = sim.peer_block("chat", create_channel("aside", "Aside"), "rival");
-    assert_eq!(wedge["height"], 4, "the wedge committed ahead of the queue: {wedge}");
     assert_eq!(
-        sim.sim_state()["oracleQueued"], 1,
+        wedge["height"], 4,
+        "the wedge committed ahead of the queue: {wedge}"
+    );
+    assert_eq!(
+        sim.sim_state()["oracleQueued"],
+        1,
         "the peer wedge did not disturb the parked follow-up"
     );
 
@@ -185,12 +204,18 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
 
     // nothing left: a further step commits nothing (both queues empty).
     let r = sim.step();
-    assert!(r["committed"].is_null(), "an empty drain mints no block: {r}");
+    assert!(
+        r["committed"].is_null(),
+        "an empty drain mints no block: {r}"
+    );
 
     // both echo results actually landed — the sagas are Done, in submit order.
     for id in ["s1", "s2"] {
         let saga = sim.query("saga", json!({ "get": { "saga_id": id } }));
-        assert_eq!(saga["saga"]["status"], "done", "saga {id} completed: {saga}");
+        assert_eq!(
+            saga["saga"]["status"], "done",
+            "saga {id} completed: {saga}"
+        );
     }
 }
 
@@ -235,7 +260,11 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
     );
 
     // neither rejected trigger minted a block — the sim journals no rejected op.
-    assert_eq!(sim.status()["height"], 0, "a rejected trigger mints no block");
+    assert_eq!(
+        sim.status()["height"],
+        0,
+        "a rejected trigger mints no block"
+    );
     // …and no wedged saga exists to be stuck at Pending.
     for id in ["s1", "s2"] {
         let saga = sim.query("saga", json!({ "get": { "saga_id": id } }));
@@ -276,8 +305,16 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
     let spec = echo_work_spec();
     vec![
         // chat — and, via the post's TagEvent, tagging.
-        ("chat", create_channel("general", "General"), Some("owner".into())),
-        ("chat", post_message("general", "m1", "hello sweep"), Some("owner".into())),
+        (
+            "chat",
+            create_channel("general", "General"),
+            Some("owner".into()),
+        ),
+        (
+            "chat",
+            post_message("general", "m1", "hello sweep"),
+            Some("owner".into()),
+        ),
         // tasks
         (
             "tasks",
@@ -474,7 +511,8 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
     // a NEW commit continues the chain at watermark+1 with a changed app-hash.
     let receipt = sim.submit_ok("chat", create_channel("hall", "Hall"), Some("owner"));
     assert_eq!(
-        receipt["height"], pre_height + 1,
+        receipt["height"],
+        pre_height + 1,
         "the new block continues the height: {receipt}"
     );
     assert_ne!(
