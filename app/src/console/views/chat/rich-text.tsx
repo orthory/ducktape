@@ -17,10 +17,9 @@ import { openExternal } from "../../dom/external-link";
 import { ConsoleContext } from "../../store/context";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { AttachmentChip } from "./AttachmentChip";
-import { isAttachment, splitAttachments } from "./attachments";
 import { splitMentions } from "./chat-input";
+import { isFileSeg, isPageSeg, splitDuckRefs } from "./duck-ref";
 import { mentionableUsers, mentionLabel, mentionResolverOf, mentionTarget } from "./mention";
-import { isPageRef, splitPageRefs } from "./page-ref";
 
 // The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
 // letters/digits/`_`/`-` at a whitespace boundary (parts are already
@@ -165,11 +164,13 @@ export function CommentText({ text, names }: { text: string; names: AuthorNames 
           (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
         );
         if (mark) return <MentionToken key={i} mention={mark.mention} names={names} />;
-        return splitPageRefs(span.text).map((segment, j) =>
-          isPageRef(segment) ? (
-            <PageRefChip key={`${i}:${j}`} pageId={segment.pageId} />
+        return splitDuckRefs(span.text).map((seg, j) =>
+          isPageSeg(seg) ? (
+            <PageRefChip key={`${i}:${j}`} pageId={seg.page.id} />
+          ) : isFileSeg(seg) ? (
+            <AttachmentChip key={`${i}:${j}`} attachment={seg.file} />
           ) : (
-            <LiteralRun key={`${i}:${j}`} text={segment.text} />
+            <LiteralRun key={`${i}:${j}`} text={seg.text} />
           ),
         );
       })}
@@ -249,21 +250,17 @@ function SpanText({
       </a>
     );
   }
-  // Attachments split FIRST (a duck://files URI can never contain `[[page:`,
-  // but a literal run around one still page-ref-splits normally).
+  // One tokenizer for every duck:// reference: page chips, file chips, and
+  // image embeds, all from markdown link/image syntax in the plain span text.
   return (
     <span style={style}>
-      {splitAttachments(span.text).map((outer, i) =>
-        isAttachment(outer) ? (
-          <AttachmentChip key={i} attachment={outer.attachment} />
+      {splitDuckRefs(span.text).map((seg, i) =>
+        isPageSeg(seg) ? (
+          <PageRefChip key={i} pageId={seg.page.id} />
+        ) : isFileSeg(seg) ? (
+          <AttachmentChip key={i} attachment={seg.file} />
         ) : (
-          splitPageRefs(outer.text).map((segment, j) =>
-            isPageRef(segment) ? (
-              <PageRefChip key={`${i}-${j}`} pageId={segment.pageId} />
-            ) : (
-              <LiteralRun key={`${i}-${j}`} text={segment.text} onTagClick={onTagClick} />
-            ),
-          )
+          <LiteralRun key={i} text={seg.text} onTagClick={onTagClick} />
         ),
       )}
     </span>

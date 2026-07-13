@@ -1,24 +1,19 @@
-// Chat attachments ride as `duck://files/<path>` URIs in ordinary message
-// text — ZERO chat wire change (a new ChatMsg variant is a flag day; a URI in
-// a plain span is not). The composer uploads a pasted file into duckfs under
-// ATTACHMENTS_ROOT and inserts the URI; the renderer chips URIs under that
-// root and ONLY that root — a chip claims "this was attached here", and only
-// composer uploads earn it. Paths elsewhere stay literal text.
+// Chat attachment UPLOAD + name hygiene. A pasted file lands in duckfs under
+// ATTACHMENTS_ROOT/<uuid>/<name>; the composer then inserts a markdown
+// reference to it (`![name](duck://files/<path>)`) — the ref GRAMMAR and its
+// render-time tokenizer live in `duck-ref.ts`, the single place all duck://
+// references (pages and files) are parsed. This module owns only the write
+// side and the two name transforms it needs.
 //
-// Security posture (audited before merge):
-// - names are sanitized to a single path segment: separators, dots-only,
-//   control chars, and whitespace can never reach the duckfs path;
-// - each upload lands under a fresh uuid directory, so pasting `a.png` twice
-//   never CAS-conflicts and no sender can overwrite another's attachment;
-// - the tokenizer accepts only whitespace-free URIs under the root, and the
-//   renderer treats the name as React text (escaped) — never markup.
+// Security posture (audited): each upload gets a fresh uuid directory (no
+// collisions, no cross-sender overwrite); names are sanitized to a single
+// markdown- and path-safe segment; the render-side confinement to
+// ATTACHMENTS_ROOT lives in duck-ref.ts.
 
 import { MAX_NAME_BYTES, uploadFile } from "../../../domain/files-client";
 import type { BlockEvent, NodeTransport } from "../../../domain/transport";
 
 export const ATTACHMENTS_ROOT = "/shared/attachments";
-const URI_SCHEME = "duck://files";
-const URI_PREFIX = `${URI_SCHEME}${ATTACHMENTS_ROOT}/`;
 
 /** Paste-upload cap. Every byte is replicated through consensus blocks on
  *  every node, and a paste is the easiest accident in the app — keep it an
@@ -29,19 +24,6 @@ export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
  *  svg — script-bearing by design) downloads instead of rendering. */
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "avif"]);
 
-export interface AttachmentRef {
-  /** Absolute duckfs path, `/shared/attachments/<uuid>/<name>`. */
-  path: string;
-  /** The display name — the path's last segment. */
-  name: string;
-}
-
-export type AttachmentSegment = { text: string } | { attachment: AttachmentRef };
-
-export const isAttachment = (
-  segment: AttachmentSegment,
-): segment is { attachment: AttachmentRef } => "attachment" in segment;
-
 /** True when the chip may render an inline <img> preview. Extension-based on
  *  purpose: previews of OTHER senders' attachments must not need a metadata
  *  query, and an <img> renders nothing executable regardless of real bytes. */
@@ -50,23 +32,25 @@ export const isImageName = (name: string): boolean => {
   return dot > 0 && IMAGE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
 };
 
-/** Collapse an arbitrary (attacker-typed) filename to one safe duckfs path
- *  segment: path separators and brackets become `-`, whitespace runs become
- *  one `-`, control characters drop, leading dots strip (no dotfiles, no `..`),
- *  and the result is clamped to the module's name byte cap. Empty in → "file". */
 // Bidi overrides + zero-width chars: a hostile name can spoof its extension
-// (`photo\u202Egnp.exe` reads as `photo​exe.png` in a label) or hide a
-// dot. Strip them everywhere a name is shown or saved.
+// (`photo<RLO>gnp.exe` reads as `photoexe.png` in a label) or hide a dot.
+// Strip them everywhere a name is shown or saved.
 // eslint-disable-next-line no-control-regex
-const UNSAFE_NAME_CHARS = /[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+const UNSAFE_NAME_CHARS =
+  /[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
 
+/** Collapse an arbitrary (attacker-typed) filename to one safe duckfs path
+ *  segment: path separators, brackets, and markdown-active chars (`* ( )`, so
+ *  the name is safe inside a `![..](..)` ref) become `-`, whitespace runs
+ *  become one `-`, control/bidi drop, leading dots strip (no dotfiles, no
+ *  `..`), clamped to the module's name byte cap. Empty in → "file". */
 export const sanitizeAttachmentName = (raw: string): string => {
   let name = raw
     // NFC first: the duckfs module rejects non-NFC path segments, so an NFD
     // name (common from macOS) would pass every rule below then fail the commit.
     .normalize("NFC")
     .trim()
-    .replace(/[/\\[\]]/g, "-")
+    .replace(/[/\\[\]*()]/g, "-")
     .replace(UNSAFE_NAME_CHARS, "")
     .replace(/\s+/g, "-")
     .replace(/^\.+/, "");
@@ -78,63 +62,21 @@ export const sanitizeAttachmentName = (raw: string): string => {
   return name || "file";
 };
 
-/** The received-side display name — the URI's last segment is authored by ANY
- *  sender, so strip control/bidi/zero-width chars before it reaches a label or
- *  a download filename. It cannot affect the fetch path (the tokenizer already
- *  confined that); this only stops label spoofing. */
+/** The received-side display name — a ref's label/last-segment is authored by
+ *  ANY sender, so strip control/bidi/zero-width chars before it reaches a
+ *  label or a download filename. It cannot affect the fetch path (the
+ *  tokenizer already confined that); this only stops label spoofing. */
 export const displayName = (name: string): string =>
   name.replace(UNSAFE_NAME_CHARS, "") || "file";
 
-/** The URI a sent message carries for `path`. */
-export const attachmentUri = (path: string): string => `${URI_SCHEME}${path}`;
-
-/** Split message text into literal runs and attachment refs, in order and
- *  lossless (concatenating segment sources reproduces the input) — the
- *  splitPageRefs discipline. A URI ends at the first whitespace; sanitized
- *  names never contain any. Only two-level paths under the root are accepted
- *  (`<uuid>/<name>`) — anything shallower or deeper stays literal. */
-export const splitAttachments = (text: string): AttachmentSegment[] => {
-  const out: AttachmentSegment[] = [];
-  let literalFrom = 0;
-  let scan = 0;
-  for (;;) {
-    const open = text.indexOf(URI_PREFIX, scan);
-    if (open === -1) break;
-    let end = open + URI_PREFIX.length;
-    while (end < text.length && !/\s/.test(text[end])) end += 1;
-    scan = end;
-    const rest = text.slice(open + URI_PREFIX.length, end);
-    const segments = rest.split("/");
-    // exactly <dir>/<name>, both non-empty, no dot-segments.
-    if (
-      segments.length !== 2 ||
-      segments.some((s) => s === "" || s === "." || s === "..")
-    ) {
-      continue; // malformed: stays in the literal run, verbatim
-    }
-    if (open > literalFrom) out.push({ text: text.slice(literalFrom, open) });
-    out.push({
-      attachment: {
-        // path is for FETCHING — kept verbatim (tokenizer-confined, node
-        // re-canonicalizes); name is for DISPLAY — stripped of bidi/control
-        // spoofing before it reaches any label or download filename.
-        path: `${ATTACHMENTS_ROOT}/${rest}`,
-        name: displayName(segments[1]),
-      },
-    });
-    literalFrom = scan;
-  }
-  if (literalFrom < text.length) out.push({ text: text.slice(literalFrom) });
-  return out;
-};
-
-/** Upload one pasted file into duckfs and return the URI to insert. The
- *  fresh uuid directory isolates every upload: no name collisions, no
- *  cross-sender overwrites, and the per-path CAS never conflicts. */
+/** Upload one pasted file into duckfs and return the committed path + sanitized
+ *  name (the composer builds the markdown ref). The fresh uuid directory
+ *  isolates every upload: no name collisions, no cross-sender overwrites, and
+ *  the per-path CAS never conflicts. */
 export const uploadAttachment = async (
   transport: NodeTransport,
   file: { name: string; type: string; bytes: Uint8Array<ArrayBuffer> },
-): Promise<{ uri: string; block: BlockEvent }> => {
+): Promise<{ path: string; name: string; isImage: boolean; block: BlockEvent }> => {
   if (file.bytes.length > MAX_ATTACHMENT_BYTES) {
     throw new Error(
       `attachment exceeds ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))} MiB`,
@@ -148,5 +90,5 @@ export const uploadAttachment = async (
     meta: file.type ? { mime: file.type } : {},
     message: `attach ${name}`,
   });
-  return { uri: attachmentUri(path), block };
+  return { path, name, isImage: isImageName(name), block };
 };

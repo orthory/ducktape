@@ -22,6 +22,7 @@ import {
 } from "./mention";
 import { insertPageRef, pageRefCandidates, pageRefTokenAt } from "./page-ref";
 import { MAX_ATTACHMENT_BYTES, uploadAttachment } from "./attachments";
+import { fileRefMarkdown } from "./duck-ref";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
@@ -159,7 +160,11 @@ export function Composer({
   const pickPage = (pageId: string) => {
     if (!pageToken) return;
     const el = ref.current;
-    const next = insertPageRef(value, pageToken, el?.selectionStart ?? caret, pageId);
+    const title = pages.find((p) => p.id === pageId)?.title ?? pageId;
+    const next = insertPageRef(value, pageToken, el?.selectionStart ?? caret, {
+      id: pageId,
+      title,
+    });
     pendingSelection.current = [next.caret, next.caret];
     setCaret(next.caret);
     setPageIndex(0);
@@ -293,14 +298,18 @@ export function Composer({
       setAttaching((prev) => [...prev, name]);
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        const { uri } = await uploadAttachment(transport, {
+        const uploaded = await uploadAttachment(transport, {
           name,
           type: file.type,
           bytes,
         });
+        // images embed (`![]`, inline preview); other files link (`[]`,
+        // download chip). The composer appends the markdown to whatever the
+        // draft holds NOW (the caret may have moved during the async upload).
+        const ref = fileRefMarkdown(uploaded.path, uploaded.name, uploaded.isImage);
         const current = valueRef.current;
         const sep = current === "" || /\s$/.test(current) ? "" : " ";
-        const next = `${current}${sep}${uri} `;
+        const next = `${current}${sep}${ref} `;
         pendingSelection.current = [next.length, next.length];
         setCaret(next.length);
         onChange(next);
