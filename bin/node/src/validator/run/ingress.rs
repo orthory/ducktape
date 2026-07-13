@@ -191,15 +191,22 @@ impl ValidatorRuntime<'_> {
             return;
         }
         if !members.contains(&verified.issuer.as_ref().to_vec()) {
-            // a removed member's invites are dead FOREVER — permanent
-            // reject, same loud contract as the spent-nonce path.
+            // deliberately NON-fatal: this check reads THIS validator's
+            // committed valset, which cannot distinguish a REMOVED issuer
+            // (invite dead forever) from a just-admitted one this view has
+            // not applied yet. a fatal here would let one lagging validator
+            // kill a healthy join on the joiner's first round-robin hit;
+            // the joiner keeps announcing and an up-to-date member redeems.
+            // a genuinely removed issuer is caught by the parking bail.
             send_reply(
                 false,
-                "the inviting member is no longer part of this network — this \
-                 invite is permanently dead; ask a current member for a fresh one"
+                "the inviting member is not in this validator's current view — \
+                 if it was removed, this invite is dead (ask a current member \
+                 for a fresh one); if it was just admitted, another member \
+                 will redeem shortly"
                     .into(),
                 None,
-                true,
+                false,
             );
             return;
         }
