@@ -232,7 +232,15 @@ impl RunsModule {
         if let Some(item) = portable.context.as_deref() {
             sources.push(item);
         }
-        if let Some(section) = self.page_context(ctx, &sources).await {
+        // resolve BOTH duck:// sections from the original sources (anchor text +
+        // item body) before touching `portable.context` — `sources` borrows it,
+        // so both queries run first, then the sections append in order (page,
+        // then attachment). attachments render the referenced file's committed
+        // TEXT; images/binaries are named, not inlined (the agent plane is
+        // text-only).
+        let page_section = self.page_context(ctx, &sources).await;
+        let attachment_section = self.attachment_context(ctx, &sources).await;
+        for section in [page_section, attachment_section].into_iter().flatten() {
             portable.context = Some(match portable.context.take() {
                 Some(item) => format!("{item}\n\n{section}"),
                 None => section,

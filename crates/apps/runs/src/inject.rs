@@ -2,10 +2,13 @@
 //! a forge-channel run's envelope carries in its `context` field, rendered
 //! from COMMITTED tracker state at compose height (I1) and byte-capped.
 //!
-//! extended by M2 with `[[page:<id>]]` page-spec injection: refs parsed from
-//! the trigger message text and the injected item body resolve against
-//! COMMITTED pages state at compose height and render each referenced page's
-//! subtree into the same `context` section.
+//! extended with duck:// reference injection: `[label](duck://page/<id>)` and
+//! `[label](duck://files/<path>)` refs parsed from the trigger message text and
+//! the injected item body resolve against COMMITTED pages/files state at
+//! compose height — each referenced page's subtree and each attachment's text
+//! render into the same `context` section. The ref grammar is the console's
+//! `splitDuckRefs` twin (parity is load-bearing: a chip a human sees but the
+//! agent's context skips, or vice-versa, is a lie about what the agent read).
 //!
 //! the wording is part of the committed prompt input (the envelope JSON is
 //! the provider prompt), so the render is a pure function of the item record
@@ -13,12 +16,14 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use chat::MessageView;
 use pages::{Block, BlockKind, PageQuery, PageReply};
 use sdk::Ctx;
 
-use crate::RunsModule;
 use crate::forge_source::{ForgeItem, ForgeItemKind};
+use crate::{FilesQuery, FilesReply, ModuleId, RunsModule, files_decode_reply, files_encode_query};
 
 /// the item-context byte cap (spec verbatim: 16 KiB, truncate-with-marker —
 /// never fail on size). separate from — and earlier than — the whole-payload
@@ -59,7 +64,17 @@ pub(crate) fn render_item_context(repo: &str, item: &ForgeItem, work_branch: &st
     crate::truncate_on_boundary(&out, MAX_CONTEXT_BYTES, TRUNCATION_MARKER)
 }
 
-// ---- `[[page:<id>]]` page-spec injection (M2) ---------------------------------
+// ---- duck:// reference injection (M2/M3) --------------------------------------
+//
+// refs use the unified markdown grammar the chat console renders
+// (app/src/console/views/chat/duck-ref.ts `splitDuckRefs`) — the two MUST
+// accept exactly the same refs, or the agent's injected context disagrees with
+// the chip a human sees:
+//   [label](duck://page/<id>)     -> the page's committed subtree
+//   [label](duck://files/<path>)  -> the attachment's committed text
+// file refs are confined to /shared/attachments/<dir>/<name> — the console's
+// own confinement, and the only guard against a crafted ref pulling another
+// duckfs path into the agent's context (reads are not authority-gated).
 
 /// the page-section byte budget across ALL injected pages — separate from
 /// (and additional to) the 16 KiB item-context cap above.
@@ -68,9 +83,8 @@ pub(crate) const PAGE_CONTEXT_BYTES: usize = 64 * 1024;
 /// the deterministic page-section truncation marker.
 const PAGE_TRUNCATION_MARKER: &str = "\n[page context truncated at 64 KiB]";
 
-/// the ref syntax: `[[page:` `<id>` `]]`.
-const PAGE_REF_OPEN: &str = "[[page:";
-const PAGE_REF_CLOSE: &str = "]]";
+/// the confinement root for file refs (matches the console tokenizer).
+const ATTACHMENTS_ROOT: &str = "/shared/attachments/";
 
 /// the trigger message's plain text — the ref-parse source for a chat anchor.
 pub(crate) fn message_text(message: &MessageView) -> String {
@@ -89,28 +103,72 @@ pub(crate) fn message_text(message: &MessageView) -> String {
         .join("\n")
 }
 
-/// parse `[[page:<id>]]` refs from the given sources in order, first-seen
-/// dedupe across all of them. a malformed ref (empty id, whitespace or
-/// bracket chars, unterminated) is skipped — NEVER a failure.
-pub(crate) fn parse_page_refs(sources: &[&str]) -> Vec<String> {
-    let mut refs: Vec<String> = Vec::new();
+/// the duck:// refs a message carries: page ids and confined attachment paths,
+/// each in first-seen order (deduped across all sources).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DuckRefs {
+    pub pages: Vec<String>,
+    /// absolute `/shared/attachments/<dir>/<name>` paths — already confined.
+    pub files: Vec<String>,
+}
+
+/// parse every `[label](duck://page|files/…)` markdown ref from the sources, in
+/// order, first-seen deduped — the Rust twin of the console's `splitDuckRefs`.
+/// A malformed ref (bad url, out-of-confinement file path) is skipped, NEVER a
+/// failure. The `![..]` embed marker and the label are ignored: only the
+/// referenced id/path matters for injection.
+pub(crate) fn parse_duck_refs(sources: &[&str]) -> DuckRefs {
+    let mut out = DuckRefs::default();
     for source in sources {
-        let mut rest = *source;
-        while let Some(open) = rest.find(PAGE_REF_OPEN) {
-            rest = &rest[open + PAGE_REF_OPEN.len()..];
-            let Some(close) = rest.find(PAGE_REF_CLOSE) else {
-                break; // unterminated — nothing after this can close.
-            };
-            let id = &rest[..close];
-            rest = &rest[close + PAGE_REF_CLOSE.len()..];
-            let malformed =
-                id.is_empty() || id.contains(|c: char| c.is_whitespace() || c == '[' || c == ']');
-            if !malformed && !refs.iter().any(|r| r == id) {
-                refs.push(id.to_string());
+        let mut rest: &str = source;
+        while let Some(open) = rest.find('[') {
+            let after = &rest[open + 1..];
+            // label runs to the first `]`; none anywhere ⇒ no ref can close.
+            let Some(close) = after.find(']') else { break };
+            let label = &after[..close];
+            let tail = &after[close + 1..];
+            if label.contains('\n') || !tail.starts_with('(') {
+                rest = &rest[open + 1..]; // not a link here — step past this `[`
+                continue;
             }
+            let url_area = &tail[1..];
+            // url ends at the first `)` or whitespace; a `)` must actually close.
+            let end = url_area
+                .find(|c: char| c == ')' || c.is_whitespace())
+                .unwrap_or(url_area.len());
+            if !url_area[end..].starts_with(')') {
+                rest = &rest[open + 1..];
+                continue;
+            }
+            classify_duck_url(&url_area[..end], &mut out);
+            rest = &url_area[end + 1..];
         }
     }
-    refs
+    out
+}
+
+/// classify one extracted `duck://…` url into the ref lists — the same rules
+/// as the console's `classify`: a page id is a single non-empty segment; a file
+/// path is exactly `<dir>/<name>` (non-empty, non-dot) under the attachments
+/// root. Anything else is dropped.
+fn classify_duck_url(url: &str, out: &mut DuckRefs) {
+    if let Some(id) = url.strip_prefix("duck://page/") {
+        if !id.is_empty() && !id.contains('/') && !out.pages.iter().any(|p| p == id) {
+            out.pages.push(id.to_string());
+        }
+        return;
+    }
+    let Some(path) = url.strip_prefix("duck://files") else {
+        return;
+    };
+    let Some(rest) = path.strip_prefix(ATTACHMENTS_ROOT) else {
+        return;
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    let confined = segs.len() == 2 && segs.iter().all(|s| !s.is_empty() && *s != "." && *s != "..");
+    if confined && !out.files.iter().any(|f| f == path) {
+        out.files.push(path.to_string());
+    }
 }
 
 /// render the page section from resolved refs, in the given (first-seen)
@@ -179,8 +237,58 @@ fn render_page(page_id: &str, blocks: Option<&[Block]>) -> String {
     out
 }
 
+// ---- duck://files attachment injection ----------------------------------------
+
+/// the attachment-section byte budget across ALL injected attachments — also
+/// the per-file read cap, so one attachment can't blow the section.
+pub(crate) const ATTACHMENT_CONTEXT_BYTES: usize = 64 * 1024;
+
+/// the deterministic attachment-section truncation marker.
+const ATTACHMENT_TRUNCATION_MARKER: &str = "\n[attachment context truncated at 64 KiB]";
+
+/// one referenced attachment's resolved content.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Attachment {
+    /// UTF-8 text content, inlined into the agent's context.
+    Text(String),
+    /// non-UTF-8 bytes (an image, a binary): named, never inlined — the agent
+    /// input plane is text-only.
+    Binary,
+    /// the ref resolved to nothing at compose height.
+    NotFound,
+}
+
+/// the attachment's display name — the path's last segment.
+fn attachment_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// render the attachment section from resolved refs, in first-seen order, the
+/// whole section capped at [`ATTACHMENT_CONTEXT_BYTES`]. pure — same input,
+/// same bytes.
+pub(crate) fn render_attachments_section(items: &[(String, Attachment)]) -> String {
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|(path, content)| {
+            let name = attachment_name(path);
+            match content {
+                Attachment::Text(text) => format!("[attachment: {name}]\n{text}"),
+                Attachment::Binary => {
+                    format!("[attachment: {name} — binary content, not shown]")
+                }
+                Attachment::NotFound => format!("[attachment: {name} — not found]"),
+            }
+        })
+        .collect();
+    crate::truncate_on_boundary(
+        &format!("Referenced attachments:\n\n{}", rendered.join("\n\n")),
+        ATTACHMENT_CONTEXT_BYTES,
+        ATTACHMENT_TRUNCATION_MARKER,
+    )
+}
+
 impl RunsModule {
-    /// the `[[page:<id>]]` page section for a run (M2): parse refs from the
+    /// the `duck://page/<id>` page section for a run (M2): parse refs from the
     /// given sources (the trigger message text, then the injected item body),
     /// resolve each against COMMITTED pages state at compose height — the
     /// same cross-module query lane as the forge tracker reads (I1) — and
@@ -188,7 +296,7 @@ impl RunsModule {
     /// unresolvable ref renders its marker, NEVER a failure.
     pub(crate) async fn page_context(&self, ctx: &dyn Ctx, sources: &[&str]) -> Option<String> {
         let pages = self.pages.clone()?;
-        let refs = parse_page_refs(sources);
+        let refs = parse_duck_refs(sources).pages;
         if refs.is_empty() {
             return None;
         }
@@ -221,6 +329,57 @@ impl RunsModule {
         match pages::decode_reply(&reply) {
             Ok(PageReply::Page(blocks)) => blocks,
             _ => None,
+        }
+    }
+
+    /// the `duck://files` attachment section for a run: parse the confined file
+    /// refs from the same sources, resolve each against COMMITTED files state at
+    /// compose height, and render its TEXT content. Images/binaries are named,
+    /// not inlined (agent input is text-only); an unresolvable ref renders its
+    /// marker. `None` when no files module is wired or no file ref parses;
+    /// NEVER a failure.
+    pub(crate) async fn attachment_context(
+        &self,
+        ctx: &dyn Ctx,
+        sources: &[&str],
+    ) -> Option<String> {
+        let files = self.files.clone()?;
+        let paths = parse_duck_refs(sources).files;
+        if paths.is_empty() {
+            return None;
+        }
+        let mut resolved = Vec::new();
+        for path in paths {
+            let content = self.attachment_content(ctx, &files, &path).await;
+            resolved.push((path, content));
+        }
+        Some(render_attachments_section(&resolved))
+    }
+
+    /// one committed attachment's content at compose height. a query/decode
+    /// failure degrades to `NotFound`; non-UTF-8 bytes (an image, a binary) are
+    /// `Binary` — the agent plane cannot ingest them. bounded by the section
+    /// budget so a single file can't blow the read.
+    async fn attachment_content(&self, ctx: &dyn Ctx, files: &ModuleId, path: &str) -> Attachment {
+        let query = files_encode_query(&FilesQuery::Read {
+            path: path.to_string(),
+            snapshot: None,
+            offset: 0,
+            len: ATTACHMENT_CONTEXT_BYTES as u64,
+        });
+        let Ok(reply) = ctx.query(files, &query).await else {
+            return Attachment::NotFound;
+        };
+        let b64 = match files_decode_reply(&reply) {
+            Ok(FilesReply::Read { b64, .. }) => b64,
+            _ => return Attachment::NotFound,
+        };
+        let Ok(bytes) = STANDARD.decode(b64.as_bytes()) else {
+            return Attachment::NotFound;
+        };
+        match String::from_utf8(bytes) {
+            Ok(text) => Attachment::Text(text),
+            Err(_) => Attachment::Binary,
         }
     }
 }
@@ -369,25 +528,55 @@ mod tests {
     }
 
     #[test]
-    fn page_refs_parse_across_sources_deduped_in_first_seen_order() {
-        let refs = parse_page_refs(&[
-            "see [[page:plan]] and [[page:spec]] and [[page:plan]] again",
-            "the body cites [[page:spec]] then [[page:notes]]",
+    fn duck_page_refs_parse_across_sources_deduped_in_first_seen_order() {
+        let refs = parse_duck_refs(&[
+            "see [Plan](duck://page/plan) and [Spec](duck://page/spec) and [P](duck://page/plan)",
+            "the body cites [S](duck://page/spec) then [N](duck://page/notes)",
         ]);
-        assert_eq!(refs, vec!["plan", "spec", "notes"]);
+        assert_eq!(refs.pages, vec!["plan", "spec", "notes"]);
+        assert!(refs.files.is_empty());
     }
 
     #[test]
-    fn malformed_page_refs_are_skipped_never_a_failure() {
-        let refs = parse_page_refs(&[
-            "[[page:]]",              // empty id
-            "[[page:has space]]",     // whitespace
-            "[[page:unterminated",    // no close
-            "[[page:a]b]]",           // bracket inside the id
-            "[page:not-a-ref]]",      // wrong open
-            "trailing [[page:ok]] ok",
+    fn malformed_or_non_duck_refs_are_skipped_never_a_failure() {
+        let refs = parse_duck_refs(&[
+            "[empty](duck://page/)",            // empty id
+            "[ext](https://example.com)",       // not a duck scheme
+            "[unterminated](duck://page/x",     // no closing paren
+            "[nested](duck://page/a/b)",        // page id must be one segment
+            "plain [not a link] text",          // no url
+            "ok [Good](duck://page/ok) ok",
         ]);
-        assert_eq!(refs, vec!["ok"]);
+        assert_eq!(refs.pages, vec!["ok"]);
+    }
+
+    #[test]
+    fn duck_file_refs_are_confined_to_the_attachments_root() {
+        let refs = parse_duck_refs(&[
+            "![img](duck://files/shared/attachments/u1/cat.png)",  // ok (embed marker ignored)
+            "[doc](duck://files/shared/attachments/u2/notes.md)",  // ok
+            "[home](duck://files/home/alice/secret.txt)",          // outside root — dropped
+            "[skill](duck://files/shared/skills/a/b)",             // wrong subtree — dropped
+            "[deep](duck://files/shared/attachments/a/b/c)",       // wrong depth — dropped
+            "[dots](duck://files/shared/attachments/../secret)",   // dot-segment — dropped
+        ]);
+        assert_eq!(
+            refs.files,
+            vec![
+                "/shared/attachments/u1/cat.png",
+                "/shared/attachments/u2/notes.md",
+            ],
+        );
+        assert!(refs.pages.is_empty());
+    }
+
+    #[test]
+    fn a_message_mixing_page_and_file_refs_parses_both() {
+        let refs = parse_duck_refs(&[
+            "context in [Plan](duck://page/plan) and see ![shot](duck://files/shared/attachments/u/s.png)",
+        ]);
+        assert_eq!(refs.pages, vec!["plan"]);
+        assert_eq!(refs.files, vec!["/shared/attachments/u/s.png"]);
     }
 
     #[test]
@@ -469,10 +658,10 @@ mod tests {
                 message_id: "m1".into(),
                 author: chat::AuthorRef::User(vec![1; 32]),
                 blocks: vec![
-                    ChatBlock::paragraph("see [[page:plan]]"),
+                    ChatBlock::paragraph("see [Plan](duck://page/plan)"),
                     ChatBlock::Code {
                         lang: None,
-                        text: "and [[page:spec]]".into(),
+                        text: "and [Spec](duck://page/spec)".into(),
                     },
                 ],
                 created_at: 0,
@@ -488,7 +677,68 @@ mod tests {
             channel_head_seq: 1,
         };
         let text = message_text(&message);
-        assert!(text.contains("see [[page:plan]]"), "{text}");
-        assert!(text.contains("and [[page:spec]]"), "{text}");
+        assert!(text.contains("see [Plan](duck://page/plan)"), "{text}");
+        assert!(text.contains("and [Spec](duck://page/spec)"), "{text}");
+    }
+
+    // ---- duck://files attachment injection ------------------------------------
+
+    #[test]
+    fn attachments_render_text_binary_and_missing() {
+        let section = render_attachments_section(&[
+            (
+                "/shared/attachments/u1/notes.md".into(),
+                Attachment::Text("# Plan\nship it".into()),
+            ),
+            ("/shared/attachments/u2/cat.png".into(), Attachment::Binary),
+            ("/shared/attachments/u3/gone.txt".into(), Attachment::NotFound),
+        ]);
+        assert!(section.starts_with("Referenced attachments:"), "{section}");
+        // text content is inlined under a name header (name = last segment).
+        assert!(section.contains("[attachment: notes.md]\n# Plan\nship it"), "{section}");
+        // an image is named, never inlined (the agent plane is text-only).
+        assert!(
+            section.contains("[attachment: cat.png — binary content, not shown]"),
+            "{section}"
+        );
+        assert!(section.contains("[attachment: gone.txt — not found]"), "{section}");
+    }
+
+    #[test]
+    fn the_attachment_section_truncates_at_its_budget_with_a_marker() {
+        let big = render_attachments_section(&[(
+            "/shared/attachments/u/big.txt".into(),
+            Attachment::Text("x".repeat(128 * 1024)),
+        )]);
+        assert_eq!(big.len(), ATTACHMENT_CONTEXT_BYTES);
+        assert!(big.ends_with(ATTACHMENT_TRUNCATION_MARKER), "{}", &big[big.len() - 60..]);
+    }
+
+    #[test]
+    fn attachment_truncation_respects_utf8_boundaries() {
+        let big = render_attachments_section(&[(
+            "/shared/attachments/u/big.txt".into(),
+            Attachment::Text("é".repeat(64 * 1024)),
+        )]);
+        assert!(big.len() <= ATTACHMENT_CONTEXT_BYTES);
+        assert!(big.len() > ATTACHMENT_CONTEXT_BYTES - 4);
+        assert!(big.ends_with(ATTACHMENT_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn attachment_rendering_is_byte_deterministic() {
+        let items = || {
+            vec![
+                (
+                    "/shared/attachments/u/a.md".to_string(),
+                    Attachment::Text("hi".into()),
+                ),
+                ("/shared/attachments/u/b.png".to_string(), Attachment::Binary),
+            ]
+        };
+        assert_eq!(
+            render_attachments_section(&items()).as_bytes(),
+            render_attachments_section(&items()).as_bytes(),
+        );
     }
 }
