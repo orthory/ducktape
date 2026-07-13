@@ -289,15 +289,17 @@ fn ed_bind_auth(key: &Ed, preimage: &[u8]) -> Value {
 /// one op per registered module the sim can reach over /v1/submit, in a fixed
 /// order. `chat` cascades a `TagEvent` into `tagging`; `runs` subscribes through
 /// `tagging` too; `identity`'s bind founds the account `duckdns` then claims a
-/// handle on. no op here produces a CROSS-block follow-up (the fire-and-forget
-/// saga trigger's effect is dropped — no worker — and no dispatch result lands),
-/// so auto and stepped commit the identical block per op.
+/// handle on, and `gateway` publishes a member-signed route from that same
+/// just-bound publisher node. no op here produces a CROSS-block follow-up (the
+/// fire-and-forget saga trigger's effect is dropped — no worker — and no
+/// dispatch result lands), so auto and stepped commit the identical block per op.
 ///
-/// three modules are deliberately absent (see the report): `files` (duckfs
-/// takes a BINARY op-frame, not a JSON submit), `gateway` (SetRoute needs a
-/// MemberAuthorization signature over a RouteStatement), and `forge` (a
-/// libgit2-on-disk module whose determinism is repo-internal — its own e2e owns
-/// it, and it stays out of this cross-dir app-hash-equality assertion).
+/// TWO modules stay absent (see the report): `files` (duckfs takes a BINARY
+/// op-frame, not a JSON submit) and `forge` (a libgit2-on-disk module whose
+/// determinism is repo-internal — its own e2e owns it, and it stays out of this
+/// cross-dir app-hash-equality assertion). `gateway` was the third until its
+/// SetRoute MemberAuthorization ceremony joined the sweep here — a route the
+/// account's founding Ed25519 member signs, keyed on the just-bound node.
 fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
     let node = "n".repeat(32);
     let key = Ed::from_seed(7);
@@ -398,7 +400,55 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "set_handle": { "handle": "eddy" } }),
             Some(node.clone()),
         ),
+        // gateway — the account's founding key signs a route from the just-bound
+        // publisher node. the sim wires `Gateway::new(.., None, "local")` (no
+        // valset), so the only ceremony is: the publisher node is bound to the
+        // account (the identity op above), and a current Ed25519 member signs.
+        (
+            "gateway",
+            gateway_set_route(&key, &node),
+            Some(node.clone()),
+        ),
     ]
+}
+
+/// a gateway `SetRoute` op, member-signed. the route names the account founded
+/// by `key`'s bind (its `account_id` is that key's pubkey) and the publisher
+/// `node` the identity op bound to it; the `MemberAuthorization` is `key`'s
+/// ed25519 signature over the route-signing preimage under `GATEWAY_ROUTE_NS` —
+/// the same member-consent shape `ed_bind_auth` builds, keyed on the gateway
+/// namespace. deterministic: same seed, same preimage, same signature.
+fn gateway_set_route(key: &Ed, node: &str) -> Value {
+    let statement = gateway::RouteStatement {
+        version: 1,
+        chain_id: "local".into(),
+        account_id: key.public_key().as_ref().to_vec(),
+        name: gateway::RouteName::named("api"),
+        publisher_node: node.as_bytes().to_vec(),
+        revision: 1,
+        route: Some(gateway::RouteDefinition {
+            target: gateway::RouteTarget::LoopbackHttp,
+            policy: gateway::RoutePolicy {
+                audience: gateway::RouteAudience::Owner,
+                methods: vec![gateway::RouteMethod::Get],
+                max_request_bytes: 0,
+                max_response_bytes: 1024,
+                allow_authorization: false,
+                allow_upgrade: false,
+            },
+        }),
+    };
+    let preimage = gateway::route_signing_preimage(&statement).expect("route preimage");
+    let signature = key.sign(gateway::GATEWAY_ROUTE_NS, &preimage);
+    let authorization = gateway::MemberAuthorization {
+        signer: key.public_key().as_ref().to_vec(),
+        signature: signature.as_ref().to_vec(),
+    };
+    serde_json::to_value(gateway::GatewayMsg::SetRoute {
+        statement,
+        authorization,
+    })
+    .expect("gateway op serializes")
 }
 
 /// run the script through the HOLD path (submit parks, a step commits it),
