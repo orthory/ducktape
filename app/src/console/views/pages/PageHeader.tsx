@@ -11,14 +11,17 @@ import type { PageMeta } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
 import { color, font, radius } from "../../theme/tokens";
 import type { CommentAnchor } from "./CommentCard";
+import { PagePresenceBar, type PagePresencePeer } from "./PagePresence";
 
 export function PageHeader({
   chain,
+  presence,
   onOpen,
   onComment,
 }: {
   /** Root-first ancestry INCLUDING the open page, or empty with no page open. */
   chain: PageMeta[];
+  presence: PagePresencePeer[];
   onOpen: (pageId: string) => void;
   onComment: (anchor: CommentAnchor) => void;
 }) {
@@ -76,6 +79,7 @@ export function PageHeader({
 
       {chain.length > 0 ? (
         <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexShrink: 0 }}>
+          <PagePresenceBar peers={presence} />
           <button
             type="button"
             aria-label="Comment on page"

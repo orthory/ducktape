@@ -34,7 +34,7 @@ pub(crate) async fn run(
     namespace: Vec<u8>,
     identity_chain_id: String,
     blobs: noded::blobs::BlobHandle,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
     // no consensus coordinates yet: track the genesis mesh at the
     // base index. validators ignore this index if they have rotated

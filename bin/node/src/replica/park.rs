@@ -105,14 +105,15 @@ pub(super) async fn park(
         relay_rx,
         mut lobby_tx,
         mut lobby_rx,
+        voice_requests,
     } = channels;
     // a workspace handle for the gate phase to persist a delivered coord cap
     // (private coordination) — `workspace` itself is moved into the gateway
     // plane below, so clone before it leaves.
     let cap_dir = workspace.clone();
-    let agent_peers = (wireguard_listen.is_some()
-        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake))
-    .then(|| {
+    let media_peers = if wireguard_listen.is_some()
+        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
+    {
         let tracked = crate::voice_plane::MediaPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
         );
@@ -122,6 +123,13 @@ pub(super) async fn park(
             .as_ref()
             .try_into()
             .expect("ed25519 keys are 32 bytes");
+        crate::voice::spawn_hub(
+            voice_requests,
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(&tracked),
+            me,
+            planes.clone(),
+        );
         crate::agent_plane::spawn(
             label.clone(),
             crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
@@ -131,8 +139,15 @@ pub(super) async fn park(
             planes.clone(),
             stream_hub.run_output(),
         );
-        tracked
-    });
+        Some(tracked)
+    } else {
+        eprintln!(
+            "[node {label}] realtime sessions are DISABLED on this node: the mesh overlay \
+             is unavailable (wireguard_listen unset, or the fake effect)"
+        );
+        drop(voice_requests);
+        None
+    };
     let gateway_book = gateway_requests.map(|requests| {
         let book = crate::gateway_plane::OverlayBook::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -1212,7 +1227,7 @@ pub(super) async fn park(
                     if let Some(book) = &gateway_book {
                         book.set_peers(plan.valset().transport_members().iter());
                     }
-                    if let Some(peers) = &agent_peers {
+                    if let Some(peers) = &media_peers {
                         peers.set_peers(plan.valset().transport_members().iter());
                     }
                     last_tracked = plan.epoch();
@@ -1398,7 +1413,7 @@ pub(super) async fn park(
             }
             let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
             oracle.track(tip.epoch, mesh);
-            if gateway_book.is_some() || agent_peers.is_some() {
+            if gateway_book.is_some() || media_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip
                     .participants
                     .iter()
@@ -1408,7 +1423,7 @@ pub(super) async fn park(
                 if let Some(book) = &gateway_book {
                     book.set_peers(transport.iter());
                 }
-                if let Some(peers) = &agent_peers {
+                if let Some(peers) = &media_peers {
                     peers.set_peers(transport.iter());
                 }
             }

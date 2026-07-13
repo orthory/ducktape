@@ -37,9 +37,12 @@ import { PageHeader } from "./PageHeader";
 import { PageNotice } from "./PageNotice";
 import { PageRail } from "./PageRail";
 import { PageTitle } from "./PageTitle";
+import type { PagePresencePeer } from "./PagePresence";
 import { Subpages } from "./Subpages";
+import { usePagePresence } from "./use-page-presence";
 
 export { EDIT_BOUNDARY_MS };
+const EMPTY_PRESENCE: PagePresencePeer[] = [];
 
 // ── The view ─────────────────────────────────────────────
 
@@ -100,6 +103,43 @@ export function PagesView() {
       : state.author;
 
   const activePage = state.activePage;
+  const presenceRecipients = useMemo(() => {
+    const self = state.status?.publicKey?.toLowerCase();
+    return [...new Set([...state.members, ...state.residents].map((key) => key.toLowerCase()))]
+      .filter((key) => key !== self);
+  }, [state.members, state.residents, state.status?.publicKey]);
+  const { peers: livePeers, publishCursor } = usePagePresence({
+    nodeUrl: state.nodeUrl,
+    pageId: activePage,
+    selfNode: state.status?.publicKey ?? null,
+    recipients: presenceRecipients,
+  });
+  const onCursor = useCallback(
+    (blockId: string | null, anchor: number, head: number) =>
+      publishCursor({ blockId, anchor, head }),
+    [publishCursor],
+  );
+  const presence = useMemo<PagePresencePeer[]>(
+    () =>
+      livePeers.map((peer) => ({
+        ...peer,
+        name:
+          state.nodeUsers[peer.peer]?.name ??
+          state.authorNames[peer.peer] ??
+          `Peer ${peer.peer.slice(0, 6)}`,
+      })),
+    [livePeers, state.nodeUsers, state.authorNames],
+  );
+  const presenceByBlock = useMemo(() => {
+    const byBlock = new Map<string, PagePresencePeer[]>();
+    for (const peer of presence) {
+      if (!peer.blockId) continue;
+      const group = byBlock.get(peer.blockId) ?? [];
+      group.push(peer);
+      byBlock.set(peer.blockId, group);
+    }
+    return byBlock;
+  }, [presence]);
   // the persisted set belongs to the page that was open when it changed, so the
   // writer reads the page id from a ref, never from a stale closure — and
   // `setCollapsed` stays referentially stable, which BlockRow's memo needs.
@@ -342,6 +382,7 @@ export function PagesView() {
           <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
             <PageHeader
               chain={chain}
+              presence={presence}
               onOpen={actions.openPage}
               onComment={commentOnPage}
             />
@@ -452,6 +493,8 @@ export function PagesView() {
                     pageId={root.id}
                     raw={root.text}
                     titleRef={titleRef}
+                    presence={presenceByBlock.get(root.id) ?? EMPTY_PRESENCE}
+                    onCursor={onCursor}
                     onCommit={(text) =>
                       actions.updatePageBlockText({ blockId: root.id, text })
                     }
@@ -480,6 +523,8 @@ export function PagesView() {
                       expanded={!collapsed.has(row.block.id)}
                       op={state.ops[opKey.pageBlock(row.block.id)]}
                       threadCount={threadsByTarget.get(row.block.id) ?? 0}
+                      presence={presenceByBlock.get(row.block.id) ?? EMPTY_PRESENCE}
+                      onCursor={onCursor}
                       // the indicator only appears where the drop would ACTUALLY
                       // land: a drag into its own subtree is a cycle the module
                       // would reject, and must not be invited.
