@@ -243,7 +243,7 @@ function NodeDetail({ snap, connected, onOpen }: { snap: Snap; connected: boolea
         ? "member · validator"
         : "guest"
     : snap.client
-      ? "client · observe"
+      ? "user · node"
       : "—";
   const nodeKey = workspace?.pubkey ?? status?.publicKey ?? "";
   return (

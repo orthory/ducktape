@@ -161,7 +161,7 @@ describe("title bar workspace name", () => {
 
     await waitFor(() => expect(screen.getByLabelText("Search")).toBeTruthy());
     expect(screen.getByText("ducktape")).toBeTruthy();
-    expect(screen.getByText("CLIENT")).toBeTruthy();
+    expect(screen.getByText("USER")).toBeTruthy();
   });
 });
 

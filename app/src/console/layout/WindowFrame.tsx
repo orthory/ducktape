@@ -267,7 +267,7 @@ function TitleBar() {
               flexShrink: 0,
             }}
           >
-            {isClientMode(state) ? "CLIENT" : state.workspace ? "LOCAL" : "OFFLINE"}
+            {isClientMode(state) ? "USER" : state.workspace ? "LOCAL" : "OFFLINE"}
           </span>
         </div>
       </div>
