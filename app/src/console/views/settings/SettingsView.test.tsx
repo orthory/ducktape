@@ -71,6 +71,10 @@ describe("SettingsView", () => {
   it("renders the thinned surface: account link row, prefs, workspace facts", () => {
     const { spies } = renderSettings();
 
+    const content = document.querySelector('[data-settings-content="full-width"]') as HTMLElement;
+    expect(content).toHaveStyle({ width: "100%" });
+    expect(content.style.maxWidth).toBe("");
+
     // Workspace facts that still live here.
     expect(screen.getByText("WORKSPACE")).toBeInTheDocument();
     expect(screen.getByText("Acme Research")).toBeInTheDocument();

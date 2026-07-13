@@ -184,6 +184,10 @@ describe("AgentView", () => {
   it("renders roster, detail, and the three tabs after the split", () => {
     renderAgents();
 
+    const content = document.querySelector('[data-agent-content="full-width"]') as HTMLElement;
+    expect(content).toHaveStyle({ width: "100%" });
+    expect(content.style.maxWidth).toBe("");
+
     expect(screen.getByRole("complementary", { name: /agent roster/i })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: /agent detail/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /agents/i })).toBeInTheDocument();
