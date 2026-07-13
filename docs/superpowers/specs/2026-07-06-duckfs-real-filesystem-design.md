@@ -445,10 +445,16 @@ Settled in the storage-plane review; these amend the sections above.
   not built — demand-gated, cheap to add later on the existing client engine.
 - **Prerequisites for exposing duckfs beyond a trusted team network** (not
   wave-1 blockers, but named so nobody ships public without them):
-  1. **Auth on the noded `/v1/files` lane.** Everything rides
-     `DEFAULT_ORIGIN` today; the lane must authenticate callers and stamp the
-     real origin (reuse the agent session-key plane) before `/home/<owner>`
-     authority means anything over HTTP.
+  1. **Auth on the files write path.** SHIPPED for the desktop app: commits
+     are user-signed op frames (`user-sign-frame` sidecar verb → shell
+     command pinned to the files module → `POST /v1/submit/frame`), so the
+     verified user key is the commit's author and `/home/<user>` authority
+     is real; a locked identity falls back to the unsigned lane with the
+     status-quo `ext:noded` authorship. Chunk staging stays unsigned on
+     purpose — staging is content-addressed and identity-neutral (the
+     digest-keyed table carries owner only for quota/TTL bookkeeping).
+     Remaining for public exposure: gate or disable the `/v1/files` write
+     convenience lane (today the loopback CLI's local-trust path).
   2. **Per-owner committed-storage quota.** Staging has a 1 GiB/owner cap but
      committed state has none; an owner can grow the replicated tree without
      bound. Enforcing a committed-bytes budget per owner at execute time

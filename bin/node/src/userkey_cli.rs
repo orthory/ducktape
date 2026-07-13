@@ -26,6 +26,7 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "user-sign-add-member" => cmd_user_sign_add_member(args, &mut stdin),
         "user-sign-remove-member" => cmd_user_sign_remove_member(args, &mut stdin),
         "user-sign-gateway-route" => cmd_user_sign_gateway_route(args, &mut stdin),
+        "user-sign-frame" => cmd_user_sign_frame(args, &mut stdin),
         "user-webauthn-challenge" => cmd_user_webauthn_challenge(args),
         "user-p256-payload" => cmd_user_p256_payload(args),
         _ => return None,
@@ -555,6 +556,59 @@ fn cmd_user_sign_gateway_route(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", user_sign_gateway_route(args, stdin)?);
+    Ok(())
+}
+
+/// `user-sign-frame` core — see [`cmd_user_sign_frame`].
+fn user_sign_frame(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(
+        flags
+            .get("key")
+            .ok_or("user-sign-frame needs --key <path>")?,
+    );
+    let target = flags
+        .get("target")
+        .ok_or("user-sign-frame needs --target <module>")?
+        .clone();
+    let seq: u64 = flags
+        .get("seq")
+        .ok_or("user-sign-frame needs --seq <n>")?
+        .parse()
+        .map_err(|e| format!("--seq is not a valid u64: {e}"))?;
+
+    // stdin order: password FIRST (only when the key file is v2-encrypted —
+    // load_user_signer reads nothing otherwise), then the payload as ONE hex
+    // line. the payload is not a secret; it rides stdin because a 1 MiB chunk
+    // frame would blow past OS argv limits.
+    let user = load_user_signer(&key_path, stdin)?;
+    let payload_hex = read_stdin_line(stdin, "payload-hex")?;
+    let payload = config::unhex(&payload_hex).map_err(|e| format!("payload hex: {e}"))?;
+
+    let frame = node::encode_frame(&user, seq, &sdk::Msg { target, payload });
+    Ok(hex_bytes(&frame))
+}
+
+/// `user-sign-frame --key <path> --target <module> --seq <n>` — stdin:
+/// [password line when the key is v2-encrypted], then one payload-hex line.
+/// Wraps the payload in a `node` op frame signed by the user key and prints
+/// the frame as hex (the only stdout line). POSTed raw to `/v1/submit/frame`,
+/// the frame's verified signer becomes the op's `Origin::External` — the
+/// authenticated authorship the frameless `/v1/submit`'s plaintext `origin`
+/// convention cannot provide. `seq` is the frame's ordering/dedup tie-breaker
+/// (same-payload resubmits need a fresh seq to survive the consensus lane's
+/// content-digest replay guard); it is NOT tracked in state — any u64 works.
+fn cmd_user_sign_frame(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_frame(args, stdin)?);
     Ok(())
 }
 
@@ -1451,5 +1505,75 @@ mod userkey_verb_tests {
         let mut stdin = empty_stdin();
         let err = cmd_user_key(&args_of(&["bogus"]), &mut stdin).unwrap_err();
         assert!(err.to_string().contains("unknown user-key subcommand"));
+    }
+
+    #[test]
+    fn sign_frame_round_trips_through_decode_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        write_legacy(&key_path, &[7u8; 32]);
+
+        // plaintext key: no password line — stdin is just the payload hex.
+        let payload: &[u8] = b"\x00raw chunk bytes";
+        let mut stdin = stdin_of(&[&hex_bytes(payload)]);
+        let frame_hex = user_sign_frame(
+            &args_of(&[
+                "--key",
+                key_path.to_str().unwrap(),
+                "--target",
+                "files",
+                "--seq",
+                "42",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        let (origin, msg) =
+            node::decode_frame(&config::unhex(&frame_hex).unwrap()).expect("frame verifies");
+        let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
+        assert_eq!(origin, sdk::Origin::External(signer.public_key().as_ref().to_vec()));
+        assert_eq!(msg.target, "files");
+        assert_eq!(msg.payload, payload);
+    }
+
+    #[test]
+    fn sign_frame_reads_the_password_first_for_encrypted_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        let line = userkey::seal_user_key(&[9u8; 32], "hunter2duck").unwrap();
+        userkey::write_user_key_new(&key_path, &line).unwrap();
+
+        let mut stdin = stdin_of(&["hunter2duck", &hex_bytes(b"{}")]);
+        let frame_hex = user_sign_frame(
+            &args_of(&[
+                "--key",
+                key_path.to_str().unwrap(),
+                "--target",
+                "files",
+                "--seq",
+                "0",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+        assert!(node::decode_frame(&config::unhex(&frame_hex).unwrap()).is_ok());
+
+        // wrong password: refused before any payload is read.
+        let mut stdin = stdin_of(&["wrong password", &hex_bytes(b"{}")]);
+        assert!(
+            user_sign_frame(
+                &args_of(&[
+                    "--key",
+                    key_path.to_str().unwrap(),
+                    "--target",
+                    "files",
+                    "--seq",
+                    "0",
+                ]),
+                &mut stdin,
+            )
+            .is_err()
+        );
     }
 }

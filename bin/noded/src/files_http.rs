@@ -5,8 +5,13 @@
 //! it through the SAME `NodeCommand::Submit`/`Query` lane the generic /v1/submit
 //! and /v1/query use, so there is no new consensus path and no per-module
 //! plumbing beyond the wire encode. all writes ride the daemon's own external
-//! origin (like an unnamed /v1/submit); a public deployment that needs real
-//! submitter identity here threads it exactly where /v1/submit would.
+//! origin (like an unnamed /v1/submit) — this is the LOCAL-TRUST convenience
+//! lane (the CLI's write path, origin-guarded, loopback). authenticated
+//! per-user authorship does not thread through here: the desktop app signs a
+//! `FilesMsg` into an op frame with the user key (`user-sign-frame`) and
+//! POSTs it to `/v1/submit/frame`, whose verified signer becomes the commit's
+//! author. a public deployment gates or disables THIS lane; the frame lane is
+//! the one that survives untrusted callers.
 //!
 //! extracted from `lib.rs` (which is already over the file-size cap) so the
 //! duckfs surface grows in its own module; the workspace rpc (task 9) reuses the

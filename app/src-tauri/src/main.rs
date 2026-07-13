@@ -203,6 +203,7 @@ fn main() {
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,
+            user_identity::user_sign_files_frame,
             touchid::touchid_available,
             touchid::touchid_enroll,
             touchid::touchid_enrolled,
