@@ -11,7 +11,9 @@ use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
 use crate::host_reads::{read_redemptions_from_host, read_valset_members, read_valset_residents};
-use crate::rpc::{JoinRequestRecord, JoinRequestView, RpcJob, RpcReply, RpcRequest, RpcStatus};
+use crate::rpc::{
+    JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
+};
 use crate::util::{hex, unix_ms};
 use crate::{config, lobby, relay, relay_runtime};
 
@@ -88,6 +90,18 @@ impl ValidatorRuntime<'_> {
                     .collect();
                 RpcReply {
                     join_requests: Some(views),
+                    ..RpcReply::ok()
+                }
+            }
+            RpcRequest::JoinState => {
+                // a validator is a full member — the terminal join state. the
+                // node-owned source (ADR §6): no log-marker parsing.
+                RpcReply {
+                    join_state: Some(JoinStateView {
+                        phase: "promoted".into(),
+                        detail: "validator".into(),
+                        height: node.finalized().map(|f| f.height),
+                    }),
                     ..RpcReply::ok()
                 }
             }

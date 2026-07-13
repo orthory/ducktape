@@ -135,6 +135,18 @@ pub fn save_invite_token(dir: &Path, token: &InviteToken) -> Result<(), String> 
         .map_err(|e| format!("write {path:?}: {e}"))
 }
 
+/// delete the stored invite token — a CONSUMED credential must not survive to
+/// confuse a later boot (ADR §6). called once the join gate reports `Admitted`:
+/// the invite has done its one job. best-effort; a missing file is success.
+pub fn delete_invite_token(dir: &Path) {
+    let path = dir.join(INVITE_TOKEN_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("warning: could not delete spent invite token {path:?}: {e}"),
+    }
+}
+
 /// the token a previous `join` stored, if any — a missing file is the normal
 /// state for founders, dev-shape nodes, and manual (token-less) joins.
 pub fn load_invite_token(dir: &Path) -> Result<Option<InviteToken>, String> {

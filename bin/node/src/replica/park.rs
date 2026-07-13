@@ -36,7 +36,7 @@ use crate::relay_runtime;
 use crate::replica;
 use crate::resident_announce;
 use crate::resident_dispatch;
-use crate::rpc::{RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
+use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{catch_up_post_reboot_frames, PostRebootCatchupError};
 use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
@@ -558,6 +558,10 @@ pub(super) async fn park(
                                             ),
                                         }
                                     }
+                                    // a CONSUMED credential must not survive to
+                                    // confuse a later boot (ADR §6): the invite
+                                    // did its one job.
+                                    config::delete_invite_token(&cap_dir);
                                     resident_standing = true;
                                     break 'gate;
                                 }
@@ -709,6 +713,32 @@ pub(super) async fn park(
                                 "this node is not a member — join requests queue on \
                                  validators",
                             ),
+                            // the node-owned join state (ADR §6): derived from
+                            // the gate outcome + committed chain progress this
+                            // loop already holds — never a scattered guess. a
+                            // TERMINAL reject exits the process before the loop,
+                            // so this arm only ever answers the live states.
+                            RpcRequest::JoinState => {
+                                let (phase, detail, height) = match &serving {
+                                    Some((h, _)) if resident_standing => (
+                                        "synced",
+                                        "serving reads from a pre-synced boundary",
+                                        Some(*h),
+                                    ),
+                                    _ if resident_standing => {
+                                        ("admitted", "standing granted — syncing the boundary", None)
+                                    }
+                                    _ => ("parked", "awaiting admission through the join gate", None),
+                                };
+                                RpcReply {
+                                    join_state: Some(JoinStateView {
+                                        phase: phase.into(),
+                                        detail: detail.into(),
+                                        height,
+                                    }),
+                                    ..RpcReply::ok()
+                                }
+                            }
                             RpcRequest::Shutdown => {
                                 // a resident writes no checkpoint — nothing to
                                 // flush; a restart parks straight back here.

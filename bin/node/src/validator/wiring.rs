@@ -250,6 +250,19 @@ pub(super) async fn finish(
                         continue;
                     };
                     let req_kind = req.kind_name();
+                    // NOTE (ADR §5 server-side fail-closed — NOT enforceable at
+                    // this seam): a transport-key standing gate cannot live here.
+                    // joiners AND residents transport under the SHARED derived
+                    // lobby identity (boot/mesh.rs — their real key is untracked
+                    // pre-promotion), so an admitted resident and a pre-admission
+                    // joiner are the SAME peer key on this channel; refusing the
+                    // lobby identity breaks resident sync, and exempting it
+                    // re-admits pre-admission joiners. R4 is enforced CLIENT-side
+                    // (the gate phase blocks all statesync until Admitted) plus
+                    // by lobby-identity-gated transport (a non-invite key is
+                    // bounced at the mesh handshake). a true server-side gate
+                    // needs a real-key standing proof ON the statesync request —
+                    // a follow-up protocol change (see the PR body).
                     let resp = drive_sync_request(&mut server, &state_tx, req).await;
                     let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
                     // the serve-lane observation (`ducktape_statesync_serve_*`):
