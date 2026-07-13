@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine as _;
 use crate::facets::{WireSink, decode_run_result_v1};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
@@ -76,6 +77,9 @@ struct CaptureCtx {
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
+    /// committed attachment bytes served by the "files" Read arm, keyed by
+    /// absolute path (the duck://files injection resolves these).
+    files_content: BTreeMap<String, Vec<u8>>,
     msgs: Vec<Msg>,
     #[allow(dead_code)]
     effects: Vec<Effect>,
@@ -105,6 +109,7 @@ impl CaptureCtx {
             taken_page_ids: BTreeSet::new(),
             page_target_threads: BTreeMap::new(),
             files_head: None,
+            files_content: BTreeMap::new(),
             msgs: Vec::new(),
             effects: Vec::new(),
             events: Vec::new(),
@@ -171,6 +176,12 @@ impl CaptureCtx {
     /// composer's `source_snapshot`).
     fn with_files_head(mut self, head: &str) -> Self {
         self.files_head = Some(head.into());
+        self
+    }
+    /// serve committed bytes at `path` from the "files" Read arm — the
+    /// duck://files attachment injection reads these.
+    fn with_file(mut self, path: &str, bytes: &[u8]) -> Self {
+        self.files_content.insert(path.into(), bytes.to_vec());
         self
     }
     fn with_origin(mut self, origin: Origin) -> Self {
@@ -450,6 +461,26 @@ impl Ctx for CaptureCtx {
                         window_len: 0,
                     },
                 ))),
+                FilesQuery::Read {
+                    path, offset, len, ..
+                } => {
+                    let reply = match self.files_content.get(&path) {
+                        Some(bytes) => {
+                            let start = (offset as usize).min(bytes.len());
+                            let end = (start + len as usize).min(bytes.len());
+                            let slice = &bytes[start..end];
+                            FilesReply::Read {
+                                b64: base64::engine::general_purpose::STANDARD
+                                    .encode(slice),
+                                eof: end == bytes.len(),
+                            }
+                        }
+                        // an absent path answers as a module rejection (a 404
+                        // on the real node) — the injector reads that as absent.
+                        None => return Err(Error::QueryUnsupported),
+                    };
+                    Ok(files_encode_reply(&reply))
+                }
                 _ => Err(Error::QueryUnsupported),
             },
             "forge" => match forge::decode_query(req).map_err(Error::Module)? {
