@@ -131,9 +131,9 @@ export function BrowserView({ visible = true }: { visible?: boolean }) {
     // deep link, not a browsable address — hand it to the protocol's open
     // plane. Gateway addresses (dotted, `.duck`) fall through untouched, and a
     // dotless input that doesn't classify keeps parseDuckAddress's error.
-    const trimmed = raw.trim();
+    const trimmed = raw.trim().replace(/^duck:\/\//i, "duck://");
     const moduleRef = classifyDuckRef(
-      /^duck:\/\//i.test(trimmed) ? trimmed : `duck://${trimmed}`,
+      /^duck:\/\//.test(trimmed) ? trimmed : `duck://${trimmed}`,
       "",
       false,
     );

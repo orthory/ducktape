@@ -1,6 +1,6 @@
 // What a rendered body's references DO when clicked: a mention mark opens its
-// principal (agent detail / the person in Members), a `[[page:<id>]]` chip
-// opens the page — and neither pretends to resolve something it can't.
+// principal (agent detail / the person in Members), a duck:// chip deep-links
+// through the open plane — and neither pretends to resolve something it can't.
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
