@@ -391,9 +391,9 @@ Note: `load_or_generate_identity` runs at :1261, after descriptor/config writes 
 
 `bin/node/tests/common/mod.rs`: `NetworkShapeCluster::invite()` (:191) becomes `invite(&self, target_hex: &str)`; add `pub fn keygen_friend(&self, idx: usize) -> String` that runs the `keygen` verb against the friend workspace dir (the dir `join_friend*` would use — mirror its path construction) and returns the printed hex. `join_friend`/`join_friend_manual` keep their signatures (join reuses the pre-generated identity).
 
-Update every caller: `live_admission_e2e.rs`, `coordinated_invite_cli.rs`, and PR1's `invite_reuse_e2e.rs`. The reuse test's meaning shifts: B (a different key) now dies at VERIFY — assert the FATAL line contains `"locked to a different key"` instead of `"invite already redeemed"`; keep the exit assertion. Flow per test: `let code = cluster.keygen_friend(1); let invite = cluster.invite(&code); cluster.join_friend(&invite);`.
+Update every caller: `live_admission_e2e.rs`, `coordinated_invite_cli.rs`, and PR1's strengthened `join_request_e2e.rs::a_spent_invite_is_refused_loudly_on_both_ends`. That test's meaning shifts: the second joiner (a fresh key, same blob) now dies at VERIFY — assert the FATAL line contains `"locked to a different key"` instead of `"invite already redeemed"`; keep the exit assertion. (The spent-nonce fatal reply becomes unreachable via the lobby once invites are targeted — the nonce set stays as the consensus single-use invariant, covered by the governance rig.) Flow per test: `let code = cluster.keygen_friend(1); let invite = cluster.invite(&code); cluster.join_friend(&invite);`.
 
-Run: `ops/build-with.sh cargo test -p ducktape-node --test live_admission_e2e --test invite_reuse_e2e --test coordinated_invite_cli -- --nocapture`
+Run: `ops/build-with.sh cargo test -p ducktape-node --test live_admission_e2e --test join_request_e2e --test coordinated_invite_cli -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Commit** — `git commit -m "feat(node)!: mandatory --target invites, keygen join codes, join-side self-check"`

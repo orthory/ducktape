@@ -24,6 +24,17 @@
 
 ### Task 1: Regression e2e — a reused invite kills the second joiner loudly
 
+> **DRIFT RESOLUTION (2026-07-13, controller):** the scenario already exists —
+> `bin/node/tests/join_request_e2e.rs::a_spent_invite_is_refused_loudly_on_both_ends`
+> (added with the loud-spent-invite fix, commit c277a382) pins the member refusal
+> and the joiner FATAL line via kill+wipe+rejoin on idx 1 (the harness is
+> hard-wired to 2 nodes; there is no idx 2, and network-shape founders never
+> print "converged app_hash="). Task 1 therefore became: strengthen THAT test in
+> place with the two missing assertions — `fresh invite` actionable guidance and
+> `wait_exit` (process actually died) — plus a mirrored
+> `NetworkShapeCluster::wait_exit`. The pseudocode below is superseded; kept for
+> the four-assertion contract it defines.
+
 The user observed a joiner "just waiting" on a consumed invite. Current code *should* already fail loudly (`ingress.rs:200-230` sends `fatal:true`; `wiring.rs:382-395` exits 1). This test pins that end to end with current binaries; if it FAILS, we found the real bug — fix it here before proceeding.
 
 **Files:**
@@ -100,7 +111,7 @@ Expected: PASS if the current fail-loud path works. **If it FAILS (joiner keeps 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add bin/node/tests/invite_reuse_e2e.rs
+git add bin/node/tests/join_request_e2e.rs bin/node/tests/common/mod.rs
 git commit -m "test(node): pin fail-loud refusal of a spent invite end to end"
 ```
 
@@ -263,7 +274,7 @@ Anchor exactly as the loop is written (it may be a `select!` or an interval tick
 
 - [ ] **Step 2: Verify the success path is untouched**
 
-Run: `ops/build-with.sh cargo test -p ducktape-node --test invite_reuse_e2e --test live_admission_e2e -- --nocapture`
+Run: `ops/build-with.sh cargo test -p ducktape-node --test join_request_e2e --test live_admission_e2e -- --nocapture`
 Expected: PASS — a normal auto-redeemed join lands standing in well under 300s, and the reuse test's fatal reply beats the deadline. (The deadline itself is deliberately not e2e-tested: a 300s stall test is CI poison; the reply-driven fatal path is covered, and the deadline is a two-line guard.)
 
 - [ ] **Step 3: Commit**
@@ -282,7 +293,7 @@ git commit -m "fix(node): hard 5-minute deadline on the fresh-join lobby announc
 ```bash
 ops/build-with.sh cargo clippy -p ducktape-node --tests --no-deps
 ops/build-with.sh cargo test -p ducktape-node lobby
-ops/build-with.sh cargo test -p ducktape-node --test invite_reuse_e2e --test invite_e2e --test live_admission_e2e --test join_request_e2e
+ops/build-with.sh cargo test -p ducktape-node --test join_request_e2e --test invite_e2e --test live_admission_e2e --test join_request_e2e
 ```
 Expected: all green. (Touch a `.rs` file first if cargo would serve a cached, warning-free build — cached runs pass vacuously.)
 
