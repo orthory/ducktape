@@ -10,10 +10,11 @@ import { useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 
 import { authorName } from "../../../domain/chat-client";
-import type { AuthorNames, ChatThread } from "../../../domain/chat-client";
+import type { AuthorNames, Channel, ChatThread } from "../../../domain/chat-client";
 import { opForMessage } from "../../store/finalization";
 import type { OpLedger } from "../../store/finalization";
 import { Icon } from "../../components/Icon";
+import { ArchivedNotice } from "./ArchivedNotice";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
 import { color, font, radius } from "../../theme/tokens";
@@ -22,7 +23,7 @@ const THREAD_COMPOSER_MAX_HEIGHT = 120;
 
 export function ThreadPanel({
   thread,
-  channelName,
+  channel,
   names,
   ops,
   selfKey,
@@ -38,7 +39,9 @@ export function ThreadPanel({
   onClose,
 }: {
   thread: ChatThread;
-  channelName: string;
+  /** The thread's channel — its name titles the panel, and an archived one
+   *  refuses replies and reactions (the composer gives way to the notice). */
+  channel: Channel;
   names: AuthorNames;
   /** The store's finalization ledger — root and replies draw their marks. */
   ops: OpLedger;
@@ -56,6 +59,7 @@ export function ThreadPanel({
 }) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const archived = channel.archived === true;
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -112,7 +116,7 @@ export function ThreadPanel({
               whiteSpace: "nowrap",
             }}
           >
-            #{channelName}
+            #{channel.name}
           </span>
         </div>
         <button
@@ -152,6 +156,7 @@ export function ThreadPanel({
             names={names}
             groupStart
             selfKey={selfKey}
+            archived={archived}
             hovered={hoverMsg === thread.root.seq}
             menuOpen={menuOpenId === thread.root.seq}
             replyHint={null}
@@ -180,6 +185,7 @@ export function ThreadPanel({
                 names={names}
                 groupStart
                 selfKey={selfKey}
+                archived={archived}
                 hovered={hoverMsg === reply.seq}
                 menuOpen={menuOpenId === reply.seq}
                 replyHint={null}
@@ -229,16 +235,22 @@ export function ThreadPanel({
         )}
       </div>
 
-      <div onKeyDown={handleComposerKeyDown} style={{ flexShrink: 0 }}>
-        <Composer
-          value={draft}
-          onChange={setDraft}
-          onSend={send}
-          placeholder={`Reply to ${authorName(thread.root.head.author, names)}…`}
-          maxHeight={THREAD_COMPOSER_MAX_HEIGHT}
-          autoFocus
-        />
-      </div>
+      {archived ? (
+        // A reply is a post, and the module refuses posts on an archived
+        // channel — the thread stays readable, but its composer gives way.
+        <ArchivedNotice channel={channel} />
+      ) : (
+        <div onKeyDown={handleComposerKeyDown} style={{ flexShrink: 0 }}>
+          <Composer
+            value={draft}
+            onChange={setDraft}
+            onSend={send}
+            placeholder={`Reply to ${authorName(thread.root.head.author, names)}…`}
+            maxHeight={THREAD_COMPOSER_MAX_HEIGHT}
+            autoFocus
+          />
+        </div>
+      )}
     </div>
   );
 }

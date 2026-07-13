@@ -164,11 +164,15 @@ function AgentPill() {
 function ReactionsRow({
   message,
   selfKey,
+  reactable,
   onReact,
   onAddReaction,
 }: {
   message: MessageView;
   selfKey: string;
+  /** False on an archived channel: the module refuses the write, so the chips
+   *  stay legible but inert and the "add" affordance is gone. */
+  reactable: boolean;
   onReact: (emoji: string) => void;
   onAddReaction: () => void;
 }) {
@@ -180,8 +184,9 @@ function ReactionsRow({
         return (
           <HoverButton
             key={reaction.emoji}
+            disabled={!reactable}
             onClick={() => onReact(reaction.emoji)}
-            title={mine ? "Remove reaction" : "React"}
+            title={reactable ? (mine ? "Remove reaction" : "React") : "This channel is archived"}
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -200,27 +205,29 @@ function ReactionsRow({
           </HoverButton>
         );
       })}
-      <HoverButton
-        onClick={(event) => {
-          event.stopPropagation();
-          onAddReaction();
-        }}
-        title="Add a reaction"
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: 26,
-          padding: "2px 0",
-          borderRadius: 999,
-          border: `1px solid ${color.borderSoft}`,
-          background: color.paper,
-          color: color.muted2,
-        }}
-        hoverStyle={{ background: color.hover, color: color.muted3 }}
-      >
-        <AddReactGlyph size={13} />
-      </HoverButton>
+      {reactable && (
+        <HoverButton
+          onClick={(event) => {
+            event.stopPropagation();
+            onAddReaction();
+          }}
+          title="Add a reaction"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: 26,
+            padding: "2px 0",
+            borderRadius: 999,
+            border: `1px solid ${color.borderSoft}`,
+            background: color.paper,
+            color: color.muted2,
+          }}
+          hoverStyle={{ background: color.hover, color: color.muted3 }}
+        >
+          <AddReactGlyph size={13} />
+        </HoverButton>
+      )}
     </div>
   );
 }
@@ -618,6 +625,7 @@ function OverflowMenu({
 function HoverBar({
   channelId,
   seq,
+  reactable,
   onQuickReact,
   onOpenPicker,
   onOpenThread,
@@ -626,6 +634,9 @@ function HoverBar({
 }: {
   channelId: string;
   seq: number;
+  /** False on an archived channel — the module refuses reactions AND the agent's
+   *  answering post, so neither is offered (the run would burn and be lost). */
+  reactable: boolean;
   onQuickReact: (emoji: string) => void;
   onOpenPicker: () => void;
   onOpenThread: () => void;
@@ -658,30 +669,34 @@ function HoverBar({
         boxShadow: shadow.card,
       }}
     >
-      {QUICK_REACTS.map((emoji) => (
-        <HoverButton
-          key={emoji}
-          title={`React ${emoji}`}
-          onClick={() => onQuickReact(emoji)}
-          style={{ ...btnStyle, font: "14px/1 sans-serif" }}
-          hoverStyle={{ background: color.hover }}
-        >
-          {emoji}
-        </HoverButton>
-      ))}
-      <HoverButton
-        title="Pick a reaction"
-        onClick={(event) => {
-          event.stopPropagation();
-          onOpenPicker();
-        }}
-        style={btnStyle}
-        hoverStyle={{ background: color.hover }}
-      >
-        <AddReactGlyph size={15} />
-      </HoverButton>
-      <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
-      <AskAgentButton channelId={channelId} seq={seq} style={btnStyle} />
+      {reactable && (
+        <>
+          {QUICK_REACTS.map((emoji) => (
+            <HoverButton
+              key={emoji}
+              title={`React ${emoji}`}
+              onClick={() => onQuickReact(emoji)}
+              style={{ ...btnStyle, font: "14px/1 sans-serif" }}
+              hoverStyle={{ background: color.hover }}
+            >
+              {emoji}
+            </HoverButton>
+          ))}
+          <HoverButton
+            title="Pick a reaction"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenPicker();
+            }}
+            style={btnStyle}
+            hoverStyle={{ background: color.hover }}
+          >
+            <AddReactGlyph size={15} />
+          </HoverButton>
+          <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
+          <AskAgentButton channelId={channelId} seq={seq} style={btnStyle} />
+        </>
+      )}
       {threadable && (
         <HoverButton
           title="Reply in thread"
@@ -706,6 +721,7 @@ export function MessageItem({
   names,
   groupStart,
   selfKey,
+  archived = false,
   hovered,
   menuOpen,
   replyHint,
@@ -725,6 +741,10 @@ export function MessageItem({
   names: AuthorNames;
   groupStart: boolean;
   selfKey: string;
+  /** The channel is archived — the module refuses reactions (and an agent's
+   *  answering post), so those affordances are hidden rather than left to fail
+   *  silently. Edit/delete are NOT gated: the module still admits them. */
+  archived?: boolean;
   hovered: boolean;
   menuOpen: boolean;
   /** "· lastReplyAuthor" hint for the inline thread pill, or null. */
@@ -883,6 +903,7 @@ export function MessageItem({
           <ReactionsRow
             message={message}
             selfKey={selfKey}
+            reactable={!archived}
             onReact={onReact}
             onAddReaction={() => {
               onMenuToggle(false);
@@ -898,6 +919,7 @@ export function MessageItem({
         <HoverBar
           channelId={message.channel_id}
           seq={message.seq}
+          reactable={!archived}
           onQuickReact={onReact}
           onOpenPicker={() => {
             onMenuToggle(false);

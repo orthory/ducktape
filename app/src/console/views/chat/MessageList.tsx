@@ -68,6 +68,7 @@ export function MessageList({
   ops,
   selfKey,
   workspaceId,
+  archived = false,
   hoverMsg,
   menuOpenId,
   listRef,
@@ -90,6 +91,9 @@ export function MessageList({
   ops: OpLedger;
   selfKey: string;
   workspaceId: string | null;
+  /** Archived channel — the module refuses reactions, so each row drops its
+   *  react affordances (edit/delete still land, and stay offered). */
+  archived?: boolean;
   hoverMsg: number | null;
   menuOpenId: number | null;
   listRef: RefObject<HTMLDivElement | null>;
@@ -147,6 +151,7 @@ export function MessageList({
                 names={names}
                 groupStart={groupStart}
                 selfKey={selfKey}
+                archived={archived}
                 hovered={hoverMsg === message.seq}
                 menuOpen={menuOpenId === message.seq}
                 replyHint={replyHint}
