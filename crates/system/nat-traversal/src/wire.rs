@@ -109,7 +109,8 @@ const TAG_INVITE_CHUNK: u8 = 15;
 
 /// Short-invite wire numerology — the single source of truth (`invite_store`
 /// and the coordinator dispatch consume these).
-/// content id = first 16 bytes of sha256(blob bytes).
+/// the id is a RANDOM, PoP-owner-owned lookup key (not a content hash) — 4
+/// bytes keeps the short URL tiny; integrity is the blob's envelope signature.
 pub const INVITE_ID_LEN: usize = 4;
 /// hard cap on a shelved raw blob.
 pub const INVITE_BLOB_MAX: usize = 8192;
