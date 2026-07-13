@@ -2005,7 +2005,7 @@ format = "text"
         assert_eq!(plan.run_argv.last(), Some(&plan.vm));
         assert!(!plan.guest_script.contains("ssh"));
         assert!(plan.guest_script.contains("--go"));
-        assert!(plan.guest_script.contains("rsync -a --delete"));
+        assert!(plan.guest_script.contains("rsync -aO --delete"));
     }
 
     /// a sandbox spec with no auth section — the shape both skills tests want.
