@@ -48,6 +48,7 @@ import {
 import {
   defaultScreenForSection,
   moduleAvailable,
+  moduleFilterOf,
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
@@ -77,6 +78,7 @@ import {
   isClientMode,
   loadDocTabs,
   loadPendingDisplayName,
+  nodeControlAvailable,
   removeTab,
   resetNodeProjection,
   saveAccent,
@@ -1453,10 +1455,10 @@ export function createActions({
     // exists in the recentmost committed data.
     const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
     const requestedSection = sectionForScreen(snap.screen);
-    const clientMode = isClientMode(before);
+    const filter = moduleFilterOf(before);
     const screen =
-      requestedSection && !moduleAvailable(snap.screen, clientMode)
-        ? defaultScreenForSection(requestedSection, clientMode)
+      requestedSection && !moduleAvailable(snap.screen, filter)
+        ? defaultScreenForSection(requestedSection, filter)
         : snap.screen;
     const viewMode = sectionForScreen(screen) ?? snap.viewMode;
     const channel =
@@ -1481,9 +1483,10 @@ export function createActions({
     const agent = scopeMatches && screen === "agent" ? snap.agent : null;
     const member = scopeMatches && screen === "members" ? snap.member : null;
 
-    // Shell screens retain the entry's recorded rail. A remote client also
-    // normalizes old operator-only entries to the Observe rail's Node screen.
-    if (!clientMode) saveViewMode(viewMode);
+    // Shell screens retain the entry's recorded rail. Entries recorded on the
+    // operator rail normalize to the account fallback when node control is
+    // unavailable now (the rail is absent, not disabled — ADR A5/A6).
+    if (!filter.clientMode) saveViewMode(viewMode);
     patch({
       atHome: snap.atHome,
       screen,
@@ -1689,14 +1692,14 @@ export function createActions({
   // Home layer — with the sidebar navigable at Home, every screen move must
   // drop the layer or the shell would change invisibly underneath it.
   const landOn = (screen: string, extra: Partial<ConsoleState> = {}) => {
-    const clientMode = isClientMode(getState());
+    const filter = moduleFilterOf(getState());
     const requestedSection = sectionForScreen(screen);
     const target =
-      requestedSection && !moduleAvailable(screen, clientMode)
-        ? defaultScreenForSection(requestedSection, clientMode)
+      requestedSection && !moduleAvailable(screen, filter)
+        ? defaultScreenForSection(requestedSection, filter)
         : screen;
     const section = sectionForScreen(target);
-    if (section && !clientMode) saveViewMode(section);
+    if (section && !filter.clientMode) saveViewMode(section);
     patch({
       screen: target,
       atHome: false,
@@ -1732,15 +1735,19 @@ export function createActions({
     applyNavSnapshot,
 
     setViewMode: (mode) => {
+      // ADR A5/A6: the operator rail is absent, not disabled — refuse to enter
+      // it while node control is unavailable (the toggle is hidden then; this
+      // guards programmatic and persisted paths).
+      if (mode === "operator" && !nodeControlAvailable(getState())) return;
       if (!isClientMode(getState())) saveViewMode(mode);
       update((prev) => {
-        const clientMode = isClientMode(prev);
+        const filter = moduleFilterOf(prev);
         // Keep the body on the chosen rail: if the current screen belongs to the
         // other rail (or is a shell screen), land on this rail's default surface.
         const screen =
-          sectionForScreen(prev.screen) === mode && moduleAvailable(prev.screen, clientMode)
+          sectionForScreen(prev.screen) === mode && moduleAvailable(prev.screen, filter)
             ? prev.screen
-            : defaultScreenForSection(mode, clientMode);
+            : defaultScreenForSection(mode, filter);
         return { viewMode: mode, screen };
       });
     },

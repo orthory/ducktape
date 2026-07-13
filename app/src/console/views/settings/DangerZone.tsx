@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 
 import { normalizeKey } from "../../../domain/names";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { nodeControlAvailable } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton, SectionLabel } from "./parts";
@@ -78,7 +79,7 @@ function DangerRow({
 export function DangerZone() {
   const { state, actions } = useDucktape();
   const [pendingAction, setPendingAction] = useState<"leave" | "forget" | "forceForget" | null>(null);
-  const base = !state.workspace || !state.managed;
+  const base = !nodeControlAvailable(state);
 
   // Is THIS node still a current validator, and how big is the set? Leaving is
   // an on-chain self-removal that needs a strict majority of the OTHER members;

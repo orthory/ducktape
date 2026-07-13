@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNod
 
 import { sandboxApply, sandboxPreflight, type SandboxPreflight } from "../../../domain/sandbox-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { nodeControlAvailable } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import {
@@ -264,7 +265,7 @@ export function SandboxTab() {
   // Only the app that owns the local managed node can truthfully probe the node
   // host; otherwise leave pf null → the checklist renders all-unknown.
   const workspaceId = state.workspace?.id ?? null;
-  const canProbe = state.managed && Boolean(workspaceId);
+  const canProbe = nodeControlAvailable(state);
 
   const runPreflight = useMemo(
     () => () => {

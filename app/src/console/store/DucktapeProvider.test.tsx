@@ -1768,7 +1768,7 @@ describe("DucktapeProvider", () => {
     expect(capturedState!.blocks.length).toBe(0);
   });
 
-  it("enters client mode with Forge available and operator routes constrained", async () => {
+  it("enters client mode with Forge available and node/A3 surfaces absent", async () => {
     const { transport } = makeFakeNode();
     const remote = makeFakeNode().transport;
     const remoteQuery = vi.mocked(remote.query);
@@ -1789,11 +1789,16 @@ describe("DucktapeProvider", () => {
     act(() => capturedActions!.setScreen("forge"));
     expect(capturedState!.screen).toBe("forge");
 
+    // The operator rail is absent for a client (ADR A5/A6): entering it is a
+    // no-op, not a redirect to a read-only node screen.
     act(() => capturedActions!.setViewMode("operator"));
-    expect(capturedState!.screen).toBe("status");
+    expect(capturedState!.viewMode).toBe("user");
+    expect(capturedState!.screen).toBe("forge");
 
+    // Governance is A3-pending on the client rail: landing on it falls back
+    // to the account default instead.
     act(() => capturedActions!.setScreen("governance"));
-    expect(capturedState!.screen).toBe("status");
+    expect(capturedState!.screen).toBe("chat");
 
     await waitFor(() => expect(remote.query).toHaveBeenCalled());
     expect(remoteQuery.mock.calls.some(([target]) => target === "forge")).toBe(true);

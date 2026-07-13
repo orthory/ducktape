@@ -126,8 +126,8 @@ describe("SettingsView", () => {
     expect(spies.setScreen).toHaveBeenCalledWith("status");
   });
 
-  it("shows only read-only node links for a remote client", () => {
-    const { spies } = renderSettings({
+  it("shows a remote client no node links at all (ADR A5/A6)", () => {
+    renderSettings({
       workspace: null,
       nodeUrl: "https://node.example",
       managed: false,
@@ -136,11 +136,9 @@ describe("SettingsView", () => {
     expect(screen.queryByRole("button", { name: /open members/i })).not.toBeInTheDocument();
     expect(screen.queryByText("DANGER ZONE")).not.toBeInTheDocument();
     expect(screen.queryByText("Governance")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /open node/i }));
-    fireEvent.click(screen.getByRole("button", { name: /open metrics/i }));
-    expect(spies.setScreen).toHaveBeenNthCalledWith(1, "status");
-    expect(spies.setScreen).toHaveBeenNthCalledWith(2, "metrics");
+    // Node control is a conditional surface: a client gets no links into it.
+    expect(screen.queryByRole("button", { name: /open node/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /open metrics/i })).not.toBeInTheDocument();
   });
 
   it("requests an on-chain leave through an in-app dialog, without tearing down", () => {
