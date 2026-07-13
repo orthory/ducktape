@@ -9,11 +9,12 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import { isModuleChannel } from "../../../domain/chat-client";
-import type { PostPolicy } from "../../../domain/chat-client";
+import type { Channel, PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
 import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { ArchivedNotice } from "./ArchivedNotice";
 import { ChannelMembersButton } from "./ChannelMembers";
 import { ChannelMenu } from "./ChannelMenu";
 import { selfAuthorKeyOf } from "./chat-helpers";
@@ -67,20 +68,62 @@ function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (polic
  *  dock to sit inside this rail, so the two must agree. */
 export const CHANNEL_RAIL_WIDTH = 200;
 
+/** One rail row. `muted` dims an archived channel — it still enters on click
+ *  (that is how you get back to its "…" menu to unarchive it). */
+function ChannelRow({
+  channel,
+  active,
+  muted = false,
+  onSelect,
+}: {
+  channel: Channel;
+  active: boolean;
+  muted?: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      onClick={onSelect}
+      style={{
+        all: "unset",
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        gap: 7,
+        width: "calc(100% - 16px)",
+        margin: "1px 8px",
+        padding: "6px 9px",
+        borderRadius: radius.sm,
+        background: active ? color.hover : "transparent",
+        color: active ? color.ink : muted ? color.muted2 : color.muted3,
+        font: `${active ? 600 : 400} 12.5px ${font.sans}`,
+        boxSizing: "border-box",
+      }}
+    >
+      <Icon name="hash" size={13} color={active ? color.ink : color.muted2} />
+      <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {channel.name}
+      </span>
+      <HuddleRailBadge channel={channel} />
+    </button>
+  );
+}
+
 function ChannelRail() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
   const [creating, setCreating] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   // module-reserved channels (forge's per-item discussion threads,
   // `forge:<repo>:<n>`) are hidden from the chat surface — their messages
   // render inside the owning module's view, never in this rail. Archived
-  // channels are hidden too; there is no "show archived" browser yet, so an
-  // archived channel is only reachable while it stays the open one (its header
-  // "…" menu offers Unarchive) — a deliberate simplification.
-  const channels = state.channels.filter(
-    (channel) => !isModuleChannel(channel.id) && !channel.archived,
-  );
+  // channels leave the main list too, but keep their own collapsed section at
+  // its foot — entering one is the only way back to the "…" menu that unarchives
+  // it, so they must never become unreachable.
+  const listed = state.channels.filter((channel) => !isModuleChannel(channel.id));
+  const channels = listed.filter((channel) => !channel.archived);
+  const archived = listed.filter((channel) => channel.archived);
 
   const create = (event: FormEvent) => {
     event.preventDefault();
@@ -172,39 +215,57 @@ function ChannelRail() {
       )}
 
       <div style={{ overflowY: "auto", flex: 1 }}>
-        {channels.map((channel) => {
-          const active = channel.id === state.activeChannel;
-          return (
-            <button
-              key={channel.id}
-              onClick={() => actions.selectChannel(channel.id)}
-              style={{
-                all: "unset",
-                cursor: "pointer",
-                display: "flex",
-                alignItems: "center",
-                gap: 7,
-                width: "calc(100% - 16px)",
-                margin: "1px 8px",
-                padding: "6px 9px",
-                borderRadius: radius.sm,
-                background: active ? color.hover : "transparent",
-                color: active ? color.ink : color.muted3,
-                font: `${active ? 600 : 400} 12.5px ${font.sans}`,
-                boxSizing: "border-box",
-              }}
-            >
-              <Icon name="hash" size={13} color={active ? color.ink : color.muted2} />
-              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {channel.name}
-              </span>
-              <HuddleRailBadge channel={channel} />
-            </button>
-          );
-        })}
+        {channels.map((channel) => (
+          <ChannelRow
+            key={channel.id}
+            channel={channel}
+            active={channel.id === state.activeChannel}
+            onSelect={() => actions.selectChannel(channel.id)}
+          />
+        ))}
         {channels.length === 0 && (
           <div style={{ padding: "6px 15px", font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
             No channels yet — create one.
+          </div>
+        )}
+
+        {archived.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <HoverButton
+              onClick={() => setShowArchived((open) => !open)}
+              title={showArchived ? "Hide archived channels" : "Show archived channels"}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                width: "calc(100% - 16px)",
+                margin: "1px 8px",
+                padding: "5px 9px",
+                borderRadius: radius.sm,
+                font: `600 11px ${font.sans}`,
+                letterSpacing: ".04em",
+                color: color.muted,
+                boxSizing: "border-box",
+              }}
+              hoverStyle={{ background: color.hover, color: color.ink }}
+            >
+              <Icon
+                name="chevronRight"
+                size={11}
+                style={{ transform: showArchived ? "rotate(90deg)" : "none" }}
+              />
+              <span>ARCHIVED · {archived.length}</span>
+            </HoverButton>
+            {showArchived &&
+              archived.map((channel) => (
+                <ChannelRow
+                  key={channel.id}
+                  channel={channel}
+                  active={channel.id === state.activeChannel}
+                  muted
+                  onSelect={() => actions.selectChannel(channel.id)}
+                />
+              ))}
           </div>
         )}
       </div>
@@ -218,9 +279,10 @@ function EmptyChannelState() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
-  // module-reserved and archived channels are hidden (see ChannelRail) — a
-  // workspace whose only channels are module-owned or archived still reads
-  // "No channels yet".
+  // module-reserved channels are hidden and archived ones live in the rail's
+  // own collapsed section (see ChannelRail) — a workspace whose only channels
+  // are module-owned or archived still reads "No channels yet" and offers the
+  // create form.
   const hasChannels = state.channels.some(
     (channel) => !isModuleChannel(channel.id) && !channel.archived,
   );
@@ -305,6 +367,10 @@ function EmptyChannelState() {
 export function ChatView() {
   const { state, actions } = useDucktape();
   const channel = state.channels.find((c) => c.id === state.activeChannel);
+  // An archived channel refuses posts, reactions and huddle joins in the module
+  // — so those affordances go away here rather than fail silently. Edits and
+  // deletes still land, and stay offered.
+  const archived = channel?.archived === true;
   const selfKey = selfAuthorKeyOf(selfAuthorBytes(state.status, state.author));
   const workspaceId = state.workspace?.id ?? null;
   const rootMessageCount = state.messages.filter((message) => message.head.thread === null).length;
@@ -413,7 +479,7 @@ export function ChatView() {
           )}
           {channel?.post_policy === "members_only" && <ChannelMembersButton channel={channel} />}
           {channel && <ChannelTagsButton />}
-          {channel && <HuddleHeaderButton channel={channel} />}
+          {channel && !archived && <HuddleHeaderButton channel={channel} />}
           {channel && <ChannelMenu channel={channel} />}
         </div>
 
@@ -432,6 +498,7 @@ export function ChatView() {
                 ops={state.ops}
                 selfKey={selfKey}
                 workspaceId={workspaceId}
+                archived={archived}
                 hoverMsg={hoverMsg}
                 menuOpenId={msgMenuId}
                 listRef={listRef}
@@ -448,12 +515,16 @@ export function ChatView() {
                 onTagClick={actions.setTagFilter}
               />
             )}
-            <Composer
-              value={draft}
-              onChange={setDraft}
-              onSend={handleSend}
-              placeholder={`Message #${channel.name}`}
-            />
+            {archived ? (
+              <ArchivedNotice channel={channel} />
+            ) : (
+              <Composer
+                value={draft}
+                onChange={setDraft}
+                onSend={handleSend}
+                placeholder={`Message #${channel.name}`}
+              />
+            )}
           </>
         ) : (
           <EmptyChannelState />
@@ -462,7 +533,7 @@ export function ChatView() {
       {state.activeThread && channel && (
         <ThreadPanel
           thread={state.activeThread}
-          channelName={channel.name}
+          channel={channel}
           names={state.authorNames}
           ops={state.ops}
           selfKey={selfKey}

@@ -1,7 +1,7 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { MessageView } from "../../../domain/chat-client";
+import type { Channel, MessageView } from "../../../domain/chat-client";
 import { ConsoleContext } from "../../store/context";
 import type { ConsoleActions } from "../../store/actions";
 import { createInitialState, type ConsoleState } from "../../store/state";
@@ -60,7 +60,26 @@ const noopActions = {
   closeThread: vi.fn(),
   replyInThread: vi.fn(),
   toggleReaction: vi.fn(),
+  setChannelArchived: vi.fn(),
 } as unknown as ConsoleActions;
+
+const archivedChannel = (id: string): Channel => ({
+  id,
+  name: id,
+  created_at: 2,
+  head_seq: 0,
+  post_policy: "open",
+  hooks: [],
+  pinned: [],
+  archived: true,
+});
+
+const renderChat = (state: ConsoleState, actions: ConsoleActions = noopActions) =>
+  render(
+    <ConsoleContext.Provider value={{ state, actions }}>
+      <ChatView />
+    </ConsoleContext.Provider>,
+  );
 
 describe("ChatView channel rail", () => {
   it("hides module-reserved channels (forge:* item threads) from the rail", () => {
@@ -94,6 +113,45 @@ describe("ChatView channel rail", () => {
     // channel must not (its messages belong to the forge view).
     expect(screen.getAllByText("general").length).toBeGreaterThan(0);
     expect(screen.queryByText("ducktape#1")).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatView archived channels", () => {
+  it("replaces the composer with an archived notice on the active channel", () => {
+    const base = stateWithMessages([]);
+    const setChannelArchived = vi.fn();
+    renderChat(
+      { ...base, channels: [{ ...base.channels[0]!, archived: true }] },
+      { ...noopActions, setChannelArchived } as unknown as ConsoleActions,
+    );
+
+    // the composer is gone entirely — a post typed into it would be rejected by
+    // the module — and the notice says why in its place.
+    expect(screen.queryByPlaceholderText("Message #general")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Send message")).not.toBeInTheDocument();
+    expect(screen.getByText(/This channel is archived/)).toBeInTheDocument();
+
+    // an owner-less channel admits any user's admin op (check_channel_admin), so
+    // the notice offers the way back out.
+    fireEvent.click(screen.getByText("Unarchive"));
+    expect(setChannelArchived).toHaveBeenCalledWith("general", false);
+  });
+
+  it("lists archived channels under the rail's Archived section and enters one on click", () => {
+    const base = stateWithMessages([]);
+    const selectChannel = vi.fn();
+    renderChat(
+      { ...base, channels: [...base.channels, archivedChannel("retro")] },
+      { ...noopActions, selectChannel } as unknown as ConsoleActions,
+    );
+
+    // collapsed by default: the archived channel is not in the main list…
+    expect(screen.queryByText("retro")).not.toBeInTheDocument();
+    // …and the section that holds it counts what's inside.
+    fireEvent.click(screen.getByText("ARCHIVED · 1"));
+
+    fireEvent.click(screen.getByText("retro"));
+    expect(selectChannel).toHaveBeenCalledWith("retro");
   });
 });
 

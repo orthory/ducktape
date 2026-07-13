@@ -3,7 +3,7 @@
 // messages and reaction ownership apart. No store/transport dependencies —
 // everything here is a function of data already in `ConsoleState`.
 
-import type { AuthorRef, MessageView } from "../../../domain/chat-client";
+import type { AuthorRef, Channel, MessageView } from "../../../domain/chat-client";
 import { wallClockMillisOf } from "../../../domain/wire";
 
 /** Consecutive messages from the same author within this window (and the same
@@ -29,6 +29,13 @@ export const isAgentAuthor = (author: AuthorRef): boolean =>
  *  origin bytes on the embedded daemon (which stores them verbatim). */
 export const selfAuthorKeyOf = (selfBytes: number[]): string =>
   `user:${selfBytes.join(",")}`;
+
+/** May this viewer rename / archive / unarchive the channel? Mirrors the
+ *  module's `check_channel_admin`: an owned channel admits only its owner among
+ *  User origins, an owner-less one (module/system-minted, or a legacy record)
+ *  admits any user. `selfKey` is `selfAuthorKeyOf(selfAuthorBytes(...))`. */
+export const canAdministerChannel = (channel: Channel, selfKey: string): boolean =>
+  !channel.owner || selfAuthorKeyOf(channel.owner) === selfKey;
 
 export const hasReacted = (message: MessageView, emoji: string, selfKey: string): boolean =>
   message.reactions.some(

@@ -201,7 +201,8 @@ export function ChannelMenu({ channel }: { channel: Channel }) {
           onCancel={() => setConfirmArchive(false)}
         >
           Archiving <strong>{channel.name}</strong> hides it from the channel list and blocks new
-          posts, reactions, and huddles. You can unarchive it from this menu while it stays open.
+          posts, reactions, and huddles. It stays readable under the rail's Archived section, and
+          this menu can unarchive it from there.
         </ConfirmDialog>
       )}
     </div>
