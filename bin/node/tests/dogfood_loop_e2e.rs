@@ -8,7 +8,7 @@
 //!   2. mentioning the agent runs the provider INSIDE a real git worktree of
 //!      the repo at the pinned main tip; the host commits + pushes branch
 //!      `agent/item-1` through consensus and the PR sink opens a PR whose
-//!      title is the first line of the reply's message facet.
+//!      title is the bound Forge issue title.
 //!   3. re-mentioning in the PR's OWN channel forks the branch TIP: a second
 //!      commit lands on the SAME branch (parent = the first), and the
 //!      duplicate guard opens NO second PR.
@@ -46,9 +46,9 @@ const ROUND_TRIP: Duration = Duration::from_secs(120);
 const AGENT_ID: &str = "quacker-dogfood";
 const REPO: &str = "dogfood";
 const WORK_BRANCH: &str = "agent/item-1";
-/// the worker script's single-line reply — and therefore the PR title the
-/// sink derives from the message facet's first line.
+/// the worker script's single-line reply; it belongs in the published body.
 const REPLY_TITLE: &str = "Dogfood loop proof";
+const ISSUE_TITLE: &str = "prove the dogfood loop";
 const RACE_REPLY: &str = "raced an interloper";
 
 /// one script-backed provider standing in for a coding agent. the script FILE
@@ -520,7 +520,7 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
         "forge",
         &forge::encode_msg(&forge::ForgeMsg::OpenIssue {
             repo: REPO.into(),
-            title: "prove the dogfood loop".into(),
+            title: ISSUE_TITLE.into(),
             body: "mention the duck, get a PR".into(),
         }),
     );
@@ -574,7 +574,7 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     watch(&issue_channel);
 
     // ---- run 1: issue mention → worktree at the pinned main tip → branch
-    //      `agent/item-1` born → a PR titled by the reply's first line.
+    //      `agent/item-1` born → a PR titled by the bound Forge issue.
     post_mention(&cluster, 0, &issue_channel, "m1");
     let run_1 = runs::run_id_for(&issue_channel, seq_of(&cluster, 0, &issue_channel, "m1"), AGENT_ID);
     assert_eq!(
@@ -600,7 +600,7 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     assert_eq!(head_ref, "HEAD", "the worktree is DETACHED at the pin");
     assert_eq!(head, main_tip, "run 1 forks the pinned main tip");
 
-    // the PR: opened by the sink, titled from the message facet's first line.
+    // the PR: opened by the sink, titled from verified bound issue metadata.
     let pr_number = poll_until("the PR to open", FINALIZE, || {
         tracker_items(&cluster, 0)
             .iter()
@@ -609,7 +609,10 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     });
     let pr = tracker_item(&cluster, 0, pr_number).expect("the PR item");
     assert_eq!(pr.summary.state, forge::ItemState::Open);
-    assert_eq!(pr.summary.title, REPLY_TITLE, "PR title = the reply's first line");
+    assert_eq!(
+        pr.summary.title, ISSUE_TITLE,
+        "PR title = the bound issue title"
+    );
     assert_eq!(pr.source_branch.as_deref(), Some(WORK_BRANCH));
     assert_eq!(pr.target_branch.as_deref(), Some("main"));
     let pr_channel = pr.channel_id.clone();

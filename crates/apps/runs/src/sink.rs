@@ -21,8 +21,8 @@ use crate::forge_source::{ForgeItemKind, ForgeItemState};
 use crate::response::REPLY_KIND_CODE;
 use crate::{RunsModule, truncate_on_boundary};
 
-/// the PR-title clamp: the first line of the message facet, at most this many
-/// CHARS (char-boundary safe, never a byte slice).
+/// the fallback PR-title clamp: the first line of the message facet, at most
+/// this many CHARS (char-boundary safe, never a byte slice).
 const PR_TITLE_MAX_CHARS: usize = 100;
 
 /// mirror of `forge::MAX_TITLE_BYTES` (conformance-pinned): an OpenPr whose
@@ -46,9 +46,9 @@ pub(crate) fn saga_id_for_dispatch(receiver: &str, dispatch_id: &str) -> String 
 }
 
 /// render the validated response's reply blocks — the message facet exactly as
-/// chat receives it — into the deterministic text the PR title/body derive
-/// from: paragraphs verbatim, code blocks fenced, blocks joined by one blank
-/// line. normalization already guarantees non-empty trimmed texts.
+/// chat receives it — into the deterministic prose the PR body carries:
+/// paragraphs verbatim, code blocks fenced, blocks joined by one blank line.
+/// normalization already guarantees non-empty trimmed texts.
 pub(crate) fn message_facet_text(blocks: &[ReplyBlock]) -> String {
     blocks
         .iter()
@@ -64,11 +64,14 @@ pub(crate) fn message_facet_text(blocks: &[ReplyBlock]) -> String {
         .join("\n\n")
 }
 
-/// PR title: the first non-blank line of the message facet, clamped to
-/// [`PR_TITLE_MAX_CHARS`] chars AND forge's title byte cap, both on char
-/// boundaries. a blank facet falls back to `agent run <run_id>` (forge
-/// rejects empty titles — the fallback keeps the no-abort rule).
-fn derive_pr_title(message: &str, run_id: &str) -> String {
+/// PR title: verified bound Forge metadata is authoritative and already obeys
+/// Forge's title cap. Only when that metadata is unavailable does the first
+/// non-blank response line become a bounded fallback. A blank facet finally
+/// falls back to `agent run <run_id>` because Forge rejects empty titles.
+fn derive_pr_title(item_title: Option<&str>, message: &str, run_id: &str) -> String {
+    if let Some(title) = item_title.filter(|title| !title.trim().is_empty()) {
+        return truncate_on_boundary(title, FORGE_TITLE_BYTE_CAP, "");
+    }
     let line: String = message
         .lines()
         .map(str::trim)
@@ -161,10 +164,12 @@ impl RunsModule {
     /// target (the no-fail rule: an OpenPr for an unborn branch — either end —
     /// or with source == target would abort the block), and the duplicate-PR
     /// guard (an OPEN PR already sourcing this branch was UPDATED by the push
-    /// — skip with a breadcrumb). the OpenPr's title/body derive from `message` (the
-    /// rendered message facet) and `receipt` — the wire sink's echoed empty
-    /// title/body are IGNORED. `executing_node` is the caller-computed saga
-    /// attribution ([`Self::executing_node`]) the PR body breadcrumb names.
+    /// — skip with a breadcrumb). the OpenPr title comes from the verified
+    /// bound Forge item; only an unavailable item falls back to `message`.
+    /// The body carries the full rendered message facet and `receipt` — the
+    /// wire sink's echoed empty title/body are IGNORED. `executing_node` is
+    /// the caller-computed saga attribution ([`Self::executing_node`]) the PR
+    /// body breadcrumb names.
     /// any missing precondition degrades to a breadcrumb — the sink NEVER
     /// aborts the delivery block.
     ///
@@ -302,7 +307,36 @@ impl RunsModule {
                         return None;
                     }
                 }
-                let title = derive_pr_title(message, run_id);
+                // Re-read the bound item from committed tracker state at the
+                // publication boundary. A response receipt is never metadata
+                // and therefore cannot replace a title that Forge verifies.
+                let item_title = match crate::forge_source::parse_forge_channel(&entry.channel_id) {
+                    Some(item_ref) if item_ref.repo == repo => {
+                        match self.forge_item(&*ctx, &forge, repo, item_ref.number).await {
+                            Ok(Some(item)) => Some(item.title),
+                            Ok(None) => {
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "run {run_id} pr sink: bound Forge item unavailable; using response-title fallback"
+                                    ),
+                                );
+                                None
+                            }
+                            Err(why) => {
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "run {run_id} pr sink: bound Forge item unavailable ({why}); using response-title fallback"
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let title = derive_pr_title(item_title.as_deref(), message, run_id);
                 let body = derive_pr_body(message, run_id, receipt, executing_node);
                 ctx.emit_msg(Msg {
                     target: forge,
@@ -425,24 +459,51 @@ mod tests {
     }
 
     #[test]
-    fn pr_title_is_the_first_nonblank_line_clamped_to_100_chars_on_char_boundaries() {
+    fn response_title_fallback_is_clamped_to_100_chars_on_char_boundaries() {
         // plain: the first line wins.
-        assert_eq!(derive_pr_title("Fix the gate\n\nmore detail", "r"), "Fix the gate");
+        assert_eq!(
+            derive_pr_title(None, "Fix the gate\n\nmore detail", "r"),
+            "Fix the gate"
+        );
         // 2-byte chars: exactly 100 CHARS survive (200 bytes — inside the
         // forge byte cap); a byte slice at 100 would split a char.
-        let title = derive_pr_title(&"é".repeat(120), "r");
+        let title = derive_pr_title(None, &"é".repeat(120), "r");
         assert_eq!(title, "é".repeat(100));
         // 4-byte chars: the forge 256-BYTE cap clamps earlier — still on a
         // char boundary (64 whole ducks == 256 bytes).
-        let title = derive_pr_title(&"🦆".repeat(120), "r");
+        let title = derive_pr_title(None, &"🦆".repeat(120), "r");
         assert_eq!(title, "🦆".repeat(64));
         assert!(title.len() <= FORGE_TITLE_BYTE_CAP);
     }
 
     #[test]
-    fn pr_title_falls_back_when_the_message_facet_is_blank() {
-        assert_eq!(derive_pr_title("", "run-1"), "agent run run-1");
-        assert_eq!(derive_pr_title("  \n\t\n", "run-1"), "agent run run-1");
+    fn bound_item_title_beats_a_pages_style_one_line_receipt() {
+        let issue = "Use Forge issue titles for auto-published Agent PRs";
+        let receipt = "Implemented and recorded verification on the referenced Pages block.";
+        assert_eq!(derive_pr_title(Some(issue), receipt, "run-1"), issue);
+    }
+
+    #[test]
+    fn bound_item_title_beats_a_long_response() {
+        let issue = "Use Forge issue titles for auto-published Agent PRs";
+        let response = "A long model response must stay in the body. ".repeat(200);
+        assert_eq!(derive_pr_title(Some(issue), &response, "run-1"), issue);
+    }
+
+    #[test]
+    fn bound_item_title_never_degrades_to_a_generic_message() {
+        let issue = "Use Forge issue titles for auto-published Agent PRs";
+        assert_eq!(derive_pr_title(Some(issue), "Apply agent changes", "run-1"), issue);
+    }
+
+    #[test]
+    fn pr_title_falls_back_only_without_bound_item_metadata() {
+        assert_eq!(
+            derive_pr_title(None, "Useful response\nmore", "run-1"),
+            "Useful response"
+        );
+        assert_eq!(derive_pr_title(None, "", "run-1"), "agent run run-1");
+        assert_eq!(derive_pr_title(None, "  \n\t\n", "run-1"), "agent run run-1");
     }
 
     #[test]

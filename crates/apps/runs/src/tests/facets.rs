@@ -654,6 +654,18 @@ fn forge_push_run() -> (RunsModule, Registry, String) {
     (m, granted, run_id)
 }
 
+/// Re-key the lightweight sink fixture as a real Forge issue run. Composition
+/// itself is covered separately; this keeps the publication-boundary test
+/// focused on the committed tracker lookup that verifies the title.
+fn bind_run_to_forge_issue(m: &mut RunsModule, run_id: &str, number: u64) -> String {
+    let old_dispatch = dispatch_id_for(run_id);
+    let mut entry = m.pending.remove(&old_dispatch).expect("pending fixture run");
+    entry.channel_id = format!("forge:app:{number}");
+    let bound_run_id = entry.run_id();
+    m.pending.insert(dispatch_id_for(&bound_run_id), entry);
+    bound_run_id
+}
+
 /// a faceted wrapper whose receipt is a forge receipt (§5 shape).
 fn forge_wrapper(
     response_text: &str,
@@ -698,11 +710,13 @@ fn breadcrumbs(ctx: &CaptureCtx) -> Vec<String> {
 }
 
 #[test]
-fn pr_sink_derives_title_and_body_from_the_message_facet_and_forge_receipt() {
-    // the full derivation: title = first line of the message facet, body =
-    // the whole facet + the receipt breadcrumb (run id, branch@oid, the
-    // executing node from the run's Done saga record).
-    let (mut m, granted, run_id) = forge_push_run();
+fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
+    // The full derivation: title = the committed bound Forge issue title;
+    // body = the whole response facet + receipt breadcrumb (run id,
+    // branch@oid, executing node). The Pages-style receipt must not become
+    // publication metadata.
+    let (mut m, granted, fixture_run_id) = forge_push_run();
+    let run_id = bind_run_to_forge_issue(&mut m, &fixture_run_id, 7);
     let oid = "1a".repeat(20);
     let saga_id = sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run_id));
     let mut ctx = CaptureCtx::new()
@@ -712,8 +726,12 @@ fn pr_sink_derives_title_and_body_from_the_message_facet_and_forge_receipt() {
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main")
+        .with_forge_item(
+            "app",
+            forge_issue(7, "Fix the flaky gate", "Issue reproduction"),
+        )
         .with_saga_assignee(&saga_id, &[0xab; 32]);
-    let message = "Fix the flaky gate: retry twice\n\nDetails in the diff.";
+    let message = "Implemented and recorded verification on the referenced Pages block.\n\nDetails in the diff.";
     exec(
         &mut m,
         &mut ctx,
@@ -729,7 +747,7 @@ fn pr_sink_derives_title_and_body_from_the_message_facet_and_forge_receipt() {
         forge::decode_msg(&forge_ops[0].payload).unwrap(),
         forge::ForgeMsg::OpenPr {
             repo: "app".into(),
-            title: "Fix the flaky gate: retry twice".into(),
+            title: "Fix the flaky gate".into(),
             body: format!(
                 "{message}\n\n---\nrun: {run_id}\noutput: agent/x@{oid}\nnode: {}",
                 "ab".repeat(32)
@@ -739,11 +757,11 @@ fn pr_sink_derives_title_and_body_from_the_message_facet_and_forge_receipt() {
         }
     );
     // the delivered-runs ring observes the same delivery: the forge
-    // output ref and the number the fresh OpenPr gets (empty tracker → 1).
+    // output ref and the number the fresh OpenPr gets (issue #7 → PR #8).
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, Some(format!("agent/x@{oid}")));
-    assert_eq!(rec.pr_number, Some(1));
+    assert_eq!(rec.pr_number, Some(8));
     assert_eq!(rec.executing_node, "ab".repeat(32));
 }
 
