@@ -173,7 +173,7 @@ pub(super) async fn park(
     // just gets the next re-announce.
     let announce_frame = invite_token
         .as_ref()
-        .map(|t| IoBuf::from(lobby::encode_msg(&lobby::join_request(&signer, &namespace, t))));
+        .map(|t| IoBuf::from(lobby::encode_msg(&lobby::gate_request(&signer, &namespace, t))));
     let mut announce_targets: Vec<ed25519::PublicKey> = validators.clone();
 
     let me_bytes = signer.public_key().as_ref().to_vec();

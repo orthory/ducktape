@@ -367,56 +367,65 @@ pub(super) async fn wire(
         context.child("lobby_replies").spawn(move |_ctx| async move {
             while let Ok((peer, msg)) = lobby_rx.recv().await {
                 let bytes: Vec<u8> = msg.into();
-                if let Ok(lobby::LobbyMsg::JoinReply {
-                    recorded,
-                    detail,
-                    cap,
-                    fatal,
-                }) = lobby::decode_msg(&bytes)
-                {
-                    println!(
-                        "[node {label}] member {}: {}{detail}",
-                        hex_bytes(&peer.as_ref()[..4]),
-                        if recorded { "" } else { "join request refused — " },
-                    );
-                    if fatal {
-                        // this invite can NEVER redeem (e.g. its
-                        // single-use token is already spent by
-                        // another key) — retrying is a silent
-                        // forever-spin. stop loudly: the FATAL
-                        // marker is the app/operator contract.
-                        eprintln!(
-                            "[node {label}] FATAL: {detail} — this invite cannot \
-                             be redeemed (an invite admits exactly one person). \
-                             ask the inviter for a fresh invite and re-join with \
-                             the new blob."
+                match lobby::decode_msg(&bytes) {
+                    // the AUTHORITATIVE admission (ADR §3): standing is
+                    // granted at `height`. persist any coord.cap the
+                    // member delivered (private coordination); the park
+                    // loop discovers the granted standing on its next poll.
+                    Ok(lobby::GateMsg::Admitted { height, cap }) => {
+                        println!(
+                            "[node {label}] member {} ADMITTED us at height {height}",
+                            hex_bytes(&peer.as_ref()[..4]),
                         );
-                        std::process::exit(1);
-                    }
-                    // a delivered cap (private coordination): unpack
-                    // the opaque bytes and persist beside identity.
-                    if let Some(cap_bytes) = cap {
-                        match config::unpack_coord_cap(&cap_bytes) {
-                            Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
-                                Ok(()) => println!(
-                                    "[node {label}] coordinator cap delivered by \
-                                     member {} — saved (issuer {}, expires {})",
-                                    hex_bytes(&peer.as_ref()[..4]),
-                                    hex_bytes(&cap.issuer.as_ref()[..4]),
-                                    cap.not_after,
-                                ),
+                        if let Some(cap_bytes) = cap {
+                            match config::unpack_coord_cap(&cap_bytes) {
+                                Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
+                                    Ok(()) => println!(
+                                        "[node {label}] coordinator cap delivered by \
+                                         member {} — saved (issuer {}, expires {})",
+                                        hex_bytes(&peer.as_ref()[..4]),
+                                        hex_bytes(&cap.issuer.as_ref()[..4]),
+                                        cap.not_after,
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[node {label}] coordinator cap delivered but \
+                                         could not be saved: {e}"
+                                    ),
+                                },
                                 Err(e) => eprintln!(
-                                    "[node {label}] coordinator cap delivered but \
-                                     could not be saved: {e}"
+                                    "[node {label}] member {} sent a malformed \
+                                     coordinator cap: {e}",
+                                    hex_bytes(&peer.as_ref()[..4]),
                                 ),
-                            },
-                            Err(e) => eprintln!(
-                                "[node {label}] member {} sent a malformed \
-                                 coordinator cap: {e}",
-                                hex_bytes(&peer.as_ref()[..4]),
-                            ),
+                            }
                         }
                     }
+                    // the gate refused. a TERMINAL reject can never redeem
+                    // (spent, foreign, expired, …) — stop loudly instead of
+                    // spinning (ADR R2). a non-terminal reject (issuer view
+                    // lag, member busy) leaves the round-robin to another
+                    // member; just log it.
+                    Ok(lobby::GateMsg::Rejected {
+                        code,
+                        detail,
+                        terminal,
+                    }) => {
+                        if terminal {
+                            eprintln!(
+                                "[node {label}] FATAL: gate refused ({code:?}): {detail} — \
+                                 this invite cannot be redeemed. ask the inviter for a \
+                                 fresh invite and re-join with the new blob."
+                            );
+                            std::process::exit(1);
+                        }
+                        println!(
+                            "[node {label}] member {} declined ({code:?}): {detail} — \
+                             trying another member",
+                            hex_bytes(&peer.as_ref()[..4]),
+                        );
+                    }
+                    // a Request echoed back or junk — ignore.
+                    Ok(lobby::GateMsg::Request { .. }) | Err(_) => {}
                 }
             }
         });

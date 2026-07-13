@@ -207,6 +207,14 @@ pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
 /// block events). mirrors the rpc bridge's stuck-node budget.
 pub(crate) const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 
+/// the join gate's settle budget (ADR §3.2): a gating member holds the joiner's
+/// pending `Admitted`/`Rejected` reply against its submitted `Redeem` frame for
+/// this long. if the frame has not drained by then the member answers
+/// `Rejected{ Busy, terminal: false }` and the joiner fails over to another
+/// member. wider than `SUBMIT_HOLD` because a fresh joiner's first block can
+/// wait on mesh warm-up.
+pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// the five channels epoch `e`'s engine uses: vote, certificate, resolver, the
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
 /// backstop — a validator that missed the one-shot relay gossip for a
