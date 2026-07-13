@@ -65,6 +65,38 @@ fs.writeFileSync(bodyPath, item.body || "");
 NODE
 }
 
+neutralize_github_closing_keywords() {
+  local body=$1 repo=$2
+  node - "$body" "$repo" <<'NODE'
+const fs = require("node:fs");
+const [bodyPath, repo] = process.argv.slice(2);
+const lines = fs.readFileSync(bodyPath, "utf8").split("\n");
+let fence = "";
+
+for (let i = 0; i < lines.length; i += 1) {
+  const marker = lines[i].match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+  if (fence) {
+    if (marker?.[0] === fence[0] && marker.length >= fence.length &&
+        new RegExp(`^ {0,3}\\${fence[0]}{${fence.length},}[ \\t]*$`).test(lines[i])) {
+      fence = "";
+    }
+    continue;
+  }
+  if (marker) {
+    fence = marker;
+    continue;
+  }
+  lines[i] = lines[i].replace(
+    /\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+#([1-9][0-9]*)\b/gi,
+    (match, number, offset) =>
+      `${lines[i].slice(0, offset).trim() ? "addresses" : "Addresses"} Forge ${repo} item ${number}`,
+  );
+}
+
+fs.writeFileSync(bodyPath, lines.join("\n"));
+NODE
+}
+
 assert_clean() {
   local dir=$1
   [ -z "$(git -C "$dir" status --porcelain --untracked-files=all)" ] ||
@@ -267,6 +299,7 @@ main() {
   log "reading canonical Forge PR #$PR_NUMBER from $BASE_URL"
   query_item "$RUN_DIR/item.json"
   parse_item "$RUN_DIR/item.json" "$RUN_DIR/item-fields" "$RUN_DIR/pr-body"
+  neutralize_github_closing_keywords "$RUN_DIR/pr-body" "$FORGE_REPO"
   local -a item
   mapfile -t item <"$RUN_DIR/item-fields"
   [ "${#item[@]}" -eq 4 ] || die "Forge PR metadata was incomplete"
