@@ -349,7 +349,7 @@ fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
     let context = v["context"].as_str().expect("a page ref composes context");
     assert!(context.starts_with("Referenced pages:"), "{context}");
     assert!(
-        context.contains("[[page:plan]] — Project Plan"),
+        context.contains("[Project Plan](duck://page/plan)"),
         "{context}"
     );
     assert!(context.contains("spec paragraph"), "{context}");
@@ -459,7 +459,7 @@ fn a_page_ref_in_the_forge_item_body_appends_after_the_item_context() {
         "the page section follows the item context: {context}"
     );
     assert!(
-        context.contains("[[page:plan]] — Project Plan"),
+        context.contains("[Project Plan](duck://page/plan)"),
         "{context}"
     );
     assert!(
@@ -488,7 +488,7 @@ fn a_missing_page_ref_composes_its_marker_never_a_failure() {
     .expect("an unresolvable ref never fails compose");
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
     let context = v["context"].as_str().unwrap();
-    assert!(context.contains("[[page:gone — not found]]"), "{context}");
+    assert!(context.contains("[page gone — not found]"), "{context}");
 }
 
 #[test]

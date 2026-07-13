@@ -117,6 +117,14 @@ pub(crate) struct DuckRefs {
 /// A malformed ref (bad url, out-of-confinement file path) is skipped, NEVER a
 /// failure. The `![..]` embed marker and the label are ignored: only the
 /// referenced id/path matters for injection.
+///
+/// parity ceiling: on a hand-typed ADVERSARIALLY-nested body (a ref whose
+/// label brackets wrap another ref, e.g. `[a](b[c](duck://page/p))`) this
+/// under-reads relative to the console's regex — the refs parsed here are
+/// always a SUBSET of what a human's chips show, never a superset. That is the
+/// safe direction (the agent can miss a contrived ref; it can never be fed a
+/// file the author didn't reference), and the composer only ever emits clean,
+/// non-nested refs.
 pub(crate) fn parse_duck_refs(sources: &[&str]) -> DuckRefs {
     let mut out = DuckRefs::default();
     for source in sources {
@@ -193,9 +201,11 @@ pub(crate) fn render_pages_section(pages: &[(String, Option<Vec<Block>>)]) -> St
 /// pass). an unresolvable page is its one-line marker.
 fn render_page(page_id: &str, blocks: Option<&[Block]>) -> String {
     let Some((root, rest)) = blocks.and_then(|b| b.split_first()) else {
-        return format!("[[page:{page_id} — not found]]");
+        return format!("[page {page_id} — not found]");
     };
-    let mut out = format!("[[page:{page_id}]] — {}", root.text);
+    // the header IS the live ref: an agent echoing it produces a working chip
+    // (the retired `[[page:]]` syntax would not).
+    let mut out = format!("[{}](duck://page/{page_id})", root.text);
     let mut depth = BTreeMap::from([(root.id.as_str(), 0usize)]);
     for block in rest {
         let d = block
@@ -377,9 +387,30 @@ impl RunsModule {
         let Ok(bytes) = STANDARD.decode(b64.as_bytes()) else {
             return Attachment::NotFound;
         };
-        match String::from_utf8(bytes) {
-            Ok(text) => Attachment::Text(text),
-            Err(_) => Attachment::Binary,
+        decode_attachment(&bytes)
+    }
+}
+
+/// classify read bytes as text or binary. A read capped at the budget can slice
+/// a UTF-8 file mid-codepoint, so a failure confined to the final ≤3 bytes (a
+/// truncated trailing char) still counts as TEXT — the valid prefix is inlined.
+/// A failure earlier in the buffer is genuinely non-UTF-8 (an image, a binary).
+/// pure — same bytes, same classification, on every validator.
+fn decode_attachment(bytes: &[u8]) -> Attachment {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Attachment::Text(text.to_string()),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if valid > 0 && bytes.len() - valid <= 3 {
+                // only the truncated trailing codepoint is invalid.
+                Attachment::Text(
+                    std::str::from_utf8(&bytes[..valid])
+                        .expect("valid_up_to is a utf-8 boundary")
+                        .to_string(),
+                )
+            } else {
+                Attachment::Binary
+            }
         }
     }
 }
@@ -580,10 +611,31 @@ mod tests {
     }
 
     #[test]
+    fn a_shallow_file_path_under_the_root_is_not_confined() {
+        // exactly one segment under the root (no <dir>/<name>) — dropped, same
+        // as the console tokenizer.
+        let refs = parse_duck_refs(&["[x](duck://files/shared/attachments/only)"]);
+        assert!(refs.files.is_empty());
+    }
+
+    #[test]
+    fn a_utf8_file_cut_mid_codepoint_is_still_text_not_binary() {
+        // the read cap can slice a multibyte char; the valid prefix is text.
+        let mut bytes = "grüße".repeat(4).into_bytes();
+        bytes.push(0xC3); // a dangling UTF-8 lead byte (a truncated 'ü')
+        assert!(matches!(decode_attachment(&bytes), Attachment::Text(_)));
+        // but a genuine image (non-utf8 EARLY) stays binary.
+        assert_eq!(
+            decode_attachment(&[0x89, 0x50, 0x4e, 0xff, 0xfe, 0x01]),
+            Attachment::Binary
+        );
+    }
+
+    #[test]
     fn a_page_renders_headings_todos_lists_code_and_nesting_from_preorder() {
         let section = render_pages_section(&[("plan".into(), Some(preorder_page()))]);
         assert!(section.starts_with("Referenced pages:"), "{section}");
-        assert!(section.contains("[[page:plan]] — Project Plan"), "{section}");
+        assert!(section.contains("[Project Plan](duck://page/plan)"), "{section}");
         assert!(section.contains("\nthe intro\n"), "{section}");
         assert!(section.contains("\n# Goals\n"), "{section}");
         assert!(section.contains("\n## Near term\n"), "{section}");
@@ -606,10 +658,10 @@ mod tests {
             ("plan".into(), Some(preorder_page())),
             ("gone".into(), None),
         ]);
-        assert!(section.contains("[[page:gone — not found]]"), "{section}");
+        assert!(section.contains("[page gone — not found]"), "{section}");
         // an empty reply Vec is as unresolvable as None.
         let empty = render_pages_section(&[("void".into(), Some(Vec::new()))]);
-        assert!(empty.contains("[[page:void — not found]]"), "{empty}");
+        assert!(empty.contains("[page void — not found]"), "{empty}");
     }
 
     #[test]
