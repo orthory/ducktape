@@ -1946,6 +1946,78 @@ fn git_clone_over_http_round_trips_full_history() {
     );
 }
 
+/// Regression for stateless upload-pack negotiation: once a checkout has
+/// common objects with Forge, stock git sends one or more flush-ended `have`
+/// rounds before `done`. The server must answer those rounds with NAK only;
+/// PACK bytes are legal only in the final response.
+#[test]
+fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
+    if !have_git() {
+        eprintln!(
+            "skipping git_fetch_and_pull_into_nonempty_checkout_complete_negotiation: no `git` on PATH"
+        );
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/negotiated", daemon.port);
+
+    let source = tempfile::TempDir::new().expect("source repo");
+    let src = source.path();
+    git_ok(src, &["init"]);
+    // More than git's initial have window guarantees at least one have batch
+    // ends in a flush before the client reaches `done`.
+    for number in 1..=20 {
+        let content = format!("base {number}\n");
+        let message = format!("base commit {number}");
+        commit_file(src, "history.txt", &content, &message);
+    }
+    git_ok(src, &["remote", "add", "ducktape", &url]);
+    git_ok(src, &["push", "ducktape", "main"]);
+    let first_head = rev_parse_head(src);
+
+    let checkout_root = tempfile::TempDir::new().expect("checkout root");
+    let checkout = checkout_root.path().join("checkout");
+    git_ok(
+        checkout_root.path(),
+        &["clone", &url, checkout.to_str().expect("utf-8 checkout path")],
+    );
+
+    // A fetch from a non-empty repo has a common first commit. This exercises
+    // the intermediate have/NAK round and leaves the worktree at its prior head.
+    commit_file(src, "history.txt", "fetched\n", "fetched commit");
+    git_ok(src, &["push", "ducktape", "main"]);
+    let fetch = git_capture(&checkout, &["fetch", "origin"]);
+    eprintln!("=== negotiated git fetch ===\n{}", render(&fetch));
+    assert!(
+        fetch.status.success(),
+        "fetch into a non-empty checkout failed:\n{}",
+        render(&fetch)
+    );
+    assert_eq!(
+        rev_parse_head(&checkout),
+        first_head,
+        "fetch must not move the checked-out branch"
+    );
+
+    // Advance once more so pull performs its own negotiated fetch, then verify
+    // both the ref update and checkout bytes through stock git.
+    commit_file(src, "history.txt", "pulled\n", "pulled commit");
+    git_ok(src, &["push", "ducktape", "main"]);
+    let pull = git_capture(&checkout, &["pull", "--ff-only"]);
+    eprintln!("=== negotiated git pull ===\n{}", render(&pull));
+    assert!(
+        pull.status.success(),
+        "pull into a non-empty checkout failed:\n{}",
+        render(&pull)
+    );
+    assert_eq!(rev_parse_head(&checkout), rev_parse_head(src));
+    assert_eq!(
+        std::fs::read(checkout.join("history.txt")).expect("read pulled file"),
+        b"pulled\n"
+    );
+}
+
 /// Regression: a push whose data exceeds git's `http.postBuffer` is preceded by
 /// a flush-only PROBE POST (zero commands) before the real chunked request. The
 /// receive-pack handler must answer that probe 200, not 400 — otherwise every
