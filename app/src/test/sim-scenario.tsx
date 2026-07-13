@@ -38,11 +38,13 @@ function Probe() {
 }
 
 export interface SimScenario {
-  /** Spawn a fresh sim + provider; resolves once the store is connected. */
+  /** Spawn a fresh sim + provider; resolves once the store is connected. The
+   *  `base` is the sim's http origin — a few scenarios re-dial it (connectRemote)
+   *  to exercise a store path that needs a resolved node url. */
   boot(
     options?: SimSpawnOptions,
     ui?: ReactNode,
-  ): Promise<{ sim: SimControl; transport: NodeTransport }>;
+  ): Promise<{ sim: SimControl; transport: NodeTransport; base: string }>;
   /** The live store state as of the LAST render — re-read after every await. */
   state(): Captured["state"];
   actions(): Captured["actions"];
@@ -85,7 +87,7 @@ export const useSimScenario = (): SimScenario => {
     await waitFor(() => expect(capturedState?.connected).toBe(true), {
       timeout: 15_000,
     });
-    return { sim: live.sim, transport };
+    return { sim: live.sim, transport, base: live.base };
   };
 
   return {

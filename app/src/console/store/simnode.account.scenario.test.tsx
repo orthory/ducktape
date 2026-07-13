@@ -26,6 +26,7 @@ import { describe, expect, it } from "vitest";
 import { keyHex } from "../../domain/chat-client";
 import { simnodeBinary } from "../../test/simnode-harness";
 import { useSimScenario } from "../../test/sim-scenario";
+import { opKey } from "./finalization";
 
 const bin = simnodeBinary();
 if (!bin) {
@@ -161,6 +162,130 @@ describe.skipIf(!bin)("account scenarios against the sim node", () => {
         expect(state().error).toMatch(
           /bind this node to an identity account before registering a \.duck name/,
         ),
+      );
+    },
+  );
+
+  // ── WRITE tier: --node-key gives the sim a self identity ─────────────
+  //
+  // With `--node-key K`, status.publicKey serves K, so the store resolves the
+  // self account via nodeUsers[K] and its WRITE paths become reachable. One
+  // subtlety the sim exposes: a REAL node discards the /v1/submit origin and
+  // stamps its OWN node key as author; the sim keeps the client origin verbatim
+  // (a testing divergence). duckdns's set_handle requires a 32-byte, account-
+  // bound origin, so the store's write must author AS K here — we set the store
+  // author to the `hex:` escape of K, which the sim decodes to K's raw bytes,
+  // reproducing exactly what a real node does automatically.
+
+  /** K, the fabricated node key --node-key seeds (status.publicKey serves it). */
+  const nodeKeyBytes = Array.from({ length: 32 }, () => 0x11);
+  const nodeKeyHex = keyHex(nodeKeyBytes);
+  /** Author the store's submits AS K: the sim's `hex:` origin escape decodes to
+   *  K's raw bytes (a real node stamps K itself). */
+  const asNodeKeyOrigin = "hex:" + nodeKeyHex;
+
+  /** Found account A over the bare wire and bind `nodeHex` to it, naming the
+   *  node key's RAW bytes via the `hex:` origin escape. Returns the account id. */
+  const bindAccount = async (
+    sim: Awaited<ReturnType<typeof boot>>["sim"],
+    secret: Uint8Array,
+    node: number[],
+    displayName: string,
+  ): Promise<string> => {
+    const nodeHex = keyHex(node);
+    await sim.peerBlock(
+      "identity",
+      { bind_node: { authorizer: edBindAuth(secret, Uint8Array.from(node), "", 0) } },
+      "hex:" + nodeHex,
+    );
+    await sim.peerBlock(
+      "identity",
+      { set_account_name: { display_name: displayName } },
+      "hex:" + nodeHex,
+    );
+    return keyHex(Array.from(ed25519.getPublicKey(secret)));
+  };
+
+  it(
+    "setDuckHandle lands end-to-end: the store's write registers the .duck name for the bound account",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot({ nodeKey: nodeKeyHex, auto: true });
+
+      const accountId = await bindAccount(
+        sim,
+        new Uint8Array(32).fill(7),
+        nodeKeyBytes,
+        "Eddy",
+      );
+      // the store hydrates the self node → account mapping off status.publicKey.
+      await waitFor(() =>
+        expect(state().nodeUsers[nodeKeyHex]?.accountId).toBe(accountId),
+      );
+
+      // author AS K so the set_handle submit lands under the bound node.
+      act(() => actions().setAuthor(asNodeKeyOrigin));
+      act(() => actions().setDuckHandle("eddy"));
+
+      // the write settled: the op finalized and committed truth carries the
+      // handle keyed by the account id (the store's own read projection).
+      await waitFor(() =>
+        expect(state().ops[opKey.duckHandle()]?.phase).toBe("finalized"),
+      );
+      await waitFor(() =>
+        expect(state().accountHandles[accountId]).toBe("eddy"),
+      );
+
+      // accountBindNode's auto-bind vocabulary (bound/already/locked/deferred/
+      // skipped) is NOT reachable in this provider-only lane: the action guards
+      // on a selected workspace (null here) before it ever reaches the tauri-
+      // signed bind. Pin the honest guard; the vocabulary lives in
+      // auto-bind.test.ts (which drives a stub transport + a mocked shell).
+      await expect(actions().accountBindNode()).rejects.toThrow(
+        /not connected to a workspace node/,
+      );
+    },
+  );
+
+  it(
+    "claiming an already-taken handle surfaces the module's rejection in store state",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot({ nodeKey: nodeKeyHex, auto: true });
+
+      // a RIVAL account (its own bound node) claims "duke" first, over the wire.
+      const rivalNode = Array.from({ length: 32 }, () => 0x22);
+      await bindAccount(sim, new Uint8Array(32).fill(9), rivalNode, "Rival");
+      await sim.peerBlock(
+        "duckdns",
+        { set_handle: { handle: "duke" } },
+        "hex:" + keyHex(rivalNode),
+      );
+
+      // OUR account binds to K…
+      const accountId = await bindAccount(
+        sim,
+        new Uint8Array(32).fill(7),
+        nodeKeyBytes,
+        "Eddy",
+      );
+      await waitFor(() =>
+        expect(state().nodeUsers[nodeKeyHex]?.accountId).toBe(accountId),
+      );
+
+      // …and the store tries to claim the taken handle: the REAL duckdns module
+      // refuses, and the failure lands in the op ledger.
+      act(() => actions().setAuthor(asNodeKeyOrigin));
+      act(() => actions().setDuckHandle("duke"));
+      await waitFor(() =>
+        expect(state().ops[opKey.duckHandle()]?.phase).toBe("failed"),
+      );
+      expect(state().ops[opKey.duckHandle()]?.error).toMatch(
+        /already claimed by another account/,
+      );
+      // the optimistic handle rolled back — our account holds no name.
+      await waitFor(() =>
+        expect(state().accountHandles[accountId]).toBeUndefined(),
       );
     },
   );
