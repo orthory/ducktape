@@ -421,12 +421,12 @@ fn genesis_duckdns_wasm() -> WasmModule {
         .with_state_schema_revision(2)
 }
 
-/// saga / agent / automations at their GENESIS code (adapter-ported,
-/// revision 2 — see [`genesis_vaults_wasm`]). the sibling wiring — saga's
-/// valset/capability assignment reads, agent's saga dead-letter + runs hook,
-/// automations' chat/tasks/inbox lanes — is genesis-constant and compiled
-/// into the guests (the exact production constructors these builders used to
-/// call natively).
+/// saga / agent / automations at their GENESIS code (adapter-ported; saga and
+/// automations are revision 2, while agent's later role tail makes it revision
+/// 3). the sibling wiring — saga's valset/capability assignment reads, agent's
+/// saga dead-letter + runs hook, automations' chat/tasks/inbox lanes — is
+/// genesis-constant and compiled into the guests (the exact production
+/// constructors these builders used to call natively).
 fn genesis_saga_wasm() -> WasmModule {
     WasmModule::from_bytes(SAGA_MODULE_ID, SAGA_WASM_COMPONENT)
         .expect("embedded saga component loads")
@@ -436,7 +436,7 @@ fn genesis_saga_wasm() -> WasmModule {
 fn genesis_agent_wasm() -> WasmModule {
     WasmModule::from_bytes(AGENT_MODULE_ID, AGENT_WASM_COMPONENT)
         .expect("embedded agent component loads")
-        .with_state_schema_revision(2)
+        .with_state_schema_revision(3)
 }
 
 fn genesis_automations_wasm() -> WasmModule {
@@ -1421,7 +1421,7 @@ mod tests {
         // fail-closed like every other historical schema).
         assert_eq!(
             crate::config::hex_bytes(&pre_clients_state_schema_fingerprint()),
-            "2a98f8c74b3ba96be0526b307d5ad6c332988d0e1632bb627b8198afd93c0a59"
+            "2f9bc45b9abc691c65d9f6175f7a3aba39962dc8b6fce27ba207162887a60375"
         );
         assert_eq!(
             classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 0),

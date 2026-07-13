@@ -305,7 +305,8 @@ pub(super) async fn restore_host(
     jobs.install(bytes, root)
         .map_err(|error| format!("jobs install: {error}"))?;
 
-    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()))
+        .with_legacy_v1_state();
     let (bytes, root) = snapshot_of("agent")?;
     agent
         .install(bytes, root)
@@ -633,7 +634,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|error| format!("jobs install: {error}"))?;
 
     let (bytes, root) = snapshot_of("agent").await?;
-    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()))
+        .with_legacy_v1_state();
     agent
         .install(&bytes, root)
         .map_err(|error| format!("agent install: {error}"))?;

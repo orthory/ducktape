@@ -499,6 +499,11 @@ pub struct AgentModule {
     /// in lockstep. an opaque id: this crate never decodes its interface.
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
+    /// Recovery-only execution mode for the exact protocol-v1 native
+    /// registry. Its snapshot predates roles, so role mutations and
+    /// role-bearing snapshots must remain unavailable while that workspace
+    /// advertises the revision-1 fingerprint.
+    legacy_v1: bool,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
     /// this block's staged writes, read ahead of committed state
@@ -529,9 +534,17 @@ impl AgentModule {
             id,
             saga,
             hook,
+            legacy_v1: false,
             agents: BTreeMap::new(),
             pending_agents: BTreeMap::new(),
         }
+    }
+
+    /// Preserve the exact protocol-v1 snapshot/root contract while rolling a
+    /// newer node binary over an existing native workspace.
+    pub fn with_legacy_v1_state(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
     }
 
     // ---- staged-over-committed reads ---------------------------------------
@@ -836,6 +849,11 @@ impl AgentModule {
             AgentMsg::PauseAgent { agent_id } => self.stage_active(ctx, agent_id, false, now),
             AgentMsg::ResumeAgent { agent_id } => self.stage_active(ctx, agent_id, true, now),
             AgentMsg::SetAgentRole { agent_id, role } => {
+                if self.legacy_v1 {
+                    return Err(Error::Module(
+                        "agent roles are unavailable on the native-v1 state schema".into(),
+                    ));
+                }
                 let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
                 if state.role == role {
                     return Ok(());
@@ -888,6 +906,15 @@ impl AgentModule {
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let agents = decode_committed(bytes).map_err(Error::Module)?;
+        if self.legacy_v1
+            && agents
+                .values()
+                .any(|agent| agent.role != AgentRole::General)
+        {
+            return Err(Error::Module(
+                "native-v1 agent snapshot contains a role tail".into(),
+            ));
+        }
         if committed_root(&agents) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
@@ -903,6 +930,14 @@ impl AgentModule {
 impl Module for AgentModule {
     fn id(&self) -> ModuleId {
         self.id.clone()
+    }
+
+    fn state_schema_revision(&self) -> u32 {
+        if self.legacy_v1 {
+            1
+        } else {
+            2
+        }
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
@@ -1979,6 +2014,64 @@ mod tests {
             get_agent(&m, "bot").unwrap().role,
             AgentRole::ProjectLibrarian
         );
+    }
+
+    #[test]
+    fn native_v1_mode_keeps_revision_one_and_rejects_roles() {
+        let mut legacy = module().with_legacy_v1_state();
+        assert_eq!(Module::state_schema_revision(&legacy), 1);
+        assert_eq!(Module::state_schema_revision(&module()), 2);
+
+        let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
+        exec(
+            &mut legacy,
+            &mut owner,
+            &admin(&register("bot", &[])),
+        )
+        .unwrap();
+        commit(&mut legacy);
+        let (legacy_bytes, legacy_root) = (legacy.snapshot(), legacy.root());
+
+        let err = exec(
+            &mut legacy,
+            &mut owner,
+            &admin(&AgentMsg::SetAgentRole {
+                agent_id: "bot".into(),
+                role: AgentRole::ProjectLibrarian,
+            }),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unavailable on the native-v1 state schema"));
+        assert_eq!(legacy.snapshot(), legacy_bytes);
+        assert_eq!(legacy.root(), legacy_root);
+
+        let mut current = module();
+        exec(
+            &mut current,
+            &mut owner,
+            &admin(&register("bot", &[])),
+        )
+        .unwrap();
+        exec(
+            &mut current,
+            &mut owner,
+            &admin(&AgentMsg::SetAgentRole {
+                agent_id: "bot".into(),
+                role: AgentRole::ProjectLibrarian,
+            }),
+        )
+        .unwrap();
+        commit(&mut current);
+        let err = legacy
+            .install(&current.snapshot(), current.root())
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("native-v1 agent snapshot contains a role tail"));
+        assert_eq!(legacy.snapshot(), legacy_bytes);
+        assert_eq!(legacy.root(), legacy_root);
     }
 
     /// the library grant is an ORDINARY duckfs read cap — no special namespace,
