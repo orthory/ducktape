@@ -307,6 +307,10 @@ impl ValidatorRuntime<'_> {
                 lobby::LobbyMsg::JoinRequest { proof, .. } => proof.clone(),
                 _ => unreachable!("verified above"),
             },
+            // verify enforced target == joiner, so the joiner IS the target.
+            target: verified.joiner.as_ref().to_vec(),
+            role: verified.role.as_u8(),
+            expires_unix_secs: verified.expires_unix_secs,
         };
         let seq = *next_seq;
         *next_seq += 1;

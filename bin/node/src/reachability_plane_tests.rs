@@ -21,7 +21,13 @@ fn src() -> std::net::SocketAddr {
 fn intro_bytes() -> (Vec<u8>, ed25519::PublicKey, [u8; 32]) {
     let issuer = ed25519::PrivateKey::from_seed(1);
     let joiner = ed25519::PrivateKey::from_seed(2);
-    let token = mint_invite_token(&issuer, BINDING);
+    let token = mint_invite_token(
+        &issuer,
+        BINDING,
+        &joiner.public_key(),
+        crate::config::InviteRole::Resident,
+        u64::MAX,
+    );
     let wg = [9u8; 32];
     let msg = lobby::intro_request(&joiner, BINDING, &token, wg);
     (lobby::encode_intro(&msg), joiner.public_key(), wg)
