@@ -16,6 +16,7 @@
     "core:window:allow-toggle-maximize",
     "trusted",
     "agent:default",
-    "notification:default"
+    "notification:default",
+    "opener:allow-open-url"
   ]
 }
