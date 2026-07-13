@@ -15,7 +15,8 @@ import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { selfAuthorKeyOf } from "../chat/chat-helpers";
 import { color, font, radius } from "../../theme/tokens";
-import { EDIT_BOUNDARY_MS, buildRows } from "./pages-model";
+import { EDIT_BOUNDARY_MS, buildRows, subtreePlan } from "./pages-model";
+import type { DuplicateOp } from "./pages-model";
 import type { FocusIntent } from "./block-keys";
 import { dropTarget } from "./page-drag";
 import { loadCollapsed, saveCollapsed } from "./page-collapse";
@@ -54,6 +55,10 @@ export function PagesView() {
   const [pendingBlockDelete, setPendingBlockDelete] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [pasteNotice, setPasteNotice] = useState<number | null>(null);
+  // the just-deleted subtree, snapshotted for Undo. null = no toast; [] = a
+  // toast without the button (the subtree was over the op cap to restore); a
+  // non-empty plan = the ops to re-insert. Superseded by a newer delete.
+  const [deleteUndo, setDeleteUndo] = useState<DuplicateOp[] | null>(null);
   // the floating comment card's aim: ONE target (a block id or the page id),
   // the label naming it, and the viewport anchor of the affordance that
   // opened it. Null = no card. The aside panel stays as the all-threads
@@ -180,6 +185,33 @@ export function PagesView() {
     return () => clearTimeout(timer);
   }, [pasteNotice]);
 
+  // the delete-undo toast lingers a little longer than the paste notice — undo
+  // is an action, not just an FYI — then dismisses itself.
+  useEffect(() => {
+    if (deleteUndo === null) return;
+    const timer = setTimeout(() => setDeleteUndo(null), 8000);
+    return () => clearTimeout(timer);
+  }, [deleteUndo]);
+
+  // Replay the snapshot as plain inserts: the wire FIFO (actions.ts) keeps them
+  // in plan order, so the subtree comes back exactly as it was. A checked to-do
+  // needs a second op — InsertBlock carries no `checked` bit. Comments on the
+  // deleted blocks were purged in consensus and cannot be restored.
+  const undoDelete = () => {
+    if (!deleteUndo) return;
+    for (const op of deleteUndo) {
+      actions.insertPageBlock({
+        blockId: op.blockId,
+        parent: op.parent,
+        after: op.after,
+        kind: op.kind,
+        text: op.text,
+      });
+      if (op.checked) actions.setPageBlockChecked({ blockId: op.blockId, checked: true });
+    }
+    setDeleteUndo(null);
+  };
+
   const openBlockComments = useCallback((blockId: string, anchor: CommentAnchor) => {
     setCommentCard({ target: blockId, label: "this block", anchor });
   }, []);
@@ -201,6 +233,7 @@ export function PagesView() {
     openComments: openBlockComments,
     confirmRemove: setPendingBlockDelete,
     onPasteCapped: setPasteNotice,
+    onDeleted: setDeleteUndo,
   });
 
   const commentOnPage = (anchor: CommentAnchor) => {
@@ -280,6 +313,42 @@ export function PagesView() {
                 Pasted the first {MAX_PASTE_BLOCKS} blocks — {pasteNotice} more line
                 {pasteNotice === 1 ? "" : "s"} were dropped. Each block is one write, so a
                 paste is capped.
+              </div>
+            ) : null}
+
+            {deleteUndo !== null ? (
+              <div
+                role="status"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "7px 22px",
+                  borderBottom: `1px solid ${color.borderSoft}`,
+                  background: color.sunken,
+                  color: color.muted3,
+                  font: `500 11.5px ${font.sans}`,
+                }}
+              >
+                <span>Block deleted.</span>
+                {deleteUndo.length > 0 ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={undoDelete}
+                      style={{
+                        all: "unset",
+                        cursor: "pointer",
+                        color: color.accent,
+                        font: `600 11.5px ${font.sans}`,
+                        textDecoration: "underline",
+                      }}
+                    >
+                      Undo
+                    </button>
+                    <span>Comments on it are not restored.</span>
+                  </>
+                ) : null}
               </div>
             ) : null}
 
@@ -496,12 +565,14 @@ export function PagesView() {
           confirmLabel="Delete block"
           onCancel={() => setPendingBlockDelete(null)}
           onConfirm={() => {
+            // Snapshot for Undo before the subtree is gone (empty if too big).
+            setDeleteUndo(subtreePlan(blocks, pendingBlockDelete));
             actions.removePageBlock(pendingBlockDelete);
             setPendingBlockDelete(null);
           }}
         >
           It has {pendingBlockChildren} nested block{pendingBlockChildren === 1 ? "" : "s"}, which
-          go with it. There is no undo.
+          go with it.
         </ConfirmDialog>
       )}
     </div>

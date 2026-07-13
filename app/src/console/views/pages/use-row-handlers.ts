@@ -29,8 +29,9 @@ import {
   moveDownTarget,
   moveUpTarget,
   outdentTarget,
+  subtreePlan,
 } from "./pages-model";
-import type { Row } from "./pages-model";
+import type { DuplicateOp, Row } from "./pages-model";
 
 /** A drag in flight: what is moving, and where it would land. */
 export interface DragState {
@@ -58,6 +59,9 @@ export interface RowHandlersDeps {
   confirmRemove: (blockId: string) => void;
   /** A paste past the block cap dropped lines; the view says so. */
   onPasteCapped: (dropped: number) => void;
+  /** A block was deleted; hand the view the pre-delete subtree snapshot so it
+   *  can offer an Undo. Empty means the subtree was too big to restore. */
+  onDeleted: (plan: DuplicateOp[]) => void;
 }
 
 export interface RowHandlersApi {
@@ -83,9 +87,10 @@ export function useRowHandlers({
   openComments,
   confirmRemove,
   onPasteCapped,
+  onDeleted,
 }: RowHandlersDeps): RowHandlersApi {
-  const live = useRef({ rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped });
-  live.current = { rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped };
+  const live = useRef({ rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped, onDeleted });
+  live.current = { rows, blocks, root, actions, activePage, drag, confirmRemove, onPasteCapped, onDeleted };
 
   const appendBlock = useCallback(() => {
     const { root, actions } = live.current;
@@ -153,12 +158,17 @@ export function useRowHandlers({
    *  Returns false when it deferred to the dialog instead of removing. The merge
    *  does NOT come through here — it hands the children to the adopter first, so
    *  by the time it removes there is no subtree left to warn about. */
-  const removeBlock = useCallback((blockId: string): boolean => {
+  const removeBlock = useCallback((blockId: string, undo = true): boolean => {
     const block = live.current.blocks.find((b) => b.id === blockId);
     if (block && block.children.length > 0) {
+      // Deferred to the dialog — PagesView snapshots on confirm, since the
+      // remove happens there, not here.
       live.current.confirmRemove(blockId);
       return false;
     }
+    // Snapshot the (single-block) subtree BEFORE it's gone so the view can offer
+    // an Undo. The backspace remove-empty typing flow opts out (undo=false).
+    if (undo) live.current.onDeleted(subtreePlan(live.current.blocks, blockId));
     void live.current.actions.removePageBlock(blockId);
     return true;
   }, []);
@@ -300,7 +310,8 @@ export function useRowHandlers({
       // keystroke.
       removeEmpty: (row) => {
       const index = live.current.rows.findIndex((r) => r.block.id === row.block.id);
-      if (removeBlock(row.block.id)) focusRow(editableAbove(index), "end");
+      // No undo toast for the fluid backspace-on-empty typing motion.
+      if (removeBlock(row.block.id, false)) focusRow(editableAbove(index), "end");
       },
       indent: (row) => move(row.block.id, indentTarget(live.current.blocks, row.block.id)),
       outdent: (row) => move(row.block.id, outdentTarget(live.current.blocks, row.block.id)),

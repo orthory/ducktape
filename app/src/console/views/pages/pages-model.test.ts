@@ -12,6 +12,7 @@ import {
   moveUpTarget,
   outdentTarget,
   shortcutFor,
+  subtreePlan,
 } from "./pages-model";
 
 const block = (patch: Partial<PageBlock> & { id: string }): PageBlock => ({
@@ -214,5 +215,33 @@ describe("duplicatePlan", () => {
 
   it("caps the burst — every copy is a consensus op", () => {
     expect(duplicatePlan(TREE, "b", mint(), 1)).toHaveLength(1);
+  });
+});
+
+describe("subtreePlan", () => {
+  it("preserves ids, order, checked, and re-anchors the root at its slot", () => {
+    // a checked to-do among b's descendants so `checked` is exercised.
+    const tree: PageBlock[] = [
+      block({ id: "p1", parent: null, kind: "page", text: "Plan", children: ["a", "b"] }),
+      block({ id: "a", text: "first" }),
+      block({ id: "b", kind: "toggle", text: "details", children: ["c"] }),
+      block({ id: "c", parent: "b", kind: "todo", text: "done", checked: true }),
+    ];
+    // b is second under p1, so its root op re-anchors after "a".
+    expect(subtreePlan(tree, "b")).toEqual([
+      { blockId: "b", parent: "p1", after: "a", kind: "toggle", text: "details", checked: false },
+      { blockId: "c", parent: "b", after: null, kind: "todo", text: "done", checked: true },
+    ]);
+  });
+
+  it("anchors a first-child root at the front (after null)", () => {
+    expect(subtreePlan(TREE, "a")[0]).toMatchObject({ blockId: "a", parent: "p1", after: null });
+  });
+
+  it("refuses the page root, an unknown block, and an over-cap subtree", () => {
+    expect(subtreePlan(TREE, "p1")).toEqual([]);
+    expect(subtreePlan(TREE, "ghost")).toEqual([]);
+    // b holds 1 child (2 blocks); a limit of 1 overflows, so no partial plan.
+    expect(subtreePlan(TREE, "b", 1)).toEqual([]);
   });
 });
