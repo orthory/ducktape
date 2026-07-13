@@ -742,7 +742,7 @@ pub async fn run_coordinator_workers_with_metrics(
     let (result_tx, mut results) = mpsc::channel(capacity);
     let auth = AuthWorkers::spawn(policy, workers, capacity, result_tx);
     let mut ordered = OrderedRequests::new(capacity);
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; AuthRequest::MAX_ENCODED_LEN];
 
     loop {
         if ordered.has_capacity() {
@@ -835,9 +835,9 @@ async fn run_coordinator_with_metrics(
     mut coord: Coordinator,
     metrics: CoordinatorMetrics,
 ) {
-    // Big enough for an AuthRequest with a cap (~251 bytes worst case: the
-    // 32-byte caller field plus the inner request, authenticator, and cap).
-    let mut buf = [0u8; 512];
+    // Big enough for the largest AuthRequest — an InvitePut wrapping a
+    // full-size invite blob, plus the caller field, authenticator, and cap.
+    let mut buf = [0u8; AuthRequest::MAX_ENCODED_LEN];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
