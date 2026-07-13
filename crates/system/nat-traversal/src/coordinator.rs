@@ -321,11 +321,17 @@ impl Coordinator {
             }
             // The coordinator never routes these through `handle`:
             // BindResponse/LookupResponse/PunchSync/Punch are node-directed.
+            // The invite-shelf requests (InvitePut/InviteGet) gain real dispatch
+            // in a follow-up; InvitePutAck/InviteChunk are node-directed replies.
             // Ignore defensively.
             Msg::BindResponse { .. }
             | Msg::LookupResponse { .. }
             | Msg::PunchSync { .. }
-            | Msg::Punch { .. } => CoordinatorReplies::new(),
+            | Msg::Punch { .. }
+            | Msg::InvitePut { .. }
+            | Msg::InvitePutAck { .. }
+            | Msg::InviteGet { .. }
+            | Msg::InviteChunk { .. } => CoordinatorReplies::new(),
         }
     }
 
