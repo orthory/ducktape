@@ -434,6 +434,52 @@ describe("DucktapeProvider", () => {
     );
   });
 
+  it("lets a pending provider retry finish across an unrelated chat hydrate", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const retry = deferred<unknown>();
+    let registry: "fail" | "defer" = "fail";
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target !== "capability") return baseQuery(target, request);
+      return registry === "fail"
+        ? Promise.reject(new Error("registry unavailable"))
+        : retry.promise;
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <Probe />
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    registry = "defer";
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+        failedQueries,
+      ),
+    );
+
+    await act(async () => emitOps("chat", [{ height: 5 }]));
+    await waitFor(() => expect(screen.getByTestId("height")).toHaveTextContent("5"));
+
+    await act(async () => {
+      retry.resolve({ all: [[[1], ["codex"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("codex"));
+    expect(capturedState!.capabilitiesStatus).toBe("ready");
+    expect(screen.getByTestId("height")).toHaveTextContent("5");
+  });
+
   it("ignores an older provider retry after a newer scoped hydrate wins", async () => {
     const { transport, emitOps } = makeFakeNode();
     const query = transport.query as ReturnType<typeof vi.fn>;

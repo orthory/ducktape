@@ -874,10 +874,8 @@ export interface ConsoleSnapshot {
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
-  capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
-  capabilitiesByNode: Map<string, string[]>;
   runLease: Map<string, RunLease>;
   files: FileEntry[];
   blocks: BlockRecord[];
@@ -903,10 +901,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
-  capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
-  capabilitiesByNode: snapshot.capabilitiesByNode,
   runLease: snapshot.runLease,
   files: snapshot.files,
   blocks: snapshot.blocks,

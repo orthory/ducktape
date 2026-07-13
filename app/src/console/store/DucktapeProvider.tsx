@@ -192,6 +192,9 @@ export function DucktapeProvider({
   // A newer hydrate against the same transport owns the UI. This prevents a
   // slower, older slice failure from overwriting a snapshot that already won.
   const hydrateGenRef = useRef(0);
+  // Capability reads also run on explicit UI retry. Keep their ordering local
+  // so a retry cannot cancel unrelated chat/pages hydration (or vice versa).
+  const capabilityHydrateGenRef = useRef(0);
 
   const fail = useCallback(
     (err: unknown) =>
@@ -330,6 +333,25 @@ export function DucktapeProvider({
     [],
   );
 
+  const refreshCapabilitySlices = useCallback(
+    (live: NodeTransport, showLoading = false): Promise<void> => {
+      const generation = (capabilityHydrateGenRef.current += 1);
+      if (showLoading) {
+        dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
+      }
+      return fetchCapabilitySlices(live).then((capability) => {
+        if (
+          nodeRef.current !== live ||
+          capabilityHydrateGenRef.current !== generation
+        ) {
+          return;
+        }
+        dispatch({ type: "patch", patch: capability });
+      });
+    },
+    [],
+  );
+
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
@@ -347,6 +369,7 @@ export function DucktapeProvider({
     const fetchStartedAt = Date.now();
     const hydrate = (status: NodeStatus) => {
       if (stale() || !acceptsStatus(live, status)) return Promise.resolve();
+      void refreshCapabilitySlices(live);
       return Promise.resolve()
         .then(() =>
           Promise.all([
@@ -356,7 +379,6 @@ export function DucktapeProvider({
             fetchForgeSlices(live),
             fetchPagesSlices(live, fetchedPage),
             fetchAgentsSlices(live),
-            fetchCapabilitySlices(live),
             fetchRunsSlices(live),
             fetchPeopleSlices(live),
             fetchFilesSlices(live),
@@ -373,7 +395,6 @@ export function DucktapeProvider({
             forge,
             pagesSlices,
             agents,
-            capability,
             runs,
             people,
             files,
@@ -416,15 +437,12 @@ export function DucktapeProvider({
                     ? stateRef.current.activePageBlocks
                     : (pagesSlices.pageBlocks ?? []),
                   agents: agents.agents,
-                  capabilities: capability.capabilities,
-                  capabilitiesByNode: capability.capabilitiesByNode,
                   watches: runs.watches,
                   pendingRuns: runs.pendingRuns,
                   runLease: runs.runLease,
                   files: files.files,
                   blocks,
                 }),
-                capabilitiesStatus: capability.capabilitiesStatus,
                 ...(streamDown ? {} : { connectionDown: null }),
                 openTabs,
                 activePage,
@@ -450,6 +468,7 @@ export function DucktapeProvider({
     handleStatusFailure,
     probeStatus,
     reconcileDocTabs,
+    refreshCapabilitySlices,
     shouldHoldPages,
   ]);
 
@@ -475,6 +494,7 @@ export function DucktapeProvider({
       const prev = stateRef.current.status;
       if (!prev) return refresh();
       const scope = scopeFor(changedModules(prev, status));
+      if (scope.has("capability")) void refreshCapabilitySlices(live);
       const fetchedPage = stateRef.current.activePage;
       return Promise.resolve()
         .then(() =>
@@ -487,7 +507,6 @@ export function DucktapeProvider({
             scope.has("forge") ? fetchForgeSlices(live) : null,
             scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
             scope.has("agents") ? fetchAgentsSlices(live) : null,
-            scope.has("capability") ? fetchCapabilitySlices(live) : null,
             scope.has("runs") ? fetchRunsSlices(live) : null,
             scope.has("people") ? fetchPeopleSlices(live) : null,
             scope.has("files") ? fetchFilesSlices(live) : null,
@@ -503,7 +522,6 @@ export function DucktapeProvider({
             forge,
             pagesSlices,
             agents,
-            capability,
             runs,
             people,
             files,
@@ -529,7 +547,6 @@ export function DucktapeProvider({
                 ...(governance ?? {}),
                 ...(forge ?? {}),
                 ...(agents ?? {}),
-                ...(capability ?? {}),
                 ...(runs ?? {}),
                 ...(people ?? {}),
                 ...(files ?? {}),
@@ -560,6 +577,7 @@ export function DucktapeProvider({
     handleStatusFailure,
     probeStatus,
     refresh,
+    refreshCapabilitySlices,
     reconcileDocTabs,
     shouldHoldPages,
   ]);
@@ -567,19 +585,8 @@ export function DucktapeProvider({
   const refreshCapabilities = useCallback(() => {
     const live = nodeRef.current;
     if (!live || !stateRef.current.connected) return;
-    const generation = (hydrateGenRef.current += 1);
-    dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
-    void fetchCapabilitySlices(live).then((capability) => {
-      if (
-        nodeRef.current !== live ||
-        !stateRef.current.connected ||
-        hydrateGenRef.current !== generation
-      ) {
-        return;
-      }
-      dispatch({ type: "patch", patch: capability });
-    });
-  }, []);
+    void refreshCapabilitySlices(live, true);
+  }, [refreshCapabilitySlices]);
 
   const actions = useMemo(
     () =>
