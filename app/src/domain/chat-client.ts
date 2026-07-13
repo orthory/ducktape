@@ -61,6 +61,13 @@ export interface Channel {
   pinned: number[];
   /** Live voice huddle roster, in join order. Empty/absent = no huddle. */
   huddle?: HuddleMember[];
+  /** The creating user's identity bytes (AuthorRef::User). null/absent for
+   *  module/system-minted channels and legacy records — only the owner may
+   *  rename/archive an owned channel; an owner-less one is open to any user. */
+  owner?: number[] | null;
+  /** Archived channels reject posts, reactions, and huddle joins (membership,
+   *  rename, and unarchive still work). Absent = false on legacy records. */
+  archived?: boolean;
 }
 
 export interface MessageHead {
@@ -177,6 +184,32 @@ export const createChannel = (
         post_policy: params.postPolicy,
       },
     },
+    params.origin,
+  );
+
+/** Rename a channel. The module reuses CreateChannel's name validation and
+ *  gates on the channel owner (only the creator may rename an owned channel;
+ *  legacy owner-less channels admit any user). Authorship comes from `origin`. */
+export const renameChannel = (
+  transport: NodeTransport,
+  params: { channelId: string; name: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { rename_channel: { channel_id: params.channelId, name: params.name } },
+    params.origin,
+  );
+
+/** Archive or unarchive a channel. An archived channel rejects posts,
+ *  reactions, and huddle joins (membership/rename/unarchive still work). Owner-
+ *  gated like `renameChannel`; authorship comes from `origin`. */
+export const setChannelArchived = (
+  transport: NodeTransport,
+  params: { channelId: string; archived: boolean; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { set_channel_archived: { channel_id: params.channelId, archived: params.archived } },
     params.origin,
   );
 

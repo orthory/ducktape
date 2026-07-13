@@ -198,6 +198,12 @@ export interface ConsoleActions {
   /** Add/remove a channel member (SetMembership) as a tracked op, refetching
    *  the roster on settle. A members_only channel gates posting on this set. */
   setChannelMembership(channelId: string, user: number[], member: boolean): void;
+  /** Rename a channel (RenameChannel). Owner-gated by the module — only surfaced
+   *  on channels the local user may administer. No-op on a blank name. */
+  renameChannel(channelId: string, name: string): void;
+  /** Archive or unarchive a channel (SetChannelArchived). Archived channels are
+   *  hidden from the rail and reject posts/reactions/huddle joins. */
+  setChannelArchived(channelId: string, archived: boolean): void;
   sendMessage(body: string): void;
   /** Post `body` into ANY channel (not just the active one) with the same
    *  mention parsing + first-agent-mention watch arming as `sendMessage` —
@@ -1788,6 +1794,27 @@ export function createActions({
 
     setChannelMembership: (channelId, user, member) => {
       void submitMembership(channelId, user, member);
+    },
+
+    renameChannel: (channelId, name) => {
+      const trimmed = name.trim();
+      if (!channelId || !trimmed) return;
+      void submitTracked(
+        opKey.channel(channelId),
+        (live) =>
+          chatClient.renameChannel(live, { channelId, name: trimmed, origin: getState().author }),
+        (prev) => optimistic.channelRenamed(prev, { channelId, name: trimmed }),
+      );
+    },
+
+    setChannelArchived: (channelId, archived) => {
+      if (!channelId) return;
+      void submitTracked(
+        opKey.channel(channelId),
+        (live) =>
+          chatClient.setChannelArchived(live, { channelId, archived, origin: getState().author }),
+        (prev) => optimistic.channelArchivedSet(prev, { channelId, archived }),
+      );
     },
 
     sendMessage: (body) => {

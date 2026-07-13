@@ -177,6 +177,28 @@ export const channelCreated = (
         ],
       };
 
+/** Rename a channel in place so the rail and header update before the block
+ *  lands; the refresh reconciles with committed state after. */
+export const channelRenamed = (
+  prev: ConsoleState,
+  params: { channelId: string; name: string },
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === params.channelId ? { ...c, name: params.name } : c,
+  ),
+});
+
+/** Flip a channel's archived flag optimistically — the rail hides archived
+ *  channels, so this drops it from (or restores it to) the list instantly. */
+export const channelArchivedSet = (
+  prev: ConsoleState,
+  params: { channelId: string; archived: boolean },
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === params.channelId ? { ...c, archived: params.archived } : c,
+  ),
+});
+
 /** Add ourselves to a channel's huddle roster the instant we join, so the pill
  *  and dock react before the block lands. Idempotent on our node key; the
  *  refresh replaces the roster (with the module-assigned join order) after. */

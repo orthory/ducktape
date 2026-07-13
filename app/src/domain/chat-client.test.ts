@@ -17,7 +17,9 @@ import {
   latestMessages,
   leaveHuddle,
   postMessage,
+  renameChannel,
   searchMessages,
+  setChannelArchived,
   setMembership,
   sweepHuddle,
   tagSearch,
@@ -69,6 +71,26 @@ describe("chat msgs", () => {
           post_policy: "members_only",
         },
       },
+      "jess",
+    );
+  });
+
+  it("encodes RenameChannel and stamps the origin", async () => {
+    const transport = stubTransport();
+    await renameChannel(transport, { channelId: "general", name: "General v2", origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { rename_channel: { channel_id: "general", name: "General v2" } },
+      "jess",
+    );
+  });
+
+  it("encodes SetChannelArchived and stamps the origin", async () => {
+    const transport = stubTransport();
+    await setChannelArchived(transport, { channelId: "general", archived: true, origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { set_channel_archived: { channel_id: "general", archived: true } },
       "jess",
     );
   });
