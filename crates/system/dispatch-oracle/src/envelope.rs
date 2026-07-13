@@ -333,6 +333,7 @@ mod tests {
             "workspace": {
                 "kind": "forge",
                 "repo": "app",
+                "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
                 "branch_born": false
@@ -620,6 +621,7 @@ mod tests {
             workspace.source,
             crate::workspace_source::WorkspaceSource::Forge {
                 repo: "app".into(),
+                item_title: Some("Fix the gate".into()),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,

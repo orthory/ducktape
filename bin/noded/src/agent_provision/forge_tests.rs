@@ -31,12 +31,7 @@ fn init_repo(dir: &Path) -> git2::Repository {
 
 /// write a commit straight into the odb (no index, no checkout — forge's
 /// materialization shape) and return its hex oid. moves NO ref.
-fn odb_commit(
-    repo: &git2::Repository,
-    parent: Option<&str>,
-    path: &str,
-    content: &str,
-) -> String {
+fn odb_commit(repo: &git2::Repository, parent: Option<&str>, path: &str, content: &str) -> String {
     let blob = repo.blob(content.as_bytes()).unwrap();
     let parent_commit =
         parent.map(|hex| repo.find_commit(git2::Oid::from_str(hex).unwrap()).unwrap());
@@ -187,6 +182,7 @@ impl Bed {
             agent_display_name: Some(AGENT_DISPLAY_NAME.into()),
             source: WorkspaceSource::Forge {
                 repo: REPO.into(),
+                item_title: Some("Fix the flaky gate".into()),
                 commit: commit.into(),
                 branch: BRANCH.into(),
                 branch_born,
@@ -280,8 +276,8 @@ async fn no_http_surface_means_a_clear_forge_provision_error() {
 async fn a_handle_without_a_forge_repo_base_is_a_clear_error() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel(); // no with_forge_repo
-    let prov = NodedProvisioner::new(handle, &bed.runs_root)
-        .with_forge(Some(bed.push_base()), NODE_IDENT);
+    let prov =
+        NodedProvisioner::new(handle, &bed.runs_root).with_forge(Some(bed.push_base()), NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
     assert!(err.contains("no forge repo base"), "{err}");
 }
@@ -341,8 +337,7 @@ async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only
         use std::os::unix::fs::MetadataExt as _;
 
         let object = format!("{}/{}", &bed.head[..2], &bed.head[2..]);
-        let source =
-            std::fs::metadata(bed.repo_dir.join(".git/objects").join(&object)).unwrap();
+        let source = std::fs::metadata(bed.repo_dir.join(".git/objects").join(&object)).unwrap();
         let cloned = std::fs::metadata(dir.join(".git/objects").join(object)).unwrap();
         assert_ne!(
             source.ino(),
@@ -360,6 +355,22 @@ async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only
     assert_eq!(
         ws.env().get("DUCKTAPE_RUN_WORKSPACE"),
         Some(&dir.display().to_string())
+    );
+    assert_eq!(
+        ws.env().get("GIT_AUTHOR_NAME").map(String::as_str),
+        Some(AGENT_DISPLAY_NAME)
+    );
+    assert_eq!(
+        ws.env().get("GIT_AUTHOR_EMAIL").map(String::as_str),
+        Some("quackbot@agents.duck")
+    );
+    assert_eq!(
+        ws.env().get("GIT_COMMITTER_NAME").map(String::as_str),
+        Some(NODE_IDENT)
+    );
+    assert_eq!(
+        ws.env().get("GIT_COMMITTER_EMAIL").map(String::as_str),
+        Some("node-f00f@nodes.duck")
     );
     ws.cleanup().await;
 }
@@ -412,7 +423,10 @@ async fn a_born_branch_is_forced_to_the_committed_tip_and_pushes_fast_forward() 
     // continuation run: new work fast-forwards the born branch (CAS holds:
     // remote is exactly at the pinned base).
     std::fs::write(dir.join("more.txt"), "more work\n").unwrap();
-    let receipt = ws.commit("agent run s2:0").await.expect("commit+push");
+    let receipt = ws
+        .commit("agent run s2:0", None)
+        .await
+        .expect("commit+push");
     let new_oid = receipt.output_commit.clone().expect("pushed oid");
     assert_ne!(new_oid, tip);
     assert_eq!(receipt.branch.as_deref(), Some(BRANCH));
@@ -468,7 +482,12 @@ async fn a_shared_repo_ref_force_move_mid_run_cannot_reparent_the_commit() {
 
     // mid-run: the interloper lands remotely AND catch-up moves the local ref.
     let bare_repo = git2::Repository::open(&bare).unwrap();
-    let c2 = odb_commit(&bare_repo, Some(&bed.head), "rival.txt", "interloper content\n");
+    let c2 = odb_commit(
+        &bare_repo,
+        Some(&bed.head),
+        "rival.txt",
+        "interloper content\n",
+    );
     set_ref(&bare_repo, BRANCH, &c2);
     let local = git2::Repository::open(&bed.repo_dir).unwrap();
     let c2_local = odb_commit(&local, Some(&bed.head), "rival.txt", "interloper content\n");
@@ -476,7 +495,10 @@ async fn a_shared_repo_ref_force_move_mid_run_cannot_reparent_the_commit() {
     set_ref(&local, BRANCH, &c2);
 
     std::fs::write(dir.join("mine.txt"), "the run's work\n").unwrap();
-    let receipt = ws.commit("agent run s1:0").await.expect("rebase-retry push");
+    let receipt = ws
+        .commit("agent run s1:0", None)
+        .await
+        .expect("rebase-retry push");
     assert!(receipt.rebased);
     let oid = receipt.output_commit.expect("post-rebase oid");
     assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
@@ -487,7 +509,10 @@ async fn a_shared_repo_ref_force_move_mid_run_cannot_reparent_the_commit() {
         git_stdout(&dir, &["show", "HEAD:rival.txt"]),
         "interloper content"
     );
-    assert_eq!(git_stdout(&dir, &["show", "HEAD:mine.txt"]), "the run's work");
+    assert_eq!(
+        git_stdout(&dir, &["show", "HEAD:mine.txt"]),
+        "the run's work"
+    );
     ws.cleanup().await;
 }
 
@@ -516,6 +541,7 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
     let mut spec = bed.spec("s1:0", &bed.head, false);
     spec.source = WorkspaceSource::Forge {
         repo: "ghost".into(),
+        item_title: Some("Fix the flaky gate".into()),
         commit: bed.head.clone(),
         branch: BRANCH.into(),
         branch_born: false,
@@ -591,8 +617,8 @@ async fn a_failed_skill_mount_checkout_leaves_no_debris() {
 // ---- commit + push --------------------------------------------------------
 
 #[test]
-fn commit_message_normalization_strips_supplied_identity_trailers_and_owns_attribution() {
-    let message = normalize_commit_message(
+fn commit_message_selection_rejects_identity_spoofing_without_rewriting_the_fallback() {
+    let message = select_commit_message(
         Some(
             "Fix the actual bug\r\n\r\nKeep the useful body:\r\n\tindented code survives\r\n\r\n\
              Co-Authored-By: Human <human@example.com>\r\n\
@@ -603,25 +629,41 @@ fn commit_message_normalization_strips_supplied_identity_trailers_and_owns_attri
              Acked-by: Fake Acker <ack@example.com>\r\n\
              Tested-by: Fake Tester <test@example.com>",
         ),
-        "Quack\nAgent <unsafe>",
-        "quack/bot@example",
-    );
-    assert!(
-        message.starts_with("Fix the actual bug\n\nKeep the useful body:\n\tindented code survives"),
-        "{message:?}"
-    );
-    assert!(!message.contains("Human") && !message.contains("Old Bot"));
-    assert!(!message.contains("Forged") && !message.contains("Fake"));
-    for trailer in ["Signed-off-by:", "Reviewed-by:", "Acked-by:", "Tested-by:"] {
-        assert!(!message.contains(trailer), "{trailer} leaked: {message:?}");
+        Some("Unused Forge title"),
+    )
+    .expect("the Forge title recovers an unsafe response");
+    assert_eq!(message, "Unused Forge title");
+
+    for trailer in [
+        "Reported-by: Human <human@example.com>",
+        "Suggested-by: Human <human@example.com>",
+        "Co-developed-by: Human <human@example.com>",
+        "Author: Human <human@example.com>",
+    ] {
+        assert!(
+            commit_message_candidate(&format!("Useful subject\n\n{trailer}")).is_none(),
+            "identity trailer escaped: {trailer}"
+        );
     }
-    assert_eq!(message.matches("Co-Authored-By:").count(), 1);
-    assert_eq!(message.matches("via Ducktape").count(), 1);
-    let local = attribution_email_local_part("quack/bot@example");
-    assert!(message.ends_with(&format!(
-        "Co-Authored-By: QuackAgent unsafe via Ducktape <{local}@agents.duck>"
-    )));
-    assert!(!message.contains('\r'));
+}
+
+#[cfg(unix)]
+#[test]
+fn git_control_sanitization_rejects_nested_object_and_ref_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    for relative in ["objects/evil", "refs/heads/evil"] {
+        let temp = tempfile::tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        let path = git_dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        let err = sanitize_agent_git_control(temp.path()).unwrap_err();
+        assert!(err.contains("contains symlink"), "{relative}: {err}");
+    }
 }
 
 /// every id consensus admits today is a DNS label, and a label IS the address:
@@ -699,7 +741,7 @@ fn a_derived_local_part_can_never_be_claimed_by_a_new_agent_id() {
 }
 
 #[test]
-fn invalid_empty_and_oversized_proposals_fall_back_without_splitting_identity_utf8() {
+fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
     let oversized = "x".repeat(MAX_COMMIT_MESSAGE_BYTES + 1);
     for proposal in [
         None,
@@ -711,14 +753,54 @@ fn invalid_empty_and_oversized_proposals_fall_back_without_splitting_identity_ut
         let safe_name = sanitize_display_name(&long_name);
         assert!(safe_name.len() <= MAX_DISPLAY_NAME_BYTES);
         assert!(safe_name.is_char_boundary(safe_name.len()));
-        let message = normalize_commit_message(proposal, &long_name, "bot");
-        assert!(
-            message.starts_with("Apply agent changes\n\n"),
-            "{message:?}"
-        );
+        let message = select_commit_message(proposal, Some("Fix the flaky gate"))
+            .expect("the Forge title recovers an invalid agent proposal");
+        assert_eq!(message, "Fix the flaky gate");
         assert!(!message.contains("dispatch") && message.len() <= MAX_COMMIT_MESSAGE_BYTES);
         assert!(message.is_char_boundary(message.len()));
     }
+
+    let err = select_commit_message(
+        Some("Fix it\n\nCo-Authored-By: Human <human@example.com>"),
+        Some("invalid\u{1f}Forge title"),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("no valid commit message") && !err.contains("Human"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn the_agent_response_owns_the_exact_message_then_forge_recovers() {
+    assert_eq!(
+        select_commit_message(
+            Some("Final response subject\n\nFinal response body"),
+            Some("Forge title"),
+        )
+        .unwrap(),
+        "Final response subject\n\nFinal response body"
+    );
+    assert_eq!(
+        select_commit_message(
+            Some("Unsafe claim\n\nReviewed-by: Human <human@example.com>"),
+            Some("Forge title"),
+        )
+        .unwrap(),
+        "Forge title"
+    );
+    assert_eq!(
+        select_commit_message(Some("invalid\u{1f}message"), Some("Forge title")).unwrap(),
+        "Forge title"
+    );
+    assert_eq!(
+        select_commit_message(
+            Some("ship it 🦆\n\nThe agent chooses its own style."),
+            Some("Forge title"),
+        )
+        .unwrap(),
+        "ship it 🦆\n\nThe agent chooses its own style."
+    );
 }
 
 #[tokio::test]
@@ -732,9 +814,18 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
         .expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "the work\n").unwrap();
 
-    let receipt = ws.commit("Apply agent changes").await.expect("commit+push");
+    let receipt = ws
+        .commit(
+            "agent run s1:0",
+            Some("fix(forge): keep the agent's intent\n\nPreserve the useful explanation."),
+        )
+        .await
+        .expect("commit+push");
     assert!(!receipt.no_changes && receipt.commit_error.is_none());
-    assert!(!receipt.rebased, "an uncontended push never claims a rebase");
+    assert!(
+        !receipt.rebased,
+        "an uncontended push never claims a rebase"
+    );
     assert_eq!(receipt.source_prefix, format!("forge:{REPO}"));
     assert_eq!(receipt.source_snapshot.as_deref(), Some(bed.head.as_str()));
     assert_eq!(receipt.branch.as_deref(), Some(BRANCH));
@@ -747,14 +838,60 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
     assert_eq!(
         git_stdout(&ws.workdir(), &["log", "-1", "--format=%s"]),
-        "Apply agent changes"
+        "fix(forge): keep the agent's intent"
     );
     let body = git_stdout(&ws.workdir(), &["log", "-1", "--format=%B"]);
-    assert!(!body.contains("s1:0"));
-    assert!(body.ends_with(&format!(
-        "Co-Authored-By: Quack Agent via Ducktape <{}@agents.duck>",
-        attribution_email_local_part(AGENT)
-    )));
+    assert_eq!(
+        body,
+        "fix(forge): keep the agent's intent\n\nPreserve the useful explanation."
+    );
+    ws.cleanup().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_git_ignores_agent_installed_hooks_and_filters() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bed = bed();
+    bed.snapshot_bare();
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let sentinel = dir.join("host-git-ran");
+    let filter = dir.join("evil-filter.sh");
+    std::fs::write(
+        &filter,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run_git(
+        &dir,
+        &["config", "filter.evil.clean", &filter.display().to_string()],
+        &[],
+    )
+    .unwrap();
+    std::fs::write(dir.join(".gitattributes"), "answer.md filter=evil\n").unwrap();
+    let hook = dir.join(".git/hooks/pre-push");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("answer.md"), "safe work\n").unwrap();
+
+    ws.commit("agent run s1:0", Some("Publish without host execution"))
+        .await
+        .expect("commit+push");
+    assert!(
+        !sentinel.exists(),
+        "host Git executed an agent-controlled hook or filter"
+    );
     ws.cleanup().await;
 }
 
@@ -768,12 +905,14 @@ async fn the_commit_carries_agent_author_and_node_committer() {
         .await
         .expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "the work\n").unwrap();
-    ws.commit("Apply agent changes").await.expect("commit+push");
+    ws.commit("agent run s1:0", None)
+        .await
+        .expect("commit+push");
     // D2: author = the agent (synthetic email), committer = the node identity.
     assert_eq!(
         git_stdout(&ws.workdir(), &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
         format!(
-            "{AGENT_DISPLAY_NAME}|{}@agents.duck|{NODE_IDENT}|node@ducktape.local",
+            "{AGENT_DISPLAY_NAME}|{}@agents.duck|{NODE_IDENT}|{NODE_IDENT}@nodes.duck",
             attribution_email_local_part(AGENT)
         )
     );
@@ -793,9 +932,12 @@ async fn a_clean_tree_yields_no_changes_and_no_push() {
     std::fs::create_dir_all(runtime.join("provider-config")).unwrap();
     std::fs::write(runtime.join("provider-config/auth.json"), "must-not-push").unwrap();
 
-    let receipt = ws.commit("agent run s1:0").await.expect("commit");
+    let receipt = ws.commit("agent run s1:0", None).await.expect("commit");
     assert!(receipt.no_changes, "a clean tree is a true no_changes");
-    assert!(!runtime.exists(), "provider runtime debris is removed before commit");
+    assert!(
+        !runtime.exists(),
+        "provider runtime debris is removed before commit"
+    );
     assert_eq!(receipt.source_prefix, format!("forge:{REPO}"));
     assert_eq!(receipt.source_snapshot.as_deref(), Some(bed.head.as_str()));
     assert_eq!(receipt.branch, None, "no push landed");
@@ -809,9 +951,7 @@ async fn a_clean_tree_yields_no_changes_and_no_push() {
 }
 
 #[tokio::test]
-async fn an_agents_own_commits_push_even_with_a_clean_tree() {
-    // an agent may `git commit` inside its worktree itself: the tree is clean
-    // but the branch moved off the pinned base — that is WORK, not no_changes.
+async fn an_agent_created_commit_chain_is_pushed_without_rewriting_it() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
@@ -820,48 +960,121 @@ async fn an_agents_own_commits_push_even_with_a_clean_tree() {
         .await
         .expect("provision");
     let dir = ws.workdir();
-    std::fs::write(dir.join("own.txt"), "self-committed\n").unwrap();
+    let author_email = format!("{}@agents.duck", attribution_email_local_part(AGENT));
+    let committer_email = format!("{NODE_IDENT}@nodes.duck");
+    let identity = [
+        ("GIT_AUTHOR_NAME", AGENT_DISPLAY_NAME),
+        ("GIT_AUTHOR_EMAIL", author_email.as_str()),
+        ("GIT_COMMITTER_NAME", NODE_IDENT),
+        ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
+    ];
+    std::fs::write(dir.join("one.txt"), "one\n").unwrap();
+    run_git(&dir, &["add", "-A"], &[]).unwrap();
+    run_git(&dir, &["commit", "-m", "First agent decision"], &identity).unwrap();
+    let first = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    std::fs::write(dir.join("two.txt"), "two\n").unwrap();
     run_git(&dir, &["add", "-A"], &[]).unwrap();
     run_git(
         &dir,
         &[
             "commit",
             "-m",
-            "Fix repository output",
+            "second choice",
             "-m",
-            "Keep the agent-selected body.\n\nCo-Authored-By: Human <human@example.com>",
+            "The agent owns this body.",
         ],
-        &[
-            ("GIT_AUTHOR_NAME", "self"),
-            ("GIT_AUTHOR_EMAIL", "self@x"),
-            ("GIT_COMMITTER_NAME", "self"),
-            ("GIT_COMMITTER_EMAIL", "self@x"),
-        ],
+        &identity,
     )
     .unwrap();
-    let own = git_stdout(&dir, &["rev-parse", "HEAD"]);
-    let own_tree = git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]);
+    let second = git_stdout(&dir, &["rev-parse", "HEAD"]);
 
-    let receipt = ws.commit("Apply agent changes").await.expect("push");
+    let receipt = ws
+        .commit(
+            "agent run s1:0",
+            Some("This response must not squash or rename committed work"),
+        )
+        .await
+        .expect("push");
     assert!(!receipt.no_changes);
-    let normalized = receipt.output_commit.expect("normalized run commit");
-    assert_ne!(normalized, own, "the intermediate commit must not leak");
-    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(normalized.as_str()));
-    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), bed.head);
-    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]), own_tree);
-    let body = git_stdout(&dir, &["log", "-1", "--format=%B"]);
-    assert!(
-        body.starts_with("Fix repository output\n\nKeep the agent-selected body."),
-        "{body}"
+    assert_eq!(receipt.output_commit.as_deref(), Some(second.as_str()));
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(second.as_str()));
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), first);
+    assert_eq!(
+        git_stdout(&dir, &["log", "-2", "--format=%s"]),
+        "second choice\nFirst agent decision"
     );
-    assert!(!body.contains("Human <human@example.com>"), "{body}");
-    assert_eq!(body.matches("Co-Authored-By:").count(), 1, "{body}");
-    assert_eq!(body.matches("via Ducktape").count(), 1, "{body}");
+    assert_eq!(
+        git_stdout(&dir, &["log", "-1", "--format=%B"]),
+        "second choice\n\nThe agent owns this body."
+    );
     ws.cleanup().await;
 }
 
 #[tokio::test]
-async fn an_invalid_agent_message_falls_back_without_losing_the_agents_tree() {
+async fn uncommitted_work_is_captured_on_top_of_the_agents_commit() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let author_email = format!("{}@agents.duck", attribution_email_local_part(AGENT));
+    let committer_email = format!("{NODE_IDENT}@nodes.duck");
+    let identity = [
+        ("GIT_AUTHOR_NAME", AGENT_DISPLAY_NAME),
+        ("GIT_AUTHOR_EMAIL", author_email.as_str()),
+        ("GIT_COMMITTER_NAME", NODE_IDENT),
+        ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
+    ];
+    std::fs::write(dir.join("committed.txt"), "committed\n").unwrap();
+    run_git(&dir, &["add", "-A"], &[]).unwrap();
+    run_git(&dir, &["commit", "-m", "Keep this commit"], &identity).unwrap();
+    let agent_commit = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    std::fs::write(dir.join("final.txt"), "uncommitted\n").unwrap();
+
+    let receipt = ws
+        .commit(
+            "agent run s1:0",
+            Some("Capture the final edit\n\nKeep the earlier commit intact."),
+        )
+        .await
+        .expect("commit+push");
+    let output = receipt.output_commit.expect("capture commit");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(output.as_str()));
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), agent_commit);
+    assert_eq!(
+        git_stdout(&dir, &["log", "-2", "--format=%s"]),
+        "Capture the final edit\nKeep this commit"
+    );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn no_agent_message_or_forge_title_never_pushes_synthetic_history() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let mut spec = bed.spec("s1:0", &bed.head, false);
+    let WorkspaceSource::Forge { item_title, .. } = &mut spec.source else {
+        unreachable!()
+    };
+    *item_title = None;
+    let ws = bed.provisioner().provision(&spec).await.expect("provision");
+    std::fs::write(ws.workdir().join("answer.md"), "real work\n").unwrap();
+
+    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
+    assert!(err.contains("no valid commit message"), "{err}");
+    assert_eq!(
+        ref_oid(&bare, BRANCH),
+        None,
+        "the runtime must not push a message it invented"
+    );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_agent_commit_cannot_spoof_git_identity_and_get_rewritten() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
@@ -883,16 +1096,66 @@ async fn an_invalid_agent_message_falls_back_without_losing_the_agents_tree() {
         ],
     )
     .unwrap();
-    let final_tree = git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]);
+    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
+    assert!(err.contains("agent author and node committer"), "{err}");
+    assert_eq!(ref_oid(&bare, BRANCH), None, "unsafe history never pushes");
+    ws.cleanup().await;
+}
 
-    let receipt = ws.commit("ignored internal value").await.expect("push");
-    let oid = receipt.output_commit.expect("normalized output");
-    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
-    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]), final_tree);
-    assert_eq!(git_stdout(&dir, &["show", "HEAD:safe.txt"]), "must survive");
-    let body = git_stdout(&dir, &["log", "-1", "--format=%B"]);
-    assert!(body.starts_with("Apply agent changes\n\n"), "{body}");
-    assert!(!body.contains("dispatch") && !body.contains('\u{1f}'), "{body:?}");
+#[tokio::test]
+async fn agent_history_must_descend_from_the_pinned_forge_commit() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let tree = git_stdout(&dir, &["rev-parse", "HEAD^{tree}"]);
+    let author_email = format!("{}@agents.duck", attribution_email_local_part(AGENT));
+    let committer_email = format!("{NODE_IDENT}@nodes.duck");
+    let identity = [
+        ("GIT_AUTHOR_NAME", AGENT_DISPLAY_NAME),
+        ("GIT_AUTHOR_EMAIL", author_email.as_str()),
+        ("GIT_COMMITTER_NAME", NODE_IDENT),
+        ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
+    ];
+    let unrelated = run_git(
+        &dir,
+        &["commit-tree", &tree, "-m", "Unrelated history"],
+        &identity,
+    )
+    .unwrap();
+    let disguise = run_git(
+        &dir,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &bed.head,
+            "-m",
+            "Replacement descendant",
+        ],
+        &identity,
+    )
+    .unwrap();
+    run_git(&dir, &["replace", &unrelated, &disguise], &[]).unwrap();
+    std::fs::write(
+        dir.join(".git/info/grafts"),
+        format!("{unrelated} {}\n", bed.head),
+    )
+    .unwrap();
+    run_git(&dir, &["reset", "--hard", &unrelated], &[]).unwrap();
+
+    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
+    assert!(err.contains("does not descend from the pinned"), "{err}");
+    assert!(!dir.join(".git/info/grafts").exists());
+    assert_eq!(
+        ref_oid(&bare, BRANCH),
+        None,
+        "unrelated history never pushes"
+    );
     ws.cleanup().await;
 }
 
@@ -905,7 +1168,12 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     // someone advanced the branch on the remote AFTER this run's base was
     // pinned: mint C2 (a child of head) straight in the bare repo.
     let bare_repo = git2::Repository::open(&bare).unwrap();
-    let c2 = odb_commit(&bare_repo, Some(&bed.head), "rival.txt", "concurrent work\n");
+    let c2 = odb_commit(
+        &bare_repo,
+        Some(&bed.head),
+        "rival.txt",
+        "concurrent work\n",
+    );
     set_ref(&bare_repo, BRANCH, &c2);
 
     let spec = bed.spec("s1:0", &bed.head, true);
@@ -913,8 +1181,14 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     let dir = ws.workdir();
     std::fs::write(dir.join("mine.txt"), "forked work\n").unwrap();
 
-    let receipt = ws.commit("agent run s1:0").await.expect("rebase-retry push");
-    assert!(receipt.rebased, "the receipt says the base moved under the work");
+    let receipt = ws
+        .commit("agent run s1:0", None)
+        .await
+        .expect("rebase-retry push");
+    assert!(
+        receipt.rebased,
+        "the receipt says the base moved under the work"
+    );
     assert!(!receipt.no_changes && receipt.commit_error.is_none());
     assert_eq!(receipt.branch.as_deref(), Some(BRANCH));
     let oid = receipt.output_commit.expect("post-rebase oid");
@@ -925,7 +1199,7 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     assert_eq!(
         git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
         format!(
-            "{AGENT_DISPLAY_NAME}|{}@agents.duck|{NODE_IDENT}|node@ducktape.local",
+            "{AGENT_DISPLAY_NAME}|{}@agents.duck|{NODE_IDENT}|{NODE_IDENT}@nodes.duck",
             attribution_email_local_part(AGENT)
         )
     );
@@ -933,7 +1207,7 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
 }
 
 #[tokio::test]
-async fn an_identical_concurrent_patch_keeps_a_normalized_attribution_commit() {
+async fn an_identical_concurrent_patch_keeps_the_agent_attribution_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let bare_repo = git2::Repository::open(&bare).unwrap();
@@ -949,11 +1223,11 @@ async fn an_identical_concurrent_patch_keeps_a_normalized_attribution_commit() {
     std::fs::write(dir.join("same.txt"), "identical work\n").unwrap();
 
     let receipt = ws
-        .commit("agent run s1:0")
+        .commit("agent run s1:0", None)
         .await
         .expect("rebase-retry push");
     assert!(receipt.rebased);
-    let oid = receipt.output_commit.expect("normalized output commit");
+    let oid = receipt.output_commit.expect("output commit");
     assert_ne!(
         oid, c2,
         "the unrelated upstream commit is not the receipt output"
@@ -963,13 +1237,12 @@ async fn an_identical_concurrent_patch_keeps_a_normalized_attribution_commit() {
     assert_eq!(
         git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%s"]),
         format!(
-            "{AGENT_DISPLAY_NAME}|{}@agents.duck|Apply agent changes",
+            "{AGENT_DISPLAY_NAME}|{}@agents.duck|Fix the flaky gate",
             attribution_email_local_part(AGENT)
         )
     );
     let body = git_stdout(&dir, &["log", "-1", "--format=%B"]);
-    assert_eq!(body.matches("Co-Authored-By:").count(), 1, "{body}");
-    assert!(body.contains(" via Ducktape <"), "{body}");
+    assert_eq!(body, "Fix the flaky gate");
     ws.cleanup().await;
 }
 
@@ -987,7 +1260,7 @@ async fn a_rebase_conflict_aborts_cleanly_and_degrades() {
     let dir = ws.workdir();
     std::fs::write(dir.join("readme.md"), "my conflicting edit\n").unwrap();
 
-    let err = ws.commit("agent run s1:0").await.unwrap_err();
+    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
     assert!(
         err.contains("rebase conflict") && err.contains(BRANCH),
         "ONLY a genuine conflict degrades, naming the branch: {err}"
@@ -1000,7 +1273,10 @@ async fn a_rebase_conflict_aborts_cleanly_and_degrades() {
     } else {
         dir.join(rebase_path)
     };
-    assert!(!rebase_abs.exists(), "no rebase-merge debris at {rebase_dir}");
+    assert!(
+        !rebase_abs.exists(),
+        "no rebase-merge debris at {rebase_dir}"
+    );
     // … the interloper's tip stays branch head …
     assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(c2.as_str()));
     // … and the pool maps exactly this Err to commit_failed + Degraded.
@@ -1035,13 +1311,17 @@ async fn a_remote_that_always_rejects_exhausts_the_bounded_retries() {
         .expect("provision");
     std::fs::write(ws.workdir().join("mine.txt"), "work\n").unwrap();
 
-    let err = ws.commit("agent run s1:0").await.unwrap_err();
+    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
     assert!(
         err.contains("after 3 attempts") && err.contains("pre-receive"),
         "the bound ends the loop carrying the real reject: {err}"
     );
     let pushes = std::fs::read_to_string(bare.join("hook.log")).unwrap();
-    assert_eq!(pushes.lines().count(), 3, "exactly PUSH_ATTEMPTS pushes, no spin");
+    assert_eq!(
+        pushes.lines().count(),
+        3,
+        "exactly PUSH_ATTEMPTS pushes, no spin"
+    );
     ws.cleanup().await;
 }
 
@@ -1083,7 +1363,7 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
         .await
         .expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "done\n").unwrap();
-    let receipt = ws.commit("agent run s1:0").await.expect("push");
+    let receipt = ws.commit("agent run s1:0", None).await.expect("push");
     let dir = ws.workdir();
     ws.cleanup().await;
     assert!(!dir.exists());

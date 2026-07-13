@@ -50,8 +50,8 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// the strict output contract riding every composed payload — exactly the
 /// [`agent::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
-{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
+{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -122,6 +122,9 @@ pub(crate) enum WorkspaceSource {
     /// a forge repo checkout (M1) — the git-native workspace lane.
     Forge {
         repo: String,
+        /// the authoritative tracker title at compose height. it is commit
+        /// fallback metadata only; an agent-authored Git message wins.
+        item_title: String,
         /// the pinned base: a 40-hex sha1 tip resolved from COMMITTED forge
         /// refs at compose height (I1) — the work-branch tip when born, else
         /// the main tip an issue run forks from.
@@ -1014,6 +1017,7 @@ mod tests {
         let inputs = PortableInputs {
             workspace: WorkspaceSource::Forge {
                 repo: "app".into(),
+                item_title: "Fix the gate".into(),
                 commit: commit.clone(),
                 branch: "agent/item-7".into(),
                 branch_born: false,
@@ -1052,12 +1056,13 @@ mod tests {
         // the tagged forge source, with its committed field order.
         assert_eq!(v["workspace"]["kind"], "forge");
         assert_eq!(v["workspace"]["repo"], "app");
+        assert_eq!(v["workspace"]["item_title"], "Fix the gate");
         assert_eq!(v["workspace"]["commit"], commit);
         assert_eq!(v["workspace"]["branch"], "agent/item-7");
         assert_eq!(v["workspace"]["branch_born"], false);
         assert!(
             payload.contains(&format!(
-                r#""workspace":{{"kind":"forge","repo":"app","commit":"{commit}","branch":"agent/item-7","branch_born":false}}"#
+                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false}}"#
             )),
             "the forge workspace field order is part of the committed bytes: {payload}"
         );
@@ -1082,6 +1087,7 @@ mod tests {
         let inputs = || PortableInputs {
             workspace: WorkspaceSource::Forge {
                 repo: "app".into(),
+                item_title: "Ship the fix".into(),
                 commit: "cd".repeat(20),
                 branch: "feature/x".into(),
                 branch_born: true,

@@ -289,6 +289,7 @@ impl RunsModule {
         Ok(PortableInputs {
             workspace: WorkspaceSource::Forge {
                 repo: repo.to_string(),
+                item_title: item.title.clone(),
                 commit,
                 branch,
                 branch_born,

@@ -364,17 +364,23 @@ pub struct ReplyBlock {
     pub lang: Option<String>,
 }
 
-/// the formal agent response: reply blocks plus a bounded list of
-/// [`AgentAction`]s. lenient by construction — both fields default, unknown
-/// JSON fields are ignored — so a model answer either IS this shape or the
-/// consumer wraps it as one; validation (grants, caps, probes) is a separate,
-/// strict step.
+/// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,
+/// and an optional workspace commit message. lenient by construction — all
+/// fields default, unknown JSON fields are ignored — so a model answer either
+/// IS this shape or the consumer wraps it as one; validation (grants, caps,
+/// probes) is a separate, strict step.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResponse {
     #[serde(default)]
     pub reply_blocks: Vec<ReplyBlock>,
     #[serde(default)]
     pub actions: Vec<AgentAction>,
+    /// complete Git commit message authored by the agent for uncommitted
+    /// workspace changes. Optional for clean and legacy responses; existing
+    /// agent commits keep their own messages. The host owns only safety
+    /// validation, Git identity, and Forge-title recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
 }
 
 /// one validated cross-module write an agent's response may request.

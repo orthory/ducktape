@@ -44,6 +44,7 @@ pub(super) fn agent_response_from_text(text: &str, job_run: bool) -> AgentRespon
             vec![paragraph_block(non_empty_text(text))]
         },
         actions: Vec::new(),
+        commit_message: None,
     });
     normalize_response(parsed, text, job_run)
 }
@@ -138,6 +139,10 @@ fn page_reply_comment_id(run_id: &str) -> String {
 }
 
 fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool) -> AgentResponse {
+    // The host consumed this from the raw provider response before assembling
+    // the runner result. It is not a consensus-delivery facet, and retaining
+    // it here could needlessly inflate a job's bounded finalize payload.
+    response.commit_message = None;
     response.actions.truncate(MAX_ACTIONS_PER_RUN);
     response.reply_blocks = response
         .reply_blocks
