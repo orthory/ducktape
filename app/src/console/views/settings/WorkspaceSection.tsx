@@ -4,6 +4,7 @@
 // quorum). Settings deliberately does NOT duplicate those controls.
 
 import { useDucktape } from "../../store/use-ducktape";
+import { isClientMode, nodeControlAvailable } from "../../store/state";
 import { color, font } from "../../theme/tokens";
 import {
   ControlRow,
@@ -18,6 +19,8 @@ import {
 export function WorkspaceSection() {
   const { state, actions } = useDucktape();
   const workspace = state.workspace;
+  const clientMode = isClientMode(state);
+  const canControl = nodeControlAvailable(state);
 
   return (
     <>
@@ -41,7 +44,12 @@ export function WorkspaceSection() {
         />
         <ControlRow
           title="Switch workspace"
-          desc="Create, join, or select another local workspace."
+          desc={
+            clientMode
+              ? "Connect to another workspace or remote node."
+              : "Create, join, or select another local workspace."
+          }
+          last={!canControl && clientMode}
           control={
             <HoverButton
               ariaLabel="Workspaces"
@@ -53,35 +61,42 @@ export function WorkspaceSection() {
             </HoverButton>
           }
         />
-        <ControlRow
-          title="Members & invites"
-          desc="Invite, admit, and manage members from the Members view."
-          control={
-            <HoverButton
-              ariaLabel="Open Members"
-              onClick={() => actions.setScreen("members")}
-              hoverBg={color.titlebar}
-              style={outlineButton}
-            >
-              Open Members
-            </HoverButton>
-          }
-        />
-        <ControlRow
-          title="Node & daemon"
-          desc="Start or stop the daemon and inspect ports, data dir, and quorum from the Node view."
-          last
-          control={
-            <HoverButton
-              ariaLabel="Open Node"
-              onClick={() => actions.setScreen("status")}
-              hoverBg={color.titlebar}
-              style={outlineButton}
-            >
-              Open Node
-            </HoverButton>
-          }
-        />
+        {!clientMode && (
+          <ControlRow
+            title="Members & invites"
+            desc="Invite, admit, and manage members from the Members view."
+            last={!canControl}
+            control={
+              <HoverButton
+                ariaLabel="Open Members"
+                onClick={() => actions.setScreen("members")}
+                hoverBg={color.titlebar}
+                style={outlineButton}
+              >
+                Open Members
+              </HoverButton>
+            }
+          />
+        )}
+        {/* Node control is a conditional surface (ADR A5/A6): a remote client
+            has no node views at all, so no link rows point at them. */}
+        {canControl && (
+          <ControlRow
+            title="Node & daemon"
+            desc="Start or stop the daemon and inspect ports, data dir, and quorum from the Node view."
+            last
+            control={
+              <HoverButton
+                ariaLabel="Open Node"
+                onClick={() => actions.setScreen("status")}
+                hoverBg={color.titlebar}
+                style={outlineButton}
+              >
+                Open Node
+              </HoverButton>
+            }
+          />
+        )}
       </GroupCard>
     </>
   );

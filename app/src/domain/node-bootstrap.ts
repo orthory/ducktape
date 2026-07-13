@@ -53,6 +53,36 @@ export const isMacDesktop = (): boolean =>
 const webUrl = (): string =>
   import.meta.env.VITE_DUCKTAPE_NODE_URL || `http://${DEFAULT_LISTEN}`;
 
+/** The desktop shell's files-frame signer, or undefined outside Tauri (web
+ *  build: no user-key custody, writes ride the unsigned convenience lane).
+ *  The shell command pins the target module to `files` and rejects with the
+ *  exact string `identity-locked` on an encrypted, uncached key — which the
+ *  transport maps to its unsigned-lane fallback. */
+const filesFrameSigner = (): ((payloadHex: string) => Promise<string>) | undefined =>
+  isTauri()
+    ? async (payloadHex: string) => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        return invoke<string>("user_sign_files_frame", { payloadHex });
+      }
+    : undefined;
+
+/** The desktop shell's generic content-op signer, or undefined outside Tauri.
+ *  Used for REMOTE connections so every op is authored as the connecting
+ *  user's key (`ext:<user-pubkey>`) — authorized by the remote node's
+ *  client-standing door — instead of the remote node re-signing with its own
+ *  key. The shell command gates the target to content modules and rejects a
+ *  locked key with `identity-locked` (the transport surfaces it, no silent
+ *  fallback). */
+const contentFrameSigner = ():
+  | ((target: string, payloadHex: string) => Promise<string>)
+  | undefined =>
+  isTauri()
+    ? async (target: string, payloadHex: string) => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        return invoke<string>("user_sign_frame", { target, payloadHex });
+      }
+    : undefined;
+
 /** Web build: dial the configured node url. Nothing to manage. */
 export const resolveNode = (): NodeResolution => {
   const url = webUrl();
@@ -62,7 +92,7 @@ export const resolveNode = (): NodeResolution => {
 /** Desktop build: wrap a selected workspace's node url as a managed
  *  resolution. The Rust side already spawned/adopted the process. */
 export const connectWorkspace = (httpUrl: string): NodeResolution => ({
-  transport: remoteTransport(httpUrl),
+  transport: remoteTransport(httpUrl, { signFilesPayload: filesFrameSigner() }),
   url: httpUrl,
   managed: true,
 });
@@ -73,7 +103,14 @@ export const connectWorkspace = (httpUrl: string): NodeResolution => ({
  *  same as the web build). The transport is already url-agnostic; this is just
  *  the lifecycle label. */
 export const connectRemote = (httpUrl: string): NodeResolution => ({
-  transport: remoteTransport(httpUrl),
+  // every op is authored by THIS user's key, not the remote node's: `submit`
+  // rides the authenticated frame lane (`signPayload`) so the remote node's
+  // client-standing door authorizes the connecting user as their own bounded
+  // identity, and files commits stay user-signed too (`signFilesPayload`).
+  transport: remoteTransport(httpUrl, {
+    signFilesPayload: filesFrameSigner(),
+    signPayload: contentFrameSigner(),
+  }),
   url: httpUrl,
   managed: false,
 });

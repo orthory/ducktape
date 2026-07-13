@@ -6,7 +6,7 @@ use commonware_utils::ordered::Set;
 use host::Host;
 use recovery::{Manifest, Recovery};
 use sdk::StateRoot;
-use statesync::{SyncServer, fetch_frames};
+use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::read_upgrade_version_fields;
@@ -115,6 +115,18 @@ pub(crate) type ServedSeal = (
     Vec<(sdk::ModuleId, StateRoot)>,
 );
 
+/// a failed backfill, split by whether retrying the same range can ever
+/// succeed. `permanent` means the SOURCE no longer holds the frames — the
+/// range fell below its retention floor while this follower was suspended
+/// (a slept laptop's signature shape) — so waiting for the next certificate
+/// re-plans the same impossible range forever; the only way forward is a
+/// fresh boundary sync, the same jump a rebooted node takes when its reboot
+/// gap is pruned.
+pub(crate) struct BackfillUnavailable {
+    pub(crate) permanent: bool,
+    pub(crate) detail: String,
+}
+
 /// fold the committed views in `(after_view, up_to_view]` that never reached
 /// this replica as certificates — lost gossip, or ancestors committed by
 /// descent without their own finalization (the parent-linkage gap the fold
@@ -133,14 +145,17 @@ pub(crate) async fn replica_backfill<C>(
     watermark: &mut Option<u64>,
     seal_checks: &mut std::collections::HashMap<u64, ServedSeal>,
     label: &str,
-) -> Result<(), String>
+) -> Result<(), BackfillUnavailable>
 where
     C: statesync::SyncClient,
 {
     let (after_view, up_to_view) = views;
     let frames = fetch_frames(client, view_base + after_view, view_base + up_to_view)
         .await
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| BackfillUnavailable {
+            permanent: matches!(e, SyncError::RangePruned { .. }),
+            detail: e.to_string(),
+        })?;
     println!(
         "[node {label}] replica: backfilling {} committed frame(s) in views ({after_view}, \
          {up_to_view}]",
@@ -357,6 +372,15 @@ pub(crate) enum SyncStateRequest {
     /// the Manifest path.
     TipCoords {
         reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
+    },
+    /// the fail-closed standing check (ADR §5.1): is `requester` in committed
+    /// standing (validators ∪ residents)? answered from the loop's own
+    /// committed host reads, FRESH per request — a just-committed Redeem grant
+    /// is seen immediately (a cached snapshot would starve a fresh resident
+    /// between its Redeem block and the later transport cutover).
+    Standing {
+        requester: [u8; 32],
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
 }
 

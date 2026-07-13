@@ -32,6 +32,37 @@ pub enum BlockKind {
     Divider,
 }
 
+/// Inline formatting applied to a UTF-16 span of a block's text. UTF-16 is
+/// deliberate: browser selection offsets use UTF-16 code units, so the wire
+/// range is exactly what the editor reports even around emoji.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum InlineMark {
+    Bold,
+    Italic,
+    Underline,
+    Strikethrough,
+    Code,
+}
+
+/// One half-open inline mark range (`start..end`) in UTF-16 code units.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SpanMark {
+    pub start: u32,
+    pub end: u32,
+    pub kind: InlineMark,
+}
+
+/// A half-open comment selection range in UTF-16 code units. The module
+/// rebases both endpoints whenever the target block's text changes, so this
+/// remains relative to the selected text instead of becoming a stale absolute
+/// character offset.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelativeAnchor {
+    pub start: u32,
+    pub end: u32,
+}
+
 /// one block of a page, as stored and as returned by queries.
 ///
 /// the tree shape lives here: `parent` points up (None only for a page root),
@@ -50,13 +81,16 @@ pub struct Block {
     pub kind: BlockKind,
     /// the text payload — the page title for `Page`, empty for `Divider`.
     pub text: String,
+    /// Persistent inline formatting. Missing on legacy records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<SpanMark>,
     /// only meaningful for `Todo` (false everywhere else).
     pub checked: bool,
     /// ordered child block ids.
     pub children: Vec<String>,
 }
 
-/// the insert payload: a client-minted globally-unique id plus kind and text.
+/// the insert payload: a client-minted globally-unique id plus content.
 /// `parent`/`page`/`children` are derived by the module from the insert
 /// position; `checked` starts false ([`PageMsg::SetChecked`] flips it).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -64,6 +98,8 @@ pub struct NewBlock {
     pub id: String,
     pub kind: BlockKind,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<SpanMark>,
 }
 
 /// write intents the pages module accepts (its `execute` payload).
@@ -95,7 +131,24 @@ pub enum PageMsg {
         block: NewBlock,
     },
     /// replace a block's text. on a page root this renames the page.
-    UpdateText { block_id: String, text: String },
+    UpdateText {
+        block_id: String,
+        text: String,
+        /// New clients can replace content + marks atomically during a
+        /// split/merge. Legacy clients omit this and existing marks rebase.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        marks: Option<Vec<SpanMark>>,
+    },
+    /// Apply or remove one inline mark over an exact UTF-16 range. Applying
+    /// merges adjacent/overlapping spans of the same kind; removing splits
+    /// spans when needed.
+    SetSpanMark {
+        block_id: String,
+        start: u32,
+        end: u32,
+        kind: InlineMark,
+        active: bool,
+    },
     /// convert a block to another kind (markdown-shortcut conversions). both
     /// converting TO `Page` and converting a page root away are rejected.
     SetKind { block_id: String, kind: BlockKind },
@@ -138,6 +191,10 @@ pub enum PageMsg {
         comment_id: String,
         target: String,
         text: String,
+        /// Exact selection for a new thread. Replies omit it; legacy payloads
+        /// decode as block-level comments.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<RelativeAnchor>,
         /// Structured mentions carried by this comment. Only agent refs are
         /// translated into tagging-plane entities; default keeps old payloads
         /// wire-compatible.
@@ -147,8 +204,23 @@ pub enum PageMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_agent: Option<String>,
     },
+    /// Move a thread with text that crossed a block boundary during split or
+    /// merge. The replacement anchor is validated against the new target.
+    MoveCommentThread {
+        thread_id: String,
+        target: String,
+        #[serde(default)]
+        anchor: Option<RelativeAnchor>,
+    },
     /// replace a comment's text; stored-author-only. rejected on a tombstone.
-    EditComment { comment_id: String, text: String },
+    /// `mentions` carries only refs newly introduced by this edit, so an
+    /// unrelated wording change cannot re-engage everyone already mentioned.
+    EditComment {
+        comment_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<AuthorRef>,
+    },
     /// tombstone a comment; stored-author-only. when it was the thread's last
     /// live comment, the whole thread record is removed.
     DeleteComment { comment_id: String },
@@ -161,6 +233,7 @@ pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
 pub const MAX_QUERY_TARGETS: usize = 512;
+pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
 
 // client-minted id length caps (consensus constants). the shared DERIVED
 // blocks — the per-target thread index (a `Vec<thread_id>`, up to
@@ -209,6 +282,9 @@ pub struct Thread {
     pub target: String,
     pub opener: AuthorRef,
     pub created_at: u64,
+    /// `None` is a block/page-level thread; `Some` pins it to exact text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<RelativeAnchor>,
     pub resolved: bool,
     pub resolved_by: Option<AuthorRef>,
     pub comment_ids: Vec<String>,
@@ -348,5 +424,49 @@ mod interface_tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn legacy_edit_comment_defaults_missing_mentions() {
+        let legacy = br#"{"edit_comment":{"comment_id":"c1","text":"reworded"}}"#;
+        assert_eq!(
+            decode_msg(legacy).unwrap(),
+            PageMsg::EditComment {
+                comment_id: "c1".into(),
+                text: "reworded".into(),
+                mentions: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_blocks_and_comments_default_missing_ranges() {
+        let block: Block = serde_json::from_slice(
+            br#"{"id":"b1","parent":"p1","page":"p1","kind":"paragraph","text":"hello","checked":false,"children":[]}"#,
+        )
+        .unwrap();
+        assert!(block.marks.is_empty());
+        let thread: Thread = serde_json::from_slice(
+            br#"{"id":"t1","target":"b1","opener":"system","created_at":1,"resolved":false,"resolved_by":null,"comment_ids":[]}"#,
+        )
+        .unwrap();
+        assert!(thread.anchor.is_none());
+        assert_eq!(
+            decode_msg(br#"{"update_text":{"block_id":"b1","text":"next"}}"#).unwrap(),
+            PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "next".into(),
+                marks: None,
+            }
+        );
+
+        let legacy = br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
+        let PageMsg::AddComment { anchor, mentions, as_agent, .. } = decode_msg(legacy).unwrap()
+        else {
+            panic!("expected AddComment")
+        };
+        assert!(anchor.is_none());
+        assert!(mentions.is_empty());
+        assert!(as_agent.is_none());
     }
 }

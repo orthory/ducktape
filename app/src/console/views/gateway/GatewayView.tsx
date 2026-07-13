@@ -17,6 +17,7 @@ import * as workspaces from "../../../domain/workspace-client";
 import type { RouteMethod, RouteRecord, RouteStatement, RouteSummary } from "../../../domain/gateway-client";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { AccountAudiencePicker } from "./AccountAudiencePicker";
 
 const METHOD_ORDER: RouteMethod[] = ["get", "head", "post", "put", "patch", "delete"];
 
@@ -32,7 +33,7 @@ type RouteHealth =
 const short = (value?: string, width = 8): string =>
   value ? `${value.slice(0, width)}…${value.slice(-4)}` : "—";
 
-const buttonStyle = (disabled = false): CSSProperties => ({
+export const buttonStyle = (disabled = false): CSSProperties => ({
   all: "unset",
   boxSizing: "border-box",
   cursor: disabled ? "default" : "pointer",
@@ -46,7 +47,7 @@ const buttonStyle = (disabled = false): CSSProperties => ({
   font: `600 11px ${font.sans}`,
 });
 
-const fieldStyle: CSSProperties = {
+export const fieldStyle: CSSProperties = {
   minWidth: 0,
   height: 30,
   boxSizing: "border-box",
@@ -76,6 +77,7 @@ export function GatewayView() {
   const [port, setPort] = useState("3000");
   const [defaultPath, setDefaultPath] = useState("index.html");
   const [audience, setAudience] = useState<"network" | "owner" | "accounts">("network");
+  const [audienceAccounts, setAudienceAccounts] = useState<string[]>([]);
   const [methods, setMethods] = useState<RouteMethod[]>(["get", "head"]);
   const [requestKiB, setRequestKiB] = useState("256");
   const [responseKiB, setResponseKiB] = useState("4096");
@@ -109,6 +111,7 @@ export function GatewayView() {
     setPort("3000");
     setDefaultPath("index.html");
     setAudience("network");
+    setAudienceAccounts([]);
     setMethods(["get", "head"]);
     setRequestKiB("256");
     setResponseKiB("4096");
@@ -124,6 +127,11 @@ export function GatewayView() {
     }
     setTarget(definition.target.kind);
     setAudience(definition.policy.audience.kind);
+    setAudienceAccounts(
+      definition.policy.audience.kind === "accounts"
+        ? definition.policy.audience.account_ids.map((id) => gateway.bytesToHex(id))
+        : [],
+    );
     setMethods(definition.policy.methods);
     setRequestKiB(String(definition.policy.max_request_bytes / 1024));
     setResponseKiB(String(definition.policy.max_response_bytes / 1024));
@@ -235,15 +243,16 @@ export function GatewayView() {
 
   const publish = async (): Promise<void> => {
     if (!transport || !workspaceId) throw new Error("Connect a managed workspace first.");
-    if (audience === "accounts") {
-      throw new Error("Explicit account audiences are read-only in this Routes editor.");
-    }
     gateway.validateRouteName(name);
     const maxResponse = numericCap(
       responseKiB,
       gateway.MAX_FILE_BYTES,
       "Response cap",
     );
+    // Owner is never implicit; validatePolicy (via validateStatement) rejects an
+    // empty, oversized, or unsorted account set before the signer is invoked.
+    const audiencePolicy: gateway.RouteAudience =
+      audience === "accounts" ? gateway.accountsAudience(audienceAccounts) : { kind: audience };
     let definition: gateway.RouteDefinition;
     const previousPort = local?.port ?? null;
     if (target === "duck_fs") {
@@ -256,7 +265,7 @@ export function GatewayView() {
       definition = {
         target: { kind: "duck_fs", manifest_sha256 },
         policy: {
-          audience: { kind: audience },
+          audience: audiencePolicy,
           methods: ["get", "head"],
           max_request_bytes: 0,
           max_response_bytes: maxResponse,
@@ -283,7 +292,7 @@ export function GatewayView() {
       definition = {
         target: { kind: "loopback_http" },
         policy: {
-          audience: { kind: audience },
+          audience: audiencePolicy,
           methods: sortedMethods,
           max_request_bytes: maxRequest,
           max_response_bytes: maxResponse,
@@ -353,7 +362,7 @@ export function GatewayView() {
   const canMutate = Boolean(
     transport && isTauri() && workspaceId && accountId && publisherNode && chainId && !busy,
   );
-  const canPublish = canMutate && audience !== "accounts" && !labelError;
+  const canPublish = canMutate && !labelError && (audience !== "accounts" || audienceAccounts.length > 0);
 
   const healthText = health.kind === "checking" ? "Checking end to end…"
     : health.kind === "serving" ? `Healthy · HTTP ${health.status}`
@@ -369,6 +378,8 @@ export function GatewayView() {
     const prefix = item.name.label ? `${item.name.label}.` : "";
     return handle ? `${prefix}${handle}.duck` : item.name.label ?? "Account apex";
   };
+  const accountLabel = (id: string): string =>
+    state.accountHandles[id] ? `${state.accountHandles[id]}.duck` : state.authorNames[id] ?? short(id);
 
   return (
     <div
@@ -381,7 +392,10 @@ export function GatewayView() {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", background: color.sidebar }}>
-        <div style={{ maxWidth: 460, margin: "0 auto", padding: "22px 20px 40px" }}>
+        <div
+          data-gateway-content="full-width"
+          style={{ width: "100%", boxSizing: "border-box", padding: "22px 20px 40px" }}
+        >
           <p style={{ font: `400 11px/1.55 ${font.sans}`, color: color.muted3, margin: "0 0 14px" }}>
             Connect one account address to exact DuckFS content or a local HTTP service.
             The address, reverse proxy, and signed access policy are saved together.
@@ -469,10 +483,20 @@ export function GatewayView() {
               <select aria-label="Route audience" value={audience} onChange={(event) => setAudience(event.target.value as typeof audience)} style={{ ...fieldStyle, display: "block", width: "100%", marginTop: 5 }}>
                 <option value="network">All identified network members</option>
                 <option value="owner">Owning account only</option>
-                {audience === "accounts" && <option value="accounts">Explicit accounts (read only)</option>}
+                <option value="accounts">Specific accounts</option>
               </select>
             </label>
           </div>
+
+          {audience === "accounts" && (
+            <AccountAudiencePicker
+              roster={Object.keys(state.accountKeys)}
+              label={accountLabel}
+              selected={audienceAccounts}
+              onChange={setAudienceAccounts}
+              ownerAccountId={accountId}
+            />
+          )}
 
           {target === "duck_fs" ? (
             <div style={{ marginTop: 13 }}>
@@ -532,7 +556,6 @@ export function GatewayView() {
           </div>
           {!isTauri() && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Saving routes requires the desktop user-key signer.</p>}
           {isTauri() && !accountId && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Bind this node to your Identity account before saving routes.</p>}
-          {audience === "accounts" && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>This explicit-account policy remains active but cannot be changed in this compact editor.</p>}
           {note && <div role="status" style={{ marginTop: 12, padding: 10, borderRadius: radius.sm, background: color.paper, border: `1px solid ${color.border}`, color: color.muted3, font: `500 10.5px/1.45 ${font.sans}` }}>{note}</div>}
         </div>
       </div>

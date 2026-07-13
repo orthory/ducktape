@@ -10,6 +10,7 @@ use dispatch::DispatchModule;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
+use clients::Clients;
 use host::Host;
 use kv::Kv;
 use modreg::Modreg;
@@ -487,6 +488,7 @@ struct ProductionModules {
     chat: WasmModule,
     forge: Forge,
     valset: Valset,
+    clients: Clients,
     governance: WasmModule,
     upgrade: Upgrade,
     modreg: Modreg,
@@ -520,6 +522,7 @@ impl ProductionModules {
             Box::new(self.chat),
             Box::new(self.forge),
             Box::new(self.valset),
+            Box::new(self.clients),
             Box::new(self.governance),
             Box::new(self.upgrade),
             Box::new(self.modreg),
@@ -595,15 +598,22 @@ pub(super) async fn genesis_host(
     for v in genesis_validators {
         valset.insert(v.as_ref().to_vec());
     }
+    // the client ACL: empty at genesis. a redeemed role=Client invite records a
+    // key here (governance emits ClientsMsg::Grant). SEPARATE from valset by
+    // design — a client never gets statesync/quorum standing.
+    let clients = Clients::new("clients");
     ProductionModules {
         kv,
         pages,
         chat,
         forge,
         valset,
-        // governance is the SOLE authorized author of valset changes: member
-        // proposals + ballots, deterministic tally, follow-up membership ops.
-        // adapter-ported; the invite binding rides its GENESIS CONFIG.
+        clients,
+        // governance is the SOLE authorized author of valset AND client-ACL
+        // changes: member proposals + ballots, deterministic tally, follow-up
+        // membership ops, and the redeem-time client grant. adapter-ported;
+        // the invite binding rides its GENESIS CONFIG, the clients sibling id
+        // is compiled into the guest like the rest.
         governance: genesis_governance_wasm(bindings),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
@@ -720,6 +730,12 @@ pub(super) async fn restore_host(
     valset
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
+
+    let mut clients = Clients::new("clients");
+    let (bytes, root) = snapshot_of("clients")?;
+    clients
+        .install(bytes, root)
+        .map_err(|e| format!("clients install: {e}"))?;
 
     // wasm tenants with GENESIS CONFIG restore like any other wasm module:
     // construct through the genesis builder (config-only initial store), then
@@ -862,6 +878,7 @@ pub(super) async fn restore_host(
         chat,
         forge,
         valset,
+        clients,
         governance,
         upgrade,
         modreg,
@@ -1064,6 +1081,12 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("clients").await?;
+    let mut clients = Clients::new("clients");
+    clients
+        .install(&bytes, root)
+        .map_err(|e| format!("clients install: {e}"))?;
+
     let (bytes, root) = snapshot_of(SAGA_MODULE_ID).await?;
     let mut saga = genesis_saga_wasm();
     saga.install(&bytes, root)
@@ -1222,6 +1245,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         chat,
         forge,
         valset,
+        clients,
         governance,
         upgrade,
         modreg,

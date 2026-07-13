@@ -37,7 +37,7 @@
 
 use serde_json::{Value, json};
 
-use agent::AgentAction;
+use agent::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
 use tasks::TaskStatus;
 
 use super::{Tool, arg_bool, arg_str, opt_u64, schema};
@@ -113,6 +113,20 @@ pub(super) fn tools() -> Vec<Tool> {
             },
             handler: page_check,
         },
+        Tool {
+            name: "ducktape_duckfs_write_text",
+            description: "Write one small UTF-8 text file under a granted DuckFS prefix. Requires \
+                          the duckfs.write_text action and a duckfs_write prefix containing the \
+                          path. The tool fetches the current DuckFS refs head and signs it into \
+                          the action as the CAS base.",
+            schema: || {
+                schema(&[
+                    ("path", "string", true, "Absolute DuckFS path to write."),
+                    ("text", "string", true, "UTF-8 text content to write."),
+                ])
+            },
+            handler: duckfs_write_text,
+        },
     ]
 }
 
@@ -162,6 +176,27 @@ fn page_check(run: &Run, args: &Value) -> Result<Value> {
     run.act(AgentAction::SetPageChecked {
         block: arg_str(args, "block_id")?,
         checked: arg_bool(args, "checked")?,
+    })
+}
+
+fn duckfs_write_text(run: &Run, args: &Value) -> Result<Value> {
+    let path = arg_str(args, "path")?;
+    let text = arg_str(args, "text")?;
+    if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
+        return Err(NodeError::Rejected(format!(
+            "text is {} bytes; the cap is {MAX_DUCKFS_WRITE_TEXT_BYTES}",
+            text.len()
+        )));
+    }
+    let refs = run.node.files("refs", &[])?;
+    let base_snapshot = refs
+        .get("head")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    run.act(AgentAction::DuckfsWriteText {
+        path,
+        text,
+        base_snapshot,
     })
 }
 

@@ -19,7 +19,7 @@ pub const COORD_CAP_NS: &[u8] = b"ducktape-coord-cap-v1";
 pub const DEFAULT_FRESHNESS_WINDOW_SECS: u64 = 30;
 /// Lifetime of a minted admission capability (`mint_coord_cap`), in seconds:
 /// one year. Deliberately long-lived — there is NO cap-rotation flow yet (a
-/// joiner receives exactly one cap over its `JoinReply` and never refreshes
+/// joiner receives exactly one cap over its `Admitted` gate reply and never refreshes
 /// it), so a short TTL would strand admitted nodes. Rotation (re-minting +
 /// re-delivering a fresh cap before expiry) is DEFERRED; when it lands this
 /// TTL should shrink to match the rotation cadence.

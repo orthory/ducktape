@@ -1214,6 +1214,15 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
         // it fails every codex agent run, quietly. Hence a pin.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
             assert!(
+                spec.args.windows(2).any(|w| w == [
+                    "-c",
+                    "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_SESSION_KEY\",\"DUCKTAPE_RUN_ID\"]"
+                ]),
+                "{}: codex passes only the run env names to its MCP child: {:?}",
+                spec.tag,
+                spec.args
+            );
+            assert!(
                 spec.args.windows(2).any(|w| w[0] == "-c"
                     && w[1] == "mcp_servers.ducktape.default_tools_approval_mode=\"approve\""),
                 "{}: codex must PRE-APPROVE the ducktape tools, or exec cancels every call: {:?}",

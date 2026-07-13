@@ -4,7 +4,7 @@ import type { AgentRecord } from "../../../domain/agent-client";
 import { keyBytes, type ChatBlock } from "../../../domain/chat-client";
 import { parseMessageInput } from "./chat-input";
 import {
-  agentMentions,
+  addedStructuredMentions,
   hasAgentMention,
   insertMention,
   mentionCandidates,
@@ -14,6 +14,7 @@ import {
   mentionResolverOf,
   mentionTarget,
   mentionTokenAt,
+  structuredMentions,
 } from "./mention";
 
 const agent = (
@@ -254,20 +255,40 @@ describe("hasAgentMention", () => {
   });
 });
 
-describe("agentMentions", () => {
-  it("returns distinct structured agent refs and ignores plain/user mentions", () => {
+describe("structuredMentions", () => {
+  it("returns distinct structured user and agent refs, ignoring plain text", () => {
     const ref = { agent: { module: "runs", agent_id: "quackbot" } };
+    const user = { user: [1, 2] };
     const blocks: ChatBlock[] = [
       {
         paragraph: [
           { text: "@quackbot", marks: [{ mention: ref }] },
           { text: " again", marks: [{ mention: ref }] },
-          { text: " @eddy", marks: [{ mention: { user: [1, 2] } }] },
+          { text: " @eddy", marks: [{ mention: user }] },
+          { text: " again", marks: [{ mention: user }] },
         ],
       },
       { code: { lang: null, text: "@quackbot" } },
     ];
-    expect(agentMentions(blocks)).toEqual([ref]);
+    expect(structuredMentions(blocks)).toEqual([ref, user]);
+  });
+
+  it("reports only refs newly introduced by an edit", () => {
+    const oldRef = { user: [1, 2] };
+    const newRef = { agent: { module: "runs", agent_id: "quackbot" } };
+    const before = [{ paragraph: [{ text: "@eddy", marks: [{ mention: oldRef }] }] }];
+    const after = [
+      {
+        paragraph: [
+          { text: "@eddy", marks: [{ mention: oldRef }] },
+          { text: " @quackbot", marks: [{ mention: newRef }] },
+        ],
+      },
+    ];
+
+    expect(addedStructuredMentions(before as ChatBlock[], after as ChatBlock[])).toEqual([
+      newRef,
+    ]);
   });
 });
 

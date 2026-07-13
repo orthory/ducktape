@@ -331,6 +331,10 @@ export interface NodeTransport {
     offset?: number;
     len?: number;
   }): Promise<FileReadRange>;
+  /** A direct raw-byte URL for browser-native downloads and drag-out. Optional
+   *  for injected transports that do not expose the daemon's HTTP surface; the
+   *  remote transport falls back to ranged reads above the 64 MiB facade cap. */
+  filesObjectUrl?(params: { path: string; snapshot?: string; size?: number }): string | undefined;
   /** The bounded commit history, newest-first (GET /v1/files/history). */
   filesHistory(params?: { limit?: number }): Promise<FileSnapshot[]>;
 
@@ -499,7 +503,59 @@ const wsBase = (baseUrl: string): string =>
 export const callSocketUrl = (baseUrl: string, channel: string): string =>
   `${wsBase(baseUrl)}/v1/call/ws?channel=${encodeURIComponent(channel)}`;
 
-export const remoteTransport = (baseUrl: string): NodeTransport => {
+/** The off-consensus Pages presence socket. It shares the node's authenticated
+ * overlay runtime with calls, but carries only page caret beacons. */
+export const pagePresenceSocketUrl = (baseUrl: string, page: string): string =>
+  `${wsBase(baseUrl)}/v1/presence/ws?page=${encodeURIComponent(page)}`;
+
+/** Optional capabilities a host environment can graft onto [`remoteTransport`]. */
+export interface RemoteTransportOptions {
+  /**
+   * Sign a files-module op payload (hex in) into a raw signed op frame (hex
+   * out) with the USER key — the desktop shell's `user_sign_files_frame`
+   * command. When present, `filesCommit` rides the authenticated
+   * `POST /v1/submit/frame` lane so the commit's author is the user
+   * (`ext:<user-pubkey>`, real `/home/<user>` authority) instead of the
+   * daemon's shared `ext:noded`. Throwing the exact string `identity-locked`
+   * falls back to the unsigned convenience lane (status-quo authorship);
+   * any other failure propagates.
+   */
+  signFilesPayload?: (payloadHex: string) => Promise<string>;
+  /**
+   * Sign an arbitrary CONTENT-module op payload (hex in) into a raw signed op
+   * frame (hex out) with the USER key — the shell's `user_sign_frame` command
+   * (gated to content modules). When present, every `submit` rides the
+   * authenticated `POST /v1/submit/frame` lane so the op is authored as the
+   * connecting user (`ext:<user-pubkey>`) and authorized by the remote node's
+   * client-standing door, instead of the frameless lane where the remote node
+   * discards the origin and re-signs with its OWN key. Only wired for REMOTE
+   * connections (a local workspace's own node signing is correct as-is).
+   * Unlike `signFilesPayload`, a locked identity here FAILS LOUD: a silent
+   * frameless fallback would mis-author the op as the remote node's key and be
+   * refused by the door anyway.
+   */
+  signPayload?: (target: string, payloadHex: string) => Promise<string>;
+}
+
+const bytesToHexString = (bytes: Uint8Array): string =>
+  Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+const hexStringToBytes = (hex: string): Uint8Array<ArrayBuffer> => {
+  const clean = hex.trim();
+  if (clean.length % 2 !== 0 || /[^0-9a-fA-F]/.test(clean)) {
+    throw new Error("transport: signer returned invalid frame hex");
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+};
+
+export const remoteTransport = (
+  baseUrl: string,
+  opts?: RemoteTransportOptions,
+): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
   const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
@@ -676,10 +732,49 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   };
 
   return {
-    // JSON.stringify drops an undefined origin, so the field only crosses the
-    // wire when a caller set one
-    submit: (target, payload, origin) =>
-      postJson<SubmitReceipt>(`${base}/v1/submit`, { target, payload, origin }),
+    // With a user-key signer (remote connections), every op is user-authored
+    // over the authenticated frame lane. Without one (local workspace / web),
+    // the frameless lane rides — JSON.stringify drops an undefined origin, so
+    // the field only crosses the wire when a caller set one.
+    submit: async (target, payload, origin) => {
+      const sign = opts?.signPayload;
+      if (sign) {
+        // sign the JSON-encoded payload; module decoders are key-order /
+        // whitespace-insensitive, and each lane content-addresses its own
+        // bytes, so the signed frame need not be byte-identical to the
+        // frameless lane's server-side encoding.
+        const payloadHex = bytesToHexString(new TextEncoder().encode(JSON.stringify(payload)));
+        let frameHex: string;
+        try {
+          frameHex = await sign(target, payloadHex);
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          // fail loud, no frameless fallback: a locked identity must not
+          // silently re-author the op as the remote node's key.
+          if (detail === "identity-locked") {
+            throw new NodeError(
+              "httpError",
+              "unlock your identity to act on a remote node — remote ops are signed by your key",
+            );
+          }
+          throw err;
+        }
+        const res = await fetchDeadline(`${base}/v1/submit/frame`, {
+          method: "POST",
+          headers: { "content-type": "application/octet-stream" },
+          body: hexStringToBytes(frameHex),
+        });
+        if (!res.ok) {
+          throw new NodeError(
+            "httpError",
+            (await errorDetail(res)) || `node replied ${res.status}`,
+            res.status,
+          );
+        }
+        return (await res.json()) as SubmitReceipt;
+      }
+      return postJson<SubmitReceipt>(`${base}/v1/submit`, { target, payload, origin });
+    },
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),
     view: (module, request) =>
@@ -739,7 +834,42 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
         throw new NodeError("badBody", "/v1/files/stage returned an invalid response");
       }
     },
-    filesCommit: (body) => postJson<BlockEvent>(`${base}/v1/files/commit`, body),
+    filesCommit: async (body) => {
+      const sign = opts?.signFilesPayload;
+      if (sign) {
+        // the exact FilesMsg the convenience route would build server-side
+        // (externally-tagged serde enum, snake_case) — signed by the user key
+        // so the commit's author is the user, not the daemon.
+        const payload = new TextEncoder().encode(JSON.stringify({ commit: body }));
+        try {
+          const frameHex = await sign(bytesToHexString(payload));
+          const res = await fetchDeadline(`${base}/v1/submit/frame`, {
+            method: "POST",
+            headers: { "content-type": "application/octet-stream" },
+            body: hexStringToBytes(frameHex),
+          });
+          if (!res.ok) {
+            throw new NodeError(
+              "httpError",
+              (await errorDetail(res)) || `node replied ${res.status}`,
+              res.status,
+            );
+          }
+          return (await res.json()) as SubmitReceipt;
+        } catch (err) {
+          // a locked identity falls back to the unsigned lane — the commit
+          // still lands, with the daemon's status-quo authorship. anything
+          // else (a real signer or node failure) propagates. tauri invoke
+          // rejects with the raw string, not an Error — accept both shapes.
+          const detail = err instanceof Error ? err.message : String(err);
+          if (detail !== "identity-locked") throw err;
+          console.warn(
+            "[transport] user key locked; files commit rides the unsigned lane as ext:noded",
+          );
+        }
+      }
+      return postJson<BlockEvent>(`${base}/v1/files/commit`, body);
+    },
     filesStat: async ({ path, snapshot }) => {
       try {
         return await getJson<FileEntry>(
@@ -758,6 +888,13 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       getJson<FileReadRange>(
         `${base}/v1/files/read${queryString({ path, snapshot, offset, len })}`,
       ),
+    filesObjectUrl: ({ path, snapshot, size }) =>
+      size !== undefined && size > 64 * 1024 * 1024
+        ? undefined
+        : `${base}/v1/files/object${path
+            .split("/")
+            .map((segment) => encodeURIComponent(segment))
+            .join("/")}${queryString({ snapshot })}`,
     filesHistory: async (params) => {
       const body = await getJson<{ snapshots: FileSnapshot[] }>(
         `${base}/v1/files/history${queryString({ limit: params?.limit })}`,

@@ -7,15 +7,21 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SetStateAction } from "react";
+import type { RelativeAnchor, ThreadView } from "../../../domain/pages-client";
 
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
-import { selfAuthorBytes } from "../../store/state";
+import {
+  DEFAULT_AUTHOR,
+  loadPendingDisplayName,
+  selfAuthorBytes,
+} from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { selfAuthorKeyOf } from "../chat/chat-helpers";
-import { color, font, radius } from "../../theme/tokens";
-import { EDIT_BOUNDARY_MS, buildRows } from "./pages-model";
+import { accentVar, color, font, radius } from "../../theme/tokens";
+import { EDIT_BOUNDARY_MS, buildRows, subtreePlan } from "./pages-model";
+import type { DuplicateOp } from "./pages-model";
 import type { FocusIntent } from "./block-keys";
 import { dropTarget } from "./page-drag";
 import { loadCollapsed, saveCollapsed } from "./page-collapse";
@@ -29,12 +35,16 @@ import { CommentCard } from "./CommentCard";
 import type { CommentAnchor } from "./CommentCard";
 import { DocTabs } from "./DocTabs";
 import { PageHeader } from "./PageHeader";
+import { PageNotice } from "./PageNotice";
 import { PageRail } from "./PageRail";
 import { PageTitle } from "./PageTitle";
-import { CommentsPanel } from "./CommentsPanel";
+import type { PagePresencePeer } from "./PagePresence";
 import { Subpages } from "./Subpages";
+import { usePagePresence } from "./use-page-presence";
 
 export { EDIT_BOUNDARY_MS };
+const EMPTY_PRESENCE: PagePresencePeer[] = [];
+const EMPTY_THREADS: ThreadView[] = [];
 
 // ── The view ─────────────────────────────────────────────
 
@@ -49,19 +59,30 @@ export function PagesView() {
   // which block to focus next, and WHERE in it. This used to be a bare block
   // id, so every focus hop slammed the caret to the end of the text.
   const [focus, setFocus] = useState<FocusIntent | null>(null);
-  const [panelOpen, setPanelOpen] = useState(false);
   const [pendingPageDelete, setPendingPageDelete] = useState<string | null>(null);
   const [pendingBlockDelete, setPendingBlockDelete] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [pasteNotice, setPasteNotice] = useState<number | null>(null);
+  // the just-deleted subtree, snapshotted for Undo, BOUND TO THE PAGE it came
+  // from: this view survives a doc switch, and InsertBlock is parent/after-
+  // anchored and page-agnostic, so a replay fired from another doc restores the
+  // subtree into the original page — off-screen, looking like nothing happened.
+  // null = no toast; `ops` [] = a toast without the button (the subtree was over
+  // the op cap); a non-empty plan = the ops to re-insert. A newer delete wins.
+  const [deleteUndo, setDeleteUndo] = useState<{ page: string; ops: DuplicateOp[] } | null>(
+    null,
+  );
+  // a restore that could not land — see `undoDelete`.
+  const [undoFailed, setUndoFailed] = useState(false);
   // the floating comment card's aim: ONE target (a block id or the page id),
   // the label naming it, and the viewport anchor of the affordance that
-  // opened it. Null = no card. The aside panel stays as the all-threads
-  // overview behind the header toggle; composing happens in the card.
+  // opened it. Null = no card. Threads live beside their page/block target;
+  // there is no second, duplicate all-comments list to get lost inside.
   const [commentCard, setCommentCard] = useState<{
     target: string;
     label: string;
     anchor: CommentAnchor;
+    range?: RelativeAnchor;
   } | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
@@ -79,8 +100,49 @@ export function PagesView() {
   // committed authorship for OUR writes — a comment's Edit/Delete only exist
   // for the author, because the module rejects anyone else's.
   const selfKey = selfAuthorKeyOf(selfAuthorBytes(state.status, state.author));
+  const selfName =
+    state.author === DEFAULT_AUTHOR
+      ? loadPendingDisplayName() ?? state.author
+      : state.author;
 
   const activePage = state.activePage;
+  const presenceRecipients = useMemo(() => {
+    const self = state.status?.publicKey?.toLowerCase();
+    return [...new Set([...state.members, ...state.residents].map((key) => key.toLowerCase()))]
+      .filter((key) => key !== self);
+  }, [state.members, state.residents, state.status?.publicKey]);
+  const { peers: livePeers, publishCursor } = usePagePresence({
+    nodeUrl: state.nodeUrl,
+    pageId: activePage,
+    selfNode: state.status?.publicKey ?? null,
+    recipients: presenceRecipients,
+  });
+  const onCursor = useCallback(
+    (blockId: string | null, anchor: number, head: number) =>
+      publishCursor({ blockId, anchor, head }),
+    [publishCursor],
+  );
+  const presence = useMemo<PagePresencePeer[]>(
+    () =>
+      livePeers.map((peer) => ({
+        ...peer,
+        name:
+          state.nodeUsers[peer.peer]?.name ??
+          state.authorNames[peer.peer] ??
+          `Peer ${peer.peer.slice(0, 6)}`,
+      })),
+    [livePeers, state.nodeUsers, state.authorNames],
+  );
+  const presenceByBlock = useMemo(() => {
+    const byBlock = new Map<string, PagePresencePeer[]>();
+    for (const peer of presence) {
+      if (!peer.blockId) continue;
+      const group = byBlock.get(peer.blockId) ?? [];
+      group.push(peer);
+      byBlock.set(peer.blockId, group);
+    }
+    return byBlock;
+  }, [presence]);
   // the persisted set belongs to the page that was open when it changed, so the
   // writer reads the page id from a ref, never from a stale closure — and
   // `setCollapsed` stays referentially stable, which BlockRow's memo needs.
@@ -96,10 +158,19 @@ export function PagesView() {
     [],
   );
 
-  // live thread count keyed by target (block id or page id).
+  // the snapshot belongs to the page that was open when the block was deleted,
+  // so the page id comes from the ref, never a stale closure — and `noteDeleted`
+  // stays referentially stable, which the row handlers want.
+  const noteDeleted = useCallback((ops: DuplicateOp[]) => {
+    const page = pageRef.current;
+    if (page) setDeleteUndo({ page, ops });
+  }, []);
+
+  // live threads keyed by target (block id or page id); rows need anchors as
+  // well as counts so exact selections can be painted behind the textarea.
   const threadsByTarget = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const group of state.pageThreads) map.set(group.target, group.threads.length);
+    const map = new Map<string, ThreadView[]>();
+    for (const group of state.pageThreads) map.set(group.target, group.threads);
     return map;
   }, [state.pageThreads]);
 
@@ -180,8 +251,67 @@ export function PagesView() {
     return () => clearTimeout(timer);
   }, [pasteNotice]);
 
-  const openBlockComments = useCallback((blockId: string, anchor: CommentAnchor) => {
-    setCommentCard({ target: blockId, label: "this block", anchor });
+  // the delete-undo toast lingers a little longer than the paste notice — undo
+  // is an action, not just an FYI — then dismisses itself. So does the failure
+  // that a click on it can leave behind.
+  useEffect(() => {
+    if (deleteUndo === null) return;
+    const timer = setTimeout(() => setDeleteUndo(null), 8000);
+    return () => clearTimeout(timer);
+  }, [deleteUndo]);
+
+  useEffect(() => {
+    if (!undoFailed) return;
+    const timer = setTimeout(() => setUndoFailed(false), 6000);
+    return () => clearTimeout(timer);
+  }, [undoFailed]);
+
+  // Replay the snapshot as plain inserts: the wire FIFO (actions.ts) keeps them
+  // in plan order, so the subtree comes back exactly as it was. A checked to-do
+  // needs a second op — InsertBlock carries no `checked` bit (only ever set on a
+  // to-do: subtreePlan drops the module's stale bit, so this never fires a
+  // NotTodo-rejected SetChecked on a converted block). Comments on the deleted
+  // blocks were purged in consensus and cannot be restored.
+  //
+  // The ROOT op is the only one anchored to blocks this batch does not re-insert
+  // itself: its parent and previous sibling belong to the live document and can
+  // have been removed under us, and the module then rejects it (ParentNotFound /
+  // AnchorNotFound) — and every child op chained behind it too, one error toast
+  // each, while nothing comes back. So the batch is GATED on the root landing,
+  // and the root goes out `quiet`: a failed restore says so ONCE, here.
+  const undoDelete = async () => {
+    const snapshot = deleteUndo;
+    if (!snapshot || snapshot.ops.length === 0) return;
+    setDeleteUndo(null);
+    // Undo clicked after a doc switch restores into the page it came from, so
+    // go back there first — a restore the user cannot see is not a restore.
+    if (snapshot.page !== activePage) actions.openPage(snapshot.page);
+    for (const [index, op] of snapshot.ops.entries()) {
+      const insert = actions.insertPageBlock({
+        blockId: op.blockId,
+        parent: op.parent,
+        after: op.after,
+        kind: op.kind,
+        text: op.text,
+        ...(op.marks ? { marks: op.marks } : {}),
+        quiet: index === 0,
+      });
+      // the rest of the plan only anchors onto blocks the root brought back, so
+      // waiting on the root once is enough to know the restore has a floor.
+      if (index === 0 && !(await insert)) {
+        setUndoFailed(true);
+        return;
+      }
+      if (op.checked) actions.setPageBlockChecked({ blockId: op.blockId, checked: true });
+    }
+  };
+
+  const openBlockComments = useCallback((
+    blockId: string,
+    anchor: CommentAnchor,
+    range?: RelativeAnchor,
+  ) => {
+    setCommentCard({ target: blockId, label: range ? "selected text" : "this block", anchor, range });
   }, []);
 
   // row intents -> store ops + caret placement. `handlers` is referentially
@@ -190,6 +320,7 @@ export function PagesView() {
     actions,
     rows,
     blocks,
+    pageThreads: state.pageThreads,
     root,
     activePage,
     drag,
@@ -201,6 +332,7 @@ export function PagesView() {
     openComments: openBlockComments,
     confirmRemove: setPendingBlockDelete,
     onPasteCapped: setPasteNotice,
+    onDeleted: noteDeleted,
   });
 
   const commentOnPage = (anchor: CommentAnchor) => {
@@ -210,7 +342,7 @@ export function PagesView() {
 
   // a reply must carry the THREAD's target (a block id or the page id) — the
   // module rejects an append whose target differs from the thread's. Never
-  // assume the page here. Shared by the card and the panel.
+  // assume the page here.
   const replyToThread = (threadId: string, text: string) => {
     const target =
       state.pageThreads
@@ -225,6 +357,7 @@ export function PagesView() {
     state.pages.find((p) => p.id === pendingPageDelete)?.title || "Untitled";
   const pendingBlockChildren =
     blocks.find((b) => b.id === pendingBlockDelete)?.children.length ?? 0;
+  const pageCommentCount = root ? threadsByTarget.get(root.id)?.length ?? 0 : 0;
 
   return (
     <div
@@ -260,27 +393,47 @@ export function PagesView() {
           <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
             <PageHeader
               chain={chain}
-              panelOpen={panelOpen}
+              presence={presence}
               onOpen={actions.openPage}
-              onComment={commentOnPage}
-              onTogglePanel={() => setPanelOpen((open) => !open)}
             />
 
             {pasteNotice !== null ? (
-              <div
-                role="status"
-                style={{
-                  padding: "7px 22px",
-                  borderBottom: `1px solid ${color.borderSoft}`,
-                  background: color.sunken,
-                  color: color.muted3,
-                  font: `500 11.5px ${font.sans}`,
-                }}
-              >
+              <PageNotice>
                 Pasted the first {MAX_PASTE_BLOCKS} blocks — {pasteNotice} more line
                 {pasteNotice === 1 ? "" : "s"} were dropped. Each block is one write, so a
                 paste is capped.
-              </div>
+              </PageNotice>
+            ) : null}
+
+            {deleteUndo !== null ? (
+              <PageNotice>
+                <span>Block deleted.</span>
+                {deleteUndo.ops.length > 0 ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={undoDelete}
+                      style={{
+                        all: "unset",
+                        cursor: "pointer",
+                        color: color.accent,
+                        font: `600 11.5px ${font.sans}`,
+                        textDecoration: "underline",
+                      }}
+                    >
+                      Undo
+                    </button>
+                    <span>Comments on it are not restored.</span>
+                  </>
+                ) : null}
+              </PageNotice>
+            ) : null}
+
+            {undoFailed ? (
+              <PageNotice role="alert" tone="danger">
+                Couldn't restore the block — the place it sat in is gone. Someone else
+                deleted or moved what it hung from.
+              </PageNotice>
             ) : null}
 
             <div
@@ -340,16 +493,38 @@ export function PagesView() {
                 <div
                   style={{
                     width: "100%",
-                    maxWidth: 820,
+                    maxWidth: 780,
                     margin: "0 auto",
-                    padding: `36px ${COLUMN_PAD_X}px 0`,
+                    padding: `32px ${COLUMN_PAD_X}px 120px`,
                     boxSizing: "border-box",
                   }}
                 >
+                  {chain.length > 1 ? (
+                    <button
+                      type="button"
+                      aria-label={`Back to ${chain[chain.length - 2].title || "Untitled"}`}
+                      onClick={() => actions.openPage(chain[chain.length - 2].id)}
+                      style={{
+                        all: "unset",
+                        cursor: "pointer",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 7,
+                        marginBottom: 20,
+                        color: color.muted,
+                        font: `500 13px ${font.sans}`,
+                      }}
+                    >
+                      <span aria-hidden="true">‹</span>
+                      {chain[chain.length - 2].title || "Untitled"}
+                    </button>
+                  ) : null}
                   <PageTitle
                     pageId={root.id}
                     raw={root.text}
                     titleRef={titleRef}
+                    presence={presenceByBlock.get(root.id) ?? EMPTY_PRESENCE}
+                    onCursor={onCursor}
                     onCommit={(text) =>
                       actions.updatePageBlockText({ blockId: root.id, text })
                     }
@@ -361,6 +536,61 @@ export function PagesView() {
                       else appendBlock();
                     }}
                   />
+
+                  <button
+                    type="button"
+                    aria-label="Comment on page"
+                    onClick={(event) => {
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      commentOnPage({ x: rect.right, y: rect.bottom });
+                    }}
+                    style={{
+                      all: "unset",
+                      cursor: "pointer",
+                      width: "100%",
+                      boxSizing: "border-box",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 9,
+                      padding: "0 0 12px",
+                      marginBottom: 22,
+                      borderBottom: `1px solid ${color.borderSoft}`,
+                      color: color.muted2,
+                      font: `400 13.5px ${font.sans}`,
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: 22,
+                        height: 22,
+                        borderRadius: "50%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        background: color.panel,
+                        color: color.muted3,
+                      }}
+                    >
+                      <Icon name="chat" size={12} strokeWidth={1.8} />
+                    </span>
+                    <span>
+                      {pageCommentCount > 0
+                        ? `${pageCommentCount} page comment${pageCommentCount === 1 ? "" : "s"}`
+                        : "Add a comment…"}
+                    </span>
+                    {pageCommentCount > 0 ? (
+                      <span
+                        style={{
+                          marginLeft: "auto",
+                          color: accentVar,
+                          font: `650 11px ${font.mono}`,
+                        }}
+                      >
+                        Open
+                      </span>
+                    ) : null}
+                  </button>
 
                   <Subpages
                     pages={state.pages}
@@ -377,7 +607,9 @@ export function PagesView() {
                       caret={focus?.id === row.block.id ? focus.caret : null}
                       expanded={!collapsed.has(row.block.id)}
                       op={state.ops[opKey.pageBlock(row.block.id)]}
-                      threadCount={threadsByTarget.get(row.block.id) ?? 0}
+                      threads={threadsByTarget.get(row.block.id) ?? EMPTY_THREADS}
+                      presence={presenceByBlock.get(row.block.id) ?? EMPTY_PRESENCE}
+                      onCursor={onCursor}
                       // the indicator only appears where the drop would ACTUALLY
                       // land: a drag into its own subtree is a cycle the module
                       // would reject, and must not be invited.
@@ -422,7 +654,9 @@ export function PagesView() {
                     }}
                   >
                     <Icon name="plus" size={13} strokeWidth={1.8} />
-                    {rows.length === 0 ? "Start writing — or press '/' for a block menu" : "Add a block"}
+                    {rows.length === 0
+                      ? "Start writing — or press '/' for the block menu"
+                      : "Click to add a block, or type '/'"}
                   </button>
                 </div>
               )}
@@ -440,21 +674,6 @@ export function PagesView() {
             </div>
           </div>
 
-          {panelOpen && root ? (
-            <CommentsPanel
-              threads={state.pageThreads}
-              authorNames={state.authorNames}
-              selfKey={selfKey}
-              composer={null}
-              onClose={() => setPanelOpen(false)}
-              onSubmitNew={(target, text) => actions.addComment({ target, text })}
-              onCancelNew={() => {}}
-              onReply={replyToThread}
-              onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
-              onEdit={(commentId, text) => actions.editComment({ commentId, text })}
-              onDelete={(commentId) => actions.deleteComment(commentId)}
-            />
-          ) : null}
         </div>
       </main>
       {commentCard ? (
@@ -462,13 +681,19 @@ export function PagesView() {
           target={commentCard.target}
           label={commentCard.label}
           anchor={commentCard.anchor}
+          selection={commentCard.range}
+          targetText={blocks.find((block) => block.id === commentCard.target)?.text ?? ""}
           threads={
             state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? []
           }
           authorNames={state.authorNames}
           selfKey={selfKey}
+          selfName={selfName}
+          ops={state.ops}
           onClose={() => setCommentCard(null)}
-          onSubmitNew={(target, text) => actions.addComment({ target, text })}
+          onSubmitNew={(target, text, range) =>
+            actions.addComment({ target, text, ...(range ? { anchor: range } : {}) })
+          }
           onReply={replyToThread}
           onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
           onEdit={(commentId, text) => actions.editComment({ commentId, text })}
@@ -494,12 +719,14 @@ export function PagesView() {
           confirmLabel="Delete block"
           onCancel={() => setPendingBlockDelete(null)}
           onConfirm={() => {
+            // Snapshot for Undo before the subtree is gone (empty if too big).
+            noteDeleted(subtreePlan(blocks, pendingBlockDelete));
             actions.removePageBlock(pendingBlockDelete);
             setPendingBlockDelete(null);
           }}
         >
           It has {pendingBlockChildren} nested block{pendingBlockChildren === 1 ? "" : "s"}, which
-          go with it. There is no undo.
+          go with it.
         </ConfirmDialog>
       )}
     </div>

@@ -5,7 +5,7 @@
 // since they're just two separate component instances).
 
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
+import type { ClipboardEvent, CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import type { PageMeta } from "../../../domain/pages-client";
 import { Icon } from "../../components/Icon";
@@ -21,6 +21,8 @@ import {
   mentionTokenAt,
 } from "./mention";
 import { insertPageRef, pageRefCandidates, pageRefTokenAt } from "./page-ref";
+import { MAX_ATTACHMENT_BYTES, uploadAttachment } from "./attachments";
+import { fileRefMarkdown } from "./duck-ref";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
@@ -158,7 +160,11 @@ export function Composer({
   const pickPage = (pageId: string) => {
     if (!pageToken) return;
     const el = ref.current;
-    const next = insertPageRef(value, pageToken, el?.selectionStart ?? caret, pageId);
+    const title = pages.find((p) => p.id === pageId)?.title ?? pageId;
+    const next = insertPageRef(value, pageToken, el?.selectionStart ?? caret, {
+      id: pageId,
+      title,
+    });
     pendingSelection.current = [next.caret, next.caret];
     setCaret(next.caret);
     setPageIndex(0);
@@ -261,6 +267,71 @@ export function Composer({
     onChange(before + inserted + after);
   };
 
+  // ── pasted attachments ──
+  // A paste whose clipboard carries FILES uploads them into duckfs and
+  // inserts a markdown ref (`![name](duck://files/…)` image / `[name](…)`
+  // file); a plain text paste is untouched. The upload is async, so the ref
+  // is APPENDED to the draft as it stands at resolve time (the caret may have
+  // moved mid-upload; appending never
+  // clobbers typing). `valueRef` mirrors the controlled prop for that.
+  const [attaching, setAttaching] = useState<string[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
+  const attachFiles = async (files: File[]) => {
+    const transport = store?.transport;
+    if (!transport) {
+      setAttachError("attachments need a connected node");
+      return;
+    }
+    setAttachError(null);
+    for (const file of files) {
+      const name = file.name || "pasted-image.png";
+      // size-gate BEFORE reading the whole blob into memory (a huge paste
+      // shouldn't allocate then reject).
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setAttachError(
+          `${name} exceeds ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))} MiB`,
+        );
+        continue;
+      }
+      setAttaching((prev) => [...prev, name]);
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const uploaded = await uploadAttachment(transport, {
+          name,
+          type: file.type,
+          bytes,
+        });
+        // images embed (`![]`, inline preview); other files link (`[]`,
+        // download chip). The composer appends the markdown to whatever the
+        // draft holds NOW (the caret may have moved during the async upload).
+        const ref = fileRefMarkdown(uploaded.path, uploaded.name, uploaded.isImage);
+        const current = valueRef.current;
+        const sep = current === "" || /\s$/.test(current) ? "" : " ";
+        const next = `${current}${sep}${ref} `;
+        pendingSelection.current = [next.length, next.length];
+        setCaret(next.length);
+        onChange(next);
+      } catch (err) {
+        setAttachError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAttaching((prev) => {
+          const at = prev.indexOf(name);
+          return at === -1 ? prev : [...prev.slice(0, at), ...prev.slice(at + 1)];
+        });
+      }
+    }
+  };
+
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData?.files ?? []);
+    if (files.length === 0) return; // text pastes stay native
+    event.preventDefault();
+    void attachFiles(files);
+  };
+
   const canSend = value.trim().length > 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -340,8 +411,15 @@ export function Composer({
             rows={1}
             value={value}
             onChange={(event) => handleChange(event.target.value, event.target.selectionStart)}
-            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onSelect={(event) => {
+              // React's select plugin re-fires during a pick's own keydown with
+              // the pre-insert caret; while a programmatic restore is pending,
+              // selection reports describe the past (see use-mention-menu).
+              if (pendingSelection.current) return;
+              setCaret(event.currentTarget.selectionStart);
+            }}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             placeholder={placeholder}
@@ -350,7 +428,7 @@ export function Composer({
               minWidth: 0,
               resize: "none",
               display: "block",
-              font: `400 13.5px ${font.sans}`,
+              font: `400 15px ${font.sans}`,
               color: color.ink,
               lineHeight: 1.5,
               padding: 0,
@@ -388,7 +466,15 @@ export function Composer({
                 whiteSpace: "nowrap",
               }}
             >
-              <b style={{ fontWeight: 600, color: color.muted }}>Enter</b> to send
+              {attaching.length > 0 ? (
+                <>uploading {attaching[0]}…</>
+              ) : attachError ? (
+                <span style={{ color: color.danger }}>{attachError}</span>
+              ) : (
+                <>
+                  <b style={{ fontWeight: 600, color: color.muted }}>Enter</b> to send
+                </>
+              )}
             </span>
           </div>
           <button

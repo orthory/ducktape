@@ -32,7 +32,10 @@ const MENTION_TOKEN = /@([a-z0-9._-]+)/g;
 // its AuthorRef. Marked spans (bold/link/…) pass through untouched — a
 // mention nested in bold isn't a supported composition, and unknown @tokens
 // stay plain text by simply not splitting on them.
-const splitMentions = (span: Span, resolver: MentionResolver): Span[] => {
+// Exported for the pages comment renderer: comments store PLAIN text, so their
+// @mentions are re-derived at render time — through this same grammar, so a
+// handle highlights exactly when the submit path would have resolved it.
+export const splitMentions = (span: Span, resolver: MentionResolver): Span[] => {
   if (span.marks.length > 0) return [span];
   const out: Span[] = [];
   let last = 0;

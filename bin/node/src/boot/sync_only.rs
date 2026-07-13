@@ -28,13 +28,14 @@ pub(crate) async fn run(
     >,
     mut oracle: discovery::Oracle<ed25519::PublicKey>,
     quota: Quota,
+    signer: &ed25519::PrivateKey,
     mesh_participants: Set<ed25519::PublicKey>,
     sync_sources: Vec<ed25519::PublicKey>,
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
     identity_chain_id: String,
     blobs: noded::blobs::BlobHandle,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
     // no consensus coordinates yet: track the genesis mesh at the
     // base index. validators ignore this index if they have rotated
@@ -103,13 +104,18 @@ pub(crate) async fn run(
     }
     // rotate across every validator that can serve — the payloads
     // verify against consensus roots, so source choice is pure
-    // availability.
+    // availability. carry this node's real-key standing proof (ADR §5.1):
+    // a sync-only node WITH committed standing (a resident observing) is
+    // served; a standing-less observer is now refused, by design.
+    let (sync_requester, sync_proof) = statesync::sign_sync_proof(signer, &namespace);
     let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
         sync_sources.clone(),
         None,
+        sync_requester,
+        sync_proof,
     );
 
     // the mesh takes a moment to connect, and the server only serves

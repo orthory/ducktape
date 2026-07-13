@@ -194,16 +194,36 @@ export function TagFilterBar() {
   );
 }
 
-function TagHitRow({ hit, names }: { hit: ChatSearchHit; names: Record<string, string> }) {
+function TagHitRow({
+  hit,
+  names,
+  onOpen,
+}: {
+  hit: ChatSearchHit;
+  names: Record<string, string>;
+  onOpen: () => void;
+}) {
   const when = dateTimeOf(hit.time);
+  const [hover, setHover] = useState(false);
   return (
-    <div
+    <button
+      type="button"
+      onClick={onOpen}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         display: "flex",
         flexDirection: "column",
+        alignItems: "stretch",
         gap: 2,
+        width: "100%",
         padding: "8px 10px",
+        border: "none",
         borderRadius: radius.sm,
+        background: hover ? color.hover : "transparent",
+        textAlign: "left",
+        font: "inherit",
+        cursor: "pointer",
         minWidth: 0,
       }}
     >
@@ -224,14 +244,14 @@ function TagHitRow({ hit, names }: { hit: ChatSearchHit; names: Record<string, s
       >
         {hit.text}
       </span>
-    </div>
+    </button>
   );
 }
 
-/** The filtered pane: the active tag's hits (newest first, read-only rows),
- *  rendered in place of the live message stream. */
+/** The filtered pane: the active tag's hits (newest first), rendered in place of
+ *  the live message stream. Clicking a hit jumps to it in the channel. */
 export function TagHitList() {
-  const { state } = useDucktape();
+  const { state, actions } = useDucktape();
   const filter = state.tagFilter;
   if (!filter) return null;
   return (
@@ -255,7 +275,11 @@ export function TagHitList() {
       )}
       {state.tagHits.map((hit) => (
         <div key={`${hit.channelId}/${hit.seq}`} role="listitem" style={{ minWidth: 0 }}>
-          <TagHitRow hit={hit} names={state.authorNames} />
+          <TagHitRow
+            hit={hit}
+            names={state.authorNames}
+            onOpen={() => actions.focusMessage(hit.channelId, hit.seq)}
+          />
         </div>
       ))}
     </div>

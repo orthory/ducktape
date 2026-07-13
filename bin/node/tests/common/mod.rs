@@ -121,6 +121,21 @@ pub struct NetworkShapeCluster {
 }
 
 impl NetworkShapeCluster {
+    /// freeze (`SIGSTOP`) or thaw (`SIGCONT`) a running node — the closest a
+    /// test gets to a laptop sleeping mid-run: the process vanishes from the
+    /// scheduler while its kernel keeps its sockets ESTABLISHED, exactly the
+    /// silent half-open shape a slept machine leaves its peers holding.
+    pub fn signal(&self, idx: usize, signal: &str) {
+        let node = self.nodes[idx].as_ref().expect("node not running");
+        let pid = node.child.id();
+        let status = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{signal} {pid} failed");
+    }
+
     pub fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("network-shape tempdir");
         let ports = alloc_ports(6);
@@ -173,11 +188,33 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// mint (or reuse) the friend workspace's identity via the `keygen` verb
+    /// and return its pubkey hex — the JOIN CODE the invite locks to.
+    /// `join_friend` reuses this pre-generated identity.
+    pub fn keygen_friend(&self, _idx: usize) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+            .args(["keygen", "--dir"])
+            .arg(&self.friend_dir)
+            .output()
+            .expect("run keygen");
+        assert!(
+            out.status.success(),
+            "keygen failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// mint an invite LOCKED to the friend's key. Every invite is targeted now,
+    /// so this pre-generates the friend identity (which `join_friend` reuses)
+    /// and passes `--target`.
     pub fn invite(&self) -> String {
+        let target = self.keygen_friend(1);
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .args(["invite", "--config"])
             .arg(cfg)
+            .args(["--target", &target])
             .output()
             .expect("run invite");
         assert!(
@@ -219,8 +256,11 @@ impl NetworkShapeCluster {
             .expect("join-requests prints json")
     }
 
-    pub fn join_friend(&self, invite: &str) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    /// run the `join` verb against the friend workspace WITHOUT asserting
+    /// success — the caller inspects the outcome (a targeted invite refuses a
+    /// mismatched local identity at the CLI, before any node spawns).
+    pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .args([
                 "join",
                 invite,
@@ -236,7 +276,11 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.rpc_ports[1]),
             ])
             .output()
-            .expect("run join");
+            .expect("run join")
+    }
+
+    pub fn join_friend(&self, invite: &str) -> String {
+        let out = self.try_join_friend(invite);
         assert!(
             out.status.success(),
             "join failed:\n{}",
@@ -281,6 +325,12 @@ impl NetworkShapeCluster {
     /// kill node `idx`'s process (reaped by NodeProc's drop).
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None;
+    }
+
+    /// node `idx`'s captured stdout+stderr — for a failing test to preserve
+    /// evidence before the cluster tempdir (and the logs in it) is dropped.
+    pub fn log_path(&self, idx: usize) -> PathBuf {
+        self.nodes[idx].as_ref().expect("node not running").log.clone()
     }
 
     /// one json-lines rpc against node `idx` — the NetworkShapeCluster
@@ -392,6 +442,25 @@ impl NetworkShapeCluster {
                 );
             }
             std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// wait for node `idx` to exit ON ITS OWN (e.g. the fail-loud FATAL path)
+    /// and reap it — the [`Cluster::wait_exit`] mirror.
+    pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            if node.child.try_wait().expect("poll node").is_some() {
+                self.nodes[idx] = None;
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "network-shape node idx {idx} did not exit within {timeout:?};\n{}",
+                self.all_log_tails(40)
+            );
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 

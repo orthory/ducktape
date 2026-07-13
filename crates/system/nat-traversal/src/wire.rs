@@ -40,6 +40,35 @@ pub enum Msg {
     Punch {
         from: NodeKey,
     },
+    /// Publish a self-authenticating invite blob to the coordinator's shelf
+    /// under its content id. Authenticated self-op (`key` == caller).
+    InvitePut {
+        key: NodeKey,
+        id: [u8; INVITE_ID_LEN],
+        expires_unix_secs: u64,
+        blob: Vec<u8>,
+    },
+    /// The coordinator's answer to `InvitePut`. Node-directed.
+    InvitePutAck {
+        id: [u8; INVITE_ID_LEN],
+        ok: bool,
+    },
+    /// Fetch one chunk of a shelved blob. `pad` zero bytes trail the datagram
+    /// so the request is never smaller than the reply (anti-amplification).
+    InviteGet {
+        key: NodeKey,
+        id: [u8; INVITE_ID_LEN],
+        chunk: u16,
+        pad: u16,
+    },
+    /// One chunk of a shelved blob (`total` == 0 means unknown/expired id).
+    /// Node-directed.
+    InviteChunk {
+        id: [u8; INVITE_ID_LEN],
+        chunk: u16,
+        total: u16,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -56,6 +85,8 @@ pub enum WireError {
     BadCrypto,
     #[error("auth envelope inner is not a request")]
     NotARequest,
+    #[error("length field exceeds the protocol maximum")]
+    TooLarge,
 }
 
 const TAG_BIND_REQ: u8 = 1;
@@ -70,6 +101,24 @@ const TAG_PUNCH: u8 = 7;
 // old protocol decodes as BadTag here instead of aliasing a future message.
 const TAG_READVERTISE: u8 = 10;
 const TAG_AUTH_REQUEST: u8 = 11;
+// Short-invite shelf tags (PR2). 8/9 stay reserved (see above).
+const TAG_INVITE_PUT: u8 = 12;
+const TAG_INVITE_PUT_ACK: u8 = 13;
+const TAG_INVITE_GET: u8 = 14;
+const TAG_INVITE_CHUNK: u8 = 15;
+
+/// Short-invite wire numerology — the single source of truth (`invite_store`
+/// and the coordinator dispatch consume these).
+/// the id is a RANDOM, PoP-owner-owned lookup key (not a content hash) — 4
+/// bytes keeps the short URL tiny; integrity is the blob's envelope signature.
+pub const INVITE_ID_LEN: usize = 4;
+/// hard cap on a shelved raw blob.
+pub const INVITE_BLOB_MAX: usize = 8192;
+/// bytes carried per `InviteChunk`.
+pub const INVITE_CHUNK_BYTES: usize = 1000;
+/// minimum zero-pad on an `InviteGet` datagram: the request is at least this
+/// large, so a reply to a spoofed source never amplifies (reflection ≤ 1×).
+pub const INVITE_GET_PAD: u16 = 1024;
 
 fn put<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, bytes: &[u8]) {
     out.try_extend_from_slice(bytes)
@@ -128,6 +177,16 @@ impl<'a> Reader<'a> {
         b.copy_from_slice(s);
         Ok(u64::from_be_bytes(b))
     }
+    fn u16(&mut self) -> Result<u16, WireError> {
+        let s = self.take(2)?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+    fn invite_id(&mut self) -> Result<[u8; INVITE_ID_LEN], WireError> {
+        let s = self.take(INVITE_ID_LEN)?;
+        let mut id = [0u8; INVITE_ID_LEN];
+        id.copy_from_slice(s);
+        Ok(id)
+    }
     fn addr(&mut self) -> Result<SocketAddr, WireError> {
         let fam = self.take(1)?[0];
         let ip = match fam {
@@ -160,9 +219,12 @@ impl<'a> Reader<'a> {
 }
 
 impl Msg {
-    /// Largest encoded bare message. This fixed upper bound lets the hot UDP
-    /// loop encode replies on its stack instead of allocating per datagram.
-    pub const MAX_ENCODED_LEN: usize = 1 + 32 + 1 + 1 + 16 + 2;
+    /// Largest encoded bare message — an `InvitePut` carrying a full-size blob.
+    /// This fixed upper bound lets the hot UDP loop encode replies on its stack
+    /// instead of allocating per datagram. The largest REPLY the coordinator
+    /// ever sends is still small (an `InviteChunk`, ≤ 1023 B); the buffer is
+    /// sized for the largest inbound request an `AuthRequest` can wrap.
+    pub const MAX_ENCODED_LEN: usize = 1 + 32 + INVITE_ID_LEN + 8 + 2 + INVITE_BLOB_MAX;
 
     /// Encode into a stack-backed, fixed-capacity vector.
     pub fn encode_inline(&self) -> ArrayVec<u8, { Self::MAX_ENCODED_LEN }> {
@@ -221,6 +283,59 @@ impl Msg {
                 out.push(TAG_PUNCH);
                 put_key(out, from);
             }
+            Msg::InvitePut {
+                key,
+                id,
+                expires_unix_secs,
+                blob,
+            } => {
+                out.push(TAG_INVITE_PUT);
+                put_key(out, key);
+                put(out, id);
+                put_u64(out, *expires_unix_secs);
+                put(out, &(blob.len() as u16).to_be_bytes());
+                put(out, blob);
+            }
+            Msg::InvitePutAck { id, ok } => {
+                out.push(TAG_INVITE_PUT_ACK);
+                put(out, id);
+                out.push(u8::from(*ok));
+            }
+            Msg::InviteGet {
+                key,
+                id,
+                chunk,
+                pad,
+            } => {
+                out.push(TAG_INVITE_GET);
+                put_key(out, key);
+                put(out, id);
+                put(out, &chunk.to_be_bytes());
+                put(out, &pad.to_be_bytes());
+                // structural anti-amplification: trail `pad` zero bytes so the
+                // datagram is at least as large as any reply. A pad past the
+                // buffer capacity trips the same expect every other message does.
+                const ZERO: [u8; 256] = [0u8; 256];
+                let mut remaining = *pad as usize;
+                while remaining > 0 {
+                    let n = remaining.min(ZERO.len());
+                    put(out, &ZERO[..n]);
+                    remaining -= n;
+                }
+            }
+            Msg::InviteChunk {
+                id,
+                chunk,
+                total,
+                bytes,
+            } => {
+                out.push(TAG_INVITE_CHUNK);
+                put(out, id);
+                put(out, &chunk.to_be_bytes());
+                put(out, &total.to_be_bytes());
+                put(out, &(bytes.len() as u16).to_be_bytes());
+                put(out, bytes);
+            }
         }
     }
 
@@ -228,9 +343,11 @@ impl Msg {
     pub fn subject_key(&self) -> Option<NodeKey> {
         match self {
             Msg::BindRequest { from } => Some(*from),
-            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => {
-                Some(*key)
-            }
+            Msg::Register { key }
+            | Msg::Readvertise { key, .. }
+            | Msg::Lookup { key }
+            | Msg::InvitePut { key, .. }
+            | Msg::InviteGet { key, .. } => Some(*key),
             _ => None,
         }
     }
@@ -281,6 +398,58 @@ impl Msg {
                 peer_reflexive: r.addr()?,
             },
             TAG_PUNCH => Msg::Punch { from: r.key()? },
+            TAG_INVITE_PUT => {
+                let key = r.key()?;
+                let id = r.invite_id()?;
+                let expires_unix_secs = r.u64()?;
+                let blob_len = r.u16()? as usize;
+                if blob_len > INVITE_BLOB_MAX {
+                    return Err(WireError::TooLarge);
+                }
+                let blob = r.take(blob_len)?.to_vec();
+                Msg::InvitePut {
+                    key,
+                    id,
+                    expires_unix_secs,
+                    blob,
+                }
+            }
+            TAG_INVITE_PUT_ACK => {
+                let id = r.invite_id()?;
+                let ok = r.take(1)?[0] != 0;
+                Msg::InvitePutAck { id, ok }
+            }
+            TAG_INVITE_GET => {
+                let key = r.key()?;
+                let id = r.invite_id()?;
+                let chunk = r.u16()?;
+                let pad = r.u16()?;
+                // consume the pad zero bytes; only their SIZE matters (the
+                // anti-amplification property), never their content.
+                r.take(pad as usize)?;
+                Msg::InviteGet {
+                    key,
+                    id,
+                    chunk,
+                    pad,
+                }
+            }
+            TAG_INVITE_CHUNK => {
+                let id = r.invite_id()?;
+                let chunk = r.u16()?;
+                let total = r.u16()?;
+                let len = r.u16()? as usize;
+                if len > INVITE_CHUNK_BYTES {
+                    return Err(WireError::TooLarge);
+                }
+                let bytes = r.take(len)?.to_vec();
+                Msg::InviteChunk {
+                    id,
+                    chunk,
+                    total,
+                    bytes,
+                }
+            }
             other => return Err(WireError::BadTag(other)),
         };
         Ok(msg)
@@ -423,6 +592,28 @@ mod tests {
             Msg::Punch {
                 from: NodeKey([10u8; 32]),
             },
+            Msg::InvitePut {
+                key: NodeKey([11u8; 32]),
+                id: [0xcd; INVITE_ID_LEN],
+                expires_unix_secs: 1_800_000_000,
+                blob: vec![0xee; 1500],
+            },
+            Msg::InvitePutAck {
+                id: [0xcd; INVITE_ID_LEN],
+                ok: true,
+            },
+            Msg::InviteGet {
+                key: NodeKey([12u8; 32]),
+                id: [0xcd; INVITE_ID_LEN],
+                chunk: 3,
+                pad: INVITE_GET_PAD,
+            },
+            Msg::InviteChunk {
+                id: [0xcd; INVITE_ID_LEN],
+                chunk: 3,
+                total: 9,
+                bytes: vec![0xaa; INVITE_CHUNK_BYTES],
+            },
         ];
         for m in cases {
             let bytes = m.encode();
@@ -431,6 +622,34 @@ mod tests {
             let back = Msg::decode(&bytes).expect("decode");
             assert_eq!(m, back);
         }
+    }
+
+    #[test]
+    fn invite_put_rejects_an_oversized_blob_and_get_pads_the_datagram() {
+        // an InvitePut blob above INVITE_BLOB_MAX must not decode (buffer bound).
+        let mut big = Msg::InvitePut {
+            key: NodeKey([1u8; 32]),
+            id: [0; INVITE_ID_LEN],
+            expires_unix_secs: 0,
+            blob: vec![0; INVITE_BLOB_MAX],
+        }
+        .encode();
+        // grow the declared length past the cap by hand: tag(1)+key(32)+id(16)+expires(8) then len u16
+        let len_at = 1 + 32 + INVITE_ID_LEN + 8;
+        big[len_at..len_at + 2].copy_from_slice(&((INVITE_BLOB_MAX as u16) + 1).to_be_bytes());
+        big.push(0);
+        assert!(Msg::decode(&big).is_err());
+
+        // an InviteGet's encoded datagram is AT LEAST pad bytes long — the
+        // anti-amplification property is structural, not caller discipline.
+        let get = Msg::InviteGet {
+            key: NodeKey([2u8; 32]),
+            id: [7; INVITE_ID_LEN],
+            chunk: 0,
+            pad: INVITE_GET_PAD,
+        };
+        assert!(get.encode().len() >= INVITE_GET_PAD as usize);
+        assert_eq!(Msg::decode(&get.encode()).unwrap(), get);
     }
 
     #[test]
@@ -511,6 +730,18 @@ mod tests {
             },
             Msg::Lookup {
                 key: NodeKey([7u8; 32]),
+            },
+            Msg::InvitePut {
+                key: subject,
+                id: [0xcd; INVITE_ID_LEN],
+                expires_unix_secs: 1_800_000_000,
+                blob: vec![0xee; 1500],
+            },
+            Msg::InviteGet {
+                key: subject,
+                id: [0xcd; INVITE_ID_LEN],
+                chunk: 3,
+                pad: INVITE_GET_PAD,
             },
         ];
         for inner in inners {

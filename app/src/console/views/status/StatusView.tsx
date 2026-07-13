@@ -18,6 +18,7 @@ import {
   type NodeMetrics,
 } from "../../../domain/metrics";
 import { Icon } from "../../components/Icon";
+import { isClientMode } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import { useMetricsStream } from "../metrics/use-metrics-stream";
@@ -26,14 +27,12 @@ import { LogsTab } from "./LogsTab";
 import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
 import { NodeFactsCard } from "./NodeFactsCard";
 import { PeersTab } from "./PeersTab";
-import { SandboxTab } from "./SandboxTab";
 
-type TabId = "overview" | "peers" | "sandbox" | "permissions" | "logs";
+type TabId = "overview" | "peers" | "permissions" | "logs";
 
 const TABS: ReadonlyArray<readonly [TabId, string]> = [
   ["overview", "Overview"],
   ["peers", "Connections"],
-  ["sandbox", "Sandbox"],
   ["permissions", "Permissions"],
   ["logs", "Logs"],
 ];
@@ -81,12 +80,15 @@ const shortValue = (value: string | null | undefined, start = 12, end = 8): stri
 const numberValue = (value: number | null | undefined): string =>
   typeof value === "number" ? value.toLocaleString() : "—";
 
-function workspaceRole(workspace: {
-  name: string;
-  pubkey: string;
-  member: boolean;
-  founder: boolean;
-} | null) {
+function workspaceRole(
+  workspace: {
+    name: string;
+    pubkey: string;
+    member: boolean;
+    founder: boolean;
+  } | null,
+  clientMode = false,
+) {
   if (workspace?.founder) {
     return {
       id: "genesis",
@@ -113,6 +115,20 @@ function workspaceRole(workspace: {
       body:
         "This workspace is admitted as a member and runs a validator for the network.",
       validator: true,
+    } as const;
+  }
+  if (clientMode) {
+    return {
+      id: "client",
+      pill: "user · node",
+      title: "Remote user",
+      badge: "READ ONLY",
+      tint: tint(color.amber).text,
+      bg: tint(color.amber).bg,
+      border: tint(color.amber).border,
+      body:
+        "This user can inspect the connected node's committed state and metrics without node-operator controls.",
+      validator: false,
     } as const;
   }
   return {
@@ -221,8 +237,8 @@ function NodeHeader({
 }) {
   const { state, actions } = useDucktape();
   const status = state.status;
-  const role = workspaceRole(state.workspace);
-  const peer = shortValue(state.workspace?.pubkey, 12, 8);
+  const role = workspaceRole(state.workspace, isClientMode(state));
+  const peer = shortValue(state.workspace?.pubkey ?? status?.publicKey, 12, 8);
   const version = status?.version ? `v${status.version}` : "v—";
 
   return (
@@ -350,9 +366,9 @@ function CheckRow({ text, active }: { text: string; active: boolean }) {
 
 function AccessCard() {
   const { state } = useDucktape();
-  const role = workspaceRole(state.workspace);
+  const role = workspaceRole(state.workspace, isClientMode(state));
   const workspaceName = state.workspace?.name ?? "Remote node";
-  const peer = shortValue(state.workspace?.pubkey, 14, 8);
+  const peer = shortValue(state.workspace?.pubkey ?? state.status?.publicKey, 14, 8);
 
   return (
     <div
@@ -963,7 +979,7 @@ function HeaderCell({
 
 function PermissionsTab() {
   const { state } = useDucktape();
-  const role = workspaceRole(state.workspace);
+  const role = workspaceRole(state.workspace, isClientMode(state));
   const rows = permissionRows(state.managed);
   const validatorCount = state.members.length;
 
@@ -974,7 +990,7 @@ function PermissionsTab() {
           font: `400 12px ${font.sans}`,
           color: color.muted3,
           lineHeight: 1.55,
-          maxWidth: 680,
+          width: "100%",
         }}
       >
         This panel only distinguishes the roles this app can derive today: an
@@ -991,7 +1007,8 @@ function PermissionsTab() {
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
           overflow: "hidden",
-          maxWidth: 680,
+          width: "100%",
+          boxSizing: "border-box",
           background: color.paper,
         }}
       >
@@ -1011,7 +1028,10 @@ function PermissionsTab() {
             capability
           </div>
           <HeaderCell label="Validator" active={role.validator} />
-          <HeaderCell label="Guest client" active={!role.validator} />
+          <HeaderCell
+            label={role.id === "client" ? "Remote user" : "Guest client"}
+            active={!role.validator}
+          />
         </div>
 
         {rows.map((row) => (
@@ -1057,7 +1077,8 @@ function PermissionsTab() {
       <div
         style={{
           marginTop: 14,
-          maxWidth: 680,
+          width: "100%",
+          boxSizing: "border-box",
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
           padding: "15px 17px",
@@ -1151,8 +1172,6 @@ export function StatusView() {
       >
         {activeTab === "peers" ? (
           <PeersTab />
-        ) : activeTab === "sandbox" ? (
-          <SandboxTab />
         ) : activeTab === "permissions" ? (
           <PermissionsTab />
         ) : activeTab === "logs" ? (

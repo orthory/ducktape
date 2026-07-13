@@ -23,7 +23,7 @@ use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::reachability_plane::wire_reachability_plane;
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
-use crate::{blob_fetch, voice, voice_plane};
+use crate::{voice, voice_plane};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -52,7 +52,6 @@ pub(super) struct RuntimeWiring {
     pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
-    pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
     pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
@@ -80,7 +79,6 @@ pub(super) async fn finish(
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
-    blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
     mut mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
@@ -180,21 +178,6 @@ pub(super) async fn finish(
     // flood degrades to retries instead of unbounded memory.
     let (bridge_tx, sync_ingress) =
         futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-    // the blob fetch-on-miss lane (the #298 prompt-blob cross-node gap):
-    // the oracle pool's resolver asks current peers for a digest its own
-    // store lacks, over this same statesync channel. the pending map is
-    // the serve loop's demux — frames answering OUR fetches never enter
-    // the request path — and the peer set follows every cutover re-track
-    // beside the other planes' books.
-    let blob_pending: blob_fetch::PendingMap = Default::default();
-    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(
-            initial_member_keys
-                .iter()
-                .chain(initial_resident_keys.iter())
-                .cloned()
-                .collect(),
-        ));
     context.child("sync_ingress").spawn(move |_ctx| {
         let mut receiver = sync_rx;
         let mut bridge_tx = bridge_tx;
@@ -249,40 +232,93 @@ pub(super) async fn finish(
         let state_tx = sync_state_tx;
         let mut sync_tx = sync_tx;
         let mut ingress = sync_ingress;
-        let blob_pending = blob_pending.clone();
-        let sync_blobs = blobs.clone();
+        // the genesis namespace the standing proof is bound to (ADR §5.1).
+        let serve_namespace = namespace.clone();
         context
             .child("statesync_serve")
             .spawn(move |_ctx| async move {
                 let mut server = SyncServer::new();
                 while let Some((peer, bytes)) = ingress.next().await {
-                    // mesh frames ride an rpc envelope (multiplexed
-                    // channel — the id correlates).
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                    // mesh frames ride the AUTHENTICATED rpc envelope
+                    // (requester ‖ proof ‖ id ‖ body — the id correlates).
+                    let Ok((requester, proof, rpc_id, body)) =
+                        statesync::decode_rpc_authed(&bytes)
+                    else {
                         continue; // malformed rpc envelope: drop, never crash.
                     };
-                    // the mesh demux: OUR fetch answers are consumed,
-                    // stray responses (a blob answer landing after its
-                    // fan-out's sweep) and unparseable frames are
-                    // DROPPED — answering either is how two serve
-                    // loops bounce Error frames forever. only a real
-                    // request proceeds.
-                    let req = match blob_fetch::classify_mesh_frame(&blob_pending, rpc_id, body) {
-                        blob_fetch::MeshFrame::OurResponse
-                        | blob_fetch::MeshFrame::StrayResponse
-                        | blob_fetch::MeshFrame::Junk => continue,
-                        blob_fetch::MeshFrame::Request(req) => req,
+                    // FAIL-CLOSED (ADR §5.1). a transport-key standing gate is
+                    // IMPOSSIBLE at this seam: a pre-admission joiner and an
+                    // admitted resident share the derived LOBBY key on this
+                    // channel (boot/mesh.rs), so their peer identity is the
+                    // SAME. enforcement is a REQUEST-LEVEL real-key proof:
+                    //  (1) the proof must verify — the requester signed
+                    //      SYNC_AUTH_NAMESPACE over the genesis namespace with a
+                    //      key it holds. sound as a STATIC per-session proof: the
+                    //      mesh transport is authenticated+encrypted, so the
+                    //      proof is not wire-capturable, and a pre-admission
+                    //      joiner can only sign for its own non-standing key.
+                    //  (2) that key must be in COMMITTED standing (validators ∪
+                    //      residents), read fresh per request through the loop
+                    //      seam. a valid targeted invite alone yields no standing
+                    //      key ⇒ leaks ZERO chain state (R4). the restore path
+                    //      and validator backfill dial under their real keys —
+                    //      which ARE in the valset — so they still sync; an
+                    //      admitted resident's key enters residents at its Redeem
+                    //      block, so it syncs the instant it is admitted, still
+                    //      under the shared lobby transport key.
+                    // a failed check DROPS the request (deny-by-default, like the
+                    // malformed/non-request drops), never a reply.
+                    if !statesync::verify_sync_proof(requester, proof, &serve_namespace) {
+                        continue;
+                    }
+                    let requester = *requester;
+                    // only a decodable REQUEST proceeds. everything else —
+                    // a stray response, version skew, junk — is DROPPED,
+                    // never answered: answering non-requests is how two
+                    // serve loops bounce Error frames forever.
+                    let Ok(req) = statesync::decode_request(body) else {
+                        continue;
                     };
-                    let req_kind = req.kind_name();
-                    let resp = match req {
-                        // blob fetches are host state — answered from the
-                        // node-local store, never routed into SyncServer.
-                        statesync::SyncRequest::Blob { digest } => {
-                            blob_fetch::serve_blob(&sync_blobs, &digest)
+                    // the COMMITTED-standing check gates the STATE-BEARING lanes
+                    // (Manifest/Chunk/Module/Frames/Index*), fresh per request via
+                    // the loop-owned seam (a just-Redeemed resident is admitted
+                    // immediately; see SyncStateRequest::Standing). the TipCoords
+                    // DETECTION lane is EXEMPT: it carries coordinates (height,
+                    // app_hash, epoch, membership), never state bytes, and a node
+                    // that has LOST standing (a revoked resident) or awaits an
+                    // out-of-band grant needs it to detect its own transition — a
+                    // poll its own revocation would otherwise refuse, wedging it
+                    // forever (it never learns to fall back to a parked joiner).
+                    // the PoP above still gates it (only a real key-holder polls),
+                    // and every STATE lane stays refused, so ZERO chain state
+                    // crosses to a standing-less key.
+                    if !matches!(req, statesync::SyncRequest::TipCoords) {
+                        let (standing_tx, standing_rx) = tokio::sync::oneshot::channel();
+                        let mut probe = state_tx.clone();
+                        if futures::SinkExt::send(
+                            &mut probe,
+                            SyncStateRequest::Standing {
+                                requester,
+                                reply: standing_tx,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            continue; // state owner shutting down.
                         }
-                        req => drive_sync_request(&mut server, &state_tx, req).await,
-                    };
-                    let framed = statesync::encode_rpc(rpc_id, &statesync::encode_response(&resp));
+                        if !standing_rx.await.unwrap_or(false) {
+                            continue; // not in committed standing: refuse (drop).
+                        }
+                    }
+                    let req_kind = req.kind_name();
+                    let resp = drive_sync_request(&mut server, &state_tx, req).await;
+                    let framed = statesync::encode_rpc_authed(
+                        &[0u8; 32],
+                        &[0u8; 64],
+                        rpc_id,
+                        &statesync::encode_response(&resp),
+                    );
                     // the serve-lane observation (`ducktape_statesync_serve_*`):
                     // who pulled what, and the progression the response
                     // itself proves (served boundary / frame heights).
@@ -345,7 +381,6 @@ pub(super) async fn finish(
         mesh_oracle,
         channel_bank,
         gateway_book,
-        blob_peers,
         sync_state_rx,
         lobby_ingress,
         relay_ingress,
@@ -387,7 +422,7 @@ pub(super) async fn wire(
     wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
 ) -> PreWiring {
@@ -586,6 +621,8 @@ pub(super) async fn wire(
                     coordinators,
                     // members serve the invite intro: a fresh joiner's
                     // tunnel comes up against this listener before any p2p.
+                    // None when this config mints no direct intro endpoint —
+                    // coordinated intros ride the plane's shared socket.
                     invite_listen,
                     coord_cap.clone(),
                     reach_p2p_tx,

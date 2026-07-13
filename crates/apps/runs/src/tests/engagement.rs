@@ -13,6 +13,7 @@ fn pages_comment_mention_dispatches_without_a_chat_watch() {
             target: "b-p".into(),
             opener: pages::AuthorRef::User(vec![4; 32]),
             created_at: 1,
+            anchor: None,
             resolved: false,
             resolved_by: None,
             comment_ids: vec!["comment-1".into()],

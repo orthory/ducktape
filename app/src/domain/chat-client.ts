@@ -61,6 +61,13 @@ export interface Channel {
   pinned: number[];
   /** Live voice huddle roster, in join order. Empty/absent = no huddle. */
   huddle?: HuddleMember[];
+  /** The creating user's identity bytes (AuthorRef::User). null/absent for
+   *  module/system-minted channels and legacy records — only the owner may
+   *  rename/archive an owned channel; an owner-less one is open to any user. */
+  owner?: number[] | null;
+  /** Archived channels reject posts, reactions, and huddle joins (membership,
+   *  rename, and unarchive still work). Absent = false on legacy records. */
+  archived?: boolean;
 }
 
 export interface MessageHead {
@@ -180,6 +187,32 @@ export const createChannel = (
     params.origin,
   );
 
+/** Rename a channel. The module reuses CreateChannel's name validation and
+ *  gates on the channel owner (only the creator may rename an owned channel;
+ *  legacy owner-less channels admit any user). Authorship comes from `origin`. */
+export const renameChannel = (
+  transport: NodeTransport,
+  params: { channelId: string; name: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { rename_channel: { channel_id: params.channelId, name: params.name } },
+    params.origin,
+  );
+
+/** Archive or unarchive a channel. An archived channel rejects posts,
+ *  reactions, and huddle joins (membership/rename/unarchive still work). Owner-
+ *  gated like `renameChannel`; authorship comes from `origin`. */
+export const setChannelArchived = (
+  transport: NodeTransport,
+  params: { channelId: string; archived: boolean; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { set_channel_archived: { channel_id: params.channelId, archived: params.archived } },
+    params.origin,
+  );
+
 export const postMessage = (
   transport: NodeTransport,
   params: {
@@ -262,6 +295,24 @@ export const deleteMessage = (
     params.origin,
   );
 
+// ── Membership (members-only channel gate — who may post) ──
+
+/** Add or remove an external user from a channel's member set (SetMembership).
+ *  `user` is the AuthorRef::User bytes the module compares against (the node
+ *  pubkey on a networked node, the origin bytes on the embedded daemon — the
+ *  same bytes `selfAuthorBytes` derives). Only members may post in a
+ *  members_only channel; any non-empty origin may modify the set for now.
+ *  Authorship comes from `origin`. */
+export const setMembership = (
+  transport: NodeTransport,
+  params: { channelId: string; user: number[]; member: boolean; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { set_membership: { channel_id: params.channelId, user: params.user, member: params.member } },
+    params.origin,
+  );
+
 // ── Huddle (voice roster ops — consensus membership, not the audio) ──
 
 /** Join a channel's voice huddle. `node` is THIS node's 32-byte ed25519 mesh
@@ -322,6 +373,26 @@ export const latestMessages = (
     )
     .then((reply) => replyVariant<MessageView[]>(reply, "messages"));
 
+/** The window of messages centered on `seq` — the jump-to-message read for a
+ *  hit older than the newest-`MAX_QUERY_LIMIT` tail `latestMessages` returns.
+ *  The node clamps both ends to the channel's live range (a window at the head
+ *  is short — nothing exists past it) and the limit to MAX_QUERY_LIMIT.
+ *  REJECTED by a node too old to know the query variant: callers must fall back
+ *  to the tail rather than leave the reader nowhere. */
+export const messagesAround = (
+  transport: NodeTransport,
+  channelId: string,
+  seq: number,
+  limit: number = MAX_QUERY_LIMIT,
+): Promise<MessageView[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.query(TARGET, {
+        messages_around: { channel_id: channelId, seq, limit },
+      }),
+    )
+    .then((reply) => replyVariant<MessageView[]>(reply, "messages"));
+
 export const thread = (
   transport: NodeTransport,
   params: { channelId: string; rootSeq: number },
@@ -338,6 +409,16 @@ export const thread = (
       }),
     )
     .then((reply) => replyVariant<ChatThread | null>(reply, "thread"));
+
+/** The channel's member set — the User-author key bytes SetMembership added.
+ *  Empty in an open channel (membership is only consulted for members_only). */
+export const channelMembers = (
+  transport: NodeTransport,
+  channelId: string,
+): Promise<number[][]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { members: { channel_id: channelId } }))
+    .then((reply) => replyVariant<number[][]>(reply, "members"));
 
 // ── Materialized view (the module's derived-index endpoint) ──
 

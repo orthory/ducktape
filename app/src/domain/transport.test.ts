@@ -82,6 +82,42 @@ describe("remoteTransport", () => {
     });
   });
 
+  it("routes submit through the user signer to POST /v1/submit/frame when signPayload is set", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, { height: 7, appHash: "cd".repeat(32) }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const signPayload = vi.fn(async (_t: string, _hex: string) => "ab".repeat(60)); // fake frame hex
+
+    const transport = remoteTransport("http://node.example:8844", { signPayload });
+    const payload = { send: { channel_id: "general", body: "hi" } };
+    const block = await transport.submit("chat", payload);
+
+    expect(block).toEqual({ height: 7, appHash: "cd".repeat(32) });
+    // the user signer was called with the target and the JSON.stringify'd payload as hex…
+    const expectedHex = Array.from(new TextEncoder().encode(JSON.stringify(payload)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    expect(signPayload).toHaveBeenCalledWith("chat", expectedHex);
+    // …and the raw frame bytes went to the authenticated frame lane, not the frameless one.
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://node.example:8844/v1/submit/frame");
+    expect(init.headers["content-type"]).toBe("application/octet-stream");
+    expect(init.body).toBeInstanceOf(Uint8Array);
+  });
+
+  it("fails loud (no frameless fallback) when the remote user identity is locked", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const signPayload = vi.fn(async () => {
+      throw "identity-locked";
+    });
+    const transport = remoteTransport("http://node.example:8844", { signPayload });
+    await expect(transport.submit("chat", {})).rejects.toThrow(/unlock your identity/);
+    // it did NOT fall back to the frameless lane.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("surfaces the daemon's error body as the thrown message", async () => {
     vi.stubGlobal(
       "fetch",
@@ -106,6 +142,22 @@ describe("remoteTransport", () => {
     await expect(transport.query("tasks", "list")).resolves.toEqual({
       tasks: [],
     });
+  });
+
+  it("builds an encoded raw-object URL for native file downloads", () => {
+    const transport = remoteTransport("http://node.example:8844/");
+    expect(
+      transport.filesObjectUrl?.({
+        path: "/shared/design notes/a#1.md",
+        snapshot: "ab".repeat(32),
+        size: 1024,
+      }),
+    ).toBe(
+      `http://node.example:8844/v1/files/object/shared/design%20notes/a%231.md?snapshot=${"ab".repeat(32)}`,
+    );
+    expect(
+      transport.filesObjectUrl?.({ path: "/shared/archive.bin", size: 64 * 1024 * 1024 + 1 }),
+    ).toBeUndefined();
   });
 
   it("fetches GET /v1/status including the daemon version", async () => {

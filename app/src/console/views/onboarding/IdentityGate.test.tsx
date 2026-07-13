@@ -1172,6 +1172,34 @@ describe("identity gate — unlock with Touch ID", () => {
     expect(screen.queryByTestId("console")).toBeNull();
   });
 
+  it("a canceled OS prompt is quiet — no error, the button is re-armed", async () => {
+    markTauri();
+    touchidAvailableMock.mockResolvedValue(true);
+    identityStateMock.mockResolvedValue({
+      state: "locked",
+      pubkey: "ab12",
+      mnemonicConfirmed: true,
+    });
+    touchidUnlockMock.mockRejectedValue(new Error("touchid-canceled"));
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Unlock your account");
+    await act(async () => {
+      fireEvent.click(await screen.findByText("Unlock with Touch ID"));
+    });
+
+    // Dismissing the sheet is a user choice, not a failure: still locked, no
+    // error text, and the Touch ID button is back for a retry.
+    expect(screen.queryByText(/unavailable|canceled/i)).toBeNull();
+    expect(screen.queryByTestId("console")).toBeNull();
+    expect(await screen.findByText("Unlock with Touch ID")).toBeEnabled();
+  });
+
   it("no Touch ID button when the shim reports unavailable", async () => {
     markTauri();
     touchidAvailableMock.mockResolvedValue(false);

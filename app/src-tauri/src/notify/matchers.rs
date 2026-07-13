@@ -29,6 +29,10 @@ pub struct Notification {
     /// Channel used for focus suppression and mute filtering. Runs, forge, and
     /// governance notifications have no channel and use `None`.
     pub channel_id: Option<String>,
+    /// The posted message that caused a Chat mention/reply. Kept separately
+    /// from the hidden Forge discussion channel so the UI can focus the public
+    /// item's matching discussion row.
+    pub message_id: Option<String>,
 }
 
 pub struct MatcherCtx<'a> {
@@ -51,11 +55,46 @@ pub fn match_topic(
 ) -> Option<Notification> {
     match topic {
         "module:chat" => match_chat(op, ctx, state),
+        "module:pages" => match_pages(op, ctx),
         "module:runs" => match_run(op),
         "module:forge" => match_forge(op),
         "module:governance" => match_governance(op),
         _ => None,
     }
+}
+
+fn match_pages(op: &OpRow, ctx: &MatcherCtx<'_>) -> Option<Notification> {
+    if op.origin.kind != OriginKind::External {
+        return None;
+    }
+    let author = op.origin.id.as_deref()?;
+    if is_me(ctx, author) {
+        return None;
+    }
+
+    let payload = op.payload.as_ref()?;
+    let comment = decode::variant(payload, "add_comment")
+        .or_else(|| decode::variant(payload, "edit_comment"))?;
+    let my_user = ctx.self_user_key_hex?;
+    let mentioned = comment.get("mentions")?.as_array()?.iter().any(|mention| {
+        mention
+            .get("user")
+            .and_then(decode::bytes_hex)
+            .is_some_and(|user| user.eq_ignore_ascii_case(my_user))
+    });
+    mentioned.then(|| Notification {
+        category: Category::Mention,
+        title: format!("{} mentioned you in Pages", display_name(ctx, author)),
+        body: truncate(
+            comment
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            140,
+        ),
+        channel_id: None,
+        message_id: None,
+    })
 }
 
 fn match_chat(op: &OpRow, ctx: &MatcherCtx<'_>, state: &mut MatchState) -> Option<Notification> {
@@ -90,6 +129,7 @@ fn match_message(
     }
 
     let channel = message.get("channel_id")?.as_str()?;
+    let message_id = message.get("message_id")?.as_str()?;
     let blocks = message.get("blocks")?;
     blocks.as_array()?;
     let thread = match message.get("thread")? {
@@ -109,6 +149,7 @@ fn match_message(
             format!("{name} mentioned you in #{channel}"),
             decode::blocks_preview(blocks, 140),
             channel,
+            Some(message_id),
         ));
     }
 
@@ -123,6 +164,7 @@ fn match_message(
         format!("{name} replied to your thread in #{channel}"),
         decode::blocks_preview(blocks, 140),
         channel,
+        Some(message_id),
     ))
 }
 
@@ -151,6 +193,7 @@ fn match_run(op: &OpRow) -> Option<Notification> {
         title: title.to_string(),
         body,
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -167,6 +210,7 @@ fn match_forge(op: &OpRow) -> Option<Notification> {
         title: format!("PR #{number} merged in {repo}"),
         body: String::new(),
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -186,6 +230,7 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
             title: "New admission proposal".to_string(),
             body: format!("proposal {proposal_id}"),
             channel_id: None,
+            message_id: None,
         });
     }
 
@@ -196,6 +241,7 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
         title: "New member admitted".to_string(),
         body: format!("{} joined via invite", short_hex(&joiner)),
         channel_id: None,
+        message_id: None,
     })
 }
 
@@ -225,12 +271,14 @@ pub(super) fn chat_notification(
     title: String,
     body: String,
     channel: &str,
+    message_id: Option<&str>,
 ) -> Notification {
     Notification {
         category,
         title,
         body,
         channel_id: Some(channel.to_string()),
+        message_id: message_id.map(str::to_string),
     }
 }
 
@@ -338,6 +386,7 @@ mod tests {
         assert_eq!(notification.category, Category::Mention);
         assert_eq!(notification.title, "Casey mentioned you in #general");
         assert_eq!(notification.body, "hello");
+        assert_eq!(notification.message_id.as_deref(), Some("m1"));
 
         let own = op(
             OriginKind::External,
@@ -373,6 +422,58 @@ mod tests {
         assert_eq!(
             with_root(&both, Some("aaaa")).unwrap().category,
             Category::Mention
+        );
+    }
+
+    #[test]
+    fn matches_structured_pages_user_mentions_from_other_people_only() {
+        let ctx = ctx(&no_root);
+        let mention = op(
+            OriginKind::External,
+            "cccc",
+            json!({
+                "add_comment": {
+                    "thread_id": "t1",
+                    "comment_id": "c1",
+                    "target": "page-1",
+                    "text": "please review this",
+                    "mentions": [{ "user": [18, 52] }]
+                }
+            }),
+        );
+        let notification = once("module:pages", &mention, &ctx).unwrap();
+        assert_eq!(notification.category, Category::Mention);
+        assert_eq!(notification.title, "Casey mentioned you in Pages");
+        assert_eq!(notification.body, "please review this");
+        assert_eq!(notification.message_id, None);
+
+        let own = op(
+            OriginKind::External,
+            "AAAA",
+            mention.payload.clone().unwrap(),
+        );
+        assert!(once("module:pages", &own, &ctx).is_none());
+        let agent_only = op(
+            OriginKind::External,
+            "cccc",
+            json!({ "add_comment": { "text": "hi", "mentions": [{ "agent": { "module": "runs", "agent_id": "bot" } }] } }),
+        );
+        assert!(once("module:pages", &agent_only, &ctx).is_none());
+
+        let edit = op(
+            OriginKind::External,
+            "cccc",
+            json!({
+                "edit_comment": {
+                    "comment_id": "c1",
+                    "text": "adding you now",
+                    "mentions": [{ "user": [18, 52] }]
+                }
+            }),
+        );
+        assert_eq!(
+            once("module:pages", &edit, &ctx).unwrap().body,
+            "adding you now"
         );
     }
 
@@ -516,6 +617,6 @@ mod tests {
     #[test]
     fn ignores_unknown_topics() {
         let row = op(OriginKind::External, "cccc", json!({}));
-        assert!(once("module:pages", &row, &ctx(&no_root)).is_none());
+        assert!(once("module:unknown", &row, &ctx(&no_root)).is_none());
     }
 }

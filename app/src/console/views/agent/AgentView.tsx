@@ -230,10 +230,14 @@ export function AgentView() {
           />
 
           <main style={{ flex: 1, minWidth: 0, minHeight: 0, overflowY: "auto", padding: 22 }}>
-            <div style={{ maxWidth: 640, margin: "0 auto" }}>
+            <div data-agent-content="full-width" style={{ width: "100%" }}>
               {adding ? (
                 <RegisterAgentForm
                   capabilities={state.capabilities}
+                  capabilitiesStatus={state.capabilitiesStatus}
+                  onRetryCapabilities={
+                    state.connected ? actions.refreshCapabilities : undefined
+                  }
                   onRegister={actions.registerAgent}
                   onDone={() => setAdding(false)}
                 />
@@ -241,6 +245,7 @@ export function AgentView() {
                 <AgentDetail
                   agent={selectedAgent}
                   capabilities={state.capabilities}
+                  capabilitiesStatus={state.capabilitiesStatus}
                   onPause={actions.pauseAgent}
                   onResume={actions.resumeAgent}
                   onUpdate={actions.updateAgent}
@@ -255,7 +260,7 @@ export function AgentView() {
         </div>
       ) : tab === "auto-reply" ? (
         <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 22 }}>
-          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+          <div data-agent-content="full-width" style={{ width: "100%" }}>
             <WatchesPanel
               channels={state.channels}
               agents={state.agents}
@@ -268,7 +273,7 @@ export function AgentView() {
         </main>
       ) : (
         <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 22 }}>
-          <div style={{ maxWidth: 720, margin: "0 auto" }}>
+          <div data-agent-content="full-width" style={{ width: "100%" }}>
             <JobsWorkerRow
               on={jobWorkerOn}
               op={state.ops[opKey.jobWorker()]}

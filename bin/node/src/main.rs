@@ -53,7 +53,6 @@ use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
 mod agent_plane;
-mod blob_fetch;
 mod boot;
 mod cli;
 mod cli_flags;
@@ -121,6 +120,8 @@ use sdk::{Msg, StateRoot};
 
 fn main() {
     resource_limits::raise_open_file_limit();
+    #[cfg(target_os = "macos")]
+    hold_macos_activity();
     // Convert any terminal error into the same stable `FATAL:` marker the node
     // already prints for its other fatal paths (recovery, admission, promotion),
     // plus a non-zero exit. This closes the run-path boot failures (bind
@@ -132,6 +133,26 @@ fn main() {
         eprintln!("FATAL: {err}");
         std::process::exit(1);
     }
+}
+
+/// macOS: opt this process out of App Nap for its whole life. the desktop
+/// shell spawns the node detached but the child stays in the app's darwin
+/// coalition, and the app hides to the menu bar with zero visible windows —
+/// exactly the state macOS answers with timer coalescing and I/O throttling.
+/// a 1s-block consensus follower cannot survive either. the option set
+/// deliberately ALLOWS idle system sleep (a node must never turn a laptop
+/// into a space heater); `LatencyCritical` additionally asks for full timer
+/// precision. the returned token re-enables the nap when it deallocates, so
+/// it is forgotten, never dropped.
+#[cfg(target_os = "macos")]
+fn hold_macos_activity() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+            | NSActivityOptions::LatencyCritical,
+        &NSString::from_str("ducktape-node follows 1s consensus blocks"),
+    );
+    std::mem::forget(token);
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -333,7 +354,11 @@ fn run_node(
     // which is out of <storage>; the pre-existing non-portable D7 gap is a
     // separate, migration-aware hardening (tracked as a follow-up).
     let agent_dirs = capability_host::AgentDirs::under(&storage);
-    let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
+    // 15s instead of commonware's 60s default: this read/write deadline is
+    // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
+    let rt_cfg = commonware_runtime::tokio::Config::default()
+        .with_storage_directory(storage)
+        .with_read_write_timeout(constants::MESH_IO_TIMEOUT);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     // the seam's stack handle (socket mode): one slot for the process,
@@ -390,6 +415,7 @@ fn run_node(
                 network,
                 oracle,
                 quota,
+                &signer,
                 mesh_participants,
                 sync_sources,
                 storage_for_sync,

@@ -11,7 +11,15 @@
 import { keyHex } from "../../domain/chat-client";
 import type { ChatBlock, HuddleMember, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import type { PageBlock } from "../../domain/pages-client";
+import type {
+  Comment,
+  InlineMark,
+  PageBlock,
+  RelativeAnchor,
+  TargetThreads,
+  ThreadView,
+} from "../../domain/pages-client";
+import { applySpanMark, rebaseMarks, rebaseRange } from "../../domain/pages-ranges";
 import type { ConsoleState } from "./state";
 
 // ── Chat ────────────────────────────────────────────────
@@ -176,6 +184,44 @@ export const channelCreated = (
           },
         ],
       };
+
+/** Rename a channel in place so the rail and header update before the block
+ *  lands; the refresh reconciles with committed state after. */
+export const channelRenamed = (
+  prev: ConsoleState,
+  params: { channelId: string; name: string },
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === params.channelId ? { ...c, name: params.name } : c,
+  ),
+});
+
+/** Flip a channel's archived flag optimistically — the rail hides archived
+ *  channels, so this drops it from (or restores it to) the list instantly. */
+export const channelArchivedSet = (
+  prev: ConsoleState,
+  params: { channelId: string; archived: boolean },
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === params.channelId ? { ...c, archived: params.archived } : c,
+  ),
+});
+
+/** Add/remove one channel member the instant the SetMembership op is submitted,
+ *  so the member row (and its finalization mark) exists before the block lands —
+ *  without it the mark has no row to render on until the post-settle refetch.
+ *  Idempotent on the target's key hex: a double click re-projects the same row
+ *  rather than a duplicate (the module's stage_membership no-ops the same way).
+ *  refreshChannelMembers reconciles the set to committed truth after. */
+export const channelMembershipSet = (
+  prev: ConsoleState,
+  params: { channelId: string; user: number[]; member: boolean },
+): Partial<ConsoleState> => {
+  if (prev.activeChannel !== params.channelId) return {};
+  const hex = keyHex(params.user);
+  const others = prev.channelMembers.filter((bytes) => keyHex(bytes) !== hex);
+  return { channelMembers: params.member ? [...others, params.user] : others };
+};
 
 /** Add ourselves to a channel's huddle roster the instant we join, so the pill
  *  and dock react before the block lands. Idempotent on our node key; the
@@ -354,14 +400,36 @@ export const pageBlockMoved = (
 export const pageBlockPatched = (
   prev: ConsoleState,
   blockId: string,
-  patch: Partial<Pick<PageBlock, "text" | "kind" | "checked">>,
+  patch: Partial<Pick<PageBlock, "text" | "marks" | "kind" | "checked">>,
 ): Partial<ConsoleState> => {
   const target = prev.activePageBlocks.find((b) => b.id === blockId);
+  const nextPatch =
+    target && typeof patch.text === "string" && patch.marks === undefined
+      ? { ...patch, marks: rebaseMarks(target.text, patch.text, target.marks) }
+      : patch;
   const out: Partial<ConsoleState> = {
     activePageBlocks: prev.activePageBlocks.map((b) =>
-      b.id === blockId ? { ...b, ...patch } : b,
+      b.id === blockId ? { ...b, ...nextPatch } : b,
     ),
   };
+  if (target && typeof patch.text === "string") {
+    out.pageThreads = prev.pageThreads.map((group) =>
+      group.target !== blockId
+        ? group
+        : {
+            ...group,
+            threads: group.threads.map((view) => ({
+              ...view,
+              thread: view.thread.anchor
+                ? {
+                    ...view.thread,
+                    anchor: rebaseRange(target.text, patch.text as string, view.thread.anchor),
+                  }
+                : view.thread,
+            })),
+          },
+    );
+  }
   if (target && target.parent === null && typeof patch.text === "string") {
     out.pages = prev.pages.map((p) =>
       p.id === target.id ? { ...p, title: patch.text as string } : p,
@@ -369,6 +437,20 @@ export const pageBlockPatched = (
   }
   return out;
 };
+
+export const pageSpanMarked = (
+  prev: ConsoleState,
+  blockId: string,
+  range: RelativeAnchor,
+  kind: InlineMark,
+  active: boolean,
+): Partial<ConsoleState> => ({
+  activePageBlocks: prev.activePageBlocks.map((block) =>
+    block.id === blockId
+      ? { ...block, marks: applySpanMark(block.marks, range, kind, active) }
+      : block,
+  ),
+});
 
 export const pageBlockRemoved = (
   prev: ConsoleState,
@@ -385,6 +467,187 @@ export const pageBlockRemoved = (
       ),
   };
 };
+
+// ── Page comments ───────────────────────────────────────
+//
+// Comment views live in `pageThreads`, grouped by target. The module's
+// committed shapes these projections mirror: authorship derives from the
+// submit origin (so `authorBytes` is the committed self identity, same as
+// chat's postedMessage), `created_at` is the node's consensus_time (local
+// millis here, same as postedMessage — see domain/wire.ts), a delete
+// tombstones the comment and REMOVES the whole thread when no live comment
+// remains, and the query never returns tombstoned comments.
+
+/** Map the thread with `threadId` wherever its group holds it. */
+const mapThreadView = (
+  groups: TargetThreads[],
+  threadId: string,
+  fn: (view: ThreadView) => ThreadView,
+): TargetThreads[] =>
+  groups.map((group) => ({
+    ...group,
+    threads: group.threads.map((view) => (view.thread.id === threadId ? fn(view) : view)),
+  }));
+
+export const commentAdded = (
+  prev: ConsoleState,
+  params: {
+    threadId: string;
+    commentId: string;
+    target: string;
+    text: string;
+    anchor?: RelativeAnchor;
+    authorBytes: number[];
+    /** LOCAL wall-clock millis (`Date.now()`) — see postedMessage's atMs. */
+    at: number;
+  },
+): Partial<ConsoleState> => {
+  const author = { user: params.authorBytes };
+  const comment: Comment = {
+    id: params.commentId,
+    thread_id: params.threadId,
+    author,
+    text: params.text,
+    created_at: params.at,
+    edited_at: null,
+    deleted: false,
+  };
+  const groups = prev.pageThreads;
+  const exists = groups.some((g) => g.threads.some((v) => v.thread.id === params.threadId));
+  if (exists) {
+    return {
+      pageThreads: mapThreadView(groups, params.threadId, (view) => ({
+        thread: {
+          ...view.thread,
+          comment_ids: [...view.thread.comment_ids, comment.id],
+        },
+        comments: [...view.comments, comment],
+      })),
+    };
+  }
+  // a NEW thread: join the target's group, or open one at the end — the
+  // refresh re-slots it into the module's target order.
+  const view: ThreadView = {
+    thread: {
+      id: params.threadId,
+      target: params.target,
+      opener: author,
+      created_at: params.at,
+      anchor: params.anchor ?? null,
+      resolved: false,
+      resolved_by: null,
+      comment_ids: [comment.id],
+    },
+    comments: [comment],
+  };
+  return {
+    pageThreads: groups.some((g) => g.target === params.target)
+      ? groups.map((g) =>
+          g.target === params.target ? { ...g, threads: [...g.threads, view] } : g,
+        )
+      : [...groups, { target: params.target, threads: [view] }],
+  };
+};
+
+export const commentThreadMoved = (
+  prev: ConsoleState,
+  threadId: string,
+  target: string,
+  anchor: RelativeAnchor | null,
+): Partial<ConsoleState> => {
+  const source = prev.pageThreads.find((group) =>
+    group.threads.some((view) => view.thread.id === threadId));
+  const current = source?.threads.find((view) => view.thread.id === threadId);
+  if (!source || !current) return {};
+  const moved: ThreadView = {
+    ...current,
+    thread: { ...current.thread, target, anchor },
+  };
+  if (source.target === target) {
+    return {
+      pageThreads: prev.pageThreads.map((group) =>
+        group.target === target
+          ? {
+              ...group,
+              threads: group.threads.map((view) =>
+                view.thread.id === threadId ? moved : view),
+            }
+          : group),
+    };
+  }
+  const hasTarget = prev.pageThreads.some((group) => group.target === target);
+  const groups = prev.pageThreads.map((group) => {
+    if (group.target === source.target) {
+      return { ...group, threads: group.threads.filter((view) => view.thread.id !== threadId) };
+    }
+    return group.target === target ? { ...group, threads: [...group.threads, moved] } : group;
+  });
+  return {
+    pageThreads: hasTarget ? groups : [...groups, { target, threads: [moved] }],
+  };
+};
+
+export const commentEdited = (
+  prev: ConsoleState,
+  commentId: string,
+  text: string,
+  at: number,
+): Partial<ConsoleState> => ({
+  pageThreads: prev.pageThreads.map((group) => ({
+    ...group,
+    threads: group.threads.map((view) =>
+      view.comments.some((c) => c.id === commentId)
+        ? {
+            ...view,
+            comments: view.comments.map((c) =>
+              c.id === commentId ? { ...c, text, edited_at: at } : c,
+            ),
+          }
+        : view,
+    ),
+  })),
+});
+
+export const commentDeleted = (
+  prev: ConsoleState,
+  commentId: string,
+): Partial<ConsoleState> => ({
+  pageThreads: prev.pageThreads
+    .map((group) => ({
+      ...group,
+      threads: group.threads
+        .map((view) =>
+          view.comments.some((c) => c.id === commentId)
+            ? {
+                thread: {
+                  ...view.thread,
+                  comment_ids: view.thread.comment_ids.filter((id) => id !== commentId),
+                },
+                comments: view.comments.filter((c) => c.id !== commentId),
+              }
+            : view,
+        )
+        // the module removes a thread whose last live comment died
+        .filter((view) => view.comments.length > 0),
+    }))
+    .filter((group) => group.threads.length > 0),
+});
+
+export const threadResolved = (
+  prev: ConsoleState,
+  threadId: string,
+  resolved: boolean,
+  resolverBytes: number[],
+): Partial<ConsoleState> => ({
+  pageThreads: mapThreadView(prev.pageThreads, threadId, (view) => ({
+    ...view,
+    thread: {
+      ...view.thread,
+      resolved,
+      resolved_by: resolved ? { user: resolverBytes } : null,
+    },
+  })),
+});
 
 // ── Agents ──────────────────────────────────────────────
 

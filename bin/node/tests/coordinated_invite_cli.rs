@@ -18,6 +18,19 @@ fn command_output(out: &std::process::Output) -> String {
     )
 }
 
+/// mint (or reuse) `<dir>/identity.key` via the `keygen` verb and return its
+/// pubkey hex — the join code every targeted invite locks to. `join --dir <dir>`
+/// reuses this identity, so the join-side target self-check passes.
+fn keygen(dir: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args(["keygen", "--dir"])
+        .arg(dir)
+        .output()
+        .expect("run keygen");
+    assert!(out.status.success(), "keygen failed:\n{}", command_output(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// grab `n` distinct free localhost ports by holding every listener at once
 /// (sequential bind-drop can hand the same port back twice).
 fn alloc_ports(n: usize) -> Vec<u16> {
@@ -156,9 +169,11 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
         command_output(&init)
     );
 
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -250,9 +265,11 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     reachability::store::save(&storage.join("mesh-state.json"), &mesh)
         .expect("seed mesh-state.json");
 
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -328,9 +345,11 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
 
     // a default founder advertises the overlay ULA (not a routable host), so its
     // WireGuard bootstrap is coordinated-only — no underlay endpoint baked in.
+    let target = keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
+        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -506,6 +525,171 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
         healed,
         "the plane must establish rendezvous once the coordinator answers — \
          without a process restart:\n{log}"
+    );
+}
+
+/// End to end through the REAL binary: `invite --short` publishes the full
+/// signed blob to the coordinator under a random owner-owned id and prints a `🦆://<name>/<id>`
+/// short URL; `join <url>` fetches it back and materializes the workspace. When
+/// the joiner points at a coordinator that does NOT hold the link (a restart
+/// dropped the in-memory shelf), the short join fails LOUDLY — and the full
+/// blob (printed above the URL) still joins with no coordinator at all.
+#[test]
+fn short_invite_publishes_joins_and_falls_back_to_the_full_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let founder = dir.path().join("founder");
+
+    // coordinator A holds the shelf; B starts fresh (an empty, restarted shelf).
+    let probe_a = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp probe A");
+    let coord_a = probe_a.local_addr().expect("probe A addr");
+    drop(probe_a);
+    let probe_b = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp probe B");
+    let coord_b = probe_b.local_addr().expect("probe B addr");
+    drop(probe_b);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("coordinator runtime");
+    let _a = rt.spawn(async move {
+        let sock = tokio::net::UdpSocket::bind(coord_a).await.expect("bind coord A");
+        nat_traversal::run_coordinator(sock, nat_traversal::AuthPolicy::Open { require_pop: true })
+            .await;
+    });
+    let _b = rt.spawn(async move {
+        let sock = tokio::net::UdpSocket::bind(coord_b).await.expect("bind coord B");
+        nat_traversal::run_coordinator(sock, nat_traversal::AuthPolicy::Open { require_pop: true })
+            .await;
+    });
+    // let both coordinators bind before the first publish (the client retries
+    // anyway, but this keeps the test snappy and deterministic).
+    std::thread::sleep(Duration::from_millis(300));
+
+    // found a network pointed at coordinator A.
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args([
+            "init",
+            "--name",
+            "short-e2e",
+            "--dir",
+            founder.to_str().expect("utf-8 founder dir"),
+            "--primary-coordinator",
+            &coord_a.to_string(),
+        ])
+        .output()
+        .expect("run init");
+    assert!(init.status.success(), "init failed:\n{}", command_output(&init));
+
+    // mint a SHORT invite locked to the friend's pre-generated key: publishes
+    // the blob to A, prints the full blob then the short URL as the LAST line.
+    let friend = dir.path().join("friend");
+    let target = keygen(&friend);
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args(["invite", "--config"])
+        .arg(founder.join("node.toml"))
+        .args(["--target", &target])
+        .arg("--short")
+        .output()
+        .expect("run invite --short");
+    assert!(
+        invite.status.success(),
+        "invite --short failed:\n{}",
+        command_output(&invite)
+    );
+    let stdout = String::from_utf8_lossy(&invite.stdout);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let full_blob = lines.first().expect("invite prints the full blob").to_string();
+    let short_url = lines.last().expect("invite --short prints the URL").to_string();
+    assert!(
+        short_url.starts_with("🦆://short-e2e/"),
+        "the last line is a 🦆://<name>/<id> short URL:\n{}",
+        command_output(&invite)
+    );
+    assert!(
+        full_blob.starts_with('🦆') && !full_blob.contains("://"),
+        "the full blob is printed above the short URL:\n{}",
+        command_output(&invite)
+    );
+
+    // join via the SHORT URL, pointed at A: fetch + materialize the workspace
+    // (the friend dir already holds the targeted identity from keygen above).
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args([
+            "join",
+            &short_url,
+            "--dir",
+            friend.to_str().expect("utf-8 friend dir"),
+            "--primary-coordinator",
+            &coord_a.to_string(),
+        ])
+        .output()
+        .expect("run join <short-url>");
+    assert!(
+        join.status.success(),
+        "join via short URL failed:\n{}",
+        command_output(&join)
+    );
+    let network_toml = friend.join("network.toml");
+    assert!(
+        network_toml.exists(),
+        "a short-URL join must materialize the workspace descriptor"
+    );
+    let descriptor = std::fs::read_to_string(&network_toml).expect("read network.toml");
+    assert!(
+        descriptor.contains("short-e2e#"),
+        "the materialized descriptor is for the named network:\n{descriptor}"
+    );
+
+    // join the SAME URL pointed at the EMPTY coordinator B (a restart dropped
+    // the shelf): the link is gone, and the join must fail LOUDLY.
+    let friend2 = dir.path().join("friend2");
+    let join_gone = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args([
+            "join",
+            &short_url,
+            "--dir",
+            friend2.to_str().expect("utf-8 friend2 dir"),
+            "--primary-coordinator",
+            &coord_b.to_string(),
+        ])
+        .output()
+        .expect("run join against empty coordinator");
+    assert!(
+        !join_gone.status.success(),
+        "a short invite absent from the coordinator must fail the join, not proceed:\n{}",
+        command_output(&join_gone)
+    );
+    assert!(
+        String::from_utf8_lossy(&join_gone.stderr).contains("not on the coordinator"),
+        "the failure names the dead link and points at the full-blob fallback:\n{}",
+        command_output(&join_gone)
+    );
+
+    // the FULL blob still joins with no coordinator at all — the universal
+    // fallback the loud error tells the user about.
+    // invites are targeted: friend3 must present the SAME key the invite was
+    // minted for, so seed it with the friend's identity before joining.
+    let friend3 = dir.path().join("friend3");
+    std::fs::create_dir_all(&friend3).expect("create friend3");
+    std::fs::copy(friend.join("identity.key"), friend3.join("identity.key"))
+        .expect("seed friend3 with the targeted identity");
+    let join_full = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args([
+            "join",
+            &full_blob,
+            "--dir",
+            friend3.to_str().expect("utf-8 friend3 dir"),
+        ])
+        .output()
+        .expect("run join <full-blob>");
+    assert!(
+        join_full.status.success(),
+        "the full blob must still join without any coordinator:\n{}",
+        command_output(&join_full)
+    );
+    assert!(
+        friend3.join("network.toml").exists(),
+        "the full-blob join materializes the workspace too"
     );
 }
 

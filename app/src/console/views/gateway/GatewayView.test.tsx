@@ -30,6 +30,9 @@ afterEach(() => vi.restoreAllMocks());
 describe("GatewayView route editor", () => {
   it("describes one route abstraction", () => {
     renderGateway();
+    const content = document.querySelector('[data-gateway-content="full-width"]') as HTMLElement;
+    expect(content).toHaveStyle({ width: "100%" });
+    expect(content.style.maxWidth).toBe("");
     expect(screen.getByText("Gateway")).toBeInTheDocument();
     expect(screen.getByText(/address, reverse proxy, and signed access policy are saved together/)).toBeInTheDocument();
   });

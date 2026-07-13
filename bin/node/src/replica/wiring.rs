@@ -41,6 +41,11 @@ pub(super) struct ReplicaChannels {
     pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
     pub(super) lobby_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
+    /// the joiner's gate-reply lane: the park loop's gate phase blocks on this
+    /// for the authoritative `GateMsg::Admitted`/`Rejected` (ADR §3.3). NOT a
+    /// side printer any more — the reply IS the admission signal.
+    pub(super) lobby_rx: discovery::Receiver<ed25519::PublicKey>,
+    pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -70,8 +75,7 @@ pub(super) async fn wire(
     invite_token: &Option<config::InviteToken>,
     invite_wireguard: &Option<config::StoredInviteWireGuard>,
     invite_fronts: Vec<config::Front>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
-    workspace: std::path::PathBuf,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
@@ -344,83 +348,17 @@ pub(super) async fn wire(
             }
         }
     }
-    // media rides the overlay (Service::Voice/Service::Video), never the
-    // mesh; a parked joiner serves no huddle media, so drop the session
-    // lane to make /v1/call/ws refuse instead of hang (this branch always
-    // ends in the promotion reboot, never main.rs's validator path).
-    drop(voice_requests);
     // the submit-relay lane: once resident standing lands, writes leave
     // here — this node signs its own frames and a validator takes
     // custody. replies (the frame's consensus fate) come back on the
     // same lane. `relay_rx` is bridged into the serve window below (a
     // torn-down select must never drop its `recv()` mid-flight).
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
-    // the lobby lane: where this parked node announces its key. member
-    // replies are drained by a printer task — purely informational.
-    let (lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
-    {
-        let label = label.clone();
-        // the parked joiner persists a coord.cap delivered over a
-        // JoinReply into its workspace, so a later boot presents it to
-        // the private coordinator (loaded via `load_coord_cap`).
-        let cap_dir = workspace.clone();
-        context.child("lobby_replies").spawn(move |_ctx| async move {
-            while let Ok((peer, msg)) = lobby_rx.recv().await {
-                let bytes: Vec<u8> = msg.into();
-                if let Ok(lobby::LobbyMsg::JoinReply {
-                    recorded,
-                    detail,
-                    cap,
-                    fatal,
-                }) = lobby::decode_msg(&bytes)
-                {
-                    println!(
-                        "[node {label}] member {}: {}{detail}",
-                        hex_bytes(&peer.as_ref()[..4]),
-                        if recorded { "" } else { "join request refused — " },
-                    );
-                    if fatal {
-                        // this invite can NEVER redeem (e.g. its
-                        // single-use token is already spent by
-                        // another key) — retrying is a silent
-                        // forever-spin. stop loudly: the FATAL
-                        // marker is the app/operator contract.
-                        eprintln!(
-                            "[node {label}] FATAL: {detail} — this invite cannot \
-                             be redeemed (an invite admits exactly one person). \
-                             ask the inviter for a fresh invite and re-join with \
-                             the new blob."
-                        );
-                        std::process::exit(1);
-                    }
-                    // a delivered cap (private coordination): unpack
-                    // the opaque bytes and persist beside identity.
-                    if let Some(cap_bytes) = cap {
-                        match config::unpack_coord_cap(&cap_bytes) {
-                            Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
-                                Ok(()) => println!(
-                                    "[node {label}] coordinator cap delivered by \
-                                     member {} — saved (issuer {}, expires {})",
-                                    hex_bytes(&peer.as_ref()[..4]),
-                                    hex_bytes(&cap.issuer.as_ref()[..4]),
-                                    cap.not_after,
-                                ),
-                                Err(e) => eprintln!(
-                                    "[node {label}] coordinator cap delivered but \
-                                     could not be saved: {e}"
-                                ),
-                            },
-                            Err(e) => eprintln!(
-                                "[node {label}] member {} sent a malformed \
-                                 coordinator cap: {e}",
-                                hex_bytes(&peer.as_ref()[..4]),
-                            ),
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // the lobby lane: the joiner speaks `GateMsg::Request` here and the park
+    // loop's gate phase (ADR §3.3) blocks on the authoritative reply — no side
+    // printer, the reply IS the admission signal, so `lobby_rx` is handed to
+    // `park` verbatim.
+    let (lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
     network.start();
 
     ReplicaChannels {
@@ -434,5 +372,7 @@ pub(super) async fn wire(
         relay_tx,
         relay_rx,
         lobby_tx,
+        lobby_rx,
+        voice_requests,
     }
 }

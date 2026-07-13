@@ -11,6 +11,5 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$root/ops/dev-macos-runner.sh"
-build_with="${BUILD_WITH:-$root/ops/build-with.sh}"
 
-exec "$build_with" "${CARGO:-cargo}" "$@"
+exec "${CARGO:-cargo}" "$@"

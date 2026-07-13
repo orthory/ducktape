@@ -7,14 +7,17 @@
 //! on a Tauri runtime worker.
 //!
 //! this module also holds the SESSION PASSWORD CACHE: once the user proves
-//! they know the password (create/restore/unlock/encrypt), the shell keeps it
-//! in process memory for the rest of the app's run so bind/unbind don't
-//! re-prompt on every call. app restart = locked again; there is no disk
-//! persistence of the password, ever.
+//! they know the password (create/restore/unlock/encrypt/reveal), the shell
+//! keeps it in process memory for the rest of the app's run so bind/unbind
+//! don't re-prompt on every call. app restart = locked again; there is no
+//! disk persistence of the password, ever. every store also fires
+//! [`IDENTITY_UNLOCKED_EVENT`] so the webview can re-run the connect-time
+//! auto-bind it lost to the boot/unlock race.
 
 use std::sync::Mutex;
 
 use serde::Serialize;
+use tauri::Emitter as _;
 use zeroize::Zeroize as _;
 
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb, run_verb_with_stdin};
@@ -108,6 +111,24 @@ fn cache_peek() -> Option<SecretString> {
 /// `user_identity_lock` command (a Settings affordance).
 fn cache_clear() {
     session_lock().take();
+}
+
+/// the shell→webview event announcing the session just became signable (the
+/// cache now holds a verified password). the console's provider listens and
+/// re-runs the connect-time auto-bind: the boot connect always outruns a human
+/// typing a password, so on an encrypted key that fire-and-forget pass
+/// deterministically short-circuits "locked" — without this nudge the node
+/// would never auto-bind (and the display-name flow behind it stays gated).
+pub(crate) const IDENTITY_UNLOCKED_EVENT: &str = "ducktape://identity-unlocked";
+
+/// cache the just-verified `password` AND announce the unlock to the webview.
+/// the single choke point every verified-password path funnels through:
+/// create, restore, unlock (password and Touch ID), encrypt, reveal. a failed
+/// emit is deliberately dropped — the announcement is a retry nudge, not a
+/// correctness gate, and the next connect re-runs the bind anyway.
+fn cache_store_and_announce(app: &crate::rt::AppHandle, password: &str) {
+    cache_store(password);
+    let _ = app.emit(IDENTITY_UNLOCKED_EVENT, ());
 }
 
 // ── Wire types ──────────────────────────────────────────
@@ -288,7 +309,7 @@ fn user_identity_create_blocking(
         &[&password],
     )?;
     let (mnemonic, pubkey) = parse_init_output(&out)?;
-    cache_store(&password);
+    cache_store_and_announce(&app, &password);
     Ok(IdentityCreated { pubkey, mnemonic })
 }
 
@@ -329,7 +350,7 @@ fn user_identity_restore_blocking(
         &[&mnemonic, &password],
     )?;
     let pubkey = last_line(&out);
-    cache_store(&password);
+    cache_store_and_announce(&app, &password);
     crate::workspaces::set_mnemonic_confirmed(&app)?;
     Ok(IdentityPubkey { pubkey })
 }
@@ -372,7 +393,7 @@ pub(crate) fn unlock_with_secret(
         &[&password],
     )?;
     let pubkey = last_line(&out);
-    cache_store(&password);
+    cache_store_and_announce(app, &password);
     Ok(IdentityPubkey { pubkey })
 }
 
@@ -386,7 +407,10 @@ fn user_identity_unlock_blocking(
 /// reveal the 24-word mnemonic. ALWAYS uses the password the caller just
 /// supplied -- the session cache is NEVER consulted here, by design: reveal
 /// is the one action the spec says must always re-prompt, however recently
-/// the identity was unlocked.
+/// the identity was unlocked. (that contract is about CONSULTING the cache;
+/// a successful reveal still STORES the just-verified password, so finishing
+/// the interrupted-create resume ceremony leaves the session unlocked instead
+/// of demanding the same password again one screen later.)
 #[tauri::command]
 pub async fn user_identity_reveal(
     app: crate::rt::AppHandle,
@@ -415,6 +439,9 @@ fn user_identity_reveal_blocking(
         ],
         &[&password],
     )?;
+    // the verb just verified `password` by decrypting the key -- the same
+    // trust event as unlock, so the session becomes signable here too.
+    cache_store_and_announce(&app, &password);
     Ok(IdentityMnemonic {
         mnemonic: last_line(&out),
     })
@@ -458,7 +485,7 @@ fn user_identity_encrypt_blocking(
         &[&password],
     )?;
     let pubkey = last_line(&out);
-    cache_store(&password);
+    cache_store_and_announce(&app, &password);
     crate::workspaces::set_mnemonic_confirmed(&app)?;
     Ok(IdentityPubkey { pubkey })
 }
@@ -712,9 +739,159 @@ pub async fn user_sign_remove_member(
         .await
 }
 
+// ── files op-frame signing ──────────────────────────
+
+/// this shell process's frame `seq`, seeded from wall-clock millis so an app
+/// restart never reuses a `(seq, payload)` pair an earlier run submitted — a
+/// byte-identical frame is swallowed by the consensus lane's content-digest
+/// replay guard instead of re-applying. `seq` is a tie-breaker, not tracked
+/// in state, so millis + increment is all the coordination needed.
+fn next_frame_seq() -> u64 {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: OnceLock<AtomicU64> = OnceLock::new();
+    SEQ.get_or_init(|| {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        AtomicU64::new(millis)
+    })
+    .fetch_add(1, Ordering::Relaxed)
+}
+
+/// sign ONE files-module op frame with the user key: `payload_hex` is the
+/// module payload (`FilesMsg` JSON, or the `0x00` putblob frame) as hex, the
+/// return is the raw signed frame as hex, ready for `POST /v1/submit/frame`,
+/// whose verified signer becomes the op's authenticated authorship
+/// (`ext:<user-pubkey>` — real `/home/<user>` authority instead of the
+/// daemon's shared `ext:noded`). The target module is pinned to `files`
+/// HERE, shell-side: the webview never gets a generic signing oracle over
+/// arbitrary modules (the gateway-route precedent). `identity-locked`
+/// (exact string) on an encrypted, uncached key.
+#[tauri::command]
+pub async fn user_sign_files_frame(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    payload_hex: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            // stdin: password first when the key is locked (signing_stdin's
+            // contract), then the payload hex line the verb reads after it.
+            let mut stdin_lines = signing_stdin(&app)?;
+            stdin_lines.push(SecretString::new(payload_hex));
+            let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
+            let key = user_key_path(&app)?.to_string_lossy().into_owned();
+            let seq = next_frame_seq().to_string();
+            let out = run_verb_with_stdin(
+                &[
+                    "user-sign-frame",
+                    "--key",
+                    &key,
+                    "--target",
+                    "files",
+                    "--seq",
+                    &seq,
+                ],
+                &stdin_refs,
+            )?;
+            Ok(last_line(&out))
+        })
+        .await
+}
+
+/// modules a REMOTE-connected user may sign a frame for. a thin client
+/// operates the app's CONTENT surfaces — it never touches the
+/// membership/consensus-control modules (`identity`, `valset`, `governance`,
+/// `upgrade`, `modreg`, `clients`), so this is not a blanket signing oracle
+/// even though it is one command (the `user_sign_files_frame` caution, kept).
+/// Consensus is the real gate — the submit door + each module's own origin
+/// ACL — this list is defense-in-depth so a compromised console webview
+/// cannot even ATTEMPT a control-plane op as the user.
+const CLIENT_SIGNABLE_TARGETS: &[&str] = &[
+    "chat", "pages", "files", "forge", "tasks", "kv", "directory", "tagging", "inbox",
+];
+
+/// whether a remote user may sign a frame for `target` — the content-module
+/// gate. The membership/consensus-control modules are absent by design.
+fn client_target_allowed(target: &str) -> bool {
+    CLIENT_SIGNABLE_TARGETS.contains(&target)
+}
+
+/// sign ONE content-module op frame with the user key for a REMOTE node — the
+/// generalization of [`user_sign_files_frame`] over `target`, gated by
+/// [`CLIENT_SIGNABLE_TARGETS`]. `payload_hex` is the module payload as hex;
+/// the return is the raw signed frame hex for `POST /v1/submit/frame`, whose
+/// verified signer becomes the op's authorship (`ext:<user-pubkey>`) so a
+/// thin client acts as ITS OWN bounded identity on the dev's node rather than
+/// as the node's shared key. `identity-locked` (exact string) on a locked key
+/// — the remote caller must fail loud, never silently mis-attribute.
+#[tauri::command]
+pub async fn user_sign_frame(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    target: String,
+    payload_hex: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    if !client_target_allowed(&target) {
+        return Err(format!(
+            "user_sign_frame refuses target {target:?}: a remote client signs content ops, \
+             not membership or consensus-control ops"
+        ));
+    }
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            let mut stdin_lines = signing_stdin(&app)?;
+            stdin_lines.push(SecretString::new(payload_hex));
+            let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
+            let key = user_key_path(&app)?.to_string_lossy().into_owned();
+            let seq = next_frame_seq().to_string();
+            let out = run_verb_with_stdin(
+                &[
+                    "user-sign-frame",
+                    "--key",
+                    &key,
+                    "--target",
+                    &target,
+                    "--seq",
+                    &seq,
+                ],
+                &stdin_refs,
+            )?;
+            Ok(last_line(&out))
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_signer_gates_content_modules_and_refuses_control_plane() {
+        // content ops a thin client legitimately makes are allowed…
+        for t in ["chat", "pages", "files", "forge", "tasks", "kv"] {
+            assert!(client_target_allowed(t), "{t} should be signable");
+        }
+        // …but the membership / consensus-control modules are refused, so the
+        // signer is never a blanket oracle even as one command.
+        for t in ["identity", "valset", "governance", "upgrade", "modreg", "clients"] {
+            assert!(!client_target_allowed(t), "{t} must NOT be signable by a client");
+        }
+        // gateway/duckdns require validator/resident standing at their own
+        // module ACL — never grantable to a client, so not in the list.
+        for t in ["gateway", "duckdns"] {
+            assert!(!client_target_allowed(t), "{t} is control-plane for a client");
+        }
+        assert!(!client_target_allowed("not-a-module"));
+    }
 
     #[test]
     fn parse_key_status_reads_absent() {

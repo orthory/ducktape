@@ -9,7 +9,6 @@ shift || true
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$root"
-BUILD_WITH="${BUILD_WITH:-$ROOT/ops/build-with.sh}"
 # shellcheck source=ops/dev.sh
 DEV_SH_LIB=1 . "$root/ops/dev.sh"
 

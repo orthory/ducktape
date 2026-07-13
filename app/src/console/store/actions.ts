@@ -7,6 +7,7 @@ import type { ChatBlock, PostPolicy } from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
 import type {
   ForgeItemDetail,
+  ForgeItemTarget,
   ForgeReviewComment,
   ForgeReviewVerdict,
 } from "../../domain/forge-client";
@@ -38,13 +39,16 @@ import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
 import {
-  agentMentions,
+  addedStructuredMentions,
   hasAgentMention,
   mentionableUsers,
   mentionResolverOf,
+  structuredMentions,
 } from "../views/chat/mention";
 import {
   defaultScreenForSection,
+  moduleAvailable,
+  moduleFilterOf,
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
@@ -71,8 +75,10 @@ import {
   clearRemoteUrl,
   docTabsScope,
   hasNodeContext,
+  isClientMode,
   loadDocTabs,
   loadPendingDisplayName,
+  nodeControlAvailable,
   removeTab,
   resetNodeProjection,
   saveAccent,
@@ -116,8 +122,9 @@ export interface ConsoleActions {
   openExplorerAt(height: number): void;
   /** Jump to a forge item — the screen switch plus the one-shot forgeFocus
    *  hand-off (the explorerFocus idiom). Used by the notification bell; the
-   *  navigate deep-link listener patches the same fields. */
-  openForgeItem(repo: string, number: number | null): void;
+   *  navigate deep-link listener patches the same fields. `number` null is a
+   *  repo-only focus (a `duck://forge/<repo>` deep link). */
+  openForgeItem(target: ForgeItemTarget | { repo: string; number: null }): void;
   /** Jump to the files browser opened on `path` — the same one-shot hand-off,
    *  used by the agent form to open a skill document in Files. */
   openFiles(path: string): void;
@@ -183,7 +190,31 @@ export interface ConsoleActions {
     label: string | null,
   ): Promise<void>;
   selectChannel(channelId: string): void;
+  /** Load `channelId` on the chat screen and scroll+flash message `seq` once its
+   *  slice lands (jump-to-message from a tag/search hit). Clears any tag filter,
+   *  like `selectChannel`. A `seq` older than the channel tail is paged in by
+   *  `loadMessageWindow` — see ChatView. */
+  focusMessage(channelId: string, seq: number): void;
+  /** Page in the messagesAround window centered on `seq` and re-arm the focus so
+   *  ChatView scrolls to it. ChatView calls this when a jump-to-message target
+   *  is older than the loaded tail and so has no row to scroll to. */
+  loadMessageWindow(channelId: string, seq: number): void;
+  /** Consume the one-shot `chatFocusSeq` (ChatView calls this once it has acted
+   *  on the jump, or when the target seq isn't in the loaded window). */
+  clearChatFocus(): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
+  /** Load the active channel's member set into `state.channelMembers` — the
+   *  members panel calls it on open. */
+  refreshChannelMembers(channelId: string): void;
+  /** Add/remove a channel member (SetMembership) as a tracked op, refetching
+   *  the roster on settle. A members_only channel gates posting on this set. */
+  setChannelMembership(channelId: string, user: number[], member: boolean): void;
+  /** Rename a channel (RenameChannel). Owner-gated by the module — only surfaced
+   *  on channels the local user may administer. No-op on a blank name. */
+  renameChannel(channelId: string, name: string): void;
+  /** Archive or unarchive a channel (SetChannelArchived). Archived channels are
+   *  hidden from the rail and reject posts/reactions/huddle joins. */
+  setChannelArchived(channelId: string, archived: boolean): void;
   sendMessage(body: string): void;
   /** Post `body` into ANY channel (not just the active one) with the same
    *  mention parsing + first-agent-mention watch arming as `sendMessage` —
@@ -282,7 +313,7 @@ export interface ConsoleActions {
   getForgeItem(repo: string, number: number): Promise<ForgeItemDetail | null>;
   /** Open an issue on `repo`; reloads the repo's item list once committed. */
   openForgeIssue(params: { repo: string; title: string; body: string }): Promise<void>;
-  /** Open a PR from `sourceBranch` into `targetBranch` ("" → the repo's main). */
+  /** Open a PR from `sourceBranch` into `targetBranch` ("" → the repo's dev). */
   openForgePr(params: {
     repo: string;
     title: string;
@@ -348,10 +379,29 @@ export interface ConsoleActions {
     after: string | null;
     kind: PageBlockKind;
     text: string;
+    marks?: pagesClient.SpanMark[];
+    /** Keep a rejection out of the global error surface — the caller reports it
+     *  instead. The delete-undo replay sets it: its ops are anchor-chained, so a
+     *  parent or anchor removed under it rejects EVERY op in the batch, one
+     *  error toast each. The failure still resolves false and still lands in the
+     *  op ledger; it is not swallowed. */
+    quiet?: boolean;
   }): Promise<boolean>;
   /** Replace a block's text; on the page root this renames the page.
    *  Resolves true once the op commits — see `insertPageBlock`. */
-  updatePageBlockText(params: { blockId: string; text: string }): Promise<boolean>;
+  updatePageBlockText(params: {
+    blockId: string;
+    text: string;
+    marks?: pagesClient.SpanMark[];
+  }): Promise<boolean>;
+  /** Apply/remove inline formatting over an exact UTF-16 selection. */
+  setPageBlockSpanMark(params: {
+    blockId: string;
+    start: number;
+    end: number;
+    kind: pagesClient.InlineMark;
+    active: boolean;
+  }): void;
   /** Convert a block to another kind (markdown shortcuts, slash menu). */
   setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
   /** Flip a Todo block's checked state. */
@@ -373,7 +423,18 @@ export interface ConsoleActions {
   loadPageThreads(): void;
   /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
    *  is minted), else appends to that thread. `target` is a block or page id. */
-  addComment(params: { threadId?: string; target: string; text: string }): void;
+  addComment(params: {
+    threadId?: string;
+    target: string;
+    text: string;
+    anchor?: pagesClient.RelativeAnchor;
+  }): void;
+  /** Re-anchor a thread when its selected text crosses a split/merge boundary. */
+  moveCommentThread(params: {
+    threadId: string;
+    target: string;
+    anchor: pagesClient.RelativeAnchor | null;
+  }): Promise<boolean>;
   /** Edit own comment text. */
   editComment(params: { commentId: string; text: string }): void;
   /** Tombstone own comment (removes the thread if it was the last live one). */
@@ -392,6 +453,9 @@ export interface ConsoleActions {
     caps?: agentClient.ResourceCaps;
     skills?: agentClient.SkillRef[];
   }): void;
+  /** Re-read the network capability registry without rebuilding the rest of the
+   *  console snapshot. Used by the create form after a failed registry read. */
+  refreshCapabilities(): void;
   /** Pause / resume an agent (owner-gated). */
   pauseAgent(agentId: string): void;
   resumeAgent(agentId: string): void;
@@ -442,6 +506,17 @@ export interface ConsoleActions {
   proposeSetShares(accountId: string, shares: number): void;
   /** Switch future proposals between account shares and validator ballots. */
   proposeSetShareMode(enabled: boolean): void;
+  /** Authorize a height-gated node upgrade: opens a ScheduleUpgrade proposal.
+   *  Governance only SCHEDULES — arming still needs the upgrade module's R=n
+   *  readiness quorum at the boundary. */
+  proposeScheduleUpgrade(params: {
+    name: string;
+    toVersion: number;
+    activationHeight: number;
+  }): void;
+  /** Authorize clearing the pending upgrade before its boundary: opens a
+   *  CancelUpgrade proposal. */
+  proposeCancelUpgrade(name: string): void;
   /** Cast (or change) this node's ballot on an open proposal. */
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
@@ -504,8 +579,12 @@ export interface ConsoleActions {
   /** Connect to a node running on another device over http/https. Unmanaged —
    *  we only dial it; the url is remembered and reconnected on next launch. */
   connectRemote(url: string): void;
-  /** Fetch the active workspace's invite blob into state for sharing. */
-  revealInvite(): void;
+  /** Fetch the active workspace's invite blob into state for sharing. Every
+   *  invite is LOCKED to `target` (the invitee's join code / pubkey hex). */
+  revealInvite(target: string): void;
+  /** Fetch (or reuse) this device's JOIN CODE into state — the pubkey an
+   *  invitee hands the inviter so the invite locks to it. */
+  joinCode(): void;
   /** Admit a joiner by pubkey through the active (member) workspace — grants
    *  RESIDENT standing (staged admission's first step); promote seats it. */
   admitMember(pubkey: string): void;
@@ -552,6 +631,14 @@ export interface ConsoleActions {
 
 interface InternalActions {
   connectActive(target: Workspace): Promise<void>;
+  /** The `ducktape://identity-unlocked` handler: re-run the connect-time
+   *  auto-bind (and the parked display-name hand-off) now that the machine
+   *  key can sign. The connect-time pass fires at provider boot — always
+   *  before a human can have typed a password — so on an encrypted key it
+   *  deterministically short-circuits "locked"; this is the retry that makes
+   *  auto-bind ever land for those users. Fire-and-forget like that pass:
+   *  resolves quietly on every failure. */
+  identityUnlocked(): Promise<void>;
 }
 
 interface CreateActionsDeps {
@@ -560,6 +647,7 @@ interface CreateActionsDeps {
   getNode: () => NodeTransport | null;
   setNode(node: NodeTransport | null): void;
   refresh(): Promise<void>;
+  refreshCapabilities(): void;
   fail(err: unknown): void;
   nextBootGeneration(): number;
   isBootGenerationStale(generation: number): boolean;
@@ -571,6 +659,7 @@ export function createActions({
   getNode,
   setNode,
   refresh,
+  refreshCapabilities,
   fail,
   nextBootGeneration,
   isBootGenerationStale,
@@ -578,6 +667,26 @@ export function createActions({
   const patch = (p: Partial<ConsoleState>) => dispatch({ type: "patch", patch: p });
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
+  // a joiner PROMOTED to validator: the registry cached `member=false` from
+  // join time. `phase === "promoted"` is the authoritative "this node is a
+  // validator" signal, so flip the cached flag in-session (the Rust side
+  // persists the same, so it survives relaunch) — MONOTONIC-UP, only false→
+  // true, so a transient read never demotes. fixes canVote / canAdmin, which
+  // read `member` with no runtime fallback.
+  const adoptPromotedMember = (id: string): void =>
+    update((prev) => {
+      const listHit = prev.workspaces.some((w) => w.id === id && !w.member);
+      const activeHit = prev.workspace?.id === id && !prev.workspace.member;
+      if (!listHit && !activeHit) return {}; // already a member: reference-stable no-op
+      return {
+        // both slices carry `member`: the list feeds re-hydration, but
+        // canVote/canAdmin read the SINGULAR active `workspace` — bump both.
+        workspaces: listHit
+          ? prev.workspaces.map((w) => (w.id === id ? { ...w, member: true } : w))
+          : prev.workspaces,
+        ...(activeHit ? { workspace: { ...prev.workspace!, member: true } } : {}),
+      };
+    });
   const isCurrentNode = (live: NodeTransport): boolean => getNode() === live;
 
   /** The live transport + active workspace the account writes sign against.
@@ -589,6 +698,31 @@ export function createActions({
     if (!live || !workspace) throw new Error("not connected to a workspace node");
     return { transport: live, chainId: workspace.chainId, nodePub: workspace.pubkey };
   };
+
+  /** The auto-bind pass plus the first-run display-name hand-off: the name
+   *  chosen while creating the account parks in localStorage (names are
+   *  chain-scoped) and belongs on the ACCOUNT (identity SetAccountName) once
+   *  a bind lands, so it travels with the person across devices. An unbound
+   *  outcome leaves it parked for the next pass; there is no second per-node
+   *  name registry. Shared by adopt() (the connect-time pass) and
+   *  identityUnlocked() (the retry once the machine key can actually sign —
+   *  the connect-time pass always loses the boot-vs-unlock race on an
+   *  encrypted key). */
+  const autoBindAndFlushName = (
+    transport: NodeTransport,
+    target: { chainId: string; pubkey: string },
+  ): Promise<AutoBindResult> =>
+    autoBindUserIdentity(transport, target).then((outcome) => {
+      const pending = loadPendingDisplayName();
+      if (!pending) return outcome;
+      patch({ author: pending });
+      if (outcome !== "bound" && outcome !== "already") return outcome;
+      return identityClient
+        .setAccountName(transport, { displayName: pending, origin: pending })
+        .then(() => clearPendingDisplayName())
+        .catch(() => {}) // a bounced name stays parked for the next pass
+        .then(() => outcome);
+    });
 
   // Monotonic token gating the async search fan-out: each runSearch/clearSearch
   // bumps it, and a resolving fan-out only writes results if its token is still
@@ -877,10 +1011,17 @@ export function createActions({
   // with the inclusion height + addressable op hash, or failed. Committed
   // truth replaces the projection on the refresh that follows either way (a
   // failed submit's refresh is the rollback).
+  //
+  // `quiet` keeps a rejection out of the global error surface — the caller
+  // reports it instead. It is for a BATCH whose ops are anchor-chained, where
+  // one bad anchor rejects every op behind it and the raw per-op reasons are
+  // noise. It never swallows the failure: the ledger still records it and the
+  // promise still resolves false.
   const submitTracked = (
     key: string,
     submit: (live: NodeTransport) => Promise<unknown>,
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
+    quiet = false,
   ) => {
     const live = getNode();
     if (!live) return Promise.resolve(false);
@@ -901,7 +1042,7 @@ export function createActions({
       .catch((err) => {
         if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: failOp(prev.ops, key, String(err), Date.now()) }));
-        fail(err);
+        if (!quiet) fail(err);
         // resolve false rather than reject: a failed op is already surfaced to
         // the user here, and rejecting would turn every caller that ignores the
         // result into an unhandled rejection. `false` therefore means "this op
@@ -943,7 +1084,14 @@ export function createActions({
 
   // switching channels means: new active channel, thread panel closed, any
   // channel-scoped tag filter/catalog dropped, and THAT channel's messages
-  // loaded — every path into a channel goes here
+  // loaded — every path into a channel goes here.
+  // The pending jump-to-message focus is channel-scoped too: leaving before
+  // ChatView consumed it would otherwise flash whatever message happens to
+  // carry that seq in the channel we land in. focusMessage relies on the
+  // ordering — it calls this first, THEN latches its own seq.
+  // Entering a channel is ALSO the way out of a focused history window: this
+  // loads the tail, so clearing `chatWindow` here is what puts the refresh back
+  // on the tail — a rail click on the channel you're in is the "jump to latest".
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
@@ -955,18 +1103,70 @@ export function createActions({
       tagHits: [],
       tagHitsPending: false,
       channelTags: [],
+      channelMembers: [],
+      chatFocusSeq: null,
+      chatWindow: null,
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
       .then((messages) =>
         update((prev) =>
-          isCurrentNode(live) && prev.activeChannel === channelId ? { messages } : {},
+          // A window installed while this tail read was in flight wins over it:
+          // focusMessage calls enterChannel and THEN arms the focus that loads
+          // the window, so the two round trips overlap and can land in either
+          // order. A late tail would drop the reader back on the newest message
+          // with the history bar still up.
+          isCurrentNode(live) &&
+          prev.activeChannel === channelId &&
+          prev.chatWindow === null
+            ? { messages }
+            : {},
         ),
       )
       .catch((err) => {
         if (isCurrentNode(live)) fail(err);
       });
   };
+
+  // Load a channel's member set into `channelMembers` (guarded on the active
+  // channel + current node, like the message load). The members panel calls it
+  // on open; membership writes refetch through it so the panel reconciles to
+  // committed truth whether the op landed or not.
+  const refreshChannelMembers = (channelId: string): Promise<void> => {
+    const live = getNode();
+    if (!live) return Promise.resolve();
+    return chatClient
+      .channelMembers(live, channelId)
+      .then((channelMembers) =>
+        update((prev) =>
+          isCurrentNode(live) && prev.activeChannel === channelId ? { channelMembers } : {},
+        ),
+      )
+      .catch((err) => {
+        if (isCurrentNode(live)) fail(err);
+      });
+  };
+
+  // The one membership write path: a tracked SetMembership keyed by channel +
+  // target so each member row carries its own finalization mark, an optimistic
+  // projection so that row EXISTS to carry it from the click (the mark is the
+  // immediate feedback, and it drew on nothing until the post-settle refetch
+  // materialised the row ~a block later), then a refetch that reconciles the
+  // panel to committed state — the refetch, not the projection, is the truth.
+  const submitMembership = (
+    channelId: string,
+    user: number[],
+    member: boolean,
+  ): Promise<boolean> =>
+    submitTracked(
+      opKey.membership(channelId, keyHex(user)),
+      (live) =>
+        chatClient.setMembership(live, { channelId, user, member, origin: getState().author }),
+      (prev) => optimistic.channelMembershipSet(prev, { channelId, user, member }),
+    ).then((landed) => {
+      void refreshChannelMembers(channelId);
+      return landed;
+    });
 
   // A first agent mention in an UNWATCHED channel creates the runs watch the
   // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
@@ -1015,6 +1215,11 @@ export function createActions({
     const messageId = crypto.randomUUID();
     const blocks = parseMessageInput(body, mentionResolver());
     const author = getState().author;
+    // Posting is a return to the present: the new message takes the channel's
+    // HEAD sequence, so it belongs to the tail, not to a focused history window
+    // the reader jumped to. Drop the window here — the block's refresh then
+    // re-pulls the tail (holding the window would hide the message just sent).
+    if (getState().chatWindow?.channelId === channelId) patch({ chatWindow: null });
     return ensureMentionWatch(channelId, blocks).then(() =>
       submitTracked(
         opKey.message(channelId, messageId),
@@ -1070,10 +1275,18 @@ export function createActions({
 
   // load the comment threads for the open page (the page id + every visible
   // block id) in one batch; refreshed on open and after any comment op.
+  //
+  // The responses carry no ordering of their own: two comment ops settling
+  // close together each fire a reload, and the transport can deliver the
+  // EARLIER op's (staler) response last — which would overwrite the fresher
+  // snapshot and visibly un-render a committed comment. `pageThreadsToken`
+  // supersedes: only the latest issued reload may apply its result.
+  let pageThreadsToken = 0;
   const loadPageThreads = (
     blocksOverride?: PageBlock[],
     source?: { live: NodeTransport; page: string },
   ): Promise<void> => {
+    const token = ++pageThreadsToken;
     // `blocks` is passed by callers that JUST fetched the tree, because
     // getState().activePageBlocks lags a dispatch (stateRef updates on render);
     // reading it here would ship only the page target and miss every block.
@@ -1097,7 +1310,7 @@ export function createActions({
     return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
       .then((results) =>
         update((prev) =>
-          isCurrentNode(live) && prev.activePage === page
+          token === pageThreadsToken && isCurrentNode(live) && prev.activePage === page
             ? { pageThreads: results.flat() }
             : {},
         ),
@@ -1241,6 +1454,13 @@ export function createActions({
     // shell (never through the Home layer), and only when the target still
     // exists in the recentmost committed data.
     const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
+    const requestedSection = sectionForScreen(snap.screen);
+    const filter = moduleFilterOf(before);
+    const screen =
+      requestedSection && !moduleAvailable(snap.screen, filter)
+        ? defaultScreenForSection(requestedSection, filter)
+        : snap.screen;
+    const viewMode = sectionForScreen(screen) ?? snap.viewMode;
     const channel =
       scopeMatches && snap.channel && before.channels.some((c) => c.id === snap.channel)
         ? snap.channel
@@ -1250,21 +1470,27 @@ export function createActions({
         ? snap.page
         : null;
     const forge =
-      scopeMatches && snap.screen === "forge" && snap.forgeRepo
-        ? { repo: snap.forgeRepo, number: snap.forgeItem }
+      scopeMatches && screen === "forge" && snap.forgeRepo
+        ? {
+            repo: snap.forgeRepo,
+            number: snap.forgeItem,
+            ...(snap.forgeMessageId ? { messageId: snap.forgeMessageId } : {}),
+            ...(snap.forgeMessageSeq ? { messageSeq: snap.forgeMessageSeq } : {}),
+          }
         : null;
     const explorer =
-      scopeMatches && snap.screen === "explorer" ? snap.explorer : null;
-    const agent = scopeMatches && snap.screen === "agent" ? snap.agent : null;
-    const member = scopeMatches && snap.screen === "members" ? snap.member : null;
+      scopeMatches && screen === "explorer" ? snap.explorer : null;
+    const agent = scopeMatches && screen === "agent" ? snap.agent : null;
+    const member = scopeMatches && screen === "members" ? snap.member : null;
 
-    // The entry recorded the LIVE rail, so adopt it verbatim — re-deriving via
-    // sectionForScreen would lose a shell screen's remembered rail.
-    saveViewMode(snap.viewMode);
+    // Shell screens retain the entry's recorded rail. Entries recorded on the
+    // operator rail normalize to the account fallback when node control is
+    // unavailable now (the rail is absent, not disabled — ADR A5/A6).
+    if (!filter.clientMode) saveViewMode(viewMode);
     patch({
       atHome: snap.atHome,
-      screen: snap.screen,
-      viewMode: snap.viewMode,
+      screen,
+      viewMode,
       ...(forge ? { forgeFocus: forge } : {}),
       ...(explorer !== null ? { explorerFocus: explorer } : {}),
       ...(agent ? { agentFocus: agent } : {}),
@@ -1278,12 +1504,14 @@ export function createActions({
     return {
       scope: currentDocTabsScope(),
       atHome: snap.atHome,
-      screen: snap.screen,
-      viewMode: snap.viewMode,
+      screen,
+      viewMode,
       channel: channel ?? before.activeChannel,
       page: page ?? before.activePage,
       forgeRepo: forge ? forge.repo : (before.forgeFocus?.repo ?? before.forgeRepo),
       forgeItem: forge ? forge.number : (before.forgeFocus?.number ?? null),
+      forgeMessageId: forge?.messageId ?? before.forgeFocus?.messageId ?? null,
+      forgeMessageSeq: forge?.messageSeq ?? before.forgeFocus?.messageSeq ?? null,
       explorer: explorer ?? before.explorerFocus,
       agent: agent ?? before.agentFocus,
       member: member ?? before.memberFocus,
@@ -1362,27 +1590,7 @@ export function createActions({
     const adopt = (transport: NodeTransport): void => {
       patch({ onboardingPhase: null });
       setNode(transport);
-      autoBindUserIdentity(transport, target)
-        .then((outcome) => {
-          // First-run hand-off: the name chosen while creating the account
-          // parks in localStorage (names are chain-scoped) and lands here, on
-          // the first adopted node. When the bind landed, the name belongs on
-          // the ACCOUNT (identity SetAccountName) so it travels with the
-          // person across devices. An unbound outcome leaves it parked for the
-          // next connect; there is no second per-node name registry.
-          const pending = loadPendingDisplayName();
-          if (!pending) return;
-          patch({ author: pending });
-          if (outcome !== "bound" && outcome !== "already") return;
-          return identityClient
-            .setAccountName(transport, {
-              displayName: pending,
-              origin: pending,
-            })
-            .then(() => clearPendingDisplayName())
-            .catch(() => {});
-        })
-        .catch(() => {});
+      void autoBindAndFlushName(transport, target).catch(() => {});
     };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
@@ -1411,6 +1619,7 @@ export function createActions({
           ws.workspacePhase(target.id).then((report) => {
             if (stale()) return;
             patch({ onboardingPhase: report });
+            if (report.phase === "promoted") adoptPromotedMember(target.id);
             if (report.phase === "fatal") {
               fail(report.detail ?? "the node failed to join");
               return;
@@ -1483,13 +1692,19 @@ export function createActions({
   // Home layer — with the sidebar navigable at Home, every screen move must
   // drop the layer or the shell would change invisibly underneath it.
   const landOn = (screen: string, extra: Partial<ConsoleState> = {}) => {
-    const section = sectionForScreen(screen);
-    if (section) saveViewMode(section);
+    const filter = moduleFilterOf(getState());
+    const requestedSection = sectionForScreen(screen);
+    const target =
+      requestedSection && !moduleAvailable(screen, filter)
+        ? defaultScreenForSection(requestedSection, filter)
+        : screen;
+    const section = sectionForScreen(target);
+    if (section && !filter.clientMode) saveViewMode(section);
     patch({
-      screen,
+      screen: target,
       atHome: false,
       ...(section ? { viewMode: section } : {}),
-      ...extra,
+      ...(target === screen ? extra : {}),
     });
   };
 
@@ -1514,20 +1729,25 @@ export function createActions({
       patch({ memberFocus: null });
     },
 
-    openForgeItem: (repo, number) => landOn("forge", { forgeFocus: { repo, number } }),
+    openForgeItem: (target) => landOn("forge", { forgeFocus: target }),
 
     openFiles: (path) => landOn("files", { filesFocus: path }),
     applyNavSnapshot,
 
     setViewMode: (mode) => {
-      saveViewMode(mode);
+      // ADR A5/A6: the operator rail is absent, not disabled — refuse to enter
+      // it while node control is unavailable (the toggle is hidden then; this
+      // guards programmatic and persisted paths).
+      if (mode === "operator" && !nodeControlAvailable(getState())) return;
+      if (!isClientMode(getState())) saveViewMode(mode);
       update((prev) => {
+        const filter = moduleFilterOf(prev);
         // Keep the body on the chosen rail: if the current screen belongs to the
         // other rail (or is a shell screen), land on this rail's default surface.
         const screen =
-          sectionForScreen(prev.screen) === mode
+          sectionForScreen(prev.screen) === mode && moduleAvailable(prev.screen, filter)
             ? prev.screen
-            : defaultScreenForSection(mode);
+            : defaultScreenForSection(mode, filter);
         return { viewMode: mode, screen };
       });
     },
@@ -1667,6 +1887,66 @@ export function createActions({
 
     selectChannel: enterChannel,
 
+    focusMessage: (channelId, seq) => {
+      enterChannel(channelId); // loads the channel tail + drops any tag filter
+      landOn("chat", { chatFocusSeq: seq });
+    },
+
+    loadMessageWindow: (channelId, seq) => {
+      const live = getNode();
+      if (!live) return;
+      // Mark the window BEFORE the round trip: it is also ChatView's record
+      // that it already asked for this seq, so a target the window can't
+      // produce is requested once instead of on every re-render.
+      patch({ chatWindow: { channelId, seq } });
+      chatClient
+        .messagesAround(live, channelId, seq)
+        .then((messages) =>
+          update((prev) =>
+            // `chatWindow` is the REQUEST TOKEN, not just a flag: both exits
+            // from a window clear it synchronously while this round trip can
+            // still be in flight — posting (postToChannel) and "jump to latest"
+            // / a rail click (enterChannel). Applying a superseded response
+            // would overwrite `messages` with the old window: the just-posted
+            // message would vanish with no bar left to escape by. A matching
+            // token also means the channel is unchanged — enterChannel is the
+            // only thing that moves `activeChannel`, and it clears the window.
+            isCurrentNode(live) &&
+            prev.chatWindow?.channelId === channelId &&
+            prev.chatWindow.seq === seq
+              ? // re-arm the focus: the row exists now, so ChatView's next pass
+                // scrolls and flashes it exactly as it does for a tail hit.
+                { messages, chatFocusSeq: seq }
+              : {},
+          ),
+        )
+        .catch(() =>
+          update((prev) =>
+            // Same token, same reason: a rejection that lost the race must not
+            // clear a window the reader has since asked for (that window's own
+            // response would then fail the guard above and never land), nor
+            // report an error about a window they already left.
+            isCurrentNode(live) &&
+            prev.chatWindow?.channelId === channelId &&
+            prev.chatWindow.seq === seq
+              ? // A node too old to know the messages_around variant rejects
+                // the query outright. Stay on the tail enterChannel already
+                // loaded and say so — landing on the newest message with no
+                // word is the bug this whole path exists to fix.
+                {
+                  chatWindow: null,
+                  error:
+                    "Couldn't load the history around that message — this node may be too old to page it in.",
+                }
+              : {},
+          ),
+        );
+    },
+
+    clearChatFocus: () => {
+      patch({ chatFocusSeq: null });
+    },
+
     createChannel: (name, postPolicy) => {
       const channelId = channelIdOf(name);
       if (!channelId) return;
@@ -1687,8 +1967,45 @@ export function createActions({
             atMs: Date.now(),
           }),
       ).then((current) => {
-        if (current) enterChannel(channelId);
+        if (!current) return;
+        enterChannel(channelId);
+        // CreateChannel seeds NO members, so a members_only channel would lock
+        // its own creator out (an external author must be a member to post).
+        // Add the creator's own User identity as the first member.
+        if (postPolicy === "members_only") {
+          const { status, author } = getState();
+          void submitMembership(channelId, selfAuthorBytes(status, author), true);
+        }
       });
+    },
+
+    refreshChannelMembers: (channelId) => {
+      void refreshChannelMembers(channelId);
+    },
+
+    setChannelMembership: (channelId, user, member) => {
+      void submitMembership(channelId, user, member);
+    },
+
+    renameChannel: (channelId, name) => {
+      const trimmed = name.trim();
+      if (!channelId || !trimmed) return;
+      void submitTracked(
+        opKey.channel(channelId),
+        (live) =>
+          chatClient.renameChannel(live, { channelId, name: trimmed, origin: getState().author }),
+        (prev) => optimistic.channelRenamed(prev, { channelId, name: trimmed }),
+      );
+    },
+
+    setChannelArchived: (channelId, archived) => {
+      if (!channelId) return;
+      void submitTracked(
+        opKey.channel(channelId),
+        (live) =>
+          chatClient.setChannelArchived(live, { channelId, archived, origin: getState().author }),
+        (prev) => optimistic.channelArchivedSet(prev, { channelId, archived }),
+      );
     },
 
     sendMessage: (body) => {
@@ -2181,54 +2498,114 @@ export function createActions({
       void loadPageThreads();
     },
 
-    addComment: ({ threadId, target, text }) => {
+    // Comment projections stamp LOCAL wall-clock millis (`Date.now()`) — the
+    // embedded daemon's consensus_time timebase, so the refresh confirms the
+    // stamp rather than moving it; a height-stamping validator replaces it on
+    // refresh and the counter renders as no time label (domain/wire.ts).
+    //
+    // Every comment op reloads threads UNCONDITIONALLY after settling: the
+    // generic refresh() never writes `pageThreads`, so a failed submit's
+    // rollback only happens here — gating the reload on success would leave
+    // the failed op's projection ghost-rendered. loadPageThreads self-guards
+    // on the current node and page.
+    //
+    // ponytail: if the node dies mid-op, the rollback reload fails too and the
+    // projection outlives its failed submit (the FinalizationMark shows the
+    // failure; the next successful reload converges). A local undo snapshot in
+    // submitTracked would close that window if dead-node UX ever matters.
+    addComment: ({ threadId, target, text, anchor }) => {
       const clean = text.trim();
       if (!clean) return;
       const tid = threadId ?? crypto.randomUUID();
       const commentId = crypto.randomUUID();
-      const mentions = agentMentions(parseMessageInput(clean, mentionResolver()));
-      submitTracked(opKey.commentThread(tid), (live) =>
-        pagesClient.addComment(live, {
-          threadId: tid,
-          commentId,
+      const mentions = structuredMentions(parseMessageInput(clean, mentionResolver()));
+      submitTracked(
+        opKey.commentThread(tid),
+        (live) => {
+          const submit = () => pagesClient.addComment(live, {
+            threadId: tid,
+            commentId,
+            target,
+            text: clean,
+            anchor,
+            mentions,
+          });
+          return anchor ? inPageOrder(submit) : submit();
+        },
+        (prev) =>
+          optimistic.commentAdded(prev, {
+            threadId: tid,
+            commentId,
+            target,
+            text: clean,
+            anchor,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
+            at: Date.now(),
+          }),
+      ).then(() => loadPageThreads());
+    },
+
+    moveCommentThread: ({ threadId, target, anchor }) => {
+      const moved = submitTracked(
+        opKey.commentThread(threadId),
+        (live) => inPageOrder(() => pagesClient.moveCommentThread(live, {
+          threadId,
           target,
-          text: clean,
-          mentions,
-        }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+          anchor,
+        })),
+        (prev) => optimistic.commentThreadMoved(prev, threadId, target, anchor),
+      );
+      void moved.then(() => loadPageThreads());
+      return moved;
     },
 
     editComment: ({ commentId, text }) => {
       const clean = text.trim();
       if (!clean) return;
-      submitTracked(opKey.comment(commentId), (live) =>
-        pagesClient.editComment(live, { commentId, text: clean }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      const previous = getState().pageThreads
+        .flatMap((group) => group.threads)
+        .flatMap((view) => view.comments)
+        .find((comment) => comment.id === commentId)?.text;
+      const resolver = mentionResolver();
+      const mentions = previous
+        ? addedStructuredMentions(
+            parseMessageInput(previous, resolver),
+            parseMessageInput(clean, resolver),
+          )
+        : structuredMentions(parseMessageInput(clean, resolver));
+      submitTracked(
+        opKey.comment(commentId),
+        (live) => pagesClient.editComment(live, { commentId, text: clean, mentions }),
+        (prev) =>
+          optimistic.commentEdited(prev, commentId, clean, Date.now()),
+      ).then(() => loadPageThreads());
     },
 
     deleteComment: (commentId) => {
-      submitTracked(opKey.comment(commentId), (live) =>
-        pagesClient.deleteComment(live, commentId),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.comment(commentId),
+        (live) => pagesClient.deleteComment(live, commentId),
+        (prev) => optimistic.commentDeleted(prev, commentId),
+      ).then(() => loadPageThreads());
     },
 
     resolveThread: ({ threadId, resolved }) => {
-      submitTracked(opKey.commentThread(threadId), (live) =>
-        pagesClient.resolveThread(live, { threadId, resolved }),
-      ).then((current) => {
-        if (current) return loadPageThreads();
-      });
+      submitTracked(
+        opKey.commentThread(threadId),
+        (live) => pagesClient.resolveThread(live, { threadId, resolved }),
+        (prev) =>
+          optimistic.threadResolved(
+            prev,
+            threadId,
+            resolved,
+            selfAuthorBytes(prev.status, prev.author),
+          ),
+      ).then(() => loadPageThreads());
     },
 
     // Every page-block write goes out through `inPageOrder` — the editor's ops
     // are anchor-chained and the wire has no ordering of its own.
-    insertPageBlock: ({ blockId, parent, after, kind, text }) => {
+    insertPageBlock: ({ blockId, parent, after, kind, text, marks, quiet }) => {
       const page = getState().activePage;
       if (!page) return Promise.resolve(false);
       return submitTracked(
@@ -2238,24 +2615,48 @@ export function createActions({
             pagesClient.insertBlock(live, {
               parent,
               after,
-              block: { id: blockId, kind, text },
+              block: { id: blockId, kind, text, ...(marks ? { marks } : {}) },
             }),
           ),
         (prev) =>
           optimistic.pageBlockInserted(prev, {
             parent,
             after,
-            block: { id: blockId, parent, page, kind, text, checked: false, children: [] },
+            block: {
+              id: blockId,
+              parent,
+              page,
+              kind,
+              text,
+              ...(marks ? { marks } : {}),
+              checked: false,
+              children: [],
+            },
           }),
+        quiet,
       );
     },
 
-    updatePageBlockText: ({ blockId, text }) =>
+    updatePageBlockText: ({ blockId, text, marks }) =>
       submitTracked(
         opKey.pageBlock(blockId),
-        (live) => inPageOrder(() => pagesClient.updateText(live, { blockId, text })),
-        (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
+        (live) => inPageOrder(() => pagesClient.updateText(live, { blockId, text, marks })),
+        (prev) => optimistic.pageBlockPatched(prev, blockId, { text, ...(marks ? { marks } : {}) }),
       ),
+
+    setPageBlockSpanMark: ({ blockId, start, end, kind, active }) => {
+      void submitTracked(
+        opKey.pageBlock(blockId),
+        (live) => inPageOrder(() => pagesClient.setSpanMark(live, {
+          blockId,
+          start,
+          end,
+          kind,
+          active,
+        })),
+        (prev) => optimistic.pageSpanMarked(prev, blockId, { start, end }, kind, active),
+      );
+    },
 
     setPageBlockKind: ({ blockId, kind }) => {
       void submitTracked(
@@ -2290,6 +2691,8 @@ export function createActions({
     },
 
     // ── Agents ──
+    refreshCapabilities,
+
     registerAgent: ({ displayName, agentId, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
       const name = displayName.trim();
@@ -2502,6 +2905,36 @@ export function createActions({
       );
     },
 
+    proposeScheduleUpgrade: ({ name, toVersion, activationHeight }) => {
+      const label = name.trim();
+      if (!label) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: {
+            schedule_upgrade: {
+              name: label,
+              activation_height: activationHeight,
+              to_version: toVersion,
+            },
+          },
+        }),
+      );
+    },
+
+    proposeCancelUpgrade: (name) => {
+      const label = name.trim();
+      if (!label) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: { cancel_upgrade: { name: label } },
+        }),
+      );
+    },
+
     voteProposal: (proposalId, approve) => {
       if (!proposalId) return;
       submitTracked(opKey.proposal(proposalId), (live) =>
@@ -2658,8 +3091,12 @@ export function createActions({
       Promise.resolve()
         .then(() => ws.joinWorkspace(name.trim(), blob.trim()))
         .then((joined) => {
+          // the join consumed the staged .pending-join identity — drop the
+          // displayed join code so a later join re-stages a fresh key
+          // instead of showing one the next workspace will not hold.
           update((prev) => ({
             workspaces: mergeWorkspace(prev.workspaces, joined),
+            joinCode: null,
           }));
           return connectActive(joined);
         })
@@ -2697,6 +3134,7 @@ export function createActions({
       Promise.resolve()
         .then(() => ws.workspacePhase(target.id))
         .then((report) => {
+          if (report.phase === "promoted") adoptPromotedMember(target.id);
           if (report.phase === "fatal") {
             fail(report.detail ?? `"${target.name}" failed to join its network`);
             return;
@@ -2717,38 +3155,61 @@ export function createActions({
     connectRemote: (rawUrl) => {
       const url = bootstrap.normalizeNodeUrl(rawUrl);
       if (!url) return;
-      // Supersede any in-flight workspace connect/poll loop (joiner tick).
-      nextBootGeneration();
-      // Drop the old node + its projections so the switch shows no stale state
-      // (mirrors selectWorkspace's reset).
-      setNode(null);
-      patch({
-        ...resetForNodeChange(),
-        workspace: null,
-        openTabs: loadDocTabs(docTabsScope(null, url)),
-        onboardingPhase: null,
-        onboardingBusy: false,
-        inviteBlob: null,
-        // A remote node is unmanaged — dialed directly, never spawned here.
-        nodeUrl: url,
-        managed: false,
-        needsOnboarding: false,
-        atHome: false,
-        error: null,
-      });
-      // Remember it for next launch, then dial. The hydrate effect (keyed on the
-      // node) runs refresh(); an unreachable remote simply reads as disconnected
-      // (the "no running node" surface) instead of throwing.
-      saveRemoteUrl(url);
-      setNode(bootstrap.connectRemote(url).transport);
+      const gen = nextBootGeneration();
+      const transport = bootstrap.connectRemote(url).transport;
+      patch({ onboardingBusy: true, error: null });
+      Promise.resolve()
+        .then(() => transport.status())
+        .then(
+          () => {
+            if (isBootGenerationStale(gen)) return;
+            // Commit the switch only after the remote proves it is a Ducktape
+            // node. A failed dial leaves the current workspace/picker intact.
+            setNode(null);
+            patch({
+              ...resetForNodeChange(),
+              screen: "chat",
+              viewMode: "user",
+              workspace: null,
+              openTabs: loadDocTabs(docTabsScope(null, url)),
+              onboardingPhase: null,
+              onboardingBusy: false,
+              inviteBlob: null,
+              nodeUrl: url,
+              managed: false,
+              needsOnboarding: false,
+              atHome: false,
+              error: null,
+            });
+            saveRemoteUrl(url);
+            setNode(transport);
+          },
+          (err) => {
+            if (isBootGenerationStale(gen)) return;
+            patch({ onboardingBusy: false, needsOnboarding: true });
+            fail(err);
+          },
+        );
     },
 
-    revealInvite: () => {
-      const target = getState().workspace;
-      if (!target) return;
+    revealInvite: (targetCode) => {
+      const active = getState().workspace;
+      if (!active) return;
+      const code = targetCode.trim();
+      if (!code) {
+        fail("paste the invitee's join code — every invite is locked to it");
+        return;
+      }
       Promise.resolve()
-        .then(() => ws.inviteBlob(target.id))
-        .then((blob) => patch({ inviteBlob: blob }))
+        .then(() => ws.inviteBlob(active.id, code))
+        .then((forms) => patch({ inviteBlob: forms.blob, inviteShort: forms.short }))
+        .catch(fail);
+    },
+
+    joinCode: () => {
+      Promise.resolve()
+        .then(() => ws.joinCode())
+        .then((code) => patch({ joinCode: code }))
         .catch(fail);
     },
 
@@ -2903,5 +3364,25 @@ export function createActions({
       ),
 
     connectActive,
+
+    identityUnlocked: () =>
+      Promise.resolve()
+        .then(() => {
+          const live = getNode();
+          const { workspace } = getState();
+          // Nothing adopted yet: the adopt() that eventually lands runs its
+          // own bind pass against the now-signable key — no retry needed.
+          if (!live || !workspace) return;
+          return autoBindAndFlushName(live, workspace).then((outcome) =>
+            // A landed bind repaints Owned-by/Members from the refreshed
+            // identity projection now, not on the next block tick.
+            outcome === "bound" || outcome === "already"
+              ? refresh().then(() => undefined)
+              : undefined,
+          );
+        })
+        // Same contract as the connect-time pass: a failed retry is invisible;
+        // the next unlock or connect retries again.
+        .catch(() => {}),
   };
 }

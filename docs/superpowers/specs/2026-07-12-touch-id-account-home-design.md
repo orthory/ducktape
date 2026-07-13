@@ -85,6 +85,31 @@ SE-protected and prompts for Touch ID on read. `BiometryCurrentSet` (not
 `BiometryAny`) means a change to the enrolled fingerprint set invalidates the
 item — a deliberate security default whose fallback is the recovery phrase.
 
+> **Amended 2026-07-13:** the ACL is now `kSecAccessControlUserPresence` —
+> biometry when the sensor is usable, the Mac's login password otherwise.
+> `BiometryCurrentSet` proved biometric-only in practice: a closed lid
+> (clamshell) made the item unreadable with no password fallback, and a
+> fingerprint-set change invalidated it permanently. User-presence keeps the
+> 24-word phrase as the recovery of last resort while restoring the OS
+> password fallback; `touchid_unlock` rewrites pre-switch items under the new
+> ACL on their next successful read, and a dismissed sheet now rejects with
+> `touchid-canceled` instead of masquerading as `touchid-unavailable`.
+
+> **Amended 2026-07-13 (second):** live probing on real macOS 15.6 showed the
+> ACL path **never worked in an unentitled build**: `SecItemAdd` with any
+> `kSecAttrAccessControl` requires the data-protection keychain, which returns
+> errSecMissingEntitlement (-34018) unless the binary is signed with an
+> application-identifier entitlement (the repo's `Entitlements.plist` carries
+> camera/mic only, and dev/ad-hoc builds can never carry it — AMFI kills
+> ad-hoc binaries claiming it). Since `TouchIdCreateFlow` deliberately
+> swallows enroll errors, this surfaced as "Touch ID is unavailable" at the
+> next unlock. Enroll is now a two-rung ladder: the ACL item where possible,
+> else a plain login-keychain item under `vault-passphrase.plain` whose read
+> is gated by an `LAContext` `deviceOwnerAuthentication` sheet (same
+> Touch-ID-or-password UX, no entitlement needed). A successful unlock
+> re-enrolls at the best rung, so items self-upgrade when a build gains
+> entitlements.
+
 **Unlock** (`touchid_unlock`): `SecItemCopyMatching` triggers the OS Touch ID
 prompt and releases the passphrase, which feeds the **existing**
 `user_identity_unlock` path (passphrase over stdin, never argv/env) and caches

@@ -1,0 +1,22 @@
+[package]
+name = "clients"
+edition.workspace = true
+version.workspace = true
+
+# the client ACL as replicated state: a single ed25519 key set granting thin
+# clients SUBMIT authorization only — NOT consensus membership, NOT statesync
+# standing. structurally separate from valset (the sync door reads valset, never
+# this) so a client can never obtain sync standing. clones valset's single-set
+# discipline for ONE set. depends only on sdk + serde (+ sha2 for the
+# state-based root, commonware-cryptography/-codec for ed25519 key validation).
+[dependencies]
+sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }

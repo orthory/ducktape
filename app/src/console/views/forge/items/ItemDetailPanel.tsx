@@ -40,11 +40,15 @@ export function ItemDetailPanel({
   number,
   onBack,
   backLabel,
+  messageId,
+  messageSeq,
 }: {
   repo: string;
   number: number;
   onBack: () => void;
   backLabel: string;
+  messageId?: string;
+  messageSeq?: number;
 }) {
   const { state, actions } = useDucktape();
   const [detail, setDetail] = useState<ForgeItemDetail | null>(null);
@@ -72,6 +76,10 @@ export function ItemDetailPanel({
     setEditing(false);
     void refetch();
   }, [refetch]);
+
+  useEffect(() => {
+    if (messageId || messageSeq) setPrTab("conversation");
+  }, [messageId, messageSeq]);
 
   const authorLabel = useAuthorName(detail?.author ?? "system");
 
@@ -219,7 +227,7 @@ export function ItemDetailPanel({
       {!isPr && (
         <>
           {body}
-          <Discussion channelId={detail.channel_id} />
+          <Discussion channelId={detail.channel_id} messageId={messageId} messageSeq={messageSeq} />
         </>
       )}
 
@@ -243,7 +251,7 @@ export function ItemDetailPanel({
             <>
               {body}
               <MergeBox repo={repo} detail={detail} onChanged={() => void refetch()} />
-              <Discussion channelId={detail.channel_id} />
+              <Discussion channelId={detail.channel_id} messageId={messageId} messageSeq={messageSeq} />
             </>
           )}
           {prTab === "commits" && <PrCommits repo={repo} detail={detail} />}

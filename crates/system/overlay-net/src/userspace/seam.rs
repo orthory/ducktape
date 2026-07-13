@@ -11,9 +11,10 @@
 //!
 //! the adapter types deliberately mirror commonware's own tokio arm, because
 //! consumers above the seam were written against its semantics: sends and
-//! recvs carry the tokio arm's 60s default timeouts, a cancelled (dropped
-//! mid-flight) send or recv poisons the half permanently, and `peek` answers
-//! from a `BufReader`'s already-buffered bytes without performing I/O.
+//! recvs carry the same [`IO_TIMEOUT`] the node boots the OS arm with, a
+//! cancelled (dropped mid-flight) send or recv poisons the half permanently,
+//! and `peek` answers from a `BufReader`'s already-buffered bytes without
+//! performing I/O.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -25,11 +26,19 @@ use tokio::time::timeout;
 use super::sockets::{VirtualTcpListener, VirtualTcpStream};
 use super::stack::{LISTEN_BACKLOG, StackSlot, accept_via_slot};
 
-/// the tokio network arm's default read/write timeouts — mesh connections
-/// carried by the OS arm already live under exactly these, so the virtual
-/// arm keeps the same contract (the p2p layer's keepalives are calibrated
-/// against them).
-const IO_TIMEOUT: Duration = Duration::from_secs(60);
+/// the per-read/write deadline on every mesh socket, virtual and OS arm
+/// alike (the node boots commonware's tokio runtime with this same value —
+/// `constants::MESH_IO_TIMEOUT` aliases this const so the two arms cannot
+/// drift). this deadline is the ONLY detector for a half-open connection: a
+/// laptop that slept, roamed Wi-Fi, or lost its NAT mapping keeps a
+/// silently-dead socket until a read times out, and with 1s blocks every
+/// such event freezes block delivery for the full window. commonware's
+/// default is 60s; the discovery mesh pings every connection each 5s (the
+/// `local` preset's bit-vec gossip), so 15s = three missed keepalives —
+/// ample against jitter, 4x faster to heal. the same deadline bounds writes:
+/// a max-size 2 MiB message must move at ~1.1 Mbps or the connection is
+/// treated as dead.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// match the tokio arm's read buffer (64 KiB): `peek` can only see what the
 /// buffer holds, so capacity is part of the peek contract, not just a perf

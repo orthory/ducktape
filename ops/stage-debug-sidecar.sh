@@ -13,7 +13,7 @@ esac
 
 src="$root/target/debug/ducktape-node${suffix}"
 if [ ! -x "$src" ]; then
-  "$root/ops/build-with.sh" cargo build -p node-bin --manifest-path "$root/Cargo.toml"
+  cargo build -p node-bin --manifest-path "$root/Cargo.toml"
 fi
 
 dest="$root/app/src-tauri/binaries/ducktape-node-${triple}${suffix}"

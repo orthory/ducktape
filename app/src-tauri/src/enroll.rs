@@ -14,7 +14,8 @@
 //! the desktop `user.key` signing the add-member cert in the UI, NOT anything
 //! this server does. So a rogue peer on the LAN can at most offer a candidate
 //! key the user must still approve. The token, the bind-only-during-enrollment
-//! lifetime, and the strict input validation are defense-in-depth on top.
+//! lifetime, the advertised-interface-only bind, and the strict input
+//! validation are defense-in-depth on top.
 
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
@@ -25,8 +26,8 @@ use tiny_http::{Method, Request, Response, Server};
 
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 use crate::lan_http::{
-    MAX_REQUEST_BODY_BYTES, html, is_hex, js, json, lan_ipv4, random_token, read_json, serve,
-    status, token_matches,
+    MAX_REQUEST_BODY_BYTES, html, is_hex, js, json, lan_ipv4, lan_server, random_token, read_json,
+    serve, status, token_matches,
 };
 
 // ── session state ────────────────────────────────────────
@@ -217,12 +218,7 @@ pub fn enroll_start(
     }
     let token = random_token()?;
     let ip = lan_ipv4()?;
-    let server = Arc::new(Server::http("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?);
-    let port = server
-        .server_addr()
-        .to_ip()
-        .ok_or("server has no ip address")?
-        .port();
+    let (server, port) = lan_server(ip)?;
 
     {
         let mut guard = state();

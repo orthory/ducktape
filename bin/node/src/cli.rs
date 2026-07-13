@@ -31,6 +31,7 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "promote" => cmd_promote(args),
         "resident-remove" => cmd_resident_remove(args),
         "join-requests" => cmd_join_requests(args),
+        "join-state" => cmd_join_state(args),
         "member-remove" => cmd_member_remove(args),
         "member-leave" => cmd_member_leave(args),
         "member-status" => cmd_member_status(args),
@@ -61,19 +62,29 @@ fn config_path(flags: &std::collections::BTreeMap<String, String>) -> Result<Pat
     ))
 }
 
-/// `keygen [--out <path>]` — generate (or reuse) a persisted ed25519 identity.
-/// pubkey on stdout (scriptable); provenance on stderr.
+/// `keygen [--out <path>] [--dir <dir>]` — generate (or reuse) a persisted
+/// ed25519 identity. pubkey on stdout (scriptable); provenance on stderr.
+/// `--dir <dir>` mints (or reuses) `<dir>/identity.key`, creating the dir: this
+/// is the JOIN CODE an invitee hands the inviter so the invite can be locked to
+/// this key before the workspace joins anything.
 fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    let out = PathBuf::from(
-        flags
-            .get("out")
-            .map(String::as_str)
-            .unwrap_or("identity.key"),
-    );
+    let out = match flags.get("dir") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            dir.join("identity.key")
+        }
+        None => PathBuf::from(
+            flags
+                .get("out")
+                .map(String::as_str)
+                .unwrap_or("identity.key"),
+        ),
+    };
     let (key, generated) = config::load_or_generate_identity(&out)?;
     println!("{}", hex_bytes(key.public_key().as_ref()));
     eprintln!(
@@ -196,7 +207,11 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// this member's identity. the joiner's node redeems the token automatically
 /// (governance `Redeem`) — no member approval step follows.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
+    // `--short` is a boolean flag; parse_flags treats every `--flag` as taking
+    // a value, so lift it out before parsing the rest.
+    let short = args.iter().any(|a| a == "--short");
+    let rest: Vec<String> = args.iter().filter(|a| a.as_str() != "--short").cloned().collect();
+    let (pos, flags) = parse_flags(&rest)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
@@ -207,6 +222,13 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
+    // every invite is locked to the ONE key it admits — no bearer invites.
+    let target = flags.get("target").ok_or(
+        "--target <invitee-pubkey-hex> is required: every invite is locked to \
+         the person it admits. the invitee gets their code from the app's \
+         join screen or `ducktape-node keygen --dir <workspace>`",
+    )?;
+    let target = config::decode_key(target)?;
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
@@ -365,18 +387,60 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .expect("clock is past the epoch")
         .as_secs()
         + ttl_days * 24 * 60 * 60;
-    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
-    println!(
-        "{}",
-        config::encode_invite(
-            &invite_descriptor,
-            &token,
-            wireguard.as_ref(),
-            &fronts,
-            expires,
-            &key
-        )?
+    // the expiry now lives INSIDE the token (signed), not as a separate blob
+    // field; the token is minted against the invitee's key with Resident role.
+    let token = config::mint_invite_token(
+        &key,
+        descriptor.genesis_namespace().as_bytes(),
+        &target,
+        config::InviteRole::Resident,
+        expires,
     );
+    let blob_string = config::encode_invite(
+        &invite_descriptor,
+        &token,
+        wireguard.as_ref(),
+        &fronts,
+        &key,
+    )?;
+    println!("{blob_string}");
+
+    if short {
+        // publish the full signed blob to the ambient coordinator by content
+        // id, then print the short URL as the LAST line (the app reads the last
+        // line). This is the SAME coordinator the reachability plane registers
+        // with — config value or the shipped default.
+        let coord = config::coordinator_socket_addr(raw.primary_coordinator.as_deref())?
+            .ok_or("--short needs a primary coordinator (config or default)")?;
+        let raw_bytes = config::invite_blob_bytes(&blob_string)?;
+        let signer = key.clone();
+        // the shelf id is a RANDOM owner-owned lookup key, not a content hash
+        // (a 4-byte content hash is brute-forceable → invite substitution). The
+        // coordinator refuses an id another owner already holds, so on refusal
+        // we re-mint a fresh id and retry a bounded number of times.
+        let published = tokio::runtime::Runtime::new()?.block_on(async move {
+            let client = nat_traversal::NatClient::bind_multi_auth(
+                nat_traversal::NodeKey(own),
+                vec![coord],
+                signer,
+                None,
+            )
+            .await?;
+            for _ in 0..4 {
+                let id = config::random_invite_id();
+                if client.invite_put(id, expires, raw_bytes.clone()).await? {
+                    return Ok::<Option<_>, std::io::Error>(Some(id));
+                }
+            }
+            Ok(None)
+        })?;
+        let Some(id) = published else {
+            return Err(
+                "coordinator refused the short invite — try again (or share the full blob)".into(),
+            );
+        };
+        println!("{}", config::short_invite_url(&descriptor.chain_id, &id));
+    }
     Ok(())
 }
 
@@ -576,6 +640,36 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .get("join_requests")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]))
+    );
+    Ok(())
+}
+
+/// `join-state [--config node.toml]` — the node's AUTHORITATIVE onboarding
+/// phase over its local rpc: `parked | admitted | synced | promoted`, derived
+/// from committed standing (not log markers), so it is restart-proof. the
+/// desktop app reads this instead of parsing daemon.log, which loses the
+/// admission markers across a restart and mis-reads a re-syncing resident as
+/// unjoined. prints the `join_state` projection as JSON.
+fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let cfg_path = config_path(&flags)?;
+    let resolved = config::resolve(&cfg_path)?;
+    let addr = resolved
+        .rpc_listen
+        .ok_or("join-state reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let reply = rpc_call(&addr, &serde_json::json!({ "cmd": "join_state" }))?;
+    if reply["ok"] != true {
+        return Err(format!("join-state: {}", reply["error"]).into());
+    }
+    println!(
+        "{}",
+        reply
+            .get("join_state")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(null))
     );
     Ok(())
 }
@@ -1176,10 +1270,72 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [blob] = pos.as_slice() else {
         return Err("join needs exactly one <invite blob>".into());
     };
-    let invite = config::decode_invite(blob)?;
+    // a `🦆://<name>/<id>` short invite: fetch the full signed blob back from
+    // the ambient coordinator, confirm it is for the network the URL names,
+    // then feed the normal join path. A full blob passes through untouched.
+    let blob: String = match config::parse_short_invite(blob) {
+        Some((name, id)) => {
+            let coord = config::coordinator_socket_addr(
+                flags.get("primary-coordinator").map(String::as_str),
+            )?
+            .ok_or(
+                "this short invite needs a coordinator, but coordination is disabled here — \
+                 paste the full invite blob",
+            )?;
+            let raw = tokio::runtime::Runtime::new()?
+                .block_on(async move {
+                    // a throwaway signed identity: the workspace identity does
+                    // not exist yet and the fetch is read-only.
+                    let signer = config::ephemeral_signer();
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(signer.public_key().as_ref());
+                    let client = nat_traversal::NatClient::bind_multi_auth(
+                        nat_traversal::NodeKey(k),
+                        vec![coord],
+                        signer,
+                        None,
+                    )
+                    .await?;
+                    client.invite_fetch(id).await
+                })?
+                .ok_or(
+                    "this short invite is not on the coordinator (expired, evicted, or a \
+                     coordinator restart) — ask the inviter to reveal it again or paste the \
+                     full blob",
+                )?;
+            let fetched = config::wrap_invite_bytes(&raw);
+            // verify the fetched blob is for the network the URL names before
+            // trusting anything else about it (envelope/token verify follows).
+            let invite = config::decode_invite(&fetched)?;
+            let got_name = invite.descriptor.chain_id.split('#').next().unwrap_or("");
+            if got_name != name {
+                return Err(format!(
+                    "short invite names network {name:?} but the coordinator returned a blob \
+                     for {got_name:?} — refusing"
+                )
+                .into());
+            }
+            fetched
+        }
+        None => blob.clone(),
+    };
+    let invite = config::decode_invite(&blob)?;
     let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
+    // mint (or reuse) the identity FIRST — before touching the directory shape —
+    // so a target mismatch aborts the join loudly, right here, instead of
+    // parking a node that will only ever be refused at the lobby.
+    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+    let me_hex = hex_bytes(key.public_key().as_ref());
+    if invite.token.target != key.public_key() {
+        return Err(format!(
+            "this invite is locked to a different key.\n  invite target: {}\n  this workspace: {me_hex}\n\
+             hand the inviter THIS key (the join code) and ask for a fresh invite.",
+            hex_bytes(invite.token.target.as_ref()),
+        )
+        .into());
+    }
     config::guard_join_descriptor(&dir, &descriptor)?;
     // plumbing merges: explicit flags win, an existing node.toml's values
     // (network- or dev-shape) survive, defaults fill the rest. computed
@@ -1258,8 +1414,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     descriptor.save(&dir.join("network.toml"))?;
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
-    let me_hex = hex_bytes(key.public_key().as_ref());
+    // identity was minted + target-checked at the top of the join.
     config::write_node_toml(&dir, &plumbing)?;
     // the capability the joining node redeems automatically; a re-join with a
     // fresh invite replaces a stale/spent one.

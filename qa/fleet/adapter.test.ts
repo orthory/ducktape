@@ -41,6 +41,16 @@ test('Fleet config is CEF-only and points at owned hooks', async () => {
   for (const text of [qaSkill, upgradeSkill, opsReadme]) {
     expect(text).not.toContain('node_modules/.bin/tauri-agent-fleet')
   }
+  expect(qaSkill).toContain('ops/smoke-macos-sandbox.sh')
+  expect(opsReadme).toContain('ops/smoke-macos-sandbox.sh')
+  for (const script of ['ops/smoke-macos-sandbox.sh', 'qa/fleet/fail-next-node-start.sh']) {
+    expect(Bun.spawnSync(['bash', '-n', join(root, script)]).exitCode).toBe(0)
+  }
+  const cleanupHook = await Bun.file(join(root, 'qa/fleet/cleanup-instance.ts')).text()
+  expect(cleanupHook).toContain("process.platform === 'darwin'")
+  expect(cleanupHook).toContain("Bun.spawnSync(['/bin/kill'")
+  const sandboxSmoke = await Bun.file(join(root, 'ops/smoke-macos-sandbox.sh')).text()
+  expect(sandboxSmoke).toContain('bun install --frozen-lockfile')
   expect(await Bun.file(join(root, 'app/src/main.tsx')).text()).toContain(
     'import.meta.env.VITE_TAURI_AGENT === "1"'
   )
@@ -112,6 +122,15 @@ test('cleanup hook terminates only the recorded instance node group on this plat
       cwd: root,
       env: { ...process.env, FLEET_ARTIFACT_DIR: artifact, FLEET_HOME: home, FLEET_INSTANCE_ID: 'target' }
     }).exitCode).toBe(0)
+
+    await rm(artifact, { recursive: true, force: true })
+    await writeFile(join(home, '.ducktape/workspaces/target/node.pid'), '2147483647')
+    const stale = Bun.spawnSync(['bun', join(root, 'qa/fleet/cleanup-instance.ts')], {
+      cwd: root,
+      env: { ...process.env, FLEET_ARTIFACT_DIR: artifact, FLEET_HOME: home, FLEET_INSTANCE_ID: 'target' }
+    })
+    expect(stale.exitCode, stale.stderr.toString()).toBe(0)
+    expect(await Bun.file(join(home, '.ducktape/workspaces/target/node.pid')).exists()).toBe(false)
   } finally {
     kill(target)
     kill(sibling)
@@ -147,11 +166,47 @@ esac
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     const registry = JSON.parse(await readFile(join(home, '.ducktape/registry.json'), 'utf8'))
     expect(registry.active).toBe('smoke-1234')
+    expect(registry.mnemonicConfirmed).toBe(false)
+    expect(await Bun.file(join(home, '.ducktape/user.key')).exists()).toBe(false)
     expect(registry.workspaces[0]).toMatchObject({ id: 'smoke-1234', chainId: 'test-chain', pubkey: 'test-pubkey', founder: true, member: true })
     const ports = Object.values(registry.workspaces[0].ports) as number[]
     expect(new Set(ports).size).toBe(3)
     expect(ports.every((port) => Number.isInteger(port) && port > 0 && port <= 65_535)).toBe(true)
     expect((await stat(join(home, '.ducktape/registry.json'))).mode & 0o777).toBe(0o600)
     expect((await stat(join(home, '.ducktape/workspaces/smoke-1234'))).mode & 0o777).toBe(0o700)
+  } finally { await rm(scratch, { recursive: true, force: true }) }
+})
+
+test('instance hook can opt in to a locked throwaway QA identity', async () => {
+  const scratch = await mkdtemp(join(tmpdir(), 'ducktape-fleet-identity-'))
+  try {
+    const artifact = join(scratch, 'artifact')
+    const home = join(scratch, 'home')
+    const node = join(artifact, 'bin', 'ducktape-node')
+    await mkdir(join(artifact, 'bin'), { recursive: true })
+    await mkdir(home)
+    await writeFile(node, `#!/usr/bin/env bash
+set -eu
+case "$1" in
+  init) echo test-chain ;;
+  keygen) while [ "$1" != "--out" ]; do shift; done; touch "$2"; echo test-pubkey ;;
+  user-key) while [ "$1" != "--out" ]; do shift; done; read -r password; printf '%s' "$password" > "$2"; echo mnemonic; echo user-pubkey ;;
+esac
+`)
+    await chmod(node, 0o700)
+    const result = Bun.spawnSync(['bash', join(root, 'qa/fleet/prepare-instance.sh')], {
+      cwd: root,
+      env: {
+        ...process.env,
+        FLEET_ARTIFACT_DIR: artifact,
+        FLEET_HOME: home,
+        FLEET_INSTANCE_ID: 'identity-1234',
+        FLEET_QA_IDENTITY_PASSWORD: 'fleet-test-password'
+      }
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    const registry = JSON.parse(await readFile(join(home, '.ducktape/registry.json'), 'utf8'))
+    expect(registry.mnemonicConfirmed).toBe(true)
+    expect(await readFile(join(home, '.ducktape/user.key'), 'utf8')).toBe('fleet-test-password')
   } finally { await rm(scratch, { recursive: true, force: true }) }
 })

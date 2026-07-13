@@ -161,6 +161,7 @@ describe("title bar workspace name", () => {
 
     await waitFor(() => expect(screen.getByLabelText("Search")).toBeTruthy());
     expect(screen.getByText("ducktape")).toBeTruthy();
+    expect(screen.getByText("USER")).toBeTruthy();
   });
 });
 
@@ -209,9 +210,11 @@ describe("title bar back/forward", () => {
     expect(button("Back").disabled).toBe(true);
     expect(button("Forward").disabled).toBe(true);
 
-    // a screen switch pushes an entry: back opens up.
+    // a screen switch pushes an entry: back opens up. (files, not members:
+    // this web harness is a remote client, and members is off the client rail
+    // until the ADR's A3 data plane lands.)
     await act(async () => {
-      actions!.setScreen("members");
+      actions!.setScreen("files");
     });
     await waitFor(() => expect(button("Back").disabled).toBe(false));
     expect(button("Forward").disabled).toBe(true);

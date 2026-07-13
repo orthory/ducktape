@@ -1,6 +1,6 @@
 //! The WS client of the node's typed multiplexed `/v1/ws` stream (PR #306).
 //!
-//! Connects, subscribes the four notifier topics, maps wire frames onto the
+//! Connects, subscribes the notifier topics, maps wire frames onto the
 //! engine's [`Frame`], and drives [`Engine::handle`]. App start and node-url
 //! changes subscribe live-from-tip (no resume — the no-replay guarantee);
 //! only a transient in-session reconnect resumes from the engine's in-memory
@@ -20,8 +20,9 @@ use tokio_tungstenite::tungstenite::Message;
 use super::engine::{Engine, Frame, Sink};
 
 /// The notifier's fixed topic set — subscribed once per connection.
-pub const TOPICS: [&str; 4] = [
+pub const TOPICS: [&str; 5] = [
     "module:chat",
+    "module:pages",
     "module:runs",
     "module:forge",
     "module:governance",
@@ -515,7 +516,13 @@ mod tests {
         assert_eq!(frame["op"], "subscribe");
         assert_eq!(
             frame["topics"],
-            json!(["module:chat", "module:runs", "module:forge", "module:governance"])
+            json!([
+                "module:chat",
+                "module:pages",
+                "module:runs",
+                "module:forge",
+                "module:governance"
+            ])
         );
         assert!(
             frame.get("resume").is_none(),

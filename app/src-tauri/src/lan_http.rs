@@ -24,6 +24,21 @@ pub fn lan_ipv4() -> Result<IpAddr, String> {
         .ip())
 }
 
+/// bind an ephemeral relay server on `ip` ONLY — never the wildcard. the QR
+/// advertises exactly one interface's address, and a wildcard bind would also
+/// accept from every interface it never advertised (overlay, VPN, container
+/// bridges); the advertised-interface bind keeps reachability exactly equal to
+/// what the QR says.
+pub fn lan_server(ip: IpAddr) -> Result<(Arc<Server>, u16), String> {
+    let server = Arc::new(Server::http((ip, 0)).map_err(|e| format!("bind: {e}"))?);
+    let port = server
+        .server_addr()
+        .to_ip()
+        .ok_or("server has no ip address")?
+        .port();
+    Ok((server, port))
+}
+
 /// a 128-bit hex session token from OS randomness.
 pub fn random_token() -> Result<String, String> {
     let mut buf = [0u8; 16];
@@ -118,5 +133,34 @@ mod tests {
         assert!(!token_matches("0123456789abcdef", "0123456789abcdee"));
         assert!(!token_matches("0123456789abcdef", "0123456789abcdef00"));
         assert!(!token_matches("0123456789abcdef", "01234567"));
+    }
+
+    #[test]
+    fn lan_server_binds_the_given_ip_on_an_ephemeral_port() {
+        use std::net::{Ipv4Addr, TcpStream};
+
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (server, port) = lan_server(ip).expect("bind loopback");
+        assert_ne!(port, 0);
+        assert_eq!(server.server_addr().to_ip().expect("ip").ip(), ip);
+        TcpStream::connect((ip, port)).expect("bound address accepts");
+    }
+
+    /// the posture mule: the relay listens on the advertised interface ONLY.
+    /// needs a routable non-loopback interface, so it is opt-in:
+    ///   cargo test -p ducktape-desktop lan_server_is_unreachable -- --ignored
+    #[test]
+    #[ignore = "needs a routable non-loopback interface"]
+    fn lan_server_is_unreachable_off_the_advertised_interface() {
+        use std::net::TcpStream;
+
+        let ip = lan_ipv4().expect("routable interface");
+        assert!(!ip.is_loopback(), "host has no non-loopback route");
+        let (_server, port) = lan_server(ip).expect("bind advertised interface");
+        // reachable exactly where the QR points…
+        TcpStream::connect((ip, port)).expect("advertised address accepts");
+        // …and refused on any interface the QR never advertised (loopback
+        // stands in for overlay/VPN/bridge addresses).
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }

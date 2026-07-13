@@ -64,6 +64,21 @@ pub(super) struct Registry {
     pub(super) mnemonic_confirmed: bool,
 }
 
+/// mark the workspace `id`'s node as holding validator standing. MONOTONIC-UP:
+/// only ever flips `member` false→true, never clears it, so a transient signal
+/// cannot demote a validator. returns whether the flag changed (so the caller
+/// saves only on a real transition). a missing id or an already-member
+/// workspace is a no-op returning `false`.
+pub(super) fn mark_member(reg: &mut Registry, id: &str) -> bool {
+    match reg.workspaces.iter_mut().find(|w| w.id == id) {
+        Some(ws) if !ws.member => {
+            ws.member = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// the http coordinates `workspace_select` returns to the webview.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,7 +168,7 @@ pub(super) fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String
     write_atomic(path, text.as_bytes())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -189,6 +204,35 @@ mod tests {
             "the corrupt file is preserved as .bak"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mark_member_is_monotonic_up_and_idempotent() {
+        let ws = |id: &str, member: bool| Workspace {
+            id: id.into(),
+            name: id.into(),
+            chain_id: "c".into(),
+            pubkey: "p".into(),
+            founder: false,
+            member,
+            ports: Ports { listen: 1, http: 2, rpc: 3, wireguard: None, invite: None },
+        };
+        let mut reg = Registry {
+            version: 1,
+            active: None,
+            workspaces: vec![ws("joiner", false), ws("already", true)],
+            mnemonic_confirmed: false,
+        };
+        // false→true is a real transition (caller should save).
+        assert!(mark_member(&mut reg, "joiner"));
+        assert!(reg.workspaces[0].member);
+        // idempotent: a second call is a no-op (no needless save).
+        assert!(!mark_member(&mut reg, "joiner"));
+        // already a member: no-op. never DEMOTES.
+        assert!(!mark_member(&mut reg, "already"));
+        assert!(reg.workspaces[1].member);
+        // unknown id: no-op, no panic.
+        assert!(!mark_member(&mut reg, "ghost"));
     }
 
     #[test]

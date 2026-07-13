@@ -70,7 +70,7 @@ export function HomeView() {
     >
       <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Home</div>
 
-      <div style={{ width: "100%", maxWidth: 720, alignSelf: "center" }}>
+      <div data-home-content="full-width" style={{ width: "100%" }}>
         <ProfileCard accountId={accountId} />
 
         <WorkspacesTable />

@@ -23,14 +23,6 @@ import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
 const QUICK_REACTS = ["👍", "✅", "👀"];
 
-// The message content (avatar + body + hover affordances) is capped to a
-// readable measure and left-aligned, while the row's hover highlight spans the
-// full pane. This keeps long lines legible on a wide pane AND anchors the hover
-// bar / menu / picker to the content's right edge instead of the far pane edge.
-// 880 is the width the console already used for the column — the earlier hover
-// complaint was the highlight stopping short of the edge, not the text measure.
-const CONTENT_MAX = 880;
-
 // `created_at` is the node's consensus_time — millis, legacy seconds, or a
 // height counter depending on the lane (see domain/wire.ts). Empty when the
 // stamp isn't real wall-clock — better to show no time than a fake "09:21 AM".
@@ -119,7 +111,8 @@ function AddReactGlyph({ size = 15 }: { size?: number }) {
 
 // ── Avatar ───────────────────────────────────────────────
 
-function Avatar({ author, name, size }: { author: AuthorRef; name: string; size: number }) {
+// Exported: the pages comment cards render the same author identity dot.
+export function Avatar({ author, name, size }: { author: AuthorRef; name: string; size: number }) {
   const agent = isAgentAuthor(author);
   return (
     <span
@@ -163,11 +156,15 @@ function AgentPill() {
 function ReactionsRow({
   message,
   selfKey,
+  reactable,
   onReact,
   onAddReaction,
 }: {
   message: MessageView;
   selfKey: string;
+  /** False on an archived channel: the module refuses the write, so the chips
+   *  stay legible but inert and the "add" affordance is gone. */
+  reactable: boolean;
   onReact: (emoji: string) => void;
   onAddReaction: () => void;
 }) {
@@ -179,8 +176,9 @@ function ReactionsRow({
         return (
           <HoverButton
             key={reaction.emoji}
+            disabled={!reactable}
             onClick={() => onReact(reaction.emoji)}
-            title={mine ? "Remove reaction" : "React"}
+            title={reactable ? (mine ? "Remove reaction" : "React") : "This channel is archived"}
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -189,7 +187,7 @@ function ReactionsRow({
               borderRadius: 999,
               border: `1px solid ${mine ? accentVar : color.borderSoft}`,
               background: mine ? "rgba(160,90,60,.10)" : color.paper,
-              font: `500 11px ${font.sans}`,
+              font: `500 12px ${font.sans}`,
               color: mine ? accentVar : color.muted3,
             }}
             hoverStyle={{ background: mine ? "rgba(160,90,60,.16)" : color.hover }}
@@ -199,27 +197,29 @@ function ReactionsRow({
           </HoverButton>
         );
       })}
-      <HoverButton
-        onClick={(event) => {
-          event.stopPropagation();
-          onAddReaction();
-        }}
-        title="Add a reaction"
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: 26,
-          padding: "2px 0",
-          borderRadius: 999,
-          border: `1px solid ${color.borderSoft}`,
-          background: color.paper,
-          color: color.muted2,
-        }}
-        hoverStyle={{ background: color.hover, color: color.muted3 }}
-      >
-        <AddReactGlyph size={13} />
-      </HoverButton>
+      {reactable && (
+        <HoverButton
+          onClick={(event) => {
+            event.stopPropagation();
+            onAddReaction();
+          }}
+          title="Add a reaction"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: 26,
+            padding: "2px 0",
+            borderRadius: 999,
+            border: `1px solid ${color.borderSoft}`,
+            background: color.paper,
+            color: color.muted2,
+          }}
+          hoverStyle={{ background: color.hover, color: color.muted3 }}
+        >
+          <AddReactGlyph size={13} />
+        </HoverButton>
+      )}
     </div>
   );
 }
@@ -256,13 +256,13 @@ function ThreadIndicator({
       <span style={{ color: accentVar, display: "flex" }}>
         <ThreadGlyph size={12} />
       </span>
-      <span style={{ font: `500 11.5px ${font.sans}`, color: accentVar }}>
+      <span style={{ font: `500 12.5px ${font.sans}`, color: accentVar }}>
         {replyCount} {replyCount === 1 ? "reply" : "replies"}
       </span>
       {replyHint && (
         <span
           style={{
-            font: `400 11px ${font.sans}`,
+            font: `400 12px ${font.sans}`,
             color: color.muted2,
             minWidth: 0,
             overflow: "hidden",
@@ -314,7 +314,7 @@ function EditBox({
           borderRadius: radius.sm,
           border: `1px solid ${accentVar}`,
           background: color.paper,
-          font: `400 13.5px ${font.sans}`,
+          font: `400 15px ${font.sans}`,
           color: color.ink,
           lineHeight: 1.5,
           outline: "none",
@@ -435,7 +435,7 @@ function MenuRow({
         width: "100%",
         padding: "7px 9px",
         borderRadius: radius.sm,
-        font: `400 12.5px ${font.sans}`,
+        font: `400 13px ${font.sans}`,
         color: color.inkSoft,
       }}
       hoverStyle={{ background: color.hover }}
@@ -477,7 +477,7 @@ function CopyMenuRow({
         width: "100%",
         padding: "7px 9px",
         borderRadius: radius.sm,
-        font: `400 12.5px ${font.sans}`,
+        font: `400 13px ${font.sans}`,
         color: color.inkSoft,
       }}
       hoverStyle={{ background: color.hover }}
@@ -502,7 +502,7 @@ function DangerMenuRow({ label, icon, onClick }: { label: string; icon: ReactNod
         width: "100%",
         padding: "7px 9px",
         borderRadius: radius.sm,
-        font: `400 12.5px ${font.sans}`,
+        font: `400 13px ${font.sans}`,
         color: color.danger,
       }}
       hoverStyle={{ background: color.dangerSoft }}
@@ -617,6 +617,7 @@ function OverflowMenu({
 function HoverBar({
   channelId,
   seq,
+  reactable,
   onQuickReact,
   onOpenPicker,
   onOpenThread,
@@ -625,6 +626,9 @@ function HoverBar({
 }: {
   channelId: string;
   seq: number;
+  /** False on an archived channel — the module refuses reactions AND the agent's
+   *  answering post, so neither is offered (the run would burn and be lost). */
+  reactable: boolean;
   onQuickReact: (emoji: string) => void;
   onOpenPicker: () => void;
   onOpenThread: () => void;
@@ -657,30 +661,34 @@ function HoverBar({
         boxShadow: shadow.card,
       }}
     >
-      {QUICK_REACTS.map((emoji) => (
-        <HoverButton
-          key={emoji}
-          title={`React ${emoji}`}
-          onClick={() => onQuickReact(emoji)}
-          style={{ ...btnStyle, font: "14px/1 sans-serif" }}
-          hoverStyle={{ background: color.hover }}
-        >
-          {emoji}
-        </HoverButton>
-      ))}
-      <HoverButton
-        title="Pick a reaction"
-        onClick={(event) => {
-          event.stopPropagation();
-          onOpenPicker();
-        }}
-        style={btnStyle}
-        hoverStyle={{ background: color.hover }}
-      >
-        <AddReactGlyph size={15} />
-      </HoverButton>
-      <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
-      <AskAgentButton channelId={channelId} seq={seq} style={btnStyle} />
+      {reactable && (
+        <>
+          {QUICK_REACTS.map((emoji) => (
+            <HoverButton
+              key={emoji}
+              title={`React ${emoji}`}
+              onClick={() => onQuickReact(emoji)}
+              style={{ ...btnStyle, font: "15px/1 sans-serif" }}
+              hoverStyle={{ background: color.hover }}
+            >
+              {emoji}
+            </HoverButton>
+          ))}
+          <HoverButton
+            title="Pick a reaction"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenPicker();
+            }}
+            style={btnStyle}
+            hoverStyle={{ background: color.hover }}
+          >
+            <AddReactGlyph size={15} />
+          </HoverButton>
+          <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
+          <AskAgentButton channelId={channelId} seq={seq} style={btnStyle} />
+        </>
+      )}
       {threadable && (
         <HoverButton
           title="Reply in thread"
@@ -705,6 +713,7 @@ export function MessageItem({
   names,
   groupStart,
   selfKey,
+  archived = false,
   hovered,
   menuOpen,
   replyHint,
@@ -724,6 +733,10 @@ export function MessageItem({
   names: AuthorNames;
   groupStart: boolean;
   selfKey: string;
+  /** The channel is archived — the module refuses reactions (and an agent's
+   *  answering post), so those affordances are hidden rather than left to fail
+   *  silently. Edit/delete are NOT gated: the module still admits them. */
+  archived?: boolean;
   hovered: boolean;
   menuOpen: boolean;
   /** "· lastReplyAuthor" hint for the inline thread pill, or null. */
@@ -805,7 +818,7 @@ export function MessageItem({
         background: active ? color.sunken : "transparent",
       }}
     >
-      <div style={{ position: "relative", display: "flex", gap: 11, maxWidth: CONTENT_MAX, minWidth: 0 }}>
+      <div style={{ position: "relative", display: "flex", gap: 11, minWidth: 0 }}>
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
         {groupStart ? (
           <Avatar author={message.head.author} name={author} size={30} />
@@ -816,7 +829,7 @@ export function MessageItem({
             <FinalizationMark op={op} />
           </span>
         ) : hovered ? (
-          <span style={{ font: `400 10px ${font.mono}`, color: color.muted2, marginTop: 4 }}>
+          <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2, marginTop: 4 }}>
             {timeOf(message.head.created_at)}
           </span>
         ) : null}
@@ -827,7 +840,7 @@ export function MessageItem({
             <span
               title={unresolvedKey ? "Member without a display name yet" : undefined}
               style={{
-                font: unresolvedKey ? `500 12px ${font.mono}` : `600 13px ${font.sans}`,
+                font: unresolvedKey ? `500 13px ${font.mono}` : `600 15px ${font.sans}`,
                 color: unresolvedKey ? color.muted3 : color.ink,
                 minWidth: 0,
                 overflow: "hidden",
@@ -839,11 +852,11 @@ export function MessageItem({
               {author}
             </span>
             {isAgentAuthor(message.head.author) && <AgentPill />}
-            <span style={{ font: `400 11px ${font.mono}`, color: color.muted2 }}>
+            <span style={{ font: `400 11.5px ${font.mono}`, color: color.muted2 }}>
               {timeOf(message.head.created_at)}
             </span>
             {message.head.edited_at !== null && (
-              <span style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>(edited)</span>
+              <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>(edited)</span>
             )}
             <FinalizationMark op={op} />
           </div>
@@ -851,8 +864,8 @@ export function MessageItem({
         <div
           data-chat-body
           style={{
-            font: `400 13.5px ${font.sans}`,
-            lineHeight: 1.55,
+            font: `400 15px ${font.sans}`,
+            lineHeight: 1.5,
             marginTop: groupStart ? 2 : 0,
             color: deleted ? color.muted2 : color.inkSofter,
             minWidth: 0,
@@ -882,6 +895,7 @@ export function MessageItem({
           <ReactionsRow
             message={message}
             selfKey={selfKey}
+            reactable={!archived}
             onReact={onReact}
             onAddReaction={() => {
               onMenuToggle(false);
@@ -897,6 +911,7 @@ export function MessageItem({
         <HoverBar
           channelId={message.channel_id}
           seq={message.seq}
+          reactable={!archived}
           onQuickReact={onReact}
           onOpenPicker={() => {
             onMenuToggle(false);

@@ -24,7 +24,7 @@ type RegistryEntry = [number[], string[]];
 
 /** Every distinct executor tag announced anywhere on the network, sorted. The
  *  "Runs on" picker shows these; an empty list means no host has announced yet
- *  (or the node predates the module) — the caller degrades to a text field. */
+ *  — the caller renders a disabled setup state rather than accepting a blind tag. */
 export const capabilities = (transport: NodeTransport): Promise<string[]> =>
   Promise.resolve()
     .then(() => transport.query(TARGET, "all"))

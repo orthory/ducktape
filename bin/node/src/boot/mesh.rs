@@ -156,13 +156,25 @@ pub(crate) fn build(
     // keep the OS pass-through — fake stages no data plane at all, so
     // pass-through preserves its long-standing "overlay dials just fail
     // like a downed interface" behavior.
+    //
+    // socket mode's wildcard mesh bind normally carries the kernel OS leg
+    // beside the virtual one — but a node that advertises ONLY its overlay
+    // ULA hands out no underlay address anywhere (no bootstrap hint is
+    // minted, gossip carries the ULA), so its kernel leg could never
+    // receive a legitimate dial. it would sit unreachable as a wildcard
+    // listener the host firewall alarms on (macOS prompts about every
+    // wildcard bind) — such a node keeps the virtual leg only.
+    let underlay_ingress = match &advertised_reach {
+        Ingress::Socket(addr) => !overlay_router.is_overlay(addr),
+        // a hostname advertisement is an underlay address by construction.
+        Ingress::Dns { .. } => true,
+    };
     let overlay_backend = match wireguard_effect {
-        WireGuardEffectKind::Socket => {
-            overlay_net::OverlayBackend::Userspace(overlay_slot.clone())
-        }
-        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => {
-            overlay_net::OverlayBackend::Tun
-        }
+        WireGuardEffectKind::Socket => overlay_net::OverlayBackend::Userspace {
+            slot: overlay_slot.clone(),
+            underlay_ingress,
+        },
+        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => overlay_net::OverlayBackend::Tun,
     };
     let (network, oracle) = Network::new(
         overlay_net::OverlayContext::with_backend(

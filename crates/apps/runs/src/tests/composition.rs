@@ -223,35 +223,36 @@ fn compose_forge(
 }
 
 #[test]
-fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
+fn an_issue_run_forks_dev_with_an_unborn_item_branch_and_requests_a_pr() {
     let registry = forge_read_registry();
-    let main_tip = "cd".repeat(20);
+    let dev_tip = "cd".repeat(20);
     let m = forge_module();
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "Fix the gate", "repro inside"))
-        .with_forge_tip("app", "main", &main_tip)
+        .with_forge_tip("app", "dev", &dev_tip)
         .with_files_head(&"aa".repeat(32));
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
 
     assert_eq!(v["ducktape_run"], 3);
     assert_eq!(v["workspace"]["kind"], "forge");
     assert_eq!(v["workspace"]["repo"], "app");
+    assert_eq!(v["workspace"]["item_title"], "Fix the gate");
     assert_eq!(
-        v["workspace"]["commit"], main_tip,
-        "an issue with an unborn work branch forks the committed main tip"
+        v["workspace"]["commit"], dev_tip,
+        "an issue with an unborn work branch forks the committed dev tip"
     );
     assert_eq!(v["workspace"]["branch"], "agent/item-7");
     assert_eq!(v["workspace"]["branch_born"], false);
-    // the requested sink: a PR of the work branch onto main, no title/body.
+    // the requested sink: a PR of the work branch onto dev, no title/body.
     assert_eq!(v["result_contract"]["sink"]["mode"], "pr");
     assert_eq!(v["result_contract"]["sink"]["repo"], "app");
     assert_eq!(
         v["result_contract"]["sink"]["source_branch"],
         "agent/item-7"
     );
-    assert_eq!(v["result_contract"]["sink"]["target_branch"], "main");
+    assert_eq!(v["result_contract"]["sink"]["target_branch"], "dev");
     assert!(v["result_contract"]["sink"].get("title").is_none());
     assert!(v["result_contract"]["sink"].get("body").is_none());
     // the deterministic item context rides the envelope.
@@ -270,19 +271,19 @@ fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
 #[test]
 fn a_forge_session_continues_from_the_born_work_branch_tip() {
     let registry = forge_read_registry();
-    let main_tip = "cd".repeat(20);
+    let dev_tip = "cd".repeat(20);
     let item_tip = "ef".repeat(20);
     let m = forge_module();
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "Fix the gate", "body"))
-        .with_forge_tip("app", "main", &main_tip)
+        .with_forge_tip("app", "dev", &dev_tip)
         .with_forge_tip("app", "agent/item-7", &item_tip);
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
     assert_eq!(
         v["workspace"]["commit"], item_tip,
-        "a born work branch is the session: later runs fork ITS tip, not main"
+        "a born work branch is the session: later runs fork ITS tip, not dev"
     );
     assert_eq!(v["workspace"]["branch"], "agent/item-7");
     assert_eq!(v["workspace"]["branch_born"], true);
@@ -297,11 +298,12 @@ fn a_pr_item_run_works_the_prs_own_source_branch() {
         .with_registry(&registry)
         .with_transcript("forge:app:8", transcript(2))
         .with_forge_item("app", forge_pr(8, "Wire it", "please", "feature/x", "dev"))
-        .with_forge_tip("app", "main", &"cd".repeat(20))
+        .with_forge_tip("app", "dev", &"cd".repeat(20))
         .with_forge_tip("app", "feature/x", &src_tip);
     let v = compose_forge(&m, &ctx, &registry, "forge:app:8").unwrap();
     // THE pr-item rule: the session pushes the PR's own branch, so the
     // open PR updates in place.
+    assert_eq!(v["workspace"]["item_title"], "Wire it");
     assert_eq!(v["workspace"]["branch"], "feature/x");
     assert_eq!(v["workspace"]["commit"], src_tip);
     assert_eq!(v["workspace"]["branch_born"], true);
@@ -333,7 +335,7 @@ fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
             "general",
             vec![
                 message(1, "msg 1"),
-                message(2, "please work from [[page:plan]]"),
+                message(2, "please work from [Plan](duck://page/plan)"),
             ],
         )
         .with_page("plan", page_blocks("plan", "Project Plan"));
@@ -349,12 +351,85 @@ fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
     let context = v["context"].as_str().expect("a page ref composes context");
     assert!(context.starts_with("Referenced pages:"), "{context}");
     assert!(
-        context.contains("[[page:plan]] — Project Plan"),
+        context.contains("[Project Plan](duck://page/plan)"),
         "{context}"
     );
     assert!(context.contains("spec paragraph"), "{context}");
     assert!(
         context.contains("- [ ] do the thing [blk:b-t]"),
+        "{context}"
+    );
+}
+
+#[test]
+fn a_file_ref_in_the_trigger_message_injects_the_attachment_text() {
+    // a duck://files ref pulls the referenced attachment's committed TEXT into
+    // the same context section — the agent-integration payoff of the unified
+    // grammar. an IMAGE (non-utf8) in the same message is named, not inlined.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let agent = record("bot", &[ACTION_CHAT_POST]);
+    let m = module().with_files_module("files");
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript(
+            "general",
+            vec![message(
+                1,
+                "notes [notes.md](duck://files/shared/attachments/u1/notes.md) \
+                 and ![shot](duck://files/shared/attachments/u2/shot.png)",
+            )],
+        )
+        .with_file(
+            "/shared/attachments/u1/notes.md",
+            b"# Handoff\nrun the flaky gate twice",
+        )
+        // non-utf8 bytes = an image; named, never inlined.
+        .with_file("/shared/attachments/u2/shot.png", &[0x89, 0x50, 0x4e, 0xff, 0xfe]);
+    let prepared = block_on(m.prepare_dispatch(
+        &ctx,
+        &agent,
+        &crate::run_id_for("general", 1, "bot"),
+        "general",
+        1,
+    ))
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    let context = v["context"].as_str().expect("a file ref composes context");
+    assert!(context.starts_with("Referenced attachments:"), "{context}");
+    assert!(
+        context.contains("[attachment: notes.md]\n# Handoff\nrun the flaky gate twice"),
+        "{context}"
+    );
+    assert!(
+        context.contains("[attachment: shot.png — binary content, not shown]"),
+        "{context}"
+    );
+}
+
+#[test]
+fn an_unresolvable_file_ref_composes_its_marker_never_a_failure() {
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let agent = record("bot", &[ACTION_CHAT_POST]);
+    let m = module().with_files_module("files");
+    let ctx = CaptureCtx::new().with_registry(&registry).with_transcript(
+        "general",
+        vec![message(
+            1,
+            "see [gone.txt](duck://files/shared/attachments/u/gone.txt)",
+        )],
+    );
+    let prepared = block_on(m.prepare_dispatch(
+        &ctx,
+        &agent,
+        &crate::run_id_for("general", 1, "bot"),
+        "general",
+        1,
+    ))
+    .expect("an unresolvable attachment never fails compose");
+    let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    let context = v["context"].as_str().expect("a file ref composes context");
+    assert!(
+        context.contains("[attachment: gone.txt — not found]"),
         "{context}"
     );
 }
@@ -368,15 +443,15 @@ fn a_page_ref_in_the_forge_item_body_appends_after_the_item_context() {
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item(
             "app",
-            forge_issue(7, "Fix the gate", "spec at [[page:plan]]"),
+            forge_issue(7, "Fix the gate", "spec at [Plan](duck://page/plan)"),
         )
-        .with_forge_tip("app", "main", &"cd".repeat(20))
+        .with_forge_tip("app", "dev", &"cd".repeat(20))
         .with_page("plan", page_blocks("plan", "Project Plan"));
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
     let context = v["context"].as_str().unwrap();
     // the M1 item context is untouched and leads; the page section follows.
     assert!(context.starts_with("Forge item context"), "{context}");
-    assert!(context.contains("spec at [[page:plan]]"), "{context}");
+    assert!(context.contains("spec at [Plan](duck://page/plan)"), "{context}");
     let item_body = context.find("spec at").unwrap();
     let pages_at = context
         .find("Referenced pages:")
@@ -386,7 +461,7 @@ fn a_page_ref_in_the_forge_item_body_appends_after_the_item_context() {
         "the page section follows the item context: {context}"
     );
     assert!(
-        context.contains("[[page:plan]] — Project Plan"),
+        context.contains("[Project Plan](duck://page/plan)"),
         "{context}"
     );
     assert!(
@@ -404,7 +479,7 @@ fn a_missing_page_ref_composes_its_marker_never_a_failure() {
         .with_pages_module("pages");
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
-        .with_transcript("general", vec![message(1, "see [[page:gone]]")]);
+        .with_transcript("general", vec![message(1, "see [Gone](duck://page/gone)")]);
     let prepared = block_on(m.prepare_dispatch(
         &ctx,
         &agent,
@@ -415,7 +490,7 @@ fn a_missing_page_ref_composes_its_marker_never_a_failure() {
     .expect("an unresolvable ref never fails compose");
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
     let context = v["context"].as_str().unwrap();
-    assert!(context.contains("[[page:gone — not found]]"), "{context}");
+    assert!(context.contains("[page gone — not found]"), "{context}");
 }
 
 #[test]
@@ -425,7 +500,7 @@ fn page_refs_without_a_wired_pages_module_compose_no_page_section() {
     let m = module().with_files_module("files");
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
-        .with_transcript("general", vec![message(1, "see [[page:plan]]")]);
+        .with_transcript("general", vec![message(1, "see [Plan](duck://page/plan)")]);
     let prepared = block_on(m.prepare_dispatch(
         &ctx,
         &agent,
@@ -449,8 +524,8 @@ fn page_injection_composes_byte_deterministically() {
         CaptureCtx::new()
             .with_registry(&registry)
             .with_transcript("forge:app:7", transcript(2))
-            .with_forge_item("app", forge_issue(7, "Fix", "see [[page:plan]]"))
-            .with_forge_tip("app", "main", &"cd".repeat(20))
+            .with_forge_item("app", forge_issue(7, "Fix", "see [Plan](duck://page/plan)"))
+            .with_forge_tip("app", "dev", &"cd".repeat(20))
             .with_page("plan", page_blocks("plan", "Project Plan"))
     };
     let agent = registry.get("bot").unwrap();
@@ -485,17 +560,17 @@ fn forge_compose_failures_have_deterministic_reasons() {
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
     assert!(reason.contains("no forge item"), "{reason}");
 
-    // issue with no main branch to fork.
+    // issue with no dev branch to fork.
     let ctx = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "t", "b"));
     let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
-    assert!(reason.contains("main"), "{reason}");
+    assert!(reason.contains("dev"), "{reason}");
 
     // PR whose source branch is not born.
     let ctx = CaptureCtx::new()
@@ -512,7 +587,7 @@ fn forge_compose_failures_have_deterministic_reasons() {
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "t", "b"))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     let reason = compose_forge(&unwired, &ctx, &registry, "forge:app:7").unwrap_err();
     assert!(reason.contains("forge module"), "{reason}");
 }
@@ -559,7 +634,7 @@ fn an_engagement_on_a_forge_channel_without_the_cap_skips_with_a_breadcrumb() {
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "t", "b"))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     exec(&mut m, &mut ctx, &engagement("forge:app:7", 2, vec![])).unwrap();
 
     assert!(
@@ -626,7 +701,7 @@ fn a_forge_engagement_with_the_cap_stages_the_dispatch() {
         .with_registry(&registry)
         .with_transcript("forge:app:7", transcript(2))
         .with_forge_item("app", forge_issue(7, "Fix the gate", "body"))
-        .with_forge_tip("app", "main", &"cd".repeat(20));
+        .with_forge_tip("app", "dev", &"cd".repeat(20));
     exec(&mut m, &mut ctx, &engagement("forge:app:7", 2, vec![])).unwrap();
 
     let dispatches = ctx.dispatch_msgs();

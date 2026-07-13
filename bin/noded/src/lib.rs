@@ -39,11 +39,13 @@ mod workspaces;
 // the D7 root). public so BOTH node binaries can build one and wire it into
 // their DispatchPool via `with_provisioner`.
 pub mod agent_provision;
-// the huddle websocket lane: session/control types + the /v1/call/ws handler.
+// realtime overlay websocket lanes: huddle and Pages-presence session/control types.
 mod call;
 pub use call::{
     CallClientControl, CallControlIn, CallControlOut, CallLane, CallParams, CallServerControl,
-    CallSession, CallSessionRequest,
+    CallSession, CallSessionRequest, PageCursor, PresenceClientControl, PresenceControlIn,
+    PresenceControlOut, PresenceParams, PresenceServerControl, PresenceSession,
+    PresenceSessionRequest, RealtimeSessionRequest,
 };
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
@@ -76,14 +78,14 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 
-use crate::call::call_ws;
+use crate::call::{call_ws, presence_ws};
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
 use crate::git_http::{GIT_PACK_BODY_LIMIT, git_info_refs, git_receive_pack, git_upload_pack};
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
@@ -346,6 +348,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
+        .route("/v1/presence/ws", get(presence_ws))
         .route(
             "/v1/gateway/proxy",
             post(gateway_proxy).layer(DefaultBodyLimit::max(
@@ -382,6 +385,16 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/files/find", get(files_find))
         .route("/v1/files/grep", get(files_grep))
         .route("/v1/files/history", get(files_history))
+        // the S3-shaped object facade: one url = one object. PUT is a
+        // single-change commit (stage + put), GET streams the whole file,
+        // DELETE is a single-change rm; LIST is the existing /v1/files/ls.
+        .route(
+            "/v1/files/object/{*path}",
+            put(object_put)
+                .get(object_get)
+                .delete(object_delete)
+                .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES)),
+        )
         // the read/probe surface the checkout/commit engine drives.
         .route("/v1/files/refs", get(files_refs))
         .route("/v1/files/diff", get(files_diff))
@@ -573,7 +586,7 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
 
 async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.
-    handle.shutdown.notify_one();
+    handle.request_shutdown();
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
@@ -641,6 +654,32 @@ async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_wakes_every_surface_and_remains_sticky() {
+        let (handle, _commands, _hub) = NodeHandle::channel();
+        let first = handle.clone();
+        let second = handle.clone();
+        let waiters = async move {
+            tokio::join!(first.shutdown_requested(), second.shutdown_requested());
+        };
+        let trigger = async {
+            tokio::task::yield_now().await;
+            handle.request_shutdown();
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(waiters, trigger);
+        })
+        .await
+        .expect("every registered surface wakes");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.shutdown_requested(),
+        )
+        .await
+        .expect("shutdown remains visible to a late surface");
+    }
 
     /// the explorer row round-trips through its stored index encoding — the
     /// one seam both binaries write and `GET /v1/blocks` reads.

@@ -104,11 +104,7 @@ describe("uploadFile", () => {
 
 describe("uploadFiles", () => {
   it("commits a folder as one atomic change set with preserved relative paths", async () => {
-    const digests = ["11".repeat(32), "22".repeat(32)];
-    let served = 0;
-    const filesStage = vi
-      .fn()
-      .mockImplementation(() => Promise.resolve({ digest: digests[served++] }));
+    const filesStage = vi.fn();
     const filesCommit = vi.fn().mockResolvedValue({ height: 10, appHash: "44".repeat(32) });
     const query = vi
       .fn()
@@ -134,11 +130,7 @@ describe("uploadFiles", () => {
       message: "upload folder Project",
     });
 
-    expect(filesStage).toHaveBeenCalledTimes(2);
-    expect(filesStage.mock.calls.map(([chunk]) => Array.from(chunk as Uint8Array))).toEqual([
-      [1, 2, 3],
-      [4, 5],
-    ]);
+    expect(filesStage).not.toHaveBeenCalled();
 
     const body = filesCommit.mock.calls[0][0];
     expect(body.base_snapshot).toBe("55".repeat(32));
@@ -149,7 +141,7 @@ describe("uploadFiles", () => {
           path: "/shared/Project/readme.txt",
           exec: false,
           meta: { mime: "text/plain" },
-          content: { chunks: { size: 3, chunks: [digests[0]] } },
+          content: { inline: { b64: b64(1, 2, 3) } },
         },
       },
       {
@@ -157,10 +149,37 @@ describe("uploadFiles", () => {
           path: "/shared/Project/docs/plan.md",
           exec: false,
           meta: { mime: "text/markdown" },
-          content: { chunks: { size: 2, chunks: [digests[1]] } },
+          content: { inline: { b64: b64(4, 5) } },
         },
       },
     ]);
+  });
+
+  it("stages files after the shared inline budget is exhausted", async () => {
+    const digest = "11".repeat(32);
+    const filesStage = vi.fn().mockResolvedValue({ digest });
+    const filesCommit = vi.fn().mockResolvedValue({ height: 10, appHash: "44".repeat(32) });
+    const transport = fakeTransport({ filesStage, filesCommit });
+
+    await files.uploadFiles(transport, {
+      targetDir: "/shared",
+      entries: [
+        {
+          kind: "file",
+          relativePath: "inline.bin",
+          bytes: new Uint8Array(files.MAX_INLINE_COMMIT_BYTES),
+        },
+        { kind: "file", relativePath: "staged.bin", bytes: new Uint8Array([7]) },
+      ],
+    });
+
+    expect(filesStage).toHaveBeenCalledTimes(1);
+    expect(Array.from(filesStage.mock.calls[0][0] as Uint8Array)).toEqual([7]);
+    const changes = filesCommit.mock.calls[0][0].changes;
+    expect(changes[0].put.content.inline.b64).toHaveLength(
+      Math.ceil(files.MAX_INLINE_COMMIT_BYTES / 3) * 4,
+    );
+    expect(changes[1].put.content).toEqual({ chunks: { size: 1, chunks: [digest] } });
   });
 
   it("can include an empty directory and an empty file in the same folder commit", async () => {

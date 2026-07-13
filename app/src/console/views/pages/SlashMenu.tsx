@@ -26,7 +26,7 @@ export function SlashMenu({
         top: "100%",
         left: 0,
         marginTop: 4,
-        width: 240,
+        width: 220,
         maxHeight: 280,
         overflowY: "auto",
         border: `1px solid ${color.border}`,

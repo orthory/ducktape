@@ -913,22 +913,76 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
     Ok(resp)
 }
 
-/// the rpc envelope pairing responses to in-flight requests over a shared
-/// duplex transport (a p2p channel). `id` is requester-local.
-pub fn encode_rpc(id: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + body.len());
+/// the ed25519 signing namespace for the statesync standing proof (ADR §5.1).
+/// a client signs this namespace over the network's genesis namespace bytes
+/// ONCE at construction; every request carries the result as its proof.
+pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
+
+/// the AUTHENTICATED rpc envelope (ADR §5.1 fail-closed, flag day — the
+/// unauthenticated `encode_rpc` is gone): `requester(32) ‖ proof(64) ‖
+/// id(8 LE) ‖ body`. the codec only FRAMES bytes; the caller produces the
+/// proof ([`sign_sync_proof`]) and the server verifies it ([`verify_sync_proof`])
+/// against committed standing. `id` is requester-local (correlates replies).
+/// server replies reuse the same frame with the auth fields zero-filled — the
+/// client gates replies by transport peer and root-verifies payloads, so a
+/// reply's requester/proof are never inspected.
+pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + 64 + 8 + body.len());
+    out.extend_from_slice(requester);
+    out.extend_from_slice(proof);
     out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(body);
     out
 }
 
-pub fn decode_rpc(bytes: &[u8]) -> Result<(u64, &[u8]), WireError> {
-    if bytes.len() < 8 {
-        return Err(WireError::Truncated);
-    }
-    let (head, rest) = bytes.split_at(8);
-    let id = u64::from_le_bytes(head.try_into().expect("split_at(8) yields 8 bytes"));
-    Ok((id, rest))
+/// decode the authenticated envelope into borrowed `(requester, proof, id, body)`.
+/// errors `Truncated` on any buffer shorter than the 32+64+8 fixed header.
+// the 4-tuple mirrors the fixed wire layout; a named type would just indirect it.
+#[allow(clippy::type_complexity)]
+pub fn decode_rpc_authed(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
+    let (requester, rest) = bytes.split_first_chunk::<32>().ok_or(WireError::Truncated)?;
+    let (proof, rest) = rest.split_first_chunk::<64>().ok_or(WireError::Truncated)?;
+    let (id_bytes, body) = rest.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((requester, proof, u64::from_le_bytes(*id_bytes), body))
+}
+
+/// sign the standing proof: the caller's real key signs [`SYNC_AUTH_NAMESPACE`]
+/// over the genesis `namespace` bytes. returns `(requester_pubkey, proof)` to
+/// attach to every request. sound as a STATIC per-session proof because the
+/// mesh transport is authenticated+encrypted (the proof is not wire-capturable)
+/// and a pre-admission joiner can only sign for its own non-standing key.
+pub fn sign_sync_proof(
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    namespace: &[u8],
+) -> ([u8; 32], [u8; 64]) {
+    use commonware_codec::Encode as _;
+    use commonware_cryptography::Signer as _;
+    let requester: [u8; 32] = signer
+        .public_key()
+        .as_ref()
+        .try_into()
+        .expect("ed25519 public key is 32 bytes");
+    let sig = signer.sign(SYNC_AUTH_NAMESPACE, namespace);
+    let proof: [u8; 64] = sig
+        .encode()
+        .as_ref()
+        .try_into()
+        .expect("ed25519 signature is 64 bytes");
+    (requester, proof)
+}
+
+/// verify a standing proof: `requester` must have signed [`SYNC_AUTH_NAMESPACE`]
+/// over `namespace`. a malformed key/signature verifies as `false` (fail-closed).
+/// standing (requester ∈ members ∪ residents) is a SEPARATE check by the server.
+pub fn verify_sync_proof(requester: &[u8; 32], proof: &[u8; 64], namespace: &[u8]) -> bool {
+    use commonware_cryptography::{Verifier as _, ed25519};
+    let Ok(pk) = ed25519::PublicKey::decode(requester.as_slice()) else {
+        return false;
+    };
+    let Ok(sig) = ed25519::Signature::decode(proof.as_slice()) else {
+        return false;
+    };
+    pk.verify(SYNC_AUTH_NAMESPACE, namespace, &sig)
 }
 
 // ============================================================================
@@ -1246,11 +1300,11 @@ impl SyncServer {
         Ok(match req {
             SyncRequest::Manifest => ServeStep::NeedBoundary,
             SyncRequest::TipCoords => ServeStep::NeedCoords,
-            // the HOST layer answers blob fetches from its node-local store
-            // BEFORE requests reach this server; one arriving here means the
-            // host did not intercept — answer honestly instead of wedging.
+            // the blob mesh lane is RETIRED with the prompt plane it served;
+            // the wire kind stays decodable so an old peer's request answers
+            // as an honest Error, which its fan-out treats like a miss.
             SyncRequest::Blob { .. } => {
-                return Err("blob requests are answered by the host layer".into());
+                return Err("the blob mesh lane is retired".into());
             }
             SyncRequest::Frames {
                 after_height,
@@ -2103,11 +2157,57 @@ mod tests {
 
     #[test]
     fn rpc_envelope_round_trips() {
-        let framed = encode_rpc(99, b"body");
-        let (id, body) = decode_rpc(&framed).unwrap();
+        let requester = [7u8; 32];
+        let proof = [9u8; 64];
+        let framed = encode_rpc_authed(&requester, &proof, 99, b"body");
+        let (r, p, id, body) = decode_rpc_authed(&framed).unwrap();
+        assert_eq!(r, &requester);
+        assert_eq!(p, &proof);
         assert_eq!(id, 99);
         assert_eq!(body, b"body");
-        assert!(decode_rpc(&framed[..7]).is_err(), "short envelope rejects");
+        // anything shorter than the 32+64+8 fixed header is Truncated.
+        assert!(
+            decode_rpc_authed(&framed[..32 + 64 + 7]).is_err(),
+            "short envelope rejects"
+        );
+        assert!(decode_rpc_authed(&[]).is_err(), "empty rejects");
+    }
+
+    #[test]
+    fn sync_proof_signs_and_verifies_only_for_the_signing_key() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let namespace = b"net#deadbeef@feedface";
+        let (requester, proof) = sign_sync_proof(&signer, namespace);
+        assert_eq!(requester.as_slice(), signer.public_key().as_ref());
+        assert!(
+            verify_sync_proof(&requester, &proof, namespace),
+            "the real key's proof verifies"
+        );
+        // a different namespace (wrong network) fails.
+        assert!(
+            !verify_sync_proof(&requester, &proof, b"other-net"),
+            "a proof for another network is refused"
+        );
+        // a substituted requester key fails (the proof is bound to the signer).
+        let thief: [u8; 32] = ed25519::PrivateKey::from_seed(43)
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        assert!(
+            !verify_sync_proof(&thief, &proof, namespace),
+            "a substituted key fails the proof"
+        );
+        // a real standing key with a forged/empty signature is refused (you
+        // cannot mint a proof for a key without its private half). (an all-zero
+        // key is a valid small-order point whose zero signature verifies — a
+        // crypto edge that is harmless here: no node holds the zero key, so the
+        // standing gate refuses it regardless.)
+        assert!(
+            !verify_sync_proof(&requester, &[0u8; 64], namespace),
+            "a forged signature for a real key is refused"
+        );
     }
 
     #[test]

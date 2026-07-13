@@ -27,6 +27,21 @@ pub(super) type ValidatorNode = node::OrderedNode<
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
 
+/// a join gate held open awaiting its `Redeem` frame's consensus fate (ADR
+/// §3.2). the member submitted the redemption and holds the joiner's
+/// `Admitted`/`Rejected` reply keyed by the frame id until `on_drain` resolves
+/// it — the settle-then-answer seam, mirroring `pending_relays`.
+struct GatePending {
+    /// the lobby-channel connection the reply goes back to.
+    peer: ed25519::PublicKey,
+    /// the joiner key, to clear the `gating` in-flight index on resolution.
+    joiner: Vec<u8>,
+    /// the packed coord cap to deliver on `Admitted` (private coordination).
+    cap: Option<Vec<u8>>,
+    /// answer `Busy` (non-terminal) once past this instant (§3.2 timeout).
+    deadline: std::time::Instant,
+}
+
 /// The long-lived state owned by the validator event loop.
 ///
 /// A single owner lets the handler modules share ordered state without locks or
@@ -41,7 +56,6 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) mesh_oracle: commonware_p2p::authenticated::discovery::Oracle<ed25519::PublicKey>,
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
-    pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) lobby_tx: super::MeshSender,
     pub(super) relay_tx: super::MeshSender,
@@ -82,7 +96,6 @@ struct ValidatorRuntime<'a> {
     mesh_oracle: commonware_p2p::authenticated::discovery::Oracle<ed25519::PublicKey>,
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
-    blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     lobby_tx: super::MeshSender,
     relay_tx: super::MeshSender,
@@ -114,6 +127,12 @@ struct ValidatorRuntime<'a> {
     >,
     pending_relays:
         std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::Instant)>,
+    /// join gates held open awaiting their `Redeem` frame's consensus fate,
+    /// keyed by frame id (the settle-then-answer seam, resolved in `on_drain`).
+    pending_gates: std::collections::HashMap<node::FrameId, GatePending>,
+    /// the in-flight-gate index (joiner key → its frame id): one gate per
+    /// joiner, so a duplicate Request re-arms rather than double-submits.
+    gating: std::collections::HashMap<Vec<u8>, node::FrameId>,
     validator_relay: relay_runtime::ValidatorRelay,
     last_published: Option<u64>,
     join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
@@ -143,7 +162,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         mesh_oracle,
         gateway_book,
         media_peers,
-        blob_peers,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -224,6 +242,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         node::FrameId,
         (ed25519::PublicKey, std::time::Instant),
     > = std::collections::HashMap::new();
+    // join gates held open awaiting their Redeem frame's consensus fate, and
+    // the joiner→frame in-flight index that dedups a re-Request while settling.
+    let pending_gates: std::collections::HashMap<node::FrameId, GatePending> =
+        std::collections::HashMap::new();
+    let gating: std::collections::HashMap<Vec<u8>, node::FrameId> =
+        std::collections::HashMap::new();
     let validator_relay = relay_runtime::ValidatorRelay::new(blobs.clone());
     let last_published: Option<u64> = None;
     // verified-but-unapproved join requests, keyed by joiner key. NODE-
@@ -361,7 +385,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         mesh_oracle,
         gateway_book,
         media_peers,
-        blob_peers,
         reach_cmd,
         lobby_tx,
         relay_tx,
@@ -386,6 +409,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         converged,
         pending_submits,
         pending_relays,
+        pending_gates,
+        gating,
         validator_relay,
         last_published,
         join_requests,

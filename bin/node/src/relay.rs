@@ -179,8 +179,8 @@ impl BlobAssembly {
 /// the validator's door check, pure so it is testable without a mesh: the
 /// frame must decode AND verify (the kernel checks the signature binds
 /// origin/seq/target/payload), its origin must be `Origin::External`, and
-/// that ORIGIN must hold committed resident standing (validators submit
-/// locally; parked joiners have no standing). the sending peer is
+/// that ORIGIN must hold committed resident OR client standing (validators
+/// submit locally; parked joiners have no standing). the sending peer is
 /// DELIBERATELY not an argument: residents ride the network's derived lobby
 /// transport identity — derivable by any invite holder — so a peer-vs-origin
 /// check could never pass for a real resident and would gate nothing. the
@@ -188,17 +188,28 @@ impl BlobAssembly {
 /// exactly-once digest gate collapses byte-identical replays; committed
 /// standing is the only policy the door adds. membership-current state is the
 /// CALLER's to fetch — this needs only bytes.
-pub fn verify_relay_submit(frame: &[u8], residents: &[Vec<u8>]) -> Result<node::FrameId, String> {
+///
+/// client standing is admitted HERE and ONLY here: this door authorizes a
+/// SUBMIT, nothing more. it grants the client no statesync, no mesh, no quorum
+/// seat — those planes read valset (never the clients set), so admitting a
+/// client key here cannot widen its standing anywhere else.
+pub fn verify_relay_submit(
+    frame: &[u8],
+    residents: &[Vec<u8>],
+    clients: &[Vec<u8>],
+) -> Result<node::FrameId, String> {
     let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
     if !residents
         .iter()
+        .chain(clients)
         .any(|o| o.as_slice() == origin_bytes.as_slice())
     {
         return Err(
-            "origin holds no committed resident standing — submit ops via a validator".into(),
+            "origin holds no committed resident or client standing — submit ops via a validator"
+                .into(),
         );
     }
     Ok(node::frame_id(frame))
@@ -290,15 +301,27 @@ mod tests {
         let me = author.public_key().as_ref().to_vec();
         let frame = node::encode_frame(&author, 3, &msg());
         // the sending peer is never consulted — standing rides on the ORIGIN.
-        let id = verify_relay_submit(&frame, std::slice::from_ref(&me)).expect("accepted");
+        let id = verify_relay_submit(&frame, std::slice::from_ref(&me), &[]).expect("accepted");
         assert_eq!(id, node::frame_id(&frame));
     }
 
     #[test]
-    fn door_refuses_without_resident_standing() {
+    fn door_accepts_a_frame_from_a_client_origin() {
+        // a committed CLIENT (present in the clients set, NOT the residents set)
+        // is admitted at the door — the thin-client submit path. same signature
+        // gate; standing rides on the ORIGIN, sourced from the clients module.
+        let author = sk(7);
+        let me = author.public_key().as_ref().to_vec();
+        let frame = node::encode_frame(&author, 3, &msg());
+        let id = verify_relay_submit(&frame, &[], std::slice::from_ref(&me)).expect("accepted");
+        assert_eq!(id, node::frame_id(&frame));
+    }
+
+    #[test]
+    fn door_refuses_without_resident_or_client_standing() {
         let author = sk(7);
         let frame = node::encode_frame(&author, 0, &msg());
-        let err = verify_relay_submit(&frame, &[]).unwrap_err();
+        let err = verify_relay_submit(&frame, &[], &[]).unwrap_err();
         assert!(err.contains("standing"), "{err}");
     }
 
@@ -317,8 +340,8 @@ mod tests {
 
         // it fails at signature verification, NOT as a parse error: a genuine
         // junk envelope errors with different wording.
-        let junk = verify_relay_submit(b"not a frame", std::slice::from_ref(&me)).unwrap_err();
-        let err = verify_relay_submit(&tampered, std::slice::from_ref(&me)).unwrap_err();
+        let junk = verify_relay_submit(b"not a frame", std::slice::from_ref(&me), &[]).unwrap_err();
+        let err = verify_relay_submit(&tampered, std::slice::from_ref(&me), &[]).unwrap_err();
         assert_ne!(
             err, junk,
             "tamper must fail at the signature, not the parser"

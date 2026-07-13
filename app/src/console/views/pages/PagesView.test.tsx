@@ -121,6 +121,24 @@ describe("PagesView", () => {
     expect(spies.openPage).toHaveBeenCalledWith("p2");
   });
 
+  it("filters the page tree while keeping matching ancestors visible", () => {
+    renderPagesView({
+      pages: [
+        { id: "p1", title: "Launch plan", parent: null },
+        { id: "p2", title: "SMS fallback", parent: "p1" },
+        { id: "p3", title: "Retro", parent: null },
+      ],
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search pages" }), {
+      target: { value: "sms" },
+    });
+
+    screen.getByRole("button", { name: "Open Launch plan" });
+    screen.getByRole("button", { name: "Open SMS fallback" });
+    expect(screen.queryByRole("button", { name: "Open Retro" })).toBeNull();
+  });
+
   it("deletes a page through an in-app dialog", () => {
     const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderPagesView();
@@ -181,6 +199,67 @@ describe("PagesView", () => {
     );
   });
 
+  it("moves a right-side exact comment with text split into a new block", async () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a"] }),
+        blockOf({ id: "a", text: "left right" }),
+      ],
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 5, end: 10 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(5, 5);
+    fireEvent.keyDown(area, { key: "Enter" });
+    await settle();
+
+    const inserted = (spies.insertPageBlock as unknown as Mock).mock.calls[0][0];
+    expect(spies.moveCommentThread).toHaveBeenCalledWith({
+      threadId: "t1",
+      target: inserted.blockId,
+      anchor: { start: 0, end: 5 },
+    });
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "left " });
+  });
+
+  it("keeps a crossing comment intact when its split insert fails", async () => {
+    const { spies, fails, materialize } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["a"] }),
+        blockOf({ id: "a", text: "left right" }),
+      ],
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 3, end: 8 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    materialize("updatePageBlockText", "moveCommentThread");
+    fails("insertPageBlock");
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(5, 5);
+    fireEvent.keyDown(area, { key: "Enter" });
+    await settle();
+
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    expect(spies.moveCommentThread).not.toHaveBeenCalled();
+  });
+
   it("converts a paragraph via a typed markdown prefix", () => {
     const { spies } = renderPagesView();
     fireEvent.change(screen.getByLabelText("Edit paragraph block 1"), {
@@ -211,6 +290,21 @@ describe("PagesView", () => {
       parent: "a",
       after: null,
     });
+  });
+
+  it("types Tab inside code instead of moving the block", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["code"] }),
+        blockOf({ id: "code", kind: "code", text: "let x = 1" }),
+      ],
+    });
+    const area = screen.getByLabelText("Edit code block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(3, 3);
+    fireEvent.keyDown(area, { key: "Tab" });
+    expect(area).toHaveValue("let\t x = 1");
+    expect(area.selectionStart).toBe(4);
+    expect(spies.movePageBlock).toBeUndefined();
   });
 
   it("removes an empty block on Backspace", () => {
@@ -451,11 +545,10 @@ describe("floating comment card", () => {
     expect(screen.queryByRole("dialog", { name: "Comments on this page" })).toBeNull();
   });
 
-  it("still opens the aside panel from the header Comments toggle", () => {
+  it("does not duplicate target threads in an all-comments list", () => {
     renderPagesView();
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
-    screen.getByRole("complementary", { name: "Comments" });
-    expect(screen.queryByRole("dialog", { name: /comments on/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show comments" })).toBeNull();
+    expect(screen.queryByRole("complementary", { name: "Comments" })).toBeNull();
   });
 
   it("hover reveals the comment affordance but no copy-block-link", () => {
@@ -463,6 +556,70 @@ describe("floating comment card", () => {
     fireEvent.mouseOver(screen.getByLabelText("Edit paragraph block 1"));
     screen.getByRole("button", { name: "Comment on block 1" });
     expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
+  });
+
+  it("persists inline marks and exact comment anchors for selected text", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 5);
+    fireEvent.select(area);
+
+    screen.getByRole("toolbar", { name: "Selection actions" });
+    fireEvent.click(screen.getByRole("button", { name: "Bold" }));
+    expect(spies.setPageBlockSpanMark).toHaveBeenCalledWith({
+      blockId: "a",
+      start: 0,
+      end: 5,
+      kind: "bold",
+      active: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Comment on selected text" }));
+    const dialog = screen.getByRole("dialog", { name: "Comments on selected text" });
+    fireEvent.change(within(dialog).getByLabelText("New comment text"), {
+      target: { value: "tighten this" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add comment" }));
+    expect(spies.addComment).toHaveBeenCalledWith({
+      target: "a",
+      text: "tighten this",
+      anchor: { start: 0, end: 5 },
+    });
+  });
+
+  it("renders persisted marks and opens an anchored thread from its highlight", () => {
+    const marked = PAGE.map((block) =>
+      block.id === "a"
+        ? { ...block, marks: [{ start: 0, end: 5, kind: "bold" as const }] }
+        : block,
+    );
+    renderPagesView({
+      activePageBlocks: marked,
+      pageThreads: [{
+        target: "a",
+        threads: [{
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 0, end: 5 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [{
+            id: "c1", thread_id: "t1", author: { user: [1] }, text: "note",
+            created_at: 1, edited_at: null, deleted: false,
+          }],
+        }],
+      }],
+    });
+    const mirror = document.querySelector("[data-inline-text]");
+    expect(mirror?.textContent).toBe("First draft");
+    expect(mirror?.querySelector("span")?.style.fontWeight).toBe("750");
+
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(2, 2);
+    fireEvent.click(area);
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    expect(screen.getByLabelText("Commented text").textContent).toBe("First");
   });
 });
 
@@ -599,6 +756,33 @@ describe("text moves across block boundaries", () => {
       text: "First draftShip it",
     });
     expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  it("moves exact comments before removing a merged source block", async () => {
+    const { spies } = renderPagesView({
+      pageThreads: [{
+        target: "b",
+        threads: [{
+          thread: {
+            id: "t1", target: "b", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 0, end: 4 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+    await settle();
+
+    expect(spies.moveCommentThread).toHaveBeenCalledWith({
+      threadId: "t1",
+      target: "a",
+      anchor: { start: 11, end: 15 },
+    });
+    expect(callOrder(spies.moveCommentThread)[0]).toBeLessThan(callOrder(spies.removePageBlock)[0]);
   });
 
   it("leaves Backspace alone in the middle of a block", () => {
@@ -930,6 +1114,78 @@ describe("pasting a document", () => {
     materialize("insertPageBlock");
     pasteInto("Edit paragraph block 1", "just some words");
     expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+
+  it("keeps marks with the original text around a multi-block paste", async () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({
+          id: "e",
+          text: "AA middle ZZ",
+          marks: [
+            { start: 0, end: 2, kind: "bold" },
+            { start: 10, end: 12, kind: "italic" },
+          ],
+        }),
+      ],
+      pageThreads: [{
+        target: "e",
+        threads: [{
+          thread: {
+            id: "tail-thread", target: "e", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 10, end: 12 }, resolved: false, resolved_by: null,
+            comment_ids: ["tail-comment"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    pasteInto("Edit paragraph block 1", "one\ntwo", [3, 9]);
+    await settle();
+
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "e",
+      text: "AA one",
+      marks: [{ start: 0, end: 2, kind: "bold" }],
+    });
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(expect.objectContaining({
+      text: "two ZZ",
+      marks: [{ start: 4, end: 6, kind: "italic" }],
+    }));
+    const inserted = (spies.insertPageBlock as unknown as Mock).mock.calls[0][0];
+    expect(spies.moveCommentThread).toHaveBeenCalledWith({
+      threadId: "tail-thread",
+      target: inserted.blockId,
+      anchor: { start: 4, end: 6 },
+    });
+  });
+
+  it("keeps an anchored tail in the source when a pasted block fails", async () => {
+    const { spies, fails, materialize } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({ id: "e", text: "head tail" }),
+      ],
+      pageThreads: [{
+        target: "e",
+        threads: [{
+          thread: {
+            id: "tail-thread", target: "e", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 5, end: 9 }, resolved: false, resolved_by: null,
+            comment_ids: ["tail-comment"],
+          },
+          comments: [],
+        }],
+      }],
+    });
+    materialize("updatePageBlockText", "moveCommentThread");
+    fails("insertPageBlock");
+    pasteInto("Edit paragraph block 1", "one\ntwo", [5, 5]);
+    await settle();
+
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    expect(spies.moveCommentThread).not.toHaveBeenCalled();
   });
 
   it("caps the burst and says so — every block is one consensus write", () => {
@@ -1342,5 +1598,94 @@ describe("drag to reorder", () => {
       .closest('[style*="margin-left"]') as HTMLElement;
     fireEvent.drop(row, { dataTransfer: foreign });
     expect(spies.movePageBlock).not.toHaveBeenCalled();
+  });
+});
+
+// RemoveBlock takes the whole subtree and consensus has no undo of its own, so
+// the view keeps a snapshot and replays it as inserts. Three ways that goes
+// wrong, all of them found in review, none of them corrupting state:
+describe("the delete-undo toast", () => {
+  const openMenu = (n: number) =>
+    fireEvent.click(screen.getByRole("button", { name: `Block ${n} actions` }));
+  const deleteBlock = (n: number) => {
+    openMenu(n);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+  };
+  const undo = () => fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+  it("replays the subtree with its ids, kind and position", async () => {
+    const { spies } = renderPagesView();
+    deleteBlock(2); // the childless to-do
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+
+    undo();
+    await settle();
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "b", parent: "p1", after: "a", kind: "todo", text: "Ship it" }),
+    );
+  });
+
+  // SetKind leaves `checked` set in the module, so a to-do that was ticked and
+  // then converted to text still carries the bit. Replaying it is a SetChecked
+  // on a paragraph — NotTodo, an error toast on a restore that WORKED.
+  it("does not replay `checked` on a block that is no longer a to-do", async () => {
+    const converted: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a"] }),
+      blockOf({ id: "a", kind: "paragraph", text: "was a to-do", checked: true }),
+    ];
+    const { spies, materialize } = renderPagesView({ activePageBlocks: converted });
+    materialize("setPageBlockChecked");
+    deleteBlock(1);
+
+    undo();
+    await settle();
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "a", kind: "paragraph" }),
+    );
+    expect(spies.setPageBlockChecked).not.toHaveBeenCalled();
+  });
+
+  // this view survives a doc switch, and InsertBlock is page-agnostic: the undo
+  // used to restore the subtree into the other document, off-screen, so the
+  // click read as a no-op.
+  it("goes back to the page the block was deleted from before restoring", async () => {
+    const { spies, rerender } = renderPagesView();
+    deleteBlock(2);
+    rerender({ activePage: "p2", activePageBlocks: [] });
+
+    undo();
+    await settle();
+    expect(spies.openPage).toHaveBeenCalledWith("p1");
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ blockId: "b", parent: "p1" }),
+    );
+  });
+
+  // the anchor or the parent can be gone by the time Undo is clicked (someone
+  // else deleted it). Every op in the batch then rejects, and each rejection
+  // used to raise its own toast while nothing came back.
+  it("reports a restore that cannot land ONCE, instead of one toast per block", async () => {
+    const nested: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["a"] }),
+      blockOf({ id: "a", kind: "toggle", text: "Parent", children: ["a1"] }),
+      blockOf({ id: "a1", parent: "a", text: "Child" }),
+    ];
+    const { spies, fails } = renderPagesView({ activePageBlocks: nested });
+    fails("insertPageBlock");
+    deleteBlock(1); // has a child, so it asks first
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: /delete this block/i })).getByRole("button", {
+        name: /delete block/i,
+      }),
+    );
+
+    undo();
+    await settle();
+    // the root op did not land, so the two ops chained behind it never went out
+    // (they would each have been rejected, and each have raised its own toast).
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(1);
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(expect.objectContaining({ quiet: true }));
+    // …and the failure is reported, once, in the reader's words.
+    within(screen.getByRole("alert")).getByText(/couldn't restore the block/i);
   });
 });

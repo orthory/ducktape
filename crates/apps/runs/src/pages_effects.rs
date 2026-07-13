@@ -203,6 +203,7 @@ impl RunsModule {
                         comment_id: page_comment_id(run_id, slot),
                         target: target.clone(),
                         text: body.clone(),
+                        anchor: None,
                         mentions: Vec::new(),
                         // pages refines Module("runs") + as_agent into
                         // AuthorRef::Agent — the same wire chat replies use.

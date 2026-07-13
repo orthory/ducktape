@@ -71,7 +71,7 @@ pub enum ForgeMsg {
         body: String,
     },
     /// open a pull request from a born `source_branch` onto `target_branch`
-    /// (empty -> "main"). same number space + discussion channel as issues.
+    /// (empty -> "dev"). same number space + discussion channel as issues.
     OpenPr {
         #[serde(default)]
         repo: String,

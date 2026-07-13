@@ -41,6 +41,8 @@ const snap = (over: Partial<NavSnapshot> = {}): NavSnapshot => ({
   page: null,
   forgeRepo: null,
   forgeItem: null,
+  forgeMessageId: null,
+  forgeMessageSeq: null,
   explorer: null,
   agent: null,
   member: null,
@@ -94,8 +96,23 @@ describe("latchOneShots", () => {
 
 describe("readNavEntry", () => {
   it("round-trips a stamped snapshot with its stack position", () => {
-    const s = snap({ channel: "general", forgeItem: 7 });
+    const s = snap({
+      channel: "general",
+      forgeItem: 7,
+      forgeMessageId: "m7",
+      forgeMessageSeq: 4,
+    });
     expect(readNavEntry(stampNav(s, 3))).toEqual({ snap: s, index: 3 });
+  });
+
+  it("reads pre-anchor history entries with empty Forge message focus", () => {
+    const old = stampNav(snap(), 1) as unknown as Record<string, unknown>;
+    delete old.forgeMessageId;
+    delete old.forgeMessageSeq;
+    expect(readNavEntry(old)?.snap).toMatchObject({
+      forgeMessageId: null,
+      forgeMessageSeq: null,
+    });
   });
 
   it("rejects foreign or malformed history state", () => {
@@ -297,15 +314,17 @@ describe("browser back/forward (provider integration)", () => {
   });
 
   it("screen switches push entries; back/forward walk them and restore the rail", async () => {
+    // status = an operator-section screen; this harness's managed workspace
+    // passes the node-control gate, so the rail genuinely flips (ADR A5/A6).
     await bootShell();
     const lengthBefore = window.history.length;
 
     await act(async () => {
-      actions!.setScreen("members");
+      actions!.setScreen("status");
     });
     expect(screen.getByTestId("viewMode").textContent).toBe("operator");
     expect(window.history.length).toBe(lengthBefore + 1);
-    expect(readNavEntry(window.history.state)?.snap.screen).toBe("members");
+    expect(readNavEntry(window.history.state)?.snap.screen).toBe("status");
     expect(screen.getByTestId("nav").textContent).toBe("1/2");
 
     await traverse(() => window.history.back());
@@ -315,7 +334,7 @@ describe("browser back/forward (provider integration)", () => {
     expect(screen.getByTestId("nav").textContent).toBe("0/2");
 
     await traverse(() => window.history.forward());
-    await waitFor(() => expect(screen.getByTestId("screen").textContent).toBe("members"));
+    await waitFor(() => expect(screen.getByTestId("screen").textContent).toBe("status"));
     expect(screen.getByTestId("viewMode").textContent).toBe("operator");
     expect(screen.getByTestId("nav").textContent).toBe("1/2");
   });

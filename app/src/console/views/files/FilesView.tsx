@@ -22,13 +22,12 @@ import {
   joinPath,
   ls,
   mkdir,
-  readAll,
   refs,
   uploadFile,
   uploadFiles,
 } from "../../../domain/files-client";
 import type { FileEntry, FileUploadEntry } from "../../../domain/files-client";
-import { FILES_WATCH_TOPIC } from "../../../domain/stream";
+import { FILES_WATCH_TOPIC, isFileChangeTailItem } from "../../../domain/stream";
 import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow, tint } from "../../theme/tokens";
@@ -475,14 +474,12 @@ function EntryRow({
   selected,
   onOpen,
   onContextMenu,
-  onPrepareDownload,
   onDragStart,
 }: {
   entry: FileEntry;
   selected: boolean;
   onOpen: () => void;
   onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
-  onPrepareDownload: () => void;
   onDragStart: (event: ReactDragEvent<HTMLButtonElement>) => void;
 }) {
   const [hover, setHover] = useState(false);
@@ -495,16 +492,10 @@ function EntryRow({
       draggable={!isDir}
       onClick={onOpen}
       onContextMenu={onContextMenu}
-      onMouseDown={() => {
-        if (!isDir) onPrepareDownload();
-      }}
       onDragStart={(event) => {
         if (!isDir) onDragStart(event);
       }}
-      onMouseEnter={() => {
-        setHover(true);
-        if (!isDir) onPrepareDownload();
-      }}
+      onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
         all: "unset",
@@ -566,7 +557,6 @@ function DirectoryColumnView({
   onOpen,
   onContextMenu,
   onLoadMore,
-  onPrepareDownload,
   onFileDragStart,
 }: {
   column: DirectoryColumn;
@@ -578,7 +568,6 @@ function DirectoryColumnView({
     entry: FileEntry | null,
   ) => void;
   onLoadMore: (path: string) => void;
-  onPrepareDownload: (entry: FileEntry) => void;
   onFileDragStart: (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => void;
 }) {
   const rows = sortEntries(column.entries);
@@ -628,14 +617,27 @@ function DirectoryColumnView({
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
-        {column.loading ? (
+        {column.loading && rows.length === 0 ? (
           <CenterState title="Loading…" detail="Reading this directory." muted />
-        ) : column.error ? (
+        ) : column.error && rows.length === 0 ? (
           <CenterState title="Could not read folder" detail={column.error} muted />
         ) : rows.length === 0 ? (
           <CenterState title="Empty directory" detail="Nothing here." muted />
         ) : (
           <>
+            {column.loading && (
+              <div
+                role="status"
+                style={{
+                  padding: "6px 16px",
+                  borderBottom: `1px solid ${color.borderSoft}`,
+                  font: `500 10.5px ${font.sans}`,
+                  color: color.muted2,
+                }}
+              >
+                Refreshing…
+              </div>
+            )}
             {rows.map((entry) => (
               <EntryRow
                 key={entry.path}
@@ -643,7 +645,6 @@ function DirectoryColumnView({
                 selected={selectedPath === entry.path || childPath === entry.path}
                 onOpen={() => onOpen(entry)}
                 onContextMenu={(event) => onContextMenu(event, entry)}
-                onPrepareDownload={() => onPrepareDownload(entry)}
                 onDragStart={(event) => onFileDragStart(event, entry)}
               />
             ))}
@@ -1021,9 +1022,6 @@ export function FilesView() {
   const { state, transport } = useDucktape();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
-  const dragDownloadUrls = useRef<Map<string, string>>(new Map());
-  const dragDownloadFiles = useRef<Map<string, File>>(new Map());
-  const dragDownloadRequests = useRef<Set<string>>(new Set());
   // dragenter/dragleave fire per descendant, so we count entry depth instead of
   // toggling on each one — the overlay stays put as the pointer crosses columns.
   const dragDepth = useRef(0);
@@ -1048,42 +1046,47 @@ export function FilesView() {
 
   const backed = Boolean(state.status?.modules.some((m) => m.id === "files"));
   const readOnly = snapshot !== null;
-  const bumpReload = useCallback(() => setReloadToken((n) => n + 1), []);
+  const reloadColumns = useCallback((paths?: Iterable<string>) => {
+    const wanted = paths ? new Set(paths) : null;
+    setColumns((prev) =>
+      prev.map((column) =>
+        wanted === null || wanted.has(column.path)
+          ? { ...column, loading: true, error: null }
+          : column,
+      ),
+    );
+    setReloadToken((n) => n + 1);
+  }, []);
   const dir = columns[columns.length - 1]?.path ?? DEFAULT_DIR;
   const error = actionError ?? columns.find((column) => column.error)?.error ?? null;
   const columnKey = columns.map((column) => column.path).join("\0");
-  const dragDownloadKey = (entry: FileEntry): string => `${snapshot ?? "live"}:${entry.path}`;
-
-  useEffect(
-    () => () => {
-      dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
-      dragDownloadUrls.current.clear();
-      dragDownloadFiles.current.clear();
-      dragDownloadRequests.current.clear();
-    },
-    [],
-  );
-
-  useEffect(() => {
-    dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
-    dragDownloadUrls.current.clear();
-    dragDownloadFiles.current.clear();
-    dragDownloadRequests.current.clear();
-  }, [snapshot, transport]);
 
   useEffect(() => {
     if (!transport || !backed || snapshot !== null) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const scheduleReload = () => {
+    let reloadAll = false;
+    const dirty = new Set<string>();
+    const scheduleReload = (paths?: string[]) => {
+      if (paths) {
+        paths.forEach((path) => {
+          dirty.add(parentDir(path));
+          dirty.add(path);
+        });
+      } else reloadAll = true;
       if (timer !== null) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
-        bumpReload();
+        const paths = reloadAll ? undefined : new Set(dirty);
+        reloadAll = false;
+        dirty.clear();
+        reloadColumns(paths);
       }, 100);
     };
     const off = transport.subscribe([FILES_WATCH_TOPIC], {
       onTail: (frame) => {
-        if (frame.topic === FILES_WATCH_TOPIC) scheduleReload();
+        if (frame.topic !== FILES_WATCH_TOPIC) return;
+        const paths = isFileChangeTailItem(frame.item) ? frame.item.paths : [];
+        scheduleReload(paths.length > 0 ? paths : undefined);
       },
       onLagged: (topic) => {
         if (topic === FILES_WATCH_TOPIC) scheduleReload();
@@ -1093,11 +1096,11 @@ export function FilesView() {
       if (timer !== null) clearTimeout(timer);
       off();
     };
-  }, [transport, backed, snapshot, bumpReload]);
+  }, [transport, backed, snapshot, reloadColumns]);
 
   // Track the live head for the history panel's diff base.
   useEffect(() => {
-    if (!transport) return;
+    if (!transport || !showHistory) return;
     let alive = true;
     refs(transport)
       .then((r) => alive && setHead(r.head))
@@ -1105,20 +1108,15 @@ export function FilesView() {
     return () => {
       alive = false;
     };
-  }, [transport, reloadToken]);
+  }, [transport, showHistory, reloadToken]);
 
   // Page each visible browser column. A fresh live network may not have /shared
   // yet; keep that as an empty writeable default instead of drifting writes to root.
   useEffect(() => {
     if (!transport) return;
     let alive = true;
-    const paths = columns.map((column) => column.path);
-
-    setColumns((prev) =>
-      prev.map((column) =>
-        paths.includes(column.path) ? { ...column, loading: true, error: null } : column,
-      ),
-    );
+    const paths = columns.filter((column) => column.loading).map((column) => column.path);
+    if (paths.length === 0) return;
 
     paths.forEach((path) => {
       ls(transport, { path, snapshot: snapshot ?? undefined })
@@ -1249,7 +1247,7 @@ export function FilesView() {
 
   const refreshDirectory = () => {
     setContextMenu(null);
-    bumpReload();
+    reloadColumns();
   };
 
   const uploadBrowserEntries = async (entries: BrowserUploadEntry[], targetDir: string) => {
@@ -1297,7 +1295,7 @@ export function FilesView() {
         });
       }
       setUpload(null);
-      bumpReload();
+      reloadColumns([writeDir]);
     } catch (err) {
       setUpload(null);
       setActionError(errMsg(err));
@@ -1328,9 +1326,8 @@ export function FilesView() {
 
   const canUpload = Boolean(transport) && !readOnly && backed;
 
-  // An inbound OS file drag. Internal file-download drags also expose "Files"
-  // (we add a File to the dataTransfer), so exclude anything carrying our own
-  // file-path type — dragging a file out must not trigger the upload overlay.
+  // An inbound OS file drag. Exclude anything carrying our own file-path type
+  // in case the platform also reports an internal download drag as "Files".
   const isUploadDrag = (event: ReactDragEvent<HTMLElement>): boolean => {
     const types = Array.from(event.dataTransfer?.types ?? []);
     return types.includes("Files") && !types.includes("application/x-ducktape-file-path");
@@ -1371,43 +1368,20 @@ export function FilesView() {
       .catch((err) => setActionError(errMsg(err)));
   };
 
-  const prepareDragDownload = (entry: FileEntry) => {
-    if (!transport || entry.kind !== "file" || typeof URL.createObjectURL !== "function") return;
-    const key = dragDownloadKey(entry);
-    if (dragDownloadUrls.current.has(key) || dragDownloadRequests.current.has(key)) return;
-    dragDownloadRequests.current.add(key);
-    readAll(transport, { path: entry.path, snapshot: snapshot ?? undefined })
-      .then((bytes) => {
-        const mime = entry.meta.mime || "application/octet-stream";
-        const name = basename(entry.path);
-        const file = new File([bytes], name, { type: mime });
-        const url = URL.createObjectURL(file);
-        const previous = dragDownloadUrls.current.get(key);
-        if (previous) URL.revokeObjectURL?.(previous);
-        dragDownloadFiles.current.set(key, file);
-        dragDownloadUrls.current.set(key, url);
-      })
-      .catch((err) => setActionError(errMsg(err)))
-      .finally(() => dragDownloadRequests.current.delete(key));
-  };
-
   const handleFileDragStart = (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => {
-    if (entry.kind !== "file") return;
+    if (!transport || entry.kind !== "file") return;
     const name = basename(entry.path);
     const mime = entry.meta.mime || "application/octet-stream";
-    const key = dragDownloadKey(entry);
-    const downloadUrl = dragDownloadUrls.current.get(key);
-    const downloadFile = dragDownloadFiles.current.get(key);
+    const downloadUrl = transport.filesObjectUrl?.({
+      path: entry.path,
+      snapshot: snapshot ?? undefined,
+      size: entry.size,
+    });
     event.dataTransfer.effectAllowed = "copy";
-    if (downloadFile && event.dataTransfer.items?.add) {
-      event.dataTransfer.items.add(downloadFile);
-    }
     event.dataTransfer.setData("application/x-ducktape-file-path", entry.path);
     event.dataTransfer.setData("text/plain", entry.path);
     if (downloadUrl) {
       event.dataTransfer.setData("DownloadURL", `${mime}:${name}:${downloadUrl}`);
-    } else {
-      prepareDragDownload(entry);
     }
   };
 
@@ -1422,7 +1396,7 @@ export function FilesView() {
       await mkdir(transport, { path: joinPath(writeTargetDir(dir), name) });
       setNewFolderOpen(false);
       setNewFolderName("");
-      bumpReload();
+      reloadColumns([writeTargetDir(dir)]);
     } catch (err) {
       setActionError(errMsg(err));
     } finally {
@@ -1445,7 +1419,7 @@ export function FilesView() {
         });
       }
       setDeleteTarget(null);
-      bumpReload();
+      reloadColumns([parentDir(entry.path)]);
     } catch (err) {
       setActionError(errMsg(err));
     } finally {
@@ -1611,7 +1585,6 @@ export function FilesView() {
                       onOpen={openEntry}
                       onContextMenu={openContextMenu}
                       onLoadMore={loadMore}
-                      onPrepareDownload={prepareDragDownload}
                       onFileDragStart={handleFileDragStart}
                     />
                   ))}
