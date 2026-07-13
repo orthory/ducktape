@@ -573,7 +573,7 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
 
 async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.
-    handle.shutdown.notify_one();
+    handle.request_shutdown();
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
@@ -641,6 +641,32 @@ async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_wakes_every_surface_and_remains_sticky() {
+        let (handle, _commands, _hub) = NodeHandle::channel();
+        let first = handle.clone();
+        let second = handle.clone();
+        let waiters = async move {
+            tokio::join!(first.shutdown_requested(), second.shutdown_requested());
+        };
+        let trigger = async {
+            tokio::task::yield_now().await;
+            handle.request_shutdown();
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(waiters, trigger);
+        })
+        .await
+        .expect("every registered surface wakes");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.shutdown_requested(),
+        )
+        .await
+        .expect("shutdown remains visible to a late surface");
+    }
 
     /// the explorer row round-trips through its stored index encoding — the
     /// one seam both binaries write and `GET /v1/blocks` reads.
