@@ -279,25 +279,37 @@ pub(super) async fn finish(
                     let Ok(req) = statesync::decode_request(body) else {
                         continue;
                     };
-                    // the COMMITTED-standing check, via the loop-owned seam
-                    // (fresh per request — a just-Redeemed resident is admitted
-                    // immediately; see SyncStateRequest::Standing).
-                    let (standing_tx, standing_rx) = tokio::sync::oneshot::channel();
-                    let mut probe = state_tx.clone();
-                    if futures::SinkExt::send(
-                        &mut probe,
-                        SyncStateRequest::Standing {
-                            requester,
-                            reply: standing_tx,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        continue; // state owner shutting down.
-                    }
-                    if !standing_rx.await.unwrap_or(false) {
-                        continue; // not in committed standing: refuse (drop).
+                    // the COMMITTED-standing check gates the STATE-BEARING lanes
+                    // (Manifest/Chunk/Module/Frames/Index*), fresh per request via
+                    // the loop-owned seam (a just-Redeemed resident is admitted
+                    // immediately; see SyncStateRequest::Standing). the TipCoords
+                    // DETECTION lane is EXEMPT: it carries coordinates (height,
+                    // app_hash, epoch, membership), never state bytes, and a node
+                    // that has LOST standing (a revoked resident) or awaits an
+                    // out-of-band grant needs it to detect its own transition — a
+                    // poll its own revocation would otherwise refuse, wedging it
+                    // forever (it never learns to fall back to a parked joiner).
+                    // the PoP above still gates it (only a real key-holder polls),
+                    // and every STATE lane stays refused, so ZERO chain state
+                    // crosses to a standing-less key.
+                    if !matches!(req, statesync::SyncRequest::TipCoords) {
+                        let (standing_tx, standing_rx) = tokio::sync::oneshot::channel();
+                        let mut probe = state_tx.clone();
+                        if futures::SinkExt::send(
+                            &mut probe,
+                            SyncStateRequest::Standing {
+                                requester,
+                                reply: standing_tx,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            continue; // state owner shutting down.
+                        }
+                        if !standing_rx.await.unwrap_or(false) {
+                            continue; // not in committed standing: refuse (drop).
+                        }
                     }
                     let req_kind = req.kind_name();
                     let resp = drive_sync_request(&mut server, &state_tx, req).await;
