@@ -121,6 +121,24 @@ describe("PagesView", () => {
     expect(spies.openPage).toHaveBeenCalledWith("p2");
   });
 
+  it("filters the page tree while keeping matching ancestors visible", () => {
+    renderPagesView({
+      pages: [
+        { id: "p1", title: "Launch plan", parent: null },
+        { id: "p2", title: "SMS fallback", parent: "p1" },
+        { id: "p3", title: "Retro", parent: null },
+      ],
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search pages" }), {
+      target: { value: "sms" },
+    });
+
+    screen.getByRole("button", { name: "Open Launch plan" });
+    screen.getByRole("button", { name: "Open SMS fallback" });
+    expect(screen.queryByRole("button", { name: "Open Retro" })).toBeNull();
+  });
+
   it("deletes a page through an in-app dialog", () => {
     const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderPagesView();
