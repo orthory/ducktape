@@ -105,6 +105,7 @@ pub fn wrap_podman(
 /// ponytail: a fixed process-wide cap; a host serving Linux guests (no such
 /// limit) could make the cap image-conditional, but v1 is one backend per node.
 pub const TART_MAX_CONCURRENT: usize = 2;
+const TART_MIN_CORES: u64 = 2;
 
 /// the process-wide Tart concurrency gate (see [`TART_MAX_CONCURRENT`]).
 pub fn tart_semaphore() -> &'static tokio::sync::Semaphore {
@@ -410,7 +411,7 @@ pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str) -> Vec<String> {
 pub(crate) fn tart_set_argv(vm: &str, limits: &BTreeMap<String, u64>) -> Option<Vec<String>> {
     let mut argv = vec!["set".to_string(), vm.to_string()];
     if let Some(cores) = limits.get("cores") {
-        argv.extend(["--cpu".into(), cores.to_string()]);
+        argv.extend(["--cpu".into(), cores.max(&TART_MIN_CORES).to_string()]);
     }
     if let Some(mem_gb) = limits.get("mem_gb") {
         argv.extend(["--memory".into(), mem_gb.saturating_mul(1024).to_string()]);
@@ -608,6 +609,12 @@ mod tests {
         assert_eq!(
             tart_set_argv("vm", &limits).unwrap().join(" "),
             "set vm --cpu 4 --memory 8192"
+        );
+        assert_eq!(
+            tart_set_argv("vm", &BTreeMap::from([("cores".into(), 1)]))
+                .unwrap()
+                .join(" "),
+            "set vm --cpu 2"
         );
         assert_eq!(tart_set_argv("vm", &BTreeMap::new()), None);
     }
