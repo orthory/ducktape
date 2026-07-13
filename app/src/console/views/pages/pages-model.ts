@@ -220,13 +220,51 @@ export function moveDownTarget(
   return { parent: parent.id, after: parent.children[pos + 1] };
 }
 
-/** One insert of a duplicate: the wire's InsertBlock plus the `checked` bit,
- *  which InsertBlock does not carry (the caller follows with SetChecked). */
+/** One InsertBlock op plus the `checked` bit, which InsertBlock does not carry
+ *  (the caller follows with SetChecked). Shared by duplicatePlan (fresh ids) and
+ *  subtreePlan (original ids, for delete-undo). */
 export interface DuplicateOp extends MoveTarget {
   blockId: string;
   kind: BlockKind;
   text: string;
   checked: boolean;
+}
+
+/** Preorder-emit a block and its subtree as InsertBlock ops: each block's id
+ *  comes from `idFor`, the root anchors `after` `rootAfter`, and every child
+ *  anchors after the previously-emitted sibling. Empty when the block is unknown
+ *  or the page root. Capped, because every op is a consensus submit. */
+function planSubtree(
+  blocks: PageBlock[],
+  blockId: string,
+  idFor: (srcId: string) => string,
+  rootAfter: string | null,
+  limit: number,
+): DuplicateOp[] {
+  const map = byId(blocks);
+  const source = map.get(blockId);
+  if (!source || !source.parent) return [];
+
+  const ops: DuplicateOp[] = [];
+  const emit = (srcId: string, parent: string, after: string | null): string | null => {
+    if (ops.length >= limit) return null;
+    const block = map.get(srcId);
+    if (!block) return null;
+    const id = idFor(srcId);
+    ops.push({
+      blockId: id,
+      parent,
+      after,
+      kind: block.kind,
+      text: block.text,
+      checked: block.checked,
+    });
+    let prev: string | null = null;
+    for (const child of block.children) prev = emit(child, id, prev) ?? prev;
+    return id;
+  };
+  emit(blockId, source.parent, rootAfter);
+  return ops;
 }
 
 /** Deep-copy a block and its subtree: preorder inserts with fresh ids, the copy
@@ -240,30 +278,29 @@ export function duplicatePlan(
   mintId: () => string,
   limit = 60,
 ): DuplicateOp[] {
-  const map = byId(blocks);
-  const source = map.get(blockId);
-  if (!source || !source.parent) return [];
+  return planSubtree(blocks, blockId, () => mintId(), blockId, limit);
+}
 
-  const ops: DuplicateOp[] = [];
-  const copy = (srcId: string, parent: string, after: string | null): string | null => {
-    if (ops.length >= limit) return null;
-    const block = map.get(srcId);
-    if (!block) return null;
-    const id = mintId();
-    ops.push({
-      blockId: id,
-      parent,
-      after,
-      kind: block.kind,
-      text: block.text,
-      checked: block.checked,
-    });
-    let prev: string | null = null;
-    for (const child of block.children) prev = copy(child, id, prev) ?? prev;
-    return id;
-  };
-  copy(blockId, source.parent, blockId);
-  return ops;
+/** Snapshot a block and its subtree so a delete can be undone: preorder inserts
+ *  that PRESERVE the original ids (client-minted and free to reuse once the
+ *  remove commits) and the `checked` bit, re-anchoring the root at its original
+ *  position (after its previous sibling). Empty when the block is unknown, is
+ *  the page root, or the subtree exceeds `limit` — a partial restore is worse
+ *  than none, so an over-cap subtree refuses outright rather than truncating.
+ *  Same consensus-op ceiling duplicatePlan and paste honor. */
+export function subtreePlan(
+  blocks: PageBlock[],
+  blockId: string,
+  limit = 60,
+): DuplicateOp[] {
+  const map = byId(blocks);
+  const siblings = map.get(map.get(blockId)?.parent ?? "")?.children ?? [];
+  const pos = siblings.indexOf(blockId);
+  const after = pos > 0 ? siblings[pos - 1] : null;
+  // Ask for one past the ceiling: a plan that comes back longer than `limit`
+  // means the subtree overflowed it, and gets refused (no partial restore).
+  const plan = planSubtree(blocks, blockId, (id) => id, after, limit + 1);
+  return plan.length > limit ? [] : plan;
 }
 
 /** List kinds continue on Enter (a fresh sibling keeps the kind); everything
