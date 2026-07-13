@@ -416,6 +416,25 @@ impl NetworkShapeCluster {
         }
     }
 
+    /// wait for node `idx` to exit ON ITS OWN (e.g. the fail-loud FATAL path)
+    /// and reap it — the [`Cluster::wait_exit`] mirror.
+    pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            if node.child.try_wait().expect("poll node").is_some() {
+                self.nodes[idx] = None;
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "network-shape node idx {idx} did not exit within {timeout:?};\n{}",
+                self.all_log_tails(40)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn all_log_tails(&self, lines: usize) -> String {
         self.nodes
             .iter()

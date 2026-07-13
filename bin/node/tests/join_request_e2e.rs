@@ -123,4 +123,11 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
         fatal.contains("invite already redeemed"),
         "the fatal line names the cause: {fatal}"
     );
+    assert!(
+        fatal.contains("fresh invite"),
+        "the fatal line carries actionable guidance: {fatal}"
+    );
+    // ... and the process actually DIES — a FATAL print followed by a silent
+    // retry loop is exactly the "joiner waits forever" field symptom.
+    cluster.wait_exit(1, Duration::from_secs(30));
 }
