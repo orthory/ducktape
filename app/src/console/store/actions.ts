@@ -1030,16 +1030,21 @@ export function createActions({
   };
 
   // The one membership write path: a tracked SetMembership keyed by channel +
-  // target so each member row carries its own finalization mark, then a refetch
-  // that reconciles the panel to committed state (no optimistic projection —
-  // the mark is the immediate feedback; the refetch is the truth).
+  // target so each member row carries its own finalization mark, an optimistic
+  // projection so that row EXISTS to carry it from the click (the mark is the
+  // immediate feedback, and it drew on nothing until the post-settle refetch
+  // materialised the row ~a block later), then a refetch that reconciles the
+  // panel to committed state — the refetch, not the projection, is the truth.
   const submitMembership = (
     channelId: string,
     user: number[],
     member: boolean,
   ): Promise<boolean> =>
-    submitTracked(opKey.membership(channelId, keyHex(user)), (live) =>
-      chatClient.setMembership(live, { channelId, user, member, origin: getState().author }),
+    submitTracked(
+      opKey.membership(channelId, keyHex(user)),
+      (live) =>
+        chatClient.setMembership(live, { channelId, user, member, origin: getState().author }),
+      (prev) => optimistic.channelMembershipSet(prev, { channelId, user, member }),
     ).then((landed) => {
       void refreshChannelMembers(channelId);
       return landed;

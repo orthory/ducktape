@@ -199,6 +199,22 @@ export const channelArchivedSet = (
   ),
 });
 
+/** Add/remove one channel member the instant the SetMembership op is submitted,
+ *  so the member row (and its finalization mark) exists before the block lands —
+ *  without it the mark has no row to render on until the post-settle refetch.
+ *  Idempotent on the target's key hex: a double click re-projects the same row
+ *  rather than a duplicate (the module's stage_membership no-ops the same way).
+ *  refreshChannelMembers reconciles the set to committed truth after. */
+export const channelMembershipSet = (
+  prev: ConsoleState,
+  params: { channelId: string; user: number[]; member: boolean },
+): Partial<ConsoleState> => {
+  if (prev.activeChannel !== params.channelId) return {};
+  const hex = keyHex(params.user);
+  const others = prev.channelMembers.filter((bytes) => keyHex(bytes) !== hex);
+  return { channelMembers: params.member ? [...others, params.user] : others };
+};
+
 /** Add ourselves to a channel's huddle roster the instant we join, so the pill
  *  and dock react before the block lands. Idempotent on our node key; the
  *  refresh replaces the roster (with the module-assigned join order) after. */
