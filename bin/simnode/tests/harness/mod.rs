@@ -26,8 +26,14 @@ impl Drop for Sim {
 }
 
 impl Sim {
-    /// spawn with an explicit fresh storage dir: the sim has no height-resume
-    /// watermark, so reusing a dir would restart heights over persisted state.
+    /// spawn a sim child against `storage`. a FRESH dir is the norm — the
+    /// determinism scenarios need one, since reused module state defeats the
+    /// same-script reproducibility the tool exists for — but reusing a dir is a
+    /// SUPPORTED restart: the sim resumes height above the index watermark
+    /// (`index.resume_height()`) and every qmdb-backed module reloads its
+    /// committed state, so respawning on the same dir CONTINUES the chain rather
+    /// than restarting at 0 (exercised by reactor_seams.rs's restart scenario;
+    /// `Drop` kills+waits the prior child, so a plain drop-then-respawn is safe).
     pub fn spawn(storage: &Path, extra_args: &[&str]) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-simnode"));
