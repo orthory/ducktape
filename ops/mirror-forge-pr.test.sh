@@ -84,6 +84,12 @@ assert_shared_dev_base "$TARGET_OID" "$GITHUB_BASE"
 bridge_tree=$(git rev-parse "$GITHUB_BASE^{tree}")
 BRIDGE=$(printf 'history-only bridge\n' | git commit-tree "$bridge_tree" -p "$GITHUB_BASE")
 assert_shared_dev_base "$BRIDGE" "$GITHUB_BASE"
+ancestor_tree=$(git rev-parse "$BASE^{tree}")
+ANCESTOR_TREE_BRIDGE=$(
+  printf 'Forge history bridge with a GitHub ancestor tree\n' |
+    git commit-tree "$ancestor_tree" -p "$MERGE_OID"
+)
+assert_shared_dev_base "$ANCESTOR_TREE_BRIDGE" "$GITHUB_BASE"
 if (assert_shared_dev_base "$TARGET_OID" "$BASE") >/dev/null 2>&1; then
   echo 'Forge-only content outside GitHub dev was accepted' >&2
   exit 1
