@@ -40,19 +40,18 @@ pub enum LobbyMsg {
     /// cannot receive it on the invite (its key does not exist at invite-mint
     /// time), so the lobby reply is its only delivery channel. lobby.rs stays
     /// crypto-agnostic: it moves bytes and never depends on the cap types.
-    /// `#[serde(default)]` keeps the wire back-compatible — an older peer's
-    /// reply (no `cap` field) deserializes with `cap == None`.
+    ///
+    /// decode is STRICT — every field present, no serde defaults. a reply
+    /// from a pre-cutover member (missing `cap`/`fatal`) fails decode and is
+    /// skipped by the reply printer; the joiner's parking bail is the
+    /// backstop. in-place wire updates, no compat shims.
     JoinReply {
         recorded: bool,
         detail: String,
-        #[serde(default)]
         cap: Option<Vec<u8>>,
-        /// this refusal is PERMANENT for this invite (its single-use token
-        /// is already redeemed by another key): the joiner must stop
-        /// re-announcing and ask for a fresh invite. `#[serde(default)]`
-        /// keeps the wire back-compatible — an older member's reply (no
-        /// `fatal` field) deserializes as non-fatal, i.e. keep retrying.
-        #[serde(default)]
+        /// this refusal is PERMANENT for this invite (e.g. its single-use
+        /// token is already redeemed by another key): the joiner must stop
+        /// re-announcing and ask for a fresh invite.
         fatal: bool,
     },
 }
@@ -372,19 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_missing_the_cap_field_defaults_to_none() {
-        // an OLD peer (pre-cap wire) omits `cap` entirely; serde default fills
-        // it as None so the new joiner stays back-compatible.
-        let wire = br#"{"join_reply":{"recorded":true,"detail":"awaiting approval"}}"#;
-        let decoded = decode_msg(wire).expect("old-wire reply decodes");
-        assert_eq!(
-            decoded,
-            LobbyMsg::JoinReply {
-                recorded: true,
-                detail: "awaiting approval".into(),
-                cap: None,
-                fatal: false,
-            }
-        );
+    fn a_reply_missing_fields_is_rejected_not_defaulted() {
+        // pre-cutover members omit `cap`/`fatal`. there is NO compat decode:
+        // such a reply is skipped (undecodable) and the joiner's parking
+        // bail handles the stall. in-place wire updates, no version tags.
+        let old_wire = br#"{"join_reply":{"recorded":true,"detail":"awaiting approval"}}"#;
+        assert!(decode_msg(old_wire).is_err());
     }
 }

@@ -160,11 +160,13 @@ impl ValidatorRuntime<'_> {
             Err(_) => return, // junk on the doorbell — drop.
         };
         // crypto first (pure, cheap): the token must verify for
-        // THIS network and the announced key must prove itself.
+        // THIS network and the announced key must prove itself. a
+        // verify failure is PERMANENT for this blob (tampered,
+        // foreign, or malformed) — fail it loudly.
         let verified = match lobby::verify_join_request(&msg, namespace) {
             Ok(v) => v,
             Err(e) => {
-                send_reply(false, e, None, false);
+                send_reply(false, e, None, true);
                 return;
             }
         };
@@ -189,11 +191,15 @@ impl ValidatorRuntime<'_> {
             return;
         }
         if !members.contains(&verified.issuer.as_ref().to_vec()) {
+            // a removed member's invites are dead FOREVER — permanent
+            // reject, same loud contract as the spent-nonce path.
             send_reply(
                 false,
-                "the inviting member is no longer part of this network".into(),
+                "the inviting member is no longer part of this network — this \
+                 invite is permanently dead; ask a current member for a fresh one"
+                    .into(),
                 None,
-                false,
+                true,
             );
             return;
         }

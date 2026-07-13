@@ -231,6 +231,15 @@ git commit -m "fix(node): permanent lobby rejects (bad crypto, dead issuer) repl
 
 ### Task 4: Joiner lobby-phase deadline — the universal backstop
 
+> **DRIFT RESOLUTION (2026-07-13, controller): NO CODE CHANGE.** The backstop
+> already exists — the parking loop bails FATAL `exit(1)` after ~30 minutes
+> without standing (`bin/node/src/replica/park.rs:494`, `attempt > 900 &&
+> !resident_standing`, ~2s ticks), with operator guidance in the message. The
+> announce loop lives in park.rs (not wiring.rs as planned), and the reply-
+> driven fatal path plus this bail together already guarantee "never waits
+> forever". A tighter 5-minute deadline was judged not worth touching the
+> parking loop for. Task closed as already-implemented-upstream.
+
 First contact has a 90s window (`wiring.rs:298`); the lobby announce loop has NO ceiling. Any stall the member never answers fatally (mute member, dropped replies, undecodable replies after Task 2) spins forever. Add a hard deadline: a FRESH joiner (no standing) that announces for `JOIN_LOBBY_DEADLINE` without standing landing exits FATAL. A restart-with-standing keeps its retry-forever behavior (it is a restore, not a join).
 
 **Files:**
