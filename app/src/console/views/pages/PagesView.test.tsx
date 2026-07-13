@@ -466,11 +466,10 @@ describe("floating comment card", () => {
     expect(screen.queryByRole("dialog", { name: "Comments on this page" })).toBeNull();
   });
 
-  it("still opens the aside panel from the header Comments toggle", () => {
+  it("does not duplicate target threads in an all-comments list", () => {
     renderPagesView();
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
-    screen.getByRole("complementary", { name: "Comments" });
-    expect(screen.queryByRole("dialog", { name: /comments on/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show comments" })).toBeNull();
+    expect(screen.queryByRole("complementary", { name: "Comments" })).toBeNull();
   });
 
   it("hover reveals the comment affordance but no copy-block-link", () => {
@@ -478,6 +477,26 @@ describe("floating comment card", () => {
     fireEvent.mouseOver(screen.getByLabelText("Edit paragraph block 1"));
     screen.getByRole("button", { name: "Comment on block 1" });
     expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
+  });
+
+  it("opens block style and comment actions when text is selected", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 5);
+    fireEvent.select(area);
+
+    screen.getByRole("toolbar", { name: "Selection actions" });
+    fireEvent.change(screen.getByLabelText("Block style"), {
+      target: { value: "heading2" },
+    });
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({
+      blockId: "a",
+      kind: "heading2",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Comment on selected block" }));
+    screen.getByRole("dialog", { name: "Comments on this block" });
   });
 });
 

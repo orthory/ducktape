@@ -64,11 +64,15 @@ where
         let m = decode_msg(&msg.payload).map_err(Error::Module)?;
         let tagged_comment = match &m {
             super::PageMsg::AddComment {
-                thread_id,
                 comment_id,
                 mentions,
                 ..
-            } => Some((thread_id.clone(), comment_id.clone(), mentions.clone())),
+            } => Some((comment_id.clone(), mentions.clone())),
+            super::PageMsg::EditComment {
+                comment_id,
+                mentions,
+                ..
+            } if !mentions.is_empty() => Some((comment_id.clone(), mentions.clone())),
             _ => None,
         };
         // origin + consensus time feed the comment ops (author + timestamp);
@@ -78,19 +82,18 @@ where
         self.apply(m, &origin, now)
             .await
             .map_err(|e| Error::Module(e.to_string()))?;
-        if let (Some(tagging), Some((thread_id, comment_id, mentions))) =
-            (&self.tagging, tagged_comment)
-        {
-            let thread = self
-                .load_thread(&thread_id)
-                .await
-                .map_err(|e| Error::Module(e.to_string()))?
-                .ok_or_else(|| Error::Module("staged comment thread is missing".into()))?;
+        if let (Some(tagging), Some((comment_id, mentions))) = (&self.tagging, tagged_comment) {
             let comment = self
                 .load_comment(&comment_id)
                 .await
                 .map_err(|e| Error::Module(e.to_string()))?
                 .ok_or_else(|| Error::Module("staged comment is missing".into()))?;
+            let thread_id = comment.thread_id.clone();
+            let thread = self
+                .load_thread(&thread_id)
+                .await
+                .map_err(|e| Error::Module(e.to_string()))?
+                .ok_or_else(|| Error::Module("staged comment thread is missing".into()))?;
             let ordinal = thread
                 .comment_ids
                 .iter()

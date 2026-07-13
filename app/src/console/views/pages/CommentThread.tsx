@@ -1,10 +1,10 @@
 // Shared comment-thread pieces: one thread's card (comments, reply, resolve,
-// edit/delete) and the new-thread composer. Rendered by both the full
-// CommentsPanel and the floating per-target CommentCard.
+// edit/delete), participants, and the new-thread composer. Rendered by the
+// floating per-target CommentCard.
 //
 // Both composers carry the chat @mention typeahead (useMentionMenu): the
-// submit path already parses @tokens into structured agent mentions, so the
-// menu is what makes them typeable without knowing an agent id by heart.
+// submit path already parses @tokens into structured user/agent mentions, so
+// the menu is what makes them typeable without knowing an id by heart.
 // Bodies render through CommentText, which resolves the same tokens back to
 // live mention chips.
 
@@ -53,6 +53,64 @@ export interface ComposerTarget {
   label: string;
 }
 
+export function DiscussionParticipants({
+  threads,
+  authorNames,
+  selfKey,
+  selfName,
+}: {
+  threads: ThreadView[];
+  authorNames: AuthorNames;
+  selfKey: string;
+  selfName: string;
+}) {
+  const participants: Comment[] = [];
+  const seen = new Set<string>();
+  for (const { comments } of threads) {
+    for (const comment of comments) {
+      const key = authorKey(comment.author);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      participants.push(comment);
+    }
+  }
+  if (participants.length === 0) return null;
+  const names = participants.map((comment) =>
+    authorKey(comment.author) === selfKey
+      ? selfName
+      : authorName(comment.author, authorNames),
+  );
+  return (
+    <div
+      aria-label={`${participants.length} discussion participant${participants.length === 1 ? "" : "s"}`}
+      title={names.join(", ")}
+      style={{ display: "flex", alignItems: "center", paddingLeft: 5 }}
+    >
+      {participants.slice(0, 3).map((comment, index) => {
+        const name = names[index]!;
+        return (
+          <span
+            key={authorKey(comment.author)}
+            style={{
+              display: "inline-flex",
+              marginLeft: index === 0 ? 0 : -6,
+              border: `2px solid ${color.paper}`,
+              borderRadius: "50%",
+            }}
+          >
+            <Avatar author={comment.author} name={name} size={22} />
+          </span>
+        );
+      })}
+      {participants.length > 3 ? (
+        <span style={{ marginLeft: 4, font: `600 10px ${font.mono}`, color: color.muted2 }}>
+          +{participants.length - 3}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 /** Composer for opening a NEW thread on a block or the page. Autofocused so
  *  the "Comment" affordances drop the user straight into typing; Enter
  *  submits, Shift+Enter breaks a line (comments render pre-wrap). */
@@ -76,10 +134,9 @@ export function NewThreadComposer({
       role="form"
       aria-label={`New comment on ${composer.label}`}
       style={{
-        margin: "8px 12px",
-        padding: "10px 12px",
-        border: `1px solid ${color.borderStrong}`,
-        borderRadius: radius.md,
+        margin: 0,
+        padding: "14px 16px",
+        borderTop: `1px solid ${color.borderSoft}`,
         background: color.paper,
       }}
     >
@@ -129,6 +186,7 @@ function CommentRow({
   comment,
   authorNames,
   selfKey,
+  selfName,
   ops,
   threadPending,
   onEdit,
@@ -137,6 +195,7 @@ function CommentRow({
   comment: Comment;
   authorNames: AuthorNames;
   selfKey: string;
+  selfName: string;
   ops: OpLedger;
   /** True while the THREAD's op (add/reply/resolve) is in flight — an
    *  optimistic row's Edit/Delete would race the create it depends on (the
@@ -148,10 +207,13 @@ function CommentRow({
 }) {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState("");
-  const name = authorName(comment.author, authorNames);
-  const own = authorKey(comment.author) === selfKey && !threadPending;
+  const editRef = useRef<HTMLTextAreaElement | null>(null);
+  const editMention = useMentionMenu(editText, setEditText, editRef);
+  const isSelf = authorKey(comment.author) === selfKey;
+  const name = isSelf ? selfName : authorName(comment.author, authorNames);
+  const own = isSelf && !threadPending;
   return (
-    <div style={{ marginBottom: 10 }}>
+    <div style={{ marginBottom: 14 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
         <Avatar author={comment.author} name={name} size={20} />
         <span
@@ -202,12 +264,27 @@ function CommentRow({
       {editing ? (
         <div style={{ marginTop: 4, marginLeft: 27 }}>
           <textarea
+            ref={editRef}
             aria-label="Edit comment text"
+            autoFocus
             value={editText}
-            onChange={(e) => setEditText(e.target.value)}
+            onChange={editMention.onTextChange}
+            onSelect={editMention.onSelect}
+            onFocus={editMention.onFocus}
+            onBlur={editMention.onBlur}
+            onKeyDown={(event) => {
+              if (editMention.onKeyDown(event)) return;
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                setEditing(false);
+              }
+            }}
             rows={2}
             style={composerStyle}
           />
+          {editMention.menu}
           <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
             <button
               type="button"
@@ -246,6 +323,7 @@ export function ThreadCard({
   view,
   authorNames,
   selfKey,
+  selfName,
   ops = EMPTY_OPS,
   onReply,
   onResolve,
@@ -259,6 +337,8 @@ export function ThreadCard({
    *  author-only — so a click on someone else's comment bought a rejected op
    *  and an error, never an edit. */
   selfKey: string;
+  /** Available before identity hydration resolves our node key in authorNames. */
+  selfName: string;
   /** The finalization ledger — comment rows mark their own in-flight ops, the
    *  reply row marks thread-keyed ones (add/reply/resolve). Optional so bare
    *  renders stay passive. */
@@ -289,9 +369,7 @@ export function ThreadCard({
   return (
     <div
       style={{
-        margin: "8px 12px",
-        border: `1px solid ${color.border}`,
-        borderRadius: radius.md,
+        borderBottom: `1px solid ${color.borderSoft}`,
         background: color.paper,
         opacity: thread.resolved ? 0.65 : 1,
       }}
@@ -302,7 +380,7 @@ export function ThreadCard({
             display: "flex",
             alignItems: "center",
             gap: 5,
-            padding: "7px 12px",
+            padding: "8px 16px",
             borderBottom: `1px solid ${color.borderSoft}`,
             color: color.muted3,
             font: `600 10.5px ${font.sans}`,
@@ -314,13 +392,14 @@ export function ThreadCard({
         </div>
       ) : null}
 
-      <div style={{ padding: "10px 12px 4px" }}>
+      <div style={{ padding: "14px 16px 3px" }}>
         {comments.map((c) => (
           <CommentRow
             key={c.id}
             comment={c}
             authorNames={authorNames}
             selfKey={selfKey}
+            selfName={selfName}
             ops={ops}
             threadPending={threadPending}
             onEdit={onEdit}
@@ -338,7 +417,7 @@ export function ThreadCard({
           display: "flex",
           alignItems: "flex-end",
           gap: 6,
-          padding: "6px 12px 10px",
+          padding: "5px 16px 14px",
         }}
       >
         <textarea

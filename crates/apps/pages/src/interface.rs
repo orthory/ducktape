@@ -148,7 +148,14 @@ pub enum PageMsg {
         as_agent: Option<String>,
     },
     /// replace a comment's text; stored-author-only. rejected on a tombstone.
-    EditComment { comment_id: String, text: String },
+    /// `mentions` carries only refs newly introduced by this edit, so an
+    /// unrelated wording change cannot re-engage everyone already mentioned.
+    EditComment {
+        comment_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<AuthorRef>,
+    },
     /// tombstone a comment; stored-author-only. when it was the thread's last
     /// live comment, the whole thread record is removed.
     DeleteComment { comment_id: String },
@@ -348,5 +355,18 @@ mod interface_tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn legacy_edit_comment_defaults_missing_mentions() {
+        let legacy = br#"{"edit_comment":{"comment_id":"c1","text":"reworded"}}"#;
+        assert_eq!(
+            decode_msg(legacy).unwrap(),
+            PageMsg::EditComment {
+                comment_id: "c1".into(),
+                text: "reworded".into(),
+                mentions: Vec::new(),
+            }
+        );
     }
 }

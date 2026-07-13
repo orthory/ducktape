@@ -258,10 +258,10 @@ export const hasAgentMention = (blocks: ChatBlock[]): boolean =>
     return spans.some(spanMentionsAgent);
   });
 
-/** Distinct structured agent refs carried by parsed blocks, in text order.
- * Pages comments use the same parser even though they store plain text, so
- * invocation never depends on reparsing an arbitrary `@word` in consensus. */
-export const agentMentions = (blocks: ChatBlock[]): AuthorRef[] => {
+/** Distinct structured refs carried by parsed blocks, in text order. Pages
+ * comments store plain text, so this sidecar is the only durable signal a
+ * notification/engagement consumer can trust without reparsing `@words`. */
+export const structuredMentions = (blocks: ChatBlock[]): AuthorRef[] => {
   const mentions: AuthorRef[] = [];
   const seen = new Set<string>();
   for (const block of blocks) {
@@ -269,17 +269,9 @@ export const agentMentions = (blocks: ChatBlock[]): AuthorRef[] => {
     const spans = "paragraph" in block ? block.paragraph : block.quote;
     for (const span of spans) {
       for (const mark of span.marks) {
-        if (
-          typeof mark !== "object" ||
-          !("mention" in mark) ||
-          typeof mark.mention !== "object" ||
-          !("agent" in mark.mention)
-        ) {
-          continue;
-        }
+        if (typeof mark !== "object" || !("mention" in mark)) continue;
         const ref = mark.mention;
-        if (!("agent" in ref)) continue;
-        const key = `${ref.agent.module}\u001f${ref.agent.agent_id}`;
+        const key = JSON.stringify(ref);
         if (seen.has(key)) continue;
         seen.add(key);
         mentions.push(ref);
@@ -287,4 +279,15 @@ export const agentMentions = (blocks: ChatBlock[]): AuthorRef[] => {
     }
   }
   return mentions;
+};
+
+/** Structured refs present after an edit but absent before it. Sending only
+ * this delta prevents an ordinary wording edit from re-notifying users or
+ * re-engaging agents already named in the comment. */
+export const addedStructuredMentions = (
+  before: ChatBlock[],
+  after: ChatBlock[],
+): AuthorRef[] => {
+  const previous = new Set(structuredMentions(before).map((ref) => JSON.stringify(ref)));
+  return structuredMentions(after).filter((ref) => !previous.has(JSON.stringify(ref)));
 };
