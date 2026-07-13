@@ -185,9 +185,13 @@ export interface ConsoleActions {
   selectChannel(channelId: string): void;
   /** Load `channelId` on the chat screen and scroll+flash message `seq` once its
    *  slice lands (jump-to-message from a tag/search hit). Clears any tag filter,
-   *  like `selectChannel`. If `seq` is older than the loaded window, ChatView
-   *  just lands in the channel. */
+   *  like `selectChannel`. A `seq` older than the channel tail is paged in by
+   *  `loadMessageWindow` — see ChatView. */
   focusMessage(channelId: string, seq: number): void;
+  /** Page in the messagesAround window centered on `seq` and re-arm the focus so
+   *  ChatView scrolls to it. ChatView calls this when a jump-to-message target
+   *  is older than the loaded tail and so has no row to scroll to. */
+  loadMessageWindow(channelId: string, seq: number): void;
   /** Consume the one-shot `chatFocusSeq` (ChatView calls this once it has acted
    *  on the jump, or when the target seq isn't in the loaded window). */
   clearChatFocus(): void;
@@ -997,6 +1001,9 @@ export function createActions({
   // ChatView consumed it would otherwise flash whatever message happens to
   // carry that seq in the channel we land in. focusMessage relies on the
   // ordering — it calls this first, THEN latches its own seq.
+  // Entering a channel is ALSO the way out of a focused history window: this
+  // loads the tail, so clearing `chatWindow` here is what puts the refresh back
+  // on the tail — a rail click on the channel you're in is the "jump to latest".
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
@@ -1010,12 +1017,22 @@ export function createActions({
       channelTags: [],
       channelMembers: [],
       chatFocusSeq: null,
+      chatWindow: null,
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
       .then((messages) =>
         update((prev) =>
-          isCurrentNode(live) && prev.activeChannel === channelId ? { messages } : {},
+          // A window installed while this tail read was in flight wins over it:
+          // focusMessage calls enterChannel and THEN arms the focus that loads
+          // the window, so the two round trips overlap and can land in either
+          // order. A late tail would drop the reader back on the newest message
+          // with the history bar still up.
+          isCurrentNode(live) &&
+          prev.activeChannel === channelId &&
+          prev.chatWindow === null
+            ? { messages }
+            : {},
         ),
       )
       .catch((err) => {
@@ -1110,6 +1127,11 @@ export function createActions({
     const messageId = crypto.randomUUID();
     const blocks = parseMessageInput(body, mentionResolver());
     const author = getState().author;
+    // Posting is a return to the present: the new message takes the channel's
+    // HEAD sequence, so it belongs to the tail, not to a focused history window
+    // the reader jumped to. Drop the window here — the block's refresh then
+    // re-pulls the tail (holding the window would hide the message just sent).
+    if (getState().chatWindow?.channelId === channelId) patch({ chatWindow: null });
     return ensureMentionWatch(channelId, blocks).then(() =>
       submitTracked(
         opKey.message(channelId, messageId),
@@ -1771,8 +1793,59 @@ export function createActions({
     selectChannel: enterChannel,
 
     focusMessage: (channelId, seq) => {
-      enterChannel(channelId); // loads the channel + drops any tag filter
+      enterChannel(channelId); // loads the channel tail + drops any tag filter
       landOn("chat", { chatFocusSeq: seq });
+    },
+
+    loadMessageWindow: (channelId, seq) => {
+      const live = getNode();
+      if (!live) return;
+      // Mark the window BEFORE the round trip: it is also ChatView's record
+      // that it already asked for this seq, so a target the window can't
+      // produce is requested once instead of on every re-render.
+      patch({ chatWindow: { channelId, seq } });
+      chatClient
+        .messagesAround(live, channelId, seq)
+        .then((messages) =>
+          update((prev) =>
+            // `chatWindow` is the REQUEST TOKEN, not just a flag: both exits
+            // from a window clear it synchronously while this round trip can
+            // still be in flight — posting (postToChannel) and "jump to latest"
+            // / a rail click (enterChannel). Applying a superseded response
+            // would overwrite `messages` with the old window: the just-posted
+            // message would vanish with no bar left to escape by. A matching
+            // token also means the channel is unchanged — enterChannel is the
+            // only thing that moves `activeChannel`, and it clears the window.
+            isCurrentNode(live) &&
+            prev.chatWindow?.channelId === channelId &&
+            prev.chatWindow.seq === seq
+              ? // re-arm the focus: the row exists now, so ChatView's next pass
+                // scrolls and flashes it exactly as it does for a tail hit.
+                { messages, chatFocusSeq: seq }
+              : {},
+          ),
+        )
+        .catch(() =>
+          update((prev) =>
+            // Same token, same reason: a rejection that lost the race must not
+            // clear a window the reader has since asked for (that window's own
+            // response would then fail the guard above and never land), nor
+            // report an error about a window they already left.
+            isCurrentNode(live) &&
+            prev.chatWindow?.channelId === channelId &&
+            prev.chatWindow.seq === seq
+              ? // A node too old to know the messages_around variant rejects
+                // the query outright. Stay on the tail enterChannel already
+                // loaded and say so — landing on the newest message with no
+                // word is the bug this whole path exists to fix.
+                {
+                  chatWindow: null,
+                  error:
+                    "Couldn't load the history around that message — this node may be too old to page it in.",
+                }
+              : {},
+          ),
+        );
     },
 
     clearChatFocus: () => {

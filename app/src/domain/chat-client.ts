@@ -373,6 +373,26 @@ export const latestMessages = (
     )
     .then((reply) => replyVariant<MessageView[]>(reply, "messages"));
 
+/** The window of messages centered on `seq` — the jump-to-message read for a
+ *  hit older than the newest-`MAX_QUERY_LIMIT` tail `latestMessages` returns.
+ *  The node clamps both ends to the channel's live range (a window at the head
+ *  is short — nothing exists past it) and the limit to MAX_QUERY_LIMIT.
+ *  REJECTED by a node too old to know the query variant: callers must fall back
+ *  to the tail rather than leave the reader nowhere. */
+export const messagesAround = (
+  transport: NodeTransport,
+  channelId: string,
+  seq: number,
+  limit: number = MAX_QUERY_LIMIT,
+): Promise<MessageView[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.query(TARGET, {
+        messages_around: { channel_id: channelId, seq, limit },
+      }),
+    )
+    .then((reply) => replyVariant<MessageView[]>(reply, "messages"));
+
 export const thread = (
   transport: NodeTransport,
   params: { channelId: string; rootSeq: number },

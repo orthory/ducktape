@@ -135,6 +135,22 @@ export interface ConnectionDown {
 
 // ── State shape ─────────────────────────────────────────
 
+/** A focused history window (see ConsoleState.chatWindow). Doubles as the
+ *  REQUEST TOKEN for every read taken on the window's behalf: it is patched in
+ *  before the round trip and cleared synchronously when the reader leaves the
+ *  window, so a response is applicable only while the window it was fetched for
+ *  is still the one on screen — compare with `sameChatWindow`. */
+export interface ChatWindow {
+  channelId: string;
+  seq: number;
+}
+
+export const sameChatWindow = (
+  a: ChatWindow | null,
+  b: ChatWindow | null,
+): boolean =>
+  a === b || (!!a && !!b && a.channelId === b.channelId && a.seq === b.seq);
+
 export interface ConsoleState {
   // ── Session / node core ──
   screen: string;
@@ -164,6 +180,15 @@ export interface ConsoleState {
    *  load — set by `focusMessage` (tag/search jump-to-message), consumed and
    *  cleared by ChatView. Null when there's nothing to focus. */
   chatFocusSeq: number | null;
+  /** A jump-to-message landed OUTSIDE the channel's newest-MAX_QUERY_LIMIT
+   *  tail: `messages` then holds the messagesAround window centered on `seq`,
+   *  not the tail. The per-block refresh re-pulls THIS window (so edits and
+   *  reactions on the messages you jumped to stay live) instead of the tail —
+   *  see fetchChatSlices. It ends when the reader leaves it: re-entering the
+   *  channel (rail click / "Jump to latest") or posting drops it and the tail
+   *  comes back. Also ChatView's record that it already asked, so a seq the
+   *  window can't produce is asked for once, not forever. */
+  chatWindow: ChatWindow | null;
   /** The active #tag filter (see TagFilter), or null for the live view. */
   tagFilter: TagFilter | null;
   /** The active tag filter's hits (newest first) — query-driven, like
@@ -733,6 +758,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     chatFocusSeq: null,
+    chatWindow: null,
     tagFilter: null,
     tagHits: [],
     tagHitsPending: false,
@@ -825,6 +851,7 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   messages: [],
   activeThread: null,
   chatFocusSeq: null,
+  chatWindow: null,
   tagFilter: null,
   tagHits: [],
   tagHitsPending: false,

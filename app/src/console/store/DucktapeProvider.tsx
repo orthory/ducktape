@@ -74,6 +74,7 @@ import {
   DEFAULT_AUTHOR,
   docTabsScope,
   loadRemoteUrl,
+  sameChatWindow,
   saveDocTabs,
 } from "./state";
 import type { ConsoleState } from "./state";
@@ -376,10 +377,13 @@ export function DucktapeProvider({
       if (capabilityTrustGenRef.current === capabilityTrustFloor) {
         void refreshCapabilitySlices(live);
       }
+      // the chat read is taken FOR this window (the tail, when null) — the
+      // request token the apply below re-checks against `state.chatWindow`.
+      const fetchedWindow = stateRef.current.chatWindow;
       return Promise.resolve()
         .then(() =>
           Promise.all([
-            fetchChatSlices(live, stateRef.current.activeChannel),
+            fetchChatSlices(live, stateRef.current.activeChannel, fetchedWindow),
             fetchValsetSlices(live),
             fetchGovernanceSlices(live),
             fetchForgeSlices(live),
@@ -412,6 +416,16 @@ export function DucktapeProvider({
             // un-render the confirmed write until a later refresh — skip; the
             // next block's hydrate carries a taller status.
             if (status.height < receiptFloor(stateRef.current.ops)) return;
+            // The reader left (or entered) the history window while this read
+            // was in flight, so `chat.messages` is the wrong slice — a window
+            // where the tail is now wanted, or vice versa. Posting is the sharp
+            // case: it clears `chatWindow` and paints the optimistic message,
+            // and applying the window we fetched would erase it. Keep what is on
+            // screen; the write's own refresh (or the next block) re-reads.
+            const holdMessages = !sameChatWindow(
+              stateRef.current.chatWindow,
+              fetchedWindow,
+            );
             const holdPages = shouldHoldPages(fetchedPage, fetchStartedAt);
             const { openTabs, activePage } = holdPages
               ? {
@@ -433,7 +447,9 @@ export function DucktapeProvider({
                   governanceShares: governance.governanceShares,
                   forgeHead: forge.forgeHead,
                   activeChannel: chat.activeChannel,
-                  messages: chat.messages,
+                  messages: holdMessages
+                    ? stateRef.current.messages
+                    : chat.messages,
                   authorNames: people.authorNames,
                   nodeUsers: people.nodeUsers,
                   accountKeys: people.accountKeys,
@@ -508,11 +524,12 @@ export function DucktapeProvider({
         void refreshCapabilitySlices(live);
       }
       const fetchedPage = stateRef.current.activePage;
+      const fetchedWindow = stateRef.current.chatWindow; // request token — see refresh()
       return Promise.resolve()
         .then(() =>
           Promise.all([
             scope.has("chat")
-              ? fetchChatSlices(live, stateRef.current.activeChannel)
+              ? fetchChatSlices(live, stateRef.current.activeChannel, fetchedWindow)
               : null,
             scope.has("valset") ? fetchValsetSlices(live) : null,
             scope.has("governance") ? fetchGovernanceSlices(live) : null,
@@ -546,6 +563,12 @@ export function DucktapeProvider({
               !holdPages && pagesSlices
                 ? reconcileDocTabs(pagesSlices.pages)
                 : null;
+            // the window moved under this read (a post, or "jump to latest") —
+            // keep the messages on screen, drop the slice. See refresh().
+            const holdMessages = !sameChatWindow(
+              stateRef.current.chatWindow,
+              fetchedWindow,
+            );
             return dispatch({
               type: "patch",
               patch: {
@@ -555,6 +578,9 @@ export function DucktapeProvider({
                 status,
                 blocks,
                 ...(chat ?? {}),
+                ...(chat && holdMessages
+                  ? { messages: stateRef.current.messages }
+                  : {}),
                 ...(valset ?? {}),
                 ...(governance ?? {}),
                 ...(forge ?? {}),

@@ -36,6 +36,7 @@ import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import * as runsClient from "../../domain/runs-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { NodeStatus, NodeTransport } from "../../domain/transport";
+import type { ChatWindow } from "./state";
 
 // ── Types ───────────────────────────────────────────────
 
@@ -110,12 +111,24 @@ export interface ChatSlices {
   messages: chatClient.MessageView[];
 }
 
-/** Channels + the active channel's latest messages. Default-channel
- *  selection skips module-reserved channels (forge's hidden discussion
- *  threads); a deliberately-selected id survives as long as it exists. */
+/** Channels + the active channel's messages. Default-channel selection skips
+ *  module-reserved channels (forge's hidden discussion threads); a
+ *  deliberately-selected id survives as long as it exists.
+ *
+ *  `focused` (state.chatWindow) is the jump-to-message history window: when one
+ *  is up for the active channel this re-pulls THAT window rather than the tail.
+ *  Re-pulling the tail here is what would clobber it — and a plain hold would be
+ *  worse than this re-read, because the console's optimistic projections (edit /
+ *  delete / react) are only ever erased by an authoritative refresh, so a frozen
+ *  slice would strand a failed op on screen. The window ends when the reader
+ *  leaves it (enterChannel) or posts (postToChannel) — both clear `chatWindow`,
+ *  and the tail comes back on the next refresh. Those exits can land mid-fetch,
+ *  which is why `focused` is also the caller's request token: the provider drops
+ *  `messages` from the patch if `state.chatWindow` moved while this ran. */
 export const fetchChatSlices = (
   live: NodeTransport,
   currentActive: string | null,
+  focused: ChatWindow | null = null,
 ): Promise<ChatSlices> =>
   Promise.resolve()
     .then(() => chatClient.channels(live))
@@ -124,8 +137,17 @@ export const fetchChatSlices = (
         currentActive && channels.some((c) => c.id === currentActive)
           ? currentActive
           : (channels.find((c) => !chatClient.isModuleChannel(c.id))?.id ?? null);
+      // Best-effort like every other group fetch: a node that cannot answer the
+      // window query degrades to the tail instead of failing the whole hydrate
+      // (loadMessageWindow's own catch is what tells the reader why).
+      const focusedWindow =
+        active && focused?.channelId === active
+          ? chatClient
+              .messagesAround(live, active, focused.seq)
+              .catch(() => chatClient.latestMessages(live, active))
+          : null;
       return Promise.resolve()
-        .then(() => (active ? chatClient.latestMessages(live, active) : []))
+        .then(() => focusedWindow ?? (active ? chatClient.latestMessages(live, active) : []))
         .then((messages) => ({ channels, activeChannel: active, messages }));
     });
 
