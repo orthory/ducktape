@@ -111,10 +111,12 @@ export function TrayPopover() {
   // entry above it, not part of the scrollable rail).
   const rail = useMemo(
     () =>
-      (snap.client
+      snap.client
         ? modulesInSection("user", { nodeControl: false, clientMode: true })
-        : [...MODULES].sort((a, b) => a.nav.order - b.nav.order)
-      ).filter((m) => m.id !== "status"),
+        : [
+            ...modulesInSection("user", { nodeControl: true, clientMode: false }),
+            ...modulesInSection("operator", { nodeControl: true, clientMode: false }),
+          ].filter((m) => m.id !== "status"),
     [snap.client],
   );
   useEffect(() => {
@@ -254,7 +256,9 @@ function NodeDetail({ snap, connected, onOpen }: { snap: Snap; connected: boolea
       <Field k="Members" v={snap.memberCount === null ? "—" : `${snap.memberCount}`} />
       <Field k="Modules" v={`${status?.modules.length ?? 0} installed`} />
       <SoftwareBlock />
-      <OpenButton onClick={onOpen} />
+      {/* The node console is a conditional surface (ADR A5/A6): a remote
+          client has no node views, so the tray offers no jump into one. */}
+      {!snap.client && <OpenButton onClick={onOpen} />}
     </>
   );
 }

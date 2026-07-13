@@ -16,6 +16,8 @@ import { MetricsView } from "../views/metrics/MetricsView";
 import { SandboxView } from "../views/sandbox/SandboxView";
 import { StatusView } from "../views/status/StatusView";
 import type { AppModule, ModuleFilter, NavSection } from "./module-def";
+import { isClientMode, nodeControlAvailable } from "../store/state";
+import type { ConsoleState } from "../store/state";
 
 // The sidebar's view-mode toggle partitions these into two rails:
 //   USER — the account surfaces: participant apps plus the network-data
@@ -47,6 +49,16 @@ export const MODULES: AppModule[] = [
 
 export const moduleById = (id: string): AppModule | undefined =>
   MODULES.find((m) => m.id === id);
+
+/** The availability filter for a console state — the single construction
+ *  site, so when the gate grows the A2 remote-owner term every consumer
+ *  (sidebar, nav actions) picks it up at once. */
+export const moduleFilterOf = (
+  state: Pick<ConsoleState, "workspace" | "managed" | "nodeUrl">,
+): ModuleFilter => ({
+  nodeControl: nodeControlAvailable(state),
+  clientMode: isClientMode(state),
+});
 
 /** Account surfaces whose client-mode projections aren't wired yet (the ADR's
  *  pending A3 work); a direct remote client hides them until that lands. */

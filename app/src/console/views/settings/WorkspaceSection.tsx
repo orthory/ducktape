@@ -4,7 +4,7 @@
 // quorum). Settings deliberately does NOT duplicate those controls.
 
 import { useDucktape } from "../../store/use-ducktape";
-import { isClientMode } from "../../store/state";
+import { isClientMode, nodeControlAvailable } from "../../store/state";
 import { color, font } from "../../theme/tokens";
 import {
   ControlRow,
@@ -20,6 +20,7 @@ export function WorkspaceSection() {
   const { state, actions } = useDucktape();
   const workspace = state.workspace;
   const clientMode = isClientMode(state);
+  const canControl = nodeControlAvailable(state);
 
   return (
     <>
@@ -48,6 +49,7 @@ export function WorkspaceSection() {
               ? "Connect to another workspace or remote node."
               : "Create, join, or select another local workspace."
           }
+          last={!canControl && clientMode}
           control={
             <HoverButton
               ariaLabel="Workspaces"
@@ -63,6 +65,7 @@ export function WorkspaceSection() {
           <ControlRow
             title="Members & invites"
             desc="Invite, admit, and manage members from the Members view."
+            last={!canControl}
             control={
               <HoverButton
                 ariaLabel="Open Members"
@@ -75,38 +78,21 @@ export function WorkspaceSection() {
             }
           />
         )}
-        <ControlRow
-          title={clientMode ? "Node overview" : "Node & daemon"}
-          desc={
-            clientMode
-              ? "Inspect the connected node's status, version, and committed roots."
-              : "Start or stop the daemon and inspect ports, data dir, and quorum from the Node view."
-          }
-          last={!clientMode}
-          control={
-            <HoverButton
-              ariaLabel="Open Node"
-              onClick={() => actions.setScreen("status")}
-              hoverBg={color.titlebar}
-              style={outlineButton}
-            >
-              Open Node
-            </HoverButton>
-          }
-        />
-        {clientMode && (
+        {/* Node control is a conditional surface (ADR A5/A6): a remote client
+            has no node views at all, so no link rows point at them. */}
+        {canControl && (
           <ControlRow
-            title="Metrics"
-            desc="Inspect read-only health and performance metrics from the connected node."
+            title="Node & daemon"
+            desc="Start or stop the daemon and inspect ports, data dir, and quorum from the Node view."
             last
             control={
               <HoverButton
-                ariaLabel="Open Metrics"
-                onClick={() => actions.setScreen("metrics")}
+                ariaLabel="Open Node"
+                onClick={() => actions.setScreen("status")}
                 hoverBg={color.titlebar}
                 style={outlineButton}
               >
-                Open Metrics
+                Open Node
               </HoverButton>
             }
           />

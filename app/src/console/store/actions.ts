@@ -48,9 +48,9 @@ import {
 import {
   defaultScreenForSection,
   moduleAvailable,
+  moduleFilterOf,
   sectionForScreen,
 } from "../modules/registry";
-import type { ModuleFilter } from "../modules/module-def";
 import type { Action } from "./reducer";
 import {
   addMemberFromResponse,
@@ -1430,12 +1430,6 @@ export function createActions({
   // honored — a selection whose target vanished from the committed data (or
   // that another workspace minted) is skipped, and the caller re-stamps the
   // entry with the honored result so the stack and the store converge.
-  /** The registry's availability inputs for a state snapshot (ADR A5/A6). */
-  const filterOf = (s: ConsoleState): ModuleFilter => ({
-    nodeControl: nodeControlAvailable(s),
-    clientMode: isClientMode(s),
-  });
-
   const applyNavSnapshot = (snap: NavSnapshot): NavSnapshot => {
     const before = getState();
     // Gated bodies (onboarding, the join waiting room, a boot failure) own
@@ -1460,7 +1454,7 @@ export function createActions({
     // exists in the recentmost committed data.
     const scopeMatches = !snap.atHome && snap.scope === currentDocTabsScope();
     const requestedSection = sectionForScreen(snap.screen);
-    const filter = filterOf(before);
+    const filter = moduleFilterOf(before);
     const screen =
       requestedSection && !moduleAvailable(snap.screen, filter)
         ? defaultScreenForSection(requestedSection, filter)
@@ -1697,7 +1691,7 @@ export function createActions({
   // Home layer — with the sidebar navigable at Home, every screen move must
   // drop the layer or the shell would change invisibly underneath it.
   const landOn = (screen: string, extra: Partial<ConsoleState> = {}) => {
-    const filter = filterOf(getState());
+    const filter = moduleFilterOf(getState());
     const requestedSection = sectionForScreen(screen);
     const target =
       requestedSection && !moduleAvailable(screen, filter)
@@ -1746,7 +1740,7 @@ export function createActions({
       if (mode === "operator" && !nodeControlAvailable(getState())) return;
       if (!isClientMode(getState())) saveViewMode(mode);
       update((prev) => {
-        const filter = filterOf(prev);
+        const filter = moduleFilterOf(prev);
         // Keep the body on the chosen rail: if the current screen belongs to the
         // other rail (or is a shell screen), land on this rail's default surface.
         const screen =

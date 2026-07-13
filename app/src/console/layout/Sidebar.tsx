@@ -5,9 +5,9 @@
 // authority.
 
 import { Icon, type IconName } from "../components/Icon";
-import { modulesInSection } from "../modules/registry";
+import { moduleFilterOf, modulesInSection } from "../modules/registry";
 import type { NavSection } from "../modules/module-def";
-import { isClientMode, nodeControlAvailable } from "../store/state";
+import { nodeControlAvailable } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
 import { initialsOf } from "../views/home/ProfileCard";
@@ -101,10 +101,7 @@ export function Sidebar() {
   // Without node control any persisted "operator" mode falls back to the
   // account rail — the NODE surface is absent, so it cannot be selected.
   const mode = canControl ? state.viewMode : "user";
-  const rail = modulesInSection(mode, {
-    nodeControl: canControl,
-    clientMode: isClientMode(state),
-  });
+  const rail = modulesInSection(mode, moduleFilterOf(state));
 
   return (
     <div
