@@ -16,7 +16,7 @@ import type { ChatSearchHit } from "../../../domain/chat-client";
 import { basename } from "../../../domain/files-client";
 import type { FileEntry } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
-import { displayNameForKey, shortKey } from "../../../domain/names";
+import { displayNameForKey, normalizeKey, shortKey } from "../../../domain/names";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
@@ -245,6 +245,23 @@ export function SearchModal() {
     actions.setScreen(screen);
     actions.closeSearch();
   };
+  const openFile = (path: string) => {
+    actions.openFiles(path);
+    actions.closeSearch();
+  };
+  // A member hit's key is a NODE key, but the members view selects by ACCOUNT
+  // (memberFocus). Invert nodeUsers to the bound account and hand it off lower-
+  // cased, the form MembersView compares against; unbound keys fall back to a
+  // plain navigate.
+  const openMember = (nodeKey: string) => {
+    const accountId = state.nodeUsers[normalizeKey(nodeKey)]?.accountId;
+    if (accountId) {
+      actions.openMember(accountId.toLowerCase());
+      actions.closeSearch();
+    } else {
+      goto("members");
+    }
+  };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -325,7 +342,7 @@ export function SearchModal() {
                   key={hit.key}
                   meta={shortKey(hit.key)}
                   text={hit.name}
-                  onOpen={() => goto("members")}
+                  onOpen={() => openMember(hit.key)}
                 />
               ))}
             </Group>
@@ -338,7 +355,7 @@ export function SearchModal() {
                   key={hit.path}
                   meta={hit.path}
                   text={basename(hit.path)}
-                  onOpen={() => goto("files")}
+                  onOpen={() => openFile(hit.path)}
                 />
               ))}
             </Group>
