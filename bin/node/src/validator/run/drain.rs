@@ -34,7 +34,6 @@ impl ValidatorRuntime<'_> {
             mesh_oracle,
             gateway_book,
             media_peers,
-            blob_peers,
             reach_cmd,
             relay_tx,
             next_seq,
@@ -466,10 +465,6 @@ impl ValidatorRuntime<'_> {
                 if let Some(peers) = &media_peers {
                     peers.set_peers(plan.valset().transport_members().iter());
                 }
-                // the blob fetch-on-miss lane fans out to the same
-                // tracked set — follow the re-track.
-                *blob_peers.write().expect("blob peers lock") =
-                    plan.valset().transport_members().iter().cloned().collect();
                 // the reachability plane retunnels for the new
                 // member set the moment transport admits it —
                 // with the epoch's resident tier as the pre-warm

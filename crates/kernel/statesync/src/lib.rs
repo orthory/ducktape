@@ -1246,11 +1246,11 @@ impl SyncServer {
         Ok(match req {
             SyncRequest::Manifest => ServeStep::NeedBoundary,
             SyncRequest::TipCoords => ServeStep::NeedCoords,
-            // the HOST layer answers blob fetches from its node-local store
-            // BEFORE requests reach this server; one arriving here means the
-            // host did not intercept — answer honestly instead of wedging.
+            // the blob mesh lane is RETIRED with the prompt plane it served;
+            // the wire kind stays decodable so an old peer's request answers
+            // as an honest Error, which its fan-out treats like a miss.
             SyncRequest::Blob { .. } => {
-                return Err("blob requests are answered by the host layer".into());
+                return Err("the blob mesh lane is retired".into());
             }
             SyncRequest::Frames {
                 after_height,
