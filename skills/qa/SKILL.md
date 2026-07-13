@@ -113,6 +113,21 @@ The first form builds each selected revision. The second builds the selected
 revision/CEF runtime once and launches isolated instances from the same cached
 artifact.
 
+## macOS sandbox hardware gate
+
+After touching the Sandbox page, sandbox config transaction, node restart, or
+Podman/Tart provider lifecycle, run this on an Apple Silicon Mac:
+
+```bash
+ops/smoke-macos-sandbox.sh
+```
+
+The gate uses real Podman and Tart execution, then launches isolated native CEF
+instances for successful Podman/Tart Apply and an injected failed-start
+rollback. It must finish through Fleet teardown; do not remove its worktree or
+stop its processes manually. The QA identity password is opt-in and confined
+to Fleet's disposable HOME.
+
 ## Linux host prerequisite fallback
 
 Linux Fleet expects `Xvfb` and `x11vnc` on PATH. macOS must not install or invoke
