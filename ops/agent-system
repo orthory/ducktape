@@ -316,15 +316,33 @@ switch (command) {
   case "cgroup": {
     need(args, 1);
     const pid = integer(args[0], "PID");
-    const group = fs
-      .readFileSync(`/proc/${pid}/cgroup`, "utf8")
+    let cgroup;
+    try {
+      cgroup = fs.readFileSync(`/proc/${pid}/cgroup`, "utf8");
+    } catch {
+      die(`cannot read cgroup for PID ${pid}`);
+    }
+    const group = cgroup
       .split("\n")
       .find((line) => line.startsWith("0::"))
       ?.slice(3);
     if (!group) die(`no cgroup v2 entry for ${pid}`);
     console.log(group);
-    for (const name of ["cpu.max", "memory.max", "memory.current", "memory.swap.max", "memory.swap.current"])
-      console.log(`${name}=${fs.readFileSync(path.join("/sys/fs/cgroup", group, name), "utf8").trim()}`);
+    for (const name of [
+      "cpu.max",
+      "memory.max",
+      "memory.current",
+      "memory.swap.max",
+      "memory.swap.current",
+    ]) {
+      try {
+        console.log(
+          `${name}=${fs.readFileSync(path.join("/sys/fs/cgroup", group, name), "utf8").trim()}`,
+        );
+      } catch {
+        die(`cannot read ${name} for PID ${pid}`);
+      }
+    }
     break;
   }
   default:
