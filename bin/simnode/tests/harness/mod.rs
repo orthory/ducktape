@@ -330,3 +330,21 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
         }
     })
 }
+
+/// a `MemberAuth` JSON whose ed25519 `key` consents to `preimage` under the
+/// identity bind namespace — the shared ed25519 member-auth builder the bound and
+/// governed scenarios reuse (identity binds, gateway routes, share adoption).
+/// promoted here once the round-3 suites duplicated it a third time; the earlier
+/// suites keep their own local copies untouched.
+pub fn ed_bind_auth(
+    key: &commonware_cryptography::ed25519::PrivateKey,
+    preimage: &[u8],
+) -> serde_json::Value {
+    use commonware_cryptography::Signer as _;
+    let sig = key.sign(identity::IDENTITY_BIND_NS, preimage);
+    serde_json::json!({
+        "key": key.public_key().as_ref().to_vec(),
+        "kind": "ed25519",
+        "proof": { "signature": { "sig": sig.as_ref().to_vec() } },
+    })
+}

@@ -11,7 +11,8 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel};
+use harness::{Sim, create_channel, ed_bind_auth};
+use identity::bind_preimage;
 use sdk::Msg;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
@@ -381,17 +382,22 @@ fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
     );
 }
 
-/// the "kv" module's committed root from a `/v1/status` projection.
-fn kv_root(status: &serde_json::Value) -> String {
+/// one module's committed root from a `/v1/status` projection.
+fn module_root(status: &serde_json::Value, id: &str) -> String {
     status["modules"]
         .as_array()
         .expect("modules array")
         .iter()
-        .find(|m| m["id"] == "kv")
-        .expect("kv module registered")["root"]
+        .find(|m| m["id"] == id)
+        .unwrap_or_else(|| panic!("{id} module registered"))["root"]
         .as_str()
         .expect("root hex")
         .to_string()
+}
+
+/// the "kv" module's committed root — the original single-module projection.
+fn kv_root(status: &serde_json::Value) -> String {
+    module_root(status, "kv")
 }
 
 // ── E4 — node-key seeding ───────────────────────────────
@@ -437,5 +443,206 @@ fn a_malformed_node_key_fails_loud_at_startup() {
     assert!(
         err.contains("--node-key"),
         "the error names the flag: {err}"
+    );
+}
+
+// ── E5 — multi-module batch-vs-singles conformance sweep ──
+
+fn kv_set(key: &[u8], value: &[u8]) -> serde_json::Value {
+    serde_json::json!({ "set": { "key": key.to_vec(), "value": value.to_vec() } })
+}
+fn create_page(id: &str) -> serde_json::Value {
+    serde_json::json!({ "create_page": { "page_id": id, "title": id, "parent": null } })
+}
+fn create_task(id: &str) -> serde_json::Value {
+    serde_json::json!({ "create_task": { "task_id": id, "title": id } })
+}
+fn deliver(member: &str, body: &str) -> serde_json::Value {
+    serde_json::json!({ "deliver": { "member": member, "kind": "note", "body": body } })
+}
+
+/// drop the block-dependent `keys` (created_at, updated_at) from each object of a
+/// reply array, leaving the block-invariant logical identity to compare.
+fn strip(array: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    serde_json::Value::Array(
+        array
+            .as_array()
+            .expect("reply array")
+            .iter()
+            .map(|item| {
+                let mut item = item.clone();
+                if let Some(object) = item.as_object_mut() {
+                    for key in keys {
+                        object.remove(*key);
+                    }
+                }
+                item
+            })
+            .collect(),
+    )
+}
+
+/// PR #546's kv root-divergence finding, generalized into standing insurance: the
+/// SAME script run once as ONE N-member batch block and once as N single blocks
+/// reaches a converging LOGICAL state, while the authenticated module roots divide
+/// by WHAT each root commits to (investigated against the module sources):
+///
+///   - qmdb-backed modules (kv, pages) commit to the commit-BOUNDARY structure via
+///     their commonware sequential-merkle op log, so ONE block ≠ N blocks even for
+///     the identical writes — their roots DIFFER. this is the finding, generalized
+///     past kv to a second qmdb module.
+///   - a plain, content-only module with no embedded block coordinate (duckdns)
+///     commits to the key→value map alone — its root is BYTE-IDENTICAL across the
+///     two block shapes.
+///   - the plain modules that stamp the block's `consensus_time` into their records
+///     (tasks, inbox) also DIFFER, but for a reason ORTHOGONAL to qmdb: the batch's
+///     one block carries one timestamp, the N singles carry N. their LOGICAL
+///     identity still converges once that block-dependent stamp is stripped — so
+///     "plain vs qmdb" is NOT the invariant; "content-only AND block-coordinate-
+///     free" is.
+///
+/// the insurance runs both ways: a future module that starts authenticating block
+/// structure (or stamps a block coordinate) trips duckdns's byte-identity; one
+/// that stops authenticating it trips kv/pages.
+#[test]
+fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_structure() {
+    // identical genesis: same valset seed, same module set (kv is under the flag).
+    let valset = "11".repeat(32);
+    let dir_a = tempfile::tempdir().expect("storage dir");
+    let dir_b = tempfile::tempdir().expect("storage dir");
+    let sim_a = Sim::spawn(dir_a.path(), &["--with-valset", &valset]);
+    let sim_b = Sim::spawn(dir_b.path(), &["--with-valset", &valset]);
+
+    // the duckdns account: identity bind seats the node, and set_handle then reads
+    // it (across members in the batch, across blocks in the singles). both runs
+    // bind the identical account deterministically.
+    let key = Ed::from_seed(9);
+    let node = "n".repeat(32);
+    let preimage = bind_preimage("", node.as_bytes(), 0);
+
+    // the shared script — identical ops AND origins, so the ONLY difference between
+    // the two runs is block structure. (target, payload, origin)
+    let script: Vec<(&str, serde_json::Value, String)> = vec![
+        (
+            "identity",
+            serde_json::json!({ "bind_node": { "authorizer": ed_bind_auth(&key, &preimage) } }),
+            node.clone(),
+        ),
+        (
+            "duckdns",
+            serde_json::json!({ "set_handle": { "handle": "eddy" } }),
+            node.clone(),
+        ),
+        ("kv", kv_set(b"k1", b"v1"), "peer".into()),
+        ("kv", kv_set(b"k2", b"v2"), "peer".into()),
+        ("pages", create_page("p1"), "peer".into()),
+        ("pages", create_page("p2"), "peer".into()),
+        ("tasks", create_task("t1"), "peer".into()),
+        ("tasks", create_task("t2"), "peer".into()),
+        ("inbox", deliver("eddy", "hi"), "courier".into()),
+        ("inbox", deliver("eddy", "yo"), "courier".into()),
+    ];
+    let n = script.len() as u64;
+
+    // run A: the whole script as ONE batch block.
+    let batch: Vec<serde_json::Value> = script
+        .iter()
+        .map(|(target, payload, origin)| {
+            serde_json::json!({ "target": target, "payload": payload, "origin": origin })
+        })
+        .collect();
+    let (code, reply) = sim_a.peer_batch(serde_json::json!(batch));
+    assert_eq!(code, 200, "batch: {reply}");
+    assert!(
+        reply["members"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .all(|m| m["disposition"] == "applied"),
+        "every member applied: {reply}"
+    );
+
+    // run B: the SAME ops as N single blocks, in the same order.
+    for (target, payload, origin) in &script {
+        sim_b.peer_block(target, payload.clone(), origin);
+    }
+
+    let a = sim_a.status();
+    let b = sim_b.status();
+    assert_eq!(a["height"], 1, "the batch is one block");
+    assert_eq!(b["height"], n, "the singles are {n} blocks");
+    assert_ne!(
+        a["appHash"], b["appHash"],
+        "the app-hash reflects the diverging roots"
+    );
+
+    // qmdb-backed modules authenticate the commit boundary → roots DIFFER.
+    for id in ["kv", "pages"] {
+        assert_ne!(
+            module_root(&a, id),
+            module_root(&b, id),
+            "{id} is qmdb-backed: its root commits to block structure, so 1 block != {n} blocks"
+        );
+    }
+
+    // a plain, content-only, block-coordinate-free module → BYTE-IDENTICAL root.
+    // (a future duckdns that went qmdb-backed or stamped a block coordinate fails
+    // HERE — the standing insurance.)
+    assert_eq!(
+        module_root(&a, "duckdns"),
+        module_root(&b, "duckdns"),
+        "duckdns commits to content alone — its root is batch-invariant"
+    );
+
+    // the plain modules that stamp consensus_time DIFFER too — the embedded block
+    // time, NOT the qmdb commit boundary. pinned so the distinction stays honest.
+    for id in ["tasks", "inbox"] {
+        assert_ne!(
+            module_root(&a, id),
+            module_root(&b, id),
+            "{id} authenticates the block's consensus_time (orthogonal to qmdb)"
+        );
+    }
+
+    // LOGICAL STATE CONVERGES. the time-free modules converge fully — every key
+    // resolves to the same value, the page list is byte-identical.
+    for k in [b"k1".as_slice(), b"k2".as_slice()] {
+        let query = serde_json::json!({ "get": { "key": k.to_vec() } });
+        assert_eq!(
+            sim_a.query("kv", query.clone())["value"],
+            sim_b.query("kv", query)["value"],
+            "kv value for {k:?} converges"
+        );
+    }
+    assert_eq!(
+        sim_a.query("pages", serde_json::json!("list_pages"))["page_list"],
+        sim_b.query("pages", serde_json::json!("list_pages"))["page_list"],
+        "the page list converges"
+    );
+
+    // the timestamp-stamping modules converge once the block-dependent stamp is
+    // stripped: the SAME entities exist in both runs, only their created_at differs.
+    let tasks_a = strip(
+        &sim_a.query("tasks", serde_json::json!("list"))["tasks"],
+        &["created_at", "updated_at"],
+    );
+    let tasks_b = strip(
+        &sim_b.query("tasks", serde_json::json!("list"))["tasks"],
+        &["created_at", "updated_at"],
+    );
+    assert_eq!(
+        tasks_a, tasks_b,
+        "the same tasks exist in both runs (only the stamped time differs)"
+    );
+    let inbox_query =
+        serde_json::json!({ "list": { "member": "eddy", "from_seq": 0, "limit": 100 } });
+    let inbox_a = strip(
+        &sim_a.query("inbox", inbox_query.clone())["items"],
+        &["created_at"],
+    );
+    let inbox_b = strip(&sim_b.query("inbox", inbox_query)["items"], &["created_at"]);
+    assert_eq!(
+        inbox_a, inbox_b,
+        "the same inbox items exist in both runs (only the stamped time differs)"
     );
 }
