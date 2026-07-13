@@ -98,6 +98,18 @@ export function FilePreview({
 
   const handleDownload = () => {
     if (downloading) return;
+    const objectUrl = transport.filesObjectUrl?.({
+      path: entry.path,
+      snapshot: snapshot ?? undefined,
+      size: entry.size,
+    });
+    if (objectUrl) {
+      const a = document.createElement("a");
+      a.href = objectUrl;
+      a.download = entry.path.split("/").pop() || "download";
+      a.click();
+      return;
+    }
     setDownloading(true);
     readAll(transport, { path: entry.path, snapshot: snapshot ?? undefined })
       .then((bytes) => {
