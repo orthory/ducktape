@@ -481,7 +481,9 @@ pub(crate) async fn files_has_chunks(
 // existing /v1/files/ls — a flat, cursor-paged dir page IS the sanctioned
 // LIST. same trust story as every handler in this file: the local-trust
 // convenience lane (ext:noded); authenticated authorship rides the signed
-// frame lane instead.
+// frame lane instead. NOTE the lane's actor makes the usable keyspace
+// effectively /shared/** — check_authority admits ext:noded nowhere else
+// a caller would name.
 
 /// one PUT is buffered whole, then staged in 1 MiB chunks — every byte rides
 /// consensus blocks, so this bounds a single request's block fan-out.
@@ -502,10 +504,11 @@ fn object_path(rest: &str) -> String {
     format!("/{rest}")
 }
 
-/// the current head snapshot, as a commit base — S3 semantics are
-/// last-writer-wins, so the base is simply "the head as of this request";
-/// a racing writer to the SAME path surfaces as the module's per-path CAS
-/// rejection (400) rather than a silent overwrite.
+/// the current head snapshot, as a commit base — sequential overwrites are
+/// last-writer-wins like S3 (the base is "the head as of this request").
+/// CONCURRENT same-path writers diverge from S3: the loser gets the module's
+/// per-path CAS rejection (400) where S3 would silently order them — an
+/// honest conflict beats a silent overwrite on a consensus filesystem.
 async fn head_snapshot(handle: &NodeHandle) -> Result<Option<String>, Response> {
     match files_query(handle, &FilesQuery::Refs {}).await {
         Ok(FilesReply::Refs(info)) => Ok(info.head),
@@ -580,8 +583,11 @@ pub struct ObjectGetParams {
 }
 
 /// GET /v1/files/object/{*path}?snapshot= — the object's raw bytes, whole
-/// (application/octet-stream). pages the module's byte-range Read to eof;
-/// a directory answers 400, an absent path 404.
+/// (application/octet-stream). pages the module's byte-range Read to eof.
+/// an absent path is 404, a directory or symlink 400 (this surface serves
+/// FILE bytes, never a link target), and an object over the facade cap is
+/// 413 — the whole body is buffered here, symmetric with PUT, so oversized
+/// objects belong on the ranged /v1/files/read instead.
 pub(crate) async fn object_get(
     State(handle): State<NodeHandle>,
     axum::extract::Path(rest): axum::extract::Path<String>,
@@ -589,6 +595,32 @@ pub(crate) async fn object_get(
 ) -> Response {
     use base64::Engine as _;
     let path = object_path(&rest);
+    match files_query(
+        &handle,
+        &FilesQuery::Stat {
+            path: path.clone(),
+            snapshot: p.snapshot.clone(),
+        },
+    )
+    .await
+    {
+        Ok(FilesReply::Stat(None)) => {
+            return error_response(StatusCode::NOT_FOUND, "no object at that path");
+        }
+        Ok(FilesReply::Stat(Some(entry))) => {
+            if entry.kind != duckfs_core::EntryKindWire::File {
+                return error_response(StatusCode::BAD_REQUEST, "not an object (not a file)");
+            }
+            if entry.size > MAX_OBJECT_BYTES as u64 {
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "object exceeds the facade cap; read it ranged via /v1/files/read",
+                );
+            }
+        }
+        Ok(_) => return wrong_reply(),
+        Err(resp) => return resp,
+    }
     let mut bytes: Vec<u8> = Vec::new();
     loop {
         let q = FilesQuery::Read {
@@ -619,7 +651,9 @@ pub(crate) async fn object_get(
 }
 
 /// DELETE /v1/files/object/{*path} — a single-change rm commit. idempotent
-/// like S3: deleting an absent object is a 200 no-op, never an error.
+/// like S3 for the common repeat-delete: an absent object is a 200 no-op.
+/// (the gate is stat-then-commit, so a same-path delete/delete RACE can
+/// still surface the module's 400 — narrow, and honest about the conflict.)
 pub(crate) async fn object_delete(
     State(handle): State<NodeHandle>,
     axum::extract::Path(rest): axum::extract::Path<String>,
