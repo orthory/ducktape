@@ -85,6 +85,16 @@ SE-protected and prompts for Touch ID on read. `BiometryCurrentSet` (not
 `BiometryAny`) means a change to the enrolled fingerprint set invalidates the
 item — a deliberate security default whose fallback is the recovery phrase.
 
+> **Amended 2026-07-13:** the ACL is now `kSecAccessControlUserPresence` —
+> biometry when the sensor is usable, the Mac's login password otherwise.
+> `BiometryCurrentSet` proved biometric-only in practice: a closed lid
+> (clamshell) made the item unreadable with no password fallback, and a
+> fingerprint-set change invalidated it permanently. User-presence keeps the
+> 24-word phrase as the recovery of last resort while restoring the OS
+> password fallback; `touchid_unlock` rewrites pre-switch items under the new
+> ACL on their next successful read, and a dismissed sheet now rejects with
+> `touchid-canceled` instead of masquerading as `touchid-unavailable`.
+
 **Unlock** (`touchid_unlock`): `SecItemCopyMatching` triggers the OS Touch ID
 prompt and releases the passphrase, which feeds the **existing**
 `user_identity_unlock` path (passphrase over stdin, never argv/env) and caches

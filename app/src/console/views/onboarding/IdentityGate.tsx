@@ -521,9 +521,12 @@ function LockedScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
     touchidAvailable().then(setTouchid, () => setTouchid(false));
   }, []);
 
-  // The biometric Keychain read prompts Touch ID; on a device whose biometrics
-  // were invalidated the shim returns the "touchid-unavailable" sentinel, which
-  // we translate into "use your recovery phrase" rather than a raw error.
+  // The Keychain read prompts the OS user-presence sheet — Touch ID when the
+  // sensor is usable, the Mac's login password when it isn't (lid closed). A
+  // dismissed sheet rejects with "touchid-canceled" (not an error, stay
+  // quiet); "touchid-unavailable" means the item itself is gone (never
+  // enrolled, disabled, or unreadable), which we translate into the manual
+  // paths rather than a raw error.
   const runTouchId = () => {
     setBusy(true);
     setError(null);
@@ -531,9 +534,10 @@ function LockedScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
       .then(onDone)
       .catch((err) => {
         const msg = errMessage(err);
+        if (msg.includes("touchid-canceled")) return;
         setError(
           msg.includes("touchid-unavailable")
-            ? "Touch ID is unavailable — unlock with your recovery phrase (Restore) instead."
+            ? "Touch ID is unavailable — unlock with your password or recovery phrase (Restore) instead."
             : msg,
         );
       })
