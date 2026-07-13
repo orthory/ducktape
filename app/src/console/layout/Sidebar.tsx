@@ -1,12 +1,13 @@
-// The 74px icon rail: brand, a USER ⇄ NODE OPERATOR mode toggle, one entry per
-// module of the active rail, and settings. The rail knows no module by name —
-// modules appear by registering, and the toggle picks which section's group of
-// modules the rail shows (see registry.ts / module-def.ts). Neither rail confers
+// The 74px icon rail: brand, a two-section mode toggle, one entry per module of
+// the active rail, and settings. A local workspace labels the sections USER /
+// NODE; a direct remote connection labels the same slots CLIENT / OBSERVE and
+// the registry filters OBSERVE to read-only surfaces. Neither rail confers
 // authority; the toggle is purely which surfaces are on screen.
 
 import { Icon, type IconName } from "../components/Icon";
 import { modulesInSection } from "../modules/registry";
 import type { NavSection } from "../modules/module-def";
+import { isClientMode } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
 import { initialsOf } from "../views/home/ProfileCard";
@@ -15,21 +16,30 @@ const navBg = (active: boolean) => (active ? color.hover : "transparent");
 const navFg = (active: boolean) => (active ? color.inkSoft : color.muted);
 const navIc = (active: boolean) => (active ? color.ink : color.iconIdle);
 
-const MODES: ReadonlyArray<{
+type ModeEntry = {
   id: NavSection;
   icon: IconName;
   label: string;
   title: string;
-}> = [
+};
+
+const LOCAL_MODES: ReadonlyArray<ModeEntry> = [
   { id: "user", icon: "members", label: "USER", title: "User apps" },
   { id: "operator", icon: "node", label: "NODE", title: "Node operator" },
 ];
 
+const CLIENT_MODES: ReadonlyArray<ModeEntry> = [
+  { id: "user", icon: "members", label: "CLIENT", title: "Client apps" },
+  { id: "operator", icon: "node", label: "OBSERVE", title: "Read-only node observability" },
+];
+
 function ModeToggle({
   mode,
+  modes,
   onSelect,
 }: {
   mode: NavSection;
+  modes: ReadonlyArray<ModeEntry>;
   onSelect: (mode: NavSection) => void;
 }) {
   return (
@@ -48,7 +58,7 @@ function ModeToggle({
         marginBottom: 8,
       }}
     >
-      {MODES.map((entry) => {
+      {modes.map((entry) => {
         const active = mode === entry.id;
         return (
           <button
@@ -94,7 +104,8 @@ export const SIDEBAR_ICON_RAIL_WIDTH = 74;
 
 export function Sidebar() {
   const { state, actions } = useDucktape();
-  const rail = modulesInSection(state.viewMode);
+  const clientMode = isClientMode(state);
+  const rail = modulesInSection(state.viewMode, clientMode);
 
   return (
     <div
@@ -128,7 +139,11 @@ export function Sidebar() {
         D
       </div>
 
-      <ModeToggle mode={state.viewMode} onSelect={actions.setViewMode} />
+      <ModeToggle
+        mode={state.viewMode}
+        modes={clientMode ? CLIENT_MODES : LOCAL_MODES}
+        onSelect={actions.setViewMode}
+      />
 
       {rail.map((mod) => {
         // at Home the layer covers the routed screen, so no rail entry is the

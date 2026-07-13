@@ -6,6 +6,7 @@
 
 import { color, font } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
+import { isClientMode } from "../../store/state";
 import { DangerZone } from "./DangerZone";
 import {
   ControlRow,
@@ -44,6 +45,7 @@ function AccountLinkSection() {
 }
 
 export function SettingsView() {
+  const { state } = useDucktape();
   return (
     <div
       data-screen-label="Settings"
@@ -69,7 +71,7 @@ export function SettingsView() {
 
         <WorkspaceSection />
 
-        <DangerZone />
+        {!isClientMode(state) && <DangerZone />}
 
         <div style={{ height: 22 }} />
       </div>

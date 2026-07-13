@@ -73,6 +73,7 @@ import {
   createInitialState,
   DEFAULT_AUTHOR,
   docTabsScope,
+  isClientMode,
   loadRemoteUrl,
   sameChatWindow,
   saveDocTabs,
@@ -385,7 +386,12 @@ export function DucktapeProvider({
           Promise.all([
             fetchChatSlices(live, stateRef.current.activeChannel, fetchedWindow),
             fetchValsetSlices(live),
-            fetchGovernanceSlices(live),
+            isClientMode(stateRef.current)
+              ? {
+                  proposals: [],
+                  governanceShares: { active: false, allocations: [], total: 0 },
+                }
+              : fetchGovernanceSlices(live),
             fetchForgeSlices(live),
             fetchPagesSlices(live, fetchedPage),
             fetchAgentsSlices(live),
@@ -532,7 +538,9 @@ export function DucktapeProvider({
               ? fetchChatSlices(live, stateRef.current.activeChannel, fetchedWindow)
               : null,
             scope.has("valset") ? fetchValsetSlices(live) : null,
-            scope.has("governance") ? fetchGovernanceSlices(live) : null,
+            scope.has("governance") && !isClientMode(stateRef.current)
+              ? fetchGovernanceSlices(live)
+              : null,
             scope.has("forge") ? fetchForgeSlices(live) : null,
             scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
             scope.has("agents") ? fetchAgentsSlices(live) : null,
@@ -672,9 +680,10 @@ export function DucktapeProvider({
     () =>
       (state.status?.modules ?? [])
         .map((m) => m.id)
+        .filter((id) => !isClientMode(state) || id !== "governance")
         .sort()
         .join("\0"),
-    [state.status?.modules],
+    [state.status?.modules, state.workspace, state.nodeUrl],
   );
 
   // 1. Resolve the node once. Web: dial the configured url. Desktop: resolve
@@ -690,6 +699,8 @@ export function DucktapeProvider({
       dispatch({
         type: "patch",
         patch: {
+          screen: "chat",
+          viewMode: "user",
           nodeUrl: resolution.url,
           managed: false,
           needsOnboarding: false,
@@ -1066,7 +1077,7 @@ export function DucktapeProvider({
         listen<string | NavigateTarget>("ducktape://navigate", (event) => {
           const payload = event.payload;
           if (typeof payload === "string") {
-            if (payload) dispatch({ type: "patch", patch: { screen: payload } });
+            if (payload) actions.setScreen(payload);
             return;
           }
           let target = parseNavigateTarget(payload);
@@ -1258,7 +1269,9 @@ export function DucktapeProvider({
       focusedChannel: state.screen === "chat" ? state.activeChannel : null,
       mainWindowFocused: windowFocused,
       authorNames: state.authorNames,
-      prefs: state.notifyPrefs,
+      prefs: isClientMode(state)
+        ? { ...state.notifyPrefs, governance: false }
+        : state.notifyPrefs,
     };
     const fp = JSON.stringify(payload);
     if (fp === notifyConfigFp.current) return;
@@ -1268,6 +1281,7 @@ export function DucktapeProvider({
     state.status?.publicKey,
     state.nodeUsers,
     state.nodeUrl,
+    state.workspace,
     state.screen,
     state.activeChannel,
     state.authorNames,

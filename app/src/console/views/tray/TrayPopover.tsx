@@ -22,7 +22,8 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { Icon } from "../../components/Icon";
-import { MODULES } from "../../modules/registry";
+import { MODULES, modulesInSection } from "../../modules/registry";
+import { loadRemoteUrl } from "../../store/state";
 import { accentVar, font } from "../../theme/tokens";
 import * as identityClient from "../../../domain/identity-client";
 import { remoteTransport, type NodeStatus } from "../../../domain/transport";
@@ -39,16 +40,30 @@ const HAIRLINE = "rgba(255,255,255,0.12)";
 interface Snap {
   workspace: Workspace | null;
   status: NodeStatus | null;
-  memberCount: number;
+  memberCount: number | null;
+  client: boolean;
 }
 
-const EMPTY: Snap = { workspace: null, status: null, memberCount: 0 };
+const EMPTY: Snap = { workspace: null, status: null, memberCount: null, client: false };
 
-// Read a snapshot straight from the active workspace's node. Read-only — it
-// never spawns/selects (that's the console's job); if no workspace is active
-// or the node is down, it degrades to a "Stopped" placeholder rather than
-// throwing.
+// Read a snapshot straight from the remembered remote or active workspace's
+// node. Read-only — it never spawns/selects (that's the console's job); an
+// unreachable node degrades to an honest placeholder rather than throwing.
 async function loadSnap(): Promise<Snap> {
+  const remoteUrl = loadRemoteUrl();
+  if (remoteUrl) {
+    const live = remoteTransport(remoteUrl);
+    try {
+      return {
+        workspace: null,
+        status: await live.status(),
+        memberCount: null,
+        client: true,
+      };
+    } catch {
+      return { workspace: null, status: null, memberCount: null, client: true };
+    }
+  }
   const workspace = await activeWorkspace().catch(() => null);
   if (!workspace) return EMPTY;
   const live = remoteTransport(`http://127.0.0.1:${workspace.ports.http}`);
@@ -57,9 +72,9 @@ async function loadSnap(): Promise<Snap> {
       live.status(),
       identityClient.allAccounts(live, { from: 0, limit: 256 }).catch(() => []),
     ]);
-    return { workspace, status, memberCount: accounts.length };
+    return { workspace, status, memberCount: accounts.length, client: false };
   } catch {
-    return { workspace, status: null, memberCount: 0 };
+    return { workspace, status: null, memberCount: 0, client: false };
   }
 }
 
@@ -95,9 +110,21 @@ export function TrayPopover() {
   // The pluggable module list minus Node (Node is the pinned identity-style
   // entry above it, not part of the scrollable rail).
   const rail = useMemo(
-    () => [...MODULES].filter((m) => m.id !== "status").sort((a, b) => a.nav.order - b.nav.order),
-    [],
+    () =>
+      (snap.client
+        ? [
+            ...modulesInSection("user", true),
+            ...modulesInSection("operator", true),
+          ]
+        : [...MODULES].sort((a, b) => a.nav.order - b.nav.order)
+      ).filter((m) => m.id !== "status"),
+    [snap.client],
   );
+  useEffect(() => {
+    if (sel.kind === "module" && !rail.some((mod) => mod.id === sel.id)) {
+      setSel({ kind: "node" });
+    }
+  }, [rail, sel]);
   const nodeMod = MODULES.find((m) => m.id === "status");
   const connected = snap.status !== null;
 
@@ -144,7 +171,11 @@ export function TrayPopover() {
               }}
             />
             <span style={{ font: `400 10px ${font.mono}`, color: DIM }}>
-              {connected ? `Synced · h${(snap.status?.height ?? 0).toLocaleString()}` : "Stopped"}
+              {connected
+                ? `Synced · h${(snap.status?.height ?? 0).toLocaleString()}`
+                : snap.client
+                  ? "Unavailable"
+                  : "Stopped"}
             </span>
           </div>
         </div>
@@ -188,7 +219,7 @@ export function TrayPopover() {
 
         {/* RIGHT: scrollable detail. */}
         <div style={{ flex: 1, minWidth: 0, overflowY: "auto", padding: "12px 13px" }}>
-          {sel.kind === "node" && <NodeDetail snap={snap} connected={connected} onOpen={() => openConsole()} />}
+          {sel.kind === "node" && <NodeDetail snap={snap} connected={connected} onOpen={() => openConsole("status")} />}
           {sel.kind === "module" && (
             <ModuleDetail
               mod={rail.find((m) => m.id === sel.id)}
@@ -211,16 +242,19 @@ function NodeDetail({ snap, connected, onOpen }: { snap: Snap; connected: boolea
       : workspace.member
         ? "member · validator"
         : "guest"
-    : "—";
+    : snap.client
+      ? "client · observe"
+      : "—";
+  const nodeKey = workspace?.pubkey ?? status?.publicKey ?? "";
   return (
     <>
       <PaneTitle>Node</PaneTitle>
-      <Field k="Network" v={workspace?.name ?? "—"} />
-      <Field k="Key" v={workspace ? `0x${shortKey(workspace.pubkey)}` : "—"} mono />
+      <Field k="Network" v={workspace?.name ?? (snap.client ? "Remote node" : "—")} />
+      <Field k="Key" v={nodeKey ? `0x${shortKey(nodeKey)}` : "—"} mono />
       <Field k="Role" v={role} />
-      <Field k="Status" v={connected ? "Synced" : "Stopped"} dot={connected ? "#5cb45f" : "#cf6a5e"} />
+      <Field k="Status" v={connected ? "Synced" : snap.client ? "Unavailable" : "Stopped"} dot={connected ? "#5cb45f" : "#cf6a5e"} />
       <Field k="Height" v={`${(status?.height ?? 0).toLocaleString()}`} mono />
-      <Field k="Members" v={`${snap.memberCount}`} />
+      <Field k="Members" v={snap.memberCount === null ? "—" : `${snap.memberCount}`} />
       <Field k="Modules" v={`${status?.modules.length ?? 0} installed`} />
       <SoftwareBlock />
       <OpenButton onClick={onOpen} />

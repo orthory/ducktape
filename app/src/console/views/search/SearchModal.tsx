@@ -18,6 +18,7 @@ import type { FileEntry } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
 import { displayNameForKey, normalizeKey, shortKey } from "../../../domain/names";
 import { Icon } from "../../components/Icon";
+import { isClientMode } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
@@ -174,6 +175,7 @@ export function SearchModal() {
   const [text, setText] = useState("");
   const query = text.trim();
   const results = state.search;
+  const clientMode = isClientMode(state);
 
   // Escape closes ONLY the palette. Capture-phase + stopPropagation so a
   // background popover's own document Escape handler (emoji picker, message
@@ -202,12 +204,12 @@ export function SearchModal() {
   // Instant client-side filters over already-loaded roster + manifests.
   const memberHits = useMemo(() => {
     const q = query.toLowerCase();
-    if (!q) return [] as { key: string; name: string }[];
+    if (!q || clientMode) return [] as { key: string; name: string }[];
     return state.members
       .map((key) => ({ key, name: displayNameForKey(key, state.authorNames) ?? shortKey(key) }))
       .filter((m) => m.name.toLowerCase().includes(q) || m.key.toLowerCase().includes(q))
       .slice(0, RESULT_CAP);
-  }, [query, state.members, state.authorNames]);
+  }, [query, clientMode, state.members, state.authorNames]);
 
   const fileHits = useMemo(() => {
     const q = query.toLowerCase();
@@ -282,7 +284,11 @@ export function SearchModal() {
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
-            placeholder="Search chat, pages, members, files…"
+            placeholder={
+              clientMode
+                ? "Search chat, pages, files…"
+                : "Search chat, pages, members, files…"
+            }
             aria-label="Search"
             onChange={(event) => setText(event.target.value)}
           />
@@ -292,7 +298,9 @@ export function SearchModal() {
         <div style={scroll}>
           {!query && (
             <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-              Type to search chat, pages, members, and files.
+              {clientMode
+                ? "Type to search chat, pages, and files."
+                : "Type to search chat, pages, members, and files."}
             </p>
           )}
 

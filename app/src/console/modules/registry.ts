@@ -46,9 +46,16 @@ export const MODULES: AppModule[] = [
 export const moduleById = (id: string): AppModule | undefined =>
   MODULES.find((m) => m.id === id);
 
+/** Direct remote clients keep every user app, but expose only read-only node
+ *  observability from the operator rail. */
+export const moduleAvailable = (id: string, clientMode: boolean): boolean => {
+  const mod = moduleById(id);
+  return !clientMode || mod?.nav.section === "user" || id === "status" || id === "metrics";
+};
+
 /** The modules of one view-mode rail, ordered. */
-export const modulesInSection = (section: NavSection): AppModule[] =>
-  MODULES.filter((m) => m.nav.section === section).sort(
+export const modulesInSection = (section: NavSection, clientMode = false): AppModule[] =>
+  MODULES.filter((m) => m.nav.section === section && moduleAvailable(m.id, clientMode)).sort(
     (a, b) => a.nav.order - b.nav.order,
   );
 
@@ -58,5 +65,5 @@ export const sectionForScreen = (screen: string): NavSection | null =>
   moduleById(screen)?.nav.section ?? null;
 
 /** The default screen a rail lands on (its first, lowest-order module). */
-export const defaultScreenForSection = (section: NavSection): string =>
-  modulesInSection(section)[0]?.id ?? "chat";
+export const defaultScreenForSection = (section: NavSection, clientMode = false): string =>
+  modulesInSection(section, clientMode)[0]?.id ?? "chat";
