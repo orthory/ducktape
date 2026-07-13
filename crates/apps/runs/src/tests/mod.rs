@@ -941,6 +941,7 @@ fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
             })
             .collect(),
         actions,
+        commit_message: None,
     })
 }
 

@@ -30,6 +30,9 @@ pub enum WorkspaceSource {
     /// a forge repo pinned at a commit, worked on `branch`.
     Forge {
         repo: String,
+        /// authoritative Forge tracker title when the composing node supplied
+        /// it; absent on older in-flight v3 envelopes.
+        item_title: Option<String>,
         /// the pinned base commit (40-hex sha1) — COMMITTED refs at compose
         /// height, the checkout/fork point.
         commit: String,
@@ -71,10 +74,10 @@ impl WorkspaceSource {
     }
 }
 
-/// the wire decode of a v3 envelope's `workspace` block (contract §1). every
-/// variant field is required at the serde step (a malformed envelope fails to
-/// parse — acceptance IS validation); [`WireWorkspace::validate`] adds the
-/// per-field non-empty checks and surfaces the plain [`WorkspaceSource`].
+/// the wire decode of a v3 envelope's `workspace` block (contract §1). source
+/// coordinates are required; additive metadata defaults for old in-flight
+/// envelopes. [`WireWorkspace::validate`] adds the per-field non-empty checks
+/// and surfaces the plain [`WorkspaceSource`].
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WireWorkspace {
@@ -84,6 +87,9 @@ pub(crate) enum WireWorkspace {
     },
     Forge {
         repo: String,
+        /// additive in v3: old in-flight envelopes carry no fallback title.
+        #[serde(default)]
+        item_title: Option<String>,
         commit: String,
         branch: String,
         branch_born: bool,
@@ -111,6 +117,7 @@ impl WireWorkspace {
             }
             WireWorkspace::Forge {
                 repo,
+                item_title,
                 commit,
                 branch,
                 branch_born,
@@ -124,6 +131,7 @@ impl WireWorkspace {
                 }
                 Ok(WorkspaceSource::Forge {
                     repo,
+                    item_title,
                     commit,
                     branch,
                     branch_born,
@@ -158,7 +166,7 @@ mod tests {
     fn the_tagged_forge_shape_decodes_verbatim() {
         // the EXACT composer bytes (task-1 report §"Exact final serde shapes").
         let ws: WireWorkspace = serde_json::from_str(&format!(
-            r#"{{"kind":"forge","repo":"app","commit":"{}","branch":"agent/item-7","branch_born":false}}"#,
+            r#"{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{}","branch":"agent/item-7","branch_born":false}}"#,
             "d0".repeat(20)
         ))
         .unwrap();
@@ -166,11 +174,27 @@ mod tests {
             ws.validate().unwrap(),
             WorkspaceSource::Forge {
                 repo: "app".into(),
+                item_title: Some("Fix the gate".into()),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
             }
         );
+    }
+
+    #[test]
+    fn a_pre_title_forge_envelope_keeps_running_without_a_fallback() {
+        let ws: WireWorkspace = serde_json::from_str(
+            r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ws.validate().unwrap(),
+            WorkspaceSource::Forge {
+                item_title: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -243,6 +267,7 @@ mod tests {
         // per-kind receipt shape.
         let forge = WorkspaceSource::Forge {
             repo: "app".into(),
+            item_title: Some("Fix the gate".into()),
             commit: "d0".repeat(20),
             branch: "agent/item-7".into(),
             branch_born: true,

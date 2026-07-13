@@ -234,9 +234,15 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn context_doc(&self) -> Option<String> {
         None
     }
-    /// commit ONLY the rw source; a clean working copy → a `no_changes`
-    /// receipt (never an error).
-    async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String>;
+    /// commit ONLY the rw source; `audit_message` is host-only receipt context
+    /// while `proposal` is the agent-authored Git message. Implementations must
+    /// never turn the audit string into public Git history.
+    /// A clean working copy → a `no_changes` receipt (never an error).
+    async fn commit(
+        &self,
+        audit_message: &str,
+        proposal: Option<&str>,
+    ) -> Result<WorkspaceReceipt, String>;
     /// W5 cleanup: idempotent, best-effort, never fails the run.
     async fn cleanup(&self);
 }
@@ -537,6 +543,15 @@ pub fn effects_from_response_text(text: &str) -> Vec<RunEffect> {
         .collect()
 }
 
+/// Extract the optional Git message from the same tolerant strict-response
+/// parse used for effects. Validation remains the workspace commit boundary's
+/// job; this seam preserves the proposed subject and body verbatim.
+pub fn commit_message_from_response_text(text: &str) -> Option<String> {
+    serde_json::from_value::<agent::AgentResponse>(parse_response_value(text)?)
+        .ok()?
+        .commit_message
+}
+
 /// tolerantly parse the model's answer into a JSON object (bare / de-fenced /
 /// outermost span), matching runs' `parse_strict_response`.
 fn parse_response_value(text: &str) -> Option<serde_json::Value> {
@@ -616,6 +631,27 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn commit_message_is_optional_and_preserves_subject_and_body() {
+        let response = r#"{"reply_blocks":[],"actions":[],"commit_message":"fix: exact subject\n\nExact body."}"#;
+        assert_eq!(
+            commit_message_from_response_text(response).as_deref(),
+            Some("fix: exact subject\n\nExact body.")
+        );
+        assert_eq!(
+            commit_message_from_response_text(r#"{"reply_blocks":[],"actions":[]}"#),
+            None,
+            "old AgentResponse values remain valid"
+        );
+        assert_eq!(
+            commit_message_from_response_text(
+                r#"{"reply_blocks":"invalid","actions":[],"commit_message":"must not leak"}"#,
+            ),
+            None,
+            "an invalid AgentResponse cannot donate only its commit message"
+        );
+    }
+
     /// a CONSENSUS run id in the shape `runs` mints (`chat\x1f<channel>\x1f<seq>\x1f<agent>`).
     /// written out rather than imported: this crate must not depend on an app
     /// module. the cross-crate proof that composer and provisioner agree on the
@@ -646,6 +682,7 @@ mod tests {
             agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
+                item_title: Some("Fix the gate".into()),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,

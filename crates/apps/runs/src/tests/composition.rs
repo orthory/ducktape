@@ -238,6 +238,7 @@ fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
     assert_eq!(v["ducktape_run"], 3);
     assert_eq!(v["workspace"]["kind"], "forge");
     assert_eq!(v["workspace"]["repo"], "app");
+    assert_eq!(v["workspace"]["item_title"], "Fix the gate");
     assert_eq!(
         v["workspace"]["commit"], main_tip,
         "an issue with an unborn work branch forks the committed main tip"
@@ -302,6 +303,7 @@ fn a_pr_item_run_works_the_prs_own_source_branch() {
     let v = compose_forge(&m, &ctx, &registry, "forge:app:8").unwrap();
     // THE pr-item rule: the session pushes the PR's own branch, so the
     // open PR updates in place.
+    assert_eq!(v["workspace"]["item_title"], "Wire it");
     assert_eq!(v["workspace"]["branch"], "feature/x");
     assert_eq!(v["workspace"]["commit"], src_tip);
     assert_eq!(v["workspace"]["branch_born"], true);

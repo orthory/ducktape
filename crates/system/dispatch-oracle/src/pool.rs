@@ -347,12 +347,12 @@ async fn execute(
                 // delivers (R4 — never lost to receipt plumbing). only
                 // `CommitError::Nothing` is a true `no_changes`, and the
                 // workspace impl already maps that to Ok.
+                let audit_message = format!("agent run {}", spec.run_id);
+                let proposal =
+                    crate::provision::commit_message_from_response_text(&output.text);
                 let commit = tokio::time::timeout(
                     workspace_step_timeout(),
-                    // DuckFS persists this as snapshot audit metadata. Forge
-                    // deliberately ignores it and reads the agent-authored
-                    // proposal from the workspace instead.
-                    ws.commit(&format!("agent run {}", spec.run_id)),
+                    ws.commit(&audit_message, proposal.as_deref()),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -475,6 +475,23 @@ format = "text"
         last_run: Arc<Mutex<Option<(String, capability_host::RunContext)>>>,
         fail: bool,
         usage: Option<capability_host::TokenUsage>,
+    }
+
+    struct FixedProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl capability_host::Provider for FixedProvider {
+        fn capability(&self) -> &str {
+            "alpha"
+        }
+
+        async fn run(
+            &self,
+            _prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
+            Ok(self.0.to_owned())
+        }
     }
 
     #[async_trait::async_trait]
@@ -894,6 +911,7 @@ format = "text"
             "workspace": {
                 "kind": "forge",
                 "repo": "app",
+                "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
                 "branch_born": false
@@ -975,7 +993,11 @@ format = "text"
         fn context_doc(&self) -> Option<String> {
             self.context_doc.clone()
         }
-        async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
+        async fn commit(
+            &self,
+            _audit_message: &str,
+            _proposal: Option<&str>,
+        ) -> Result<WorkspaceReceipt, String> {
             self.committed.store(true, Ordering::SeqCst);
             if let Some(err) = &self.fail_commit {
                 return Err(err.clone());
@@ -1130,7 +1152,11 @@ format = "text"
         fn path_entries(&self) -> Vec<PathBuf> {
             Vec::new()
         }
-        async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
+        async fn commit(
+            &self,
+            _audit_message: &str,
+            _proposal: Option<&str>,
+        ) -> Result<WorkspaceReceipt, String> {
             Ok(WorkspaceReceipt {
                 source_prefix: String::new(),
                 source_snapshot: None,
@@ -1214,8 +1240,16 @@ format = "text"
         fn path_entries(&self) -> Vec<PathBuf> {
             Vec::new()
         }
-        async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
-            *self.captured.lock().unwrap() = Some(message.to_string());
+        async fn commit(
+            &self,
+            audit_message: &str,
+            proposal: Option<&str>,
+        ) -> Result<WorkspaceReceipt, String> {
+            *self.captured.lock().unwrap() = Some(
+                proposal
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| audit_message.to_owned()),
+            );
             Ok(WorkspaceReceipt {
                 source_prefix: "forge:app".into(),
                 source_snapshot: Some("d0".repeat(20)),
@@ -1266,6 +1300,7 @@ format = "text"
             spec.source,
             crate::workspace_source::WorkspaceSource::Forge {
                 repo: "app".into(),
+                item_title: Some("Fix the gate".into()),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
@@ -1289,6 +1324,28 @@ format = "text"
 
         let message = captured.lock().unwrap().clone().expect("commit called");
         assert_eq!(message, format!("agent run {saga_id}:7"));
+    }
+
+    #[tokio::test]
+    async fn response_commit_message_reaches_the_workspace_commit_boundary_exactly() {
+        let response = r#"{"reply_blocks":[],"actions":[],"commit_message":"fix: exact subject\n\nExact body."}"#;
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(FixedProvider(response))],
+        ));
+        let captured = Arc::new(Mutex::new(None));
+        let provisioner: SharedProvisioner = Arc::new(CommitMessageProbe {
+            captured: captured.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        pool.run(&effect_for("s1", 0, Some(b"me"))).await.unwrap();
+        let _ = next_result(&mut rx).await;
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("fix: exact subject\n\nExact body.")
+        );
     }
 
     #[tokio::test]
@@ -1493,7 +1550,11 @@ format = "text"
         fn path_entries(&self) -> Vec<PathBuf> {
             Vec::new()
         }
-        async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
+        async fn commit(
+            &self,
+            _audit_message: &str,
+            _proposal: Option<&str>,
+        ) -> Result<WorkspaceReceipt, String> {
             std::future::pending::<()>().await;
             unreachable!("a pending future never resolves")
         }
