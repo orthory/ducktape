@@ -195,6 +195,9 @@ export function DucktapeProvider({
   // Capability reads also run on explicit UI retry. Keep their ordering local
   // so a retry cannot cancel unrelated chat/pages hydration (or vice versa).
   const capabilityHydrateGenRef = useRef(0);
+  // Retry requires a fresh identity proof. A normal hydrate whose status read
+  // started before that proof must not fan out a capability query afterward.
+  const capabilityTrustGenRef = useRef(0);
 
   const fail = useCallback(
     (err: unknown) =>
@@ -202,9 +205,9 @@ export function DucktapeProvider({
     [],
   );
 
-  const probeStatus = useCallback((live: NodeTransport): Promise<NodeStatus> => {
+  const probeStatus = useCallback((live: NodeTransport, fresh = false): Promise<NodeStatus> => {
     const existing = statusFlightRef.current;
-    if (existing?.transport === live) return existing.promise;
+    if (!fresh && existing?.transport === live) return existing.promise;
 
     const promise = Promise.resolve()
       .then(() => live.status())
@@ -334,11 +337,10 @@ export function DucktapeProvider({
   );
 
   const refreshCapabilitySlices = useCallback(
-    (live: NodeTransport, showLoading = false): Promise<void> => {
-      const generation = (capabilityHydrateGenRef.current += 1);
-      if (showLoading) {
-        dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
-      }
+    (
+      live: NodeTransport,
+      generation = (capabilityHydrateGenRef.current += 1),
+    ): Promise<void> => {
       return fetchCapabilitySlices(live).then((capability) => {
         if (
           nodeRef.current !== live ||
@@ -360,6 +362,7 @@ export function DucktapeProvider({
     // Bind this hydrate to the exact transport that started it so a late
     // response from the previous workspace cannot repopulate cleared slices.
     const generation = (hydrateGenRef.current += 1);
+    const capabilityTrustFloor = capabilityTrustGenRef.current;
     const stale = () =>
       nodeRef.current !== live || hydrateGenRef.current !== generation;
     const hadSnapshot = stateRef.current.status !== null;
@@ -370,7 +373,9 @@ export function DucktapeProvider({
     const fetchStartedAt = Date.now();
     const hydrate = (status: NodeStatus) => {
       if (stale() || !acceptsStatus(live, status)) return Promise.resolve();
-      void refreshCapabilitySlices(live);
+      if (capabilityTrustGenRef.current === capabilityTrustFloor) {
+        void refreshCapabilitySlices(live);
+      }
       return Promise.resolve()
         .then(() =>
           Promise.all([
@@ -483,6 +488,7 @@ export function DucktapeProvider({
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
     const generation = (hydrateGenRef.current += 1);
+    const capabilityTrustFloor = capabilityTrustGenRef.current;
     const stale = () =>
       nodeRef.current !== live || hydrateGenRef.current !== generation;
     const hadSnapshot = stateRef.current.status !== null;
@@ -495,7 +501,12 @@ export function DucktapeProvider({
       const prev = stateRef.current.status;
       if (!prev) return refresh();
       const scope = scopeFor(changedModules(prev, status));
-      if (scope.has("capability")) void refreshCapabilitySlices(live);
+      if (
+        scope.has("capability") &&
+        capabilityTrustGenRef.current === capabilityTrustFloor
+      ) {
+        void refreshCapabilitySlices(live);
+      }
       const fetchedPage = stateRef.current.activePage;
       return Promise.resolve()
         .then(() =>
@@ -586,8 +597,34 @@ export function DucktapeProvider({
   const refreshCapabilities = useCallback(() => {
     const live = nodeRef.current;
     if (!live || !stateRef.current.connected) return;
-    void refreshCapabilitySlices(live, true);
-  }, [refreshCapabilitySlices]);
+    // Reserve ownership before the identity proof: an older capability read
+    // must not land while Retry is waiting for status from this same port.
+    capabilityTrustGenRef.current += 1;
+    const generation = (capabilityHydrateGenRef.current += 1);
+    dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
+    void probeStatus(live, true).then(
+      (status) => {
+        if (nodeRef.current !== live) return;
+        if (!acceptsStatus(live, status)) {
+          if (capabilityHydrateGenRef.current === generation) {
+            dispatch({ type: "patch", patch: { capabilitiesStatus: "error" } });
+          }
+          return;
+        }
+        if (capabilityHydrateGenRef.current !== generation) return;
+        return refreshCapabilitySlices(live, generation);
+      },
+      () => {
+        if (
+          nodeRef.current === live &&
+          capabilityHydrateGenRef.current === generation &&
+          !rejectedTransportsRef.current.has(live)
+        ) {
+          dispatch({ type: "patch", patch: { capabilitiesStatus: "error" } });
+        }
+      },
+    );
+  }, [acceptsStatus, probeStatus, refreshCapabilitySlices]);
 
   const actions = useMemo(
     () =>
