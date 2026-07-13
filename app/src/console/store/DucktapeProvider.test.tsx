@@ -211,6 +211,7 @@ const makeFakeNode = ({
     modules: [
       { id: "chat", root: "cc".repeat(32) },
       { id: "agent", root: "ee".repeat(32) },
+      { id: "capability", root: "ca".repeat(32) },
       { id: "identity", root: "11".repeat(32) },
     ],
   };
@@ -431,6 +432,50 @@ describe("DucktapeProvider", () => {
     expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
       failedQueries,
     );
+  });
+
+  it("ignores an older provider retry after a newer scoped hydrate wins", async () => {
+    const { transport, emitOps } = makeFakeNode();
+    const query = transport.query as ReturnType<typeof vi.fn>;
+    const baseQuery = query.getMockImplementation() as (
+      target: string,
+      request: unknown,
+    ) => Promise<unknown>;
+    const oldRetry = deferred<unknown>();
+    let registry: "fail" | "defer" | "newer" = "fail";
+    query.mockImplementation((target: string, request: unknown) => {
+      if (target !== "capability") return baseQuery(target, request);
+      if (registry === "fail") return Promise.reject(new Error("registry unavailable"));
+      if (registry === "defer") return oldRetry.promise;
+      return Promise.resolve({ all: [[[2], ["claude"]]] });
+    });
+
+    render(
+      <DucktapeProvider transport={transport}>
+        <AgentView />
+      </DucktapeProvider>,
+    );
+    fireEvent.click((await screen.findAllByRole("button", { name: /add agent/i }))[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not load.*retry/i);
+
+    const failedQueries = query.mock.calls.filter(([target]) => target === "capability").length;
+    registry = "defer";
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(query.mock.calls.filter(([target]) => target === "capability").length).toBeGreaterThan(
+        failedQueries,
+      ),
+    );
+
+    registry = "newer";
+    await act(async () => emitOps("capability", [{ height: 5 }]));
+    await waitFor(() => expect(screen.getByLabelText("Runs on")).toHaveValue("claude"));
+
+    await act(async () => {
+      oldRetry.resolve({ all: [[[1], ["codex"]]] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByLabelText("Runs on")).toHaveValue("claude");
   });
 
   it("keeps an initial status timeout loud after the one bounded retry", async () => {

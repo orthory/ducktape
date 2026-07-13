@@ -567,9 +567,16 @@ export function DucktapeProvider({
   const refreshCapabilities = useCallback(() => {
     const live = nodeRef.current;
     if (!live || !stateRef.current.connected) return;
+    const generation = (hydrateGenRef.current += 1);
     dispatch({ type: "patch", patch: { capabilitiesStatus: "loading" } });
     void fetchCapabilitySlices(live).then((capability) => {
-      if (nodeRef.current !== live || !stateRef.current.connected) return;
+      if (
+        nodeRef.current !== live ||
+        !stateRef.current.connected ||
+        hydrateGenRef.current !== generation
+      ) {
+        return;
+      }
       dispatch({ type: "patch", patch: capability });
     });
   }, []);
