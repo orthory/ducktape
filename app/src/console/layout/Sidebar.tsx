@@ -1,7 +1,7 @@
 // The 74px icon rail: brand, a two-section mode toggle, one entry per module of
-// the active rail, and settings. A local workspace labels the sections USER /
-// NODE; a direct remote connection labels the same slots CLIENT / OBSERVE and
-// the registry filters OBSERVE to read-only surfaces. Neither rail confers
+// the active rail, and settings. Both local and remote connections label the
+// sections USER / NODE; the registry filters a remote NODE rail to read-only
+// surfaces. Neither rail confers
 // authority; the toggle is purely which surfaces are on screen.
 
 import { Icon, type IconName } from "../components/Icon";
@@ -29,8 +29,8 @@ const LOCAL_MODES: ReadonlyArray<ModeEntry> = [
 ];
 
 const CLIENT_MODES: ReadonlyArray<ModeEntry> = [
-  { id: "user", icon: "members", label: "CLIENT", title: "Client apps" },
-  { id: "operator", icon: "node", label: "OBSERVE", title: "Read-only node observability" },
+  { id: "user", icon: "members", label: "USER", title: "User apps" },
+  { id: "operator", icon: "node", label: "NODE", title: "Read-only node" },
 ];
 
 function ModeToggle({

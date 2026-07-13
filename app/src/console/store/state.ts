@@ -155,7 +155,7 @@ export interface ConsoleState {
   // ── Session / node core ──
   screen: string;
   /** Which sidebar rail is shown. The local-workspace choice is persisted (see
-   *  loadViewMode); direct clients start on CLIENT without overwriting it.
+   *  loadViewMode); direct clients start on USER without overwriting it.
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
@@ -563,7 +563,7 @@ export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
 // ── View-mode persistence ───────────────────────────────
 //
 // The local-workspace rail survives restarts. Direct client sessions start on
-// CLIENT and do not overwrite it. The screen itself is NOT persisted, so local
+// USER and do not overwrite it. The screen itself is NOT persisted, so local
 // boot lands on the persisted rail's default surface. These two ids duplicate
 // the registry's first-in-section screens (chat / members) rather than import
 // the registry into this low-level state module, keeping the store free of the

@@ -120,14 +120,14 @@ function workspaceRole(
   if (clientMode) {
     return {
       id: "client",
-      pill: "client · observe",
-      title: "Remote client",
+      pill: "user · node",
+      title: "Remote user",
       badge: "READ ONLY",
       tint: tint(color.amber).text,
       bg: tint(color.amber).bg,
       border: tint(color.amber).border,
       body:
-        "This client can inspect the connected node's committed state and metrics without node-operator controls.",
+        "This user can inspect the connected node's committed state and metrics without node-operator controls.",
       validator: false,
     } as const;
   }
@@ -1029,7 +1029,7 @@ function PermissionsTab() {
           </div>
           <HeaderCell label="Validator" active={role.validator} />
           <HeaderCell
-            label={role.id === "client" ? "Remote client" : "Guest client"}
+            label={role.id === "client" ? "Remote user" : "Guest client"}
             active={!role.validator}
           />
         </div>

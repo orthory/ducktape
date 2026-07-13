@@ -58,11 +58,8 @@ describe("Sidebar", () => {
   it("keeps Forge in the remote client rail", () => {
     renderSidebar({ workspace: null, nodeUrl: "https://node.example" });
 
-    expect(screen.getByRole("tab", { name: "CLIENT" })).toHaveAttribute("title", "Client apps");
-    expect(screen.getByRole("tab", { name: "OBSERVE" })).toHaveAttribute(
-      "title",
-      "Read-only node observability",
-    );
+    expect(screen.getByRole("tab", { name: "USER" })).toHaveAttribute("title", "User apps");
+    expect(screen.getByRole("tab", { name: "NODE" })).toHaveAttribute("title", "Read-only node");
     expect(screen.getByRole("button", { name: "Forge" })).toBeInTheDocument();
   });
 
