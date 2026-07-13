@@ -122,6 +122,15 @@ test('cleanup hook terminates only the recorded instance node group on this plat
       cwd: root,
       env: { ...process.env, FLEET_ARTIFACT_DIR: artifact, FLEET_HOME: home, FLEET_INSTANCE_ID: 'target' }
     }).exitCode).toBe(0)
+
+    await rm(artifact, { recursive: true, force: true })
+    await writeFile(join(home, '.ducktape/workspaces/target/node.pid'), '2147483647')
+    const stale = Bun.spawnSync(['bun', join(root, 'qa/fleet/cleanup-instance.ts')], {
+      cwd: root,
+      env: { ...process.env, FLEET_ARTIFACT_DIR: artifact, FLEET_HOME: home, FLEET_INSTANCE_ID: 'target' }
+    })
+    expect(stale.exitCode, stale.stderr.toString()).toBe(0)
+    expect(await Bun.file(join(home, '.ducktape/workspaces/target/node.pid')).exists()).toBe(false)
   } finally {
     kill(target)
     kill(sibling)
