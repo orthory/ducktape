@@ -76,7 +76,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
@@ -382,6 +382,16 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/files/find", get(files_find))
         .route("/v1/files/grep", get(files_grep))
         .route("/v1/files/history", get(files_history))
+        // the S3-shaped object facade: one url = one object. PUT is a
+        // single-change commit (stage + put), GET streams the whole file,
+        // DELETE is a single-change rm; LIST is the existing /v1/files/ls.
+        .route(
+            "/v1/files/object/{*path}",
+            put(object_put)
+                .get(object_get)
+                .delete(object_delete)
+                .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES)),
+        )
         // the read/probe surface the checkout/commit engine drives.
         .route("/v1/files/refs", get(files_refs))
         .route("/v1/files/diff", get(files_diff))

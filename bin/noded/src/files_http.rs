@@ -473,3 +473,219 @@ pub(crate) async fn files_has_chunks(
         Err(resp) => resp,
     }
 }
+
+// ---- the S3-shaped facade (spec: Revision 2026-07-13) --------------------
+//
+// one url = one object: PUT is a single-change commit (stage + put), GET
+// streams the whole file back, DELETE is a single-change rm. listing is the
+// existing /v1/files/ls — a flat, cursor-paged dir page IS the sanctioned
+// LIST. same trust story as every handler in this file: the local-trust
+// convenience lane (ext:noded); authenticated authorship rides the signed
+// frame lane instead. NOTE the lane's actor makes the usable keyspace
+// effectively /shared/** — check_authority admits ext:noded nowhere else
+// a caller would name.
+
+/// one PUT is buffered whole, then staged in 1 MiB chunks — every byte rides
+/// consensus blocks, so this bounds a single request's block fan-out.
+/// ponytail: whole-body buffering; stream into staging if objects outgrow RAM.
+pub(crate) const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
+/// query params for the object facade's PUT.
+#[derive(Debug, Deserialize)]
+pub struct ObjectPutParams {
+    /// optional commit message; defaults to `put <path>`.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// the wildcard tail arrives without its leading slash; duckfs paths are
+/// absolute. (axum already percent-decodes the tail.)
+fn object_path(rest: &str) -> String {
+    format!("/{rest}")
+}
+
+/// the current head snapshot, as a commit base — sequential overwrites are
+/// last-writer-wins like S3 (the base is "the head as of this request").
+/// CONCURRENT same-path writers diverge from S3: the loser gets the module's
+/// per-path CAS rejection (400) where S3 would silently order them — an
+/// honest conflict beats a silent overwrite on a consensus filesystem.
+async fn head_snapshot(handle: &NodeHandle) -> Result<Option<String>, Response> {
+    match files_query(handle, &FilesQuery::Refs {}).await {
+        Ok(FilesReply::Refs(info)) => Ok(info.head),
+        Ok(_) => Err(wrong_reply()),
+        Err(resp) => Err(resp),
+    }
+}
+
+/// PUT /v1/files/object/{*path}?message= — body is the object's raw bytes.
+/// small bodies ride inline in the commit; larger ones stage 1 MiB chunks
+/// first (one submit per chunk, exactly like /v1/files/stage) and the commit
+/// references the digests. replies with the committing block.
+pub(crate) async fn object_put(
+    State(handle): State<NodeHandle>,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+    Query(p): Query<ObjectPutParams>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+    };
+    let path = object_path(&rest);
+    let base_snapshot = match head_snapshot(&handle).await {
+        Ok(head) => head,
+        Err(resp) => return resp,
+    };
+
+    use base64::Engine as _;
+    let content = if bytes.len() <= duckfs_core::MAX_INLINE_COMMIT_BYTES {
+        duckfs_core::Content::Inline {
+            b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }
+    } else {
+        let mut chunks =
+            Vec::with_capacity(bytes.len().div_ceil(duckfs_core::CHUNK_SIZE as usize));
+        for chunk in bytes.chunks(duckfs_core::CHUNK_SIZE as usize) {
+            let digest = to_hex(&object_id(Kind::Chunk, chunk));
+            if let Err(resp) = files_submit(&handle, encode_putblob(chunk)).await {
+                return resp;
+            }
+            chunks.push(digest);
+        }
+        duckfs_core::Content::Chunks {
+            size: bytes.len() as u64,
+            chunks,
+        }
+    };
+
+    let payload = encode_msg(&FilesMsg::Commit {
+        base_snapshot,
+        message: p.message.unwrap_or_else(|| format!("put {path}")),
+        changes: vec![Change::Put {
+            path,
+            exec: false,
+            meta: Default::default(),
+            content,
+        }],
+    });
+    match files_submit(&handle, payload).await {
+        Ok(block) => Json(block).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// query params for the object facade's GET.
+#[derive(Debug, Deserialize)]
+pub struct ObjectGetParams {
+    /// read a historical snapshot; omitted reads head.
+    #[serde(default)]
+    pub snapshot: Option<String>,
+}
+
+/// GET /v1/files/object/{*path}?snapshot= — the object's raw bytes, whole
+/// (application/octet-stream). pages the module's byte-range Read to eof.
+/// an absent path is 404, a directory or symlink 400 (this surface serves
+/// FILE bytes, never a link target), and an object over the facade cap is
+/// 413 — the whole body is buffered here, symmetric with PUT, so oversized
+/// objects belong on the ranged /v1/files/read instead.
+pub(crate) async fn object_get(
+    State(handle): State<NodeHandle>,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+    Query(p): Query<ObjectGetParams>,
+) -> Response {
+    use base64::Engine as _;
+    let path = object_path(&rest);
+    match files_query(
+        &handle,
+        &FilesQuery::Stat {
+            path: path.clone(),
+            snapshot: p.snapshot.clone(),
+        },
+    )
+    .await
+    {
+        Ok(FilesReply::Stat(None)) => {
+            return error_response(StatusCode::NOT_FOUND, "no object at that path");
+        }
+        Ok(FilesReply::Stat(Some(entry))) => {
+            if entry.kind != duckfs_core::EntryKindWire::File {
+                return error_response(StatusCode::BAD_REQUEST, "not an object (not a file)");
+            }
+            if entry.size > MAX_OBJECT_BYTES as u64 {
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "object exceeds the facade cap; read it ranged via /v1/files/read",
+                );
+            }
+        }
+        Ok(_) => return wrong_reply(),
+        Err(resp) => return resp,
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        let q = FilesQuery::Read {
+            path: path.clone(),
+            snapshot: p.snapshot.clone(),
+            offset: bytes.len() as u64,
+            len: MAX_READ_BYTES,
+        };
+        match files_query(&handle, &q).await {
+            Ok(FilesReply::Read { b64, eof }) => {
+                match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                    Ok(page) => bytes.extend_from_slice(&page),
+                    Err(_) => return wrong_reply(),
+                }
+                if eof {
+                    break;
+                }
+            }
+            Ok(_) => return wrong_reply(),
+            Err(resp) => return resp,
+        }
+    }
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response()
+}
+
+/// DELETE /v1/files/object/{*path} — a single-change rm commit. idempotent
+/// like S3 for the common repeat-delete: an absent object is a 200 no-op.
+/// (the gate is stat-then-commit, so a same-path delete/delete RACE can
+/// still surface the module's 400 — narrow, and honest about the conflict.)
+pub(crate) async fn object_delete(
+    State(handle): State<NodeHandle>,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+) -> Response {
+    let path = object_path(&rest);
+    match files_query(
+        &handle,
+        &FilesQuery::Stat {
+            path: path.clone(),
+            snapshot: None,
+        },
+    )
+    .await
+    {
+        Ok(FilesReply::Stat(None)) => {
+            return Json(serde_json::json!({ "deleted": false })).into_response();
+        }
+        Ok(FilesReply::Stat(Some(_))) => {}
+        Ok(_) => return wrong_reply(),
+        Err(resp) => return resp,
+    }
+    let base_snapshot = match head_snapshot(&handle).await {
+        Ok(head) => head,
+        Err(resp) => return resp,
+    };
+    let payload = encode_msg(&FilesMsg::Commit {
+        base_snapshot,
+        message: format!("rm {path}"),
+        changes: vec![Change::Rm { path }],
+    });
+    match files_submit(&handle, payload).await {
+        Ok(block) => Json(block).into_response(),
+        Err(resp) => resp,
+    }
+}
