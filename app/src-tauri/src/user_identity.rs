@@ -804,9 +804,94 @@ pub async fn user_sign_files_frame(
         .await
 }
 
+/// modules a REMOTE-connected user may sign a frame for. a thin client
+/// operates the app's CONTENT surfaces — it never touches the
+/// membership/consensus-control modules (`identity`, `valset`, `governance`,
+/// `upgrade`, `modreg`, `clients`), so this is not a blanket signing oracle
+/// even though it is one command (the `user_sign_files_frame` caution, kept).
+/// Consensus is the real gate — the submit door + each module's own origin
+/// ACL — this list is defense-in-depth so a compromised console webview
+/// cannot even ATTEMPT a control-plane op as the user.
+const CLIENT_SIGNABLE_TARGETS: &[&str] = &[
+    "chat", "pages", "files", "forge", "tasks", "kv", "directory", "tagging", "inbox",
+];
+
+/// whether a remote user may sign a frame for `target` — the content-module
+/// gate. The membership/consensus-control modules are absent by design.
+fn client_target_allowed(target: &str) -> bool {
+    CLIENT_SIGNABLE_TARGETS.contains(&target)
+}
+
+/// sign ONE content-module op frame with the user key for a REMOTE node — the
+/// generalization of [`user_sign_files_frame`] over `target`, gated by
+/// [`CLIENT_SIGNABLE_TARGETS`]. `payload_hex` is the module payload as hex;
+/// the return is the raw signed frame hex for `POST /v1/submit/frame`, whose
+/// verified signer becomes the op's authorship (`ext:<user-pubkey>`) so a
+/// thin client acts as ITS OWN bounded identity on the dev's node rather than
+/// as the node's shared key. `identity-locked` (exact string) on a locked key
+/// — the remote caller must fail loud, never silently mis-attribute.
+#[tauri::command]
+pub async fn user_sign_frame(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    target: String,
+    payload_hex: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    if !client_target_allowed(&target) {
+        return Err(format!(
+            "user_sign_frame refuses target {target:?}: a remote client signs content ops, \
+             not membership or consensus-control ops"
+        ));
+    }
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            let mut stdin_lines = signing_stdin(&app)?;
+            stdin_lines.push(SecretString::new(payload_hex));
+            let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
+            let key = user_key_path(&app)?.to_string_lossy().into_owned();
+            let seq = next_frame_seq().to_string();
+            let out = run_verb_with_stdin(
+                &[
+                    "user-sign-frame",
+                    "--key",
+                    &key,
+                    "--target",
+                    &target,
+                    "--seq",
+                    &seq,
+                ],
+                &stdin_refs,
+            )?;
+            Ok(last_line(&out))
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_signer_gates_content_modules_and_refuses_control_plane() {
+        // content ops a thin client legitimately makes are allowed…
+        for t in ["chat", "pages", "files", "forge", "tasks", "kv"] {
+            assert!(client_target_allowed(t), "{t} should be signable");
+        }
+        // …but the membership / consensus-control modules are refused, so the
+        // signer is never a blanket oracle even as one command.
+        for t in ["identity", "valset", "governance", "upgrade", "modreg", "clients"] {
+            assert!(!client_target_allowed(t), "{t} must NOT be signable by a client");
+        }
+        // gateway/duckdns require validator/resident standing at their own
+        // module ACL — never grantable to a client, so not in the list.
+        for t in ["gateway", "duckdns"] {
+            assert!(!client_target_allowed(t), "{t} is control-plane for a client");
+        }
+        assert!(!client_target_allowed("not-a-module"));
+    }
 
     #[test]
     fn parse_key_status_reads_absent() {
