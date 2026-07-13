@@ -4351,6 +4351,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
         let ctx = RunContext {
             workdir_override: Some(workdir.clone()),
             limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            executing_node: Some(execution_node_id(b"hardware-smoke")),
             ..RunContext::default()
         };
 
