@@ -96,9 +96,17 @@ export function PageTitle({
       ref={rootRef}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      style={{ position: "relative", marginBottom: 18 }}
+      style={{ position: "relative", marginBottom: 14 }}
     >
-      <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 6, height: 30 }}>
+      <div
+        style={{
+          position: "relative",
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          minHeight: 38,
+        }}
+      >
         <button
           type="button"
           aria-label={icon ? "Change page icon" : "Add page icon"}
@@ -115,7 +123,7 @@ export function PageTitle({
             border: icon ? "none" : `1px dashed ${color.borderStrong}`,
             color: color.muted2,
             font: icon
-              ? "27px/1 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif"
+              ? "24px/1 'Apple Color Emoji', 'Segoe UI Emoji', sans-serif"
               : `500 11px ${font.sans}`,
           }}
         >
@@ -151,51 +159,51 @@ export function PageTitle({
             onClose={() => setPicking(false)}
           />
         ) : null}
+        <input
+          ref={titleRef}
+          aria-label="Page title"
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            publishCursor(event.currentTarget);
+          }}
+          onSelect={(event) => publishCursor(event.currentTarget)}
+          onFocus={(event) => {
+            focusedRef.current = true;
+            publishCursor(event.currentTarget);
+          }}
+          onBlur={() => {
+            focusedRef.current = false;
+            onCursor(null, 0, 0);
+            commit();
+            // an emoji the user typed at the front IS the icon now (commit just
+            // wrote it as one), and the input holds the title WITHOUT the icon. The
+            // focus guard blocks the store sync while the input is live, so leaving
+            // it is the moment to drop it — during typing it would yank the caret.
+            setDraft((current) => splitTitleEmoji(current).title);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== "ArrowDown") return;
+            event.preventDefault();
+            commit();
+            onDescend();
+          }}
+          placeholder="Untitled"
+          spellCheck={false}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            width: "100%",
+            boxSizing: "border-box",
+            border: "none",
+            outline: "none",
+            background: "transparent",
+            padding: 0,
+            color: color.ink,
+            font: `700 28px/1.2 ${font.sans}`,
+          }}
+        />
       </div>
-
-      <input
-        ref={titleRef}
-        aria-label="Page title"
-        value={draft}
-        onChange={(event) => {
-          setDraft(event.target.value);
-          publishCursor(event.currentTarget);
-        }}
-        onSelect={(event) => publishCursor(event.currentTarget)}
-        onFocus={(event) => {
-          focusedRef.current = true;
-          publishCursor(event.currentTarget);
-        }}
-        onBlur={() => {
-          focusedRef.current = false;
-          onCursor(null, 0, 0);
-          commit();
-          // an emoji the user typed at the front IS the icon now (commit just
-          // wrote it as one), and the input holds the title WITHOUT the icon. The
-          // focus guard blocks the store sync while the input is live, so leaving
-          // it is the moment to drop it — during typing it would yank the caret.
-          setDraft((current) => splitTitleEmoji(current).title);
-        }}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter" && event.key !== "ArrowDown") return;
-          event.preventDefault();
-          commit();
-          onDescend();
-        }}
-        placeholder="Untitled"
-        spellCheck={false}
-        style={{
-          width: "100%",
-          boxSizing: "border-box",
-          border: "none",
-          outline: "none",
-          background: "transparent",
-          padding: 0,
-          marginTop: 4,
-          color: color.dark,
-          font: `650 30px/1.2 ${font.sans}`,
-        }}
-      />
       <RemoteCursors peers={presence} areaRef={titleRef} rowRef={rootRef} text={draft} />
     </div>
   );

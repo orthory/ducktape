@@ -1,7 +1,7 @@
 import type { InlineMark, RelativeAnchor, SpanMark } from "../../../domain/pages-client";
 import { rangeHasMark } from "../../../domain/pages-ranges";
 import { Icon } from "../../components/Icon";
-import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
+import { accentVar, color, font, radius } from "../../theme/tokens";
 import type { CommentAnchor } from "./CommentCard";
 
 const MARKS: { kind: InlineMark; label: string; glyph: string }[] = [
@@ -51,7 +51,7 @@ export function SelectionToolbar({
         border: `1px solid ${color.border}`,
         borderRadius: radius.md,
         background: color.paper,
-        boxShadow: shadow.pop,
+        boxShadow: "0 20px 48px rgba(0,0,0,.55)",
       }}
     >
       <div

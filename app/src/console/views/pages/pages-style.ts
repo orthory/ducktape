@@ -43,15 +43,15 @@ export const headingTopSpace = (kind: BlockKind): number =>
 export const kindFont = (kind: BlockKind): string => {
   switch (kind) {
     case "heading1":
-      return `650 24px/1.25 ${font.sans}`;
+      return `700 26px/1.25 ${font.sans}`;
     case "heading2":
-      return `650 19px/1.3 ${font.sans}`;
+      return `700 20px/1.3 ${font.sans}`;
     case "heading3":
-      return `600 16px/1.35 ${font.sans}`;
+      return `650 17px/1.4 ${font.sans}`;
     case "code":
-      return `400 12.5px/1.55 ${font.mono}`;
+      return `400 13px/1.7 ${font.mono}`;
     default:
-      return `400 14.5px/1.6 ${font.sans}`;
+      return `400 15px/1.75 ${font.sans}`;
   }
 };
 
