@@ -2948,8 +2948,12 @@ export function createActions({
       Promise.resolve()
         .then(() => ws.joinWorkspace(name.trim(), blob.trim()))
         .then((joined) => {
+          // the join consumed the staged .pending-join identity — drop the
+          // displayed join code so a later join re-stages a fresh key
+          // instead of showing one the next workspace will not hold.
           update((prev) => ({
             workspaces: mergeWorkspace(prev.workspaces, joined),
+            joinCode: null,
           }));
           return connectActive(joined);
         })
