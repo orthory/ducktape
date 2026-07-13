@@ -394,6 +394,8 @@ impl Ctx for CaptureCtx {
                         hooks: Vec::new(),
                         pinned: Vec::new(),
                         huddle: Vec::new(),
+                        owner: None,
+                        archived: false,
                     }),
                 ))),
                 _ => Err(Error::QueryUnsupported),

@@ -349,9 +349,12 @@ impl ModuleIndexer for ChatIndex {
                 row.tags = Vec::new();
                 put_row_and_toks(out, &row)
             }
-            // channel records, reactions, hooks, membership, and huddle
-            // rosters don't change any searchable text — no view impact.
+            // channel records (create/rename/archive), reactions, hooks,
+            // membership, and huddle rosters don't change any searchable text —
+            // no view impact.
             ChatMsg::CreateChannel { .. }
+            | ChatMsg::RenameChannel { .. }
+            | ChatMsg::SetChannelArchived { .. }
             | ChatMsg::AddReaction { .. }
             | ChatMsg::RemoveReaction { .. }
             | ChatMsg::RegisterHook { .. }
@@ -812,6 +815,8 @@ mod tests {
             hooks: Vec::new(),
             pinned: Vec::new(),
             huddle: Vec::new(),
+            owner: None,
+            archived: false,
         }
     }
 

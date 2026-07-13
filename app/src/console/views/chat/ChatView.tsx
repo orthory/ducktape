@@ -15,6 +15,7 @@ import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { ChannelMembersButton } from "./ChannelMembers";
+import { ChannelMenu } from "./ChannelMenu";
 import { selfAuthorKeyOf } from "./chat-helpers";
 import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
@@ -73,8 +74,13 @@ function ChannelRail() {
   const [creating, setCreating] = useState(false);
   // module-reserved channels (forge's per-item discussion threads,
   // `forge:<repo>:<n>`) are hidden from the chat surface — their messages
-  // render inside the owning module's view, never in this rail.
-  const channels = state.channels.filter((channel) => !isModuleChannel(channel.id));
+  // render inside the owning module's view, never in this rail. Archived
+  // channels are hidden too; there is no "show archived" browser yet, so an
+  // archived channel is only reachable while it stays the open one (its header
+  // "…" menu offers Unarchive) — a deliberate simplification.
+  const channels = state.channels.filter(
+    (channel) => !isModuleChannel(channel.id) && !channel.archived,
+  );
 
   const create = (event: FormEvent) => {
     event.preventDefault();
@@ -212,9 +218,12 @@ function EmptyChannelState() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
-  // module-reserved channels are hidden (see ChannelRail) — a workspace whose
-  // only channels are module-owned still reads "No channels yet".
-  const hasChannels = state.channels.some((channel) => !isModuleChannel(channel.id));
+  // module-reserved and archived channels are hidden (see ChannelRail) — a
+  // workspace whose only channels are module-owned or archived still reads
+  // "No channels yet".
+  const hasChannels = state.channels.some(
+    (channel) => !isModuleChannel(channel.id) && !channel.archived,
+  );
 
   const create = (event: FormEvent) => {
     event.preventDefault();
@@ -405,6 +414,7 @@ export function ChatView() {
           {channel?.post_policy === "members_only" && <ChannelMembersButton channel={channel} />}
           {channel && <ChannelTagsButton />}
           {channel && <HuddleHeaderButton channel={channel} />}
+          {channel && <ChannelMenu channel={channel} />}
         </div>
 
         {channel ? (
