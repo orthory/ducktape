@@ -1,4 +1,4 @@
-//! the forge lane: a per-run git WORKTREE of a node-local forge repo at the
+//! the forge lane: a per-run isolated git clone of a node-local forge repo at the
 //! run's pinned commit, committed with agent authorship and pushed back
 //! through this node's own loopback smart-HTTP lane (receive-pack → blob →
 //! `PushRefs`) so the branch move settles through consensus, CAS included
@@ -12,11 +12,11 @@
 //! only pack digests / blob addressing are sha256): never pass
 //! `--object-format` anywhere.
 //!
-//! DETACHED by construction: the worktree checks out the PINNED commit with
+//! DETACHED by construction: the clone checks out the PINNED commit with
 //! `--detach` and the provisioner never creates or moves a shared-repo ref.
 //! this is load-bearing, not style — the consensus module's committed-ref
 //! catch-up FORCE-MOVES `refs/heads/<branch>` in the shared repo while runs
-//! execute; a worktree HOLDING that branch would silently reparent its
+//! execute; a checkout HOLDING that branch would silently reparent its
 //! commit onto the moved tip with the worktree's old tree (reverting the
 //! interloper's content, fast-forward push, no reject ever fired). a
 //! detached HEAD is immune: the base stays the pin, and the remote tip is
@@ -120,8 +120,8 @@ pub fn forge_push_base(http_listen: Option<&str>) -> Option<String> {
     Some(format!("{}/forge", super::node_http_base(http_listen)?))
 }
 
-/// the construction-time probe: host `git` exists AND supports the worktree
-/// and rebase features the runtime invokes. prove those functionally in a
+/// the construction-time probe: host `git` exists AND supports the clone and
+/// rebase features the runtime invokes. prove those functionally in a
 /// scratch repo rather than accepting a version string that can admit a Git
 /// binary which only fails after a concurrent push.
 pub(super) fn probe_host_git() -> Result<(), String> {
@@ -156,22 +156,24 @@ fn probe_host_git_with(program: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("`git commit` probe setup failed: {e}"))?;
 
-        let worktree = scratch.join("worktree");
-        let worktree_arg = worktree.to_string_lossy().into_owned();
+        let clone = scratch.join("clone");
+        let clone_arg = clone.to_string_lossy().into_owned();
         run_git_program(
             program,
             &scratch,
-            &["worktree", "add", "--detach", &worktree_arg, "HEAD"],
+            &["clone", "--local", "--no-hardlinks", "--no-checkout", ".", &clone_arg],
             &[],
         )
         .map_err(|e| {
             format!(
-                "`git worktree add --detach` failed — host git lacks runtime worktree support: {e}"
+                "`git clone --local --no-hardlinks --no-checkout` failed — host git lacks runtime clone support: {e}"
             )
         })?;
+        run_git_program(program, &clone, &["checkout", "--detach", "HEAD"], &[])
+            .map_err(|e| format!("`git checkout --detach` failed: {e}"))?;
         run_git_program(
             program,
-            &worktree,
+            &clone,
             &["rebase", "--reapply-cherry-picks", "--empty=keep", "HEAD"],
             &identity,
         )
@@ -275,7 +277,7 @@ fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String>
 }
 
 /// provision one forge run: verify the repo + pinned commit are materialized
-/// on THIS node, `git worktree add` the work branch at the pinned commit under
+/// on THIS node, clone it without hardlinks under
 /// the (already D7-validated) run dir, then materialize the W6 skill mounts
 /// beside it. `handle` is the actor lane those mounts check out over (they are
 /// duckfs subtrees whatever the rw source is); `node_url` is this node's http
@@ -309,7 +311,7 @@ pub(super) async fn provision(
     };
     let workspace_args = tokio::task::spawn_blocking(move || provision_blocking(blocking))
         .await
-        .map_err(|_| "forge worktree provision task panicked".to_string())??;
+        .map_err(|_| "forge clone provision task panicked".to_string())??;
 
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the git worktree root
     // (`<slug>-ro/<name>`), never inside it: the commit bracket's `git add -A`
@@ -327,7 +329,6 @@ pub(super) async fn provision(
     } else {
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
-        let repo_dir = workspace_args.repo_dir.clone();
         let run_dir = workspace_args.run_dir.clone();
         // the handle outlives the mounts: the session bind below rides the same
         // actor lane.
@@ -340,9 +341,8 @@ pub(super) async fn provision(
             super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
                 .inspect_err(|_| {
                     // W5: a failed provision removes ALL its own debris. the mount
-                    // helper dropped its partial ro tree; the worktree — and its
-                    // metadata in the shared repo — goes here.
-                    cleanup_blocking(&repo_dir, &run_dir);
+                    // helper dropped its partial ro tree; the clone goes here.
+                    cleanup_blocking(&run_dir);
                 })
         })
         .await
@@ -350,7 +350,7 @@ pub(super) async fn provision(
         (Some(ro_root), Some(context_doc))
     };
 
-    // the worktree EXISTS now, so ask consensus to bind the run's agent session
+    // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
     let session = super::session::open(&handle, spec).await;
@@ -362,7 +362,6 @@ pub(super) async fn provision(
         session.as_ref(),
     );
     Ok(Box::new(ForgeWorkspace {
-        repo_dir: workspace_args.repo_dir,
         run_dir: workspace_args.run_dir,
         ro_dir,
         push_url,
@@ -411,35 +410,34 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
             String::from_utf8_lossy(&present.stderr).trim()
         ));
     }
-    // DETACHED checkout at the pinned commit — the provisioner never creates
-    // or moves a shared-repo ref, so the consensus module's committed-ref
-    // catch-up (which force-moves refs/heads/* in this repo while runs
-    // execute) can never reparent the run's base under it. the work branch
-    // exists only remotely; the push names it explicitly. concurrent
-    // attempts of one item both provision (no branch to contend on) and the
-    // push loop orders them.
-    let add = git(repo_dir)
-        .args(["worktree", "add", "--detach"])
+    // A SELF-CONTAINED clone keeps `.git` inside the directory Podman already
+    // mounts. `--no-hardlinks` is load-bearing: the untrusted run must not be
+    // able to corrupt the node's canonical object store through a shared inode.
+    let cloned = git(repo_dir)
+        .args(["clone", "--local", "--no-hardlinks", "--no-checkout"])
+        .arg(repo_dir.as_os_str())
         .arg(run_dir.as_os_str())
-        .arg(commit)
         .output()
         .map_err(|e| format!("host `git` failed to spawn: {e}"))?;
-    if !add.status.success() {
-        // W5 applies to the error path too: a refused/partial add must not
-        // strand a run dir or worktree metadata.
-        cleanup_blocking(repo_dir, run_dir);
+    if !cloned.status.success() {
+        cleanup_blocking(run_dir);
         return Err(format!(
-            "git worktree add for forge repo {repo:?} at {commit} failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
+            "git clone for forge repo {repo:?} failed: {}",
+            String::from_utf8_lossy(&cloned.stderr).trim()
+        ));
+    }
+    if let Err(e) = run_git(run_dir, &["checkout", "--detach", commit], &[]) {
+        cleanup_blocking(run_dir);
+        return Err(format!(
+            "git detached checkout for forge repo {repo:?} at {commit} failed: {e}"
         ));
     }
     Ok(args)
 }
 
-/// one live forge worktree: the shared repo it hangs off, its own checkout
+/// one live forge clone: the source repo, its own checkout
 /// dir, and everything the commit-and-push needs.
 struct ForgeWorkspace {
-    repo_dir: PathBuf,
     run_dir: PathBuf,
     /// the W6 skill ro root (`<slug>-ro`), `Some` iff the run had mounts —
     /// tracked ONLY so cleanup can remove it; the commit/push never look at it
@@ -818,20 +816,12 @@ fn commit_blocking(
     unreachable!("the push loop returns on every arm of its final attempt")
 }
 
-/// remove the run worktree AND its metadata in the parent repo — shared by
-/// the W5 cleanup and provision's own error path (self-cleanup of debris).
+/// remove the run clone — shared by the W5 cleanup and provision's own error
+/// path (self-cleanup of debris).
 /// idempotent, best-effort: every error is swallowed (cleanup must never
 /// fail the run, and an already-gone dir is success).
-fn cleanup_blocking(repo_dir: &Path, run_dir: &Path) {
-    // `worktree remove --force` handles the registered case, dirty/untracked
-    // trees included; the plain removal covers a half-made dir git no longer
-    // recognizes; prune drops any leftover `.git/worktrees` metadata.
-    let _ = git(repo_dir)
-        .args(["worktree", "remove", "--force"])
-        .arg(run_dir.as_os_str())
-        .output();
+fn cleanup_blocking(run_dir: &Path) {
     let _ = std::fs::remove_dir_all(run_dir);
-    let _ = git(repo_dir).args(["worktree", "prune"]).output();
 }
 
 #[async_trait::async_trait]
@@ -889,13 +879,12 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     }
 
     async fn cleanup(&self) {
-        let repo_dir = self.repo_dir.clone();
         let run_dir = self.run_dir.clone();
         // the skill ro root is the run's debris too — it sits beside the
         // worktree, so `worktree remove` never touches it.
         let ro_dir = self.ro_dir.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            cleanup_blocking(&repo_dir, &run_dir);
+            cleanup_blocking(&run_dir);
             if let Some(ro) = &ro_dir {
                 let _ = std::fs::remove_dir_all(ro);
             }
