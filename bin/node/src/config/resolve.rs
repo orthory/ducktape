@@ -185,11 +185,17 @@ pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
     let raw: NodeToml = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
-    let base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
-    if raw.network.is_some() {
-        resolve_network_shape(base, raw)
+    let launch_cwd = std::env::current_dir().map_err(|e| format!("current directory: {e}"))?;
+    let config_base = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    let base = if config_base.is_absolute() {
+        config_base.to_path_buf()
     } else {
-        resolve_dev_shape(raw)
+        launch_cwd.join(config_base)
+    };
+    if raw.network.is_some() {
+        resolve_network_shape(&base, raw)
+    } else {
+        resolve_dev_shape(raw, &launch_cwd)
     }
 }
 
@@ -484,7 +490,7 @@ fn resolve_advertised(
 
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
-fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
+fn resolve_dev_shape(raw: NodeToml, launch_cwd: &Path) -> Result<Resolved, String> {
     // resolved before any field of `raw` is moved out below (it borrows the
     // whole struct).
     let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
@@ -549,6 +555,13 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     let storage_dir = raw
         .storage_dir
         .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                launch_cwd.join(path)
+            }
+        })
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
@@ -772,6 +785,70 @@ mod tests {
         // the workspace base is the config directory — where a joiner would
         // persist a `coord.cap` delivered over its Admitted gate reply.
         assert_eq!(r.workspace, dir);
+    }
+
+    #[test]
+    fn relative_network_config_yields_absolute_runtime_paths() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let workspace = tempfile::Builder::new()
+            .prefix("ducktape-relative-config-")
+            .tempdir_in(&cwd)
+            .expect("workspace in current directory");
+        let dir = workspace.path();
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: "relative#11223344".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:52201\"\n\
+             storage_dir = \"storage\"\n",
+        )
+        .expect("write node.toml");
+
+        let relative_config = dir
+            .strip_prefix(&cwd)
+            .expect("workspace is below cwd")
+            .join("node.toml");
+        let resolved = resolve(&relative_config).expect("resolve relative config");
+
+        assert_eq!(resolved.storage_dir, dir.join("storage"));
+        assert!(resolved.storage_dir.is_absolute());
+        assert_eq!(resolved.workspace, dir);
+        assert!(resolved.workspace.is_absolute());
+    }
+
+    #[test]
+    fn dev_shape_relative_storage_is_absolute_from_launch_cwd() {
+        let launch_cwd = tmp("dev-relative-storage");
+        let raw: NodeToml = toml::from_str(
+            "id = 7\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+             peer_seeds = [7]\nbootstrapper_addr = \"127.0.0.1:52220\"\n\
+             storage_dir = \"relative/storage\"\n",
+        )
+        .expect("parse dev config");
+        let resolved = resolve_dev_shape(raw, &launch_cwd).expect("resolve relative storage");
+        assert_eq!(resolved.storage_dir, launch_cwd.join("relative/storage"));
+        assert!(resolved.storage_dir.is_absolute());
+
+        let default_raw: NodeToml = toml::from_str(
+            "id = 8\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+             peer_seeds = [8]\nbootstrapper_addr = \"127.0.0.1:52220\"\n",
+        )
+        .expect("parse default dev config");
+        let default = resolve_dev_shape(default_raw, &launch_cwd).expect("resolve default storage");
+        assert_eq!(
+            default.storage_dir,
+            std::env::temp_dir().join("ducktape-node-8")
+        );
+        assert!(default.storage_dir.is_absolute());
     }
 
     #[test]
