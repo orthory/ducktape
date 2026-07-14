@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { computeAccessibleDescription, computeAccessibleName } from "dom-accessibility-api";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -900,6 +901,10 @@ describe("AgentView", () => {
     expect(log).toHaveFocus();
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(toggle).toHaveAttribute("aria-controls", log.id);
+    for (const element of document.body.querySelectorAll("*")) {
+      expect(computeAccessibleName(element)).not.toContain("\x1f");
+      expect(computeAccessibleDescription(element)).not.toContain("\x1f");
+    }
     expect(subscribe).toHaveBeenCalledWith(
       ["run-output:ef0d635e287bb66490c26824198278cf8011f5679de48b0faeaf388843e9e5df"],
       expect.any(Object),

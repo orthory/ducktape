@@ -444,7 +444,7 @@ function RunRow({
             </button>
           </div>
           <div
-            title={`run ${run.run_id} · ${runDetail(run)}`}
+            title={`run ${runLabel} · ${runDetail(run)}`}
             style={{
               marginTop: 7,
               font: `400 11px ${font.mono}`,
@@ -510,7 +510,7 @@ function HistoryRow({
   };
   return (
     <div
-      title={`run ${rec.run_id}`}
+      title={`run ${runLabel}`}
       style={{
         display: "flex",
         alignItems: "center",
