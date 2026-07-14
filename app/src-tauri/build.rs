@@ -102,6 +102,7 @@ fn main() {
         "forge_diff",
         "forge_compare",
         "forge_build_merge",
+        "forge_sync_remote",
         "tray_open_console",
         "tray_quit",
         "huddle_pop_out",

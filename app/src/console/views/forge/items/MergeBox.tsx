@@ -11,6 +11,7 @@ import { uploadMergePack } from "../../../../domain/forge-client";
 import type { ForgeItemDetail } from "../../../../domain/forge-client";
 import { forgeBuildMerge, isForgeGitAvailable } from "../../../../domain/forge-git-client";
 import { useDucktape } from "../../../store/use-ducktape";
+import { useForgeRemote } from "../remote";
 import { color, font, radius } from "../../../theme/tokens";
 import { ActionButton, errMsg, panelLabel, shortHash, statusTone } from "../ui";
 import { itemNumber, stateTone } from "./shared";
@@ -35,6 +36,7 @@ export function MergeBox({
   onChanged: () => void;
 }) {
   const { state, actions, transport } = useDucktape();
+  const remote = useForgeRemote();
   const [busy, setBusy] = useState(false);
   const [conflicts, setConflicts] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +99,7 @@ export function MergeBox({
       targetHead,
       sourceHead,
       `Merge pull request ${itemNumber(detail.number)} from ${sourceBranch}`,
+      remote,
     )
       .then((result) => {
         if (result.conflicts.length > 0 || !result.mergeOid || !result.packHex) {

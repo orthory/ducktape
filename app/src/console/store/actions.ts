@@ -8,6 +8,7 @@ import * as forgeClient from "../../domain/forge-client";
 import type {
   ForgeItemDetail,
   ForgeItemTarget,
+  ForgeRepoHead,
   ForgeReviewComment,
   ForgeReviewVerdict,
 } from "../../domain/forge-client";
@@ -301,6 +302,10 @@ export interface ConsoleActions {
   // from its forms. The loaders land in `state.forgeItems`/`forgeBranches`
   // stamped with `state.forgeRepo`; nothing here rides the per-block refresh.
 
+  /** The namespace's repos with their committed heads, resolved to the caller
+   *  — the repo list a remote client browses from (it has no local forge
+   *  storage to enumerate). View-local, never store state. */
+  listForgeRepos(): Promise<ForgeRepoHead[]>;
   /** Load `repo`'s issue/PR summaries into `state.forgeItems` (and stamp
    *  `state.forgeRepo`). Awaitable; a load for a repo the view has since left
    *  is dropped. */
@@ -2336,6 +2341,15 @@ export function createActions({
     // resolves to the caller: the item panel re-fetches after its own writes.
     loadForgeItems,
     loadForgeBranches,
+
+    listForgeRepos: () => {
+      const live = getNode();
+      if (!live) return Promise.resolve([]);
+      return forgeClient.listRepos(live).catch((err) => {
+        fail(err);
+        return [];
+      });
+    },
 
     getForgeItem: (repo, number) => {
       const live = getNode();

@@ -246,6 +246,7 @@ describe("PullsTab", () => {
     expect(forgeGit.forgeDiff).toHaveBeenCalledWith("ducktape", {
       from: HEAD,
       to: FEATURE_HEAD,
+      remote: null,
     });
   });
 

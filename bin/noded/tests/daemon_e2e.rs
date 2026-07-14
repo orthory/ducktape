@@ -2018,6 +2018,68 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     );
 }
 
+/// The desktop remote-forge mirror fetches with LIBGIT2, not stock git: a
+/// fresh bare mirror pulls the full closure after a NAK, and a re-sync after
+/// the origin advances completes against the ACKed incremental pack — the
+/// exact client the app's `forge_sync_remote` runs, so this pins that interop.
+#[test]
+fn libgit2_mirror_fetch_completes_incremental_sync() {
+    if !have_git() {
+        eprintln!("skipping libgit2_mirror_fetch_completes_incremental_sync: no `git` on PATH");
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/mirrored", daemon.port);
+
+    let source = tempfile::TempDir::new().expect("source repo");
+    let src = source.path();
+    git_ok(src, &["init"]);
+    commit_file(src, "history.txt", "one\n", "first commit");
+    git_ok(src, &["remote", "add", "ducktape", &url]);
+    git_ok(src, &["push", "ducktape", "main"]);
+    let first_head = rev_parse_head(src);
+
+    let mirror_dir = tempfile::TempDir::new().expect("mirror dir");
+    let mirror = git2::Repository::init_bare(mirror_dir.path()).expect("init mirror");
+    let refspec = ["+refs/heads/*:refs/heads/*"];
+    let fetch = |mirror: &git2::Repository| {
+        let mut remote = mirror.remote_anonymous(&url).expect("anonymous remote");
+        remote
+            .fetch(&refspec, None::<&mut git2::FetchOptions<'_>>, None)
+            .expect("libgit2 fetch");
+    };
+
+    fetch(&mirror);
+    let first_oid = git2::Oid::from_str(&first_head).expect("head oid");
+    assert!(mirror.find_commit(first_oid).is_ok(), "fresh sync lands the head");
+
+    // origin advances; the re-sync's haves earn an ACK + delta pack, and the
+    // mirror must still complete the new head's closure from it.
+    commit_file(src, "history.txt", "two\n", "second commit");
+    git_ok(src, &["push", "ducktape", "main"]);
+    let second_head = rev_parse_head(src);
+    fetch(&mirror);
+    let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
+    let landed = mirror.find_commit(second_oid).expect("incremental sync lands the head");
+    assert_eq!(
+        landed
+            .tree()
+            .expect("tree")
+            .get_name("history.txt")
+            .map(|entry| entry.id()),
+        git2::Repository::open(src)
+            .expect("open source")
+            .find_commit(second_oid)
+            .expect("source head")
+            .tree()
+            .expect("source tree")
+            .get_name("history.txt")
+            .map(|entry| entry.id()),
+        "the delta pack must complete the changed blob"
+    );
+}
+
 /// Regression: a push whose data exceeds git's `http.postBuffer` is preceded by
 /// a flush-only PROBE POST (zero commands) before the real chunked request. The
 /// receive-pack handler must answer that probe 200, not 400 — otherwise every
