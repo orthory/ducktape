@@ -625,8 +625,26 @@ async fn establish_then_pump(
         };
         match outcome {
             Ok(reflexive) => break reflexive,
-            Err(_unreachable) => {
+            Err(unreachable) => {
                 attempts += 1;
+                // someone NAMED this variable `_unreachable` and discarded it anyway.
+                // it holds the reason the coordinator could not be reached, and this
+                // loop retries FOREVER — so a node can sit here for hours with the
+                // overlay never coming up and nothing anywhere saying why.
+                //
+                // first attempt, then every 10th: an unconditional warn on a forever-
+                // retry evicts the whole ring. `attempts` IS the diagnosis — it is what
+                // separates "flaky, healing" from "wedged since boot".
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        error = %unreachable,
+                        attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "coordinator rendezvous UNAVAILABLE — the overlay cannot come up \
+                         until this succeeds"
+                    );
+                }
                 let _ = status.send(RendezvousStatus::Unavailable { attempts });
                 let wait = tokio::time::sleep(backoff);
                 tokio::pin!(wait);

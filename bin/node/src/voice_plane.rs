@@ -191,22 +191,49 @@ async fn bind_service(
     });
     let datagram_bind = SocketAddr::new(own, service.overlay_datagram_port());
     let stream_bind = SocketAddr::new(own, service.overlay_stream_port());
-    // Say ONCE why the plane is not up yet: an interface that never arrives
-    // (an unprivileged tun, an epoch that never applies) otherwise reads as a
-    // huddle that hangs in "connecting" with an empty log.
-    let mut logged = false;
+    // Say why the plane is not up yet: an interface that never arrives (an
+    // unprivileged tun, an epoch that never applies, no `wireguard_listen` at
+    // all) otherwise reads as a huddle that hangs in "connecting" with an empty
+    // log — the "overlay never came up" bug, one of the three that hid behind
+    // the single string "Voice connection failed."
+    //
+    // this said it exactly ONCE, on a stream the app never sees. once is not
+    // enough: it cannot distinguish "waiting 2 seconds" from "waiting 3 hours".
+    // `attempts` and `elapsed_s` are what make that the same read.
+    let started = std::time::Instant::now();
+    let mut attempts: u64 = 0;
     loop {
         match OverlaySockets::bind_with(factory.clone(), datagram_bind, stream_bind, book.clone())
             .await
         {
-            Ok(sockets) => return sockets,
+            Ok(sockets) => {
+                if attempts > 0 {
+                    tracing::info!(
+                        target: "ducktape::voice",
+                        ?service,
+                        %datagram_bind,
+                        attempts,
+                        elapsed_s = started.elapsed().as_secs(),
+                        "hub bound (the overlay interface came up)"
+                    );
+                }
+                return sockets;
+            }
             // The interface (or our `/128`) is not up yet — retry quietly.
             Err(err) => {
-                if !logged {
-                    logged = true;
-                    eprintln!(
-                        "[voice-plane] {service:?} bind on {datagram_bind} waiting on the \
-                         overlay interface ({err}) — retrying until it is up"
+                attempts += 1;
+                // first, then every 20th (BIND_RETRY-paced): a forever-retry that
+                // warns unconditionally would evict the whole ring in seconds.
+                if attempts == 1 || attempts.is_multiple_of(20) {
+                    tracing::warn!(
+                        target: "ducktape::voice",
+                        ?service,
+                        %datagram_bind,
+                        error = %err,
+                        attempts,
+                        elapsed_s = started.elapsed().as_secs(),
+                        "hub NOT bound — waiting on the overlay interface; every huddle \
+                         will hang in \"connecting\" until it is up"
                     );
                 }
                 tokio::time::sleep(BIND_RETRY).await;
