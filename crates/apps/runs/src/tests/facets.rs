@@ -557,6 +557,7 @@ fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
             task_id: "t1".into(),
             title: "todo".into(),
         }],
+        delegations: Vec::new(),
         commit_message: Some("x".repeat(JOB_FINALIZE_PAYLOAD_BYTES * 2)),
     });
     let response = String::from_utf8(response).unwrap();

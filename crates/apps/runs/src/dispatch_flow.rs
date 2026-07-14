@@ -215,6 +215,22 @@ impl RunsModule {
         channel_id: &str,
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
+        self.prepare_dispatch_with_context(ctx, agent, run_id, channel_id, anchor_seq, None)
+            .await
+    }
+
+    /// The ordinary chat/Forge composition path plus one caller-supplied,
+    /// bounded context section. Delegation uses it to state parent provenance
+    /// and the child instruction without creating a second envelope shape.
+    pub(super) async fn prepare_dispatch_with_context(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &AgentRecord,
+        run_id: &str,
+        channel_id: &str,
+        anchor_seq: u64,
+        extra_context: Option<&str>,
+    ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
             Some(item_ref) => self.forge_portable_inputs(ctx, agent, &item_ref).await?,
@@ -244,6 +260,12 @@ impl RunsModule {
             portable.context = Some(match portable.context.take() {
                 Some(item) => format!("{item}\n\n{section}"),
                 None => section,
+            });
+        }
+        if let Some(extra) = extra_context {
+            portable.context = Some(match portable.context.take() {
+                Some(context) => format!("{context}\n\n{extra}"),
+                None => extra.to_string(),
             });
         }
         let payload = envelope::render_payload(

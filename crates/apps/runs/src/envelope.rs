@@ -50,8 +50,8 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// the strict output contract riding every composed payload — exactly the
 /// [`agent::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
-{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"delegations":[],"commit_message":"Your Git subject\n\nOptional body"}
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Delegations are an optional final-only child wave shaped as {"agent_id":"<registered agent>","instruction":"..."}; use them only with an owner-granted subagent_budget. Budget N admits at most min(N, 8) children at a fixed 2 cores and 4 GiB each, an aggregate estimate of 2*min(N, 8) cores and 4*min(N, 8) GiB. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this

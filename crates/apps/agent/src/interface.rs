@@ -36,6 +36,20 @@ pub const MAX_ACTIONS_PER_RUN: usize = 8;
 /// emitting.
 pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
 
+/// hard cap on one delegated child's instruction. delegation is a final-only
+/// response declaration, but its text is injected into the child's composed
+/// payload, so it needs its own trust-boundary bound before composition.
+pub const MAX_DELEGATION_INSTRUCTION_BYTES: usize = 4 * 1024;
+
+/// hard cap on the serialized delegation batch. `subagent_budget` plus the
+/// fixed fan-out cap bound compute; this independently bounds replicated input
+/// bytes.
+pub const MAX_DELEGATIONS_BYTES: usize = 8 * 1024;
+
+/// hard cap on the children one final response may fan out to, independent of
+/// the owner's potentially larger budget grant.
+pub const MAX_DELEGATIONS_PER_RUN: usize = 8;
+
 /// hard cap on a serialized [`AgentRecord`] — registry entries live in the
 /// root preimage and every snapshot, so registration is size-gated up front.
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
@@ -368,6 +382,45 @@ impl AgentRecord {
     pub fn library_readable(&self) -> bool {
         self.permits(&CapRequest::DuckfsRead(SKILL_LIBRARY_PREFIX))
     }
+
+    /// Whether `child` is a non-escalating delegation target. Delegation stays
+    /// inside one owner's trust domain, and every authority the child can
+    /// exercise must already be held by the parent.
+    pub fn can_delegate_to(&self, child: &AgentRecord) -> bool {
+        let exact = |parent: &[String], child: &[String]| {
+            child.iter().all(|item| parent.iter().any(|p| p == item))
+        };
+        let under = |parent: &[String], path: &str| {
+            parent
+                .iter()
+                .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+        };
+
+        self.owner == child.owner
+            && exact(&self.allowed_actions, &child.allowed_actions)
+            && child
+                .caps
+                .forge_read
+                .iter()
+                .chain(&child.caps.forge_push)
+                .all(|repo| {
+                    self.caps.forge_read.contains(repo) || self.caps.forge_push.contains(repo)
+                })
+            && exact(&self.caps.forge_push, &child.caps.forge_push)
+            && child.caps.duckfs_read.iter().all(|path| {
+                under(&self.caps.duckfs_read, path) || under(&self.caps.duckfs_write, path)
+            })
+            && child
+                .caps
+                .duckfs_write
+                .iter()
+                .all(|path| under(&self.caps.duckfs_write, path))
+            && exact(&self.caps.tools, &child.caps.tools)
+            && exact(&self.caps.secrets, &child.caps.secrets)
+            && (self.caps.pages_write.iter().any(|page| page == "*")
+                || exact(&self.caps.pages_write, &child.caps.pages_write))
+            && child.caps.subagent_budget <= self.caps.subagent_budget
+    }
 }
 
 // ---- the response wire spec ----------------------------------------------------
@@ -384,17 +437,30 @@ pub struct ReplyBlock {
     pub lang: Option<String>,
 }
 
+/// one child Run requested by a parent's final response. Runs supplies the
+/// fixed sandbox profile and derives all identity/context from the parent;
+/// the model chooses only an existing agent and its bounded instruction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DelegationRequest {
+    pub agent_id: String,
+    pub instruction: String,
+}
+
 /// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,
-/// and an optional workspace commit message. lenient by construction — all
-/// fields default, unknown JSON fields are ignored — so a model answer either
-/// IS this shape or the consumer wraps it as one; validation (grants, caps,
-/// probes) is a separate, strict step.
+/// a final-only delegation batch, and an optional workspace commit message.
+/// lenient by construction — all fields default, unknown JSON fields are
+/// ignored — so a model answer either IS this shape or the consumer wraps it
+/// as one; validation (grants, caps, probes) is a separate, strict step.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResponse {
     #[serde(default)]
     pub reply_blocks: Vec<ReplyBlock>,
     #[serde(default)]
     pub actions: Vec<AgentAction>,
+    /// one settlement-time child wave. This is deliberately NOT an
+    /// [`AgentAction`]: the mid-run session/MCP action lane cannot invoke it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<DelegationRequest>,
     /// complete Git commit message authored by the agent for uncommitted
     /// workspace changes. Optional for clean and legacy responses; existing
     /// agent commits keep their own messages. The host owns only safety
