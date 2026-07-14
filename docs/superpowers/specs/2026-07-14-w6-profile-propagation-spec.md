@@ -49,6 +49,15 @@ auto-bind-on-connect pass). No background fan-out (single-active premise).
    `ProfileCard` (W1 rebuilds the account home; final placement reconciles on the
    epic branch). A reusable `Avatar` component loads a duckfs path → `<img>`,
    initials fallback — reused in `ProfileCard` and `MembersView` member rows.
+5a. **Post-W1 reconciliation (rebase onto the epic branch)**: kept the panel as
+   a SIBLING card directly after `ProfileCard` — W1's account home is a flat
+   card stack with no section wrappers, so "the ProfileCard section" IS that
+   slot; merging the panel into `ProfileCard` would only fuse two coherent
+   cards. `initialsOf` now has ONE account-scoped export,
+   `components/Avatar.tsx`: W1's `NetworkRail` me chip re-pointed to it, and
+   W1's Sidebar dropped the avatar entirely (my Sidebar import edit fell away
+   in the rebase). The me chip stays initials-only — rendering the propagated
+   avatar image in the rail is a one-line follow-up if wanted.
 6. **Render scope kept sane** (ledger mandate): own avatar/bio in the panel +
    `ProfileCard`; member avatars in `MembersView`. Chat message-author avatars
    are **deferred** (hot path, needs a per-author fetch/cache) — noted, not built.
