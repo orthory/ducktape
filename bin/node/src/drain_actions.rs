@@ -23,7 +23,8 @@ pub(crate) struct BlockAction {
     pub(crate) sealed_hash: Option<StateRoot>,
     pub(crate) applied: bool,
     pub(crate) latency_us: u64,
-    pub(crate) op_count: usize,
+    pub(crate) applied_ops: usize,
+    pub(crate) rejected_ops: usize,
 }
 
 /// Group a drain's per-frame outcomes into the per-block actions consumed by
@@ -43,6 +44,8 @@ pub(crate) fn block_actions(
         let mut latency_us = 0u64;
         let mut applied = false;
         let mut ops = Vec::new();
+        let mut applied_ops = 0usize;
+        let mut rejected_ops = 0usize;
         let mut block_hash = None;
         let mut block_app_hash = None;
         let mut sealed_hash = None;
@@ -62,8 +65,14 @@ pub(crate) fn block_actions(
                 && op.target != NOP_TARGET
             {
                 let disposition = match frame.disposition {
-                    node::Disposition::Applied => noded::BlockDisposition::Applied,
-                    node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+                    node::Disposition::Applied => {
+                        applied_ops += 1;
+                        noded::BlockDisposition::Applied
+                    }
+                    node::Disposition::Rejected => {
+                        rejected_ops += 1;
+                        noded::BlockDisposition::Rejected
+                    }
                     node::Disposition::Discarded => continue,
                 };
                 if block_hash.is_none() {
@@ -83,7 +92,6 @@ pub(crate) fn block_actions(
         if let Some(system) = system_dispatches.remove(&height) {
             dispatches.extend(system);
         }
-        let op_count = ops.len();
         let record = (!ops.is_empty()).then(|| {
             noded::block_row(&noded::BlockRecord {
                 height,
@@ -101,7 +109,8 @@ pub(crate) fn block_actions(
             sealed_hash,
             applied,
             latency_us,
-            op_count,
+            applied_ops,
+            rejected_ops,
         });
     }
     actions
@@ -266,7 +275,7 @@ mod tests {
         assert_eq!(block.dispatches, vec![member_dispatch, system_dispatch]);
         assert!(block.applied);
         assert_eq!(block.latency_us, 11);
-        assert_eq!(block.op_count, 2);
+        assert_eq!((block.applied_ops, block.rejected_ops), (1, 1));
         assert_eq!(block.sealed_hash, Some(StateRoot([9; sdk::ROOT_LEN])));
         let row: serde_json::Value =
             serde_json::from_slice(block.record.as_deref().expect("explorer row")).unwrap();
@@ -278,7 +287,7 @@ mod tests {
         assert_eq!(discarded.height, 8);
         assert!(discarded.dispatches.is_empty());
         assert!(!discarded.applied);
-        assert_eq!(discarded.op_count, 0);
+        assert_eq!((discarded.applied_ops, discarded.rejected_ops), (0, 0));
         assert_eq!(discarded.sealed_hash, None);
         assert_eq!(discarded.record, None);
     }
