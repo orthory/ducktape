@@ -27,7 +27,7 @@ import { dropTarget } from "./page-drag";
 import { loadCollapsed, saveCollapsed } from "./page-collapse";
 import { MAX_PASTE_BLOCKS } from "./page-paste";
 import { ancestorChain } from "./page-tree";
-import { COLUMN_PAD_X, DOC_COLUMN_MAX } from "./pages-style";
+import { COLUMN_PAD_X, DOCK_RAIL_W, DOC_COLUMN_MAX, commentSurface } from "./pages-style";
 import { useRowHandlers } from "./use-row-handlers";
 import type { DragState } from "./use-row-handlers";
 import { BlockRow } from "./BlockRow";
@@ -83,9 +83,26 @@ export function PagesView() {
     label: string;
     anchor: CommentAnchor;
     range?: RelativeAnchor;
+    /** Content-relative top for the docked surface, captured at open time —
+     *  the viewport anchor goes stale with every scroll, this does not. */
+    dockTop: number;
   } | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
+  // the doc content wrapper (column + comment rail): its width picks the
+  // comment surface, its top converts viewport anchors to content coordinates.
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const [viewportW, setViewportW] = useState(() =>
+    typeof window === "undefined" ? 0 : window.innerWidth,
+  );
+  useEffect(() => {
+    const onResize = () => setViewportW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  // measure the real doc area when it exists; jsdom (clientWidth 0) and the
+  // first render fall back to the viewport.
+  const surface = commentSurface(contentRef.current?.clientWidth || viewportW);
 
   const blocks = state.activePageBlocks;
   const root =
@@ -306,12 +323,21 @@ export function PagesView() {
     }
   };
 
+  const dockTopOf = (anchor: CommentAnchor) =>
+    Math.max(8, anchor.y - (contentRef.current?.getBoundingClientRect().top ?? 0));
+
   const openBlockComments = useCallback((
     blockId: string,
     anchor: CommentAnchor,
     range?: RelativeAnchor,
   ) => {
-    setCommentCard({ target: blockId, label: range ? "selected text" : "this block", anchor, range });
+    setCommentCard({
+      target: blockId,
+      label: range ? "selected text" : "this block",
+      anchor,
+      range,
+      dockTop: dockTopOf(anchor),
+    });
   }, []);
 
   // row intents -> store ops + caret placement. `handlers` is referentially
@@ -337,7 +363,7 @@ export function PagesView() {
 
   const commentOnPage = (anchor: CommentAnchor) => {
     if (!activePage) return;
-    setCommentCard({ target: activePage, label: "this page", anchor });
+    setCommentCard({ target: activePage, label: "this page", anchor, dockTop: dockTopOf(anchor) });
   };
 
   // a reply must carry the THREAD's target (a block id or the page id) — the
@@ -352,6 +378,37 @@ export function PagesView() {
       "";
     actions.addComment({ threadId, target, text });
   };
+
+  // one card, two surfaces: docked renders inside the rail (dock = content-
+  // relative top), the popover renders fixed at the root. Same props otherwise.
+  const docked = surface === "docked";
+  const cardEl = (dock: number | null) =>
+    commentCard ? (
+      <CommentCard
+        target={commentCard.target}
+        label={commentCard.label}
+        anchor={commentCard.anchor}
+        dock={dock}
+        selection={commentCard.range}
+        targetText={blocks.find((block) => block.id === commentCard.target)?.text ?? ""}
+        threads={threadsForRange(
+          state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? [],
+          commentCard.range,
+        )}
+        authorNames={state.authorNames}
+        selfKey={selfKey}
+        selfName={selfName}
+        ops={state.ops}
+        onClose={() => setCommentCard(null)}
+        onSubmitNew={(target, text, range) =>
+          actions.addComment({ target, text, ...(range ? { anchor: range } : {}) })
+        }
+        onReply={replyToThread}
+        onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
+        onEdit={(commentId, text) => actions.editComment({ commentId, text })}
+        onDelete={(commentId) => actions.deleteComment(commentId)}
+      />
+    ) : null;
 
   const pendingPageDeleteTitle =
     state.pages.find((p) => p.id === pendingPageDelete)?.title || "Untitled";
@@ -490,6 +547,12 @@ export function PagesView() {
                 // below so the page has no visible bottom end. The horizontal
                 // padding houses the rows' hover gutters (pages-style keeps the
                 // two in step) — without it the scroll box would clip them.
+                // The comment rail sits BESIDE the column inside the same
+                // scroller: opening a docked card widens the rail and the
+                // column re-centers in what remains — content nudges left
+                // instead of being covered.
+                <div ref={contentRef} style={{ flex: 1, display: "flex", alignItems: "stretch" }}>
+                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
                 <div
                   style={{
                     width: "100%",
@@ -659,8 +722,6 @@ export function PagesView() {
                       : "Click to add a block, or type '/'"}
                   </button>
                 </div>
-              )}
-              {root ? (
                 <div
                   data-testid="page-canvas-filler"
                   aria-hidden="true"
@@ -670,37 +731,26 @@ export function PagesView() {
                   }}
                   style={{ flex: 1, minHeight: "40vh", cursor: "text" }}
                 />
-              ) : null}
+                </div>
+                <aside
+                  data-comment-rail
+                  aria-label="Comment rail"
+                  style={{
+                    flex: `0 0 ${docked && commentCard ? DOCK_RAIL_W : 0}px`,
+                    transition: "flex-basis .2s ease",
+                    position: "relative",
+                  }}
+                >
+                  {docked && commentCard ? cardEl(commentCard.dockTop) : null}
+                </aside>
+                </div>
+              )}
             </div>
           </div>
 
         </div>
       </main>
-      {commentCard ? (
-        <CommentCard
-          target={commentCard.target}
-          label={commentCard.label}
-          anchor={commentCard.anchor}
-          selection={commentCard.range}
-          targetText={blocks.find((block) => block.id === commentCard.target)?.text ?? ""}
-          threads={threadsForRange(
-            state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? [],
-            commentCard.range,
-          )}
-          authorNames={state.authorNames}
-          selfKey={selfKey}
-          selfName={selfName}
-          ops={state.ops}
-          onClose={() => setCommentCard(null)}
-          onSubmitNew={(target, text, range) =>
-            actions.addComment({ target, text, ...(range ? { anchor: range } : {}) })
-          }
-          onReply={replyToThread}
-          onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
-          onEdit={(commentId, text) => actions.editComment({ commentId, text })}
-          onDelete={(commentId) => actions.deleteComment(commentId)}
-        />
-      ) : null}
+      {!docked ? cardEl(null) : null}
       {pendingPageDelete && (
         <ConfirmDialog
           title={`Delete ${pendingPageDeleteTitle}?`}

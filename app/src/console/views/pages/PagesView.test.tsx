@@ -704,6 +704,39 @@ describe("floating comment card", () => {
     within(dialog).getByText("about First");
     within(dialog).getByText("about draft");
   });
+
+  it("docks the card in the side rail on a wide viewport; scroll keeps it", () => {
+    const wide = window.innerWidth;
+    window.innerWidth = 1600;
+    try {
+      renderPagesView({ pageThreads: threadsOn("a") });
+      fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+      const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
+      const rail = document.querySelector("[data-comment-rail]");
+      expect(rail?.contains(dialog)).toBe(true);
+      expect(getComputedStyle(dialog).position).toBe("absolute");
+      fireEvent.scroll(document);
+      expect(screen.queryByRole("dialog", { name: "Comments on this block" })).not.toBeNull();
+    } finally {
+      window.innerWidth = wide;
+    }
+  });
+
+  it("keeps the floating popover on a narrow viewport; scroll dismisses it", () => {
+    const wide = window.innerWidth;
+    window.innerWidth = 1000;
+    try {
+      renderPagesView({ pageThreads: threadsOn("a") });
+      fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+      const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
+      expect(document.querySelector("[data-comment-rail]")?.contains(dialog)).toBe(false);
+      expect(getComputedStyle(dialog).position).toBe("fixed");
+      fireEvent.scroll(document);
+      expect(screen.queryByRole("dialog", { name: "Comments on this block" })).toBeNull();
+    } finally {
+      window.innerWidth = wide;
+    }
+  });
 });
 
 describe("subpages", () => {

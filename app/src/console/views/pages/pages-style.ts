@@ -36,6 +36,15 @@ export const COLUMN_PAD_X = MARKER_HANG + GUTTER_WIDTH + 6;
  *  the outer cap is derived from the measure — not the other way round. */
 export const DOC_COLUMN_MAX = 620 + COLUMN_PAD_X * 2;
 
+/** The docked comment rail: a 340px card plus breathing room on both sides. */
+export const DOCK_RAIL_W = 380;
+
+/** Which comment surface fits the doc area: the docked margin card wants the
+ *  full column AND the rail side by side; anything narrower falls back to the
+ *  floating popover at the anchor. A width decision, not a mode toggle. */
+export const commentSurface = (availableW: number): "docked" | "popover" =>
+  availableW >= DOC_COLUMN_MAX + DOCK_RAIL_W + 16 ? "docked" : "popover";
+
 /** Breathing room above a heading. Rows are otherwise uniformly spaced, which
  *  made an H1 sit as tight against the paragraph above it as another
  *  paragraph would. */
