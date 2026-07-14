@@ -248,7 +248,8 @@ impl RunsModule {
                 let has_publishable_commit = matches!(
                     (&receipt.branch, &receipt.output_commit),
                     (Some(branch), Some(oid))
-                        if branch == source_branch
+                        if receipt.source_prefix == format!("forge:{repo}")
+                            && branch == source_branch
                             && !receipt.no_changes
                             && receipt.commit_error.is_none()
                             && oid.len() == 40

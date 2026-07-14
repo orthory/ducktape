@@ -805,6 +805,56 @@ fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
 }
 
 #[test]
+fn pr_sink_rejects_a_commit_pushed_to_another_repository() {
+    let (mut m, granted, run_id) = forge_push_run();
+    let oid = "1a".repeat(20);
+    let receipt = serde_json::json!({
+        "source_prefix": "forge:other",
+        "source_snapshot": "2b".repeat(20),
+        "output_snapshot": null,
+        "commit_height": null,
+        "rebased": false,
+        "no_changes": false,
+        "branch": "agent/x",
+        "output_commit": oid,
+    });
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(
+                "done",
+                serde_json::json!({
+                    "workspace_receipt": receipt,
+                    "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"","body":""},
+                    "status": "ok",
+                }),
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "a commit pushed to another repository cannot authorize this sink"
+    );
+    assert!(
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: no publishable workspace commit for source branch"
+        )),
+        "the mismatched repository is recorded as an honest publication skip: {:?}",
+        breadcrumbs(&ctx)
+    );
+}
+
+#[test]
 fn pr_sink_never_updates_an_existing_pr_when_nothing_was_pushed() {
     // A stale source ref and open PR are not publication evidence. output:none
     // remains chat/history-only and must not be reported as a PR update.
