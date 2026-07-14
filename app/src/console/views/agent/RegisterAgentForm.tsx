@@ -5,7 +5,7 @@
 // curates as an always-loaded skill (see SkillsField), so this form commits
 // pins, never prompt text.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import type { ResourceCaps, SkillRef } from "../../../domain/agent-client";
@@ -69,6 +69,7 @@ export function RegisterAgentForm({
   // The id is derived from the name by default; this reveals the override.
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
 
   // `slug` is total: it yields a legal `<id>@agents.duck` label (truncated to
   // the consensus cap, hyphens trimmed) or nothing at all. Nothing is the one
@@ -92,7 +93,8 @@ export function RegisterAgentForm({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!ready || submitting) return;
+    if (!ready || submittingRef.current) return;
+    submittingRef.current = true;
     const pages = parsePagesWrite(pagesWrite);
     const curated = cleanSkills(skills);
     // One caps record, built from both fields: the library grant is an ordinary
@@ -102,25 +104,29 @@ export function RegisterAgentForm({
       libraryRead,
     );
     setSubmitting(true);
-    const committed = await onRegister({
-      displayName: displayName.trim(),
-      agentId,
-      capability: capability.trim(),
-      allowedActions,
-      ...(Object.keys(caps).length ? { caps } : {}),
-      ...(curated.length ? { skills: curated } : {}),
-    });
-    setSubmitting(false);
-    if (!committed) return;
-    setDisplayName("");
-    setAgentIdInput("");
-    setCapability("");
-    setSkills([]);
-    setAllowedActions(["chat.post"]);
-    setPagesWrite("");
-    setLibraryRead(true);
-    setShowAdvanced(false);
-    onDone?.();
+    try {
+      const committed = await onRegister({
+        displayName: displayName.trim(),
+        agentId,
+        capability: capability.trim(),
+        allowedActions,
+        ...(Object.keys(caps).length ? { caps } : {}),
+        ...(curated.length ? { skills: curated } : {}),
+      });
+      if (!committed) return;
+      setDisplayName("");
+      setAgentIdInput("");
+      setCapability("");
+      setSkills([]);
+      setAllowedActions(["chat.post"]);
+      setPagesWrite("");
+      setLibraryRead(true);
+      setShowAdvanced(false);
+      onDone?.();
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   };
 
   return (

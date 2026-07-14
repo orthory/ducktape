@@ -2,7 +2,7 @@
 // REPLACES wholesale on save (that is the module's update semantics), so the
 // field is seeded from the record and always sent back.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import type { AgentRecord, ResourceCaps, SkillRef } from "../../../domain/agent-client";
@@ -60,6 +60,7 @@ export function AgentEditForm({
   // enforces and what the run's context document is assembled against.
   const [libraryRead, setLibraryRead] = useState(canReadLibrary(agent.caps));
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const blocked = pending || submitting;
 
   const toggle = (name: string) =>
@@ -69,25 +70,30 @@ export function AgentEditForm({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (blocked) return;
+    if (pending || submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
-    const committed = await onUpdate({
-      agentId: agent.agent_id,
-      displayName: displayName.trim(),
-      capability: capability.trim(),
-      allowedActions,
-      // caps REPLACE wholesale on update: send the record's current caps with
-      // only the two fields this form owns swapped, so every other grant
-      // survives the edit.
-      caps: withLibraryRead(
-        { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
-        libraryRead,
-      ),
-      skills: cleanSkills(skills),
-    });
-    setSubmitting(false);
-    if (!committed) return;
-    onClose();
+    try {
+      const committed = await onUpdate({
+        agentId: agent.agent_id,
+        displayName: displayName.trim(),
+        capability: capability.trim(),
+        allowedActions,
+        // caps REPLACE wholesale on update: send the record's current caps with
+        // only the two fields this form owns swapped, so every other grant
+        // survives the edit.
+        caps: withLibraryRead(
+          { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
+          libraryRead,
+        ),
+        skills: cleanSkills(skills),
+      });
+      if (!committed) return;
+      onClose();
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   };
 
   return (

@@ -70,7 +70,14 @@ import { saveAccountProfile } from "./account-profile";
 import { pushProfileEdit, reconcileProfile } from "./profile-reconcile";
 import { navSnapshotOf } from "./nav-history";
 import type { NavSnapshot } from "./nav-history";
-import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
+import {
+  beginOp,
+  failOp,
+  finalizeOp,
+  opKey,
+  prepareOpSettlement,
+  receiptOf,
+} from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
@@ -1032,10 +1039,10 @@ export function createActions({
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
-  // key), submit, then settle the record from the node's receipt — finalized
-  // with the inclusion height + addressable op hash, or failed. Committed
-  // truth replaces the projection on the refresh that follows either way (a
-  // failed submit's refresh is the rollback).
+  // key), submit, retain that pending phase through the completion refresh,
+  // then settle it as finalized or failed. Committed truth replaces the
+  // projection before controls unlock either way (a failed submit's refresh
+  // is the rollback).
   //
   // `quiet` keeps a rejection out of the global error surface — the caller
   // reports it instead. It is for a BATCH whose ops are anchor-chained, where
@@ -1064,14 +1071,21 @@ export function createActions({
       .then(() => submit(live))
       .then((result) => {
         if (!isCurrentNode(live)) return false;
+        const receipt = receiptOf(result);
         update((prev) => ({
-          ops: finalizeOp(prev.ops, key, receiptOf(result), Date.now()),
+          ops: prepareOpSettlement(prev.ops, key, receipt),
         }));
-        return refresh().then(() => true);
+        return refresh().then(() => {
+          if (!isCurrentNode(live)) return false;
+          update((prev) => ({
+            ops: finalizeOp(prev.ops, key, receipt, Date.now()),
+          }));
+          return true;
+        });
       })
       .catch((err) => {
         if (!isCurrentNode(live)) return false;
-        update((prev) => ({ ops: failOp(prev.ops, key, String(err), Date.now()) }));
+        update((prev) => ({ ops: prepareOpSettlement(prev.ops, key) }));
         if (!quiet) fail(err);
         // resolve false rather than reject: a failed op is already surfaced to
         // the user here, and rejecting would turn every caller that ignores the
@@ -1081,7 +1095,14 @@ export function createActions({
         // longer trigger a success-only side effect (the pages editor's
         // compensating split/merge depends on this, and it stops
         // `createChildPage` from opening a page that was never created).
-        return refresh().then(() => false);
+        return refresh().then(() => {
+          if (isCurrentNode(live)) {
+            update((prev) => ({
+              ops: failOp(prev.ops, key, String(err), Date.now()),
+            }));
+          }
+          return false;
+        });
       })
       .finally(() => pendingSubmits.delete(key));
   };

@@ -11,6 +11,8 @@ import {
   opForMessage,
   opKey,
   pageSnapshotSuperseded,
+  prepareOpSettlement,
+  receiptFloor,
   receiptOf,
 } from "./finalization";
 import type { OpLedger } from "./finalization";
@@ -45,6 +47,18 @@ describe("the op ledger", () => {
       settledAt: 900,
       error: "chat: empty author",
     });
+  });
+
+  it("keeps a settled submit pending through refresh without losing its receipt floor", () => {
+    let ops = beginOp({}, opKey.page("p1"), 1_000);
+    ops = prepareOpSettlement(ops, opKey.page("p1"), { height: 42 });
+    expect(ops["page/p1"]).toMatchObject({
+      phase: "pending",
+      settling: true,
+      height: 42,
+    });
+    expect(receiptFloor(ops)).toBe(42);
+    expect(pageSnapshotSuperseded(ops, 1_001, 1_002)).toBe(false);
   });
 
   it("a re-submit on the same entity key supersedes the settled record", () => {

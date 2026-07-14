@@ -2022,14 +2022,14 @@ describe("submitTracked lifecycle", () => {
     });
   });
 
-  it("refuses a second submit while the same entity key is pending", async () => {
+  it("keeps the entity pending through refresh and refuses a second submit", async () => {
     const { transport } = makeFakeNode();
-    const held = deferred<SubmitReceipt>();
-    vi.mocked(transport.submit).mockReturnValue(held.promise);
     renderConsole(transport);
     await waitFor(() =>
       expect(screen.getByTestId("channel").textContent).toBe("general"),
     );
+    const refreshStatus = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockReturnValueOnce(refreshStatus.promise);
 
     const params = {
       displayName: "Collision Agent",
@@ -2037,18 +2037,29 @@ describe("submitTracked lifecycle", () => {
       capability: "mock",
       allowedActions: ["chat.post"],
     };
-    let duplicate!: Promise<boolean>;
+    let first!: Promise<boolean>;
     act(() => {
-      void capturedActions!.registerAgent(params);
-      duplicate = capturedActions!.registerAgent(params);
+      first = capturedActions!.registerAgent(params);
     });
 
+    await waitFor(() =>
+      expect(capturedState!.ops["agent/collision-agent"]).toMatchObject({
+        seq: 1,
+        phase: "pending",
+        settling: true,
+        height: 2,
+      }),
+    );
+    const duplicate = capturedActions!.registerAgent(params);
+
     await expect(duplicate).resolves.toBe(false);
-    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(1));
-    expect(capturedState!.ops["agent/collision-agent"]).toMatchObject({
-      seq: 1,
-      phase: "pending",
+    expect(transport.submit).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      refreshStatus.resolve(statusAt(2));
+      await first;
     });
+    expect(capturedState!.ops["agent/collision-agent"].phase).toBe("finalized");
   });
 
   it("rolls the preconfirmed render back and records the rejection on failure", async () => {
@@ -2067,9 +2078,23 @@ describe("submitTracked lifecycle", () => {
     });
     expect(screen.getByTestId("messages").textContent).toBe("2");
     const key = Object.keys(capturedState!.ops)[0];
+    const refreshStatus = deferred<NodeStatus>();
+    vi.mocked(transport.status).mockReturnValueOnce(refreshStatus.promise);
 
     await act(async () => {
       reject(new Error("chat: channel is members-only"));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("messages").textContent).toBe("2");
+    expect(capturedState!.ops[key]).toMatchObject({
+      phase: "pending",
+      settling: true,
+    });
+    expect(capturedState!.error).toContain("members-only");
+
+    await act(async () => {
+      refreshStatus.resolve(statusAt(2));
     });
 
     // the rollback refresh restores committed truth; the record keeps the why.

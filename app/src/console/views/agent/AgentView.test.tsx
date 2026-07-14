@@ -417,7 +417,10 @@ describe("AgentView", () => {
     const pending = deferredResult();
 
     fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
-    spies.registerAgent.mockReturnValue(pending.promise);
+    let attempts = 0;
+    spies.registerAgent.mockImplementation(() =>
+      (attempts += 1) === 1 ? pending.promise : Promise.resolve(false),
+    );
     const name = screen.getByLabelText("Agent display name");
     fireEvent.change(name, { target: { value: "Triage Agent" } });
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
@@ -425,8 +428,11 @@ describe("AgentView", () => {
     const cancel = screen.getByRole("button", { name: /^cancel$/i });
     const form = screen.getByRole("region", { name: /register agent/i }).querySelector("form")!;
 
-    fireEvent.click(submit);
-    fireEvent.click(submit);
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
     expect(spies.registerAgent).toHaveBeenCalledTimes(1);
     expect(submit).toBeDisabled();
     expect(cancel).toBeDisabled();
@@ -503,7 +509,10 @@ describe("AgentView", () => {
   it("keeps the edit draft through pending and failure, then closes on success", async () => {
     const { spies } = renderAgents();
     const pending = deferredResult();
-    spies.updateAgent.mockReturnValue(pending.promise);
+    let attempts = 0;
+    spies.updateAgent.mockImplementation(() =>
+      (attempts += 1) === 1 ? pending.promise : Promise.resolve(false),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
     const name = screen.getByLabelText("Edit display name");
@@ -512,8 +521,11 @@ describe("AgentView", () => {
     const form = screen.getByRole("form", { name: /edit agent/i });
     const cancel = within(form).getByRole("button", { name: /^cancel$/i });
 
-    fireEvent.click(submit);
-    fireEvent.click(submit);
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
     expect(spies.updateAgent).toHaveBeenCalledTimes(1);
     expect(submit).toBeDisabled();
     expect(cancel).toBeDisabled();
