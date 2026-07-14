@@ -22,10 +22,24 @@ Following geth's `admin_`/`debug_` spirit (ledger Q9): one listener, a
 Two orthogonal gates, both enforced by one middleware layered only on the admin
 sub-router:
 
-| Gate | Question | Mechanism |
+| Regime (`AdminExposure`, flag `DUCKTAPE_ADMIN`) | Reach | Auth |
 |------|----------|-----------|
-| **Exposure** (A4) | *where* may admin be reached | `AdminExposure`: `Disabled` unregisters the routes entirely (surface **absent**, 404); `Loopback` (default) additionally refuses any non-loopback peer; `Public` accepts any peer the owner gate admits |
-| **Owner** (A5) | *who* may drive control | per-request proof-of-possession (PoP) by the owner account's key — the **#197 coordinator-auth pattern** — against the committed `BindNode` owner |
+| `Disabled` | routes never registered — surface **absent** (404) | — |
+| `Loopback` (default) | loopback peers only | **loopback-trust, no PoP** |
+| `Public` | any peer | **owner PoP required** |
+
+**Refinement (from the interim design):** `Loopback` trusts a loopback peer with
+no PoP rather than requiring a signature on every local call. This matches
+`origin_guard`'s own model (a loopback process can already read `user.key`, so
+loopback is a boundary this layer cannot tighten) and the capability matrix's
+"local control is always available on loopback" — frictionless local control,
+no bootstrap hazard. The owner PoP gate (A5) protects the **`Public` (off-box)**
+surface: the actual new capability and the real threat. Local control therefore
+needs no app-side signing; only remote (`Public`) owner control does.
+
+The owner gate (A5, `Public` only) is a per-request proof-of-possession (PoP)
+by the owner account's key — the **#197 coordinator-auth pattern** — against the
+committed `BindNode` owner.
 
 ### Owner = a chain fact, not a connection property
 
@@ -93,10 +107,14 @@ W1 concurrently reshapes `console/store` into per-network slices and keeps
 predicate replacement to W2. To keep the epic merge mechanical, W2 touches only:
 
 - The predicate body at its documented seam (`state.ts` `nodeControlAvailable`):
-  `owner ∧ adminReachable`, replacing `workspace !== null && managed`. `managed`
-  keeps its distinct meaning — the **process plane** (this app manages the
-  process; StatusView Stop/Start, LogsTab). Three-layer model: data (standing) /
-  control (owner ∧ admin reachable) / process (`managed`).
+  `(workspace ∧ managed) || (owner ∧ adminReachable)` — the non-regressing form
+  the interim comment predicted. The first disjunct keeps LOCAL managed control
+  (the **process plane**: control even while the node is stopped, so Start still
+  shows — a naive swap to `owner ∧ adminReachable` alone would regress that); the
+  second adds REMOTE owner control (the A2 split). A non-owner remote satisfies
+  neither ⇒ no control chrome. `managed` keeps its distinct process-plane meaning
+  (StatusView Stop/Start, LogsTab). Three-layer model: data (standing) / control
+  (owner ∧ admin reachable) / process (`managed`).
 - Two connect-time fields (`owner`, `adminReachable`) and a self-contained
   `admin-client.ts` that signs PoP and probes `/v1/admin/ping`.
 - A node `user-sign-admin` verb + `user_sign_admin` Tauri command (mirrors

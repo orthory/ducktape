@@ -27,6 +27,7 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "user-sign-remove-member" => cmd_user_sign_remove_member(args, &mut stdin),
         "user-sign-gateway-route" => cmd_user_sign_gateway_route(args, &mut stdin),
         "user-sign-frame" => cmd_user_sign_frame(args, &mut stdin),
+        "user-sign-admin" => cmd_user_sign_admin(args, &mut stdin),
         "user-webauthn-challenge" => cmd_user_webauthn_challenge(args),
         "user-p256-payload" => cmd_user_p256_payload(args),
         _ => return None,
@@ -609,6 +610,58 @@ fn cmd_user_sign_frame(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", user_sign_frame(args, stdin)?);
+    Ok(())
+}
+
+/// `user-sign-admin` core — see [`cmd_user_sign_admin`].
+///
+/// signs one owner control-plane request (ADR A5): the per-request PoP the
+/// node's `/v1/admin/*` gate checks under `Public` exposure. the signed bytes
+/// are `noded::admin::sign_admin`'s — the SAME function the verifier uses, so
+/// the two can never drift. the freshness timestamp is minted here and returned
+/// alongside the signature so the caller stamps the exact `ts` that was signed.
+fn user_sign_admin(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-admin needs --key <path>")?);
+    let method = flags
+        .get("method")
+        .ok_or("user-sign-admin needs --method <M>")?
+        .clone();
+    let path = flags
+        .get("path")
+        .ok_or("user-sign-admin needs --path <path-and-query>")?
+        .clone();
+
+    // stdin: password ONLY (when the key is v2-encrypted) — there is no payload.
+    let user = load_user_signer(&key_path, stdin)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sig = noded::admin::sign_admin(&user, &method, &path, ts);
+    let out = serde_json::json!({
+        "key": hex_bytes(user.public_key().as_ref()),
+        "ts": ts.to_string(),
+        "sig": hex_bytes(sig.as_ref()),
+    });
+    Ok(out.to_string())
+}
+
+/// `user-sign-admin --key <path> --method <M> --path <path-and-query>` — stdin:
+/// [password line when the key is v2-encrypted]. Prints one JSON line
+/// `{"key","ts","sig"}` the app turns into the `x-ducktape-admin-*` headers of
+/// an owner control request. Fresh `ts` per call (the PoP is replay-bounded).
+fn cmd_user_sign_admin(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_admin(args, stdin)?);
     Ok(())
 }
 
@@ -1535,6 +1588,38 @@ mod userkey_verb_tests {
         assert_eq!(origin, sdk::Origin::External(signer.public_key().as_ref().to_vec()));
         assert_eq!(msg.target, "files");
         assert_eq!(msg.payload, payload);
+    }
+
+    #[test]
+    fn sign_admin_returns_owner_pop_the_verifier_would_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        write_legacy(&key_path, &[7u8; 32]);
+
+        // plaintext key ⇒ no password line ⇒ empty stdin (no payload either).
+        let out = user_sign_admin(
+            &args_of(&[
+                "--key",
+                key_path.to_str().unwrap(),
+                "--method",
+                "POST",
+                "--path",
+                "/v1/admin/shutdown",
+            ]),
+            &mut empty_stdin(),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("one json line");
+        let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
+        // the reported key is the user's own account key.
+        assert_eq!(parsed["key"], hex_bytes(signer.public_key().as_ref()));
+        // the signature is exactly what the node's verifier reconstructs over
+        // the SAME (method, path, ts) — proving the verb signed the right bytes
+        // with the right key (single source of truth: noded::admin::sign_admin).
+        let ts: u64 = parsed["ts"].as_str().unwrap().parse().unwrap();
+        let expect = noded::admin::sign_admin(&signer, "POST", "/v1/admin/shutdown", ts);
+        assert_eq!(parsed["sig"], hex_bytes(expect.as_ref()));
     }
 
     #[test]

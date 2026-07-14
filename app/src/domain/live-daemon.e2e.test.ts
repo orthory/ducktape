@@ -108,7 +108,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     // retire it the way a real client does — through the wire; the kill is
     // only the backstop for a daemon too wedged to honor its own shutdown.
     try {
-      await fetch(`${base}/v1/shutdown`, { method: "POST" });
+      await fetch(`${base}/v1/admin/shutdown`, { method: "POST" });
     } catch {
       // already gone
     }

@@ -172,7 +172,7 @@ fn kill_pid(pid: u32, grace: Duration) {
 }
 
 /// stop this workspace's node FOR REAL: ask nicely over http first
-/// (/v1/shutdown), then kill every verified process of this workspace, then
+/// (/v1/admin/shutdown), then kill every verified process of this workspace, then
 /// CONFIRM its ports are released. `Err` when something still holds a port —
 /// the caller must NOT delete state a live process would just re-create (the
 /// zombie-workspace resurrection this replaces).
@@ -234,7 +234,7 @@ fn ports_held(ports: &Ports) -> bool {
     port_listening(ports.listen) || port_listening(ports.http)
 }
 
-/// best-effort "stop this node": POST /v1/shutdown to its http surface over a
+/// best-effort "stop this node": POST /v1/admin/shutdown to its http surface over a
 /// raw tcp write. the port addresses the node (mirroring the webview's
 /// `shutdownNode` in node-bootstrap.ts), and the node exits the whole process
 /// on this route. a node already down, or a parked joiner that serves no http,
@@ -247,8 +247,12 @@ fn post_shutdown(http_port: u16) {
         return;
     };
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    // the owner-gated control surface (ADR A2). loopback-trusted here — this is
+    // a 127.0.0.1 dial to the app's own managed node, so no PoP is needed; the
+    // node's `Loopback` exposure admits it. a refusal just falls through to the
+    // pidfile/signal escalation in `stop_workspace_node`.
     let req = format!(
-        "POST /v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\
+        "POST /v1/admin/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\
          Content-Length: 0\r\nConnection: close\r\n\r\n"
     );
     let _ = stream.write_all(req.as_bytes());

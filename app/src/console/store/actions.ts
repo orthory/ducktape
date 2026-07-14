@@ -14,6 +14,8 @@ import type {
 } from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
+import { identityState } from "../../domain/user-identity-client";
+import { adminSigner, probeAdmin } from "../../domain/admin-client";
 import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
@@ -3234,7 +3236,7 @@ export function createActions({
       Promise.resolve()
         .then(() => transport.status())
         .then(
-          () => {
+          (s) => {
             if (isBootGenerationStale(gen)) return;
             // Commit the switch only after the remote proves it is a Ducktape
             // node. A failed dial leaves the current workspace/picker intact.
@@ -3256,6 +3258,26 @@ export function createActions({
             });
             saveRemoteUrl(url);
             setNode(transport);
+            // ADR A5 remote owner control: is this account the node's owner
+            // (a chain fact), and is its owner-gated admin surface reachable?
+            // Fire-and-forget — a non-owner leaves both false (no control
+            // chrome), an owner whose admin is down shows the "unreachable"
+            // hint. The predicate's local disjunct never applies here (workspace
+            // is null), so these two fields are what gate remote control.
+            void identityState()
+              .then((id) => id.pubkey ?? "")
+              .catch(() => "")
+              .then((accountKey) =>
+                Promise.all([
+                  identityClient.nodeOwnedBy(transport, s.publicKey ?? "", accountKey),
+                  probeAdmin(url, adminSigner()),
+                ]),
+              )
+              .then(([owner, adminReachable]) => {
+                if (isBootGenerationStale(gen)) return;
+                patch({ owner, adminReachable });
+              })
+              .catch(() => {});
           },
           (err) => {
             if (isBootGenerationStale(gen)) return;

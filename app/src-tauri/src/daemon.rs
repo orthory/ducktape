@@ -196,6 +196,7 @@ const ALLOWED_VERBS: &[&str] = &[
     "user-sign-remove-member",
     "user-sign-gateway-route",
     "user-sign-frame",
+    "user-sign-admin",
     "gateway-route-bind",
     "gateway-route-unbind",
     "gateway-route-list",
@@ -793,7 +794,7 @@ pub(crate) fn watch_node_exit(mut child: Child, workspace: String) {
             match child.wait() {
                 // a CLEAN exit is the routine path, not an incident: every workspace
                 // switch, forget, and sandbox-apply asks this node to stop (POST
-                // /v1/shutdown → exit(0)). crying `error!` on the most common
+                // /v1/admin/shutdown → exit(0)). crying `error!` on the most common
                 // lifecycle action would be a false alarm in exactly the log someone
                 // reads BECAUSE they are chasing a death — and it would teach them to
                 // ignore the line that matters.

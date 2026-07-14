@@ -167,8 +167,18 @@ export interface ConsoleState {
   connected: boolean;
   /** The daemon url this build resolved to (null until bootstrap finishes). */
   nodeUrl: string | null;
-  /** True when this app owns the daemon lifecycle (desktop build). */
+  /** True when this app owns the daemon lifecycle (desktop build). The PROCESS
+   *  plane: spawn/adopt/Start/Stop/logs, available even while the node is
+   *  stopped. Distinct from the control plane (`owner` ∧ `adminReachable`). */
   managed: boolean;
+  /** ADR A5 control plane: the logged-in account OWNS the connected node — a
+   *  chain fact (the node's committed `BindNode` names an account this key is a
+   *  member of), readable over the public RPC. */
+  owner: boolean;
+  /** ADR A5 control plane: the node's owner-gated `/v1/admin/*` namespace
+   *  answered our probe. With `owner` this is `nodeControlAvailable`'s new
+   *  term — remote owner control, and the "unreachable" hint when false. */
+  adminReachable: boolean;
   status: NodeStatus | null;
 
   // ── Chat ──
@@ -631,23 +641,42 @@ export const isClientMode = (
  *  nav-history note at the top). */
 export type SeatKind = "local" | "remote";
 
-/** Node control for one seat (ADR A5, interim form): a local seat whose daemon
- *  this app manages. A remote seat is never controllable (A6 — no control
- *  chrome for someone else's node). THE seam W2 replaces with
- *  `owner(BindNode) ∧ private-RPC reachable`; the UI gate (below) delegates
- *  here and moves with it, nothing else does. */
+/** A seat's PROCESS-plane control (ADR A5): a local seat whose daemon this app
+ *  manages — controllable even while the node is stopped (Start lives on the
+ *  node console, so reachability is deliberately NOT a term here). A remote seat
+ *  has no process plane; its CONTROL plane (owner ∧ admin reachable) is added at
+ *  the availability level below. This stays W1's local/process-plane rule. */
 export const nodeControlForSeat = (kind: SeatKind, managed: boolean): boolean =>
   kind === "local" && managed;
 
-/** Node control is available: `nodeControlForSeat` evaluated for the ACTIVE
- *  seat. An entered registry workspace is the active local seat; a client
- *  connection (workspace null) is the remote seat (see networks.ts). Ours to
- *  control even while the node is stopped — Start lives on the node console,
- *  so reachability is deliberately NOT a term here. */
+const seatOf = (workspace: unknown): SeatKind => (workspace !== null ? "local" : "remote");
+
+/** Node control is available (ADR A5). Two ways in, matching the capability
+ *  matrix:
+ *   - LOCAL managed daemon (`nodeControlForSeat`): the PROCESS plane — ours to
+ *     control even while it is stopped.
+ *   - REMOTE owner control (`owner ∧ adminReachable`): the A2 public/private
+ *     split — the logged-in account owns the node (a chain fact) AND its
+ *     owner-gated admin namespace is reachable.
+ *  A non-owner remote connection satisfies neither ⇒ NO control chrome at all.
+ *  This is exactly the growth the interim seat rule's comment predicted. */
 export const nodeControlAvailable = (
-  state: Pick<ConsoleState, "workspace" | "managed">,
+  state: Pick<ConsoleState, "workspace" | "managed" | "owner" | "adminReachable">,
 ): boolean =>
-  nodeControlForSeat(state.workspace !== null ? "local" : "remote", state.managed);
+  nodeControlForSeat(seatOf(state.workspace), state.managed) ||
+  (state.owner && state.adminReachable);
+
+/** ADR A5: an OWNER whose control surface is unreachable sees a one-line
+ *  "control surface not reachable" hint — ownership is public on-chain fact, so
+ *  the app may say so. A non-owner sees nothing (handled by the predicate). The
+ *  local managed case is covered by the seat rule, so this is the
+ *  remote-owner-with-unreachable-admin case. */
+export const ownerControlUnreachable = (
+  state: Pick<ConsoleState, "workspace" | "managed" | "owner" | "adminReachable">,
+): boolean =>
+  state.owner &&
+  !state.adminReachable &&
+  !nodeControlForSeat(seatOf(state.workspace), state.managed);
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};
@@ -915,6 +944,8 @@ export const createInitialState = (): ConsoleState => {
     connected: false,
     nodeUrl: null,
     managed: false,
+    owner: false,
+    adminReachable: false,
     status: null,
     channels: [],
     activeChannel: null,
@@ -1012,6 +1043,10 @@ export const createInitialState = (): ConsoleState => {
  * subtly different hand-written lists in each switch/delete path. */
 export const resetNodeProjection = (): Partial<ConsoleState> => ({
   connected: false,
+  // control-plane facts are per-node; a node change clears them until the new
+  // connection re-evaluates ownership + admin reachability (ADR A5).
+  owner: false,
+  adminReachable: false,
   status: null,
   channels: [],
   activeChannel: null,

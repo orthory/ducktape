@@ -870,6 +870,34 @@ pub async fn user_sign_frame(
         .await
 }
 
+/// sign one OWNER CONTROL-PLANE request (ADR A5) with the user key: the
+/// per-request proof-of-possession the node's `/v1/admin/*` gate checks under
+/// `Public` exposure. Returns the one-line JSON `{"key","ts","sig"}` the app
+/// turns into the `x-ducktape-admin-*` headers of an admin request. Distinct
+/// from `user_sign_frame` (content ops) — this is node control, authorized
+/// against the committed `BindNode` owner, so it is scoped to the admin PoP
+/// alone and never a blanket signer. `identity-locked` on a locked key.
+#[tauri::command]
+pub async fn user_sign_admin(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    method: String,
+    path: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            run_sign_verb(
+                &app,
+                "user-sign-admin",
+                &[("--method", &method), ("--path", &path)],
+            )
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

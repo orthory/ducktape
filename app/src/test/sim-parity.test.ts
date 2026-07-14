@@ -178,7 +178,7 @@ describe.skipIf(!nodedBin || !simBin)("noded ↔ simnode wire conformance", () =
 
   afterAll(async () => {
     try {
-      await fetch(`${nodedBase}/v1/shutdown`, { method: "POST" });
+      await fetch(`${nodedBase}/v1/admin/shutdown`, { method: "POST" });
     } catch {
       // already gone
     }

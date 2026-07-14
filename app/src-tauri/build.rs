@@ -79,6 +79,7 @@ fn main() {
         "user_sign_remove_member",
         "user_sign_files_frame",
         "user_sign_frame",
+        "user_sign_admin",
         "touchid_available",
         "touchid_enroll",
         "touchid_enrolled",

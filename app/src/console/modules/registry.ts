@@ -54,7 +54,10 @@ export const moduleById = (id: string): AppModule | undefined =>
  *  site, so when the gate grows the A2 remote-owner term every consumer
  *  (sidebar, nav actions) picks it up at once. */
 export const moduleFilterOf = (
-  state: Pick<ConsoleState, "workspace" | "managed" | "nodeUrl">,
+  state: Pick<
+    ConsoleState,
+    "workspace" | "managed" | "nodeUrl" | "owner" | "adminReachable"
+  >,
 ): ModuleFilter => ({
   nodeControl: nodeControlAvailable(state),
   clientMode: isClientMode(state),
