@@ -47,7 +47,7 @@
 
 use agent::{
     ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentModule,
-    AgentMsg, AgentResponse, DelegationRequest, ReplyBlock, ResourceCaps,
+    AgentMsg, AgentResponse, DelegationRequest, LoadMode, ReplyBlock, ResourceCaps, SkillRef,
     encode_msg as agent_encode_msg, encode_response,
 };
 use chat::{
@@ -176,7 +176,7 @@ fn quackbot_ref() -> AuthorRef {
 }
 
 fn register_quackbot(actions: Vec<String>) -> Msg {
-    register_agent("quackbot", "Quackbot", actions, None)
+    register_agent("quackbot", "Quackbot", actions, None, None)
 }
 
 fn register_agent(
@@ -184,6 +184,7 @@ fn register_agent(
     display_name: &str,
     actions: Vec<String>,
     caps: Option<ResourceCaps>,
+    skills: Option<Vec<SkillRef>>,
 ) -> Msg {
     Msg {
         target: "agent".into(),
@@ -194,7 +195,7 @@ fn register_agent(
             allowed_actions: actions,
             recipe_hash: None,
             caps,
-            skills: None,
+            skills,
         }),
     }
 }
@@ -707,9 +708,11 @@ fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
                 "Quackbot",
                 vec![ACTION_CHAT_POST.into()],
                 Some(ResourceCaps {
+                    duckfs_read: vec!["/".into()],
                     subagent_budget: 1,
                     ..Default::default()
                 }),
+                None,
             ),
             false,
         )
@@ -719,7 +722,18 @@ fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
             &mut wasm,
             4,
             alice(),
-            register_agent("child", "Child", vec![ACTION_CHAT_POST.into()], None),
+            register_agent(
+                "child",
+                "Child",
+                vec![ACTION_CHAT_POST.into()],
+                None,
+                Some(vec![SkillRef {
+                    name: "specialist".into(),
+                    source_prefix: "/shared/skills/specialist".into(),
+                    source_snapshot: None,
+                    load: LoadMode::Always,
+                }]),
+            ),
             false,
         )
         .await;
@@ -761,6 +775,10 @@ fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
             serde_json::from_slice(&work.payload).expect("child envelope");
         assert_eq!(payload["run_id"], child_run);
         assert_eq!(payload["agent_id"], "child");
+        assert_eq!(
+            payload["skills"][0]["source_prefix"],
+            "/shared/skills/specialist"
+        );
         assert_eq!(
             payload["workspace"]["source_prefix"],
             "/shared/agent-workspaces/quackbot"
