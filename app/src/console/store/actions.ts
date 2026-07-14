@@ -470,7 +470,7 @@ export interface ConsoleActions {
     allowedActions: string[];
     caps?: agentClient.ResourceCaps;
     skills?: agentClient.SkillRef[];
-  }): void;
+  }): Promise<boolean>;
   /** Re-read the network capability registry without rebuilding the rest of the
    *  console snapshot. Used by the create form after a failed registry read. */
   refreshCapabilities(): void;
@@ -509,7 +509,7 @@ export interface ConsoleActions {
     /** REPLACES the whole curated skill set when present (an empty array clears
      *  it); omit to keep it. */
     skills?: agentClient.SkillRef[];
-  }): void;
+  }): Promise<boolean>;
   /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
    *  can process job-backed runs. */
   enableJobWorker(enabled: boolean): void;
@@ -2772,10 +2772,10 @@ export function createActions({
       const id = agentId.trim();
       const name = displayName.trim();
       const tag = capability.trim();
-      if (!id || !name || !tag) return;
+      if (!id || !name || !tag) return Promise.resolve(false);
       // No blob upload: the agent's persona is a duckfs document its skill refs
       // point at, so registration commits pins — never prompt bytes.
-      submitTracked(opKey.agent(id), (live) =>
+      return submitTracked(opKey.agent(id), (live) =>
         agentClient.registerAgent(live, {
           agentId: id,
           displayName: name,
@@ -2891,8 +2891,8 @@ export function createActions({
 
     updateAgent: ({ agentId, displayName, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
-      if (!id) return;
-      submitTracked(
+      if (!id) return Promise.resolve(false);
+      return submitTracked(
         opKey.agent(id),
         (live) =>
           agentClient.updateAgent(live, {

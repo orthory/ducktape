@@ -99,8 +99,7 @@ const renderAgents = (
     ],
     ...patch,
   };
-  const spies: Record<string, (...args: unknown[]) => void> = {};
-  const noop = vi.fn() as (...args: unknown[]) => void;
+  const spies: Record<string, ReturnType<typeof vi.fn>> = {};
   let updateCapabilities: (capabilities: string[]) => void;
 
   function Harness() {
@@ -111,8 +110,11 @@ const renderAgents = (
       {},
       {
         get: (_target, key: string) => {
-          spies[key] ??= vi.fn() as (...args: unknown[]) => void;
-          return spies[key] ?? noop;
+          spies[key] ??=
+            key === "registerAgent" || key === "updateAgent"
+              ? vi.fn().mockResolvedValue(true)
+              : vi.fn();
+          return spies[key];
         },
       },
     ) as ConsoleActions;
@@ -129,6 +131,14 @@ const renderAgents = (
     spies,
     setCapabilities: (capabilities: string[]) => act(() => updateCapabilities(capabilities)),
   };
+};
+
+const deferredResult = () => {
+  let resolve!: (result: boolean) => void;
+  const promise = new Promise<boolean>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 };
 
 const openTab = (name: RegExp) => fireEvent.click(screen.getByRole("tab", { name }));
@@ -181,6 +191,23 @@ describe("AgentView", () => {
     // Ask-to-respond moved onto the message in chat — the management page
     // no longer hosts the form.
     expect(screen.queryByText(/ask to respond/i)).toBeNull();
+  });
+
+  it("disables pause or resume while the agent write is pending", () => {
+    const { spies } = renderAgents({
+      ops: {
+        [opKey.agent("summarizer")]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+    });
+
+    const pause = screen.getByRole("button", { name: /pause agent/i });
+    expect(pause).toBeDisabled();
+    fireEvent.click(pause);
+    expect(spies.pauseAgent).not.toHaveBeenCalled();
   });
 
   it("renders roster, detail, and the three tabs after the split", () => {
@@ -348,6 +375,38 @@ describe("AgentView", () => {
     });
   });
 
+  it("keeps the registration draft through pending and failure, then closes on success", async () => {
+    const { spies } = renderAgents();
+    const pending = deferredResult();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    spies.registerAgent.mockReturnValue(pending.promise);
+    const name = screen.getByLabelText("Agent display name");
+    fireEvent.change(name, { target: { value: "Triage Agent" } });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+    const submit = screen.getByRole("button", { name: /register agent/i });
+
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    expect(spies.registerAgent).toHaveBeenCalledTimes(1);
+    expect(submit).toBeDisabled();
+    expect(name).toHaveValue("Triage Agent");
+
+    await act(async () => {
+      pending.resolve(false);
+      await pending.promise;
+    });
+    expect(submit).toBeEnabled();
+    expect(name).toHaveValue("Triage Agent");
+
+    spies.registerAgent.mockResolvedValue(true);
+    await act(async () => {
+      fireEvent.click(submit);
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("region", { name: /register agent/i })).not.toBeInTheDocument();
+  });
+
   it("grants the skill library by default, and lets the operator withhold it", () => {
     const { spies } = renderAgents();
 
@@ -393,6 +452,37 @@ describe("AgentView", () => {
         caps: { pages_write: [], duckfs_read: ["/shared/skills"] },
       }),
     );
+  });
+
+  it("keeps the edit draft through pending and failure, then closes on success", async () => {
+    const { spies } = renderAgents();
+    const pending = deferredResult();
+    spies.updateAgent.mockReturnValue(pending.promise);
+
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    const name = screen.getByLabelText("Edit display name");
+    fireEvent.change(name, { target: { value: "Revised Agent" } });
+    const submit = screen.getByRole("button", { name: /save changes/i });
+
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    expect(spies.updateAgent).toHaveBeenCalledTimes(1);
+    expect(submit).toBeDisabled();
+    expect(name).toHaveValue("Revised Agent");
+
+    await act(async () => {
+      pending.resolve(false);
+      await pending.promise;
+    });
+    expect(submit).toBeEnabled();
+    expect(name).toHaveValue("Revised Agent");
+
+    spies.updateAgent.mockResolvedValue(true);
+    await act(async () => {
+      fireEvent.click(submit);
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("form", { name: /edit agent/i })).not.toBeInTheDocument();
   });
 
   it("curates skills: the persona is always-loaded, the rest on demand", () => {
@@ -695,6 +785,40 @@ describe("AgentView", () => {
     expect(screen.getByRole("button", { name: /enable worker/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /disable worker/i })).toBeDisabled();
     expect(screen.getByText(/waiting for confirmation/i)).toBeInTheDocument();
+  });
+
+  it("disables force reassign while the run write is pending", () => {
+    const { spies } = renderAgents({
+      ops: {
+        [opKey.run("general/42/summarizer")]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: "cd".repeat(32),
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
+    });
+
+    openTab(/activity/i);
+    const reassign = screen.getByRole("button", {
+      name: /force reassign run summary agent.*general @42/i,
+    });
+    expect(reassign).toBeDisabled();
+    fireEvent.click(reassign);
+    expect(spies.reassignRun).not.toHaveBeenCalled();
   });
 
   it("offers announced executors as a Runs on picker, defaulting to the first", () => {

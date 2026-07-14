@@ -7,6 +7,7 @@ import { useState } from "react";
 import type { AgentRecord, ResourceCaps, SkillRef } from "../../../domain/agent-client";
 import { agentAddress } from "../../../domain/agent-client";
 import { Icon } from "../../components/Icon";
+import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { AgentEditForm } from "./AgentEditForm";
@@ -84,6 +85,7 @@ export function AgentDetail({
   agent,
   capabilities,
   capabilitiesStatus,
+  op,
   onPause,
   onResume,
   onUpdate,
@@ -91,6 +93,7 @@ export function AgentDetail({
   agent: AgentRecord | null;
   capabilities: string[];
   capabilitiesStatus: "loading" | "ready" | "error";
+  op?: OpRecord;
   onPause: (agentId: string) => void;
   onResume: (agentId: string) => void;
   onUpdate: (params: {
@@ -100,9 +103,10 @@ export function AgentDetail({
     allowedActions?: string[];
     caps?: ResourceCaps;
     skills?: SkillRef[];
-  }) => void;
+  }) => Promise<boolean>;
 }) {
   const [editing, setEditing] = useState(false);
+  const pending = op?.phase === "pending";
 
   if (!agent) {
     return (
@@ -216,9 +220,12 @@ export function AgentDetail({
             </button>
             <button
               type="button"
+              disabled={pending}
               onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
               style={{
                 ...onDarkButton,
+                cursor: pending ? "default" : "pointer",
+                opacity: pending ? 0.6 : 1,
                 color: active
                   ? filledForeground(color.amber)
                   : filledForeground(color.green),

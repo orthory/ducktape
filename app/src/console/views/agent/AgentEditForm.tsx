@@ -43,7 +43,7 @@ export function AgentEditForm({
     allowedActions?: string[];
     caps?: ResourceCaps;
     skills?: SkillRef[];
-  }) => void;
+  }) => Promise<boolean>;
   onClose: () => void;
 }) {
   const [displayName, setDisplayName] = useState(agent.display_name);
@@ -57,15 +57,18 @@ export function AgentEditForm({
   // (and one that has it can lose it) — the caps are what the tool plane
   // enforces and what the run's context document is assembled against.
   const [libraryRead, setLibraryRead] = useState(canReadLibrary(agent.caps));
+  const [submitting, setSubmitting] = useState(false);
 
   const toggle = (name: string) =>
     setAllowedActions((prev) =>
       prev.includes(name) ? prev.filter((action) => action !== name) : [...prev, name],
     );
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
-    onUpdate({
+    if (submitting) return;
+    setSubmitting(true);
+    const committed = await onUpdate({
       agentId: agent.agent_id,
       displayName: displayName.trim(),
       capability: capability.trim(),
@@ -79,6 +82,8 @@ export function AgentEditForm({
       ),
       skills: cleanSkills(skills),
     });
+    setSubmitting(false);
+    if (!committed) return;
     onClose();
   };
 
@@ -231,7 +236,11 @@ export function AgentEditForm({
         <button type="button" onClick={onClose} style={secondaryButton}>
           Cancel
         </button>
-        <button type="submit" style={primaryButton(true)}>
+        <button
+          type="submit"
+          disabled={submitting}
+          style={primaryButton(!submitting)}
+        >
           Save changes
         </button>
       </div>
