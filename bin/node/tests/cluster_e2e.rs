@@ -354,6 +354,36 @@ fn cluster_lifecycle() {
             && exposition.contains("module=\"directory\""),
         "the dispatch counter carries the submitted module label:\n{exposition}"
     );
+    for sample in [
+        r#"ducktape_node_phase{role="validator",phase="validating"} 1"#,
+        "ducktape_consensus_validators ",
+        "ducktape_consensus_quorum ",
+        "ducktape_consensus_reachable_validators ",
+        "ducktape_consensus_pending_ops ",
+        "ducktape_last_finalized_timestamp_seconds ",
+        r#"ducktape_ops_outcome_total{outcome="applied"}"#,
+        r#"ducktape_index_height{module="directory"}"#,
+        "ducktape_upgrade_current_version ",
+        "ducktape_upgrade_max_supported_version ",
+    ] {
+        assert!(
+            exposition.contains(sample),
+            "stable operational sample {sample:?} missing:\n{exposition}"
+        );
+    }
+    let metric_value = |name: &str| {
+        exposition
+            .lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("missing numeric {name}:\n{exposition}"))
+    };
+    assert!(
+        metric_value("ducktape_consensus_reachable_validators")
+            >= metric_value("ducktape_consensus_quorum"),
+        "a finalizing validator reports quorum reachability:\n{exposition}"
+    );
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.
@@ -394,6 +424,34 @@ fn cluster_lifecycle() {
         cluster.status(2)["app_hash"].as_str().unwrap_or_default(),
         http_hash,
         "the app surface and the rpc disagree on node 2's app-hash"
+    );
+    assert_eq!(http_status["operations"]["role"], "validator");
+    assert_eq!(http_status["operations"]["phase"], "validating");
+    assert!(
+        http_status["operations"]["upgrade"]["maxSupportedVersion"]
+            .as_u64()
+            .zip(http_status["operations"]["upgrade"]["currentVersion"].as_u64())
+            .is_some_and(|(supported, current)| supported >= current),
+        "running binary supports the active protocol: {http_status}"
+    );
+    assert!(
+        http_status["operations"]["consensus"]["validators"]
+            .as_u64()
+            .is_some_and(|validators| validators >= 3),
+        "status carries the current consensus set: {http_status}"
+    );
+    assert!(
+        http_status["operations"]["consensus"]["reachableValidators"]
+            .as_u64()
+            .zip(http_status["operations"]["consensus"]["quorum"].as_u64())
+            .is_some_and(|(reachable, quorum)| reachable >= quorum),
+        "status reports quorum reachability: {http_status}"
+    );
+    assert!(
+        http_status["operations"]["storage"]["indexes"]
+            .as_array()
+            .is_some_and(|indexes| indexes.iter().any(|index| index["module"] == "directory")),
+        "status carries bounded index watermarks: {http_status}"
     );
     let boundary = status0["app_hash"]
         .as_str()
