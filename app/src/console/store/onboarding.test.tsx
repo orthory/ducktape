@@ -1,6 +1,8 @@
-// Desktop onboarding contract: with no active workspace the gate is raised;
-// founding connects; joining parks and surfaces the phase. Drives the provider
-// over a mocked Tauri `invoke` + a stubbed node surface.
+// Desktop onboarding contract (epic W1): with no active network the account
+// home is the landing surface (not a full-screen gate); founding connects;
+// joining parks and surfaces the phase. The connect panel is the create/join/
+// remote modal. Drives the provider over a mocked Tauri `invoke` + a stubbed
+// node surface.
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +12,7 @@ import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import { LIVE_JOIN_SUPPORTED } from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
-import { OnboardingGate } from "../views/onboarding/OnboardingGate";
+import { ConnectPanel } from "../views/onboarding/ConnectPanel";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -46,6 +48,7 @@ function Probe() {
   return (
     <div>
       <span data-testid="gate">{String(state.needsOnboarding)}</span>
+      <span data-testid="home">{String(state.atHome)}</span>
       <span data-testid="ws">{state.workspace?.name ?? "none"}</span>
       <span data-testid="phase">{state.onboardingPhase?.phase ?? "none"}</span>
       <span data-testid="managed">{String(state.managed)}</span>
@@ -66,7 +69,7 @@ afterEach(() => {
 });
 
 describe("desktop onboarding", () => {
-  it("first run with no workspace raises the gate", async () => {
+  it("first run with no network lands on the account home (not a gate)", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
@@ -78,7 +81,8 @@ describe("desktop onboarding", () => {
       </DucktapeProvider>,
     );
 
-    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+    await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
+    expect(screen.getByTestId("gate").textContent).toBe("false");
   });
 
   it("createWorkspace founds a network and connects", async () => {
@@ -112,7 +116,7 @@ describe("desktop onboarding", () => {
         <Probe />
       </DucktapeProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+    await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
 
     await act(async () => {
       actions!.createWorkspace("Team");
@@ -154,8 +158,8 @@ describe("desktop onboarding", () => {
           <Probe />
         </DucktapeProvider>,
       );
-      await act(async () => {}); // flush boot → gate
-      expect(screen.getByTestId("gate").textContent).toBe("true");
+      await act(async () => {}); // flush boot → account home
+      expect(screen.getByTestId("home").textContent).toBe("true");
 
       await act(async () => {
         actions!.joinWorkspace("Guest", "ducktape-invite-v2:blob");
@@ -204,7 +208,7 @@ describe("onboarding gate — live join UI", () => {
 
       render(
         <DucktapeProvider>
-          <OnboardingGate />
+          <ConnectPanel />
         </DucktapeProvider>,
       );
       await act(async () => {}); // flush boot
@@ -214,7 +218,7 @@ describe("onboarding gate — live join UI", () => {
 
       // the join form is live — no disabled note, the invite-blob field is present
       expect(screen.queryByText(/temporarily unavailable/i)).toBeNull();
-      fireEvent.change(screen.getByPlaceholderText("Workspace name"), {
+      fireEvent.change(screen.getByPlaceholderText("Network name"), {
         target: { value: "Guest" },
       });
       fireEvent.change(screen.getByPlaceholderText(/Paste invite blob/i), {
@@ -222,7 +226,7 @@ describe("onboarding gate — live join UI", () => {
       });
 
       await act(async () => {
-        fireEvent.click(screen.getByText("Join workspace"));
+        fireEvent.click(screen.getByText("Join network"));
       });
 
       expect(invokeMock).toHaveBeenCalledWith("workspace_join", {
@@ -263,13 +267,13 @@ describe("onboarding gate — live join UI", () => {
 
       render(
         <DucktapeProvider>
-          <OnboardingGate />
+          <ConnectPanel />
         </DucktapeProvider>,
       );
       await act(async () => {}); // flush boot
 
       fireEvent.click(screen.getByText("Join"));
-      fireEvent.change(screen.getByPlaceholderText("Workspace name"), {
+      fireEvent.change(screen.getByPlaceholderText("Network name"), {
         target: { value: "Guest" },
       });
       const field = screen.getByPlaceholderText<HTMLTextAreaElement>(/Paste invite blob/i);
@@ -281,7 +285,7 @@ describe("onboarding gate — live join UI", () => {
       expect(field.value).toBe("🦆abcdefghij");
 
       await act(async () => {
-        fireEvent.click(screen.getByText("Join workspace"));
+        fireEvent.click(screen.getByText("Join network"));
       });
 
       expect(invokeMock).toHaveBeenCalledWith("workspace_join", {
@@ -312,11 +316,11 @@ describe("onboarding gate — remote node", () => {
 
     render(
       <DucktapeProvider>
-        <OnboardingGate />
+        <ConnectPanel />
         <Probe />
       </DucktapeProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+    await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
 
     fireEvent.click(screen.getByText("Remote"));
     fireEvent.change(screen.getByPlaceholderText("http://192.168.1.50:8844"), {
@@ -355,11 +359,11 @@ describe("onboarding gate — remote node", () => {
 
     render(
       <DucktapeProvider>
-        <OnboardingGate />
+        <ConnectPanel />
         <Probe />
       </DucktapeProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+    await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
 
     fireEvent.click(screen.getByText("Remote"));
     fireEvent.change(screen.getByPlaceholderText("http://192.168.1.50:8844"), {

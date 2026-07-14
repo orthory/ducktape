@@ -1,8 +1,12 @@
-// The front door (desktop): shown when there is no active workspace, or when
-// the user asks to add/switch one. Two paths — found a new network, or join one
-// from an invite blob — plus a list of existing workspaces to jump back into.
-// On submit the store mints the node key + workspace and connects; a joiner
-// falls through to JoinProgress while its node parks.
+// The connect panel (epic W1): the dismissible modal that adds a network — the
+// create / join / remote forms relocated out of the deleted full-screen "Add
+// workspace" gate. Opened from the rail "+" and the account home CTAs; the
+// account home is the base surface behind it, so it is always closable.
+//
+// Two paths mint a local node — found a new network, or join one from an invite
+// blob — plus a Remote tab that dials someone else's node (#587 client mode).
+// On submit the store mints the node key + network and connects; a joiner falls
+// through to JoinProgress while its node parks.
 
 import { useEffect, useState } from "react";
 
@@ -11,7 +15,6 @@ import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import type { Workspace } from "../../../domain/workspace-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { OnboardingChrome } from "./OnboardingChrome";
 
 type Mode = "create" | "join" | "remote";
 
@@ -78,7 +81,7 @@ function Tab({
   );
 }
 
-export function OnboardingGate() {
+export function ConnectPanel() {
   const { state, actions } = useDucktape();
   const [mode, setMode] = useState<Mode>("create");
   const [name, setName] = useState("");
@@ -93,6 +96,15 @@ export function OnboardingGate() {
     if (mode === "join" && LIVE_JOIN_SUPPORTED && !state.joinCode) actions.joinCode();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
+
+  // Escape closes the panel — the account home is always behind it.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") actions.dismissOnboarding();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [actions]);
 
   const busy = state.onboardingBusy;
   // live join is enabled (LIVE_JOIN_SUPPORTED); joinGated is the kill-switch
@@ -123,9 +135,9 @@ export function OnboardingGate() {
 
   const title =
     mode === "create"
-      ? "Name your workspace"
+      ? "Name your network"
       : mode === "join"
-        ? "Join a workspace"
+        ? "Join a network"
         : "Connect to a remote node";
   const subtitle =
     mode === "create"
@@ -136,17 +148,34 @@ export function OnboardingGate() {
           : "Paste an invite from a member — this device joins their network with a fresh node key, owned by your account."
         : "Enter the http address of a node running on another device. It stays running there — this app just connects to it.";
 
-  // The step rail appears only on a true first run: the same gate doubles as
-  // the workspace SWITCHER for anyone who already has a workspace or a live
-  // connection, where a "step 2 of 3" would lie.
-  const firstRun = state.workspaces.length === 0 && !state.workspace && !state.nodeUrl;
-
   return (
-    <OnboardingChrome step={firstRun ? 2 : null}>
+    <div
+      // The panel covers the content area (right of the rail) with a scrim; the
+      // rail stays visible so the switcher is never trapped behind it.
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add a network"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) actions.dismissOnboarding();
+      }}
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 40,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: color.scrimSoft,
+      }}
+    >
       <div
+        onMouseDown={(e) => e.stopPropagation()}
         style={{
           width: 440,
           maxWidth: "100%",
+          maxHeight: "100%",
+          overflowY: "auto",
           background: color.sidebar,
           border: `1px solid ${color.border}`,
           borderRadius: radius.lg,
@@ -157,13 +186,35 @@ export function OnboardingGate() {
           gap: 16,
         }}
       >
-        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-          <span style={{ font: `600 16px ${font.sans}`, color: color.ink }}>
-            {title}
-          </span>
-          <span style={{ font: `500 12px ${font.sans}`, color: color.muted }}>
-            {subtitle}
-          </span>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5, flex: 1, minWidth: 0 }}>
+            <span style={{ font: `600 16px ${font.sans}`, color: color.ink }}>
+              {title}
+            </span>
+            <span style={{ font: `500 12px ${font.sans}`, color: color.muted }}>
+              {subtitle}
+            </span>
+          </div>
+          <button
+            onClick={() => actions.dismissOnboarding()}
+            aria-label="Close"
+            title="Close"
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              flexShrink: 0,
+              width: 26,
+              height: 26,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: radius.sm,
+              color: color.muted,
+              font: `500 16px ${font.sans}`,
+            }}
+          >
+            ✕
+          </button>
         </div>
 
         <div
@@ -212,7 +263,7 @@ export function OnboardingGate() {
                 <>
                   <input
                     value={name}
-                    placeholder="Workspace name"
+                    placeholder="Network name"
                     onChange={(event) => setName(event.target.value)}
                     onKeyDown={(event) => event.key === "Enter" && mode === "create" && submit()}
                     style={inputStyle}
@@ -304,9 +355,9 @@ export function OnboardingGate() {
               {busy
                 ? "Setting up…"
                 : mode === "create"
-                  ? "Create workspace"
+                  ? "Create network"
                   : mode === "join"
-                    ? "Join workspace"
+                    ? "Join network"
                     : "Connect"}
             </button>
           </>
@@ -323,7 +374,7 @@ export function OnboardingGate() {
             }}
           >
             <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted2, letterSpacing: ".04em" }}>
-              YOUR WORKSPACES
+              YOUR NETWORKS
             </span>
             {state.workspaces.map((w) => (
               <div key={w.id} style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
@@ -351,7 +402,7 @@ export function OnboardingGate() {
                 </button>
                 {state.deleteNeedsForce === w.id ? (
                   <button
-                    aria-label={`Force delete workspace ${w.name}`}
+                    aria-label={`Force delete network ${w.name}`}
                     title="The node couldn't confirm it left its network — force skips that check"
                     onClick={() => confirmForceDelete(w)}
                     style={{ ...deleteButtonStyle, background: color.red, color: color.onDark }}
@@ -360,8 +411,8 @@ export function OnboardingGate() {
                   </button>
                 ) : (
                   <button
-                    aria-label={`Delete workspace ${w.name}`}
-                    title="Stop its node and delete this workspace locally"
+                    aria-label={`Delete network ${w.name}`}
+                    title="Stop its node and delete this network locally"
                     onClick={() => confirmDelete(w)}
                     style={deleteButtonStyle}
                   >
@@ -372,21 +423,6 @@ export function OnboardingGate() {
             ))}
           </div>
         )}
-
-        {(state.workspace || state.nodeUrl) && (
-          <button
-            onClick={actions.dismissOnboarding}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              textAlign: "center",
-              font: `600 11px ${font.sans}`,
-              color: color.muted,
-            }}
-          >
-            ← back to {state.workspace ? state.workspace.name : "remote node"}
-          </button>
-        )}
       </div>
 
       {pendingDelete && (
@@ -396,7 +432,7 @@ export function OnboardingGate() {
               ? `Force-delete ${pendingDelete.workspace.name}?`
               : `Delete ${pendingDelete.workspace.name}?`
           }
-          confirmLabel={pendingDelete.force ? "Force delete" : "Delete workspace"}
+          confirmLabel={pendingDelete.force ? "Force delete" : "Delete network"}
           onCancel={() => setPendingDelete(null)}
           onConfirm={() => {
             actions.deleteWorkspace(pendingDelete.workspace.id, pendingDelete.force);
@@ -406,19 +442,19 @@ export function OnboardingGate() {
           {pendingDelete.force ? (
             <>
               Its node could not confirm it has left its validator set. Forcing deletes
-              the workspace without that confirmation: its directory, node key,
+              the network without that confirmation: its directory, node key,
               and registry entry are removed for good. Only do this for a solo or
               defunct network.
             </>
           ) : (
             <>
-              This stops its node and deletes the workspace locally: directory,
+              This stops its node and deletes the network locally: directory,
               node key, and registry entry. It is refused while its node is still
               a current validator of a network with other members.
             </>
           )}
         </ConfirmDialog>
       )}
-    </OnboardingChrome>
+    </div>
   );
 }

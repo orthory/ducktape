@@ -24,7 +24,7 @@ export function WorkspaceSection() {
 
   return (
     <>
-      <SectionLabel>WORKSPACE</SectionLabel>
+      <SectionLabel>NETWORK</SectionLabel>
       <GroupCard>
         <InfoRow
           label="Network name"
@@ -43,21 +43,21 @@ export function WorkspaceSection() {
           }
         />
         <ControlRow
-          title="Switch workspace"
+          title="Switch network"
           desc={
             clientMode
-              ? "Connect to another workspace or remote node."
-              : "Create, join, or select another local workspace."
+              ? "Connect to another network or remote node."
+              : "Create, join, or select another local network."
           }
           last={!canControl && clientMode}
           control={
             <HoverButton
-              ariaLabel="Workspaces"
+              ariaLabel="Networks"
               onClick={actions.newWorkspace}
               hoverBg={color.titlebar}
               style={outlineButton}
             >
-              Workspaces
+              Networks
             </HoverButton>
           }
         />

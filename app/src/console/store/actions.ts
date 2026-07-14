@@ -1443,15 +1443,12 @@ export function createActions({
     if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
       return navSnapshotOf(before);
     }
-    // With no node in context, only same-scope entries may leave the Home
-    // layer (the no-node web shell traversing its own history). A cross-scope
-    // entry minted by a since-forgotten workspace would restore a shell with
-    // nothing behind it.
-    if (
-      !hasNodeContext(before) &&
-      !snap.atHome &&
-      snap.scope !== currentDocTabsScope()
-    ) {
+    // With no node in context, the account home owns the whole window (epic
+    // W1: it is the front door, replacing the onboarding gate) — there is no
+    // shell behind it, so a non-home entry cannot be honored. Only account-home
+    // entries traverse. (On web a configured node keeps hasNodeContext true, so
+    // that shell still traverses its own history.)
+    if (!hasNodeContext(before) && !snap.atHome) {
       return navSnapshotOf(before);
     }
 
@@ -3072,8 +3069,8 @@ export function createActions({
       const target =
         (id ? st.workspaces.find((w) => w.id === id) : undefined) ?? st.workspace ?? null;
       if (!target) {
-        // nothing to reconnect to — fall back to the front door.
-        patch({ bootError: null, needsOnboarding: true });
+        // nothing to reconnect to — fall back to the account home front door.
+        patch({ bootError: null, atHome: true });
         return;
       }
       // connectActive clears bootError/error at the start; re-drive the SAME
@@ -3303,10 +3300,11 @@ export function createActions({
             // The registry repointed to another workspace — connect to it.
             return connectActive(next);
           }
-          // None remain — fall back to the onboarding gate.
+          // None remain — fall back to the account home (its rail "+" reopens
+          // the connect panel to add a network).
           patch({
             workspace: null,
-            needsOnboarding: true,
+            atHome: true,
             onboardingBusy: false,
             managed: false,
             nodeUrl: null,
@@ -3351,7 +3349,7 @@ export function createActions({
           if (next) return connectActive(next);
           patch({
             workspace: null,
-            needsOnboarding: true,
+            atHome: true,
             onboardingBusy: false,
             managed: false,
             nodeUrl: null,
@@ -3368,14 +3366,14 @@ export function createActions({
 
     goHome: () => patch({ atHome: true }),
 
+    // Open the connect panel (create/join/remote) — a modal over whatever base
+    // is showing (the live shell when connected, the account home otherwise;
+    // both are always a valid base, so no atHome nudge is needed here).
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 
-    dismissOnboarding: () =>
-      // Closable when there's a connection to return to — a local workspace or a
-      // remote node (nodeUrl set). Nothing to go back to on a cold first boot.
-      update((prev) =>
-        prev.workspace || prev.nodeUrl ? { needsOnboarding: false } : {},
-      ),
+    // Always closable now: the account home is always the base surface behind
+    // the connect panel, so dismissing it never strands the user on a blank shell.
+    dismissOnboarding: () => patch({ needsOnboarding: false }),
 
     connectActive,
 

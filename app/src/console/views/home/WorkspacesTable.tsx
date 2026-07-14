@@ -1,10 +1,9 @@
-// Your workspaces, as a table — the account Home's replacement for hunting
-// through Settings to switch networks. One row per workspace on this machine:
-// its name, its network id, and (for the CONNECTED one only, since standing is
-// chain-scoped) whether this device's node is a validator, a resident, or has
-// no seat. Clicking anywhere on an inactive row — or its Enter button, the
-// keyboard path — routes through selectWorkspace, exactly the switch the old
-// NodesCard "Open" button did. "+ Add workspace" opens the onboarding gate.
+// Your networks, as a table — the account home's list, echoing the far-left
+// rail. One row per network on this machine: its name, its network id, and (for
+// the CONNECTED one only, since standing is chain-scoped) whether this device's
+// node is a validator, a resident, or has no seat. Clicking anywhere on an
+// inactive row — or its Enter button, the keyboard path — routes through
+// selectWorkspace, the single node-swap. "+ Add network" opens the connect panel.
 
 import { useState } from "react";
 
@@ -79,14 +78,14 @@ export function WorkspacesTable() {
           marginTop: 18,
         }}
       >
-        <SectionLabel>YOUR WORKSPACES</SectionLabel>
+        <SectionLabel>YOUR NETWORKS</SectionLabel>
         <HoverButton
-          ariaLabel="Add workspace"
+          ariaLabel="Add network"
           onClick={() => actions.newWorkspace()}
           hoverBg={color.titlebar}
           style={outlineButton}
         >
-          + Add workspace
+          + Add network
         </HoverButton>
       </div>
 
@@ -107,8 +106,8 @@ export function WorkspacesTable() {
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
             <tr>
-              <th style={headCell}>Workspace</th>
               <th style={headCell}>Network</th>
+              <th style={headCell}>Network ID</th>
               <th style={headCell}>Your standing</th>
               <th style={headCell}>Active</th>
               <th style={{ ...headCell, textAlign: "right" }} />
@@ -180,7 +179,7 @@ export function WorkspacesTable() {
             {state.workspaces.length === 0 && (
               <tr>
                 <td style={{ ...cell, borderBottom: undefined, color: color.muted }} colSpan={5}>
-                  No workspaces yet — add one to get started.
+                  No networks yet — add one to get started.
                 </td>
               </tr>
             )}

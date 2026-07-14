@@ -17,7 +17,7 @@ import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 import type { Workspace } from "../../domain/workspace-client";
-import { OnboardingGate } from "../views/onboarding/OnboardingGate";
+import { ConnectPanel } from "../views/onboarding/ConnectPanel";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -129,11 +129,10 @@ const nodeFetch = (
   });
 
 /** Boot the provider with `list` in the registry and no active workspace;
- *  `handlers` overlay per-command invoke behavior. Smart boot lands at the
- *  account Home when workspaces exist (state.atHome), or the first-run
- *  onboarding gate when the registry is empty — either way no workspace is
- *  entered and the OnboardingGate UI is rendered in the tree for the picker
- *  affordances the tests drive. */
+ *  `handlers` overlay per-command invoke behavior. Boot lands at the account
+ *  Home (state.atHome) whether or not the registry has networks (epic W1) — no
+ *  network is entered, and the ConnectPanel UI is rendered in the tree for the
+ *  picker affordances the tests drive. */
 const bootGate = async (
   list: Workspace[],
   handlers: Record<string, (args?: Record<string, unknown>) => unknown> = {},
@@ -152,17 +151,12 @@ const bootGate = async (
   });
   render(
     <DucktapeProvider>
-      <OnboardingGate />
+      <ConnectPanel />
       <Probe />
     </DucktapeProvider>,
   );
-  // boot settled and no workspace entered: Home (workspaces present) or the
-  // onboarding gate (empty registry).
-  await waitFor(() =>
-    expect(
-      screen.getByTestId(list.length > 0 ? "home" : "gate").textContent,
-    ).toBe("true"),
-  );
+  // boot settled and no network entered: the account home, registry empty or not.
+  await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
 };
 
 describe("selecting a not-admitted workspace from the picker", () => {
@@ -226,7 +220,7 @@ describe("selecting a not-admitted workspace from the picker", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("refused"))));
     render(
       <DucktapeProvider>
-        <OnboardingGate />
+        <ConnectPanel />
         <Probe />
       </DucktapeProvider>,
     );
@@ -467,7 +461,7 @@ describe("deleteWorkspace", () => {
     });
   });
 
-  it("deleting the ACTIVE workspace tears down and falls back to the gate", async () => {
+  it("deleting the ACTIVE workspace tears down and falls back to the account home", async () => {
     markTauri();
     const team = workspace({});
     invokeMock.mockImplementation((cmd: string) => {
@@ -505,7 +499,7 @@ describe("deleteWorkspace", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("ws").textContent).toBe("none");
-      expect(screen.getByTestId("gate").textContent).toBe("true");
+      expect(screen.getByTestId("home").textContent).toBe("true");
       expect(screen.getByTestId("list").textContent).toBe("");
     });
   });
@@ -521,13 +515,13 @@ describe("onboarding gate — delete affordance", () => {
 
     try {
       await act(async () => {
-        fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
+        fireEvent.click(screen.getByLabelText("Delete network Guest"));
       });
       const dialog = screen.getByRole("dialog", { name: /delete Guest/i });
       expect(nativeConfirm).not.toHaveBeenCalled();
 
       await act(async () => {
-        fireEvent.click(within(dialog).getByRole("button", { name: /delete workspace/i }));
+        fireEvent.click(within(dialog).getByRole("button", { name: /delete network/i }));
       });
 
       await waitFor(() => {
@@ -548,7 +542,7 @@ describe("onboarding gate — delete affordance", () => {
 
     try {
       await act(async () => {
-        fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
+        fireEvent.click(screen.getByLabelText("Delete network Guest"));
       });
       const dialog = screen.getByRole("dialog", { name: /delete Guest/i });
       expect(nativeConfirm).not.toHaveBeenCalled();
@@ -577,12 +571,12 @@ describe("onboarding gate — delete affordance", () => {
 
     try {
       await act(async () => {
-        fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
+        fireEvent.click(screen.getByLabelText("Delete network Guest"));
       });
       let dialog = screen.getByRole("dialog", { name: /delete Guest/i });
       expect(nativeConfirm).not.toHaveBeenCalled();
       await act(async () => {
-        fireEvent.click(within(dialog).getByRole("button", { name: /delete workspace/i }));
+        fireEvent.click(within(dialog).getByRole("button", { name: /delete network/i }));
       });
       await waitFor(() =>
         expect(screen.getByTestId("needs-force").textContent).toBe("g"),
@@ -590,7 +584,7 @@ describe("onboarding gate — delete affordance", () => {
 
       refuse = false;
       await act(async () => {
-        fireEvent.click(screen.getByLabelText("Force delete workspace Guest"));
+        fireEvent.click(screen.getByLabelText("Force delete network Guest"));
       });
       dialog = screen.getByRole("dialog", { name: /force-delete Guest/i });
       await act(async () => {

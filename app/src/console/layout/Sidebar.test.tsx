@@ -1,8 +1,9 @@
-// The icon rail's account avatar opens the account Home (a full-window layer,
-// not a rail screen), so it routes through actions.goHome rather than
-// setScreen("account"). Store comes in through a ConsoleContext harness.
+// The module-nav rail (Sidebar): the view-mode toggle and per-module entries.
+// The account "me" chip lives on the far-left network rail now (epic W1), not
+// here — see test/sim/rail.test.tsx. Store comes in through a ConsoleContext
+// harness.
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi, type Mock } from "vitest";
 
@@ -31,14 +32,6 @@ const renderSidebar = (patch: Partial<ConsoleState> = {}) => {
 };
 
 describe("Sidebar", () => {
-  it("avatar opens Home via goHome, not a rail screen", () => {
-    const { spies } = renderSidebar();
-    fireEvent.click(screen.getByRole("button", { name: /account/i }));
-    expect(spies.goHome).toHaveBeenCalled();
-    // The avatar no longer routes through the rail's setScreen("account").
-    expect(spies.setScreen?.mock.calls ?? []).not.toContainEqual(["account"]);
-  });
-
   const railBg = () =>
     (screen.getByRole("button", { name: "Chat" }) as HTMLButtonElement).style
       .background;

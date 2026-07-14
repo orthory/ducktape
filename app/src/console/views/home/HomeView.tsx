@@ -88,9 +88,9 @@ export function HomeView() {
               lineHeight: 1.5,
             }}
           >
-            Account data lives on each network — enter a workspace above to see
-            this account&apos;s keys and standing there. Device custody below
-            always works.
+            Account data lives on each network — enter a network from the rail
+            to see this account&apos;s keys and standing there. Device custody
+            below always works.
           </div>
         )}
 
