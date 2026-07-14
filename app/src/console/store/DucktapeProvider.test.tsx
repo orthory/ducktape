@@ -138,7 +138,7 @@ const JESS_USER: AccountView = {
   bio: null,
   nonce: 0,
   member_keys: [],
-  nodes: [[0xaa]],
+  nodes: [{ node_key: [0xaa], label: null }],
   updated_at: 1,
 };
 
@@ -2336,7 +2336,10 @@ const SELF_ACCOUNT: AccountView = {
   bio: null,
   nonce: 0,
   member_keys: [],
-  nodes: [[0xaa], [0xbb]],
+  nodes: [
+    { node_key: [0xaa], label: null },
+    { node_key: [0xbb], label: null },
+  ],
   updated_at: 1,
 };
 const SELF_ACCOUNT_HEX = JESS_USER_KEY.map((b) => b.toString(16).padStart(2, "0")).join("");

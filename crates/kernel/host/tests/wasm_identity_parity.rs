@@ -521,7 +521,13 @@ async fn same_ops_inner() {
     assert_eq!(acc.display_name.as_deref(), Some("Kim"));
     assert_eq!(acc.nonce, 6);
     assert_eq!(acc.member_keys.len(), 2, "founder + passkey survive");
-    assert_eq!(acc.nodes, vec![w.node_a.clone()]);
+    assert_eq!(
+        acc.nodes,
+        vec![identity::NodeView {
+            node_key: w.node_a.clone(),
+            label: None,
+        }]
+    );
 
     // error-shaped queries reject identically too (needle containment — the
     // wasm runtime wraps the native reason in its wit-error rendering).

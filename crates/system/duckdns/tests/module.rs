@@ -80,7 +80,10 @@ impl Ctx for TestCtx {
                         bio: None,
                         nonce: 0,
                         member_keys: vec![],
-                        nodes: vec![node_key],
+                        nodes: vec![identity::NodeView {
+                            node_key,
+                            label: None,
+                        }],
                         updated_at: 0,
                     });
                     Ok(identity::encode_reply(&IdentityReply::Account(account)))

@@ -26,6 +26,13 @@ export interface MemberKeyView {
   added_at: number;
 }
 
+/** One bound node as the identity module exposes it: the node key plus the
+ *  optional on-chain device label (`SetNodeLabel`). */
+export interface NodeView {
+  node_key: number[];
+  label: string | null;
+}
+
 export interface AccountView {
   account_id: number[];
   display_name: string | null;
@@ -37,7 +44,7 @@ export interface AccountView {
   bio: string | null;
   nonce: number;
   member_keys: MemberKeyView[];
-  nodes: number[][];
+  nodes: NodeView[];
   updated_at: number;
 }
 
@@ -87,6 +94,21 @@ export const setAccountProfile = (
     { set_profile: { avatar: params.avatar, bio: params.bio } },
     params.origin,
   );
+
+/** Set (or clear, on empty) the on-chain label of a bound node. Origin-gated
+ *  exactly like `setAccountName`: the local managed node stamps its own key as
+ *  origin, and the module accepts the label only for a node bound to that same
+ *  account — no signing ceremony (mirrors the account-name write). */
+export const setNodeLabel = (
+  transport: NodeTransport,
+  params: { nodeKeyHex: string; label: string | null },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    set_node_label: {
+      node_key: hexToBytes(params.nodeKeyHex),
+      label: params.label,
+    },
+  });
 
 // ── Queries (reads over committed state) ────────────────
 

@@ -410,7 +410,7 @@ export const verifyRecord = (record: RouteRecord, account: AccountView): void =>
   if (!bytesEqual(record.statement.account_id, account.account_id)) {
     throw new Error("gateway: route account does not match Identity");
   }
-  if (!account.nodes.some((node) => bytesEqual(node, record.statement.publisher_node))) {
+  if (!account.nodes.some((node) => bytesEqual(node.node_key, record.statement.publisher_node))) {
     throw new Error("gateway: publisher node is no longer bound to the account");
   }
   if (!account.member_keys.some(

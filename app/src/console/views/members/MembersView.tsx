@@ -199,7 +199,7 @@ type MemberItem =
  *  would only repeat the name directly above its own row. */
 function groupMembersByUser(
   members: MemberVM[],
-  nodeUsers: Record<string, { accountId: string; name: string | null }>,
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>,
 ): MemberItem[] {
   const items: MemberItem[] = [];
   const groups = new Map<string, MemberGroup>();

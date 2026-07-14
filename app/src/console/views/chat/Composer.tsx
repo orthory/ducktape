@@ -26,7 +26,7 @@ import { fileRefMarkdown } from "./duck-ref";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
-const EMPTY_NODE_USERS: Record<string, { accountId: string; name: string | null }> = {};
+const EMPTY_NODE_USERS: Record<string, { accountId: string; name: string | null; label?: string | null }> = {};
 const EMPTY_PAGES: PageMeta[] = [];
 
 function FmtButton({

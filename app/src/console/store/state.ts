@@ -217,8 +217,10 @@ export interface ConsoleState {
   authorBios: Record<string, string>;
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
-   *  (null if unset), already folded into `authorNames` when present. */
-  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+   *  (null if unset), already folded into `authorNames` when present; `label`
+   *  is the node's own on-chain device label (`SetNodeLabel`, null if unset),
+   *  read by the device surface. */
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>;
   /** hex(account id) → the account's collected member keys (of any scheme),
    *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
    *  display name; this is the key list the account settings surface renders. */
@@ -697,6 +699,98 @@ export const removeTab = (
   return { tabs: next, active: neighbor };
 };
 
+// ── Cross-network device cache (W5) ─────────────────────
+//
+// The device surface aggregates each joined network's bound nodes for this
+// account. Under the single-active premise there is never a live cross-network
+// query — instead the connected network's device rows are captured here on
+// every switch/refresh, keyed by chain id, and rendered as "last-known" while
+// that network is not the connected one. Mirrors the doc-tabs scope store.
+
+/** One bound node as the device surface shows it. */
+export interface DeviceRow {
+  /** hex(node key). */
+  nodeHex: string;
+  /** The node's on-chain device label, or null. */
+  label: string | null;
+  /** Valset standing on that network at capture time. */
+  standing: "Validator" | "Resident" | "No seat";
+  /** This machine's own node on that network. */
+  isThisDevice: boolean;
+}
+
+/** Last-known device state for one network. */
+export interface NetworkDevices {
+  /** The workspace/network display name at capture time. */
+  name: string;
+  /** ms epoch the rows were captured. */
+  at: number;
+  rows: DeviceRow[];
+}
+
+const DEVICE_CACHE_KEY = "ducktape.deviceCache";
+
+const parseDeviceCache = (raw: string | null): Record<string, NetworkDevices> => {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    // Best-effort shape filter — a malformed or older blob is discarded per key,
+    // never trusted into the UI.
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).filter(
+        (entry): entry is [string, NetworkDevices] => {
+          const v = entry[1] as NetworkDevices;
+          return (
+            !!v &&
+            typeof v === "object" &&
+            typeof v.name === "string" &&
+            Array.isArray(v.rows) &&
+            v.rows.every((r) => r && typeof r.nodeHex === "string")
+          );
+        },
+      ),
+    );
+  } catch {
+    return {};
+  }
+};
+
+/** Every network's last-known device rows, keyed by chain id. */
+export const loadDeviceCache = (): Record<string, NetworkDevices> =>
+  parseDeviceCache(safeGetItem(DEVICE_CACHE_KEY));
+
+/** Capture (overwrite) one network's device rows. Best-effort persistence. */
+export const saveNetworkDevices = (chainId: string, entry: NetworkDevices): void => {
+  try {
+    const store = parseDeviceCache(localStorage.getItem(DEVICE_CACHE_KEY));
+    store[chainId] = entry;
+    localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(store));
+  } catch {
+    // best-effort; a failed write just doesn't survive the switch/restart.
+  }
+};
+
+/** Drop one network's cached devices — used when a workspace is forgotten. */
+export const forgetNetworkDevices = (chainId: string): void => {
+  try {
+    const store = parseDeviceCache(localStorage.getItem(DEVICE_CACHE_KEY));
+    if (!(chainId in store)) return;
+    delete store[chainId];
+    localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(store));
+  } catch {
+    // best-effort.
+  }
+};
+
+const safeGetItem = (key: string): string | null => {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+};
+
 // ── Remote node persistence ─────────────────────────────
 //
 // The last remote node url the user dialed, so the desktop app reconnects to it
@@ -967,7 +1061,7 @@ export interface ConsoleSnapshot {
   authorNames: Record<string, string>;
   authorAvatars: Record<string, string>;
   authorBios: Record<string, string>;
-  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>;
   accountKeys: Record<string, MemberKeyView[]>;
   accountHandles: Record<string, string>;
   pages: PageMeta[];

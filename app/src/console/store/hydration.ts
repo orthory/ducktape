@@ -289,7 +289,7 @@ export interface PeopleSlices {
   authorAvatars: Record<string, string>;
   /** account bio/status, keyed like `authorNames`. */
   authorBios: Record<string, string>;
-  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>;
   accountKeys: Record<string, identityClient.MemberKeyView[]>;
   accountHandles: Record<string, string>;
 }
@@ -312,7 +312,10 @@ export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
       const authorNames: Record<string, string> = {};
       const authorAvatars: Record<string, string> = {};
       const authorBios: Record<string, string> = {};
-      const nodeUsers: Record<string, { accountId: string; name: string | null }> = {};
+      const nodeUsers: Record<
+        string,
+        { accountId: string; name: string | null; label?: string | null }
+      > = {};
       const accountKeys: Record<string, identityClient.MemberKeyView[]> = {};
       const accountHandles: Record<string, string> = Object.fromEntries(
         registrations.map((registration) => [
@@ -331,8 +334,8 @@ export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
         if (u.avatar) authorAvatars[accountId] = u.avatar;
         if (u.bio) authorBios[accountId] = u.bio;
         for (const node of u.nodes) {
-          const nodeHex = chatClient.keyHex(node);
-          nodeUsers[nodeHex] = { accountId, name: u.display_name };
+          const nodeHex = chatClient.keyHex(node.node_key);
+          nodeUsers[nodeHex] = { accountId, name: u.display_name, label: node.label };
           if (u.display_name) authorNames[nodeHex] = u.display_name;
           if (u.avatar) authorAvatars[nodeHex] = u.avatar;
           if (u.bio) authorBios[nodeHex] = u.bio;
