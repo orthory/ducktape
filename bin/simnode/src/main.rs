@@ -443,7 +443,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
 
-    let (handle, cmd_rx, stream_hub) = NodeHandle::channel();
+    // the sim gets the same ring the real node has, so a scenario can assert on
+    // the `logs` topic (e.g. that a failed agent run's breadcrumb surfaces) —
+    // and so tracing added to any shared crate is not silently dropped here.
+    let log_ring = noded::LogRing::default();
+    noded::log::init(Some(log_ring.clone()));
+
+    let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone());
@@ -971,7 +977,13 @@ impl Sim {
         self.stream_hub
             .publish_block(block.height, block.app_hash.clone());
 
-        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
+        offer_effects(
+            &self.workers,
+            block.height,
+            out.events,
+            &mut self.oracle_queue,
+        )
+        .await;
         Ok(Committed {
             block,
             op_hash,
@@ -1105,7 +1117,13 @@ impl Sim {
         }
 
         self.stream_hub.publish_block(self.height, app_hash.clone());
-        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
+        offer_effects(
+            &self.workers,
+            self.height,
+            out.events,
+            &mut self.oracle_queue,
+        )
+        .await;
 
         Ok(BatchInfo {
             height: self.height,
@@ -1210,9 +1228,11 @@ fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
+    height: u64,
     events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
+    let mut notes = noded::log::ModuleNotes::new(height);
     for eff in events {
         let mut claimed = false;
         for w in workers {
@@ -1224,21 +1244,26 @@ async fn offer_effects(
                 }
                 Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
-                    eprintln!("[simnode] worker error: {err}");
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        height,
+                        source = %eff.source,
+                        error = %err,
+                        "worker failed to handle a module event"
+                    );
                     claimed = true;
                     break;
                 }
             }
         }
-        // an unclaimed event is normally plain observability; one that
-        // DECODES as a worker request means a saga is stuck Pending.
-        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
-            println!(
-                "[simnode] WorkerRequest with no worker ({} bytes) — dropped",
-                eff.payload.len()
-            );
+        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+        // guest cannot log) — unless it decodes as a worker request, which means
+        // a saga is stuck Pending.
+        if !claimed {
+            notes.unclaimed(&eff);
         }
     }
+    notes.finish();
 }
 
 /// noded's debug echo oracle, unconditional here: the sim is a dev tool, and a

@@ -20,6 +20,7 @@
 //! this port.
 
 pub mod blobs;
+pub mod log;
 pub mod stream;
 pub use stream::{
     ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame, StreamErrorCode,
@@ -496,6 +497,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
+        .route("/v1/log-filter", post(log_filter))
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
@@ -746,6 +748,20 @@ async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.
     handle.request_shutdown();
     Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// POST /v1/log-filter — retune the log level of a RUNNING node.
+///
+///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'
+///
+/// RUST_LOG is read once at boot, so without this route every `debug!` in the
+/// tree is unreachable without a restart — and restarting a wedged node destroys
+/// the state you restarted it to look at. same trust boundary as /v1/shutdown.
+async fn log_filter(body: String) -> Response {
+    match crate::log::set_filter(body.trim()) {
+        Ok(()) => (StatusCode::OK, body).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &err),
+    }
 }
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —

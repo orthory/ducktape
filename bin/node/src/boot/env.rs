@@ -204,18 +204,46 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         bootstrappers.into_iter().chain(mesh_dial_seeds).collect();
 
     for (i, pk) in peers.iter().enumerate() {
-        println!(
-            "[node {label}] peer[{i}] identity={}",
-            hex_bytes(pk.as_ref())
+        tracing::debug!(
+            target: "ducktape::node",
+            node = %label,
+            index = i,
+            peer = %hex_bytes(pk.as_ref()),
+            "mesh peer"
         );
     }
-    println!(
-        "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), namespace {}, storage {}",
-        peers.len(),
-        validators.len(),
-        if sync_only { ", sync-only" } else { "" },
-        String::from_utf8_lossy(&namespace),
-        storage.display()
+    // the first line of every node's life, and the one that ends a whole incident
+    // class: a stale uplifted binary has faked at least four "regressions" here,
+    // and the standing workaround was `strings <bin> | grep <a symbol you just
+    // added>` — binaries were being dated by which bug they exhibited.
+    //
+    // deliberately NOT a build.rs git sha: cargo will not re-run a build script on
+    // a commit, so the sha bakes in and goes STALE — it would lie during exactly
+    // the stale-binary incident it exists to prevent (and `.git` is a FILE in every
+    // worktree here, so the usual rerun-if-changed fix is fragile too). the exe's
+    // own path + mtime is the mechanical equivalent of the manual workaround, and
+    // it cannot go stale.
+    let exe = std::env::current_exe().unwrap_or_default();
+    let built_unix = std::fs::metadata(&exe)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs());
+    tracing::info!(
+        target: "ducktape::node",
+        node = %label,
+        version = env!("CARGO_PKG_VERSION"),
+        profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+        binary = %exe.display(),
+        built_unix,
+        pid = std::process::id(),
+        listen = %listen,
+        namespace = %String::from_utf8_lossy(&namespace),
+        storage = %storage.display(),
+        peers = peers.len(),
+        validators = validators.len(),
+        sync_only,
+        "node boot"
     );
     // coordinated reach targets are split OUT of the TCP mesh dialer (a
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it

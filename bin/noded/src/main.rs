@@ -52,7 +52,6 @@ use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
-use tracing_subscriber::prelude::*;
 use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order. status reports use
@@ -113,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
 
     let log_ring = noded::LogRing::default();
-    init_tracing(log_ring.clone());
+    noded::log::init(Some(log_ring.clone()));
 
     let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle
@@ -173,19 +172,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[noded] shutdown requested, exiting");
             Ok(())
         })
-}
-
-fn init_tracing(log_ring: noded::LogRing) {
-    // the stream's `logs` topic: info floor by default so debug/trace events
-    // never pay per-event formatting into the ring; RUST_LOG overrides.
-    let ring_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(log_ring)
-        .with_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        );
-    let _ = tracing_subscriber::registry().with(ring_layer).try_init();
 }
 
 /// own the host for the process lifetime: genesis the module set, then apply
@@ -506,7 +492,7 @@ async fn submit_and_drain(
         };
 
     let mut queue = VecDeque::new();
-    offer_effects(workers, events, &mut queue).await;
+    offer_effects(workers, *height, events, &mut queue).await;
     let mut rounds = 1u32;
 
     loop {
@@ -540,7 +526,7 @@ async fn submit_and_drain(
         .await
         {
             Ok((_block, events)) => {
-                offer_effects(workers, events, &mut queue).await;
+                offer_effects(workers, *height, events, &mut queue).await;
             }
             Err(SubmitError::Fatal(err)) => {
                 eprintln!("[noded] FATAL: {err} — halting");
@@ -670,9 +656,11 @@ fn origin_tag(origin: &Origin) -> String {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
+    height: u64,
     events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
+    let mut notes = noded::log::ModuleNotes::new(height);
     for eff in events {
         let mut claimed = false;
         for w in workers {
@@ -684,19 +672,24 @@ async fn offer_effects(
                 }
                 Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
-                    eprintln!("[noded] worker error: {err}");
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        height,
+                        source = %eff.source,
+                        error = %err,
+                        "worker failed to handle a module event"
+                    );
                     claimed = true;
                     break;
                 }
             }
         }
-        // an unclaimed event is normally plain observability; one that
-        // DECODES as a worker request means a saga is stuck Pending.
-        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
-            println!(
-                "[noded] WorkerRequest with no worker ({} bytes) — dropped",
-                eff.payload.len()
-            );
+        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+        // guest cannot log) — unless it decodes as a worker request, which means
+        // a saga is stuck Pending.
+        if !claimed {
+            notes.unclaimed(&eff);
         }
     }
+    notes.finish();
 }

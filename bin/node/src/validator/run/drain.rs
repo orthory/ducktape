@@ -811,6 +811,10 @@ impl ValidatorRuntime<'_> {
         // oracle-as-op). events no worker claims are the plain
         // observability stream — only decodable-but-unhandled worker
         // requests would indicate a saga stuck Pending.
+        // one drain can apply MANY blocks; the events accumulated across all of
+        // them, so stamp them with the drain's finalized tip.
+        let height = node.finalized().map_or(0, |f| f.height);
+        let mut notes = noded::log::ModuleNotes::new(height);
         for eff in node.take_events() {
             let mut claimed = false;
             for w in workers.iter() {
@@ -819,7 +823,14 @@ impl ValidatorRuntime<'_> {
                         let seq = *next_seq;
                         *next_seq += 1;
                         if let Err(e) = node.submit(signer, seq, follow).await {
-                            eprintln!("[node {label}] worker follow-up submit failed: {e}");
+                            tracing::warn!(
+                                target: "ducktape::modules",
+                                node = %label,
+                                height,
+                                source = %eff.source,
+                                error = %e,
+                                "worker follow-up submit failed"
+                            );
                         }
                         claimed = true;
                         break;
@@ -832,21 +843,27 @@ impl ValidatorRuntime<'_> {
                     }
                     Ok(host::worker::WorkOutcome::NotMine) => {}
                     Err(e) => {
-                        eprintln!("[node {label}] worker error: {e}");
+                        tracing::warn!(
+                            target: "ducktape::modules",
+                            node = %label,
+                            height,
+                            source = %eff.source,
+                            error = %e,
+                            "worker failed to handle a module event"
+                        );
                         claimed = true; // errored ≠ unclaimed; don't double-log
                         break;
                     }
                 }
             }
-            // an unclaimed event is normally plain observability; one that
-            // DECODES as a worker request means a saga is stuck Pending.
-            if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
-                println!(
-                    "[node {label}] WorkerRequest with no worker ({} bytes) — dropped",
-                    eff.payload.len()
-                );
+            // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+            // guest cannot log) — unless it decodes as a worker request, which
+            // means a saga is stuck Pending.
+            if !claimed {
+                notes.unclaimed(&eff);
             }
         }
+        notes.finish();
         if dev_demo && !*converged && *applied >= expected {
             let h = node.app_hash();
             println!("[node {label}] converged app_hash={}", hex(&h));

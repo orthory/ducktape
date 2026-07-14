@@ -502,6 +502,12 @@ pub(crate) fn spawn_workspace_node(
             reason,
             log_tail: String::new(),
         })?;
+        // cap the tape in the same change that turns the volume up: daemon.log was
+        // opened append-forever, and only its last 64 KiB is ever read back — so a
+        // long-lived node's BOOT sequence, where every schema/bind/reachability
+        // failure is decided, scrolls permanently out of reach. one generation is
+        // enough; this is a tail, not an archive.
+        roll_if_oversized(log_path);
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -753,6 +759,17 @@ fn add_nvm_node_bins(dirs: &mut Vec<PathBuf>, home: &Path) {
 fn add_existing_path_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
     if dir.is_dir() && !dirs.iter().any(|existing| existing == &dir) {
         dirs.push(dir);
+    }
+}
+
+/// `daemon.log` grows unbounded across every restart of a workspace's node. roll
+/// it once past this size, keeping exactly one previous generation.
+const LOG_ROLL_BYTES: u64 = 32 * 1024 * 1024;
+
+fn roll_if_oversized(log_path: &Path) {
+    if fs::metadata(log_path).is_ok_and(|meta| meta.len() > LOG_ROLL_BYTES) {
+        // best-effort: a failed roll must never block the node from starting.
+        let _ = fs::rename(log_path, log_path.with_extension("log.1"));
     }
 }
 

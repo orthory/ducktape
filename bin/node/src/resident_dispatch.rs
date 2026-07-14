@@ -582,6 +582,7 @@ format = "text"
                 .to_string()
                 .into_bytes(),
                 demands: Default::default(),
+                // `Queue` — the legacy wait-for-capacity behavior these tests assume.
                 admission: Default::default(),
             }),
             deadline: None,

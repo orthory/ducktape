@@ -90,6 +90,9 @@ flate2 = "1"
 # ssh/https transport forge doesn't use either.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+# the log subscriber every bin installs (src/log.rs): ONE reloadable filter over
+# stderr + the ws-streamed LogRing. `reload` backs POST /v1/log-filter.
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

@@ -985,10 +985,23 @@ fn catch_up_logs(topic: &str, seq: &mut u64, logs: &LogRing) -> CatchUpResult {
     let mut frames = Vec::new();
     let (_, floor) = logs.read_after(*seq, STREAM_CATCHUP_BUDGET);
     if *seq < floor {
+        // the ring wrapped past this reader: the evidence it came for is GONE.
+        // `Lagged` alone re-cursors SILENTLY, so the tab just shows a shorter
+        // history and nothing says why — say it in the tail itself, where the
+        // human is actually looking. this is also how you learn empirically
+        // whether the `info` floor is too chatty, instead of guessing.
+        let dropped = floor - *seq;
         *seq = floor;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
             cursor: floor.to_string(),
+        });
+        frames.push(ServerFrame::Tail {
+            topic: topic.to_string(),
+            cursor: floor.to_string(),
+            item: TailItem::Log {
+                line: format!("--- {dropped} earlier log line(s) dropped (ring full) ---"),
+            },
         });
     }
     loop {
@@ -1352,8 +1365,15 @@ mod tests {
         assert!(
             matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "1")
         );
+        // the eviction is NAMED in the tail, not just silently re-cursored: a
+        // reader must never mistake a truncated history for a quiet node.
+        assert!(matches!(
+            result.frames.get(1),
+            Some(ServerFrame::Tail { item: TailItem::Log { line }, .. })
+                if line == "--- 1 earlier log line(s) dropped (ring full) ---"
+        ));
         assert!(
-            matches!(result.frames.get(1), Some(ServerFrame::Tail { cursor, .. }) if cursor == "2")
+            matches!(result.frames.get(2), Some(ServerFrame::Tail { cursor, .. }) if cursor == "2")
         );
         assert_eq!(seq, (LOG_RING_CAPACITY + 1) as u64);
     }

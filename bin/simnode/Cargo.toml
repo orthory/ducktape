@@ -48,7 +48,10 @@ blobstore = { workspace = true }
 # variable-length hex decode for the `hex:` origin escape and `--with-valset`
 # genesis keys (raw ed25519 bytes the JSON-string origin lane cannot express).
 duckfs-core = { workspace = true }
+# the sim installs the SAME subscriber the real node does (noded::log), so a
+# scenario sees the module breadcrumbs a wasm guest has no other way to emit.
 noded = { path = "../noded" }
+tracing = { workspace = true }
 # the op-frame codec: `node::decode_frame` verifies a signed frame's signature
 # and yields the VERIFIED signer as the op origin — the SAME function every
 # validator and the embedded daemon use, so the sim's `/v1/submit/frame` lane

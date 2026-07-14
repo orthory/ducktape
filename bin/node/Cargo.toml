@@ -122,9 +122,10 @@ bip39 = { workspace = true }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 zeroize = { workspace = true }
-# stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
+# the node's own events (noded::log installs the subscriber). the p2p/consensus
+# internals ride the same filter: RUST_LOG=commonware_p2p=debug.
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing = "0.1"
 # Raise the node's inherited open-file soft limit before opening module stores.
 libc = "0.2"
 
