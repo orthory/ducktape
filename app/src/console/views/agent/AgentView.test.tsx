@@ -17,7 +17,7 @@ import {
   filledForeground,
   filledMix,
 } from "./parts";
-import type { PendingRun } from "../../../domain/runs-client";
+import type { PendingRun, RunRecord } from "../../../domain/runs-client";
 
 const channels: Channel[] = [
   {
@@ -816,6 +816,111 @@ describe("AgentView", () => {
     });
 
     expect(screen.getAllByText("[node cafe1234] working")).toHaveLength(1);
+  });
+
+  it("keyboard-opens a terminal run log and catches up retained output", async () => {
+    const record: RunRecord = {
+      run_id: "forge:ducktape:56/7/summarizer",
+      agent_id: "summarizer",
+      channel_id: "forge:ducktape:56",
+      anchor_seq: 7,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 30,
+      delivered_at: 35,
+      executing_node: "unknown",
+      output_ref: "agent/item-56@abcdef0123456789",
+      pr_number: 140,
+    };
+    let handlers: TopicHandlers | undefined;
+    const subscribe = vi.fn((_topics, next: TopicHandlers) => {
+      handlers = next;
+      return () => {};
+    });
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [record] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe,
+    });
+    renderAgents({ pendingRuns: [] }, transport);
+
+    openTab(/activity/i);
+    const toggle = await screen.findByRole("button", {
+      name: /show execution log for run forge:ducktape:56\/7\/summarizer/i,
+    });
+    toggle.focus();
+    expect(toggle).toHaveFocus();
+    fireEvent.click(toggle);
+
+    const log = screen.getByRole("log", {
+      name: /execution log for run forge:ducktape:56\/7\/summarizer/i,
+    });
+    expect(log).toHaveFocus();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-controls", log.id);
+    expect(within(log).getByText("Waiting for retained output…")).toBeInTheDocument();
+    expect(subscribe).toHaveBeenCalledWith(
+      ["run-output:e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc"],
+      expect.any(Object),
+    );
+
+    act(() => {
+      handlers?.onTail?.({
+        type: "tail",
+        topic:
+          "run-output:e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc",
+        cursor: "3",
+        item: { stream: "stderr", line: "focused test failed" },
+      });
+    });
+    expect(within(log).getByText("focused test failed")).toBeInTheDocument();
+  });
+
+  it("opens history anchors and PRs through user-facing navigation", async () => {
+    const forgeRecord: RunRecord = {
+      run_id: "forge:ducktape:56/7/summarizer",
+      agent_id: "summarizer",
+      channel_id: "forge:ducktape:56",
+      anchor_seq: 7,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 30,
+      delivered_at: 35,
+      executing_node: "unknown",
+      output_ref: null,
+      pr_number: 140,
+    };
+    const chatRecord: RunRecord = {
+      ...forgeRecord,
+      run_id: "general/42/summarizer",
+      channel_id: "general",
+      anchor_seq: 42,
+      pr_number: null,
+    };
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [forgeRecord, chatRecord] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+    });
+    const { spies } = renderAgents({ pendingRuns: [] }, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open forge:ducktape:56 @7" }),
+    );
+    expect(spies.openForgeItem).toHaveBeenCalledWith({
+      repo: "ducktape",
+      number: 56,
+      messageSeq: 7,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open General @42" }));
+    expect(spies.focusMessage).toHaveBeenCalledWith("general", 42);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open PR #140" }));
+    expect(spies.openForgeItem).toHaveBeenLastCalledWith({
+      repo: "ducktape",
+      number: 140,
+    });
   });
 
   it("filters the timeline to the runs I requested", () => {

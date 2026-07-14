@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   cancelRun,
+  dispatchIdForRun,
   enableJobWorker,
   pendingRuns,
   recentRuns,
@@ -22,6 +23,12 @@ const stubTransport = (reply?: unknown) =>
   makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
 describe("runs msgs", () => {
+  it("derives the host output-ring key from the stable run id", () => {
+    expect(dispatchIdForRun("forge:ducktape:56/7/summarizer")).toBe(
+      "e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc",
+    );
+  });
+
   it("encodes WatchChannel — a unit policy and the Assigned newtype", async () => {
     const transport = stubTransport();
 

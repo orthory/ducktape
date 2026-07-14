@@ -9,8 +9,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
 import type { RunLease } from "../../../domain/dispatch-client";
+import { forgeItemTarget } from "../../../domain/forge-client";
 import { displayNameForKey, shortKey } from "../../../domain/names";
-import { recentRuns } from "../../../domain/runs-client";
+import { dispatchIdForRun, recentRuns } from "../../../domain/runs-client";
 import type { PendingRun, RunRecord } from "../../../domain/runs-client";
 import {
   isRunOutputTailItem,
@@ -84,16 +85,26 @@ const shortOutputRef = (ref: string): string => {
   return ref.length > 16 ? `${ref.slice(0, 16)}…` : ref;
 };
 
-function RunOutputPane({ run }: { run: PendingRun }) {
+function RunOutputPane({
+  runId,
+  dispatchId,
+  panelId,
+}: {
+  runId: string;
+  dispatchId: string;
+  panelId: string;
+}) {
   const { transport } = useDucktape();
   const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
+  const [unavailable, setUnavailable] = useState(!transport);
   const pane = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setEntries([]);
+    setUnavailable(!transport);
     if (!transport) return;
     let lastCursor = 0;
-    const topic = runOutputTopic(run.dispatch_id);
+    const topic = runOutputTopic(dispatchId);
     return transport.subscribe([topic], {
       onTail: (frame) => {
         if (frame.topic !== topic || !isRunOutputTailItem(frame.item)) return;
@@ -118,8 +129,11 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         };
         setEntries((prev) => appendActivityEntry(prev, line));
       },
+      onRefused: (refusedTopic) => {
+        if (refusedTopic === topic) setUnavailable(true);
+      },
     });
-  }, [transport, run.dispatch_id]);
+  }, [transport, dispatchId]);
 
   const rows = useMemo(() => parseActivityLog(entries), [entries]);
 
@@ -127,12 +141,21 @@ function RunOutputPane({ run }: { run: PendingRun }) {
     if (pane.current) pane.current.scrollTop = pane.current.scrollHeight;
   }, [rows.length]);
 
+  useEffect(() => {
+    pane.current?.focus();
+  }, []);
+
   const rowLabel = (row: ActivityLogRow): string =>
     row.kind === "blank" ? "" : row.kind.toUpperCase();
 
   return (
     <div
+      id={panelId}
       ref={pane}
+      role="log"
+      aria-label={`Execution log for run ${runId}`}
+      aria-live="polite"
+      tabIndex={0}
       style={{
         marginTop: 10,
         border: `1px solid ${color.borderSoft}`,
@@ -141,11 +164,12 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         padding: "8px 10px",
         maxHeight: 220,
         overflow: "auto",
+        flexBasis: "100%",
       }}
     >
       {rows.length === 0 ? (
         <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
-          waiting for output…
+          {unavailable ? "Run output unavailable." : "Waiting for retained output…"}
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -290,6 +314,7 @@ function RunRow({
   mine?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const logPanelId = `run-log-${run.dispatch_id}`;
   const leaseRemaining =
     lease?.expiresAt === null || lease?.expiresAt === undefined
       ? null
@@ -398,6 +423,7 @@ function RunRow({
             <button
               type="button"
               aria-expanded={expanded}
+              aria-controls={logPanelId}
               aria-label={`${expanded ? "Hide" : "Show"} live log for run ${run.run_id}`}
               onClick={() => setExpanded((v) => !v)}
               style={{
@@ -427,7 +453,13 @@ function RunRow({
               ? `started ${relTime(wallClockSecs(run.created_at)!)}`
               : runDetail(run)}
           </div>
-          {expanded && <RunOutputPane run={run} />}
+          {expanded && (
+            <RunOutputPane
+              runId={run.run_id}
+              dispatchId={run.dispatch_id}
+              panelId={logPanelId}
+            />
+          )}
         </div>
       </GroupCard>
     </div>
@@ -445,6 +477,8 @@ function HistoryRow({
   channels: Channel[];
   authorNames: Record<string, string>;
 }) {
+  const { actions } = useDucktape();
+  const [expanded, setExpanded] = useState(false);
   const delivered = rec.outcome === "delivered";
   const anchor = rec.channel_id
     ? `${channelLabel(channels, rec.channel_id)} @${rec.anchor_seq}`
@@ -453,6 +487,18 @@ function HistoryRow({
     rec.executing_node !== "unknown"
       ? (displayNameForKey(rec.executing_node, authorNames) ?? shortKey(rec.executing_node))
       : null;
+  const forgeTarget = rec.channel_id
+    ? forgeItemTarget(rec.channel_id, { messageSeq: rec.anchor_seq })
+    : null;
+  const prNumber = rec.pr_number;
+  const dispatchId = dispatchIdForRun(rec.run_id);
+  const logPanelId = `run-log-${dispatchId}`;
+  const openAnchor = () => {
+    if (forgeTarget) actions.openForgeItem(forgeTarget);
+    else if (rec.channel_id && rec.anchor_seq > 0) {
+      actions.focusMessage(rec.channel_id, rec.anchor_seq);
+    }
+  };
   return (
     <div
       title={`run ${rec.run_id}`}
@@ -482,10 +528,59 @@ function HistoryRow({
         tone={delivered ? statusTone.success : statusTone.danger}
       />
       {rec.degraded && <StatusPill label="DEGRADED" tone={statusTone.warning} />}
-      <Chip text={anchor} tone={statusTone.blue} />
+      {rec.channel_id && rec.anchor_seq > 0 ? (
+        <button
+          type="button"
+          onClick={openAnchor}
+          aria-label={`Open ${anchor}`}
+          style={{
+            ...secondaryButton,
+            minHeight: 22,
+            padding: "2px 7px",
+            color: statusTone.blue.text,
+          }}
+        >
+          {anchor}
+        </button>
+      ) : (
+        <Chip text={anchor} tone={statusTone.blue} />
+      )}
       <Chip text={runDuration(rec)} />
       {nodeName && <Chip text={`on ${nodeName}`} tone={statusTone.agent} />}
-      {rec.pr_number !== null && <Chip text={`PR #${rec.pr_number}`} tone={statusTone.success} />}
+      {prNumber !== null && forgeTarget ? (
+        <button
+          type="button"
+          onClick={() =>
+            actions.openForgeItem({ repo: forgeTarget.repo, number: prNumber })
+          }
+          aria-label={`Open PR #${prNumber}`}
+          style={{
+            ...secondaryButton,
+            minHeight: 22,
+            padding: "2px 7px",
+            color: statusTone.success.text,
+          }}
+        >
+          PR #{prNumber}
+        </button>
+      ) : prNumber !== null ? (
+        <Chip text={`PR #${prNumber}`} tone={statusTone.success} />
+      ) : null}
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={logPanelId}
+        aria-label={`${expanded ? "Hide" : "Show"} execution log for run ${rec.run_id}`}
+        onClick={() => setExpanded((value) => !value)}
+        style={{
+          ...secondaryButton,
+          minHeight: 22,
+          padding: "2px 8px",
+          font: `600 10px ${font.sans}`,
+        }}
+      >
+        Log
+      </button>
       {rec.output_ref && (
         <span
           title={rec.output_ref}
@@ -493,6 +588,9 @@ function HistoryRow({
         >
           {shortOutputRef(rec.output_ref)}
         </span>
+      )}
+      {expanded && (
+        <RunOutputPane runId={rec.run_id} dispatchId={dispatchId} panelId={logPanelId} />
       )}
     </div>
   );
