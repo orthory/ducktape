@@ -497,9 +497,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = noded::router(handle).merge(sim_router(sim_handle)).layer(
                 axum::middleware::from_fn_with_state(persona, strip_receipt_op_hash),
             );
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
-                .await?;
+            // connect-info so the admin namespace's fail-closed loopback gate
+            // sees the (loopback) peer — same as noded::serve.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+            .await?;
             println!("[simnode] shutdown requested, exiting");
             Ok(())
         })

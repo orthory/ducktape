@@ -158,7 +158,7 @@ export const spawnSimnode = (options: SimSpawnOptions = {}): Promise<SimNode> =>
       sim: controlOf(base),
       stop: () =>
         Promise.resolve()
-          .then(() => fetch(`${base}/v1/shutdown`, { method: "POST" }))
+          .then(() => fetch(`${base}/v1/admin/shutdown`, { method: "POST" }))
           .catch(() => undefined) // already gone
           .then(() => {
             child.kill();

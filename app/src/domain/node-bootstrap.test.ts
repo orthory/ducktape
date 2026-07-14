@@ -91,13 +91,15 @@ describe("waitUntilUp", () => {
 });
 
 describe("shutdownNode", () => {
-  it("posts /v1/shutdown and surfaces failures", async () => {
+  it("posts /v1/admin/shutdown and surfaces failures", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { ok: true }));
     vi.stubGlobal("fetch", fetchMock);
 
     await shutdownNode("http://127.0.0.1:8844/");
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8844/v1/shutdown", {
+    // owner-gated control surface; local (loopback) needs no PoP headers.
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8844/v1/admin/shutdown", {
       method: "POST",
+      headers: {},
     });
 
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(500, {})));

@@ -719,7 +719,7 @@ fn state_persists_across_restart() {
 
         // graceful retirement THROUGH the wire — the port is the daemon's
         // identity; a client that spawned it has no pid to signal.
-        let (code, _) = daemon.request("POST", "/v1/shutdown", None);
+        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
         assert_eq!(code, 200);
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
@@ -730,7 +730,7 @@ fn state_persists_across_restart() {
                     break;
                 }
                 None => {
-                    assert!(Instant::now() < deadline, "daemon ignored /v1/shutdown");
+                    assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -866,12 +866,12 @@ fn per_module_index_serves_ops_and_views() {
 
         pre_restart_height = daemon.status()["height"].as_u64().expect("height");
 
-        let (code, _) = daemon.request("POST", "/v1/shutdown", None);
+        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
         assert_eq!(code, 200);
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         while daemon.child.try_wait().expect("poll daemon").is_none() {
-            assert!(Instant::now() < deadline, "daemon ignored /v1/shutdown");
+            assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
             std::thread::sleep(Duration::from_millis(100));
         }
     }

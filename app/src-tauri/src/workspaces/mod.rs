@@ -944,8 +944,22 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
         );
     }
     // keep the handle instead of dropping it: it is the only thing that can ever
-    // report HOW the node died (and reap it). see `daemon::watch_node_exit`.
-    crate::daemon::watch_node_exit(child, ws.name.clone());
+    // report HOW the node died (and reap it). the supervisor also revives a node
+    // that crashes — validator uptime for a user who knows nothing of daemons —
+    // unless a deliberate stop raised its intent flag. see `daemon::watch_node_exit`.
+    let stopping = crate::daemon::register_supervised(&dir);
+    crate::daemon::watch_node_exit(
+        child,
+        crate::daemon::Supervisor {
+            config: node_toml(&dir),
+            log: log_path.clone(),
+            http_port: ws.ports.http,
+            listen_port: ws.ports.listen,
+            pidfile: pidfile(&dir),
+            workspace: ws.name.clone(),
+            stopping,
+        },
+    );
     // commit `active` ONLY now the node is confirmed up: a select that fails to
     // start the node must not repoint `active` at a workspace the next boot
     // then can't launch (which would strand the app on that dead workspace).

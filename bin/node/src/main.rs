@@ -326,6 +326,10 @@ fn run_node(
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
         forge_committer: config::hex_bytes(signer.public_key().as_ref()),
+        // the owner-gated admin namespace resolves ownership against this node's
+        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
+        node_key: signer.public_key().as_ref().to_vec(),
+        admin_exposure: noded::AdminExposure::from_env(),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.

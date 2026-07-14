@@ -157,3 +157,26 @@ export const accountOfMember = (
       }),
     )
     .then((reply) => replyVariant<AccountView | null>(reply, "account"));
+
+const bytesToHex = (bytes: number[]): string =>
+  bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** ADR A5 ownership: is `accountKeyHex` a member of the account that owns
+ *  `nodeKeyHex`? This is the chain fact behind remote node control — the app is
+ *  the owner iff its logged-in account key is a member of the node's bound
+ *  account. False when the node is unbound, the key is empty, or the read fails
+ *  (fail-closed: no ownership claim without a committed one). */
+export const nodeOwnedBy = (
+  transport: NodeTransport,
+  nodeKeyHex: string,
+  accountKeyHex: string,
+): Promise<boolean> => {
+  if (!accountKeyHex || !nodeKeyHex) return Promise.resolve(false);
+  const want = accountKeyHex.toLowerCase();
+  return accountOfNode(transport, nodeKeyHex)
+    .then(
+      (account) =>
+        !!account && account.member_keys.some((m) => bytesToHex(m.pubkey) === want),
+    )
+    .catch(() => false);
+};

@@ -27,7 +27,7 @@ try {
   }
   const port = registry.workspaces?.find((item) => item.id === id)?.ports?.http
   if (Number.isInteger(port) && port! > 0 && port! <= 65_535) {
-    await fetch(`http://127.0.0.1:${port}/v1/shutdown`, { method: 'POST', signal: AbortSignal.timeout(500) }).catch(() => undefined)
+    await fetch(`http://127.0.0.1:${port}/v1/admin/shutdown`, { method: 'POST', signal: AbortSignal.timeout(500) }).catch(() => undefined)
   }
 } catch { /* exact process teardown below remains authoritative */ }
 

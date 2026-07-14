@@ -104,6 +104,10 @@ pub struct NodeHandle {
     /// the node's code-plane stage lane (module-code fan-out). `None` on a
     /// daemon without a mesh — the admin stage route answers 503 there.
     pub(crate) code_stage: Option<crate::module_code::CodeStageLane>,
+    /// the owner-gated control namespace's exposure + ownership config (ADR
+    /// A2/A5). the default (`Loopback`, no node key) is the embedded daemon's
+    /// loopback-trust surface; the full node overrides it via [`Self::with_admin`].
+    pub(crate) admin: crate::admin::AdminConfig,
 }
 
 impl NodeHandle {
@@ -132,6 +136,7 @@ impl NodeHandle {
             browser_gateway: None,
             duckfs_workspaces: None,
             code_stage: None,
+            admin: crate::admin::AdminConfig::default(),
         };
         (handle, cmd_rx, hub)
     }
@@ -178,6 +183,15 @@ impl NodeHandle {
     /// only the p2p validator wires one — it owns the overlay the plane rides.
     pub fn with_code_stage(mut self, lane: crate::module_code::CodeStageLane) -> Self {
         self.code_stage = Some(lane);
+        self
+    }
+
+    /// configure the owner-gated control namespace (ADR A2/A5). the full node
+    /// passes its own consensus key (the `BindNode` subject ownership resolves
+    /// against) and the exposure the operator chose; a daemon that leaves this
+    /// at the default serves the loopback-trust surface.
+    pub fn with_admin(mut self, admin: crate::admin::AdminConfig) -> Self {
+        self.admin = admin;
         self
     }
 
@@ -234,7 +248,7 @@ impl NodeHandle {
         self.shutdown.send_replace(true);
     }
 
-    /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
+    /// resolves once a client asked the daemon to exit (POST /v1/admin/shutdown).
     pub async fn shutdown_requested(&self) {
         let mut shutdown = self.shutdown.subscribe();
         if *shutdown.borrow() {

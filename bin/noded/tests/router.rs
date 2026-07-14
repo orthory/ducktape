@@ -8,7 +8,10 @@ use commonware_cryptography::Signer as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
-use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
+use noded::{
+    AdminConfig, AdminExposure, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeStatus,
+};
 use tower::ServiceExt as _;
 
 /// a scripted actor: answers every command the same way, like a module host
@@ -425,8 +428,15 @@ async fn shutdown_acknowledges_then_signals() {
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
+    // shutdown moved to the owner-gated admin namespace (ADR A2). the default
+    // handle is loopback-trust with no on-chain owner; the loopback check is
+    // FAIL-CLOSED on a missing ConnectInfo, so the test stamps a loopback peer
+    // exactly as the connect-info make-service would.
     let response = noded::router(handle)
-        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .oneshot(with_peer(
+            post("/v1/admin/shutdown", serde_json::json!({})),
+            "127.0.0.1:40000",
+        ))
         .await
         .unwrap();
 
@@ -441,6 +451,222 @@ async fn shutdown_acknowledges_then_signals() {
     )
     .await
     .expect("shutdown signal fired");
+}
+
+/// stamp a peer address onto a request the way `into_make_service_with_connect_info`
+/// would, so the admin guard's loopback check has something to read.
+fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        addr.parse::<std::net::SocketAddr>().expect("test peer addr"),
+    ));
+    req
+}
+
+/// shutdown left the unauthenticated public surface entirely (ADR A2). the old
+/// path is a 404 — flag-day, no alias.
+#[tokio::test]
+async fn the_old_public_shutdown_route_is_gone() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "shutdown must not answer on the public surface anymore"
+    );
+}
+
+/// `DUCKTAPE_ADMIN=off` leaves the control surface simply ABSENT — the admin
+/// routes are never registered, so they 404 (not a gated-but-present 403).
+#[tokio::test]
+async fn a_disabled_admin_namespace_is_absent() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let handle = handle.with_admin(AdminConfig {
+        exposure: AdminExposure::Disabled,
+        node_key: None,
+        ..Default::default()
+    });
+    let response = noded::router(handle)
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a disabled admin namespace is absent, not forbidden"
+    );
+}
+
+/// under the default `Loopback` exposure a non-loopback peer is refused before
+/// any owner check — the exposure gate is the outer wall.
+#[tokio::test]
+async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let request = with_peer(
+        post("/v1/admin/shutdown", serde_json::json!({})),
+        "203.0.113.7:5555",
+    );
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "loopback-only admin refuses a remote peer"
+    );
+}
+
+/// an actor that answers exactly one thing: `identity` `OfNode` → the account
+/// that owns `node_key`, whose sole member is `owner_key`. everything else is a
+/// module error (the admin owner path only ever asks this one question).
+fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, node_key: Vec<u8>, owner_key: Vec<u8>) {
+    tokio::spawn(async move {
+        while let Some(cmd) = cmds.next().await {
+            if let NodeCommand::Query { target, reply, .. } = cmd {
+                assert_eq!(target, "identity");
+                let view = identity::AccountView {
+                    account_id: owner_key.clone(),
+                    display_name: None,
+                    avatar: None,
+                    bio: None,
+                    nonce: 0,
+                    member_keys: vec![identity::MemberKeyView {
+                        pubkey: owner_key.clone(),
+                        kind: identity::KeyKind::Ed25519,
+                        label: None,
+                        added_at: 0,
+                    }],
+                    nodes: vec![identity::NodeView {
+                        node_key: node_key.clone(),
+                        label: None,
+                    }],
+                    updated_at: 0,
+                };
+                let bytes = identity::encode_reply(&identity::IdentityReply::Account(Some(view)));
+                let _ = reply.send(Ok(bytes));
+            }
+        }
+    });
+}
+
+fn admin_signed_post(
+    uri: &str,
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    claimed_key_hex: &str,
+    node_key: &[u8],
+    ts: u64,
+) -> Request<Body> {
+    let sig = noded::admin::sign_admin(signer, "POST", uri, node_key, ts);
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(noded::admin::ADMIN_KEY_HEADER, claimed_key_hex)
+        .header(noded::admin::ADMIN_TS_HEADER, ts.to_string())
+        .header(
+            noded::admin::ADMIN_SIG_HEADER,
+            duckfs_core::to_hex(sig.as_ref()),
+        )
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+/// the full `Public` owner path over the actor lane: unsigned is refused, a
+/// non-owner signature is refused, the committed owner's signature passes.
+#[tokio::test]
+async fn public_admin_enforces_the_committed_owner_pop() {
+    use commonware_cryptography::Signer as _;
+    let owner = commonware_cryptography::ed25519::PrivateKey::from_seed(77);
+    let owner_key = owner.public_key().as_ref().to_vec();
+    let node_key = vec![0xabu8; 32];
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let owner_key_hex = duckfs_core::to_hex(&owner_key);
+
+    let mk_handle = || {
+        let (handle, cmd_rx, _e) = NodeHandle::channel();
+        spawn_owner_actor(cmd_rx, node_key.clone(), owner_key.clone());
+        handle.with_admin(AdminConfig {
+            exposure: AdminExposure::Public,
+            node_key: Some(node_key.clone()),
+            ..Default::default()
+        })
+    };
+
+    // unsigned ⇒ 401.
+    let bare = noded::router(mk_handle())
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED, "public admin needs a signature");
+
+    // signed by a non-owner (valid PoP, wrong account) ⇒ 403.
+    let attacker = commonware_cryptography::ed25519::PrivateKey::from_seed(99);
+    let attacker_hex = duckfs_core::to_hex(attacker.public_key().as_ref());
+    let forged = noded::router(mk_handle())
+        .oneshot(admin_signed_post(
+            "/v1/admin/shutdown",
+            &attacker,
+            &attacker_hex,
+            &node_key,
+            ts,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN, "a non-owner signer is refused");
+
+    // the owner's signature bound to a DIFFERENT node ⇒ 401 (cross-node replay).
+    let replayed = noded::router(mk_handle())
+        .oneshot(admin_signed_post(
+            "/v1/admin/shutdown",
+            &owner,
+            &owner_key_hex,
+            &[0xcd; 32],
+            ts,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.status(),
+        StatusCode::UNAUTHORIZED,
+        "a signature minted for another node is refused here"
+    );
+
+    // the committed owner's signature for THIS node ⇒ 200.
+    let ok = noded::router(mk_handle())
+        .oneshot(admin_signed_post(
+            "/v1/admin/shutdown",
+            &owner,
+            &owner_key_hex,
+            &node_key,
+            ts,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "the node owner may drive control");
+}
+
+/// the loopback gate FAILS CLOSED: a request with no ConnectInfo at all (an
+/// embedder that forgot the connect-info make-service) is refused, never
+/// granted local trust.
+#[tokio::test]
+async fn a_peer_without_connect_info_is_refused() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an unknown peer must not inherit loopback trust"
+    );
 }
 
 #[tokio::test]
