@@ -89,6 +89,39 @@ struct Electorate {
     rule: VotingRule,
 }
 
+/// who a verified frame origin speaks for (see [`Governance::resolve_actor`]).
+enum Actor {
+    /// the origin is a member key of this Identity account: it acts for every
+    /// node the account has bound (ballots stay NODE-keyed — one account
+    /// owning three electorate nodes casts three node ballots, the exact
+    /// power it held when each node voted for itself).
+    Account {
+        account_id: Vec<u8>,
+        nodes: Vec<Vec<u8>>,
+    },
+    /// the origin is no account member — it acts as itself, a node key.
+    Node(Vec<u8>),
+}
+
+impl Actor {
+    /// the node keys this actor may cast ballots as / claim standing through.
+    fn nodes(&self) -> &[Vec<u8>] {
+        match self {
+            Actor::Account { nodes, .. } => nodes,
+            Actor::Node(node) => std::slice::from_ref(node),
+        }
+    }
+
+    /// the id recorded as a proposal's `proposer` — stable across whichever
+    /// member key of an account signed.
+    fn principal(&self) -> &[u8] {
+        match self {
+            Actor::Account { account_id, .. } => account_id,
+            Actor::Node(node) => node,
+        }
+    }
+}
+
 /// one settled invite redemption — the single-use record plus the audit
 /// trail (who invited whom, when).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,21 +262,52 @@ impl Governance {
         }
     }
 
+    /// resolve the verified frame origin to a governance ACTOR (ADR A1, the
+    /// account-signed lane): an origin that is a MEMBER KEY of an Identity
+    /// account acts for that account — its ballots are the account's bound
+    /// nodes. an origin that is no account member acts as ITSELF (a node key):
+    /// a validator node remains a first-class governance actor (its own
+    /// automation, upgrade tooling, self-serving ops), so this arm is the
+    /// model, not a compat alias — the deleted thing is the node-local
+    /// re-signing TRANSPORT, not node principals.
+    async fn resolve_actor(&self, ctx: &dyn Ctx, origin: &[u8]) -> Result<Actor, Error> {
+        // an origin that is no account member — including a network with no
+        // identity module at all (an identity query error means the module is
+        // absent, so no accounts exist) — acts as its own node key. a real
+        // network always genesis-wires identity, so the error arm is only
+        // reachable in the identity-less test hosts.
+        let resolved = self
+            .identity_account(
+                ctx,
+                IdentityQuery::OfMember {
+                    member_key: origin.to_vec(),
+                },
+            )
+            .await
+            .unwrap_or(None);
+        match resolved {
+            Some(account) => Ok(Actor::Account {
+                account_id: account.account_id,
+                nodes: account.nodes.into_iter().map(|n| n.node_key).collect(),
+            }),
+            None => Ok(Actor::Node(origin.to_vec())),
+        }
+    }
+
+    /// the Identity ACCOUNT a submitter speaks for in account (share) mode: a
+    /// member key resolves to its own account; a node key resolves through its
+    /// committed `BindNode`.
+    async fn account_principal(&self, ctx: &dyn Ctx, submitter: &[u8]) -> Result<Vec<u8>, Error> {
+        match self.resolve_actor(ctx, submitter).await? {
+            Actor::Account { account_id, .. } => Ok(account_id),
+            Actor::Node(node) => self.account_of_node(ctx, &node).await,
+        }
+    }
+
     /// the CURRENT member set: the valset module's staged-over-committed
     /// projection, via the shared `valset::members` read.
     async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
         valset::members(ctx, &self.valset_id).await
-    }
-
-    async fn require_member(&self, ctx: &dyn Ctx, key: &[u8]) -> Result<(), Error> {
-        let members = self.members(ctx).await?;
-        if members.iter().any(|m| m == key) {
-            Ok(())
-        } else {
-            Err(Error::Module(
-                "submitter is not a current validator-set member".into(),
-            ))
-        }
     }
 
     fn effective_shares(&self) -> Option<&BTreeMap<Vec<u8>, u64>> {
@@ -341,7 +405,7 @@ impl Governance {
             let shares = self.effective_shares().ok_or_else(|| {
                 Error::Module("account-share mode has no configured registry".into())
             })?;
-            let account_id = self.account_of_node(ctx, submitter).await?;
+            let account_id = self.account_principal(ctx, submitter).await?;
             if !shares.contains_key(&account_id) {
                 return Err(Error::Module(
                     "submitter account holds no governance shares".into(),
@@ -359,23 +423,58 @@ impl Governance {
             ));
         }
 
+        // validator mode (the v1 default): ballots stay NODE-keyed — N
+        // validators = N votes. the module-side ACL (A1): the submitter must
+        // hold member standing. a submitter that is DIRECTLY a member node acts
+        // as itself with NO identity read (a validator's own key, and any host
+        // without an identity module); only a non-member origin is resolved as
+        // an account member key through its committed `BindNode`s.
         let members = self.members(ctx).await?;
-        if !members.iter().any(|member| member == submitter) {
-            return Err(Error::Module(
-                "submitter is not a current validator-set member".into(),
-            ));
-        }
+        let proposer = if members.iter().any(|member| member == submitter) {
+            submitter.to_vec()
+        } else {
+            let actor = self.resolve_actor(ctx, submitter).await?;
+            if !actor.nodes().iter().any(|node| members.contains(node)) {
+                return Err(Error::Module(
+                    "submitter holds no validator-set standing (no member node bound to it)"
+                        .into(),
+                ));
+            }
+            actor.principal().to_vec()
+        };
         let powers: BTreeMap<Vec<u8>, u64> =
             members.into_iter().map(|member| (member, 1)).collect();
         let total = Self::total_power(&powers)?;
         Ok((
-            submitter.to_vec(),
+            proposer,
             Electorate {
                 voter_kind: VoterKind::ValidatorNode,
                 rule: Self::threshold_rule(total, action, false),
                 powers,
             },
         ))
+    }
+
+    /// the node ballots one submitter casts against a NODE-keyed electorate: a
+    /// submitter that is directly in the electorate casts its own (no identity
+    /// read); otherwise it is resolved as an account member key and casts EVERY
+    /// bound node still in the electorate. empty ⇒ the submitter has no standing.
+    async fn node_ballots(
+        &self,
+        ctx: &dyn Ctx,
+        submitter: &[u8],
+        eligible: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if eligible(submitter) {
+            return Ok(vec![submitter.to_vec()]);
+        }
+        let actor = self.resolve_actor(ctx, submitter).await?;
+        Ok(actor
+            .nodes()
+            .iter()
+            .filter(|node| eligible(node))
+            .cloned()
+            .collect())
     }
 
     /// the CURRENT resident set (valset's staged-over-committed projection) —
@@ -838,27 +937,57 @@ impl Governance {
             return Err(Error::Module("voting closed at the deadline".into()));
         }
         let submitter = Self::external_origin(ctx)?;
-        let voter = match &proposal.electorate {
-            Some(electorate) => {
-                let principal = match electorate.voter_kind {
-                    VoterKind::ValidatorNode => submitter,
-                    VoterKind::Account => self.account_of_node(ctx, &submitter).await?,
-                };
-                if !electorate.powers.contains_key(&principal) {
+        // the ballots this op casts, by the proposal's frozen principal kind.
+        let voters: Vec<Vec<u8>> = match &proposal.electorate {
+            Some(electorate) => match electorate.voter_kind {
+                // node-keyed ballots (N validators = N votes): a submitter in
+                // the frozen electorate casts its own; an account member's op
+                // casts EVERY bound node still in the electorate — the same
+                // power the account held when each node voted for itself.
+                VoterKind::ValidatorNode => {
+                    let voters = self
+                        .node_ballots(ctx, &submitter, &|node| electorate.powers.contains_key(node))
+                        .await?;
+                    if voters.is_empty() {
+                        return Err(Error::Module(
+                            "submitter is not a member of this proposal's frozen electorate"
+                                .into(),
+                        ));
+                    }
+                    voters
+                }
+                VoterKind::Account => {
+                    let principal = self.account_principal(ctx, &submitter).await?;
+                    if !electorate.powers.contains_key(&principal) {
+                        return Err(Error::Module(
+                            "submitter is not a member of this proposal's frozen electorate"
+                                .into(),
+                        ));
+                    }
+                    vec![principal]
+                }
+            },
+            // legacy dynamic-validator proposals (pre-share snapshots): the
+            // electorate is the CURRENT member set, same node-keyed treatment.
+            None => {
+                let members = self.members(ctx).await?;
+                let voters = self
+                    .node_ballots(ctx, &submitter, &|node| members.iter().any(|m| m == node))
+                    .await?;
+                if voters.is_empty() {
                     return Err(Error::Module(
-                        "submitter is not a member of this proposal's frozen electorate".into(),
+                        "submitter is not a current validator-set member".into(),
                     ));
                 }
-                principal
-            }
-            None => {
-                self.require_member(ctx, &submitter).await?;
-                submitter
+                voters
             }
         };
         // Re-voting overwrites by frozen principal. Two nodes bound to one
-        // account therefore share one ballot instead of multiplying its power.
-        proposal.votes.insert(voter, approve);
+        // account therefore cast the same-direction ballots together, and an
+        // account (share) principal stays one ballot regardless of node count.
+        for voter in voters {
+            proposal.votes.insert(voter, approve);
+        }
         self.pending.insert(proposal_id, proposal);
         Ok(())
     }
