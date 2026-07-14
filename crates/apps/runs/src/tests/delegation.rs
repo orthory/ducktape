@@ -370,6 +370,96 @@ fn delegated_child_preserves_requester_and_owner_lifecycle_control() {
 }
 
 #[test]
+fn delegated_child_inherits_the_pinned_forge_item_workspace() {
+    let channel = "forge:ducktape:7";
+    let mut registry = delegation_registry(1);
+    for agent_id in ["bot", "child-a"] {
+        registry
+            .get_mut(agent_id)
+            .unwrap()
+            .caps
+            .forge_read
+            .push("ducktape".into());
+    }
+    let mut item = forge_issue(7, "Fix delegation", "keep the item workspace pinned");
+    item.channel_id = channel.into();
+    let branch_tip = "ef".repeat(20);
+    let transcript = transcript(2);
+    let mut module = forge_module();
+    let mut request_ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript(channel, transcript.clone())
+        .with_forge_item("ducktape", item.clone())
+        .with_forge_tip("ducktape", "dev", &"cd".repeat(20))
+        .with_forge_tip("ducktape", "agent/item-7", &branch_tip);
+    exec(
+        &mut module,
+        &mut request_ctx,
+        &admin(&RunsMsg::RequestRun {
+            agent_id: "bot".into(),
+            channel_id: channel.into(),
+            anchor_seq: 2,
+            demands: Default::default(),
+        }),
+    )
+    .unwrap();
+    let DispatchMsg::Dispatch { payload, .. } = &request_ctx.dispatch_msgs()[0] else {
+        panic!("expected parent dispatch")
+    };
+    let parent: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    commit(&mut module);
+
+    let parent_run = run_id_for(channel, 2, "bot");
+    let mut result_ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript(channel, transcript)
+        .with_forge_item("ducktape", item)
+        .with_forge_tip("ducktape", "dev", &"cd".repeat(20))
+        .with_forge_tip("ducktape", "agent/item-7", &branch_tip);
+    exec(
+        &mut module,
+        &mut result_ctx,
+        &result_event(
+            &parent_run,
+            Ok(delegated_response(vec![request("child-a", "verify it")])),
+        ),
+    )
+    .unwrap();
+    let DispatchMsg::Dispatch { payload, .. } = &result_ctx.dispatch_msgs()[0] else {
+        panic!("expected child dispatch")
+    };
+    let child: serde_json::Value = serde_json::from_slice(payload).unwrap();
+
+    assert_eq!(child["workspace"], parent["workspace"]);
+    assert_eq!(child["workspace"]["kind"], "forge");
+    assert_eq!(child["workspace"]["branch"], "agent/item-7");
+    assert_eq!(child["workspace"]["commit"], branch_tip);
+    assert_eq!(
+        child["result_contract"]["sink"],
+        parent["result_contract"]["sink"]
+    );
+    let sink = &child["result_contract"]["sink"];
+    assert_eq!(sink["mode"], "pr");
+    assert_eq!(sink["repo"], "ducktape");
+    assert_eq!(sink["source_branch"], "agent/item-7");
+    assert_eq!(sink["target_branch"], "dev");
+    let parent_context = parent["context"].as_str().unwrap();
+    let child_context = child["context"].as_str().unwrap();
+    assert!(child_context.starts_with(parent_context), "{child_context}");
+    assert!(child_context.contains("issue #7"), "{child_context}");
+    assert!(child_context.contains("title: Fix delegation"), "{child_context}");
+    assert!(
+        child_context.contains("work branch: agent/item-7"),
+        "{child_context}"
+    );
+    assert!(child_context.contains(&format!("Parent run: {parent_run}")));
+    assert!(child_context.contains("Instruction:\nverify it"));
+}
+
+#[test]
 fn delegation_is_final_only_and_limited_to_chat_or_forge() {
     let registry = delegation_registry(1);
     let module = module();
