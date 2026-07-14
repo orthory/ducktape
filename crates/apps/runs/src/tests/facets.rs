@@ -287,28 +287,27 @@ fn pr_sink_with_empty_required_fields_degrades_without_emitting_forge_op() {
 }
 
 #[test]
-fn pr_sink_with_an_unborn_branch_degrades_without_aborting() {
+fn pr_sink_with_a_deleted_source_branch_degrades_without_aborting() {
     let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
     granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
     let (mut m, run_id) = awaiting_run_with_forge(&granted);
-    // no with_forge_ref → the source branch is NOT born in committed forge.
+    // The host observed a push, but the source branch was deleted before the
+    // result settled, so committed Forge no longer exposes the ref.
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
         .with_registry(&granted)
         .with_transcript("general", transcript(2));
+    let oid = "1a".repeat(20);
     exec(
-            &mut m,
-            &mut ctx,
-            &result_event(
-                &run_id,
-                Ok(runner_wrapper(
-                    "done",
-                    serde_json::json!({"sink":{"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"PR"}}),
-                )),
-            ),
-        )
-        .unwrap();
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+        ),
+    )
+    .unwrap();
     assert!(
         ctx.msgs.iter().all(|m| m.target != "forge"),
         "an unborn source branch must never emit an OpenPr (no-fail rule)"
@@ -334,10 +333,14 @@ fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
         .with_registry(&granted)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x");
+    let oid = "1a".repeat(20);
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(forge_wrapper("done", None, None, true, None))),
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+        ),
     )
     .unwrap();
     assert!(
@@ -802,8 +805,9 @@ fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
 }
 
 #[test]
-fn pr_sink_guard_wording_is_honest_when_nothing_was_pushed() {
-    // guard hit + a no_changes receipt: nothing was pushed — say so.
+fn pr_sink_never_updates_an_existing_pr_when_nothing_was_pushed() {
+    // A stale source ref and open PR are not publication evidence. output:none
+    // remains chat/history-only and must not be reported as a PR update.
     let (mut m, granted, run_id) = forge_push_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -820,9 +824,10 @@ fn pr_sink_guard_wording_is_honest_when_nothing_was_pushed() {
     .unwrap();
     assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
     assert!(
-        breadcrumbs(&ctx)
-            .contains(&format!("run {run_id} pr sink: PR #4 already open, no changes pushed")),
-        "honest no-changes wording: {:?}",
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: no publishable workspace commit for source branch"
+        )),
+        "the no-publish gate runs before the duplicate-PR probe: {:?}",
         breadcrumbs(&ctx)
     );
 
@@ -847,9 +852,9 @@ fn pr_sink_guard_wording_is_honest_when_nothing_was_pushed() {
     assert!(ctx2.msgs.iter().all(|m| m.target != "forge"));
     assert!(
         breadcrumbs(&ctx2).contains(&format!(
-            "run {run_id2} pr sink: PR #4 already open, nothing pushed (workspace commit failed)"
+            "run {run_id2} pr sink skipped: no publishable workspace commit for source branch"
         )),
-        "honest commit-error wording: {:?}",
+        "commit failure is not a PR update: {:?}",
         breadcrumbs(&ctx2)
     );
 }
@@ -894,9 +899,9 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
 }
 
 #[test]
-fn a_no_changes_run_with_a_born_branch_and_no_open_pr_still_opens_the_pr() {
-    // plan-literal: the branch is born (earlier session work) and no PR is
-    // open for it — OpenPr fires even though THIS run pushed nothing.
+fn output_none_with_a_born_stale_branch_never_opens_a_pr_from_response_prose() {
+    // Regression for #102: a review-only output:none result can carry general
+    // response prose and point at an old born branch, but neither is a commit.
     let (mut m, granted, run_id) = forge_push_run();
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -912,14 +917,104 @@ fn a_no_changes_run_with_a_born_branch_and_no_open_pr_still_opens_the_pr() {
     )
     .unwrap();
     let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
-    assert_eq!(forge_ops.len(), 1, "OpenPr fires for a born branch with no open PR");
-    let forge::ForgeMsg::OpenPr { body, .. } = forge::decode_msg(&forge_ops[0].payload).unwrap()
-    else {
-        panic!("expected an OpenPr");
-    };
     assert!(
-        body.contains("output: none (no changes this run)"),
-        "the body is honest about the empty push: {body:?}"
+        forge_ops.is_empty(),
+        "response prose must not become a PR without a commit"
+    );
+    assert!(
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: no publishable workspace commit for source branch"
+        )),
+        "the audit breadcrumb records the no-change skip: {:?}",
+        breadcrumbs(&ctx)
+    );
+    commit(&mut m);
+    let rec = &recent_runs(&m)[0];
+    assert_eq!(rec.output_ref, None);
+    assert_eq!(rec.pr_number, None);
+}
+
+#[test]
+fn a_late_commit_for_a_merged_anchor_stays_chat_and_history_only() {
+    let (mut m, granted, fixture_run_id) = forge_push_run();
+    let run_id = bind_run_to_forge_issue(&mut m, &fixture_run_id, 7);
+    let mut merged = forge_pr(7, "Already merged", "", "agent/x", "main");
+    merged.summary.state = forge::ItemState::Merged;
+    merged.merge_oid = Some("2b".repeat(20));
+    let oid = "1a".repeat(20);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_transcript("forge:app:7", transcript(2))
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main")
+        .with_forge_item("app", merged);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper(
+                "Post-merge review found no changes needed.",
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+    assert!(breadcrumbs(&ctx).contains(&format!(
+        "run {run_id} pr sink skipped: bound Forge item is merged"
+    )));
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].pr_number, None);
+}
+
+#[test]
+fn a_success_result_arriving_after_cancellation_cannot_publish() {
+    let (mut m, granted, run_id) = forge_push_run();
+    let mut cancelled = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut cancelled,
+        &result_event(&run_id, Err("cancelled".into())),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    let oid = "1a".repeat(20);
+    let mut late = CaptureCtx::new()
+        .at(9)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main");
+    exec(
+        &mut m,
+        &mut late,
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper("late", Some("agent/x"), Some(&oid), false, None)),
+        ),
+    )
+    .unwrap();
+    assert!(late.msgs.iter().all(|m| m.target != "forge"));
+    assert!(
+        breadcrumbs(&late)
+            .iter()
+            .any(|note| note.contains("dropped result for unknown dispatch"))
+    );
+    assert_eq!(
+        recent_runs(&m).len(),
+        1,
+        "the late replay adds no history entry"
     );
 }
 
