@@ -767,6 +767,32 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
+  it("blocks both auto-reply controls while their channel key is pending", () => {
+    const { spies } = renderAgents({
+      ops: {
+        [opKey.watch("general")]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+    });
+
+    openTab(/auto-reply/i);
+    const turnOff = screen.getByRole("button", { name: /stop watching general/i });
+    expect(turnOff).toBeDisabled();
+    fireEvent.click(turnOff);
+    expect(spies.unwatchChannel).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Channel to watch"), {
+      target: { value: "general" },
+    });
+    const add = screen.getByRole("button", { name: /add auto-reply/i });
+    expect(add).toBeDisabled();
+    fireEvent.click(add);
+    expect(spies.watchChannel).not.toHaveBeenCalled();
+  });
+
   it("reassigns or cancels an in-progress run and offers honest worker actions", () => {
     const { spies } = renderAgents({
       runLease: new Map([

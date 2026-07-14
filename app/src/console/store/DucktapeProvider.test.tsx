@@ -2022,6 +2022,38 @@ describe("submitTracked lifecycle", () => {
     });
   });
 
+  it("refuses a second submit while the same entity key is pending", async () => {
+    const { transport } = makeFakeNode();
+    const held = deferred<SubmitReceipt>();
+    vi.mocked(transport.submit).mockReturnValue(held.promise);
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    const params = {
+      displayName: "Collision Agent",
+      agentId: "collision-agent",
+      capability: "mock",
+      allowedActions: ["chat.post"],
+    };
+    let duplicate!: Promise<boolean>;
+    act(() => {
+      void capturedActions!.registerAgent(params);
+    });
+    expect(capturedState!.ops["agent/collision-agent"].phase).toBe("pending");
+    act(() => {
+      duplicate = capturedActions!.registerAgent(params);
+    });
+
+    await expect(duplicate).resolves.toBe(false);
+    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(1));
+    expect(capturedState!.ops["agent/collision-agent"]).toMatchObject({
+      seq: 1,
+      phase: "pending",
+    });
+  });
+
   it("rolls the preconfirmed render back and records the rejection on failure", async () => {
     const { transport } = makeFakeNode();
     let reject!: (err: Error) => void;

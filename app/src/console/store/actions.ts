@@ -1048,6 +1048,7 @@ export function createActions({
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
     quiet = false,
   ) => {
+    if (getState().ops[key]?.phase === "pending") return Promise.resolve(false);
     const live = getNode();
     if (!live) return Promise.resolve(false);
     const startedAt = Date.now();
