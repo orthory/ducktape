@@ -181,6 +181,11 @@ pub(super) fn stop_workspace_node(
     ports: &Ports,
     grace: Duration,
 ) -> Result<(), String> {
+    // raise the stop-intent BEFORE any kill: teardown escalates to TERM/KILL,
+    // which the supervisor would otherwise read as a crash and auto-restart —
+    // fighting the very teardown that is trying to release the ports. this flag
+    // is the one thing that tells a deliberate stop apart from a crash.
+    crate::daemon::mark_stopping(dir);
     // graceful first: the node exits its whole process on this route. a node
     // already down, or a parked joiner serving no http, just fails the connect.
     post_shutdown(ports.http);
@@ -225,6 +230,9 @@ pub(super) fn stop_workspace_node(
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = fs::remove_file(pidfile(dir));
+    // the node is confirmed down and its ports released; drop the supervisor
+    // registration so a later spawn starts from a fresh (cleared) flag.
+    crate::daemon::clear_supervised(dir);
     Ok(())
 }
 

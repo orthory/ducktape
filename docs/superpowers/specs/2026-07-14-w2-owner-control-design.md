@@ -168,16 +168,31 @@ simnode-gated + live-QA'd). This is the risk-managed senior call under the
    system ops).
 5. Gate: `cargo test -p simnode`; re-seed (genesis moves); live join/promote QA.
 
-## Supervision slice (rides W2, ledger §W3 note) — PR 2
+## Supervision slice (rides W2, ledger §W3 note)
 
-Single managed node, shell side, self-contained:
+Single managed node, shell side, self-contained (a third commit on this branch):
 
-- **Crash auto-restart**: `watch_node_exit` only reaps + logs today. Add a
-  bounded-backoff respawn for an *unexpected* exit (not an operator stop), so a
-  validator that crashes comes back without the user knowing what a daemon is.
-- **Adopt-hardening**: `workspace_select` already adopts a live node
-  idempotently (`port_listening`). Harden the respawn/adopt interplay so a
-  crash-restart and a user re-select never double-spawn.
+- **Crash auto-restart**: `watch_node_exit` only reaped + logged. It now revives
+  a node that dies UNEXPECTEDLY (non-zero / signal) — validator uptime for a user
+  who knows nothing of daemons — under a hard restart cap (`MAX_AUTO_RESTARTS=5`)
+  and a constant backoff, so a node that fails preflight every boot stops rather
+  than spins. The policy is a pure `should_auto_restart(code, stopping, restarts)`
+  (unit-tested); the process-spawning guards sit on top.
+- **Stop-intent flag**: teardown escalates to TERM/KILL, which looks exactly like
+  a crash. A per-workspace `Arc<AtomicBool>` (registered at spawn, raised by
+  `stop_workspace_node` *before* it kills, cleared after) tells a deliberate stop
+  apart from a crash, so the supervisor never fights the teardown releasing the
+  ports.
+- **Adopt-hardening**: `workspace_select` already adopts a live node idempotently
+  (`port_listening`). The respawn re-checks the stop flag *and* `port_listening`
+  after its backoff, so a crash-restart racing a user re-select never
+  double-spawns — whoever bound the port first wins, the other adopts.
+
+Accepted limits (`ponytail:`): a fixed cap + constant backoff (a crash-rate
+window would be more precise if flapping ever shows up); a node adopted from a
+*previous* app instance has no `Child` handle, so it is watched/revived only once
+this shell has spawned it (a crash while the app is closed is caught on next
+launch's spawn, per the detached-survival model).
 
 ## Non-goals (this W)
 
