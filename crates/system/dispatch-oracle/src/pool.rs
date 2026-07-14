@@ -181,7 +181,7 @@ pub struct DispatchPool {
     /// materializes/commits/cleans a per-run workspace — injected by the node
     /// binary, where duckfs-client + the actor lane are reachable. Portable
     /// execution fails loudly if a host has not wired it.
-    provisioner: Option<SharedProvisioner>,
+    provisioner: SharedProvisioner,
     /// the host-local load ledger: announcements claim only current fit;
     /// assigned work that fits total capacity queues in `spawn_exec`, then
     /// reserves before the semaphore acquire. `Arc`-wrapped so the spawned
@@ -198,6 +198,7 @@ impl DispatchPool {
         node_key: Vec<u8>,
         spawn: SpawnFn,
         deliver: DeliverFn,
+        provisioner: SharedProvisioner,
     ) -> Self {
         Self::with_limit(
             providers,
@@ -206,6 +207,7 @@ impl DispatchPool {
             deliver,
             max_concurrent_runs_from_env(),
             Default::default(),
+            provisioner,
         )
     }
 
@@ -219,6 +221,7 @@ impl DispatchPool {
         deliver: DeliverFn,
         limit: usize,
         capacity: BTreeMap<String, u64>,
+        provisioner: SharedProvisioner,
     ) -> Self {
         let limit = limit.max(1);
         let owner_limit = limit.checked_mul(2).unwrap_or(limit);
@@ -230,15 +233,9 @@ impl DispatchPool {
             semaphore: Arc::new(Semaphore::new(limit)),
             owner_semaphore: Arc::new(Semaphore::new(owner_limit)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
-            provisioner: None,
+            provisioner,
             ledger: Arc::new(ResourceLedger::new(capacity)),
         }
-    }
-
-    /// wire the host-side workspace provisioner runs materialize through.
-    pub fn with_provisioner(mut self, provisioner: SharedProvisioner) -> Self {
-        self.provisioner = Some(provisioner);
-        self
     }
 
     /// how many attempts are executing (or queued for the semaphore) right
@@ -414,7 +411,7 @@ impl DispatchPool {
                                                     &job,
                                                     prepared,
                                                     provider,
-                                                    provisioner.as_ref(),
+                                                    &provisioner,
                                                     &cancellation,
                                                     permit,
                                                 )
@@ -537,7 +534,7 @@ async fn execute(
     job: &ExecJob,
     prepared: crate::envelope::Prepared,
     provider: &dyn capability_host::Provider,
-    provisioner: Option<&SharedProvisioner>,
+    provisioner: &SharedProvisioner,
     cancellation: &RunCancellation,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<AttemptOutput, String> {
@@ -547,8 +544,6 @@ async fn execute(
         mut ctx,
         workspace: plan,
     } = prepared;
-    let prov = provisioner
-        .ok_or_else(|| "portable run requires a workspace provisioner".to_string())?;
     // the REQUESTED sink (Chain when the envelope carried none) — echoed on
     // the assembled RunnerResult below so runs' delivery can route it.
     let sink = plan.sink;
@@ -569,7 +564,7 @@ async fn execute(
     };
     // (a)+(b) materialize OUTSIDE storage. A late blocking result releases the
     // provider slot, but keeps this attempt's resource admission until cleanup.
-    let provisioner = Arc::clone(prov);
+    let provisioner = Arc::clone(provisioner);
     let provision_spec = spec.clone();
     let mut provision = Box::pin(async move { provisioner.provision(&provision_spec).await });
     let provision_timeout = tokio::time::sleep(workspace_step_timeout());
@@ -1038,8 +1033,15 @@ format = "text"
             fail_commit: None,
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit, capacity)
-                .with_provisioner(provisioner),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                limit,
+                capacity,
+                provisioner,
+            ),
             rx,
         )
     }
@@ -1206,8 +1208,8 @@ format = "text"
             deliver,
             1,
             capacity.clone(),
-        )
-        .with_provisioner(provisioner);
+            provisioner,
+        );
         let occupied = pool
             .ledger
             .try_reserve("occupied", &capacity)
@@ -1465,6 +1467,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("running", 0, Some(b"me")))
@@ -1516,8 +1519,8 @@ format = "text"
             deliver,
             1,
             Default::default(),
-        )
-        .with_provisioner(Arc::new(HungCommitProvisioner { cleaned }));
+            Arc::new(HungCommitProvisioner { cleaned }),
+        );
 
         pool.run(&effect_for("hung-commit-1", 0, Some(b"me")))
             .await
@@ -1586,6 +1589,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("blocked-delivery-1", 0, Some(b"me")))
@@ -1667,6 +1671,7 @@ format = "text"
             deliver,
             1,
             demands.clone(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_with_demands(
@@ -1742,6 +1747,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("discarded", 0, Some(b"me")))
@@ -1786,6 +1792,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("completed", 0, Some(b"me")))
@@ -2275,6 +2282,16 @@ format = "text"
         )
     }
 
+    fn mock_provisioner() -> SharedProvisioner {
+        let (provisioned, committed, cleaned) = flags();
+        Arc::new(MockProvisioner {
+            provisioned,
+            committed,
+            cleaned,
+            fail_commit: None,
+        })
+    }
+
     fn pool_with_provisioner(
         providers: Arc<ProviderSet>,
         provisioner: SharedProvisioner,
@@ -2299,8 +2316,15 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit, capacity)
-                .with_provisioner(provisioner),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                limit,
+                capacity,
+                provisioner,
+            ),
             rx,
         )
     }
@@ -3477,6 +3501,7 @@ format = "text"
             deliver,
             0,
             Default::default(),
+            mock_provisioner(),
         );
         // a zero cap would deadlock every run; the pool clamps to 1.
         assert_eq!(pool.semaphore.available_permits(), 1);

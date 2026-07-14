@@ -80,7 +80,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
-    pub(super) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    pub(super) agent_provisioner: dispatch_oracle::SharedProvisioner,
     pub(super) agent_dirs: capability_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status_public_key: String,

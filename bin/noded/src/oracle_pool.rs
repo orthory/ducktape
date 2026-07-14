@@ -147,8 +147,8 @@ where
             ORACLE_ORIGIN.to_vec(),
             spawn,
             deliver,
-        )
-        .with_provisioner(provisioner),
+            provisioner,
+        ),
     )]
 }
 

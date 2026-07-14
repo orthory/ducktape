@@ -78,7 +78,7 @@ pub(super) async fn park(
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
+    agent_provisioner: &dispatch_oracle::SharedProvisioner,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
