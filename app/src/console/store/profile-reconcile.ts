@@ -22,10 +22,30 @@ import {
   setAccountName,
   setAccountProfile,
 } from "../../domain/identity-client";
+import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
 import { base64ToBytes, uploadFile } from "../../domain/files-client";
 import { ATTACHMENTS_ROOT } from "../../domain/duck-uri";
+import { keyHex } from "../../domain/chat-client";
+import { isTauri } from "../../domain/node-bootstrap";
+import { normalizeKey } from "../../domain/names";
+import { identityState } from "../../domain/user-identity-client";
 import { loadAccountProfile, saveAccountProfile } from "./account-profile";
+
+/** OWNERSHIP GUARD: true iff `account` is the LOCAL USER'S OWN account — this
+ *  machine's user key is in its member set. Both propagation directions hang on
+ *  this: without it, connecting to a FOREIGN node (client mode) would adopt the
+ *  foreign account's name/bio into the local global profile, and the push half
+ *  would write the local profile onto the foreign account. Unverifiable
+ *  (web build, locked key) counts as NOT ours — the next connect after unlock
+ *  retries, exactly like auto-bind. */
+const isOwnAccount = async (account: AccountView): Promise<boolean> => {
+  if (!isTauri()) return false;
+  const { state, pubkey } = await identityState();
+  if ((state !== "unlocked" && state !== "plaintext") || !pubkey) return false;
+  const mine = normalizeKey(pubkey);
+  return account.member_keys.some((key) => keyHex(key.pubkey) === mine);
+};
 
 /** Raster image mimes accepted for avatars → their duckfs extension. Restricted
  *  to the set the attachment chip previews inline (svg is script-bearing and
@@ -81,7 +101,13 @@ const ensureAvatarUploaded = async (
   });
 };
 
-export type ReconcileOutcome = "unbound" | "reconciled" | "skipped";
+export type ReconcileOutcome =
+  | "unbound"
+  /** The node is bound to an account that is NOT this machine's user — a
+   *  foreign/client-mode connection. Nothing adopted, nothing pushed. */
+  | "foreign"
+  | "reconciled"
+  | "skipped";
 
 /** ON-CONNECT idempotent pass: propagate the account's SET profile fields to
  *  this network, adopting on-chain values into an empty local store rather than
@@ -96,6 +122,8 @@ export const reconcileProfile = async (
     // Unbound: no account to push to yet. The bind pass runs first on connect;
     // the next connect/refresh reconciles once it lands.
     if (!account) return "unbound";
+    // Foreign account (or ownership unverifiable): neither adopt nor push.
+    if (!(await isOwnAccount(account))) return "foreign";
 
     // Self-heal: seed the local store from on-chain when unset. Stops a fresh
     // device (empty localStorage) from wiping the account, and carries the
@@ -160,6 +188,9 @@ export const pushProfileEdit = async (
 ): Promise<void> => {
   const account = await accountOfNode(transport, edit.nodePub);
   if (!account) throw new Error("this node isn't linked to an account yet");
+  if (!(await isOwnAccount(account))) {
+    throw new Error("this node is bound to someone else's account — profile not written");
+  }
 
   let avatarPath = account.avatar;
   if (edit.avatar === null) {

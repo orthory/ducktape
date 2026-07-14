@@ -1,8 +1,12 @@
 // W6 account-profile propagation: the reconcile-on-connect pass is idempotent
-// (no-op when converged, pushes only dirty fields) and the panel's direct write
-// clears explicitly. Pure over a stubbed transport — no node, no React.
+// (no-op when converged, pushes only dirty fields), OWNERSHIP-GATED (a foreign
+// account is neither adopted nor written), and the panel's direct write clears
+// explicitly. Pure over a stubbed transport — no node, no React.
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import type { AccountView } from "../../domain/identity-client";
 import { makeTransportStub } from "../transport-stub";
@@ -13,6 +17,23 @@ import {
 } from "../../console/store/profile-reconcile";
 
 const NODE = "aa".repeat(32);
+/** hex of the member key [1,2,3] every own-account fixture carries. */
+const MY_KEY = "010203";
+
+/** Desktop shell with an unlocked user key = `pubkey` (default: OUR key). */
+const markTauri = (pubkey = MY_KEY) => {
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+  invokeMock.mockImplementation((cmd: string) =>
+    cmd === "user_identity_state"
+      ? Promise.resolve({ state: "plaintext", pubkey, mnemonicConfirmed: true })
+      : Promise.reject(new Error(`unexpected invoke ${cmd}`)),
+  );
+};
+
+afterEach(() => {
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  vi.clearAllMocks();
+});
 
 const account = (patch: Partial<AccountView> = {}): AccountView => ({
   account_id: [1, 2, 3],
@@ -45,9 +66,38 @@ const submittedOps = (transport: ReturnType<typeof makeTransportStub>): string[]
 const PNG =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  markTauri();
+});
 
 describe("reconcileProfile", () => {
+  it("is a no-op in BOTH directions on a foreign account (ownership guard)", async () => {
+    // Our key is NOT in the bound account's member set (client-mode connect to
+    // someone else's node). Local profile is dirty AND the chain has a name —
+    // neither direction may move.
+    saveAccountProfile({ name: "Kim", bio: "hi" });
+    const t = transportFor(
+      account({
+        display_name: "Mallory",
+        member_keys: [{ pubkey: [9, 9, 9], kind: "ed25519", label: null, added_at: 1 }],
+      }),
+    );
+    expect(await reconcileProfile(t, { nodePub: NODE })).toBe("foreign");
+    expect(t.submit).not.toHaveBeenCalled(); // push direction blocked
+    expect(t.filesCommit).not.toHaveBeenCalled();
+    const { loadAccountProfile } = await import("../../console/store/account-profile");
+    expect(loadAccountProfile().name).toBe("Kim"); // adopt direction blocked
+  });
+
+  it("treats an unverifiable owner (web build, no user key) as foreign", async () => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    saveAccountProfile({ name: "Kim" });
+    const t = transportFor(account({ display_name: "Mallory" }));
+    expect(await reconcileProfile(t, { nodePub: NODE })).toBe("foreign");
+    expect(t.submit).not.toHaveBeenCalled();
+  });
+
   it("reports unbound and pushes nothing when the node has no account", async () => {
     saveAccountProfile({ name: "Kim", bio: "hi" });
     const t = transportFor(null);
@@ -122,5 +172,17 @@ describe("pushProfileEdit", () => {
     await expect(
       pushProfileEdit(t, { nodePub: NODE, bio: "x", avatar: undefined }),
     ).rejects.toThrow(/isn't linked/);
+  });
+
+  it("refuses to write onto a foreign account", async () => {
+    const t = transportFor(
+      account({
+        member_keys: [{ pubkey: [9, 9, 9], kind: "ed25519", label: null, added_at: 1 }],
+      }),
+    );
+    await expect(
+      pushProfileEdit(t, { nodePub: NODE, bio: "x", avatar: undefined }),
+    ).rejects.toThrow(/someone else's account/);
+    expect(t.submit).not.toHaveBeenCalled();
   });
 });

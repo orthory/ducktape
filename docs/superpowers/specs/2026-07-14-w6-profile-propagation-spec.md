@@ -27,6 +27,12 @@ auto-bind-on-connect pass). No background fan-out (single-active premise).
    ref already encodes the source-image identity, so "already reconciled" is a
    string compare, no re-upload. The identity module stores the path string
    only; bytes live in the files module.
+3a. **Ownership guard (review finding, PR #612)**: both propagation directions
+   are gated on the bound account being the LOCAL USER'S OWN — this machine's
+   unlocked user key (identityState, the auto-bind pattern) must be in the
+   account's member set. A foreign/client-mode connection returns `"foreign"`:
+   nothing adopted into the local store, nothing pushed on-chain. Unverifiable
+   (web build, locked key) counts as foreign; the next connect retries.
 3. **Reconcile = idempotent compare-and-push**, no persisted dirty flag. The
    chain is the per-network state; the "dirty flag" is derived (local desired ≠
    on-chain). Exactly mirrors `autoBindUserIdentity` (re-derives from chain each

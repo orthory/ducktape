@@ -14,18 +14,6 @@ import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { copyText, HoverButton, outlineButton, smallMono } from "../settings/parts";
 
-export const initialsOf = (name: string): string => {
-  const parts = name
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  if (parts.length === 0) return "?";
-  return parts
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase() ?? "")
-    .join("");
-};
-
 export function ProfileCard({ accountId }: { accountId: string | undefined }) {
   const { state, actions } = useDucktape();
   const registered = accountId ? state.accountHandles[accountId] : undefined;
