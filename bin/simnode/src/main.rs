@@ -443,7 +443,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
 
-    let (handle, cmd_rx, stream_hub) = NodeHandle::channel();
+    // the sim gets the same ring the real node has, so a scenario can assert on
+    // the `logs` topic (e.g. that a failed agent run's breadcrumb surfaces) —
+    // and so tracing added to any shared crate is not silently dropped here.
+    let log_ring = noded::LogRing::default();
+    noded::log::init(Some(log_ring.clone()));
+
+    let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone());
@@ -491,9 +497,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = noded::router(handle).merge(sim_router(sim_handle)).layer(
                 axum::middleware::from_fn_with_state(persona, strip_receipt_op_hash),
             );
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
-                .await?;
+            // connect-info so the admin namespace's fail-closed loopback gate
+            // sees the (loopback) peer — same as noded::serve.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+            .await?;
             println!("[simnode] shutdown requested, exiting");
             Ok(())
         })
@@ -839,7 +850,11 @@ impl Sim {
             {
                 Ok(committed) => Some(committed_info(&committed, "oracle")),
                 Err(err) => {
-                    eprintln!("[simnode] worker follow-up rejected: {err}");
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        error = %err,
+                        "worker follow-up REJECTED — the oracle's result never landed"
+                    );
                     None
                 }
             };
@@ -882,7 +897,11 @@ impl Sim {
                 .commit(Origin::External(ORACLE_ORIGIN.to_vec()), follow)
                 .await
             {
-                eprintln!("[simnode] worker follow-up rejected: {err}");
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %err,
+                    "worker follow-up REJECTED — the oracle's result never landed"
+                );
             }
         }
         Ok(())
@@ -913,7 +932,7 @@ impl Sim {
                 // same fail-stop as the real daemons: a half-committed host is
                 // indeterminate, and a SIM that limps past it would hand tests
                 // green runs over corrupt state.
-                eprintln!("[simnode] FATAL: {err} — halting");
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
@@ -962,16 +981,25 @@ impl Sim {
             })),
         };
         if let Err(err) = self.index.apply_block(&block_ops) {
-            eprintln!(
-                "[simnode] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-                self.height
+            tracing::error!(
+                target: "ducktape::consensus",
+                height = self.height,
+                error = %err,
+                "module index apply FAILED — the app's views are now STALE; wipe \
+                 <storage>/index to rebuild"
             );
         }
 
         self.stream_hub
             .publish_block(block.height, block.app_hash.clone());
 
-        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
+        offer_effects(
+            &self.workers,
+            block.height,
+            out.events,
+            &mut self.oracle_queue,
+        )
+        .await;
         Ok(Committed {
             block,
             op_hash,
@@ -1013,7 +1041,7 @@ impl Sim {
             Ok(out) => out,
             Err(SubmitError::Fatal(err)) => {
                 // same fail-stop as the single-op lane and the real daemons.
-                eprintln!("[simnode] FATAL: {err} — halting");
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             // a member reject is folded into its MemberOutcome, never here: a
@@ -1098,14 +1126,23 @@ impl Sim {
             }),
         };
         if let Err(err) = self.index.apply_block(&block_ops) {
-            eprintln!(
-                "[simnode] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-                self.height
+            tracing::error!(
+                target: "ducktape::consensus",
+                height = self.height,
+                error = %err,
+                "module index apply FAILED — the app's views are now STALE; wipe \
+                 <storage>/index to rebuild"
             );
         }
 
         self.stream_hub.publish_block(self.height, app_hash.clone());
-        offer_effects(&self.workers, out.events, &mut self.oracle_queue).await;
+        offer_effects(
+            &self.workers,
+            self.height,
+            out.events,
+            &mut self.oracle_queue,
+        )
+        .await;
 
         Ok(BatchInfo {
             height: self.height,
@@ -1138,6 +1175,11 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
+            operations: noded::OperationalStatus {
+                role: noded::NodeRole::Local,
+                phase: noded::NodePhase::Serving,
+                ..Default::default()
+            },
         }
     }
 
@@ -1205,9 +1247,11 @@ fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
+    height: u64,
     events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
+    let mut notes = noded::log::ModuleNotes::new(height);
     for eff in events {
         let mut claimed = false;
         for w in workers {
@@ -1219,21 +1263,26 @@ async fn offer_effects(
                 }
                 Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
-                    eprintln!("[simnode] worker error: {err}");
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        height,
+                        source = %eff.source,
+                        error = %err,
+                        "worker failed to handle a module event"
+                    );
                     claimed = true;
                     break;
                 }
             }
         }
-        // an unclaimed event is normally plain observability; one that
-        // DECODES as a worker request means a saga is stuck Pending.
-        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
-            println!(
-                "[simnode] WorkerRequest with no worker ({} bytes) — dropped",
-                eff.payload.len()
-            );
+        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+        // guest cannot log) — unless it decodes as a worker request, which means
+        // a saga is stuck Pending.
+        if !claimed {
+            notes.unclaimed(&eff);
         }
     }
+    notes.finish();
 }
 
 /// noded's debug echo oracle, unconditional here: the sim is a dev tool, and a

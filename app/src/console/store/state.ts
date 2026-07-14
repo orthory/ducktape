@@ -167,8 +167,18 @@ export interface ConsoleState {
   connected: boolean;
   /** The daemon url this build resolved to (null until bootstrap finishes). */
   nodeUrl: string | null;
-  /** True when this app owns the daemon lifecycle (desktop build). */
+  /** True when this app owns the daemon lifecycle (desktop build). The PROCESS
+   *  plane: spawn/adopt/Start/Stop/logs, available even while the node is
+   *  stopped. Distinct from the control plane (`owner` ∧ `adminReachable`). */
   managed: boolean;
+  /** ADR A5 control plane: the logged-in account OWNS the connected node — a
+   *  chain fact (the node's committed `BindNode` names an account this key is a
+   *  member of), readable over the public RPC. */
+  owner: boolean;
+  /** ADR A5 control plane: the node's owner-gated `/v1/admin/*` namespace
+   *  answered our probe. With `owner` this is `nodeControlAvailable`'s new
+   *  term — remote owner control, and the "unreachable" hint when false. */
+  adminReachable: boolean;
   status: NodeStatus | null;
 
   // ── Chat ──
@@ -209,10 +219,18 @@ export interface ConsoleState {
    *  `identity` for author rendering. Unbound nodes deliberately have no
    *  replicated display-name record. */
   authorNames: Record<string, string>;
+  /** hex(key) → the account's avatar duckfs path, keyed like `authorNames`
+   *  (account id AND every bound node hex). The Avatar component resolves the
+   *  bytes over the files plane; absent = render initials. */
+  authorAvatars: Record<string, string>;
+  /** hex(key) → the account's bio/status line, keyed like `authorNames`. */
+  authorBios: Record<string, string>;
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
-   *  (null if unset), already folded into `authorNames` when present. */
-  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+   *  (null if unset), already folded into `authorNames` when present; `label`
+   *  is the node's own on-chain device label (`SetNodeLabel`, null if unset),
+   *  read by the device surface. */
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>;
   /** hex(account id) → the account's collected member keys (of any scheme),
    *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
    *  display name; this is the key list the account settings surface renders. */
@@ -616,15 +634,49 @@ export const isClientMode = (
   state: Pick<ConsoleState, "workspace" | "nodeUrl">,
 ): boolean => state.workspace === null && state.nodeUrl !== null;
 
-/** Node control is available (ADR A5, interim form): the active workspace's
- *  node is a managed local daemon — ours to control even while it is stopped
- *  (Start lives on the node console, so reachability is deliberately NOT a
- *  term here). When the public/private RPC split (A2) lands, this grows
- *  `|| (owner key && private RPC reachable)`; the UI gate moves with it and
- *  nothing else does. */
+/** A rail seat's kind (see store/networks.ts, which re-exports this): a local
+ *  registry network, or the badged remote/client connection. Lives here so the
+ *  per-seat control rule below has no runtime edge back into networks.ts
+ *  (networks.ts value-imports from this module — same convention as the
+ *  nav-history note at the top). */
+export type SeatKind = "local" | "remote";
+
+/** A seat's PROCESS-plane control (ADR A5): a local seat whose daemon this app
+ *  manages — controllable even while the node is stopped (Start lives on the
+ *  node console, so reachability is deliberately NOT a term here). A remote seat
+ *  has no process plane; its CONTROL plane (owner ∧ admin reachable) is added at
+ *  the availability level below. This stays W1's local/process-plane rule. */
+export const nodeControlForSeat = (kind: SeatKind, managed: boolean): boolean =>
+  kind === "local" && managed;
+
+const seatOf = (workspace: unknown): SeatKind => (workspace !== null ? "local" : "remote");
+
+/** Node control is available (ADR A5). Two ways in, matching the capability
+ *  matrix:
+ *   - LOCAL managed daemon (`nodeControlForSeat`): the PROCESS plane — ours to
+ *     control even while it is stopped.
+ *   - REMOTE owner control (`owner ∧ adminReachable`): the A2 public/private
+ *     split — the logged-in account owns the node (a chain fact) AND its
+ *     owner-gated admin namespace is reachable.
+ *  A non-owner remote connection satisfies neither ⇒ NO control chrome at all.
+ *  This is exactly the growth the interim seat rule's comment predicted. */
 export const nodeControlAvailable = (
-  state: Pick<ConsoleState, "workspace" | "managed">,
-): boolean => state.workspace !== null && state.managed;
+  state: Pick<ConsoleState, "workspace" | "managed" | "owner" | "adminReachable">,
+): boolean =>
+  nodeControlForSeat(seatOf(state.workspace), state.managed) ||
+  (state.owner && state.adminReachable);
+
+/** ADR A5: an OWNER whose control surface is unreachable sees a one-line
+ *  "control surface not reachable" hint — ownership is public on-chain fact, so
+ *  the app may say so. A non-owner sees nothing (handled by the predicate). The
+ *  local managed case is covered by the seat rule, so this is the
+ *  remote-owner-with-unreachable-admin case. */
+export const ownerControlUnreachable = (
+  state: Pick<ConsoleState, "workspace" | "managed" | "owner" | "adminReachable">,
+): boolean =>
+  state.owner &&
+  !state.adminReachable &&
+  !nodeControlForSeat(seatOf(state.workspace), state.managed);
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};
@@ -674,6 +726,116 @@ export const removeTab = (
   if (active !== id) return { tabs: next, active };
   const neighbor = next[idx] ?? next[idx - 1] ?? null;
   return { tabs: next, active: neighbor };
+};
+
+// ── Cross-network device cache (W5) ─────────────────────
+//
+// The device surface aggregates each joined network's bound nodes for this
+// account. Under the single-active premise there is never a live cross-network
+// query — instead the connected network's device rows are captured here on
+// every switch/refresh, keyed by ACCOUNT then chain id, and rendered as
+// "last-known" while that network is not the connected one. Account keying is
+// the stale-identity guard: after a key restore/re-onboard the account id
+// changes, so a previous account's rows can never render for the new one.
+// Mirrors the doc-tabs scope store.
+
+/** One bound node as the device surface shows it. */
+export interface DeviceRow {
+  /** hex(node key). */
+  nodeHex: string;
+  /** The node's on-chain device label, or null. */
+  label: string | null;
+  /** Valset standing on that network at capture time. */
+  standing: "Validator" | "Resident" | "No seat";
+  /** This machine's own node on that network. */
+  isThisDevice: boolean;
+}
+
+/** Last-known device state for one network. */
+export interface NetworkDevices {
+  /** The workspace/network display name at capture time. */
+  name: string;
+  /** ms epoch the rows were captured. */
+  at: number;
+  rows: DeviceRow[];
+}
+
+const DEVICE_CACHE_KEY = "ducktape.deviceCache";
+
+/** The persisted blob: hex(account id) → chain id → last-known devices. */
+const parseDeviceCache = (
+  raw: string | null,
+): Record<string, Record<string, NetworkDevices>> => {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    // Best-effort shape filter — a malformed or pre-account-keyed blob is
+    // discarded per entry, never trusted into the UI.
+    const out: Record<string, Record<string, NetworkDevices>> = {};
+    for (const [account, nets] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!nets || typeof nets !== "object" || Array.isArray(nets)) continue;
+      const good = Object.fromEntries(
+        Object.entries(nets as Record<string, unknown>).filter(
+          (entry): entry is [string, NetworkDevices] => {
+            const v = entry[1] as NetworkDevices;
+            return (
+              !!v &&
+              typeof v === "object" &&
+              typeof v.name === "string" &&
+              Array.isArray(v.rows) &&
+              v.rows.every((r) => r && typeof r.nodeHex === "string")
+            );
+          },
+        ),
+      );
+      if (Object.keys(good).length > 0) out[account] = good;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+};
+
+/** One ACCOUNT's last-known device rows, keyed by chain id. */
+export const loadDeviceCache = (accountId: string): Record<string, NetworkDevices> =>
+  parseDeviceCache(safeGetItem(DEVICE_CACHE_KEY))[accountId] ?? {};
+
+/** Capture (overwrite) one network's device rows for `accountId`. */
+export const saveNetworkDevices = (
+  accountId: string,
+  chainId: string,
+  entry: NetworkDevices,
+): void => {
+  try {
+    const store = parseDeviceCache(localStorage.getItem(DEVICE_CACHE_KEY));
+    (store[accountId] ??= {})[chainId] = entry;
+    localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(store));
+  } catch {
+    // best-effort; a failed write just doesn't survive the switch/restart.
+  }
+};
+
+/** Drop one network's cached devices for `accountId` — used when a workspace
+ *  is no longer registered. */
+export const forgetNetworkDevices = (accountId: string, chainId: string): void => {
+  try {
+    const store = parseDeviceCache(localStorage.getItem(DEVICE_CACHE_KEY));
+    if (!store[accountId] || !(chainId in store[accountId])) return;
+    delete store[accountId][chainId];
+    if (Object.keys(store[accountId]).length === 0) delete store[accountId];
+    localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(store));
+  } catch {
+    // best-effort.
+  }
+};
+
+const safeGetItem = (key: string): string | null => {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
 };
 
 // ── Remote node persistence ─────────────────────────────
@@ -782,6 +944,8 @@ export const createInitialState = (): ConsoleState => {
     connected: false,
     nodeUrl: null,
     managed: false,
+    owner: false,
+    adminReachable: false,
     status: null,
     channels: [],
     activeChannel: null,
@@ -795,6 +959,8 @@ export const createInitialState = (): ConsoleState => {
     channelTags: [],
     channelMembers: [],
     authorNames: {},
+    authorAvatars: {},
+    authorBios: {},
     nodeUsers: {},
     accountKeys: {},
     accountHandles: {},
@@ -877,6 +1043,10 @@ export const createInitialState = (): ConsoleState => {
  * subtly different hand-written lists in each switch/delete path. */
 export const resetNodeProjection = (): Partial<ConsoleState> => ({
   connected: false,
+  // control-plane facts are per-node; a node change clears them until the new
+  // connection re-evaluates ownership + admin reachability (ADR A5).
+  owner: false,
+  adminReachable: false,
   status: null,
   channels: [],
   activeChannel: null,
@@ -890,6 +1060,8 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   channelTags: [],
   channelMembers: [],
   authorNames: {},
+  authorAvatars: {},
+  authorBios: {},
   nodeUsers: {},
   accountKeys: {},
   accountHandles: {},
@@ -940,7 +1112,9 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+  authorAvatars: Record<string, string>;
+  authorBios: Record<string, string>;
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>;
   accountKeys: Record<string, MemberKeyView[]>;
   accountHandles: Record<string, string>;
   pages: PageMeta[];
@@ -967,6 +1141,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
+  authorAvatars: snapshot.authorAvatars,
+  authorBios: snapshot.authorBios,
   nodeUsers: snapshot.nodeUsers,
   accountKeys: snapshot.accountKeys,
   accountHandles: snapshot.accountHandles,

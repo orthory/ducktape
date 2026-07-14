@@ -33,6 +33,12 @@ pub const IDENTITY_REMOVE_MEMBER_NS: &[u8] = b"ducktape-identity-remove-member-v
 pub const MAX_NAME_LEN: usize = 64;
 /// max member-key label length, in bytes (e.g. "Kim's phone").
 pub const MAX_LABEL_LEN: usize = 64;
+/// max account bio/status length, in bytes (a short status line).
+pub const MAX_BIO_LEN: usize = 280;
+/// max avatar reference length, in bytes -- a duckfs path
+/// (`/shared/attachments/avatars/<sha16>.<ext>`); the bytes live in the files
+/// module, identity stores only the reference.
+pub const MAX_AVATAR_REF_LEN: usize = 512;
 /// query pagination ceiling -- [`IdentityQuery::All`] clamps `limit` to this.
 pub const MAX_QUERY_LIMIT: u64 = 256;
 
@@ -46,6 +52,16 @@ pub struct MemberKeyView {
     pub added_at: u64,
 }
 
+/// one bound node as queries expose it: its node (mesh/valset) key and the
+/// optional human label a bound device set for it (`SetNodeLabel`). The label
+/// is a per-network on-chain fact, so a device's name shows on the user's other
+/// devices connected to the same network.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NodeView {
+    pub node_key: Vec<u8>,
+    pub label: Option<String>,
+}
+
 /// one account record as queries expose it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AccountView {
@@ -54,13 +70,20 @@ pub struct AccountView {
     /// remain); it is an identifier, not a live authority.
     pub account_id: Vec<u8>,
     pub display_name: Option<String>,
+    /// account avatar reference: a duckfs path the app resolves against the
+    /// files module (`None` when unset). Global to the account; propagated to
+    /// each network by the app's reconcile-on-connect pass.
+    pub avatar: Option<String>,
+    /// account bio/status line (`None` when unset). Global to the account.
+    pub bio: Option<String>,
     /// replay guard: every accepted member-signed op signs the CURRENT nonce,
     /// and acceptance bumps it. shared by the whole account.
     pub nonce: u64,
     /// the collected keys, ascending by public key. always non-empty for a
     /// live account.
     pub member_keys: Vec<MemberKeyView>,
-    pub nodes: Vec<Vec<u8>>,
+    /// the bound nodes, ascending by node key, each with its optional label.
+    pub nodes: Vec<NodeView>,
     pub updated_at: u64,
 }
 
@@ -115,6 +138,27 @@ pub enum IdentityMsg {
     /// origin-gated (a bound node is user-trusted hardware); empty trim
     /// clears, over [`MAX_NAME_LEN`] bytes rejects. no signature, no nonce bump.
     SetAccountName { display_name: String },
+    /// set the avatar reference and/or bio of the account the SUBMITTING NODE
+    /// is bound to. origin-gated exactly like [`IdentityMsg::SetAccountName`]
+    /// (a bound node is user-trusted hardware); each field empty-trims to
+    /// cleared, over its byte cap ([`MAX_AVATAR_REF_LEN`]/[`MAX_BIO_LEN`])
+    /// rejects. no signature, no nonce bump. the app's per-network reconcile
+    /// pass pushes the account's global avatar/bio through this.
+    SetProfile {
+        avatar: Option<String>,
+        bio: Option<String>,
+    },
+    /// set (or clear, on empty trim) the human label of `node_key`. ORIGIN-GATED
+    /// exactly like [`IdentityMsg::SetAccountName`]: accepted only from a node
+    /// bound to the account, and `node_key` must be bound to that SAME account
+    /// (you label your own devices). a device label is cosmetic display
+    /// metadata, not a capability — so it rides the origin gate a bound node
+    /// already carries, with no member signature and no nonce bump. over
+    /// [`MAX_LABEL_LEN`] bytes rejects.
+    SetNodeLabel {
+        node_key: Vec<u8>,
+        label: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -302,6 +346,22 @@ mod tests {
             },
             IdentityMsg::SetAccountName {
                 display_name: "eddy".into(),
+            },
+            IdentityMsg::SetProfile {
+                avatar: Some("/shared/attachments/avatars/0123456789abcdef.png".into()),
+                bio: None,
+            },
+            IdentityMsg::SetProfile {
+                avatar: None,
+                bio: Some("building ducks".into()),
+            },
+            IdentityMsg::SetNodeLabel {
+                node_key: vec![5; 32],
+                label: Some("Kim's laptop".into()),
+            },
+            IdentityMsg::SetNodeLabel {
+                node_key: vec![5; 32],
+                label: None,
             },
         ] {
             assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);

@@ -23,6 +23,7 @@ mod forge_git;
 mod huddle;
 mod lan_http;
 mod link_relay;
+mod log;
 mod menu;
 mod notify;
 mod permissions;
@@ -147,6 +148,12 @@ fn main() {
         return;
     }
 
+    // AFTER the helper dispatch (CEF re-execs this binary, and 4-6 helpers would
+    // otherwise append to the same file) and BEFORE the first `.expect()` below —
+    // which, in a bundled app, currently takes the whole thing down leaving zero
+    // bytes on disk.
+    log::init();
+
     // The streaming `duck://` handler (process-global). Registered before the
     // builder so the first gateway navigation is served.
     duck_scheme::register();
@@ -179,11 +186,6 @@ fn main() {
             workspaces::workspace_join_code,
             workspaces::workspace_invite_blob,
             workspaces::workspace_join_requests,
-            workspaces::workspace_admit,
-            workspaces::workspace_promote,
-            workspaces::workspace_resident_remove,
-            workspaces::workspace_demote,
-            workspaces::workspace_request_leave,
             workspaces::workspace_forget,
             workspaces::workspace_select,
             workspaces::workspace_sandbox_apply,
@@ -206,6 +208,7 @@ fn main() {
             user_identity::user_sign_remove_member,
             user_identity::user_sign_files_frame,
             user_identity::user_sign_frame,
+            user_identity::user_sign_admin,
             touchid::touchid_available,
             touchid::touchid_enroll,
             touchid::touchid_enrolled,

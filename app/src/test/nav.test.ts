@@ -14,19 +14,45 @@ import {
 import {
   DEFAULT_OPERATOR_SCREEN,
   nodeControlAvailable,
+  ownerControlUnreachable,
 } from "../console/store/state";
 
 const ws = { id: "w" } as unknown as Workspace;
 
-describe("nodeControlAvailable (ADR A5, interim form)", () => {
-  it("a managed local workspace is controllable", () => {
-    expect(nodeControlAvailable({ workspace: ws, managed: true })).toBe(true);
+describe("nodeControlAvailable (ADR A5)", () => {
+  const base = { workspace: null, managed: false, owner: false, adminReachable: false };
+  it("a managed local workspace is controllable (process plane)", () => {
+    expect(nodeControlAvailable({ ...base, workspace: ws, managed: true })).toBe(true);
   });
-  it("a direct remote client is not", () => {
-    expect(nodeControlAvailable({ workspace: null, managed: false })).toBe(false);
+  it("a direct remote non-owner client is not", () => {
+    expect(nodeControlAvailable(base)).toBe(false);
   });
   it("a workspace without a managed daemon is not", () => {
-    expect(nodeControlAvailable({ workspace: ws, managed: false })).toBe(false);
+    expect(nodeControlAvailable({ ...base, workspace: ws, managed: false })).toBe(false);
+  });
+  it("a remote owner whose admin surface is reachable IS controllable", () => {
+    expect(nodeControlAvailable({ ...base, owner: true, adminReachable: true })).toBe(true);
+  });
+  it("a remote owner whose admin surface is unreachable is not", () => {
+    expect(nodeControlAvailable({ ...base, owner: true, adminReachable: false })).toBe(false);
+  });
+});
+
+describe("ownerControlUnreachable (ADR A5 hint)", () => {
+  const base = { workspace: null, managed: false, owner: false, adminReachable: false };
+  it("a remote owner with an unreachable admin surface shows the hint", () => {
+    expect(ownerControlUnreachable({ ...base, owner: true })).toBe(true);
+  });
+  it("a non-owner never shows the hint", () => {
+    expect(ownerControlUnreachable(base)).toBe(false);
+  });
+  it("a reachable owner shows no hint (they get full control instead)", () => {
+    expect(ownerControlUnreachable({ ...base, owner: true, adminReachable: true })).toBe(false);
+  });
+  it("a local managed node shows no hint (process-plane control, not the remote case)", () => {
+    expect(ownerControlUnreachable({ ...base, workspace: ws, managed: true, owner: true })).toBe(
+      false,
+    );
   });
 });
 

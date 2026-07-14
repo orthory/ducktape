@@ -23,7 +23,7 @@ use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_acti
 use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
 use crate::host_reads::{
     joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
-    read_valset_residents,
+    read_valset_residents, upgrade_operations,
 };
 use crate::host_state::{NetworkBindings, SyncSubstrates, restore_host, sync_all_modules};
 use crate::lobby;
@@ -39,7 +39,7 @@ use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
     replica_verifier, verify_manifest_floor, write_boundary_checkpoint, ServedSeal,
 };
-use crate::util::{diag_log, hex};
+use crate::util::{fatal, hex};
 
 use super::promotion::{choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary};
 use super::reboot_self;
@@ -77,6 +77,7 @@ pub(super) async fn park(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
+    metrics: noded::NodeMetrics,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &dispatch_oracle::SharedProvisioner,
     agent_dirs: &capability_host::AgentDirs,
@@ -104,6 +105,13 @@ pub(super) async fn park(
         mut lobby_rx,
         voice_requests,
     } = channels;
+    metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "resident",
+        phase = "joining",
+        node = %label
+    );
     // a workspace handle for the gate phase to persist a delivered coord cap
     // (private coordination) — `workspace` itself is moved into the gateway
     // plane below, so clone before it leaves.
@@ -166,6 +174,15 @@ pub(super) async fn park(
         book
     });
     if sync_source.is_none() {
+        let error = "no validator state-sync source is configured";
+        metrics.record_sync_failure(error);
+        metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Halted);
+        tracing::error!(
+            event = "node_sync_failed",
+            role = "resident",
+            node = %label,
+            error
+        );
         eprintln!(
             "[node {label}] no statesync source: no validator other than this node \
              is available to serve (only validators answer the statesync channel)"
@@ -310,16 +327,12 @@ pub(super) async fn park(
     // linkage names it.
     if let Some(ckpt) = manifest.as_ref() {
         if let Err(e) = ckpt.preflight(MAX_PROTOCOL_VERSION) {
-            eprintln!(
-                "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
+            fatal!(label, "cannot recover — {e} (recovered boundary needs \
                  protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                ckpt.required_min_version
-            );
-            std::process::exit(1);
+                ckpt.required_min_version);
         }
         if let Err(e) = crate::host_state::preflight_recovery_schema(ckpt) {
-            eprintln!("[node {label}] FATAL: cannot recover — {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot recover — {e}");
         }
         let restored = restore_host(
             &context,
@@ -336,8 +349,7 @@ pub(super) async fn park(
         let mut host = match restored {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: replica checkpoint restore: {e}");
-                std::process::exit(1);
+                fatal!(label, "replica checkpoint restore: {e}");
             }
         };
         // heal the derived index against the CHECKPOINT boundary
@@ -351,14 +363,11 @@ pub(super) async fn park(
         let rec = match recovery.recover_with_sink(&mut host, ckpt, None).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
-                    "[node {label}] FATAL: {e}\n\
+                fatal!(label, "{e}\n\
                      [node {label}] replica state cannot be locally recovered. wipe \
                      the app-state partitions and re-join — but ALWAYS keep the \
                      consensus journal partitions: they are the anti-equivocation \
-                     record for this key."
-                );
-                std::process::exit(1);
+                     record for this key.");
             }
         };
         // seed the shared store with every retained frame so a
@@ -422,6 +431,15 @@ pub(super) async fn park(
         heal_index(&index, node_r.host(), tip, &label).await;
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
+        metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+        tracing::info!(
+            event = "node_phase_transition",
+            role = "resident",
+            phase = "serving",
+            node = %label,
+            height = tip,
+            source = "recovery"
+        );
     }
     let not_serving = |standing: bool| -> String {
         if standing {
@@ -609,13 +627,10 @@ pub(super) async fn park(
                                 // (issuer view lag / member busy) ⇒ fail over.
                                 Ok(lobby::GateMsg::Rejected { code, detail, terminal }) => {
                                     if terminal {
-                                        eprintln!(
-                                            "[node {label}] FATAL: join gate refused \
+                                        fatal!(label, "join gate refused \
                                              ({code:?}): {detail} — this invite cannot be \
                                              redeemed. ask the inviter for a fresh invite and \
-                                             re-join with the new blob."
-                                        );
-                                        std::process::exit(1);
+                                             re-join with the new blob.");
                                     }
                                     println!(
                                         "[node {label}] member {} declined ({code:?}): {detail} \
@@ -634,13 +649,10 @@ pub(super) async fn park(
             }
         }
         if !resident_standing {
-            eprintln!(
-                "[node {label}] FATAL: no member could settle the join gate after 3 rounds \
+            fatal!(label, "no member could settle the join gate after 3 rounds \
                  — the invite may be spent or expired, or no member is reachable; ask for a \
                  fresh invite (manual fallback: `ducktape-node invite-accept {}`)",
-                hex_bytes(&me_bytes)
-            );
-            std::process::exit(1);
+                hex_bytes(&me_bytes));
         }
     }
 
@@ -650,14 +662,11 @@ pub(super) async fn park(
             // ~30 minutes of 2s retries: parking forever is operator
             // guidance territory, not a silent spin. (a RESIDENT
             // holds standing indefinitely — that bail is gated off.)
-            eprintln!(
-                "[node {label}] FATAL: still no standing after {attempt} attempts — \
+            fatal!(label, "still no standing after {attempt} attempts — \
                  the invite may be spent or expired, or no member is reachable; \
                  ask for a fresh invite (manual fallback: `ducktape-node \
                  invite-accept {}`)",
-                hex_bytes(&me_bytes)
-            );
-            std::process::exit(1);
+                hex_bytes(&me_bytes));
         }
         // the serve window: between manifest polls, pump the local
         // read surfaces from the last pre-synced boundary. the window
@@ -857,6 +866,22 @@ pub(super) async fn park(
                                 let _ = reply.send(result);
                             }
                             noded::NodeCommand::Status { reply } => {
+                                metrics.update_storage(
+                                    replica_prev_ckpt.0.unwrap_or_default(),
+                                    index.is_poisoned(),
+                                    MODULE_IDS.iter().map(|module| {
+                                        (
+                                            (*module).to_string(),
+                                            index.applied_height(module).unwrap_or_default(),
+                                        )
+                                    }),
+                                );
+                                if let Some((_, node_r)) = &serving
+                                    && let Some(status) =
+                                        crate::host_reads::read_upgrade_status_raw(node_r.host()).await
+                                {
+                                    metrics.update_upgrade(upgrade_operations(&status, None));
+                                }
                                 // pre-first-sync the surface still answers (the
                                 // app's liveness heartbeat): a zeroed status is
                                 // honest — no boundary is served yet.
@@ -885,9 +910,27 @@ pub(super) async fn park(
                                     height,
                                     modules,
                                     public_key: status_public_key.clone(),
+                                    operations: metrics.operational_status(),
                                 });
                             }
                             noded::NodeCommand::Metrics { reply } => {
+                                let checkpoint_height = replica_prev_ckpt.0.unwrap_or_default();
+                                metrics.update_storage(
+                                    checkpoint_height,
+                                    index.is_poisoned(),
+                                    MODULE_IDS.iter().map(|module| {
+                                        (
+                                            (*module).to_string(),
+                                            index.applied_height(module).unwrap_or_default(),
+                                        )
+                                    }),
+                                );
+                                if let Some((_, node_r)) = &serving
+                                    && let Some(status) =
+                                        crate::host_reads::read_upgrade_status_raw(node_r.host()).await
+                                {
+                                    metrics.update_upgrade(upgrade_operations(&status, None));
+                                }
                                 let _ = reply.send(context.encode());
                             }
                         }
@@ -970,7 +1013,16 @@ pub(super) async fn park(
                             after_view,
                             up_to_view,
                         } = replica::plan_fold(replica_watermark, &anchor)
-                            && let Err(e) = replica_backfill(
+                        {
+                            metrics.begin_sync(
+                                Some(client.current_source().to_string()),
+                                replica_view_base.saturating_add(up_to_view),
+                            );
+                            metrics.set_role_phase(
+                                noded::NodeRole::Resident,
+                                noded::NodePhase::Syncing,
+                            );
+                            if let Err(e) = replica_backfill(
                                 &client,
                                 node_r,
                                 replica_view_base,
@@ -980,43 +1032,50 @@ pub(super) async fn park(
                                 &label,
                             )
                             .await
-                        {
-                            if e.permanent {
-                                // the source pruned the gap: no certificate
-                                // will ever make this range servable again
-                                // (the slept-laptop shape — the chain outran
-                                // the retention window while we were
-                                // suspended). DESCEND, exactly like the
-                                // epoch-cutover branch, so the fallback poll
-                                // re-ascends at a fresh boundary instead of
-                                // retrying the impossible range forever.
+                            {
+                                if e.permanent {
+                                    // the source pruned the gap: no certificate
+                                    // will ever make this range servable again
+                                    // (the slept-laptop shape — the chain outran
+                                    // the retention window while we were
+                                    // suspended). DESCEND, exactly like the
+                                    // epoch-cutover branch, so the fallback poll
+                                    // re-ascends at a fresh boundary instead of
+                                    // retrying the impossible range forever.
+                                    println!(
+                                        "[node {label}] replica: backfill ({after_view}, \
+                                         {up_to_view}] pruned at the source ({}) — \
+                                         re-syncing at a fresh boundary",
+                                        e.detail
+                                    );
+                                    serving = None;
+                                    metrics.record_sync_failure(e.detail.clone());
+                                    replica_scheme = None;
+                                    replica_orchestrator = None;
+                                    recovery_slot = Some(
+                                        reopen_recovery(
+                                            &context,
+                                            &mut recovery_reopens,
+                                            &label,
+                                            code_source.clone(),
+                                        )
+                                        .await,
+                                    );
+                                    break;
+                                }
+                                metrics.record_sync_retry(e.detail.clone());
+                                metrics.set_role_phase(
+                                    noded::NodeRole::Resident,
+                                    noded::NodePhase::Serving,
+                                );
                                 println!(
                                     "[node {label}] replica: backfill ({after_view}, \
-                                     {up_to_view}] pruned at the source ({}) — \
-                                     re-syncing at a fresh boundary",
+                                     {up_to_view}] unavailable: {} — retrying on the \
+                                     next certificate",
                                     e.detail
-                                );
-                                serving = None;
-                                replica_scheme = None;
-                                replica_orchestrator = None;
-                                recovery_slot = Some(
-                                    reopen_recovery(
-                                        &context,
-                                        &mut recovery_reopens,
-                                        &label,
-                                        code_source.clone(),
-                                    )
-                                    .await,
                                 );
                                 break;
                             }
-                            println!(
-                                "[node {label}] replica: backfill ({after_view}, \
-                                 {up_to_view}] unavailable: {} — retrying on the \
-                                 next certificate",
-                                e.detail
-                            );
-                            break;
                         }
                         match node_r.orderer_mut().observe_finalization(
                             &mut rand::rngs::OsRng,
@@ -1036,6 +1095,14 @@ pub(super) async fn park(
                                 // over the Frames lane (seal
                                 // cross-checked post-fold), which
                                 // also admits it.
+                                metrics.begin_sync(
+                                    Some(client.current_source().to_string()),
+                                    replica_view_base.saturating_add(view),
+                                );
+                                metrics.set_role_phase(
+                                    noded::NodeRole::Resident,
+                                    noded::NodePhase::Syncing,
+                                );
                                 if let Err(e) = replica_backfill(
                                     &client,
                                     node_r,
@@ -1058,6 +1125,11 @@ pub(super) async fn park(
                                             e.detail
                                         );
                                         serving = None;
+                                        metrics.record_sync_failure(e.detail.clone());
+                                        metrics.set_role_phase(
+                                            noded::NodeRole::Resident,
+                                            noded::NodePhase::Syncing,
+                                        );
                                         replica_scheme = None;
                                         replica_orchestrator = None;
                                         recovery_slot = Some(
@@ -1071,6 +1143,11 @@ pub(super) async fn park(
                                         );
                                         break;
                                     }
+                                    metrics.record_sync_retry(e.detail.clone());
+                                    metrics.set_role_phase(
+                                        noded::NodeRole::Resident,
+                                        noded::NodePhase::Serving,
+                                    );
                                     println!(
                                         "[node {label}] replica: unresolvable view \
                                          {view} backfill failed: {} — retrying on \
@@ -1109,8 +1186,7 @@ pub(super) async fn park(
         // the finalization floor, and the checkpoint cadence.
         if let Some((served_height, node_r)) = serving.as_mut() {
             if let Err(e) = node_r.drain_delivered().await {
-                eprintln!("[node {label}] FATAL: replica fold: {e}");
-                std::process::exit(1);
+                fatal!(label, "replica fold: {e}");
             }
             let drained = node_r.take_drained();
             // The same projection the validator consumes; this loop retains
@@ -1121,8 +1197,18 @@ pub(super) async fn park(
                     dispatches,
                     record,
                     sealed_hash,
+                    applied,
+                    latency_us,
+                    applied_ops,
+                    rejected_ops,
                     ..
                 } = action;
+                if applied {
+                    metrics.record_block(height, latency_us, &dispatches);
+                } else {
+                    metrics.record_height(height);
+                }
+                metrics.record_op_outcomes(applied_ops, rejected_ops);
                 // a BACKFILLED height's trust is the served seal:
                 // what our fold produced must match it exactly, or
                 // this replica has diverged from the quorum's fold.
@@ -1143,19 +1229,23 @@ pub(super) async fn park(
                             );
                         }
                     }
-                    eprintln!(
-                        "[node {label}] FATAL: backfilled height {height} folded to \
+                    fatal!(label, "backfilled height {height} folded to \
                          {} but the quorum sealed {} — state diverged",
                         hex(&sealed_hash.expect("checked above")),
-                        hex(&served_hash)
-                    );
-                    std::process::exit(1);
+                        hex(&served_hash));
                 }
                 let ops = indexer::BlockOps {
                     record,
                     ..noded::index_block_ops(height, height, &dispatches)
                 };
                 if let Err(err) = index.apply_block(&ops) {
+                    tracing::error!(
+                        event = "node_index_poisoned",
+                        node = %label,
+                        role = "resident",
+                        height,
+                        error = %err
+                    );
                     eprintln!(
                         "[node {label}] replica index apply failed at height \
                          {height}: {err} — wipe <storage>/index to rebuild"
@@ -1167,6 +1257,12 @@ pub(super) async fn park(
                 }
                 *served_height = height;
                 blocks_since_checkpoint += 1;
+            }
+            if !drained.is_empty()
+                && metrics.operational_status().phase == noded::NodePhase::Syncing
+            {
+                metrics.record_sync_progress(*served_height);
+                metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
             }
             // ---- valset orchestration (the replica mirror) --------
             //
@@ -1261,10 +1357,7 @@ pub(super) async fn park(
                         )
                         .await
                     {
-                        eprintln!(
-                            "[node {label}] FATAL: replica cutover journal write: {e}"
-                        );
-                        std::process::exit(1);
+                        fatal!(label, "replica cutover journal write: {e}");
                     }
                     node_r.host_mut().set_active_version(plan.boundary_version());
                     replica_scheme =
@@ -1409,6 +1502,7 @@ pub(super) async fn park(
                 // just retries on the next tick — no re-announce, the gate is
                 // done.
                 let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
+                metrics.record_sync_retry(e.to_string());
                 println!("{}", retry.log_line);
                 continue;
             }
@@ -1512,6 +1606,7 @@ pub(super) async fn park(
                     replica_epoch, tip.epoch
                 );
                 serving = None;
+                metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
                 replica_scheme = None;
                 replica_orchestrator = None;
                 recovery_slot =
@@ -1543,6 +1638,7 @@ pub(super) async fn park(
                     let m = match fetch_manifest(&client).await {
                         Ok(m) => m,
                         Err(e) => {
+                            metrics.record_sync_retry(e.to_string());
                             let retry = joiner_manifest_fetch_retry(
                                 &label,
                                 resident_standing,
@@ -1553,15 +1649,21 @@ pub(super) async fn park(
                         }
                     };
                     if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
-                        eprintln!(
-                            "[node {label}] FATAL: cannot observe this network — {e}"
-                        );
-                        std::process::exit(1);
+                        fatal!(label, "cannot observe this network — {e}");
                     }
                     println!(
                         "[node {label}] replica: bootstrapping at boundary {} ({} modules)",
                         m.height,
                         m.entries.len()
+                    );
+                    metrics.begin_sync(Some(client.current_source().to_string()), m.height);
+                    metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
+                    tracing::info!(
+                        event = "node_phase_transition",
+                        role = "resident",
+                        phase = "syncing",
+                        node = %label,
+                        target_height = m.height
                     );
                     match sync_all_modules(
                         &context,
@@ -1592,6 +1694,7 @@ pub(super) async fn park(
                                     cert,
                                 }),
                                 Err(e) => {
+                                    metrics.record_sync_retry(e.to_string());
                                     println!(
                                         "[node {label}] replica: boundary {} floor \
                                          refused ({e}) — retrying",
@@ -1629,12 +1732,22 @@ pub(super) async fn park(
                             {
                                 Ok(c) => c,
                                 Err(PostRebootCatchupError::Fatal(e)) => {
-                                    eprintln!(
-                                        "[node {label}] FATAL: replica suffix fold: {e}"
+                                    metrics.record_sync_failure(e.clone());
+                                    metrics.set_role_phase(
+                                        noded::NodeRole::Resident,
+                                        noded::NodePhase::Halted,
                                     );
-                                    std::process::exit(1);
+                                    tracing::error!(
+                                        event = "node_sync_failed",
+                                        role = "resident",
+                                        node = %label,
+                                        stage = "suffix_fold",
+                                        error = %e
+                                    );
+                                    fatal!(label, "replica suffix fold: {e}");
                                 }
                                 Err(e) => {
+                                    metrics.record_sync_retry(format!("{e:?}"));
                                     println!(
                                         "[node {label}] replica: suffix fold at \
                                          boundary {} unavailable ({e:?}) — re-bootstrapping",
@@ -1645,6 +1758,8 @@ pub(super) async fn park(
                                 }
                             };
                             let tip = caught.to_height.max(m.height);
+                            metrics.begin_sync(Some(client.current_source().to_string()), tip);
+                            metrics.record_sync_progress(tip);
                             // seed the shared store with the folded
                             // suffix: peers' resolvers can fetch these
                             // from us, and a re-reported cert for a
@@ -1724,11 +1839,32 @@ pub(super) async fn park(
                                 last_indexed_root = Some(root);
                             }
                             serving = Some((tip, node_r));
+                            metrics.set_role_phase(
+                                noded::NodeRole::Resident,
+                                noded::NodePhase::Serving,
+                            );
+                            tracing::info!(
+                                event = "node_phase_transition",
+                                role = "resident",
+                                phase = "serving",
+                                node = %label,
+                                height = tip
+                            );
                         }
-                        Err(e) => println!(
-                            "[node {label}] replica bootstrap at boundary {} failed: {e}",
-                            m.height
-                        ),
+                        Err(e) => {
+                            metrics.record_sync_failure(e.to_string());
+                            tracing::warn!(
+                                event = "node_sync_failed",
+                                role = "resident",
+                                node = %label,
+                                target_height = m.height,
+                                error = %e
+                            );
+                            println!(
+                                "[node {label}] replica bootstrap at boundary {} failed: {e}",
+                                m.height
+                            );
+                        }
                     }
                 }
                 // ---- the resident-tier pumps, one pass per poll ----
@@ -1819,6 +1955,7 @@ pub(super) async fn park(
                 tip.epoch,
                 tip.participants.len()
             );
+            metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);
             continue;
         }
         // in the epoch set: PROMOTION consumes the boundary itself —
@@ -1827,6 +1964,7 @@ pub(super) async fn park(
         let m = match fetch_manifest(&client).await {
             Ok(m) => m,
             Err(e) => {
+                metrics.record_sync_retry(e.to_string());
                 let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                 println!("{}", retry.log_line);
                 continue;
@@ -1855,8 +1993,7 @@ pub(super) async fn park(
         // install/replay — a clear early refusal, not a post-sync app-hash
         // mismatch. inert on a baseline manifest.
         if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
-            eprintln!("[node {label}] FATAL: cannot promote — {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot promote — {e}");
         }
         // THE PROMOTION COLLAPSE for a FOLDING replica: it is already
         // at head with a journal that proved every block it folded —
@@ -1871,6 +2008,15 @@ pub(super) async fn park(
             let mut base = m.clone();
             base.height = folded_tip;
             base.app_hash = node_r.host().app_hash();
+            metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Draining);
+            tracing::info!(
+                event = "node_phase_transition",
+                role = "resident",
+                phase = "draining",
+                node = %label,
+                height = base.height,
+                reason = "promotion"
+            );
             // a boundary at/below its epoch base needs no floor (the
             // fresh epoch starts from its genesis floor — exactly the
             // halted-cutover promotion); past the base, OUR persisted
@@ -1881,10 +2027,7 @@ pub(super) async fn park(
                 match node_r.sink_mut().floor_cert() {
                     Ok(fc) => fc.filter(|fc| fc.height <= folded_tip),
                     Err(e) => {
-                        eprintln!(
-                            "[node {label}] FATAL: replica promotion floor read: {e}"
-                        );
-                        std::process::exit(1);
+                        fatal!(label, "replica promotion floor read: {e}");
                     }
                 }
             };
@@ -1918,6 +2061,16 @@ pub(super) async fn park(
             recovery_slot =
                 Some(reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await);
         }
+        metrics.begin_sync(Some(client.current_source().to_string()), m.height);
+        metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
+        tracing::info!(
+            event = "node_phase_transition",
+            role = "resident",
+            phase = "syncing",
+            node = %label,
+            target_height = m.height,
+            reason = "promotion"
+        );
         match sync_all_modules(
             &context,
             &client,
@@ -1936,9 +2089,12 @@ pub(super) async fn park(
         .await
         {
             Ok(host) => {
+                metrics.begin_sync(Some(client.current_source().to_string()), m.height);
+                metrics.record_sync_progress(m.height);
                 let latest = match fetch_manifest(&client).await {
                     Ok(latest) => latest,
                     Err(e) => {
+                        metrics.record_sync_retry(e.to_string());
                         println!(
                             "[node {label}] synced boundary {} but could not revalidate \
                              latest manifest ({e}); retrying",
@@ -1948,47 +2104,45 @@ pub(super) async fn park(
                     }
                 };
                 let host_hash = host.app_hash();
-                diag_log(format!(
-                    "DIAG admission_revalidate synced_height={} synced_hash={} \
-                     latest_height={} latest_hash={} host_hash={} latest_matches_host={} \
-                     latest_floor_present={}",
-                    m.height,
-                    hex(&m.app_hash),
-                    latest.height,
-                    hex(&latest.app_hash),
-                    hex(&host_hash),
-                    latest.app_hash == host_hash,
-                    latest.floor_cert.is_some()
-                ));
+                tracing::debug!(
+                    target: "ducktape::join",
+                    synced_height = m.height,
+                    synced_hash = %hex(&m.app_hash),
+                    latest_height = latest.height,
+                    latest_hash = %hex(&latest.app_hash),
+                    host_hash = %hex(&host_hash),
+                    latest_matches_host = latest.app_hash == host_hash,
+                    latest_floor_present = latest.floor_cert.is_some(),
+                    "admission revalidate"
+                );
                 if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
-                    eprintln!("[node {label}] FATAL: promotion preflight failed: {e}");
-                    std::process::exit(1);
+                    fatal!(label, "promotion preflight failed: {e}");
                 }
                 match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
                     PromotionBoundary::Promote { boundary, source } => {
-                        diag_log(format!(
-                            "DIAG promotion_boundary chosen_height={} chosen_hash={} \
-                             chosen_floor_present={} source={}",
-                            boundary.height,
-                            hex(&boundary.app_hash),
-                            boundary.floor_cert.is_some(),
-                            source.as_str()
-                        ));
+                        tracing::debug!(
+                            target: "ducktape::join",
+                            chosen_height = boundary.height,
+                            chosen_hash = %hex(&boundary.app_hash),
+                            chosen_floor_present = boundary.floor_cert.is_some(),
+                            source = %source.as_str(),
+                            "promotion boundary chosen"
+                        );
                         let boundary = boundary.clone();
                         let boundary_floor =
                             match verify_manifest_floor(&namespace, &boundary) {
                                 Ok(floor) => floor,
                                 Err(e) => {
-                                    eprintln!(
-                                        "[node {label}] FATAL: promotion floor verify: {e}"
-                                    );
-                                    std::process::exit(1);
+                                    fatal!(label, "promotion floor verify: {e}");
                                 }
                             };
-                        diag_log(format!(
-                            "DIAG suffix_install from={} to={} frames=0",
-                            boundary.height, boundary.height
-                        ));
+                        tracing::debug!(
+                            target: "ducktape::join",
+                            from = boundary.height,
+                            to = boundary.height,
+                            frames = 0,
+                            "suffix install"
+                        );
                         let floor = boundary_floor.map(|cert| recovery::FloorCert {
                             epoch: boundary.epoch,
                             height: boundary.height,
@@ -2006,7 +2160,17 @@ pub(super) async fn park(
                     hex(&latest.app_hash)
                 );
             }
-            Err(e) => println!("[node {label}] sync at boundary {} failed: {e}", m.height),
+            Err(e) => {
+                metrics.record_sync_failure(e.to_string());
+                tracing::warn!(
+                    event = "node_sync_failed",
+                    role = "resident",
+                    node = %label,
+                    target_height = m.height,
+                    error = %e
+                );
+                println!("[node {label}] sync at boundary {} failed: {e}", m.height);
+            }
         }
     };
     println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
@@ -2038,6 +2202,15 @@ pub(super) async fn park(
         "promotion_checkpoint",
     )
     .await;
+    metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Draining);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "resident",
+        phase = "draining",
+        node = %label,
+        height = boundary.height,
+        reason = "promotion"
+    );
     // tear the pre-warm interface down cleanly before the exec: the
     // in-process boringtun device dies with the process either way,
     // but only an orderly Shutdown unlinks its UAPI socket path —

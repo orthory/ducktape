@@ -58,6 +58,8 @@ fn echo_work_spec() -> Vec<u8> {
         capability: "echo".into(),
         payload: b"hi".to_vec(),
         demands: Default::default(),
+        // `Queue` — the legacy wait-for-capacity behavior this seam exercises.
+        admission: Default::default(),
     })
 }
 

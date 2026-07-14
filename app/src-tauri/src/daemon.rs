@@ -25,12 +25,15 @@
 //! to `daemon.log`. The Tauri shell plugin's sidecar API is NOT
 //! used on purpose — it kills children when the app exits.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -182,11 +185,12 @@ const ALLOWED_VERBS: &[&str] = &[
     "invite",
     "join-requests",
     "join-state",
-    "invite-accept",
-    "member-remove",
-    "promote",
-    "resident-remove",
-    "member-leave",
+    // admit/promote/demote/removeResident/leave left this app-spawned verb lane
+    // in the W2 migration (ADR A1): the app drives them as account-signed
+    // governance frames now, never by spawning a node verb that re-signs with
+    // the node's key. The standalone `ducktape-node <verb>` operator CLI still
+    // exists for headless node-principal governance — it is invoked directly,
+    // not through this app allowlist.
     "member-status",
     "user-key",
     "user-sign-bind",
@@ -196,6 +200,7 @@ const ALLOWED_VERBS: &[&str] = &[
     "user-sign-remove-member",
     "user-sign-gateway-route",
     "user-sign-frame",
+    "user-sign-admin",
     "gateway-route-bind",
     "gateway-route-unbind",
     "gateway-route-list",
@@ -502,6 +507,12 @@ pub(crate) fn spawn_workspace_node(
             reason,
             log_tail: String::new(),
         })?;
+        // cap the tape in the same change that turns the volume up: daemon.log was
+        // opened append-forever, and only its last 64 KiB is ever read back — so a
+        // long-lived node's BOOT sequence, where every schema/bind/reachability
+        // failure is decided, scrolls permanently out of reach. one generation is
+        // enough; this is a tail, not an archive.
+        roll_if_oversized(log_path);
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -694,6 +705,14 @@ fn prepare_node_command_env(cmd: &mut Command) {
     if let Some(path) = node_launch_path(std::env::var_os("PATH"), std::env::var_os("HOME")) {
         cmd.env("PATH", path);
     }
+    // The node otherwise inherits NO environment but PATH, so a developer's
+    // `RUST_LOG=…` on the app never reached the process they wanted it to reach.
+    // This is now the COLD path — the node serves POST /v1/log-filter, so a live
+    // node can be retuned without restarting it (and without destroying the wedged
+    // state you restarted it to look at).
+    if let Some(rust_log) = std::env::var_os("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
 }
 
 fn node_launch_path(current: Option<OsString>, home: Option<OsString>) -> Option<OsString> {
@@ -753,6 +772,269 @@ fn add_nvm_node_bins(dirs: &mut Vec<PathBuf>, home: &Path) {
 fn add_existing_path_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
     if dir.is_dir() && !dirs.iter().any(|existing| existing == &dir) {
         dirs.push(dir);
+    }
+}
+
+/// Reap the node process and REPORT its death.
+///
+/// The shell held the ONLY handle that can report the node's exit status — and threw
+/// it away: `spawn_workspace_node` returned the `Child`, the caller took `.id()` for
+/// the pidfile, and then dropped it. Nothing ever called `wait()`.
+///
+/// So a node that OOMs, panics, or fails a schema preflight an hour into a session
+/// was reported with the only message we had — the grace-window one: *"the node
+/// exited before it came up."* Which is not what happened, and sent people looking
+/// in the wrong place. (It also left a zombie: a dropped `Child` is never reaped.)
+///
+/// Detaching is unaffected — the node still has its own process group and still
+/// outlives the window. This thread watches AND, for a supervised node, revives
+/// it after an unexpected death (see [`Supervisor`]).
+///
+/// ── single-node supervision (W2 slice) ──
+///
+/// how many times the supervisor auto-restarts a node that keeps dying, and the
+/// backoff between attempts. a node that fails preflight on every boot must not
+/// spin forever — after the cap we stop and leave the last error in daemon.log.
+/// ponytail: fixed cap + constant backoff; a crash-RATE window would be more
+/// precise if real flapping ever shows up.
+const MAX_AUTO_RESTARTS: u32 = 5;
+const RESTART_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Everything a supervised node needs to respawn itself after an UNEXPECTED
+/// exit. `stopping` is the shared stop-intent flag the teardown path raises so a
+/// deliberate kill — which escalates to a signal and thus LOOKS like a crash —
+/// is never mistaken for one.
+pub(crate) struct Supervisor {
+    pub(crate) config: PathBuf,
+    pub(crate) log: PathBuf,
+    pub(crate) http_port: u16,
+    /// the p2p LISTEN port — the dependable liveness probe (bound in every
+    /// phase), used to avoid double-spawning if a re-select already adopted.
+    pub(crate) listen_port: u16,
+    pub(crate) pidfile: PathBuf,
+    pub(crate) workspace: String,
+    pub(crate) stopping: Arc<AtomicBool>,
+}
+
+/// Per-workspace stop-intent flags, keyed by the workspace dir. The spawn path
+/// registers one; the teardown path raises it before it kills, so the reaper
+/// tells "we stopped it" apart from "it crashed".
+fn stop_flags() -> &'static Mutex<HashMap<PathBuf, Arc<AtomicBool>>> {
+    static FLAGS: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> = OnceLock::new();
+    FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_flags() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<AtomicBool>>> {
+    stop_flags().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Register a FRESH stop-intent flag for a workspace's supervised node (cleared).
+/// Called at spawn; overwrites any stale flag from a prior lifecycle.
+pub(crate) fn register_supervised(dir: &Path) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    lock_flags().insert(dir.to_path_buf(), flag.clone());
+    flag
+}
+
+/// Raise the stop-intent for a workspace so its supervisor will NOT auto-restart
+/// the node it is about to kill. No-op when nothing is supervised.
+pub(crate) fn mark_stopping(dir: &Path) {
+    if let Some(flag) = lock_flags().get(dir) {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Drop a workspace's supervisor registration after teardown.
+pub(crate) fn clear_supervised(dir: &Path) {
+    lock_flags().remove(dir);
+}
+
+/// persist `child`'s pid ONLY while it is still alive: `spawn_verified`'s http
+/// ready-probe can be satisfied by an ALREADY-RUNNING node on the same port, so
+/// a duplicate that bound nothing and died instantly could otherwise overwrite
+/// the live node's pidfile with a corpse pid — after which the control phase
+/// shows "Start" for a node the app is actively connected to (epic QA BUG-3).
+pub(crate) fn record_pid_if_alive(child: &mut Child, pidfile: &Path, workspace: &str) {
+    match child.try_wait() {
+        // still running — the pid is honest; a failed write only degrades stop
+        // back to the pgrep sweep.
+        Ok(None) => {
+            if let Err(err) = fs::write(pidfile, child.id().to_string()) {
+                tracing::warn!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    error = %err,
+                    "could not record the node pid — teardown falls back to the pgrep sweep"
+                );
+            }
+        }
+        _ => tracing::warn!(
+            target: "ducktape::shell",
+            %workspace,
+            pid = child.id(),
+            "spawned node already exited — not recording its pid"
+        ),
+    }
+}
+
+/// The auto-restart POLICY, factored out so it is testable without a process:
+/// revive only an UNEXPECTED exit (non-zero / signal), only when no stop was
+/// requested, and only under the crash cap.
+fn should_auto_restart(exit_code: Option<i32>, stopping: bool, restarts: u32) -> bool {
+    if exit_code == Some(0) {
+        return false; // a clean stop is not a crash
+    }
+    if stopping {
+        return false; // deliberate teardown (may have escalated to a signal)
+    }
+    restarts < MAX_AUTO_RESTARTS
+}
+
+/// Watch a node we spawned; revive it on an unexpected death. `sup` carries the
+/// respawn context and the stop-intent flag.
+pub(crate) fn watch_node_exit(child: Child, sup: Supervisor) {
+    watch_with_restarts(child, sup, 0);
+}
+
+fn watch_with_restarts(mut child: Child, sup: Supervisor, restarts: u32) {
+    let pid = child.id();
+    let started = Instant::now();
+    std::thread::Builder::new()
+        .name("node-reaper".into())
+        .spawn(move || {
+            let elapsed_s = || started.elapsed().as_secs();
+            let workspace = sup.workspace.clone();
+            match child.wait() {
+                // a CLEAN exit is the routine path, not an incident: every workspace
+                // switch, forget, and sandbox-apply asks this node to stop (POST
+                // /v1/admin/shutdown → exit(0)). crying `error!` on the most common
+                // lifecycle action would be a false alarm in exactly the log someone
+                // reads BECAUSE they are chasing a death — and it would teach them to
+                // ignore the line that matters.
+                Ok(status) if status.code() == Some(0) => tracing::info!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    pid,
+                    elapsed_s = elapsed_s(),
+                    "the workspace node stopped cleanly"
+                ),
+                // anything else is a death we did not ask for — a panic, an OOM, a
+                // failed schema preflight, or an escalation to TERM/KILL because the
+                // graceful stop did not take. `code` is None when a signal killed it.
+                Ok(status) => {
+                    let code = status.code();
+                    tracing::error!(
+                        target: "ducktape::shell",
+                        %workspace,
+                        pid,
+                        code = code.unwrap_or(-1),
+                        elapsed_s = elapsed_s(),
+                        "the workspace node EXITED — see this workspace's daemon.log for why"
+                    );
+                    maybe_restart(sup, restarts, code);
+                }
+                Err(err) => tracing::warn!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    pid,
+                    error = %err,
+                    elapsed_s = elapsed_s(),
+                    "lost track of the workspace node (cannot wait on it)"
+                ),
+            }
+        })
+        .ok();
+}
+
+/// Runs inside the reaper thread after an unexpected exit: decide, back off, and
+/// respawn — then hand the new child to a fresh watcher (bounded recursion: each
+/// reaper spawns at most one successor).
+fn maybe_restart(sup: Supervisor, restarts: u32, exit_code: Option<i32>) {
+    let stopping = sup.stopping.load(Ordering::SeqCst);
+    if !should_auto_restart(exit_code, stopping, restarts) {
+        if stopping {
+            tracing::info!(
+                target: "ducktape::shell",
+                workspace = %sup.workspace,
+                "supervised node stop was requested — not restarting"
+            );
+        } else if restarts >= MAX_AUTO_RESTARTS {
+            tracing::error!(
+                target: "ducktape::shell",
+                workspace = %sup.workspace,
+                restarts,
+                "gave up auto-restarting the workspace node — see daemon.log for the cause"
+            );
+        }
+        return;
+    }
+    sleep(RESTART_BACKOFF);
+    // re-check after the backoff: a stop or a user re-select may have landed.
+    if sup.stopping.load(Ordering::SeqCst) {
+        return;
+    }
+    // adopt-hardening: if a re-select (or a prior restart) already brought a
+    // node up on this workspace's listen OR http port, DON'T double-spawn —
+    // that node is now the one; this reaper's job is done. (http too: a mesh
+    // listener on a non-loopback interface is invisible to a loopback probe —
+    // epic QA BUG-1.)
+    if crate::workspaces::port_listening(sup.listen_port)
+        || crate::workspaces::port_listening(sup.http_port)
+    {
+        tracing::info!(
+            target: "ducktape::shell",
+            workspace = %sup.workspace,
+            "workspace node is already back up — adopting, not restarting"
+        );
+        return;
+    }
+    match spawn_workspace_node(&sup.config, &sup.log, Some(sup.http_port)) {
+        Ok(mut child) => {
+            record_pid_if_alive(&mut child, &sup.pidfile, &sup.workspace);
+            tracing::warn!(
+                target: "ducktape::shell",
+                workspace = %sup.workspace,
+                restart = restarts + 1,
+                "auto-restarted the crashed workspace node"
+            );
+            watch_with_restarts(child, sup, restarts + 1);
+        }
+        Err(failure) => tracing::error!(
+            target: "ducktape::shell",
+            workspace = %sup.workspace,
+            error = %failure,
+            "auto-restart of the crashed workspace node failed"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::should_auto_restart;
+
+    #[test]
+    fn restart_policy() {
+        // a clean exit is never a crash, whatever else is true.
+        assert!(!should_auto_restart(Some(0), false, 0));
+        // an unexpected exit with no stop requested, under the cap, restarts.
+        assert!(should_auto_restart(Some(1), false, 0));
+        assert!(should_auto_restart(None, false, super::MAX_AUTO_RESTARTS - 1)); // signal kill
+        // a requested stop suppresses restart even for a signal death (teardown
+        // escalates to KILL, which looks exactly like a crash).
+        assert!(!should_auto_restart(None, true, 0));
+        // the crash cap stops the loop.
+        assert!(!should_auto_restart(Some(1), false, super::MAX_AUTO_RESTARTS));
+    }
+}
+
+/// `daemon.log` grows unbounded across every restart of a workspace's node. roll
+/// it once past this size, keeping exactly one previous generation.
+const LOG_ROLL_BYTES: u64 = 32 * 1024 * 1024;
+
+fn roll_if_oversized(log_path: &Path) {
+    if fs::metadata(log_path).is_ok_and(|meta| meta.len() > LOG_ROLL_BYTES) {
+        // best-effort: a failed roll must never block the node from starting.
+        let _ = fs::rename(log_path, log_path.with_extension("log.1"));
     }
 }
 
@@ -981,8 +1263,20 @@ mod tests {
         // shell `user-sign-frame` with a (possibly secret) payload/password on
         // stdin — the verb AND its stdin arm must be allowlisted or every
         // user-signed submit hard-fails before the node runs.
-        assert!(validate_invocation(&["user-sign-frame", "--target", "chat", "--seq", "1"], &["deadbeef"]).is_ok());
-        assert!(validate_invocation(&["user-sign-frame", "--target", "files", "--seq", "1"], &["pw", "deadbeef"]).is_ok());
+        assert!(
+            validate_invocation(
+                &["user-sign-frame", "--target", "chat", "--seq", "1"],
+                &["deadbeef"]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_invocation(
+                &["user-sign-frame", "--target", "files", "--seq", "1"],
+                &["pw", "deadbeef"]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1006,11 +1300,15 @@ mod tests {
         // A root-owned dir writable by an arbitrary group is swappable…
         assert!(dir_replaceable_by_others(0, 12345, 0o40775, me, my_group));
         // …and other-write is always hostile without the sticky bit…
-        assert!(dir_replaceable_by_others(me, my_group, 0o40777, me, my_group));
+        assert!(dir_replaceable_by_others(
+            me, my_group, 0o40777, me, my_group
+        ));
         // …but the sticky bit clears it (/tmp's ownership rule).
         assert!(!dir_replaceable_by_others(0, 0, 0o41777, me, my_group));
         // Our own dir under our own primary group may be group-writable.
-        assert!(!dir_replaceable_by_others(me, my_group, 0o40775, me, my_group));
+        assert!(!dir_replaceable_by_others(
+            me, my_group, 0o40775, me, my_group
+        ));
         // root:admin 0775 is the macOS convention for /Applications — trusted
         // there, hostile elsewhere.
         #[cfg(target_os = "macos")]

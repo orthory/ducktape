@@ -129,10 +129,8 @@ fn run_slug(run_id: &str) -> String {
     // reuse duckfs's content-address hash (no new dep): a domain-separated
     // sha-256 over the FULL run_id → a stable 24-hex tail keyed on the entire
     // id, attempt included.
-    let digest = duckfs_core::objects::object_id(
-        duckfs_core::objects::Kind::Chunk,
-        run_id.as_bytes(),
-    );
+    let digest =
+        duckfs_core::objects::object_id(duckfs_core::objects::Kind::Chunk, run_id.as_bytes());
     let hash: String = duckfs_core::to_hex(&digest).chars().take(24).collect();
     let prefix: String = run_id
         .chars()
@@ -413,11 +411,7 @@ impl NodedProvisioner {
     /// the repo base is read off the handle's forge repo (the same base the
     /// forge module materializes into). host `git` is probed ONCE here —
     /// a probe failure makes the lane permanently unavailable, loudly.
-    pub fn with_forge(
-        self,
-        push_base: Option<String>,
-        committer_name: impl Into<String>,
-    ) -> Self {
+    pub fn with_forge(self, push_base: Option<String>, committer_name: impl Into<String>) -> Self {
         self.with_forge_probed(push_base, committer_name, forge::probe_host_git)
     }
 
@@ -537,9 +531,13 @@ mod tests {
         // pure [a-z0-9], bounded, never empty, no traversal metacharacter survives.
         for id in ["s1:0", "../../etc/passwd", "", "A/B.C-D", &"z".repeat(200)] {
             let s = run_slug(id);
-            assert!(!s.is_empty() && s.len() <= 48, "slug {s:?} bounded+non-empty");
             assert!(
-                s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                !s.is_empty() && s.len() <= 48,
+                "slug {s:?} bounded+non-empty"
+            );
+            assert!(
+                s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
                 "slug {s:?} is [a-z0-9] — no path-traversal metacharacter"
             );
         }

@@ -7,7 +7,7 @@
 //! thread and only ever talks to the actor over the command channel. every app
 //! build is a client: the web build dials this directly; the desktop shell
 //! spawns it detached (an orphan — it outlives the window) and connects the
-//! same way. POST /v1/shutdown is how a client retires it: no pid handshake,
+//! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
 //! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
@@ -52,7 +52,6 @@ use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
-use tracing_subscriber::prelude::*;
 use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order. status reports use
@@ -113,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
 
     let log_ring = noded::LogRing::default();
-    init_tracing(log_ring.clone());
+    noded::log::init(Some(log_ring.clone()));
 
     let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle
@@ -124,7 +123,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_index_store(index.clone())
         // the duckfs workspace RPC materializes managed checkouts here (disk
         // state, separate from the module's own `<storage>/duckfs` dir).
-        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        // the single-writer daemon has no consensus and no on-chain owner, so
+        // admin stays loopback-trust (ADR A2/A5); `DUCKTAPE_ADMIN=off` still
+        // removes the control surface entirely.
+        .with_admin(noded::AdminConfig {
+            exposure: noded::AdminExposure::from_env(),
+            node_key: None,
+            ..Default::default()
+        });
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle is
@@ -173,19 +180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[noded] shutdown requested, exiting");
             Ok(())
         })
-}
-
-fn init_tracing(log_ring: noded::LogRing) {
-    // the stream's `logs` topic: info floor by default so debug/trace events
-    // never pay per-event formatting into the ring; RUST_LOG overrides.
-    let ring_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(log_ring)
-        .with_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        );
-    let _ = tracing_subscriber::registry().with(ring_layer).try_init();
 }
 
 /// own the host for the process lifetime: genesis the module set, then apply
@@ -310,6 +304,7 @@ fn run_node(
         // one `context.encode()` then serves them alongside commonware's own
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
+        metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
 
         // OFF-LOOP execution: the pool gates effects inline but runs the
         // provider CLI on spawned tasks; a completed run re-enters as a
@@ -355,9 +350,12 @@ fn run_node(
             Err(err) => {
                 // poisoned, not fatal: reads stay up, writes refuse, and the
                 // wipe-to-rebuild remedy is the same one the fold error names.
-                eprintln!(
-                    "[noded] module index rebuild failed: {err} — wipe {} to rebuild",
-                    index.base().display()
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    error = %err,
+                    index = %index.base().display(),
+                    "module index rebuild FAILED — the app's views are STALE; wipe the \
+                     index directory to rebuild"
                 );
             }
         }
@@ -423,6 +421,13 @@ fn run_node(
                     let _ = reply.send(result);
                 }
                 NodeCommand::Status { reply } => {
+                    metrics.update_storage(
+                        0,
+                        index.is_poisoned(),
+                        MODULE_IDS.iter().map(|id| {
+                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                        }),
+                    );
                     let modules = MODULE_IDS
                         .iter()
                         .map(|id| ModuleStatus {
@@ -442,9 +447,17 @@ fn run_node(
                         // the embedded daemon has no mesh identity — clients
                         // treat an empty key as "no peer-routed features here".
                         public_key: String::new(),
+                        operations: metrics.operational_status(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {
+                    metrics.update_storage(
+                        0,
+                        index.is_poisoned(),
+                        MODULE_IDS.iter().map(|id| {
+                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                        }),
+                    );
                     // the context owns the registry; encode it to OpenMetrics text.
                     let _ = reply.send(context.encode());
                 }
@@ -481,16 +494,16 @@ async fn submit_and_drain(
     let (included, events) =
         match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await
     {
-        Ok(out) => out,
-        Err(SubmitError::Fatal(err)) => {
-            eprintln!("[noded] FATAL: {err} — halting");
+            Ok(out) => out,
+            Err(SubmitError::Fatal(err)) => {
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
         };
 
     let mut queue = VecDeque::new();
-    offer_effects(workers, events, &mut queue).await;
+    offer_effects(workers, *height, events, &mut queue).await;
     let mut rounds = 1u32;
 
     loop {
@@ -524,14 +537,18 @@ async fn submit_and_drain(
         .await
         {
             Ok((_block, events)) => {
-                offer_effects(workers, events, &mut queue).await;
+                offer_effects(workers, *height, events, &mut queue).await;
             }
             Err(SubmitError::Fatal(err)) => {
-                eprintln!("[noded] FATAL: {err} — halting");
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => {
-                eprintln!("[noded] worker follow-up rejected: {err}");
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %err,
+                    "worker follow-up REJECTED — the oracle's result never landed"
+                );
             }
         }
     }
@@ -589,7 +606,7 @@ async fn submit_one(
     let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
-    metrics.record_ops(1); // this lane is one member op per block
+    metrics.record_op_outcomes(1, 0); // this lane is one applied member op per block
 
     // fold the block into the derived per-module index LAST: canonical state
     // is already committed, so an index failure degrades the read models and
@@ -618,9 +635,14 @@ async fn submit_one(
         ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
     };
     if let Err(err) = index.apply_block(&block_ops) {
-        eprintln!(
-            "[noded] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-            *height
+        // consensus stays healthy while the ENTIRE app UI silently stops updating:
+        // every module view the app reads is served from this derived index.
+        tracing::error!(
+            target: "ducktape::consensus",
+            height = *height,
+            error = %err,
+            "module index apply FAILED — the app's views are now STALE; wipe \
+             <storage>/index to rebuild"
         );
     }
 
@@ -654,9 +676,11 @@ fn origin_tag(origin: &Origin) -> String {
 
 async fn offer_effects(
     workers: &[Box<dyn host::worker::Worker>],
+    height: u64,
     events: Vec<Event>,
     queue: &mut VecDeque<Msg>,
 ) {
+    let mut notes = noded::log::ModuleNotes::new(height);
     for eff in events {
         let mut claimed = false;
         for w in workers {
@@ -668,19 +692,24 @@ async fn offer_effects(
                 }
                 Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
-                    eprintln!("[noded] worker error: {err}");
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        height,
+                        source = %eff.source,
+                        error = %err,
+                        "worker failed to handle a module event"
+                    );
                     claimed = true;
                     break;
                 }
             }
         }
-        // an unclaimed event is normally plain observability; one that
-        // DECODES as a worker request means a saga is stuck Pending.
-        if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
-            println!(
-                "[noded] WorkerRequest with no worker ({} bytes) — dropped",
-                eff.payload.len()
-            );
+        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+        // guest cannot log) — unless it decodes as a worker request, which means
+        // a saga is stuck Pending.
+        if !claimed {
+            notes.unclaimed(&eff);
         }
     }
+    notes.finish();
 }

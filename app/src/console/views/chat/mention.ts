@@ -100,7 +100,7 @@ const uniqueHandle = (base: string, used: Set<string>): string => {
  *  trailing "-"), falling back to userKeyHex.slice(0, 8) when empty; a handle
  *  colliding with an earlier user's or any agent_id gets "-2", "-3", ... */
 export const mentionableUsers = (
-  nodeUsers: Record<string, { accountId: string; name: string | null }>,
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>,
   agents: AgentRecord[],
 ): UserMentionCandidate[] => {
   const seenUserKeys = new Set<string>();

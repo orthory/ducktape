@@ -731,7 +731,8 @@ mod upload_pack_tests {
     const HAVE: &str = "2222222222222222222222222222222222222222";
 
     fn request_tail(tail: &[u8]) -> Vec<u8> {
-        let mut body = pkt_line(format!("want {WANT} multi_ack_detailed side-band-64k\n").as_bytes());
+        let mut body =
+            pkt_line(format!("want {WANT} multi_ack_detailed side-band-64k\n").as_bytes());
         body.extend_from_slice(GIT_FLUSH_PKT);
         body.extend_from_slice(tail);
         body
@@ -808,8 +809,7 @@ mod upload_pack_tests {
         );
 
         // an unknown have cannot bound the walk — the answer stays full.
-        let (fallback, ack) =
-            build_upload_pack(dir.path(), &want, &[HAVE.to_string()]).unwrap();
+        let (fallback, ack) = build_upload_pack(dir.path(), &want, &[HAVE.to_string()]).unwrap();
         assert_eq!(ack, None);
         assert_eq!(fallback.len(), full.len());
 

@@ -7,23 +7,12 @@ import { useEffect, useState, type FormEvent } from "react";
 
 import { handleError, normalizeHandle } from "../../../domain/duckdns-client";
 import { shortKey } from "../../../domain/names";
+import { Avatar } from "../../components/Avatar";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { copyText, HoverButton, outlineButton, smallMono } from "../settings/parts";
-
-export const initialsOf = (name: string): string => {
-  const parts = name
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  if (parts.length === 0) return "?";
-  return parts
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase() ?? "")
-    .join("");
-};
 
 export function ProfileCard({ accountId }: { accountId: string | undefined }) {
   const { state, actions } = useDucktape();
@@ -61,23 +50,11 @@ export function ProfileCard({ accountId }: { accountId: string | undefined }) {
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 13 }}>
-        <span
-          aria-hidden="true"
-          style={{
-            width: 40,
-            height: 40,
-            borderRadius: "50%",
-            background: color.iconIdle,
-            color: color.muted3,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            flexShrink: 0,
-            font: `600 15px ${font.sans}`,
-          }}
-        >
-          {initialsOf(state.author)}
-        </span>
+        <Avatar
+          path={accountId ? state.authorAvatars[accountId] : null}
+          name={state.author}
+          size={40}
+        />
 
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>

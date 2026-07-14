@@ -50,7 +50,6 @@ use std::path::PathBuf;
 
 use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
-use tracing_subscriber::prelude::*;
 
 mod agent_plane;
 mod blob_fetch;
@@ -115,6 +114,7 @@ use validator::announce::ReadinessSignaller;
 
 #[cfg(test)]
 use directory::{DirQuery, DirReply, decode_reply, encode_query};
+use crate::util::fatal;
 use duckfs_disk::SyncScratch;
 use recovery::Recovery;
 #[cfg(test)]
@@ -207,29 +207,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let log_ring = noded::LogRing::default();
-    init_tracing(log_ring.clone());
+    // ONE filter over stderr (→ daemon.log) + the ring (→ the app's Logs tab).
+    // the old two-filter setup defaulted stderr to `EnvFilter::from_default_env()`,
+    // whose no-directive default is ERROR — so with RUST_LOG unset (which is how
+    // the desktop spawns us) nothing below error ever reached daemon.log at all.
+    noded::log::init(Some(log_ring.clone()));
 
     run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
-}
-
-fn init_tracing(log_ring: noded::LogRing) {
-    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    // the stream's `logs` topic: info floor by default so hot-path debug/trace
-    // events never pay per-event formatting into the ring; RUST_LOG overrides.
-    let ring_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(log_ring)
-        .with_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        );
-    let _ = tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(ring_layer)
-        .try_init();
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -342,6 +326,10 @@ fn run_node(
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
         forge_committer: config::hex_bytes(signer.public_key().as_ref()),
+        // the owner-gated admin namespace resolves ownership against this node's
+        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
+        node_key: signer.public_key().as_ref().to_vec(),
+        admin_exposure: noded::AdminExposure::from_env(),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
@@ -421,6 +409,7 @@ fn run_node(
                 &signer,
                 mesh_participants,
                 sync_sources,
+                metrics.clone(),
                 storage_for_sync,
                 namespace,
                 identity_chain_id,
@@ -439,8 +428,7 @@ fn run_node(
         let mut recovery = match Recovery::open(context.child("recovery")).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: cannot open the recovery store: {e}");
-                std::process::exit(1);
+                fatal!(label, "cannot open the recovery store: {e}");
             }
         };
         // code-registry swaps realize through the blob plane: replay, catch-up,
@@ -450,8 +438,7 @@ fn run_node(
         let manifest = match recovery.manifest() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: recovery checkpoint is damaged: {e}");
-                std::process::exit(1);
+                fatal!(label, "recovery checkpoint is damaged: {e}");
             }
         };
         // breadcrumb between the surface binds and the mesh/plane wiring: a
@@ -525,6 +512,7 @@ fn run_node(
                 gateway_commands.clone(),
                 &stream_hub,
                 index,
+                metrics.clone(),
                 voice_requests,
                 blobs,
                 &agent_provisioner,

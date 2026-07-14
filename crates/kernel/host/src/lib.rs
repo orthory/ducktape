@@ -1183,6 +1183,20 @@ impl Host {
                         )
                         .await
                         .map_err(|re| {
+                            // the kernel's ONLY in-band detector of module
+                            // non-determinism, and the most fork-relevant event that
+                            // can occur — a module that rejects on replay what it
+                            // accepted on first execution. it was being wrapped into
+                            // a FatalError mislabelled as an Abort-phase boundary
+                            // fault and returned in SILENCE.
+                            tracing::error!(
+                                target: "ducktape::consensus",
+                                module = %m.target,
+                                error = %re,
+                                "NON-DETERMINISTIC module: rejected on replay what it \
+                                 accepted during per-op isolation — this node's state \
+                                 may diverge from its peers"
+                            );
                             SubmitError::Fatal(FatalError {
                                 module: m.target.clone(),
                                 phase: BoundaryPhase::Abort,

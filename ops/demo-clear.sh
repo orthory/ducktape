@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # make demo-clear — remove the "demo" workspace that demo-seed created.
 #
-# Stops any node still serving the workspace (graceful /v1/shutdown first, then
+# Stops any node still serving the workspace (graceful /v1/admin/shutdown first, then
 # a pidfile + pgrep sweep where every candidate's command line is verified
 # against the workspace dir before it may be killed — a recycled pid must never
 # take an innocent process down), deletes ~/.ducktape/workspaces/<id>, and
@@ -71,7 +71,7 @@ try {
 JS
 )"
 if [ -n "$HTTP_PORT" ]; then
-  curl -s -m 2 -X POST "http://127.0.0.1:$HTTP_PORT/v1/shutdown" >/dev/null 2>&1
+  curl -s -m 2 -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" >/dev/null 2>&1
 fi
 
 PIDS="$(node_pids | xargs)"

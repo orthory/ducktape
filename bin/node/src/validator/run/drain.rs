@@ -17,13 +17,14 @@ use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
 use crate::host_reads::{
     read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
-    read_valset_residents,
+    read_valset_residents, upgrade_operations,
 };
 use crate::{lobby, relay};
-use crate::util::{hex, participant_bytes, resident_bytes};
+use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_drain(&mut self) {
+        let operation_metrics = self.metrics.clone();
         let Self {
             context,
             node,
@@ -73,8 +74,7 @@ impl ValidatorRuntime<'_> {
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: {e} — halting");
-                std::process::exit(1);
+                fatal!(label, "{e} — halting");
             }
         };
         *applied += drained_count;
@@ -94,7 +94,14 @@ impl ValidatorRuntime<'_> {
             && node.orderer().pending_len() == 0
             && let Err(e) = node.sink_mut().sync().await
         {
-            eprintln!("[node {label}] tip-seal sync failed: {e}");
+            // the idle-transition durability sync: losing it turns the tip into a
+            // TRAILING block, which on a SOLO node can brick a self-reading op.
+            tracing::warn!(
+                target: "ducktape::consensus",
+                node = %label,
+                error = %e,
+                "tip-seal sync failed — the tip block may not be durable"
+            );
         }
         // resolve held app-surface submits against what this
         // drain finished with; every disposition is deterministic,
@@ -119,7 +126,8 @@ impl ValidatorRuntime<'_> {
                 record,
                 applied,
                 latency_us,
-                op_count,
+                applied_ops,
+                rejected_ops,
                 ..
             } = action;
             // one block per height: an APPLIED block records fully
@@ -132,7 +140,7 @@ impl ValidatorRuntime<'_> {
             } else {
                 metrics.record_height(height);
             }
-            metrics.record_ops(op_count);
+            metrics.record_op_outcomes(applied_ops, rejected_ops);
             // this lane's agreed clock IS the height: the drain stamps
             // BlockContext { consensus_time: height } for every block.
             let ops = indexer::BlockOps {
@@ -140,9 +148,19 @@ impl ValidatorRuntime<'_> {
                 ..noded::index_block_ops(height, height, &dispatches)
             };
             if let Err(err) = index.apply_block(&ops) {
-                eprintln!(
-                    "[node {label}] module index apply failed at height {height}: {err} \
-                             — wipe <storage>/index to rebuild"
+                // consensus stays perfectly healthy while the ENTIRE app UI
+                // silently stops updating: every module view the app reads is
+                // served from this derived index. it does not self-heal.
+                // `event` is the operational contract (#603); `target` is the
+                // filtering plane — orthogonal, so carry both.
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    event = "node_index_poisoned",
+                    node = %label,
+                    height,
+                    error = %err,
+                    "module index apply failed — the app's views are now STALE; \
+                     wipe <storage>/index to rebuild"
                 );
             }
         }
@@ -238,6 +256,32 @@ impl ValidatorRuntime<'_> {
                     Recipients::One(peer),
                     IoBuf::from(relay::encode_msg(&msg)),
                     false,
+                );
+            }
+            // BEFORE the pending_submits lookup, deliberately. An op rejected in
+            // consensus produced no record ANYWHERE: the submitter's own log says
+            // SUCCESS (the submit was accepted) while the state machine says NO.
+            //
+            // and the internal submits — oracle results, capability announces,
+            // upgrade readiness, code-ready signals — are fire-and-forget and never
+            // enter `pending_submits` at all, so the `continue` below swallows their
+            // rejection whole. That is exactly how an announcer that latches on
+            // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
+            // upgrade stuck at R<n, and nothing anywhere saying why.
+            let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
+            // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
+            // that deliberately does not exist. warning on it would fire every block
+            // forever on an idle chain, evicting the whole 4096-line ring in ~68
+            // minutes and drowning the very evidence someone came to read.
+            if d.disposition == node::Disposition::Rejected && module != NOP_TARGET {
+                tracing::warn!(
+                    target: "ducktape::submit",
+                    node = %label,
+                    frame = %noded::hex_bytes(&d.id),
+                    height = d.height,
+                    module,
+                    reason = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
+                    "op rejected in consensus"
                 );
             }
             let Some((reply, _)) = pending_submits.remove(&d.id) else {
@@ -422,10 +466,31 @@ impl ValidatorRuntime<'_> {
                             eprintln!("[node {label}] oplog prune failed: {e}");
                         }
                         *prev_ckpt = (m.height, pos);
+                        tracing::info!(
+                            event = "node_checkpoint_written",
+                            node = %label,
+                            height = m.height.unwrap_or_default()
+                        );
                     }
-                    Err(e) => eprintln!("[node {label}] checkpoint write failed (will retry): {e}"),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "node_checkpoint_failed",
+                            node = %label,
+                            stage = "write",
+                            error = %e
+                        );
+                        eprintln!("[node {label}] checkpoint write failed (will retry): {e}");
+                    }
                 },
-                Err(e) => eprintln!("[node {label}] checkpoint capture failed (will retry): {e}"),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "node_checkpoint_failed",
+                        node = %label,
+                        stage = "capture",
+                        error = %e
+                    );
+                    eprintln!("[node {label}] checkpoint capture failed (will retry): {e}");
+                }
             }
         }
 
@@ -611,8 +676,7 @@ impl ValidatorRuntime<'_> {
                     ),
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("[node {label}] FATAL: {e} — halting");
-                        std::process::exit(1);
+                        fatal!(label, "{e} — halting");
                     }
                 }
                 // ACTIVATION (design §4): realize the agreed boundary
@@ -628,15 +692,33 @@ impl ValidatorRuntime<'_> {
                 // a separate abort-only follow-up — the one Advance owns both.
                 node.host_mut().set_active_version(plan.boundary_version());
                 match plan.upgrade_verdict() {
-                    consensus::UpgradeVerdict::Armed { name, to_version } => println!(
-                        "[node {label}] upgrade activated name={name} version={to_version} at height {}",
-                        plan.cutover_app_height()
-                    ),
-                    consensus::UpgradeVerdict::Abort { name } => println!(
-                        "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
-                        plan.cutover_app_height(),
-                        plan.boundary_version()
-                    ),
+                    consensus::UpgradeVerdict::Armed { name, to_version } => {
+                        tracing::info!(
+                            event = "node_upgrade_activated",
+                            node = %label,
+                            name = %name,
+                            to_version,
+                            height = plan.cutover_app_height()
+                        );
+                        println!(
+                            "[node {label}] upgrade activated name={name} version={to_version} at height {}",
+                            plan.cutover_app_height()
+                        );
+                    }
+                    consensus::UpgradeVerdict::Abort { name } => {
+                        tracing::warn!(
+                            event = "node_upgrade_aborted",
+                            node = %label,
+                            name = %name,
+                            height = plan.cutover_app_height(),
+                            current_version = plan.boundary_version()
+                        );
+                        println!(
+                            "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
+                            plan.cutover_app_height(),
+                            plan.boundary_version()
+                        );
+                    }
                     consensus::UpgradeVerdict::None => {}
                 }
                 // checkpoint IMMEDIATELY: the manifest must record
@@ -719,11 +801,22 @@ impl ValidatorRuntime<'_> {
         // every current member signaled), so this fires exactly when
         // readiness first reaches the full set — before H is crossed.
         if let Some(st) = read_upgrade_status_raw(node.host()).await {
+            let local_key = signer.public_key();
+            operation_metrics.update_upgrade(upgrade_operations(&st, Some(&local_key)));
             match &st.pending {
                 Some(up) => {
                     *upgrade_pending_seen = Some(up.name.clone());
                     let key = (up.name.clone(), up.to_version);
                     if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
+                        tracing::info!(
+                            event = "node_upgrade_armed",
+                            node = %label,
+                            name = %up.name,
+                            to_version = up.to_version,
+                            activation_height = up.activation_height,
+                            ready_validators = st.ready_count,
+                            required_validators = st.member_count
+                        );
                         println!(
                             "[node {label}] upgrade armed name={} to_version={} height={}",
                             up.name, up.to_version, up.activation_height
@@ -735,6 +828,11 @@ impl ValidatorRuntime<'_> {
                     if let Some(name) = upgrade_pending_seen.take() {
                         // the boundary Advance reconciled the pending
                         // (ARM flip or ABORT clear) — the slot is free.
+                        tracing::info!(
+                            event = "node_upgrade_cleared",
+                            node = %label,
+                            name = %name
+                        );
                         println!("[node {label}] upgrade cleared name={name}");
                         *upgrade_armed_latch = None;
                     }
@@ -748,6 +846,10 @@ impl ValidatorRuntime<'_> {
         // oracle-as-op). events no worker claims are the plain
         // observability stream — only decodable-but-unhandled worker
         // requests would indicate a saga stuck Pending.
+        // one drain can apply MANY blocks; the events accumulated across all of
+        // them, so stamp them with the drain's finalized tip.
+        let height = node.finalized().map_or(0, |f| f.height);
+        let mut notes = noded::log::ModuleNotes::new(height);
         for eff in node.take_events() {
             let mut claimed = false;
             for w in workers.iter() {
@@ -756,7 +858,14 @@ impl ValidatorRuntime<'_> {
                         let seq = *next_seq;
                         *next_seq += 1;
                         if let Err(e) = node.submit(signer, seq, follow).await {
-                            eprintln!("[node {label}] worker follow-up submit failed: {e}");
+                            tracing::warn!(
+                                target: "ducktape::modules",
+                                node = %label,
+                                height,
+                                source = %eff.source,
+                                error = %e,
+                                "worker follow-up submit failed"
+                            );
                         }
                         claimed = true;
                         break;
@@ -769,21 +878,27 @@ impl ValidatorRuntime<'_> {
                     }
                     Ok(host::worker::WorkOutcome::NotMine) => {}
                     Err(e) => {
-                        eprintln!("[node {label}] worker error: {e}");
+                        tracing::warn!(
+                            target: "ducktape::modules",
+                            node = %label,
+                            height,
+                            source = %eff.source,
+                            error = %e,
+                            "worker failed to handle a module event"
+                        );
                         claimed = true; // errored ≠ unclaimed; don't double-log
                         break;
                     }
                 }
             }
-            // an unclaimed event is normally plain observability; one that
-            // DECODES as a worker request means a saga is stuck Pending.
-            if !claimed && saga::decode_worker_request(&eff.payload).is_ok() {
-                println!(
-                    "[node {label}] WorkerRequest with no worker ({} bytes) — dropped",
-                    eff.payload.len()
-                );
+            // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+            // guest cannot log) — unless it decodes as a worker request, which
+            // means a saga is stuck Pending.
+            if !claimed {
+                notes.unclaimed(&eff);
             }
         }
+        notes.finish();
         if dev_demo && !*converged && *applied >= expected {
             let h = node.app_hash();
             println!("[node {label}] converged app_hash={}", hex(&h));

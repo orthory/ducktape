@@ -29,6 +29,11 @@ pub(crate) struct BindConfig<'a> {
     /// this node's signer identity — the COMMITTER on every forge run commit
     /// (D2: author is the agent, committer is the node).
     pub(crate) forge_committer: String,
+    /// this node's consensus public key — the `BindNode` subject the owner-gated
+    /// admin namespace resolves ownership against (ADR A5).
+    pub(crate) node_key: Vec<u8>,
+    /// how the owner-gated admin namespace is exposed (ADR A2/A4).
+    pub(crate) admin_exposure: noded::AdminExposure,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -42,6 +47,8 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         gateway_enabled,
         log_ring,
         forge_committer,
+        node_key,
+        admin_exposure,
     } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
@@ -109,7 +116,16 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_code_stage(code_stage_lane)
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
-        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        // the owner-gated control namespace (ADR A2/A5): this node's own key is
+        // the `BindNode` subject ownership resolves against; the exposure is the
+        // operator's choice (default loopback). shutdown + module-code staging
+        // live here, off the unauthenticated public surface.
+        .with_admin(noded::AdminConfig {
+            exposure: admin_exposure,
+            node_key: Some(node_key),
+            ..Default::default()
+        });
     let http_handle = if gateway_enabled {
         http_handle.with_gateway(gateway_lane)
     } else {
@@ -200,7 +216,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                 eprintln!("app surface server error: {e}");
                             }
                         });
-                    // a client asked the surface to shut down (POST /v1/shutdown) —
+                    // a client asked the surface to shut down (POST /v1/admin/shutdown) —
                     // mirror the rpc shutdown: exit the whole process gracefully.
                     println!("[node {thread_label}] shutdown requested via app surface — exiting");
                     std::process::exit(0);

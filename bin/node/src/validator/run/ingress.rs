@@ -11,7 +11,8 @@ use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
 use crate::host_reads::{
-    read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
+    read_clients, read_redemptions_from_host, read_upgrade_status_raw, read_valset_members,
+    read_valset_residents, upgrade_operations,
 };
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -20,6 +21,34 @@ use crate::util::{hex, unix_ms};
 use crate::{config, lobby, relay, relay_runtime};
 
 impl ValidatorRuntime<'_> {
+    async fn refresh_operations(&self, exposition: &str) {
+        let members = self.orchestrator.current_members();
+        let me = self.signer.public_key();
+        let reachable = reachable_validators(exposition, members, &me);
+        self.metrics.update_consensus(
+            self.orchestrator.epoch(),
+            self.node.finalized_view().unwrap_or(0),
+            members.len() as u64,
+            reachable,
+            (self.node.pending_batch_len() + self.node.orderer().pending_len()) as u64,
+        );
+        self.metrics.update_storage(
+            self.prev_ckpt.0.unwrap_or_default(),
+            self.index.is_poisoned(),
+            MODULE_IDS.iter().map(|module| {
+                (
+                    (*module).to_string(),
+                    self.index.applied_height(module).unwrap_or_default(),
+                )
+            }),
+        );
+        if let Some(status) = read_upgrade_status_raw(self.node.host()).await {
+            let local_key = self.signer.public_key();
+            self.metrics
+                .update_upgrade(upgrade_operations(&status, Some(&local_key)));
+        }
+    }
+
     pub(super) async fn on_rpc(&mut self, (req, reply): RpcJob) {
         let Self {
             node,
@@ -556,6 +585,8 @@ impl ValidatorRuntime<'_> {
                 let _ = reply.send(result);
             }
             noded::NodeCommand::Status { reply } => {
+                let exposition = self.context.encode();
+                self.refresh_operations(&exposition).await;
                 let modules = MODULE_IDS
                     .iter()
                     .map(|m| noded::ModuleStatus {
@@ -575,13 +606,68 @@ impl ValidatorRuntime<'_> {
                     height: self.node.finalized().map(|f| f.height).unwrap_or(0),
                     modules,
                     public_key: self.status_public_key.clone(),
+                    operations: self.metrics.operational_status(),
                 });
             }
             noded::NodeCommand::Metrics { reply } => {
                 // one registry: commonware's runtime series plus the
                 // `ducktape_*` block series the drain loop records.
+                let exposition = self.context.encode();
+                self.refresh_operations(&exposition).await;
                 let _ = reply.send(self.context.encode());
             }
         }
+    }
+}
+
+/// Commonware owns the detailed peer series. This bounded adapter counts only
+/// current validators and includes self, insulating the stable Ducktape facade
+/// from dashboard knowledge of dependency-specific metric names.
+fn reachable_validators(
+    exposition: &str,
+    validators: &std::collections::BTreeSet<ed25519::PublicKey>,
+    me: &ed25519::PublicKey,
+) -> u64 {
+    // ponytail: O(validators × exposition lines); replace with a connection
+    // snapshot API if validator sets become large enough for scrape cost to matter.
+    validators
+        .iter()
+        .filter(|validator| {
+            if *validator == me {
+                return true;
+            }
+            let prefix = format!(
+                "network_tracker_directory_connected{{peer=\"{}\"}} ",
+                validator
+            );
+            exposition.lines().any(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_some_and(|value| value > 0.0)
+            })
+        })
+        .count() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_reachable_count_includes_self_and_connected_members_only() {
+        let me = ed25519::PrivateKey::from_seed(1).public_key();
+        let connected = ed25519::PrivateKey::from_seed(2).public_key();
+        let disconnected = ed25519::PrivateKey::from_seed(3).public_key();
+        let outsider = ed25519::PrivateKey::from_seed(4).public_key();
+        let validators = [me.clone(), connected.clone(), disconnected]
+            .into_iter()
+            .collect();
+        let exposition = format!(
+            "network_tracker_directory_connected{{peer=\"{connected}\"}} 1720000000\n\
+             network_tracker_directory_connected{{peer=\"{outsider}\"}} 1720000000\n"
+        );
+
+        assert_eq!(reachable_validators(&exposition, &validators, &me), 2);
     }
 }

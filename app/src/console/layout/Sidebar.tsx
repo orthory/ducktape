@@ -10,8 +10,6 @@ import type { NavSection } from "../modules/module-def";
 import { nodeControlAvailable } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
-import { initialsOf } from "../views/home/ProfileCard";
-
 const navBg = (active: boolean) => (active ? color.hover : "transparent");
 const navFg = (active: boolean) => (active ? color.inkSoft : color.muted);
 const navIc = (active: boolean) => (active ? color.ink : color.iconIdle);
@@ -171,31 +169,8 @@ export function Sidebar() {
 
       <div style={{ flex: 1 }} />
 
-      {/* The person's console — pinned above the gear: the avatar opens the
-          account Home (a shell-level layer, not a rail module or a disconnect),
-          so it highlights on state.atHome. */}
-      <button
-        onClick={() => actions.goHome()}
-        title="Account"
-        aria-label="Account"
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: 34,
-          height: 34,
-          borderRadius: "50%",
-          marginBottom: 2,
-          background: state.atHome ? color.dark : color.iconIdle,
-          color: state.atHome ? color.onDark : color.muted3,
-          font: `600 12px ${font.sans}`,
-        }}
-      >
-        {initialsOf(state.author)}
-      </button>
-
+      {/* The account (me) chip lives on the far-left network rail now; this
+          column is pure module nav + node/app chrome (settings, theme). */}
       <button
         onClick={() => actions.setScreen("settings")}
         title="Settings"

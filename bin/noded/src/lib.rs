@@ -15,11 +15,18 @@
 //! to the node-local [`crate::blobs::BlobHandle`] forge and the block loop share.
 //!
 //! lifecycle is part of the surface: `/v1/status` carries the daemon's build
-//! version (so a newer app can spot a stale orphan), and POST `/v1/shutdown`
+//! version (so a newer app can spot a stale orphan), and POST `/v1/admin/shutdown`
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
+// the owner-gated control namespace (ADR A2/A5): `/v1/admin/*` on the same
+// listener, PoP-gated to the node owner. shutdown + module-code moved here off
+// the unauthenticated public surface.
+pub mod admin;
+pub use admin::{AdminConfig, AdminExposure};
+
 pub mod blobs;
+pub mod log;
 pub mod stream;
 pub use stream::{
     ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame, StreamErrorCode,
@@ -242,6 +249,153 @@ pub struct NodeStatus {
     /// empty on daemons with no mesh identity (the embedded local daemon).
     #[serde(default)]
     pub public_key: String,
+    /// Node-owned operational state. This is the stable, role-aware facade for
+    /// operators; dependency-specific consensus and transport metrics remain
+    /// available on `/metrics` for deeper diagnosis.
+    #[serde(default)]
+    pub operations: OperationalStatus,
+}
+
+/// The job this process is currently performing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// Single-writer embedded daemon; no mesh or consensus participation.
+    Local,
+    Validator,
+    Resident,
+    SyncOnly,
+    /// Used only until the full node has selected its role during boot.
+    #[default]
+    Unknown,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Validator => "validator",
+            Self::Resident => "resident",
+            Self::SyncOnly => "sync_only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The role-independent lifecycle phase. A role says what the node is; a
+/// phase says what it is doing now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePhase {
+    #[default]
+    Starting,
+    Recovering,
+    Joining,
+    Syncing,
+    Validating,
+    Serving,
+    Draining,
+    Halted,
+}
+
+impl NodePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Recovering => "recovering",
+            Self::Joining => "joining",
+            Self::Syncing => "syncing",
+            Self::Validating => "validating",
+            Self::Serving => "serving",
+            Self::Draining => "draining",
+            Self::Halted => "halted",
+        }
+    }
+}
+
+/// Stable operational projection shared by `/v1/status` and the
+/// `ducktape_*` metrics. Optional sections are absent when they do not apply to
+/// the selected role, rather than being filled with misleading zeroes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalStatus {
+    pub role: NodeRole,
+    pub phase: NodePhase,
+    /// Unix seconds when `phase` last changed.
+    pub phase_since: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_finalized_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consensus: Option<ConsensusOperationalStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncOperationalStatus>,
+    pub storage: StorageOperationalStatus,
+    pub upgrade: UpgradeOperationalStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsensusOperationalStatus {
+    pub epoch: u64,
+    pub view: u64,
+    pub validators: u64,
+    pub quorum: u64,
+    /// Current validators this node can use, including itself when it is a
+    /// member. This makes the number directly comparable with `quorum`.
+    pub reachable_validators: u64,
+    pub pending_ops: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncOperationalStatus {
+    /// Source identity is useful in status and logs but intentionally not a
+    /// metric label (peer identities are unbounded cardinality).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub target_height: u64,
+    pub applied_height: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
+    pub retries: u64,
+    pub failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageOperationalStatus {
+    pub checkpoint_height: u64,
+    pub index_poisoned: bool,
+    pub indexes: Vec<IndexOperationalStatus>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexOperationalStatus {
+    pub module: String,
+    pub applied_height: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeOperationalStatus {
+    pub current_version: u64,
+    /// Highest protocol version this running binary can execute.
+    pub max_supported_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation_height: Option<u64>,
+    pub ready_validators: u64,
+    pub required_validators: u64,
+    /// Present only when this node is a validator in the boundary set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locally_ready: Option<bool>,
+    pub armed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -316,7 +470,42 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
     duckfs_core::to_hex(bytes)
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+/// the ONE funnel every HTTP rejection flows through — 403 origin-guard, 413 body
+/// cap, 409 conflict, 503 no-mesh, every module 400. three lines light up the whole
+/// surface.
+///
+/// 4xx is `debug` ON PURPOSE: `gateway_http.rs`'s duck:// browse fallback proxies
+/// UNTRUSTED pages' fetches through this same funnel, so an unconditional `warn!`
+/// here is a log-ring DoS any page could drive. Turn it on when you care:
+///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::http=debug'
+///
+/// 5xx is LATCHED for the same reason, and it is not hypothetical: the gateway
+/// browse proxy maps a slow/dead publisher to a 502 (`gateway_failure_response`),
+/// so a page whose script re-fetches a failing subresource in a loop mints one
+/// line per request — enough to evict the whole 4096-line ring. First occurrence,
+/// then every 50th, carrying `occurrences`; a real outage is still visible on the
+/// first line, and the counter is what says "still broken" rather than "flapped".
+///
+/// NEVER log the URI: `/.duck/ws/{token}` carries a capability token IN THE PATH,
+/// and the ring is streamed to the webview.
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
+    if status.is_server_error() {
+        static SERVER_ERRORS: crate::log::Latch = crate::log::Latch::new(50);
+        // keyed by class, not by message: an attacker-supplied path can vary the
+        // message, and a per-message key would let them mint an unbounded number of
+        // "first occurrences" — re-opening the exact hole this latch closes.
+        if let Some(occurrences) = SERVER_ERRORS.hit("server_error") {
+            tracing::warn!(
+                target: "ducktape::http",
+                status = status.as_u16(),
+                message,
+                occurrences,
+                "request failed"
+            );
+        }
+    } else {
+        tracing::debug!(target: "ducktape::http", status = status.as_u16(), message, "request refused");
+    }
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
@@ -329,7 +518,10 @@ fn actor_gone() -> Response {
 }
 
 pub fn router(handle: NodeHandle) -> Router {
-    Router::new()
+    // the PUBLIC (data) surface — query/submit + reads, any account with
+    // standing. control ops (shutdown, module-code staging) are NOT here: they
+    // live on the owner-gated `/v1/admin/*` namespace merged below (ADR A2).
+    let public = Router::new()
         .route("/v1/submit", post(submit))
         // the AUTHENTICATED submit lane: raw signed frame bytes in, the same
         // receipt out. distinct from `/v1/submit` above, whose `origin` is a
@@ -348,7 +540,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/index/{module}/view", post(index_view))
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
-        .route("/v1/shutdown", post(shutdown))
+        .route("/v1/log-filter", post(log_filter))
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
@@ -366,14 +558,6 @@ pub fn router(handle: NodeHandle) -> Router {
             post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
         )
         .route("/v1/files/blob/{digest}", get(get_blob))
-        .route(
-            "/v1/admin/module-code/stage",
-            post(module_code::stage_module_code),
-        )
-        .route(
-            "/v1/admin/module-code/{digest}",
-            get(module_code::module_code_status),
-        )
         // ---- duckfs product surface ----
         // thin convenience wrappers over the files module's ops/queries: each
         // encodes the duckfs wire server-side and threads it through the SAME
@@ -437,11 +621,23 @@ pub fn router(handle: NodeHandle) -> Router {
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         )
-        // The control plane forges consensus ops, reads all state, writes the
-        // filesystem and pushes git. The trusted console is the ONLY web page
-        // allowed to reach it: the guard refuses any other browser origin, and
-        // the matching CORS allowlist stops a page reading a response even on a
-        // request that carries no Origin at all. See `origin_guard`.
+        ;
+    // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
+    // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
+    // not a gated-but-present route. its own PoP middleware is baked in.
+    let app = if handle.admin.exposure.enabled() {
+        public.merge(admin::admin_router(handle.clone()))
+    } else {
+        public
+    };
+    app
+        // The public data plane forges account-signed consensus ops, reads all
+        // state, writes the filesystem and pushes git. The trusted console is the
+        // ONLY web page allowed to reach it: the guard refuses any other browser
+        // origin, and the matching CORS allowlist stops a page reading a response
+        // even on a request that carries no Origin at all. See `origin_guard`.
+        // (The admin namespace inherits this outer origin guard AND its own PoP
+        // gate — defense in depth.)
         .layer(axum::middleware::from_fn(origin_guard::guard))
         .layer(origin_guard::cors())
         .with_state(handle)
@@ -595,10 +791,27 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
     }
 }
 
-async fn shutdown(State(handle): State<NodeHandle>) -> Response {
+/// POST /v1/admin/shutdown — ask the process to exit gracefully. lives on the
+/// owner-gated admin namespace (ADR A2): it was on the unauthenticated public
+/// surface, reachable by anything that could dial the port.
+pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.
     handle.request_shutdown();
     Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// POST /v1/log-filter — retune the log level of a RUNNING node.
+///
+///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'
+///
+/// RUST_LOG is read once at boot, so without this route every `debug!` in the
+/// tree is unreachable without a restart — and restarting a wedged node destroys
+/// the state you restarted it to look at. NOTE: unlike /v1/admin/shutdown this stays on the public surface (see log_filter caveat below).
+async fn log_filter(body: String) -> Response {
+    match crate::log::set_filter(body.trim()) {
+        Ok(()) => (StatusCode::OK, body).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &err),
+    }
 }
 
 /// body cap for the op-receipt blob lane. a receipt-lane bound only —
@@ -647,15 +860,21 @@ async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) 
 }
 
 /// serve the client surface on `listener` until a shutdown request lands
-/// (POST /v1/shutdown). the caller owns the runtime this runs on; the host
+/// (POST /v1/admin/shutdown). the caller owns the runtime this runs on; the host
 /// actor lives elsewhere and is reachable only through `handle`'s command
 /// lane — which is what lets ANY binary that owns a host (the embedded daemon,
 /// the p2p validator) stand up the identical surface.
 pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std::io::Result<()> {
     let shutdown = handle.clone();
-    axum::serve(listener, router(handle))
-        .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
-        .await
+    // connect-info is threaded so the admin namespace's guard can read the peer
+    // address (the `Loopback` exposure refuses non-loopback peers). every other
+    // route ignores it.
+    axum::serve(
+        listener,
+        router(handle).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+    .await
 }
 
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
@@ -665,6 +884,20 @@ async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_from_an_older_node_defaults_operational_state() {
+        let status: NodeStatus = serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "appHash": "",
+            "height": 0,
+            "modules": []
+        }))
+        .expect("the additive status field stays backward-compatible");
+
+        assert_eq!(status.operations.role, NodeRole::Unknown);
+        assert_eq!(status.operations.phase, NodePhase::Starting);
+    }
 
     #[tokio::test]
     async fn shutdown_wakes_every_surface_and_remains_sticky() {

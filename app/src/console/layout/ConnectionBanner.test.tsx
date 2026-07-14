@@ -25,10 +25,14 @@ describe("ConnectionBanner", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("shows the reason and a Restart for a managed node", () => {
+  it("shows the friendly line (raw reason in the tooltip only) and a Restart", () => {
     const startNode = vi.fn();
-    renderWith({ reason: "could not reach the node (connection refused)" }, { startNode });
-    expect(screen.getByText(/could not reach the node/)).toBeTruthy();
+    renderWith({ reason: "stream socket closed" }, { startNode });
+    // the visible copy is the friendly line alone — the raw transport reason
+    // is tooltip/log material, never banner text (epic QA BUG-5).
+    const line = screen.getByText("Lost connection to the node — reconnecting…");
+    expect(line.getAttribute("title")).toBe("stream socket closed");
+    expect(screen.queryByText(/stream socket closed/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Restart node" }));
     expect(startNode).toHaveBeenCalledTimes(1);
   });

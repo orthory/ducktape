@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CeremonyIncomplete,
   actionLabel,
   canSettleEarly,
   decisionThreshold,
+  driveMembership,
   proposals,
   tally,
   type ProposalView,
 } from "./governance-client";
+import type { NodeTransport } from "./transport";
 
 const accountProposal = (overrides: Partial<ProposalView> = {}): ProposalView => ({
   proposal_id: "p",
@@ -26,6 +29,39 @@ const accountProposal = (overrides: Partial<ProposalView> = {}): ProposalView =>
   voting_rule: { participating_majority: { quorum: 50 } },
   ...overrides,
 });
+
+/** A validator-mode membership proposal whose action matches the ceremony under
+ *  test. Electorate: three nodes, one vote each. */
+const validatorProposal = (overrides: Partial<ProposalView> = {}): ProposalView => ({
+  proposal_id: "resident:09:0",
+  action: { add_resident: { key: [9] } },
+  proposer: [1],
+  created_at: 1,
+  deadline: 1_000_000,
+  status: "open",
+  votes: [],
+  voter_kind: "validator_node",
+  electorate: [
+    [[1], 1],
+    [[2], 1],
+    [[3], 1],
+  ],
+  voting_rule: { threshold: { required_yes: 2 } },
+  ...overrides,
+});
+
+/** A transport whose `proposals` reads walk `states` (one snapshot per read)
+ *  and whose submits always land — enough to script a whole ceremony. The
+ *  proposal id in `states` must match what the ceremony mints/adopts. */
+const ceremonyTransport = (states: ProposalView[][]): NodeTransport => {
+  let reads = 0;
+  return {
+    query: async () => ({
+      proposals: states[Math.min(reads++, states.length - 1)],
+    }),
+    submitControl: async () => ({ height: 1, appHash: "aa".repeat(32) }),
+  } as unknown as NodeTransport;
+};
 
 describe("weighted governance", () => {
   it("labels both governance-selected voting modes", () => {
@@ -59,6 +95,61 @@ describe("weighted governance", () => {
     expect(
       tally({ ...structural, votes: [...structural.votes, [[9], true]] }).yes,
     ).toBe(90);
+  });
+
+  it("surfaces a rejected ceremony as a failure, not a success", async () => {
+    // The module rejects the proposal at execute time (e.g. removing the last
+    // validator): driveMembership must REJECT with the outcome in the message —
+    // an op tracker that treats resolution as success would otherwise paint a
+    // rejected membership change green.
+    const decidedByOne = { threshold: { required_yes: 1 } } as const;
+    const states: ProposalView[][] = [
+      [], // initial read: nothing open → the ceremony mints "resident:09:0"
+      // after propose+vote: our sole ballot decides, settle early…
+      [validatorProposal({ status: "open", votes: [[[1], true]], voting_rule: decidedByOne })],
+      // …but execute settled it REJECTED (e.g. a competing change won).
+      [validatorProposal({ status: "rejected", votes: [[[1], true]], voting_rule: decidedByOne })],
+    ];
+    const transport = ceremonyTransport(states);
+    const err = await driveMembership(
+      transport,
+      { add_resident: { key: [9] } },
+      "resident:",
+      "09",
+      1,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CeremonyIncomplete);
+    expect((err as CeremonyIncomplete).status).toBe("rejected");
+    expect((err as CeremonyIncomplete).message).toContain("rejected");
+  });
+
+  it("surfaces a ballot shortfall as awaiting, and a passed ceremony resolves", async () => {
+    // Shortfall: 1 yes of 2 required (3 members) → rejects with "awaiting".
+    const shortfall = ceremonyTransport([
+      [],
+      [validatorProposal({ status: "open", votes: [[[1], true]] })],
+    ]);
+    const err = await driveMembership(
+      shortfall,
+      { add_resident: { key: [9] } },
+      "resident:",
+      "09",
+      3,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CeremonyIncomplete);
+    expect((err as CeremonyIncomplete).status).toBe("open");
+    expect((err as CeremonyIncomplete).message).toContain("1 of 2");
+
+    // Passed: the deciding ballot lands and execute settles it.
+    const decidedByOne = { threshold: { required_yes: 1 } } as const;
+    const passed = ceremonyTransport([
+      [],
+      [validatorProposal({ status: "open", votes: [[[1], true]], voting_rule: decidedByOne })],
+      [validatorProposal({ status: "passed", votes: [[[1], true]], voting_rule: decidedByOne })],
+    ]);
+    await expect(
+      driveMembership(passed, { add_resident: { key: [9] } }, "resident:", "09", 1),
+    ).resolves.toMatchObject({ status: "passed" });
   });
 
   it("defaults proposal-time fields from a pre-share node", async () => {

@@ -543,8 +543,7 @@ pub(crate) async fn object_put(
             b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         }
     } else {
-        let mut chunks =
-            Vec::with_capacity(bytes.len().div_ceil(duckfs_core::CHUNK_SIZE as usize));
+        let mut chunks = Vec::with_capacity(bytes.len().div_ceil(duckfs_core::CHUNK_SIZE as usize));
         for chunk in bytes.chunks(duckfs_core::CHUNK_SIZE as usize) {
             let digest = to_hex(&object_id(Kind::Chunk, chunk));
             if let Err(resp) = files_submit(&handle, encode_putblob(chunk)).await {

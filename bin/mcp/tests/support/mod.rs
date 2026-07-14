@@ -302,7 +302,7 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = http_status(self.port, "POST", "/v1/shutdown");
+        let _ = http_status(self.port, "POST", "/v1/admin/shutdown");
         if let Some(s) = self.server.take() {
             let _ = s.join();
         }
@@ -419,6 +419,7 @@ fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>, forge_base: std::path::Pat
                             category: ModuleCategory::of("agent"),
                         }],
                         public_key: String::new(),
+                        operations: Default::default(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {

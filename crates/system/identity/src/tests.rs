@@ -204,7 +204,13 @@ fn bind_creates_a_single_member_account() {
     assert_eq!(acc.member_keys.len(), 1);
     assert_eq!(acc.member_keys[0].pubkey, ed_pub(&founder));
     assert_eq!(acc.member_keys[0].kind, KeyKind::Ed25519);
-    assert_eq!(acc.nodes, vec![node.to_vec()]);
+    assert_eq!(
+        acc.nodes,
+        vec![NodeView {
+            node_key: node.to_vec(),
+            label: None,
+        }]
+    );
 
     // resolvable by node and by member.
     assert_eq!(account_of_node(&id, node).unwrap().account_id, account_id);
@@ -525,6 +531,214 @@ fn set_account_name_is_origin_gated_to_a_bound_node() {
 }
 
 #[test]
+fn set_node_label_is_origin_gated_to_the_accounts_own_nodes() {
+    let mut id = new_identity();
+    let founder = ed(1);
+    let node1 = b"node-1";
+    let account_id = found_account(&mut id, &founder, node1);
+
+    // a second key joins and binds node2, so the account owns two nodes.
+    let joiner = ed(2);
+    let nonce = get_account(&id, &account_id).unwrap().nonce;
+    let preimage =
+        add_member_preimage(CHAIN, &account_id, &ed_pub(&joiner), KeyKind::Ed25519, nonce);
+    apply(
+        &mut id,
+        node1,
+        IdentityMsg::AddMemberKey {
+            new_key: ed_pub(&joiner),
+            new_kind: KeyKind::Ed25519,
+            new_label: None,
+            possession: ed_proof(&joiner, IDENTITY_ADD_MEMBER_NS, &preimage),
+            authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
+        },
+    )
+    .unwrap();
+    let node2 = b"node-2";
+    let nonce = get_account(&id, &account_id).unwrap().nonce;
+    apply(
+        &mut id,
+        node2,
+        IdentityMsg::BindNode {
+            authorizer: ed_auth(&joiner, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node2, nonce)),
+        },
+    )
+    .unwrap();
+
+    // node1 (a bound origin) labels its sibling node2 -> the label is trimmed
+    // and visible via a plain Get, from any device on this network.
+    apply(
+        &mut id,
+        node1,
+        IdentityMsg::SetNodeLabel {
+            node_key: node2.to_vec(),
+            label: Some("  Kim's laptop  ".into()),
+        },
+    )
+    .expect("bound node labels a sibling");
+    assert_eq!(
+        node_label(&id, &account_id, node2).as_deref(),
+        Some("Kim's laptop")
+    );
+    // labeling is cosmetic: it does NOT bump the account nonce.
+    let before = get_account(&id, &account_id).unwrap().nonce;
+
+    // clearing (empty trim) drops the label back to None, still no nonce bump.
+    apply(
+        &mut id,
+        node2,
+        IdentityMsg::SetNodeLabel {
+            node_key: node2.to_vec(),
+            label: Some("   ".into()),
+        },
+    )
+    .expect("empty label clears");
+    assert_eq!(node_label(&id, &account_id, node2), None);
+    assert_eq!(get_account(&id, &account_id).unwrap().nonce, before);
+
+    // an UNBOUND node cannot label anything.
+    let err = apply(
+        &mut id,
+        b"stranger",
+        IdentityMsg::SetNodeLabel {
+            node_key: node1.to_vec(),
+            label: Some("x".into()),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("not bound to an account"),
+        "got {err:?}"
+    );
+
+    // a bound node in a DIFFERENT account cannot label this account's node.
+    let other = ed(9);
+    let other_node = b"other-node";
+    found_account(&mut id, &other, other_node);
+    let err = apply(
+        &mut id,
+        other_node,
+        IdentityMsg::SetNodeLabel {
+            node_key: node1.to_vec(),
+            label: Some("theft".into()),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("not bound to the origin's account"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn set_profile_is_origin_gated_trims_caps_and_clears() {
+    let mut id = new_identity();
+    let founder = ed(1);
+    let node = b"node-1";
+    let account_id = found_account(&mut id, &founder, node);
+
+    // a bound node sets avatar + bio; both trim.
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: Some("  /shared/attachments/avatars/abc.png  ".into()),
+            bio: Some("  hi there  ".into()),
+        },
+    )
+    .expect("bound node sets its profile");
+    let acc = get_account(&id, &account_id).unwrap();
+    assert_eq!(acc.avatar.as_deref(), Some("/shared/attachments/avatars/abc.png"));
+    assert_eq!(acc.bio.as_deref(), Some("hi there"));
+    // no signature is consumed: the nonce stays put (still 1 from the bind).
+    assert_eq!(acc.nonce, 1);
+
+    // empty-trim clears each field independently.
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: Some("   ".into()),
+            bio: None,
+        },
+    )
+    .expect("empty avatar clears");
+    let acc = get_account(&id, &account_id).unwrap();
+    assert_eq!(acc.avatar, None, "whitespace avatar clears");
+    assert_eq!(acc.bio, None, "None bio clears");
+
+    // over-cap bio rejects, state untouched.
+    let err = apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: None,
+            bio: Some("x".repeat(MAX_BIO_LEN + 1)),
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("bio exceeds"), "got {err:?}");
+
+    // an unbound node cannot set any account's profile.
+    let err = apply(
+        &mut id,
+        b"stranger",
+        IdentityMsg::SetProfile {
+            avatar: Some("/shared/attachments/avatars/evil.png".into()),
+            bio: None,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("not bound"), "got {err:?}");
+}
+
+#[test]
+fn node_label_survives_snapshot_and_drops_on_unbind() {
+    let mut id = new_identity();
+    let founder = ed(1);
+    let node = b"node-1";
+    let account_id = found_account(&mut id, &founder, node);
+
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetNodeLabel {
+            node_key: node.to_vec(),
+            label: Some("my box".into()),
+        },
+    )
+    .unwrap();
+
+    // a fresh module installs the snapshot and answers with the SAME label.
+    let bytes = id.snapshot();
+    let root = id.root();
+    let mut joiner = new_identity();
+    joiner.install(&bytes, root).expect("install verifies + adopts");
+    assert_eq!(
+        get_account(&joiner, &account_id),
+        get_account(&id, &account_id)
+    );
+    assert_eq!(node_label(&joiner, &account_id, node).as_deref(), Some("my box"));
+
+    // unbinding the node drops it -- and its label -- from the account.
+    let nonce = get_account(&id, &account_id).unwrap().nonce;
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::UnbindNode {
+            node_key: node.to_vec(),
+            authorizer: ed_auth(
+                &founder,
+                IDENTITY_UNBIND_NS,
+                &unbind_preimage(CHAIN, node, nonce),
+            ),
+        },
+    )
+    .expect("unbind");
+    assert!(get_account(&id, &account_id).unwrap().nodes.is_empty());
+}
+
+#[test]
 fn bind_is_valset_gated_when_configured() {
     let mut id = new_gated_identity();
     let founder = ed(1);
@@ -578,6 +792,26 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
     )
     .unwrap();
 
+    // set the account's global profile (avatar ref + bio) so the roundtrip
+    // exercises the new fields too.
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: Some("/shared/attachments/avatars/0123456789abcdef.png".into()),
+            bio: Some("building ducks".into()),
+        },
+    )
+    .unwrap();
+    {
+        let acc = get_account(&id, &account_id).unwrap();
+        assert_eq!(
+            acc.avatar.as_deref(),
+            Some("/shared/attachments/avatars/0123456789abcdef.png")
+        );
+        assert_eq!(acc.bio.as_deref(), Some("building ducks"));
+    }
+
     // a fresh module installs the snapshot against the served root ...
     let bytes = id.snapshot();
     let root = id.root();
@@ -622,12 +856,15 @@ fn byzantine_snapshots_are_rejected() {
     assert!(Identity::decode_snapshot(&trailing).is_err());
 
     // an account with zero members: hand-encode one and confirm it rejects.
-    // account count 1, id-len 1 + id byte, name flag 0, nonce 0, member count 0.
+    // account count 1, id-len 1 + id byte, name/avatar/bio flags 0, nonce 0,
+    // member count 0.
     let mut zero_members = Vec::new();
     zero_members.extend_from_slice(&1u64.to_le_bytes()); // account count
     zero_members.extend_from_slice(&1u64.to_le_bytes()); // id len
     zero_members.push(0xAA); // id
     zero_members.push(0u8); // name flag
+    zero_members.push(0u8); // avatar flag
+    zero_members.push(0u8); // bio flag
     zero_members.extend_from_slice(&0u64.to_le_bytes()); // nonce
     zero_members.extend_from_slice(&0u64.to_le_bytes()); // member count == 0
     zero_members.extend_from_slice(&0u64.to_le_bytes()); // node count
@@ -646,6 +883,18 @@ fn account_of_node(id: &Identity, node: &[u8]) -> Option<AccountView> {
         other => panic!("expected Account, got {other:?}"),
     }
 }
+/// the label of `node` under `account_id`, panicking if the node is not bound
+/// -- a read helper for the `SetNodeLabel` tests.
+fn node_label(id: &Identity, account_id: &[u8], node: &[u8]) -> Option<String> {
+    get_account(id, account_id)
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|n| n.node_key == node)
+        .expect("node is bound to the account")
+        .label
+}
+
 fn account_of_member(id: &Identity, member: &[u8]) -> Option<AccountView> {
     let reply = block_on(id.query(&encode_query(&IdentityQuery::OfMember {
         member_key: member.to_vec(),

@@ -585,6 +585,12 @@ pub struct DrainedFrame {
 /// is `write!("Module({m})")`, no escaping), and it correctly leaves any other
 /// kind (e.g. `UnknownModule(..)`) untouched. node-local observability only:
 /// this string is never journaled, sealed, or hashed.
+/// hex for a log line — a state root as a raw byte array is unreadable, and
+/// hand-rolling this beats pulling a hex dependency into the kernel for one line.
+fn hex_root(root: &StateRoot) -> String {
+    root.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn member_reason(reason: String) -> String {
     match reason
         .strip_prefix("Module(")
@@ -1334,6 +1340,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     .push((height, outcome.system_dispatches));
             }
             let mut any_applied = false;
+            let (mut applied_count, mut rejected_count) = (0usize, 0usize);
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
@@ -1344,6 +1351,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
                         any_applied = true;
+                        applied_count += 1;
                         (Disposition::Applied, dispatches, None)
                     }
                     // the host stringifies the reject error with its WRAPPED
@@ -1351,6 +1359,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     // held reply keeps matching the module's own prefix (duckfs-
                     // client keys on "files: conflict:"). node-local only.
                     MemberOutcome::Rejected { reason } => {
+                        rejected_count += 1;
                         (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
                     }
                 };
@@ -1389,6 +1398,26 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 Disposition::Rejected
             };
             self.seal(height, block_disp).await?;
+            // the block spine. NOTHING in this repo ever said "height H produced
+            // app-hash X" — and fork triage, upgrade verification, and "is my node
+            // keeping up" all start exactly there.
+            //
+            // gated on `any_applied`: an idle chain heartbeats a nop block every
+            // second, and at `info` that would fill the 4096-line ring with nothing
+            // in ~68 minutes, evicting the evidence around whatever you were hunting.
+            if any_applied || has_system {
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    app_hash = %hex_root(&batch_hash),
+                    applied = applied_count,
+                    rejected = rejected_count,
+                    "block committed"
+                );
+            } else {
+                tracing::debug!(target: "ducktape::consensus", height, view, "idle block");
+            }
             last_sealed_view = Some(view);
             // OBSERVATION BARRIER (once per batch): end the drain right after a
             // batch that moved the watched root, so a once-per-drain observer

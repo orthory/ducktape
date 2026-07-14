@@ -19,9 +19,10 @@ import { isDesktop } from "../../../domain/workspace-client";
 import { hasNodeContext } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { AccountProfilePanel } from "./AccountProfilePanel";
 import { CustodyCard } from "./CustodyCard";
+import { DevicePanel } from "./DevicePanel";
 import { DevicesCard } from "./DevicesCard";
-import { NetworkNodesCard } from "./NetworkNodesCard";
 import { ProfileCard } from "./ProfileCard";
 import { WorkspacesTable } from "./WorkspacesTable";
 
@@ -73,6 +74,8 @@ export function HomeView() {
       <div data-home-content="full-width" style={{ width: "100%" }}>
         <ProfileCard accountId={accountId} />
 
+        <AccountProfilePanel accountId={accountId} />
+
         <WorkspacesTable />
 
         {disconnected && (
@@ -88,13 +91,13 @@ export function HomeView() {
               lineHeight: 1.5,
             }}
           >
-            Account data lives on each network — enter a workspace above to see
-            this account&apos;s keys and standing there. Device custody below
-            always works.
+            Account data lives on each network — enter a network from the rail
+            to see this account&apos;s keys and standing there. Device custody
+            below always works.
           </div>
         )}
 
-        <NetworkNodesCard accountId={accountId} />
+        <DevicePanel accountId={accountId} />
 
         <DevicesCard accountId={accountId} identity={identity} />
 

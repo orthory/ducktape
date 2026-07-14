@@ -91,7 +91,7 @@ describe("HomeView", () => {
 
     // Profile + workspace table are machine-scoped and always render.
     expect(screen.getByDisplayValue("Rae")).toBeInTheDocument();
-    expect(screen.getByText("YOUR WORKSPACES")).toBeInTheDocument();
+    expect(screen.getByText("YOUR NETWORKS")).toBeInTheDocument();
     expect(screen.getByText("Acme")).toBeInTheDocument();
 
     // Disconnected → the honest chain-scope banner.
@@ -106,6 +106,6 @@ describe("HomeView", () => {
     await Promise.resolve();
     expect(invokeMock).not.toHaveBeenCalled();
     // The workspace table still renders — it is machine-scoped.
-    expect(screen.getByText("YOUR WORKSPACES")).toBeInTheDocument();
+    expect(screen.getByText("YOUR NETWORKS")).toBeInTheDocument();
   });
 });

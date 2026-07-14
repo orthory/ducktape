@@ -2,6 +2,34 @@ use commonware_cryptography::ed25519;
 use consensus::{Digest, digest_of};
 use sdk::StateRoot;
 
+/// a fail-stop: the node cannot continue and a human must go fix something.
+///
+/// this is THE event an operator most needs — *the node died, here is why* — and
+/// as a bare `eprintln!` it reached stderr (and so `daemon.log`) but never the
+/// `LogRing`, which means it never reached the app's Logs tab: the only surface
+/// most users have. routing it through `tracing` puts it in both.
+///
+/// the literal "FATAL" text stays in the message on purpose: the desktop shell
+/// greps `daemon.log` for it to classify a dead node
+/// (`app/src-tauri/src/workspaces/phase.rs`), and `bin/node`'s e2e suites assert
+/// on it.
+///
+/// NOTE: `process::exit` runs no destructors, so the ring's ws subscribers may
+/// not be scheduled before we go. That is fine and deliberate — stderr is
+/// unbuffered, so `daemon.log` always has the line, and the shell reads its tail
+/// precisely to report a death (`daemon.rs::SpawnFailure::log_tail`).
+macro_rules! fatal {
+    ($label:expr, $($arg:tt)*) => {{
+        tracing::error!(
+            target: "ducktape::node",
+            node = %$label,
+            "FATAL: {}", format_args!($($arg)*)
+        );
+        std::process::exit(1)
+    }};
+}
+pub(crate) use fatal;
+
 /// the per-epoch genesis floor: domain-separated by namespace AND epoch, so a
 /// respawned engine can never confuse an old epoch's certificates with its own
 /// (an old-epoch floor fails `Floor::assert` against the new epoch).
@@ -42,27 +70,6 @@ pub(crate) fn resident_bytes(
 /// hex-encode a state root for a stable, greppable log line.
 pub(crate) fn hex(root: &StateRoot) -> String {
     duckfs_core::to_hex(&root.0)
-}
-
-pub(crate) fn diag_log(line: impl AsRef<str>) {
-    let Ok(path) = std::env::var("DUCKTAPE_DIAG_LOG") else {
-        return;
-    };
-    let line = line.as_ref();
-    println!("{line}");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            if let Err(e) = writeln!(file, "{line}") {
-                eprintln!("DUCKTAPE_DIAG_LOG append failed for {path}: {e}");
-            }
-        }
-        Err(e) => eprintln!("DUCKTAPE_DIAG_LOG open failed for {path}: {e}"),
-    }
 }
 
 pub(crate) fn unix_ms() -> u64 {

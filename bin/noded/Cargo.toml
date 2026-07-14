@@ -7,7 +7,7 @@ version.workspace = true
 # actor thread (the host is deliberately non-Send) and exposes it to clients
 # over http + websocket — POST /v1/submit (one msg = one block), POST /v1/query
 # (read committed state), GET /v1/status (version + app-hash + module roots),
-# POST /v1/shutdown (graceful exit), GET /v1/ws (a block-finalized event
+# POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a block-finalized event
 # stream). every ducktape app build is a client of this process: the web build
 # dials it directly; the tauri build spawns it as a DETACHED subprocess (an
 # orphan that outlives the window) and talks to it the same way.
@@ -90,6 +90,9 @@ flate2 = "1"
 # ssh/https transport forge doesn't use either.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+# the log subscriber every bin installs (src/log.rs): ONE reloadable filter over
+# stderr + the ws-streamed LogRing. `reload` backs POST /v1/log-filter.
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

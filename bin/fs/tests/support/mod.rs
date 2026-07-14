@@ -5,7 +5,7 @@
 //! local tokio listener. the CLI subprocess (`env!(CARGO_BIN_EXE_ducktape-fs)`)
 //! drives it over http exactly as it would a real daemon.
 //!
-//! shut down cleanly on drop (POST /v1/shutdown → serve returns → the handle
+//! shut down cleanly on drop (POST /v1/admin/shutdown → serve returns → the handle
 //! drops → the actor's command channel closes → both threads join) so the
 //! tempdir is deleted only once the host's qmdb handles are closed.
 #![allow(dead_code)]
@@ -117,7 +117,7 @@ impl Drop for Harness {
         // graceful shutdown: the serve future returns, the router (and its handle)
         // drop, the command channel closes, both threads end — so the tempdir is
         // removed only after qmdb is closed.
-        let _ = http_status(self.port, "POST", "/v1/shutdown");
+        let _ = http_status(self.port, "POST", "/v1/admin/shutdown");
         if let Some(s) = self.server.take() {
             let _ = s.join();
         }
@@ -210,6 +210,7 @@ fn run_actor(duckfs_dir: std::path::PathBuf, mut cmd_rx: mpsc::Receiver<NodeComm
                             category: ModuleCategory::of("files"),
                         }],
                         public_key: String::new(),
+                        operations: Default::default(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {

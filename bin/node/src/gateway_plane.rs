@@ -436,7 +436,7 @@ async fn account_of_node(
             if account
                 .nodes
                 .iter()
-                .any(|candidate| candidate.as_slice() == node) =>
+                .any(|candidate| candidate.node_key.as_slice() == node) =>
         {
             Ok(account)
         }
@@ -484,7 +484,7 @@ async fn revalidate_route_authority(
     let node_is_current = account
         .nodes
         .iter()
-        .any(|node| node == &statement.publisher_node);
+        .any(|node| node.node_key == statement.publisher_node);
     let proof = identity::MemberProof::Signature {
         sig: authorization.signature.clone(),
     };
@@ -1707,6 +1707,8 @@ mod tests {
         identity::AccountView {
             account_id: id,
             display_name: None,
+            avatar: None,
+            bio: None,
             nonce: 0,
             member_keys: vec![identity::MemberKeyView {
                 pubkey: member.public_key().as_ref().to_vec(),
@@ -1714,7 +1716,10 @@ mod tests {
                 label: None,
                 added_at: 0,
             }],
-            nodes: vec![node.to_vec()],
+            nodes: vec![identity::NodeView {
+                node_key: node.to_vec(),
+                label: None,
+            }],
             updated_at: 0,
         }
     }

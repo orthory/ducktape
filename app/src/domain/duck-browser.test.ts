@@ -168,7 +168,7 @@ describe("browser authority boundaries", () => {
       display_name: "Alice",
       nonce: 0,
       member_keys: [{ pubkey: [...signer], kind: "ed25519" as const, label: null, added_at: 0 }],
-      nodes: [publisher],
+      nodes: [{ node_key: publisher, label: null }],
       updated_at: 0,
     };
     const query = vi.fn(async (target: string) => {

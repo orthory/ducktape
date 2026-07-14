@@ -732,11 +732,13 @@ async fn rejections_inner() {
             propose("p", GovAction::Signal { text: "dup".into() }, 5),
             "proposal already exists",
         ),
-        // the electorate gate — decided by the valset sibling read.
+        // the standing gate — the submitter is neither a member node nor an
+        // account member key bound to one (A1). decided by the valset + identity
+        // sibling reads.
         (
             Origin::External(outsider_pub.clone()),
             propose("p2", GovAction::Signal { text: "x".into() }, 5),
-            "not a current validator-set member",
+            "no validator-set standing",
         ),
         (
             Origin::Module("saga".into()),

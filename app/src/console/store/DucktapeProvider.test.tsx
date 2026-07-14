@@ -72,6 +72,7 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../domain/node-bootstrap")>();
   const emptyNode: NodeTransport = {
     submit: vi.fn().mockResolvedValue({ height: 0, appHash: "00".repeat(32) }),
+    submitControl: vi.fn().mockResolvedValue({ height: 0, appHash: "00".repeat(32) }),
     query: vi.fn().mockResolvedValue({}),
     view: vi.fn().mockResolvedValue({ hits: [] }),
     putBlob: vi.fn().mockResolvedValue("00".repeat(32)),
@@ -134,9 +135,11 @@ const JESS_USER_KEY = Array.from({ length: 32 }, (_, index) => index);
 const JESS_USER: AccountView = {
   account_id: JESS_USER_KEY,
   display_name: "Jess K",
+  avatar: null,
+  bio: null,
   nonce: 0,
   member_keys: [],
-  nodes: [[0xaa]],
+  nodes: [{ node_key: [0xaa], label: null }],
   updated_at: 1,
 };
 
@@ -2330,9 +2333,14 @@ describe("pages snapshot refresh vs in-flight ops", () => {
 const SELF_ACCOUNT: AccountView = {
   account_id: JESS_USER_KEY,
   display_name: "Jess K",
+  avatar: null,
+  bio: null,
   nonce: 0,
   member_keys: [],
-  nodes: [[0xaa], [0xbb]],
+  nodes: [
+    { node_key: [0xaa], label: null },
+    { node_key: [0xbb], label: null },
+  ],
   updated_at: 1,
 };
 const SELF_ACCOUNT_HEX = JESS_USER_KEY.map((b) => b.toString(16).padStart(2, "0")).join("");

@@ -163,38 +163,13 @@ export const createWorkspace = (name: string): Promise<Workspace> =>
 export const joinWorkspace = (name: string, blob: string): Promise<Workspace> =>
   invoke<Workspace>("workspace_join", { name, blob });
 
-/** Admit a joiner by pubkey through this running member node's governance.
- *  Grants RESIDENT standing (mesh + statesync, no quorum seat) — the first
- *  step of staged admission; [`promoteMember`] seats it once warm. */
-export const admitMember = (id: string, pubkey: string): Promise<void> =>
-  invoke<void>("workspace_admit", { id, pubkey });
-
-/** Promote a resident into the consensus quorum by pubkey through this
- *  running member node's governance — staged admission's second step. */
-export const promoteMember = (id: string, pubkey: string): Promise<void> =>
-  invoke<void>("workspace_promote", { id, pubkey });
-
-/** Revoke resident standing by pubkey through this running member node's
- *  governance — the undo of [`admitMember`]; the key's node parks again. */
-export const removeResident = (id: string, pubkey: string): Promise<void> =>
-  invoke<void>("workspace_resident_remove", { id, pubkey });
-
-/** Remove a validator by pubkey through this running member node's governance.
- *  Opens a RemoveValidator proposal and casts this node's yes-ballot; the
- *  removal only takes effect once a strict majority of members (n/2 + 1)
- *  approve, and the removed node drops out at the next epoch cutover. */
-export const demoteMember = (id: string, pubkey: string): Promise<void> =>
-  invoke<void>("workspace_demote", { id, pubkey });
-
-/** Request to leave a network: drive this node's on-chain SELF-removal (a
- *  RemoveValidator proposal for our OWN key, casting our yes-ballot) through the
- *  running member node, and KEEP THE NODE RUNNING. In a set of two-or-more the
- *  removal stays pending until a strict majority of the remaining members
- *  approve — the node must stay up through its own pending removal or quorum
- *  cannot finalize it. A solo (n=1) node is refused (you can't remove the last
- *  validator); it forgets its workspace directly instead. Rejects on failure. */
-export const requestLeaveWorkspace = (id: string): Promise<void> =>
-  invoke<void>("workspace_request_leave", { id });
+// admit / promote / demote / removeResident / requestLeave left this bespoke
+// node-verb lane in the W2 migration (ADR A1): they are ACCOUNT-SIGNED
+// governance frames now, driven client-side via governance-client
+// `driveMembership` over `transport.submitControl`. The node no longer
+// re-signs them with its own key; nothing invokes the deleted `workspace_admit`
+// / `workspace_promote` / `workspace_demote` / `workspace_resident_remove` /
+// `workspace_request_leave` commands.
 
 /** Forget a workspace: stop its node, delete its directory, and drop its
  *  registry entry. GUARDED — refused while this node is still a current

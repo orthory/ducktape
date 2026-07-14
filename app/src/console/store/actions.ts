@@ -14,6 +14,8 @@ import type {
 } from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
+import { identityState } from "../../domain/user-identity-client";
+import { adminSigner, probeAdmin } from "../../domain/admin-client";
 import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
@@ -64,6 +66,8 @@ import {
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity, type AutoBindResult } from "./auto-bind";
+import { saveAccountProfile } from "./account-profile";
+import { pushProfileEdit, reconcileProfile } from "./profile-reconcile";
 import { navSnapshotOf } from "./nav-history";
 import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
@@ -157,8 +161,14 @@ export interface ConsoleActions {
   setNotifyPrefs(prefs: NotifyPrefs): void;
   toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
-  /** Set this node's bound identity account display name. */
+  /** Set this node's bound identity account display name. Also mirrors the name
+   *  into the app-local account profile so it propagates to networks joined
+   *  later (not only the active one). */
   setDisplayName(name: string): void;
+  /** Save the account's global avatar/bio and push them to the active network.
+   *  `avatar`: a data URL sets a new image, `null` removes it, `undefined`
+   *  keeps the current one. Rejects with an inline error on write failure. */
+  saveProfile(edit: { bio: string; avatar: string | null | undefined }): Promise<void>;
   /** Declaratively set or clear the bound account's optional `.duck` name. */
   setDuckHandle(handle: string | null): void;
 
@@ -174,6 +184,9 @@ export interface ConsoleActions {
   accountRemoveMember(targetKeyHex: string): Promise<void>;
   /** Evict a (lost) node from this account — its first UI consumer. */
   accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Set (or clear, with null) a bound node's on-chain device label. Origin-
+   *  gated — submitted by the connected managed node, no signing. */
+  accountSetNodeLabel(targetNodeHex: string, label: string | null): Promise<void>;
   /** Manually re-run the connect-time auto-bind for the active workspace's
    *  node — the escape hatch when that fire-and-forget pass returned
    *  locked/deferred/failed and nothing would ever retry. Resolves to the
@@ -719,13 +732,20 @@ export function createActions({
   ): Promise<AutoBindResult> =>
     autoBindUserIdentity(transport, target).then((outcome) => {
       const pending = loadPendingDisplayName();
-      if (!pending) return outcome;
-      patch({ author: pending });
-      if (outcome !== "bound" && outcome !== "already") return outcome;
-      return identityClient
-        .setAccountName(transport, { displayName: pending, origin: pending })
-        .then(() => clearPendingDisplayName())
-        .catch(() => {}) // a bounced name stays parked for the next pass
+      const flushName =
+        pending && (outcome === "bound" || outcome === "already")
+          ? identityClient
+              .setAccountName(transport, { displayName: pending, origin: pending })
+              .then(() => clearPendingDisplayName())
+              .catch(() => {}) // a bounced name stays parked for the next pass
+          : Promise.resolve();
+      if (pending) patch({ author: pending });
+      // Reconcile the account's global profile (name/avatar/bio) to THIS
+      // network — the idempotent auto-push mirror of the bind pass. Best-effort
+      // and self-guarding on an unbound node; the next connect retries.
+      return flushName
+        .then(() => reconcileProfile(transport, { nodePub: target.pubkey }))
+        .catch(() => {})
         .then(() => outcome);
     });
 
@@ -1443,15 +1463,12 @@ export function createActions({
     if (before.needsOnboarding || before.onboardingPhase || before.bootError) {
       return navSnapshotOf(before);
     }
-    // With no node in context, only same-scope entries may leave the Home
-    // layer (the no-node web shell traversing its own history). A cross-scope
-    // entry minted by a since-forgotten workspace would restore a shell with
-    // nothing behind it.
-    if (
-      !hasNodeContext(before) &&
-      !snap.atHome &&
-      snap.scope !== currentDocTabsScope()
-    ) {
+    // With no node in context, the account home owns the whole window (epic
+    // W1: it is the front door, replacing the onboarding gate) — there is no
+    // shell behind it, so a non-home entry cannot be honored. Only account-home
+    // entries traverse. (On web a configured node keeps hasNodeContext true, so
+    // that shell still traverses its own history.)
+    if (!hasNodeContext(before) && !snap.atHome) {
       return navSnapshotOf(before);
     }
 
@@ -1798,6 +1815,16 @@ export function createActions({
       Promise.resolve()
         .then(() => unbindNode(accountDeps(), targetNodeHex))
         .then(() => refresh()),
+    accountSetNodeLabel: (targetNodeHex, label) =>
+      Promise.resolve()
+        .then(() => {
+          const live = getNode();
+          if (!live) throw new Error("not connected to a workspace node");
+          // Origin-gated write: the local managed node stamps its own key as
+          // origin, so no signing ceremony — mirrors the account-name write.
+          return identityClient.setNodeLabel(live, { nodeKeyHex: targetNodeHex, label });
+        })
+        .then(() => refresh()),
     accountBindNode: () =>
       Promise.resolve()
         .then(() => {
@@ -1857,6 +1884,9 @@ export function createActions({
         return;
       }
       const previous = current.author;
+      // Mirror into the app-local account profile so the name propagates to
+      // networks joined later (reconcile-on-connect), not just the active one.
+      saveAccountProfile({ name: name.trim() || null });
       void submitTracked(
         opKey.accountName(),
         (live) =>
@@ -1865,6 +1895,37 @@ export function createActions({
       ).then((landed) => {
         // un-paint only if no newer write replaced the name mid-flight.
         if (!landed && getState().author === name) patch({ author: previous });
+      });
+    },
+
+    saveProfile: (edit) => {
+      const current = getState();
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
+      const accountId = nodeKey ? current.nodeUsers[nodeKey]?.accountId : undefined;
+      // Persist the global profile locally regardless of connection — the
+      // reconcile pass carries it to networks on their next connect.
+      saveAccountProfile({
+        bio: edit.bio.trim() || null,
+        ...(edit.avatar === undefined ? {} : { avatar: edit.avatar }),
+      });
+      if (!accountId) {
+        fail("bind this node to an identity account before editing your profile");
+        return Promise.resolve();
+      }
+      const live = getNode();
+      const nodePub = current.workspace?.pubkey;
+      if (!live || !nodePub) {
+        fail("not connected to a workspace node");
+        return Promise.resolve();
+      }
+      // Authoritative direct write to the active network (handles clears too).
+      return pushProfileEdit(live, {
+        nodePub,
+        bio: edit.bio,
+        avatar: edit.avatar,
+      }).catch((err) => {
+        fail(err);
+        throw err;
       });
     },
 
@@ -3072,8 +3133,8 @@ export function createActions({
       const target =
         (id ? st.workspaces.find((w) => w.id === id) : undefined) ?? st.workspace ?? null;
       if (!target) {
-        // nothing to reconnect to — fall back to the front door.
-        patch({ bootError: null, needsOnboarding: true });
+        // nothing to reconnect to — fall back to the account home front door.
+        patch({ bootError: null, atHome: true });
         return;
       }
       // connectActive clears bootError/error at the start; re-drive the SAME
@@ -3175,7 +3236,7 @@ export function createActions({
       Promise.resolve()
         .then(() => transport.status())
         .then(
-          () => {
+          (s) => {
             if (isBootGenerationStale(gen)) return;
             // Commit the switch only after the remote proves it is a Ducktape
             // node. A failed dial leaves the current workspace/picker intact.
@@ -3197,6 +3258,31 @@ export function createActions({
             });
             saveRemoteUrl(url);
             setNode(transport);
+            // ADR A5 remote owner control: is this account the node's owner
+            // (a chain fact), and is its owner-gated admin surface reachable?
+            // OWNER-GATED probe: only a confirmed owner mints a signed
+            // /v1/admin/ping — a non-owner connection never hands a PoP
+            // signature (even a scoped one) to an arbitrary remote node.
+            // Fire-and-forget — a non-owner leaves both false (no control
+            // chrome), an owner whose admin is down shows the "unreachable"
+            // hint. The predicate's local disjunct never applies here (workspace
+            // is null), so these two fields are what gate remote control.
+            const nodeKey = s.publicKey ?? "";
+            void identityState()
+              .then((id) => id.pubkey ?? "")
+              .catch(() => "")
+              .then((accountKey) => identityClient.nodeOwnedBy(transport, nodeKey, accountKey))
+              .then(
+                async (owner): Promise<[boolean, boolean]> =>
+                  owner
+                    ? [owner, await probeAdmin(url, adminSigner(nodeKey))]
+                    : [false, false],
+              )
+              .then(([owner, adminReachable]) => {
+                if (isBootGenerationStale(gen)) return;
+                patch({ owner, adminReachable });
+              })
+              .catch(() => {});
           },
           (err) => {
             if (isBootGenerationStale(gen)) return;
@@ -3227,54 +3313,85 @@ export function createActions({
         .catch(fail);
     },
 
+    // Membership ops are ACCOUNT-SIGNED governance frames now (ADR A1, the W2
+    // migration): each drives a propose→vote→execute ceremony over
+    // `submitControl`, authored by the user's account key and authorized by the
+    // governance module's own standing ACL (signer → BindNode → member node).
+    // Works identically over local and remote connections with member standing.
+    // The bespoke `ws.admit/promote/demote/leave` node-verb lane is deleted.
     admitMember: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.admitMember(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { add_resident: { key: keyBytes(hex) } },
+          "resident:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     promoteMember: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.promoteMember(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { add_validator: { key: keyBytes(hex) } },
+          "validator:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     removeResident: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.removeResident(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { remove_resident: { key: keyBytes(hex) } },
+          "resident-remove:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     demoteMember: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.demoteMember(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { remove_validator: { key: keyBytes(hex) } },
+          "member-remove:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     requestLeaveWorkspace: () => {
-      const target = getState().workspace;
-      if (!target) return;
+      // Self-removal: a RemoveValidator targeting THIS node's own key. KEEP the
+      // node running — it must stay up through its own pending removal or quorum
+      // can't finalize it. The per-block roster re-query surfaces the pending
+      // removal; nothing is torn down here.
+      const selfHex = selfNodeHex();
+      if (!getState().workspace || !selfHex) return;
       patch({ error: null });
-      // Submit the on-chain self-removal but KEEP the node running — it must
-      // stay up through its own pending removal or quorum can't finalize it.
-      // The per-block roster re-query surfaces the pending removal; nothing is
-      // torn down here.
-      Promise.resolve()
-        .then(() => ws.requestLeaveWorkspace(target.id))
-        .then(() => refresh())
-        .catch(fail);
+      submitTracked(opKey.govMembership(selfHex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { remove_validator: { key: keyBytes(selfHex) } },
+          "leave:",
+          selfHex,
+          getState().members.length,
+        ),
+      );
     },
 
     forgetWorkspace: (force = false) => {
@@ -3303,10 +3420,11 @@ export function createActions({
             // The registry repointed to another workspace — connect to it.
             return connectActive(next);
           }
-          // None remain — fall back to the onboarding gate.
+          // None remain — fall back to the account home (its rail "+" reopens
+          // the connect panel to add a network).
           patch({
             workspace: null,
-            needsOnboarding: true,
+            atHome: true,
             onboardingBusy: false,
             managed: false,
             nodeUrl: null,
@@ -3351,7 +3469,7 @@ export function createActions({
           if (next) return connectActive(next);
           patch({
             workspace: null,
-            needsOnboarding: true,
+            atHome: true,
             onboardingBusy: false,
             managed: false,
             nodeUrl: null,
@@ -3368,14 +3486,14 @@ export function createActions({
 
     goHome: () => patch({ atHome: true }),
 
+    // Open the connect panel (create/join/remote) — a modal over whatever base
+    // is showing (the live shell when connected, the account home otherwise;
+    // both are always a valid base, so no atHome nudge is needed here).
     newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 
-    dismissOnboarding: () =>
-      // Closable when there's a connection to return to — a local workspace or a
-      // remote node (nodeUrl set). Nothing to go back to on a cold first boot.
-      update((prev) =>
-        prev.workspace || prev.nodeUrl ? { needsOnboarding: false } : {},
-      ),
+    // Always closable now: the account home is always the base surface behind
+    // the connect panel, so dismissing it never strands the user on a blank shell.
+    dismissOnboarding: () => patch({ needsOnboarding: false }),
 
     connectActive,
 

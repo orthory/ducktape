@@ -26,12 +26,25 @@ export interface MemberKeyView {
   added_at: number;
 }
 
+/** One bound node as the identity module exposes it: the node key plus the
+ *  optional on-chain device label (`SetNodeLabel`). */
+export interface NodeView {
+  node_key: number[];
+  label: string | null;
+}
+
 export interface AccountView {
   account_id: number[];
   display_name: string | null;
+  /** Account avatar reference — a duckfs path (`/shared/attachments/avatars/…`)
+   *  the app resolves against the files module, or null when unset. Global to
+   *  the account; the app's reconcile-on-connect pass propagates it per-network. */
+  avatar: string | null;
+  /** Account bio/status line, or null when unset. Global to the account. */
+  bio: string | null;
   nonce: number;
   member_keys: MemberKeyView[];
-  nodes: number[][];
+  nodes: NodeView[];
   updated_at: number;
 }
 
@@ -67,6 +80,35 @@ export const setAccountName = (
     { set_account_name: { display_name: params.displayName } },
     params.origin,
   );
+
+/** Set the account's avatar reference and/or bio. Origin-gated exactly like
+ *  `setAccountName` (a bound node is user-trusted hardware) — the shell never
+ *  signs. `null` clears a field. `avatar` is a duckfs path already committed to
+ *  the files plane; the identity module stores only the reference. */
+export const setAccountProfile = (
+  transport: NodeTransport,
+  params: { avatar: string | null; bio: string | null; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { set_profile: { avatar: params.avatar, bio: params.bio } },
+    params.origin,
+  );
+
+/** Set (or clear, on empty) the on-chain label of a bound node. Origin-gated
+ *  exactly like `setAccountName`: the local managed node stamps its own key as
+ *  origin, and the module accepts the label only for a node bound to that same
+ *  account — no signing ceremony (mirrors the account-name write). */
+export const setNodeLabel = (
+  transport: NodeTransport,
+  params: { nodeKeyHex: string; label: string | null },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    set_node_label: {
+      node_key: hexToBytes(params.nodeKeyHex),
+      label: params.label,
+    },
+  });
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -115,3 +157,26 @@ export const accountOfMember = (
       }),
     )
     .then((reply) => replyVariant<AccountView | null>(reply, "account"));
+
+const bytesToHex = (bytes: number[]): string =>
+  bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** ADR A5 ownership: is `accountKeyHex` a member of the account that owns
+ *  `nodeKeyHex`? This is the chain fact behind remote node control — the app is
+ *  the owner iff its logged-in account key is a member of the node's bound
+ *  account. False when the node is unbound, the key is empty, or the read fails
+ *  (fail-closed: no ownership claim without a committed one). */
+export const nodeOwnedBy = (
+  transport: NodeTransport,
+  nodeKeyHex: string,
+  accountKeyHex: string,
+): Promise<boolean> => {
+  if (!accountKeyHex || !nodeKeyHex) return Promise.resolve(false);
+  const want = accountKeyHex.toLowerCase();
+  return accountOfNode(transport, nodeKeyHex)
+    .then(
+      (account) =>
+        !!account && account.member_keys.some((m) => bytesToHex(m.pubkey) === want),
+    )
+    .catch(() => false);
+};

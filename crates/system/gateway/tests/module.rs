@@ -7,7 +7,7 @@ use gateway::{
     RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
     RouteTarget, decode_reply, encode_msg, encode_query, route_signing_preimage,
 };
-use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView};
+use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView};
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use valset::{ValsetQuery, ValsetReply};
 
@@ -56,6 +56,8 @@ fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {
     AccountView {
         account_id: signer.public_key().as_ref().to_vec(),
         display_name: Some("Alice".into()),
+        avatar: None,
+        bio: None,
         nonce: 0,
         member_keys: vec![MemberKeyView {
             pubkey: signer.public_key().as_ref().to_vec(),
@@ -63,7 +65,10 @@ fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {
             label: None,
             added_at: 0,
         }],
-        nodes: vec![node.to_vec()],
+        nodes: vec![NodeView {
+            node_key: node.to_vec(),
+            label: None,
+        }],
         updated_at: 0,
     }
 }

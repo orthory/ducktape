@@ -91,6 +91,9 @@ export const opKey = {
   runRequest: (agentId: string) => `agent/run-request/${agentId}`,
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
+  /** A membership ceremony (admit/promote/demote/removeResident/leave) — the
+   *  ceremony mints its own proposal id, so the mark keys on the subject key. */
+  govMembership: (subjectHex: string) => `governance/membership/${subjectHex}`,
   file: (fileId: string) => `file/${fileId}`,
   /** A comment write (edit/delete) — keyed by the comment id. */
   comment: (commentId: string) => `comment/${commentId}`,

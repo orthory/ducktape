@@ -9,7 +9,7 @@ use statesync::{fetch_frames, fetch_manifest};
 use crate::constants::{BOOT_SYNC_REQUEST_TIMEOUT, CUTOVER_DELAY};
 use crate::explorer::IndexFold;
 use crate::sync::serve::to_node_disposition;
-use crate::util::{diag_log, hex};
+use crate::util::hex;
 
 pub(crate) async fn apply_verified_suffix_frame(
     host: &mut Host,
@@ -258,7 +258,11 @@ where
         .write_manifest(&ckpt)
         .await
         .map_err(|e| format!("catch-up checkpoint write: {e}"))?;
-    diag_log(format!("DIAG catchup_checkpoint height={}", target.height));
+    tracing::debug!(
+        target: "ducktape::statesync",
+        height = target.height,
+        "catch-up checkpoint captured"
+    );
     Ok(ckpt)
 }
 
@@ -315,10 +319,13 @@ where
                     hex(&host.app_hash())
                 )));
             }
-            diag_log(format!(
-                "DIAG post_reboot_catchup from={} to={} frames={}",
-                recovered_height, current_height, total_frames
-            ));
+            tracing::debug!(
+                target: "ducktape::statesync",
+                from = recovered_height,
+                to = current_height,
+                frames = total_frames,
+                "post-reboot catch-up planned"
+            );
             return Ok(PostRebootCatchup {
                 from_height: recovered_height,
                 to_height: current_height,
@@ -337,6 +344,21 @@ where
                 requested_after,
                 retained_from,
             }) => {
+                // the follower side of the same wedge (#493, macOS "missing blocks").
+                // it printed the SAME impossible range on every certificate, which is
+                // indistinguishable from healthy catch-up — and so it read as boot
+                // noise for days. `permanent` is the word that ends the guessing: this
+                // does not heal by waiting, because the source can only prune FURTHER
+                // ahead of us.
+                tracing::error!(
+                    target: "ducktape::statesync",
+                    requested_after,
+                    retained_from,
+                    gap_blocks = retained_from.saturating_sub(requested_after),
+                    permanent = true,
+                    "catch-up IMPOSSIBLE — the source pruned past our height; waiting will \
+                     never fix this, we must full-sync from a fresh checkpoint"
+                );
                 return Err(PostRebootCatchupError::RangePruned {
                     target: Box::new(tip),
                     requested_after,
@@ -373,10 +395,13 @@ where
         target = Some(tip);
     }
 
-    diag_log(format!(
-        "DIAG post_reboot_catchup from={} to={} frames={}",
-        recovered_height, current_height, total_frames
-    ));
+    tracing::debug!(
+        target: "ducktape::statesync",
+        from = recovered_height,
+        to = current_height,
+        frames = total_frames,
+        "post-reboot catch-up planned"
+    );
     Ok(PostRebootCatchup {
         from_height: recovered_height,
         to_height: current_height,
