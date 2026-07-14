@@ -1707,6 +1707,8 @@ mod tests {
         identity::AccountView {
             account_id: id,
             display_name: None,
+            avatar: None,
+            bio: None,
             nonce: 0,
             member_keys: vec![identity::MemberKeyView {
                 pubkey: member.public_key().as_ref().to_vec(),

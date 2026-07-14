@@ -47,6 +47,8 @@ impl IdentityStub {
                 AccountView {
                     account_id: account_id.clone(),
                     display_name: None,
+                    avatar: None,
+                    bio: None,
                     nonce: 0,
                     member_keys: vec![MemberKeyView {
                         pubkey: account_id,

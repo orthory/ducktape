@@ -76,6 +76,8 @@ impl Ctx for TestCtx {
                     let account = self.accounts.get(&node_key).map(|account_id| AccountView {
                         account_id: account_id.clone(),
                         display_name: None,
+                        avatar: None,
+                        bio: None,
                         nonce: 0,
                         member_keys: vec![],
                         nodes: vec![node_key],

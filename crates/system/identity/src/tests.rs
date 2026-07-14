@@ -525,6 +525,68 @@ fn set_account_name_is_origin_gated_to_a_bound_node() {
 }
 
 #[test]
+fn set_profile_is_origin_gated_trims_caps_and_clears() {
+    let mut id = new_identity();
+    let founder = ed(1);
+    let node = b"node-1";
+    let account_id = found_account(&mut id, &founder, node);
+
+    // a bound node sets avatar + bio; both trim.
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: Some("  /shared/attachments/avatars/abc.png  ".into()),
+            bio: Some("  hi there  ".into()),
+        },
+    )
+    .expect("bound node sets its profile");
+    let acc = get_account(&id, &account_id).unwrap();
+    assert_eq!(acc.avatar.as_deref(), Some("/shared/attachments/avatars/abc.png"));
+    assert_eq!(acc.bio.as_deref(), Some("hi there"));
+    // no signature is consumed: the nonce stays put (still 1 from the bind).
+    assert_eq!(acc.nonce, 1);
+
+    // empty-trim clears each field independently.
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: Some("   ".into()),
+            bio: None,
+        },
+    )
+    .expect("empty avatar clears");
+    let acc = get_account(&id, &account_id).unwrap();
+    assert_eq!(acc.avatar, None, "whitespace avatar clears");
+    assert_eq!(acc.bio, None, "None bio clears");
+
+    // over-cap bio rejects, state untouched.
+    let err = apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: None,
+            bio: Some("x".repeat(MAX_BIO_LEN + 1)),
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("bio exceeds"), "got {err:?}");
+
+    // an unbound node cannot set any account's profile.
+    let err = apply(
+        &mut id,
+        b"stranger",
+        IdentityMsg::SetProfile {
+            avatar: Some("/shared/attachments/avatars/evil.png".into()),
+            bio: None,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("not bound"), "got {err:?}");
+}
+
+#[test]
 fn bind_is_valset_gated_when_configured() {
     let mut id = new_gated_identity();
     let founder = ed(1);
@@ -578,6 +640,26 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
     )
     .unwrap();
 
+    // set the account's global profile (avatar ref + bio) so the roundtrip
+    // exercises the new fields too.
+    apply(
+        &mut id,
+        node,
+        IdentityMsg::SetProfile {
+            avatar: Some("/shared/attachments/avatars/0123456789abcdef.png".into()),
+            bio: Some("building ducks".into()),
+        },
+    )
+    .unwrap();
+    {
+        let acc = get_account(&id, &account_id).unwrap();
+        assert_eq!(
+            acc.avatar.as_deref(),
+            Some("/shared/attachments/avatars/0123456789abcdef.png")
+        );
+        assert_eq!(acc.bio.as_deref(), Some("building ducks"));
+    }
+
     // a fresh module installs the snapshot against the served root ...
     let bytes = id.snapshot();
     let root = id.root();
@@ -622,12 +704,15 @@ fn byzantine_snapshots_are_rejected() {
     assert!(Identity::decode_snapshot(&trailing).is_err());
 
     // an account with zero members: hand-encode one and confirm it rejects.
-    // account count 1, id-len 1 + id byte, name flag 0, nonce 0, member count 0.
+    // account count 1, id-len 1 + id byte, name/avatar/bio flags 0, nonce 0,
+    // member count 0.
     let mut zero_members = Vec::new();
     zero_members.extend_from_slice(&1u64.to_le_bytes()); // account count
     zero_members.extend_from_slice(&1u64.to_le_bytes()); // id len
     zero_members.push(0xAA); // id
     zero_members.push(0u8); // name flag
+    zero_members.push(0u8); // avatar flag
+    zero_members.push(0u8); // bio flag
     zero_members.extend_from_slice(&0u64.to_le_bytes()); // nonce
     zero_members.extend_from_slice(&0u64.to_le_bytes()); // member count == 0
     zero_members.extend_from_slice(&0u64.to_le_bytes()); // node count
