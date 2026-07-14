@@ -1122,6 +1122,19 @@ describe("RunsOnPicker", () => {
     );
   });
 
+  it("keeps provider switching within the first announced model", () => {
+    renderAgents({
+      capabilities: ["codex", "claude_opus_max", "claude_sonnet_medium"],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "claude" } });
+
+    expect(screen.getByLabelText("Model")).toHaveValue("opus");
+    expect(screen.getByLabelText("Effort")).toHaveValue("max");
+    expect(screen.getByText("claude_opus_max")).toBeInTheDocument();
+  });
+
   it("pins a stored tag that is no longer announced, marked offline", () => {
     // Agent "summarizer" stores capability "alpha" — no longer announced.
     const { spies } = renderAgents({ capabilities: ["codex"] });

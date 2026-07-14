@@ -205,10 +205,11 @@ export function RunsOnPicker({
   // always one announced (or pinned) capability string, never a synthesis.
   const pickProvider = (key: string) => {
     const list = entries.filter((entry) => entry.key === key);
+    const first = list[0];
     const pick =
       list.find((entry) => entry.model === null) ??
-      list.find((entry) => entry.effort === "medium") ??
-      list[0];
+      list.find((entry) => entry.model === first?.model && entry.effort === "medium") ??
+      first;
     if (pick) onChange(pick.tag);
   };
   const pickModel = (model: string) => {
