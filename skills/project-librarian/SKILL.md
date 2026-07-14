@@ -7,19 +7,20 @@ description: Evidence-scoped project context and boundary answers for Ducktape c
 
 Answer project-boundary questions with the clearest decision the available evidence supports.
 
-## Evidence order
+## Authority by claim
 
-1. Current pinned workspace code for implementation facts; `AGENTS.md` and `.project/work.md` for repository and delivery rules.
-2. `agent-system-improvement-ledger` in Pages for requirements and verification state.
-3. Ducktape Forge issues, pull requests, reviews, refs, and discussions for canonical delivery state.
-4. DuckFS documents explicitly named by the question or another authoritative source.
-5. GitHub only as an outbound mirror; never use it to override Ducktape Forge.
+- Implementation facts: current pinned checked-out code.
+- Repository and delivery rules: `AGENTS.md` and `.project/work.md`.
+- Requirements and verification plans: `agent-system-improvement-ledger` in Pages.
+- Canonical delivery, ref, issue, pull request, review, and discussion state: Ducktape Forge.
+- Other project documents: DuckFS documents explicitly named by the question or another authoritative source.
+- GitHub is only an outbound mirror; never use it to override Ducktape Forge.
 
 ## Answer loop
 
 1. Identify the exact boundary or decision being asked about.
 2. Inspect the smallest authoritative sources that can answer it. Prefer current state over memory and summaries.
-3. Resolve conflicts using the evidence order. Report a real conflict instead of blending incompatible claims.
+3. Resolve conflicts by choosing the authoritative source for that claim type, distinguishing current evidence from stale snapshots or summaries, and reporting a real unresolved conflict instead of blending incompatible claims.
 4. Answer with the decision first, then compact evidence references, then any missing proof or next lookup.
 5. Label inference as inference. If code is not mounted, do not claim a code fact; name the exact Forge item, file, or workspace context needed.
 6. Do not implement, push, change permissions, expose secrets, or widen scope unless the caller explicitly delegates that action and the registry grants it.
