@@ -12,7 +12,10 @@
 
 use std::path::Path;
 
-use git2::{Buf, Commit, ErrorCode, Oid, Repository, RepositoryInitOptions, Signature, Time, Tree};
+use git2::{
+    Buf, Commit, DiffFormat, DiffOptions, ErrorCode, Oid, Repository, RepositoryInitOptions,
+    Signature, Time, Tree,
+};
 
 /// the fixed author/committer identity — pinning it makes the commit oid
 /// reproducible across nodes (no host `user.name`/`user.email` leak).
@@ -221,4 +224,69 @@ pub fn verify_closure(repo: &Repository, head: Oid) -> Result<(), git2::Error> {
         }
     }
     Ok(())
+}
+
+/// Compare two materialized commits and return a bounded unified-diff prefix
+/// plus full diff statistics. No fetch or shell command is attempted.
+pub fn bounded_diff(
+    repo: &Repository,
+    target: Oid,
+    source: Oid,
+    max_bytes: usize,
+) -> Result<(String, bool, usize, usize, usize), git2::Error> {
+    let target_tree = repo.find_commit(target)?.tree()?;
+    let source_tree = repo.find_commit(source)?.tree()?;
+    let mut opts = DiffOptions::new();
+    opts.context_lines(3).interhunk_lines(0);
+    let mut diff = repo.diff_tree_to_tree(
+        Some(&target_tree),
+        Some(&source_tree),
+        Some(&mut opts),
+    )?;
+    diff.find_similar(None)?;
+    let stats = diff.stats()?;
+    let counts = (
+        stats.files_changed(),
+        stats.insertions(),
+        stats.deletions(),
+    );
+
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut truncated = false;
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        if truncated {
+            return true;
+        }
+        let prefix = match line.origin() {
+            'F' | 'H' | 'B' => None,
+            origin => Some(origin as u8),
+        };
+        let needed = line.content().len() + usize::from(prefix.is_some());
+        if bytes.len() + needed > max_bytes {
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            if let Some(prefix) = prefix
+                && remaining > 0
+            {
+                bytes.push(prefix);
+            }
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&line.content()[..remaining.min(line.content().len())]);
+            truncated = true;
+            return true;
+        }
+        if let Some(prefix) = prefix {
+            bytes.push(prefix);
+        }
+        bytes.extend_from_slice(line.content());
+        true
+    })?;
+    let patch = match std::str::from_utf8(&bytes) {
+        Ok(_) => String::from_utf8(bytes).expect("validated UTF-8"),
+        Err(e) if truncated && e.error_len().is_none() => {
+            bytes.truncate(e.valid_up_to());
+            String::from_utf8(bytes).expect("truncated to a UTF-8 boundary")
+        }
+        Err(_) => return Err(git2::Error::from_str("diff is not valid UTF-8 text")),
+    };
+    Ok((patch, truncated, counts.0, counts.1, counts.2))
 }

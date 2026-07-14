@@ -176,12 +176,82 @@ fn a_cap_gated_read_refuses_when_the_caps_do_not_cover_it() {
     // which this agent's (default, empty) caps do not carry.
     let h = Harness::start(ALL_ACTIONS);
 
-    let refused = h.call(h.mcp(), "ducktape_forge_items", json!({"repo": "app"}));
+    let refused = h.call(
+        h.mcp(),
+        "ducktape_forge_pr_diff",
+        json!({"repo": "app", "number": 1}),
+    );
     let (is_error, text) = content(&refused);
     assert!(is_error, "an uncapped forge read must refuse: {text}");
     assert!(
         text.contains("forge_read"),
         "the refusal must name the cap field the owner would widen: {text}"
+    );
+}
+
+#[test]
+fn a_forge_scoped_read_only_agent_can_review_a_real_pr_diff() {
+    let h = Harness::start_with_forge_read(&[], &["app"]);
+    let commit = |path: &str, content: &str, message: &str| {
+        h.submit(
+            "forge",
+            json!({"commit": {
+                "repo": "app", "path": path, "content": content, "message": message
+            }}),
+            OWNER,
+        );
+        h.query("forge", json!({"head_of": {"repo": "app"}}))["head"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let oid_bytes = |hex: &str| {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let target = commit("base.txt", "base\n", "base");
+    let source = commit("review.txt", "reviewable\n", "feature");
+    h.submit(
+        "forge",
+        json!({"push_refs": {
+            "repo": "app",
+            "updates": [
+                {"ref_name": "dev", "prev_oid": null, "new_oid": oid_bytes(&target)},
+                {"ref_name": "feature", "prev_oid": null, "new_oid": oid_bytes(&source)}
+            ],
+            "pack_digest": vec![7u8; 32]
+        }}),
+        OWNER,
+    );
+    h.submit(
+        "forge",
+        json!({"open_pr": {
+            "repo": "app", "title": "review me", "body": "",
+            "source_branch": "feature", "target_branch": "dev"
+        }}),
+        OWNER,
+    );
+
+    let reply = payload(&h.call(
+        h.mcp(),
+        "ducktape_forge_pr_diff",
+        json!({"repo": "app", "number": 1}),
+    ));
+    let diff = &reply["pr_diff"];
+    assert_eq!(diff["source_oid"], source);
+    assert_eq!(diff["target_oid"], target);
+    assert_eq!(diff["truncated"], false);
+    assert!(
+        diff["patch"].as_str().unwrap().contains("+reviewable"),
+        "{diff}"
+    );
+    assert!(
+        diff["patch"].as_str().unwrap().len() <= forge::MAX_PR_DIFF_BYTES,
+        "the typed MCP response must preserve Forge's context cap"
     );
 }
 

@@ -800,6 +800,58 @@ impl Module for Forge {
                     self.tracker.get(&name, number).map(Box::new),
                 )))
             }
+            ForgeQuery::PrDiff { repo, number } => {
+                let name = norm_repo(&repo)?;
+                let item = self.tracker.get(&name, number).ok_or_else(|| {
+                    Error::Module(format!("forge: no item #{number} in repo {name:?}"))
+                })?;
+                if item.summary.kind != ItemKind::Pr {
+                    return Err(Error::Module(format!(
+                        "forge: item #{number} is an issue, not a pull request"
+                    )));
+                }
+                let source_branch = item.source_branch.ok_or_else(|| {
+                    Error::Module(format!("forge: pull request #{number} has no source branch"))
+                })?;
+                let target_branch = item.target_branch.ok_or_else(|| {
+                    Error::Module(format!("forge: pull request #{number} has no target branch"))
+                })?;
+                let state = self.repos.get(&name).ok_or_else(|| {
+                    Error::Module(format!("forge: no repo {name:?}"))
+                })?;
+                let source = state.refs.get(&source_branch).copied().ok_or_else(|| {
+                    Error::Module(format!(
+                        "forge: pull request #{number} source branch {source_branch:?} is not materialized"
+                    ))
+                })?;
+                let target = state.refs.get(&target_branch).copied().ok_or_else(|| {
+                    Error::Module(format!(
+                        "forge: pull request #{number} target branch {target_branch:?} is not materialized"
+                    ))
+                })?;
+                let repo = git::open(&self.base.join(&name)).map_err(|e| {
+                    Error::Module(format!(
+                        "forge: repo {name:?} is not materialized (target {target}, source \
+                         {source}): {e}"
+                    ))
+                })?;
+                let (patch, truncated, files_changed, additions, deletions) =
+                    git::bounded_diff(&repo, target, source, MAX_PR_DIFF_BYTES).map_err(|e| {
+                        Error::Module(format!(
+                            "forge: objects for pull request #{number} are not fully materialized \
+                             (target {target}, source {source}): {e}"
+                        ))
+                    })?;
+                Ok(encode_reply(&ForgeReply::PrDiff(PrDiff {
+                    source_oid: source.to_string(),
+                    target_oid: target.to_string(),
+                    files_changed,
+                    additions,
+                    deletions,
+                    patch,
+                    truncated,
+                })))
+            }
         }
     }
 
@@ -927,6 +979,145 @@ mod tests {
 
     fn oid(hexc: char) -> Oid {
         Oid::from_str(&hexc.to_string().repeat(40)).unwrap()
+    }
+
+    fn materialized_pr(base: &std::path::Path, content: &[u8]) -> (Forge, Oid, Oid) {
+        let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
+        commit(&mut forge, 1, "demo", "base.txt", "base\n", "base");
+        let repo = git::open(&base.join("demo")).unwrap();
+        let target = git_head_oid(base, "demo");
+        let target_commit = repo.find_commit(target).unwrap();
+        let target_tree = target_commit.tree().unwrap();
+        let blob = repo.blob(content).unwrap();
+        let source_tree_oid =
+            git::build_tree(&repo, Some(&target_tree), "feature.txt", blob).unwrap();
+        let source_tree = repo.find_tree(source_tree_oid).unwrap();
+        let source = git::commit(
+            &repo,
+            &source_tree,
+            Some(&target_commit),
+            "feature",
+            2,
+        )
+        .unwrap();
+        git::update_ref(&repo, "refs/heads/dev", target).unwrap();
+        git::update_ref(&repo, "refs/heads/feature", source).unwrap();
+        let state = forge.repos.get_mut("demo").unwrap();
+        state.refs.insert("dev".into(), target);
+        state.refs.insert("feature".into(), source);
+
+        let mut ctx = TestCtx::with_origin(3, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut ctx,
+            &ForgeMsg::OpenPr {
+                repo: "demo".into(),
+                title: "review me".into(),
+                body: String::new(),
+                source_branch: "feature".into(),
+                target_branch: "dev".into(),
+            },
+        );
+        (forge, source, target)
+    }
+
+    #[test]
+    fn pr_diff_pins_oids_and_returns_a_reviewable_patch() {
+        let base = tmp_base("pr-diff");
+        let (forge, source, target) = materialized_pr(&base, b"reviewable\n");
+        let bytes = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap();
+        let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
+            panic!("wrong reply")
+        };
+        assert_eq!(diff.source_oid, source.to_string());
+        assert_eq!(diff.target_oid, target.to_string());
+        assert_eq!(diff.files_changed, 1);
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 0);
+        assert!(diff.patch.contains("+++ b/feature.txt"), "{}", diff.patch);
+        assert!(diff.patch.contains("+reviewable"), "{}", diff.patch);
+        assert!(!diff.truncated);
+        assert!(diff.patch.len() <= MAX_PR_DIFF_BYTES);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_caps_the_patch_and_reports_truncation() {
+        let base = tmp_base("pr-diff-cap");
+        let content = vec![b'x'; MAX_PR_DIFF_BYTES + 4096];
+        let (forge, _, _) = materialized_pr(&base, &content);
+        let bytes = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap();
+        let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
+            panic!("wrong reply")
+        };
+        assert!(diff.truncated);
+        assert_eq!(diff.patch.len(), MAX_PR_DIFF_BYTES);
+        assert_eq!(diff.files_changed, 1, "full stats survive truncation");
+        assert_eq!(diff.additions, 1, "full stats survive truncation");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_fails_honestly_when_a_pinned_object_is_unavailable() {
+        let base = tmp_base("pr-diff-missing");
+        let (mut forge, _, target) = materialized_pr(&base, b"present\n");
+        let missing = oid('f');
+        forge
+            .repos
+            .get_mut("demo")
+            .unwrap()
+            .refs
+            .insert("feature".into(), missing);
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not fully materialized"), "{err}");
+        assert!(err.contains(&missing.to_string()), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_an_issue_before_reading_git_objects() {
+        let base = tmp_base("issue-diff");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut ctx = TestCtx::with_origin(1, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut ctx,
+            &ForgeMsg::OpenIssue {
+                repo: "demo".into(),
+                title: "not a pr".into(),
+                body: String::new(),
+            },
+        );
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("issue, not a pull request"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn user_origin(b: u8) -> sdk::Origin {

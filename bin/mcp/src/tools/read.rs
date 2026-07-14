@@ -124,6 +124,21 @@ pub(super) fn tools() -> Vec<Tool> {
             handler: forge_item,
         },
         Tool {
+            name: "ducktape_forge_pr_diff",
+            description: "Read a pull request's exact committed source and target OIDs plus a \
+                          bounded unified patch and full diff statistics. The patch is capped at \
+                          48 KiB and reports truncation. Fails if the item is not a PR or the \
+                          pinned git objects are unavailable locally. Requires the repo to be in \
+                          your forge_read caps.",
+            schema: || {
+                schema(&[
+                    ("repo", "string", true, "The forge repo."),
+                    ("number", "integer", true, "The pull request number."),
+                ])
+            },
+            handler: forge_pr_diff,
+        },
+        Tool {
             name: "ducktape_files_ls",
             description: "List a directory in the Ducktape filesystem (duckfs). This is the \
                           shared, replicated filesystem — NOT your local workspace, which you \
@@ -228,6 +243,15 @@ fn forge_item(run: &Run, args: &Value) -> Result<Value> {
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
 
+fn forge_pr_diff(run: &Run, args: &Value) -> Result<Value> {
+    let repo = arg_str(args, "repo")?;
+    let number = opt_u64(args, "number")
+        .ok_or_else(|| NodeError::Rejected("this tool needs an integer \"number\"".into()))?;
+    gate_forge_read(run, &repo)?;
+    let query = ForgeQuery::PrDiff { repo, number };
+    run.node.query(TARGET_FORGE, encode(&query)?)
+}
+
 fn files_ls(run: &Run, args: &Value) -> Result<Value> {
     let path = arg_str(args, "path")?;
     gate_duckfs_read(run, &path)?;
@@ -303,6 +327,14 @@ mod tests {
             })
             .unwrap(),
             json!({"messages_latest": {"channel_id": "c", "limit": 5}})
+        );
+        assert_eq!(
+            encode(&ForgeQuery::PrDiff {
+                repo: "app".into(),
+                number: 8,
+            })
+            .unwrap(),
+            json!({"pr_diff": {"repo": "app", "number": 8}})
         );
         assert_eq!(encode(&TaskQuery::List).unwrap(), json!("list"));
         assert_eq!(encode(&PageQuery::ListPages).unwrap(), json!("list_pages"));
