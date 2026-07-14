@@ -618,8 +618,201 @@ describe("floating comment card", () => {
     const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
     area.setSelectionRange(2, 2);
     fireEvent.click(area);
-    screen.getByRole("dialog", { name: "Comments on this block" });
+    screen.getByRole("dialog", { name: "Comments on selected text" });
     expect(screen.getByLabelText("Commented text").textContent).toBe("First");
+  });
+
+  const selectFirstBlock = (start = 0, end = 5) => {
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(start, end);
+    fireEvent.select(area);
+    screen.getByRole("toolbar", { name: "Selection actions" });
+    return area;
+  };
+
+  it("waits for the pointer release before showing the guide menu", () => {
+    renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    fireEvent.mouseDown(area);
+    area.setSelectionRange(0, 5);
+    fireEvent.select(area);
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+    // release over the row (bubbles to the one-shot document listener); firing
+    // straight on `document` would bypass the React root and wedge React's
+    // select-event plugin's module-level mouse state for every later test.
+    fireEvent.mouseUp(area);
+    screen.getByRole("toolbar", { name: "Selection actions" });
+  });
+
+  it("turns the block into a heading from the guide menu", () => {
+    const { spies } = renderPagesView();
+    selectFirstBlock();
+    fireEvent.click(screen.getByRole("button", { name: "Heading 2" }));
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({ blockId: "a", kind: "heading2" });
+  });
+
+  it("dismisses the guide menu on scroll and on focus loss", () => {
+    renderPagesView();
+    selectFirstBlock();
+    fireEvent.scroll(document);
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+
+    const area = selectFirstBlock();
+    fireEvent.blur(area);
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+  });
+
+  it("⌘/ comments on the live selection", () => {
+    renderPagesView();
+    const area = selectFirstBlock(0, 5);
+    fireEvent.keyDown(area, { key: "/", metaKey: true });
+    screen.getByRole("dialog", { name: "Comments on selected text" });
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+  });
+
+  it("keeps the fresh anchor visible and quoted while composing", () => {
+    renderPagesView();
+    const area = selectFirstBlock(0, 5);
+    fireEvent.keyDown(area, { key: "/", metaKey: true });
+    const dialog = screen.getByRole("dialog", { name: "Comments on selected text" });
+    // no thread exists yet, but the range still paints behind the textarea…
+    expect(document.querySelector("[data-inline-text]")?.textContent).toBe("First draft");
+    // …and the composer echoes the selected text.
+    expect(within(dialog).getByLabelText("Commented text").textContent).toBe("First");
+  });
+
+  const twoRangeThreads = [
+    {
+      target: "a",
+      threads: [
+        {
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 0, end: 5 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [{
+            id: "c1", thread_id: "t1", author: { user: [1] }, text: "about First",
+            created_at: 1, edited_at: null, deleted: false,
+          }],
+        },
+        {
+          thread: {
+            id: "t2", target: "a", opener: { user: [1] }, created_at: 2,
+            anchor: { start: 6, end: 11 }, resolved: false, resolved_by: null,
+            comment_ids: ["c2"],
+          },
+          comments: [{
+            id: "c2", thread_id: "t2", author: { user: [1] }, text: "about draft",
+            created_at: 2, edited_at: null, deleted: false,
+          }],
+        },
+      ],
+    },
+  ] as ConsoleState["pageThreads"];
+
+  it("scopes the card to the clicked range's thread, not the whole block", () => {
+    renderPagesView({ pageThreads: twoRangeThreads });
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(2, 2); // inside "First" (t1), outside "draft" (t2)
+    fireEvent.click(area);
+    const dialog = screen.getByRole("dialog", { name: "Comments on selected text" });
+    within(dialog).getByText("about First");
+    expect(within(dialog).queryByText("about draft")).toBeNull();
+  });
+
+  it("the block affordance still shows every thread on the block", () => {
+    renderPagesView({ pageThreads: twoRangeThreads });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+    const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
+    within(dialog).getByText("about First");
+    within(dialog).getByText("about draft");
+  });
+
+  it("badges open discussions; resolved-only history keeps a quiet badge", () => {
+    const resolved = (threads: ConsoleState["pageThreads"]) =>
+      threads.map((group) => ({
+        ...group,
+        threads: group.threads.map((view) => ({
+          ...view,
+          thread: { ...view.thread, resolved: true, resolved_by: { user: [1] } },
+        })),
+      }));
+    const { rerender } = renderPagesView({ pageThreads: twoRangeThreads });
+    const badge = () => screen.getByRole("button", { name: "Comment on block 1" });
+    expect(badge().textContent).toBe("2");
+    expect(badge().title).toBe("2 open of 2 discussions");
+    // all resolved: the badge stays (the history is still discoverable) but
+    // reads quiet — total count, muted tone.
+    rerender({ pageThreads: resolved(twoRangeThreads) });
+    expect(badge().textContent).toBe("2");
+    expect(badge().title).toBe("0 open of 2 discussions");
+  });
+
+  it("docks the card in the side rail on a wide viewport; scroll keeps it", () => {
+    const wide = window.innerWidth;
+    window.innerWidth = 1600;
+    try {
+      renderPagesView({ pageThreads: threadsOn("a") });
+      fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+      const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
+      const rail = document.querySelector("[data-comment-rail]");
+      expect(rail?.contains(dialog)).toBe(true);
+      expect(getComputedStyle(dialog).position).toBe("absolute");
+      fireEvent.scroll(document);
+      expect(screen.queryByRole("dialog", { name: "Comments on this block" })).not.toBeNull();
+    } finally {
+      window.innerWidth = wide;
+    }
+  });
+
+  it("keeps the floating popover on a narrow viewport; scroll dismisses it", () => {
+    const wide = window.innerWidth;
+    window.innerWidth = 1000;
+    try {
+      renderPagesView({ pageThreads: threadsOn("a") });
+      fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+      const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
+      expect(getComputedStyle(dialog).position).toBe("fixed");
+      fireEvent.scroll(document);
+      expect(screen.queryByRole("dialog", { name: "Comments on this block" })).toBeNull();
+    } finally {
+      window.innerWidth = wide;
+    }
+  });
+
+  it("Escape spends itself on the guide menu — an open card survives", () => {
+    renderPagesView({ pageThreads: threadsOn("a") });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    const area = selectFirstBlock(0, 5);
+    fireEvent.keyDown(area, { key: "Escape" });
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Comments on this block" })).toBeNull();
+  });
+
+  it("a tier flip repositions the card without dropping the composer draft", () => {
+    const wide = window.innerWidth;
+    window.innerWidth = 1000;
+    try {
+      renderPagesView();
+      fireEvent.click(screen.getByRole("button", { name: "Comment on page" }));
+      const draft = screen.getByLabelText("New comment text") as HTMLTextAreaElement;
+      fireEvent.change(draft, { target: { value: "half-typed thought" } });
+      window.innerWidth = 1600;
+      fireEvent(window, new Event("resize"));
+      const after = screen.getByLabelText("New comment text") as HTMLTextAreaElement;
+      expect(after.value).toBe("half-typed thought");
+      expect(
+        getComputedStyle(screen.getByRole("dialog", { name: "Comments on this page" })).position,
+      ).toBe("absolute");
+    } finally {
+      window.innerWidth = wide;
+    }
   });
 });
 

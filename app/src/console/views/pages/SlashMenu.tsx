@@ -32,7 +32,7 @@ export function SlashMenu({
         border: `1px solid ${color.border}`,
         borderRadius: radius.md,
         background: color.paper,
-        boxShadow: shadow.card,
+        boxShadow: shadow.pop,
         padding: 4,
       }}
     >
@@ -60,7 +60,7 @@ export function SlashMenu({
             background: i === activeIndex ? color.hover : "transparent",
           }}
         >
-          <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>
+          <span style={{ font: `500 13px ${font.sans}`, color: color.ink }}>
             {option.label}
           </span>
           <span

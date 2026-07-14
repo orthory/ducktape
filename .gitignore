@@ -16,3 +16,4 @@ ops/wg-smoke/node*/
 
 # superpowers SDD scratch
 .superpowers/
+package-lock.json

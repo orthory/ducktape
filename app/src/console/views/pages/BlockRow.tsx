@@ -167,6 +167,8 @@ function BlockRowInner({
   expanded,
   op,
   threads,
+  commentOpen,
+  pendingCommentRange,
   dropEdge,
   presence,
   onCursor,
@@ -186,6 +188,12 @@ function BlockRowInner({
   op: OpRecord | undefined;
   /** Live comment threads on this block, including exact selection anchors. */
   threads: ThreadView[];
+  /** The comment card is open on THIS block — its margin badge lights up. */
+  commentOpen: boolean;
+  /** The range the open comment card is aimed at, when it has no thread yet:
+   *  the composer's anchor must stay visible while the user writes, or they
+   *  can no longer see what they're commenting on. */
+  pendingCommentRange?: RelativeAnchor;
   /** A drag is hovering this row and would land on this edge. */
   dropEdge: DropEdge | null;
   /** Live, off-consensus peers whose caret is in this block. */
@@ -206,6 +214,10 @@ function BlockRowInner({
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
   const rowRef = useRef<HTMLDivElement | null>(null);
   const localCaretRef = useRef<number | null>(null);
+  // true from mousedown in the textarea until the pointer releases: the guide
+  // menu appears when the drag comes OFF, not on every mid-drag selection
+  // change (which would flicker a menu under the moving pointer).
+  const pointerSelecting = useRef(false);
   // focus mirrored into a ref so the draft-sync effect below reads the live
   // value without re-running on focus flips.
   const focusedRef = useRef(false);
@@ -266,11 +278,36 @@ function BlockRowInner({
     }
   };
   const visibleMarks = rebaseMarks(block.text, draft, block.marks);
-  const commentRanges = threads
+  // each unresolved anchored thread, with its range in BOTH coordinate spaces:
+  // `live` (rebased against the draft) locates it under the caret; `anchor`
+  // (committed text) is what the store's threads are keyed by, so a click
+  // opens exactly that range's discussion.
+  const anchoredThreads = threads
     .filter(({ thread }) => !thread.resolved && thread.anchor)
-    .map(({ thread }) => rebaseRange(block.text, draft, thread.anchor as RelativeAnchor))
-    .filter((range) => range.start < range.end);
+    .map(({ thread }) => ({
+      anchor: thread.anchor as RelativeAnchor,
+      live: rebaseRange(block.text, draft, thread.anchor as RelativeAnchor),
+    }))
+    .filter(({ live }) => live.start < live.end);
+  // a fresh composer's range paints like a thread's — the anchor must not
+  // vanish the moment the guide menu closes. It only fills the gap until the
+  // thread exists: once one covers the same range, the thread's own paint wins.
+  const pendingLive =
+    pendingCommentRange &&
+    !anchoredThreads.some(
+      ({ anchor }) =>
+        anchor.start === pendingCommentRange.start && anchor.end === pendingCommentRange.end,
+    )
+      ? rebaseRange(block.text, draft, pendingCommentRange)
+      : null;
+  const commentRanges = [
+    ...anchoredThreads.map(({ live }) => live),
+    ...(pendingLive && pendingLive.start < pendingLive.end ? [pendingLive] : []),
+  ];
   const threadCount = threads.length;
+  // the margin badge counts OPEN discussions; a block whose threads are all
+  // resolved is done talking and gets the quiet hover affordance back.
+  const openThreads = threads.filter(({ thread }) => !thread.resolved).length;
 
   // the latest commit closure lives in a ref so the boundary timer neither
   // resets when the store re-renders (handlers is rebuilt per store change)
@@ -324,6 +361,19 @@ function BlockRowInner({
   const publishCursor = (el: HTMLTextAreaElement) =>
     onCursor(block.id, el.selectionStart, el.selectionEnd);
 
+  // ONE rule for turning the textarea's live selection into menu state — the
+  // release handler and onSelect must never disagree about it.
+  const snapshotSelection = (el: HTMLTextAreaElement) => {
+    if (el.selectionStart === el.selectionEnd) {
+      setSelection(null);
+      return;
+    }
+    setSelection({
+      anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
+      range: { start: el.selectionStart, end: el.selectionEnd },
+    });
+  };
+
   // A pasted DOCUMENT is blocks, not one wall of literal newlines. A single
   // line is left to the browser (it is just text at the caret).
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -339,7 +389,28 @@ function BlockRowInner({
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     const el = event.currentTarget;
 
+    // a keypress means the pointer interaction is over — if a mouseup was
+    // swallowed (released off-window, native text drag), unstick the flag or
+    // keyboard selections never raise the menu again.
+    pointerSelecting.current = false;
+
     if (event.key === "Escape" && selection) {
+      // this Escape spends itself on the guide menu — a docked comment card
+      // listening on document must not close from the same press.
+      event.stopPropagation();
+      setSelection(null);
+      return;
+    }
+
+    // ⌘/ (Ctrl+/ elsewhere) comments on the live selection — the same door the
+    // guide menu's Comment row opens. Commit the draft first (onMark's rule):
+    // the range is in draft coordinates, and everything downstream — the
+    // composer quote, the pending highlight, the submitted anchor — reads it
+    // against committed text.
+    if (selection && (event.metaKey || event.ctrlKey) && event.key === "/") {
+      event.preventDefault();
+      maybeCommit();
+      handlers.openComments(block.id, selection.anchor, selection.range);
       setSelection(null);
       return;
     }
@@ -470,25 +541,40 @@ function BlockRowInner({
         }}
         onPaste={onPaste}
         onSelect={(event) => {
-          const el = event.currentTarget;
-          publishCursor(el);
-          if (el.selectionStart === el.selectionEnd) {
-            setSelection(null);
-            return;
-          }
-          setSelection({
-            anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
-            range: { start: el.selectionStart, end: el.selectionEnd },
-          });
+          publishCursor(event.currentTarget);
+          if (pointerSelecting.current) return; // menu waits for the release
+          snapshotSelection(event.currentTarget);
+        }}
+        onMouseDown={() => {
+          pointerSelecting.current = true;
+          // one-shot: the release may land anywhere (drag off the block, off
+          // the window) — the document sees it even when the textarea doesn't.
+          document.addEventListener(
+            "mouseup",
+            () => {
+              pointerSelecting.current = false;
+              if (areaRef.current) snapshotSelection(areaRef.current);
+            },
+            { once: true },
+          );
         }}
         onFocus={(event) => {
           focusedRef.current = true;
           setFocused(true);
           publishCursor(event.currentTarget);
         }}
-        onBlur={() => {
+        onBlur={(event) => {
           focusedRef.current = false;
           setFocused(false);
+          // focus moved elsewhere: the guide menu must not linger over a
+          // selection the user has abandoned — EXCEPT when focus moved INTO
+          // the menu itself (Tab), or a keyboard user could never reach it.
+          if (
+            !(event.relatedTarget instanceof Element) ||
+            !event.relatedTarget.closest("[data-selection-toolbar]")
+          ) {
+            setSelection(null);
+          }
           onCursor(null, 0, 0);
           maybeCommit();
         }}
@@ -525,11 +611,14 @@ function BlockRowInner({
         onClick={(event) => {
           const el = event.currentTarget;
           if (el.selectionStart !== el.selectionEnd) return;
-          if (!commentRanges.some(
-            (range) => range.start <= el.selectionStart && range.end > el.selectionStart,
-          )) return;
+          // narrowest highlighted range under the caret wins: nested ranges
+          // mean nested discussions, and the click aims at the specific one.
+          const hit = anchoredThreads
+            .filter(({ live }) => live.start <= el.selectionStart && live.end > el.selectionStart)
+            .sort((a, b) => (a.live.end - a.live.start) - (b.live.end - b.live.start))[0];
+          if (!hit) return;
           const rect = el.getBoundingClientRect();
-          handlers.openComments(block.id, { x: rect.right, y: rect.top });
+          handlers.openComments(block.id, { x: rect.right, y: rect.top }, hit.anchor);
         }}
       />
     </div>
@@ -625,7 +714,7 @@ function BlockRowInner({
             aria-label={`Comment on block ${blockNumber}`}
             title={
               threadCount > 0
-                ? `${threadCount} discussion${threadCount === 1 ? "" : "s"}`
+                ? `${openThreads} open of ${threadCount} discussion${threadCount === 1 ? "" : "s"}`
                 : "Comment"
             }
             onClick={(event) => {
@@ -643,13 +732,15 @@ function BlockRowInner({
               height: 28,
               padding: "0 7px",
               borderRadius: 7,
-              background: threadCount > 0 ? color.hover : "transparent",
-              color: threadCount > 0 ? accentVar : color.muted2,
-              font: `650 11px ${font.mono}`,
+              // open discussions read at full strength; a block whose threads
+              // are all resolved keeps a QUIET grey badge (the reference's
+              // closed state) so the history stays discoverable.
+              color: commentOpen ? accentVar : openThreads > 0 ? color.muted3 : color.muted2,
+              font: `650 11.5px ${font.mono}`,
             }}
           >
             <Icon name="chat" size={16} strokeWidth={1.9} />
-            {threadCount > 0 ? threadCount : null}
+            {openThreads > 0 ? openThreads : threadCount > 0 ? threadCount : null}
           </button>
         ) : null}
       </div>
@@ -657,6 +748,7 @@ function BlockRowInner({
       {selection ? (
         <SelectionToolbar
           blockId={block.id}
+          blockKind={block.kind}
           marks={visibleMarks}
           range={selection.range}
           anchor={selection.anchor}
@@ -664,8 +756,16 @@ function BlockRowInner({
             maybeCommit();
             handlers.setMark(block.id, selection.range, kind, active);
           }}
-          onComment={(anchor) => {
-            handlers.openComments(block.id, anchor, selection.range);
+          onTurnInto={(kind) => {
+            maybeCommit();
+            handlers.setKind(block.id, kind);
+          }}
+          onComment={() => {
+            // commit first (onMark's rule): the quote, the pending highlight
+            // and the submitted anchor all read this range against committed
+            // text, and the range is in draft coordinates.
+            maybeCommit();
+            handlers.openComments(block.id, selection.anchor, selection.range);
             setSelection(null);
           }}
           onDismiss={() => setSelection(null)}
@@ -733,6 +833,9 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.expanded === b.expanded &&
     a.op === b.op &&
     a.threads === b.threads &&
+    a.commentOpen === b.commentOpen &&
+    a.pendingCommentRange?.start === b.pendingCommentRange?.start &&
+    a.pendingCommentRange?.end === b.pendingCommentRange?.end &&
     a.dropEdge === b.dropEdge &&
     a.presence === b.presence &&
     a.onCursor === b.onCursor &&

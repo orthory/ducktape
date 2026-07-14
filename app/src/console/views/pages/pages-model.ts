@@ -4,7 +4,13 @@
 // shortcut detection, and the {parent, after} targets for indent/outdent and
 // sibling moves — the exact shapes MoveBlock takes on the wire.
 
-import type { BlockKind, PageBlock, SpanMark } from "../../../domain/pages-client";
+import type {
+  BlockKind,
+  PageBlock,
+  RelativeAnchor,
+  SpanMark,
+  ThreadView,
+} from "../../../domain/pages-client";
 
 /** A pause this long while typing is one edit boundary — one consensus op.
  *  Shared by the block rows and the title input; exported for the tests that
@@ -329,3 +335,21 @@ export const emptyEnterExits = (kind: BlockKind): boolean =>
   kind === "code" ||
   kind === "callout" ||
   kind === "toggle";
+
+/** Threads whose anchored range overlaps `range` — the card opened from a
+ *  highlight scopes to that range's discussions, not the whole block. Without
+ *  a range (the block affordance / page header) every thread shows, including
+ *  unanchored block-level ones. */
+export const threadsForRange = (
+  threads: ThreadView[],
+  range?: RelativeAnchor,
+): ThreadView[] => {
+  if (!range) return threads;
+  return threads.filter(({ thread }) => {
+    const anchor = thread.anchor;
+    if (!anchor) return false;
+    return range.start === range.end
+      ? anchor.start <= range.start && anchor.end > range.start
+      : anchor.start < range.end && anchor.end > range.start;
+  });
+};

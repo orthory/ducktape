@@ -23,7 +23,7 @@ import { authorKey } from "../chat/chat-helpers";
 import { Avatar } from "../chat/MessageItem";
 import { CommentText } from "../chat/rich-text";
 import { useMentionMenu } from "../chat/use-mention-menu";
-import { color, font, radius } from "../../theme/tokens";
+import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const EMPTY_OPS: OpLedger = {};
 
@@ -51,6 +51,29 @@ const commentTime = (stamp: number): string => {
 export interface ComposerTarget {
   target: string;
   label: string;
+}
+
+/** The amber "commented text" echo — one treatment, used by both the live
+ *  thread card and the new-thread composer. */
+function AnchorQuote({ margin, children }: { margin: string; children: string }) {
+  return (
+    <div
+      aria-label="Commented text"
+      style={{
+        margin,
+        padding: "6px 9px",
+        borderLeft: `2px solid ${color.amber}`,
+        borderRadius: radius.sm,
+        background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
+        color: color.muted3,
+        font: `500 11.5px/1.4 ${font.sans}`,
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+      }}
+    >
+      {children}
+    </div>
+  );
 }
 
 export function DiscussionParticipants({
@@ -116,10 +139,14 @@ export function DiscussionParticipants({
  *  submits, Shift+Enter breaks a line (comments render pre-wrap). */
 export function NewThreadComposer({
   composer,
+  quote,
   onSubmit,
   onCancel,
 }: {
   composer: ComposerTarget;
+  /** The selected text this thread will anchor to — echoed above the box so
+   *  the writer still sees what they're commenting on. */
+  quote?: string;
   onSubmit: (target: string, text: string) => void;
   onCancel: () => void;
 }) {
@@ -143,6 +170,7 @@ export function NewThreadComposer({
       <div style={{ font: `600 11.5px ${font.sans}`, color: color.ink, marginBottom: 6 }}>
         New comment on {composer.label}
       </div>
+      {quote ? <AnchorQuote margin="0 0 8px">{quote}</AnchorQuote> : null}
       <textarea
         ref={ref}
         aria-label="New comment text"
@@ -214,11 +242,11 @@ function CommentRow({
   const own = isSelf && !threadPending;
   return (
     <div style={{ marginBottom: 14 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <Avatar author={comment.author} name={name} size={20} />
+      <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
+        <Avatar author={comment.author} name={name} size={24} />
         <span
           style={{
-            font: `600 11.5px ${font.sans}`,
+            font: `600 13px ${font.sans}`,
             color: color.ink,
             minWidth: 0,
             overflow: "hidden",
@@ -228,7 +256,7 @@ function CommentRow({
         >
           {name}
         </span>
-        <span style={{ font: `400 10px ${font.mono}`, color: color.muted2, flexShrink: 0 }}>
+        <span style={{ font: `400 10.5px ${font.mono}`, color: color.muted2, flexShrink: 0 }}>
           {commentTime(comment.created_at)}
         </span>
         {comment.edited_at !== null ? (
@@ -262,7 +290,7 @@ function CommentRow({
         ) : null}
       </div>
       {editing ? (
-        <div style={{ marginTop: 4, marginLeft: 27 }}>
+        <div style={{ marginTop: 4, marginLeft: 33 }}>
           <textarea
             ref={editRef}
             aria-label="Edit comment text"
@@ -304,10 +332,10 @@ function CommentRow({
       ) : (
         <div
           style={{
-            marginTop: 2,
-            marginLeft: 27,
-            font: `400 12.5px/1.5 ${font.sans}`,
-            color: color.ink,
+            marginTop: 3,
+            marginLeft: 33,
+            font: `400 13.5px/1.5 ${font.sans}`,
+            color: color.inkSoft,
             whiteSpace: "pre-wrap",
             overflowWrap: "anywhere",
           }}
@@ -395,24 +423,7 @@ export function ThreadCard({
         </div>
       ) : null}
 
-      {anchorText ? (
-        <div
-          aria-label="Commented text"
-          style={{
-            margin: "12px 16px 0",
-            padding: "6px 9px",
-            borderLeft: `2px solid ${color.amber}`,
-            borderRadius: radius.sm,
-            background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
-            color: color.muted3,
-            font: `500 11.5px/1.4 ${font.sans}`,
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-          }}
-        >
-          {anchorText}
-        </div>
-      ) : null}
+      {anchorText ? <AnchorQuote margin="12px 16px 0">{anchorText}</AnchorQuote> : null}
 
       <div style={{ padding: "14px 16px 3px" }}>
         {comments.map((c) => (
@@ -467,6 +478,21 @@ export function ThreadCard({
         >
           <Icon name={thread.resolved ? "refresh" : "check"} size={13} strokeWidth={1.9} />
         </button>
+        <button
+          type="button"
+          title="Send reply"
+          aria-label="Send reply"
+          aria-disabled={!reply.trim()}
+          onClick={submitReply}
+          style={{
+            ...iconBtn,
+            border: "none",
+            background: reply.trim() ? accentVar : color.borderSoft,
+            color: reply.trim() ? color.onDark : color.muted2,
+          }}
+        >
+          <Icon name="arrowUp" size={13} strokeWidth={2.2} />
+        </button>
       </div>
     </div>
   );
@@ -486,8 +512,8 @@ const composerStyle = {
   border: `1px solid ${color.borderStrong}`,
   borderRadius: radius.sm,
   background: color.paper,
-  padding: "6px 9px",
-  font: `400 12px ${font.sans}`,
+  padding: "8px 10px",
+  font: `400 13px/1.5 ${font.sans}`,
   color: color.ink,
   outline: "none",
   resize: "none" as const,
