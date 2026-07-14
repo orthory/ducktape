@@ -569,12 +569,12 @@ pub(crate) async fn git_receive_pack(
 }
 
 /// POST /forge/{repo}/git-upload-pack — serve a fetch/clone. parse the pkt-line
-/// negotiation (`want <oid>` lines, capabilities on the FIRST; `have`s receive
-/// NAK until `done` — the MVP serves a full closure), open
-/// `<forge_repo>/{repo}` READ-ONLY, build a packfile of the wanted oids' closure,
-/// and, after `done`, reply `NAK` then the pack muxed on side-band-64k band 1.
-/// incremental (`have`-aware) fetch is future work: a full pack is always
-/// correct, just larger, and `git pull` still works (it refetches).
+/// negotiation (`want <oid>` lines, capabilities on the FIRST; flush-ended
+/// `have` rounds receive plain NAK so the client keeps batching), open
+/// `<forge_repo>/{repo}` READ-ONLY, and after `done` answer with the pack on
+/// side-band-64k band 1: a have-bounded delta behind `ACK <common>` when the
+/// repo knows any of the client's haves, or the full closure behind NAK when
+/// it knows none (see [`build_upload_pack`]).
 pub(crate) async fn git_upload_pack(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
