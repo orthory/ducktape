@@ -86,12 +86,12 @@ const shortOutputRef = (ref: string): string => {
 };
 
 function RunOutputPane({
-  runId,
+  runLabel,
   dispatchId,
   panelId,
   terminal = false,
 }: {
-  runId: string;
+  runLabel: string;
   dispatchId: string;
   panelId: string;
   terminal?: boolean;
@@ -155,7 +155,7 @@ function RunOutputPane({
       id={panelId}
       ref={pane}
       role="log"
-      aria-label={`Execution log for run ${runId}`}
+      aria-label={`Execution log for run ${runLabel}`}
       aria-live="polite"
       tabIndex={0}
       style={{
@@ -338,6 +338,7 @@ function RunRow({
   const label = run.job_id
     ? `job ${run.job_id}`
     : `${channelLabel(channels, run.channel_id)} @${run.anchor_seq}`;
+  const runLabel = `${agentName} — ${label}`.replace(/\p{Cc}+/gu, " ").trim();
   return (
     <div
       style={{
@@ -396,7 +397,7 @@ function RunRow({
             <button
               type="button"
               onClick={() => onReassign(run.run_id, lease.attempt)}
-              aria-label={`Force reassign run ${run.run_id}`}
+              aria-label={`Force reassign run ${runLabel}`}
               style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28 }}
             >
               Force reassign
@@ -405,7 +406,7 @@ function RunRow({
           <button
             type="button"
             onClick={() => onCancel(run.run_id)}
-            aria-label={`Cancel run ${run.run_id}`}
+            aria-label={`Cancel run ${runLabel}`}
             style={{
               ...secondaryButton,
               marginLeft: canReassign ? 0 : "auto",
@@ -430,7 +431,7 @@ function RunRow({
               type="button"
               aria-expanded={expanded}
               aria-controls={logPanelId}
-              aria-label={`${expanded ? "Hide" : "Show"} live log for run ${run.run_id}`}
+              aria-label={`${expanded ? "Hide" : "Show"} live log for run ${runLabel}`}
               onClick={() => setExpanded((v) => !v)}
               style={{
                 ...secondaryButton,
@@ -461,7 +462,7 @@ function RunRow({
           </div>
           {expanded && (
             <RunOutputPane
-              runId={run.run_id}
+              runLabel={runLabel}
               dispatchId={run.dispatch_id}
               panelId={logPanelId}
             />
@@ -486,9 +487,11 @@ function HistoryRow({
   const { actions } = useDucktape();
   const [expanded, setExpanded] = useState(false);
   const delivered = rec.outcome === "delivered";
+  const agentName = agentLabel(agents, rec.agent_id);
   const anchor = rec.channel_id
     ? `${channelLabel(channels, rec.channel_id)} @${rec.anchor_seq}`
     : "job";
+  const runLabel = `${agentName} — ${anchor}`.replace(/\p{Cc}+/gu, " ").trim();
   const nodeName =
     rec.executing_node !== "unknown"
       ? (displayNameForKey(rec.executing_node, authorNames) ?? shortKey(rec.executing_node))
@@ -527,7 +530,7 @@ function HistoryRow({
           color: color.dark,
         }}
       >
-        {agentLabel(agents, rec.agent_id)}
+        {agentName}
       </span>
       <StatusPill
         label={delivered ? "DELIVERED" : "FAILED"}
@@ -576,7 +579,7 @@ function HistoryRow({
         type="button"
         aria-expanded={expanded}
         aria-controls={logPanelId}
-        aria-label={`${expanded ? "Hide" : "Show"} execution log for run ${rec.run_id}`}
+        aria-label={`${expanded ? "Hide" : "Show"} execution log for run ${runLabel}`}
         onClick={() => setExpanded((value) => !value)}
         style={{
           ...secondaryButton,
@@ -597,7 +600,7 @@ function HistoryRow({
       )}
       {expanded && (
         <RunOutputPane
-          runId={rec.run_id}
+          runLabel={runLabel}
           dispatchId={dispatchId}
           panelId={logPanelId}
           terminal

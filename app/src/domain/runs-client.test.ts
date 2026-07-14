@@ -24,8 +24,8 @@ const stubTransport = (reply?: unknown) =>
 
 describe("runs msgs", () => {
   it("derives the host output-ring key from the stable run id", () => {
-    expect(dispatchIdForRun("forge:ducktape:56/7/summarizer")).toBe(
-      "e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc",
+    expect(dispatchIdForRun("chat\x1fforge:ducktape:56\x1f7\x1fsummarizer")).toBe(
+      "ef0d635e287bb66490c26824198278cf8011f5679de48b0faeaf388843e9e5df",
     );
   });
 

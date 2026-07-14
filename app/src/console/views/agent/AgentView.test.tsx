@@ -641,11 +641,15 @@ describe("AgentView", () => {
     openTab(/activity/i);
 
     fireEvent.click(
-      screen.getByRole("button", { name: /force reassign run general\/42\/summarizer/i }),
+      screen.getByRole("button", {
+        name: /force reassign run summary agent.*general @42/i,
+      }),
     );
     expect(spies.reassignRun).toHaveBeenCalledWith("general/42/summarizer", 0);
 
-    fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /cancel run summary agent.*general @42/i }),
+    );
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
 
     fireEvent.click(screen.getByRole("switch", { name: /jobs worker/i }));
@@ -842,7 +846,7 @@ describe("AgentView", () => {
     openTab(/activity/i);
     fireEvent.click(
       await screen.findByRole("button", {
-        name: /show execution log for run forge:ducktape:56\/7\/summarizer/i,
+        name: /show execution log for run summary agent.*forge:ducktape:56 @7/i,
       }),
     );
 
@@ -853,9 +857,10 @@ describe("AgentView", () => {
     expect(within(log).queryByText("Waiting for retained output…")).not.toBeInTheDocument();
   });
 
-  it("keyboard-opens a terminal run log and catches up retained output", async () => {
+  it("keyboard-opens a production-format terminal log and catches up retained output", async () => {
+    const runId = "chat\x1fforge:ducktape:56\x1f7\x1fsummarizer";
     const record: RunRecord = {
-      run_id: "forge:ducktape:56/7/summarizer",
+      run_id: runId,
       agent_id: "summarizer",
       channel_id: "forge:ducktape:56",
       anchor_seq: 7,
@@ -881,20 +886,22 @@ describe("AgentView", () => {
 
     openTab(/activity/i);
     const toggle = await screen.findByRole("button", {
-      name: /show execution log for run forge:ducktape:56\/7\/summarizer/i,
+      name: /show execution log for run summary agent.*forge:ducktape:56 @7/i,
     });
+    expect(toggle.getAttribute("aria-label")).not.toContain("\x1f");
     toggle.focus();
     expect(toggle).toHaveFocus();
     fireEvent.click(toggle);
 
     const log = screen.getByRole("log", {
-      name: /execution log for run forge:ducktape:56\/7\/summarizer/i,
+      name: /execution log for run summary agent.*forge:ducktape:56 @7/i,
     });
+    expect(log.getAttribute("aria-label")).not.toContain("\x1f");
     expect(log).toHaveFocus();
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(toggle).toHaveAttribute("aria-controls", log.id);
     expect(subscribe).toHaveBeenCalledWith(
-      ["run-output:e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc"],
+      ["run-output:ef0d635e287bb66490c26824198278cf8011f5679de48b0faeaf388843e9e5df"],
       expect.any(Object),
     );
 
@@ -902,7 +909,7 @@ describe("AgentView", () => {
       handlers?.onTail?.({
         type: "tail",
         topic:
-          "run-output:e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc",
+          "run-output:ef0d635e287bb66490c26824198278cf8011f5679de48b0faeaf388843e9e5df",
         cursor: "3",
         item: { stream: "stderr", line: "focused test failed" },
       });
@@ -999,19 +1006,19 @@ describe("AgentView", () => {
     openTab(/activity/i);
     // Both runs show under the default "All" filter.
     expect(
-      screen.getByRole("button", { name: /cancel run general\/50\/summarizer/i }),
+      screen.getByRole("button", { name: /cancel run summary agent.*general @50/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }),
+      screen.getByRole("button", { name: /cancel run summary agent.*general @42/i }),
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /requested by you/i }));
     // Only the run I requested remains.
     expect(
-      screen.getByRole("button", { name: /cancel run general\/50\/summarizer/i }),
+      screen.getByRole("button", { name: /cancel run summary agent.*general @50/i }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /cancel run general\/42\/summarizer/i }),
+      screen.queryByRole("button", { name: /cancel run summary agent.*general @42/i }),
     ).not.toBeInTheDocument();
   });
 });
