@@ -303,8 +303,17 @@ describe("ForgeView", () => {
     const listForgeRepos = vi
       .fn()
       .mockResolvedValue([{ name: "ducktape", head: HEAD }]);
+    const statusAt = (root: string) => ({
+      version: "test",
+      appHash: "hash",
+      height: 1,
+      modules: [{ id: "forge", root }],
+    });
 
-    renderForge({ workspace: null, nodeUrl: origin }, { listForgeRepos });
+    const { rerender } = renderForge(
+      { workspace: null, nodeUrl: origin, status: statusAt("root-1") },
+      { listForgeRepos },
+    );
 
     // enumeration is the consensus list_repos query — never the local scanner.
     expect(await screen.findByText("ducktape/ducktape")).toBeInTheDocument();
@@ -329,6 +338,13 @@ describe("ForgeView", () => {
     );
     // the local branch reader stays untouched — the picker rides consensus refs.
     expect(forgeGit.forgeListBranches).not.toHaveBeenCalled();
+
+    // A side-branch push moves only the Forge root. The selected repo and its
+    // integration head stay identical, but the mirror and its reads refresh.
+    rerender({ workspace: null, nodeUrl: origin, status: statusAt("root-2") });
+    await waitFor(() => expect(forgeGit.forgeSyncRemote).toHaveBeenCalledTimes(2));
+    expect(forgeGit.forgeTree).toHaveBeenCalledTimes(2);
+    expect(forgeGit.forgeLog).toHaveBeenCalledTimes(2);
   });
 
   it("consumes a forgeFocus hand-off: selects the repo and opens the item", async () => {

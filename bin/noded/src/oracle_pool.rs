@@ -18,19 +18,6 @@ use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::{NodeCommand, ORACLE_ORIGIN};
 
-fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
-    Arc::new(move |ctx, line| {
-        let Some(run_key) = ctx.run_key.as_deref() else {
-            return;
-        };
-        let stream = match line.stream {
-            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
-            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
-        };
-        registry.append(run_key, stream, line.line);
-    })
-}
-
 /// the daemon's worker set: the dispatch pool (or, in debug builds under
 /// `DUCKTAPE_NODED_ECHO_ORACLE`, the inline echo stand-in).
 ///
@@ -66,7 +53,7 @@ where
     let providers = capability_host::discover(
         ORACLE_ORIGIN,
         agent_dirs,
-        Some(run_output_sink(run_output)),
+        Some(run_output.output_sink()),
         // the embedded daemon stays Direct this phase: it exposes no operator
         // sandbox knobs, so `DispatchPool::new` below keeps the bare (empty
         // capacity) ledger — the sandbox/capacity plane is bin/node only.
@@ -160,8 +147,8 @@ where
             ORACLE_ORIGIN.to_vec(),
             spawn,
             deliver,
-        )
-        .with_provisioner(provisioner),
+            provisioner,
+        ),
     )]
 }
 

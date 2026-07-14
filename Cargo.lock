@@ -1496,6 +1496,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

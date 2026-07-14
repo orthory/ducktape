@@ -175,62 +175,6 @@ pub struct ResourceCaps {
     pub subagent_budget: u32,
 }
 
-impl ResourceCaps {
-    /// The authority an ordinary read-only child may inherit from two grants.
-    ///
-    /// Read authority is the intersection of what both grants can read. Write
-    /// grants imply read for this calculation, but no write, tool, secret,
-    /// page-write, or sub-agent authority survives in the result.
-    pub fn read_only_intersection(&self, other: &Self) -> Self {
-        fn exact_reads(read: &[String], write: &[String]) -> Vec<String> {
-            let mut values = read.iter().chain(write).cloned().collect::<Vec<_>>();
-            values.sort();
-            values.dedup();
-            values
-        }
-
-        fn prefix_intersection(left: &[String], right: &[String]) -> Vec<String> {
-            let mut values = Vec::new();
-            for a in left {
-                for b in right {
-                    if a == b || b.starts_with(&format!("{a}/")) {
-                        values.push(b.clone());
-                    } else if a.starts_with(&format!("{b}/")) {
-                        values.push(a.clone());
-                    }
-                }
-            }
-            values.sort();
-            values.dedup();
-            let mut minimal: Vec<String> = Vec::new();
-            for value in values {
-                if !minimal
-                    .iter()
-                    .any(|prefix| value.starts_with(&format!("{prefix}/")))
-                {
-                    minimal.push(value);
-                }
-            }
-            minimal
-        }
-
-        let left_forge = exact_reads(&self.forge_read, &self.forge_push);
-        let right_forge = exact_reads(&other.forge_read, &other.forge_push);
-        let forge_read = left_forge
-            .into_iter()
-            .filter(|repo| right_forge.binary_search(repo).is_ok())
-            .collect();
-        let left_duckfs = exact_reads(&self.duckfs_read, &self.duckfs_write);
-        let right_duckfs = exact_reads(&other.duckfs_read, &other.duckfs_write);
-
-        Self {
-            forge_read,
-            duckfs_read: prefix_intersection(&left_duckfs, &right_duckfs),
-            ..Self::default()
-        }
-    }
-}
-
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
@@ -322,14 +266,17 @@ pub enum AgentStatus {
     Paused,
 }
 
-/// An owner-assigned semantic role used for security-sensitive agent
-/// selection. It is distinct from display text, skills, and the executor
-/// capability tag. Omitted legacy records are ordinary agents.
+/// Persisted role discriminant retained for snapshot compatibility. Omitted
+/// legacy records are ordinary agents.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     #[default]
     General,
+    /// Compatibility-only reservation: revision-2 native Agent snapshots and
+    /// revision-3 Wasm snapshots may already encode discriminant 1. Removing
+    /// or renumbering it would make committed state undecodable; it does not
+    /// select a special execution or knowledge-loading path.
     ProjectLibrarian,
 }
 
@@ -565,10 +512,6 @@ pub enum AgentMsg {
     PauseAgent { agent_id: String },
     /// owner-gated: resume engagement.
     ResumeAgent { agent_id: String },
-    /// owner-gated semantic role assignment. Kept as a separate additive op so
-    /// existing registration/update wire constructors remain source- and
-    /// JSON-compatible.
-    SetAgentRole { agent_id: String, role: AgentRole },
 }
 
 // ---- the registry hook ----------------------------------------------------------

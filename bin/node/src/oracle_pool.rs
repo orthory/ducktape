@@ -41,7 +41,7 @@ pub(crate) fn build<C>(
     context: &C,
     providers: capability_host::ProviderSet,
     node_key: Vec<u8>,
-    provisioner: Option<SharedProvisioner>,
+    provisioner: SharedProvisioner,
     // the announced sandbox capacity — the pool's `ResourceLedger`. EMPTY for
     // a direct-spawn node (demandless jobs only), the probed host totals for a
     // Podman one. SAME map the capability announce carries, so the ledger and
@@ -85,24 +85,15 @@ where
         })
     });
 
-    let mut pool = DispatchPool::with_limit(
+    let pool = DispatchPool::with_limit(
         Arc::new(providers),
         node_key,
         spawn,
         deliver,
         max_concurrent_runs_from_env(),
         capacity,
+        provisioner,
     );
-    // portable (v3) runs materialize a per-run duckfs workspace through this,
-    // over the SAME NodeHandle actor lane the /v1/fs/workspaces RPC uses. LIVE:
-    // the composer emits v3 for every run (files module wired unconditionally),
-    // so this seam is on the hot path. `None` keeps the accept-only degrade
-    // (raw-text delivery, no workspace) — main.rs currently always passes
-    // `Some`, so the branch is defensive plumbing for embedders, not a live
-    // production mode.
-    if let Some(provisioner) = provisioner {
-        pool = pool.with_provisioner(provisioner);
-    }
     let control = pool.attempt_control();
     (Box::new(pool), control, rx)
 }

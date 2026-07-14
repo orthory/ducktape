@@ -109,9 +109,7 @@ struct WireResultContract {
 }
 
 /// the assembled provider input plus the per-run context and the pinned
-/// workspace plan. the pool acts on `workspace` iff a provisioner is wired;
-/// otherwise the run stays accept-only (dormant), so surfacing the plan here
-/// never activates a mount.
+/// workspace plan. The pool requires a provisioner before executing it.
 #[derive(Debug)]
 pub struct Prepared {
     pub input: String,
@@ -125,10 +123,7 @@ pub struct Prepared {
 /// the saga result (NEVER a silent fallback: the pinned workspace and the
 /// curated skills are the whole point).
 ///
-/// SYNC in spirit — it no longer awaits a blob read (the prompt lane is gone),
-/// but it stays `async` because the pool calls it inside its spawned task and a
-/// signature churn would buy nothing.
-pub async fn prepare(input: &str) -> Result<Prepared, String> {
+pub fn prepare(input: &str) -> Result<Prepared, String> {
     let claimed = match serde_json::from_str::<Value>(input) {
         Ok(Value::Object(map)) if map.contains_key("ducktape_run") => Value::Object(map),
         _ => {
@@ -212,10 +207,7 @@ pub async fn prepare(input: &str) -> Result<Prepared, String> {
 /// consensus-supplied host path like the constant `/workspace` is exactly the
 /// unwritable cwd that turned live runs into `create_dir_all` failures, W1).
 /// portable ACTIVATION — a per-run writable mount and its bindings — happens
-/// in the pool iff a provisioner is wired (the production binaries always wire
-/// one); an embedder without one leaves the returned plan inert and the host's
-/// own scratch/persistent workspace policy owns the cwd (see
-/// `capability-host::workdir_for`).
+/// in the pool through its required execution-time provisioner.
 fn accept_portable_envelope(
     ctx: &mut RunContext,
     consensus_run_id: Option<String>,
@@ -347,8 +339,8 @@ mod tests {
         .to_string()
     }
 
-    #[tokio::test]
-    async fn non_envelope_payloads_are_loud_errors_never_passthrough() {
+    #[test]
+    fn non_envelope_payloads_are_loud_errors_never_passthrough() {
         // FLAG DAY: the legacy flat-string passthrough is gone — anything
         // that is not a marker-carrying JSON object fails the run.
         for legacy in [
@@ -360,7 +352,7 @@ mod tests {
             r#"{"run_id":"r","agent_id":"a"}"#,
             "the ducktape_run marker is discussed here",
         ] {
-            let err = prepare(legacy).await.unwrap_err();
+            let err = prepare(legacy).unwrap_err();
             assert!(
                 err.contains("no ducktape_run envelope marker"),
                 "{legacy:?} must be rejected loudly, got {err:?}"
@@ -368,87 +360,85 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn v2_envelopes_are_rejected() {
+    #[test]
+    fn v2_envelopes_are_rejected() {
         // the second half of the flag day: the v2 tolerance is gone.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["ducktape_run"] = serde_json::json!(2);
-        let err = prepare(&v.to_string()).await.unwrap_err();
+        let err = prepare(&v.to_string()).unwrap_err();
         assert!(err.contains("version 2"), "got {err:?}");
         assert!(err.contains("understands 3"), "got {err:?}");
     }
 
-    #[tokio::test]
-    async fn an_envelope_assembles_instructions_contract_conversation() {
+    #[test]
+    fn an_envelope_assembles_instructions_contract_conversation() {
         let Prepared {
             input,
             ctx,
             workspace,
-        } = prepare(&envelope_json()).await.unwrap();
+        } = prepare(&envelope_json()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
 
-    #[tokio::test]
-    async fn a_retired_prompt_hash_key_can_never_resurrect_the_blob_lane() {
+    #[test]
+    fn a_retired_prompt_hash_key_can_never_resurrect_the_blob_lane() {
         // the prompt blob is RETIRED (flag day). a stale composer's leftover
         // pin must be inert data — tolerated like any unknown field, never
         // resolved, and above all never able to suppress `instructions` (the
         // trap the old worker shipped: a present pin silently dropped them).
         let mut stale: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         stale["prompt_hash"] = serde_json::json!("07".repeat(32));
-        let Prepared { input, .. } = prepare(&stale.to_string()).await.unwrap();
+        let Prepared { input, .. } = prepare(&stale.to_string()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
     }
 
-    #[tokio::test]
-    async fn claimed_but_broken_envelopes_are_loud_errors() {
+    #[test]
+    fn claimed_but_broken_envelopes_are_loud_errors() {
         // an unknown version is a mixed-network signal, never model input.
-        let err = prepare(r#"{"ducktape_run":99}"#).await.unwrap_err();
+        let err = prepare(r#"{"ducktape_run":99}"#).unwrap_err();
         assert!(err.contains("version 99"), "got {err:?}");
 
         // a non-integer marker.
-        let err = prepare(r#"{"ducktape_run":"3"}"#).await.unwrap_err();
+        let err = prepare(r#"{"ducktape_run":"3"}"#).unwrap_err();
         assert!(err.contains("not an integer"), "got {err:?}");
 
         // v3 with required fields missing.
-        let err = prepare(r#"{"ducktape_run":3,"agent_id":"bot"}"#)
-            .await
-            .unwrap_err();
+        let err = prepare(r#"{"ducktape_run":3,"agent_id":"bot"}"#).unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
     }
 
-    #[tokio::test]
-    async fn additive_fields_under_the_same_version_are_tolerated() {
+    #[test]
+    fn additive_fields_under_the_same_version_are_tolerated() {
         // a newer composer may add an OPTIONAL field without a flag day; the
         // worker must not kill in-flight runs over it.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["a_future_field"] = serde_json::json!("x");
-        let Prepared { input, .. } = prepare(&v.to_string()).await.unwrap();
+        let Prepared { input, .. } = prepare(&v.to_string()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
     }
 
-    #[tokio::test]
-    async fn an_in_flight_envelope_without_a_display_name_uses_the_agent_id() {
+    #[test]
+    fn an_in_flight_envelope_without_a_display_name_uses_the_agent_id() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v.as_object_mut().unwrap().remove("agent_display_name");
-        let Prepared { workspace, .. } = prepare(&v.to_string()).await.unwrap();
+        let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
         assert_eq!(workspace.agent_display_name, "bot");
     }
 
-    #[tokio::test]
-    async fn job_envelopes_carry_no_thread_key() {
+    #[test]
+    fn job_envelopes_carry_no_thread_key() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["thread_key"] = serde_json::Value::Null;
-        let Prepared { ctx, .. } = prepare(&v.to_string()).await.unwrap();
+        let Prepared { ctx, .. } = prepare(&v.to_string()).unwrap();
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key, None);
     }
 
-    #[tokio::test]
-    async fn envelopes_are_accepted_and_marked_portable_without_activating_a_mount() {
+    #[test]
+    fn envelopes_are_accepted_and_marked_portable_without_activating_a_mount() {
         // the worker ACCEPTS the envelope and marks the run portable, but it
         // does NOT activate a workspace mount: no consensus-supplied cwd
         // override, no workspace env. the pool activates the plan iff a
@@ -457,7 +447,7 @@ mod tests {
             input,
             ctx,
             workspace,
-        } = prepare(&envelope_json()).await.unwrap();
+        } = prepare(&envelope_json()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
@@ -503,8 +493,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_load_mode_rides_each_skill_into_the_plan_in_curation_order() {
+    #[test]
+    fn the_load_mode_rides_each_skill_into_the_plan_in_curation_order() {
         // the soul's whole shape depends on these two bits: WHICH skills inline
         // (the persona) and in WHAT order (curation). an unset mode is
         // on-demand — additive, and the safe default (indexed, not inlined).
@@ -514,7 +504,7 @@ mod tests {
             {"name":"release","source_prefix":"/shared/skills/release","always":false},
             {"name":"legacy","source_prefix":"/shared/skills/legacy"},
         ]);
-        let Prepared { workspace, .. } = prepare(&v.to_string()).await.unwrap();
+        let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
         let modes: Vec<(&str, bool)> = workspace
             .skills
             .iter()
@@ -533,29 +523,29 @@ mod tests {
     /// library exists. an envelope that never stated it defaults to DENIED —
     /// advertising a door the tool plane would refuse is the one outcome this
     /// field exists to prevent.
-    #[tokio::test]
-    async fn the_library_read_grant_rides_the_envelope_into_the_plan() {
+    #[test]
+    fn the_library_read_grant_rides_the_envelope_into_the_plan() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["library_readable"] = serde_json::json!(true);
-        let Prepared { workspace, .. } = prepare(&v.to_string()).await.unwrap();
+        let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
         assert!(workspace.library_readable);
 
         // the composer's own default (an agent with no grant) and a pre-field
         // envelope are the same wire: no key.
-        let Prepared { workspace, .. } = prepare(&envelope_json()).await.unwrap();
+        let Prepared { workspace, .. } = prepare(&envelope_json()).unwrap();
         assert!(
             !workspace.library_readable,
             "an unstated grant is no grant: the run is never pointed at the library"
         );
     }
 
-    #[tokio::test]
-    async fn the_plan_carries_the_consensus_run_id_and_tolerates_its_absence() {
+    #[test]
+    fn the_plan_carries_the_consensus_run_id_and_tolerates_its_absence() {
         // the id `runs` resolves the run by. it MUST survive the decode: the
         // pool has no other way to name the run — its own spec id is
         // `{saga_id}:{attempt}`, which resolves nothing in consensus — so a
         // dropped id here silently kills every mid-run write the run makes.
-        let Prepared { workspace, .. } = prepare(&envelope_json()).await.unwrap();
+        let Prepared { workspace, .. } = prepare(&envelope_json()).unwrap();
         assert_eq!(
             workspace.consensus_run_id.as_deref(),
             Some(CONSENSUS_RUN_ID),
@@ -569,19 +559,19 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("run_id");
         let Prepared {
             input, workspace, ..
-        } = prepare(&legacy.to_string()).await.unwrap();
+        } = prepare(&legacy.to_string()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(workspace.consensus_run_id, None);
     }
 
-    #[tokio::test]
-    async fn an_old_shape_envelope_that_still_carries_mount_path_decodes_fine() {
+    #[test]
+    fn an_old_shape_envelope_that_still_carries_mount_path_decodes_fine() {
         // the composer no longer emits mount_path (D7), but an ADDITIVE field
         // inside the tagged workspace object must never reject an in-flight
         // envelope — the extra field is tolerated (decoded and ignored).
         let mut old_shape: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         old_shape["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
-        let Prepared { ctx, workspace, .. } = prepare(&old_shape.to_string()).await.unwrap();
+        let Prepared { ctx, workspace, .. } = prepare(&old_shape.to_string()).unwrap();
         assert!(
             ctx.portable,
             "an old-shape envelope is still accepted + portable"
@@ -597,8 +587,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_forge_envelope_is_accepted_with_its_pinned_source_and_requested_sink() {
+    #[test]
+    fn a_forge_envelope_is_accepted_with_its_pinned_source_and_requested_sink() {
         // the worker half of the forge lane: the tagged forge source surfaces
         // on the plan, the item context lands in the assembled input
         // (instructions → context → contract → conversation), and the
@@ -608,7 +598,7 @@ mod tests {
             input,
             ctx,
             workspace,
-        } = prepare(&forge_envelope_json()).await.unwrap();
+        } = prepare(&forge_envelope_json()).unwrap();
         assert_eq!(
             input,
             "GENERIC\n\nForge item context — you are working this item as a session.\n\
@@ -640,15 +630,15 @@ mod tests {
         assert!(workspace.skills.is_empty());
     }
 
-    #[tokio::test]
-    async fn context_reaches_the_provider_input_between_instructions_and_contract() {
+    #[test]
+    fn context_reaches_the_provider_input_between_instructions_and_contract() {
         // the coordinator-decided reading order (M1 follow-up to contract §1):
         // system instructions → item context → output contract → conversation.
         // the section is byte-exact from the envelope field, joined with the
         // SAME "\n\n" delimiter the existing sections use.
         let mut with_context: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         with_context["context"] = serde_json::json!("Forge item context — repo: app");
-        let Prepared { input, .. } = prepare(&with_context.to_string()).await.unwrap();
+        let Prepared { input, .. } = prepare(&with_context.to_string()).unwrap();
         assert_eq!(
             input,
             "GENERIC\n\nForge item context — repo: app\n\nCONTRACT\n\nCONVERSATION"
@@ -656,25 +646,25 @@ mod tests {
 
         // the None case stays byte-identical — no stray delimiter: a
         // context-less envelope assembles exactly the pre-context bytes.
-        let Prepared { input, .. } = prepare(&envelope_json()).await.unwrap();
+        let Prepared { input, .. } = prepare(&envelope_json()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
     }
 
-    #[tokio::test]
-    async fn the_retired_runtime_section_is_no_longer_assembled_into_the_input() {
+    #[test]
+    fn the_retired_runtime_section_is_no_longer_assembled_into_the_input() {
         // the runtime section (tool plane + skill listing) MOVED into the
         // assembled context document. a stale composer that still emits the key
         // must not have it spliced back into the prompt — one assembly, one
         // place, or the two drift.
         let mut with_runtime: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         with_runtime["runtime"] = serde_json::json!("TOOL PLANE");
-        let Prepared { input, .. } = prepare(&with_runtime.to_string()).await.unwrap();
+        let Prepared { input, .. } = prepare(&with_runtime.to_string()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert!(!input.contains("TOOL PLANE"));
     }
 
-    #[tokio::test]
-    async fn the_flat_pre_forge_workspace_shape_is_rejected_loudly() {
+    #[test]
+    fn the_flat_pre_forge_workspace_shape_is_rejected_loudly() {
         // the workspace block is a tagged enum (`kind` = duckfs | forge). the
         // old flat duckfs shape carries no `kind` — a mixed-binary signal that
         // must fail loudly, never decode.
@@ -683,25 +673,25 @@ mod tests {
             "source_prefix": "/shared/agent-workspaces/bot",
             "source_snapshot": "aa".repeat(32)
         });
-        let err = prepare(&flat.to_string()).await.unwrap_err();
+        let err = prepare(&flat.to_string()).unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
         assert!(err.contains("kind"), "names the missing tag: {err:?}");
     }
 
-    #[tokio::test]
-    async fn an_envelope_that_omits_or_breaks_the_portable_shape_fails_loudly() {
+    #[test]
+    fn an_envelope_that_omits_or_breaks_the_portable_shape_fails_loudly() {
         // accept still means VALIDATE: a missing/empty/wrong portable block is
         // a mixed-network signal, never silently downgraded.
         let base: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
 
         let mut missing = base.clone();
         missing["workspace"] = serde_json::Value::Null;
-        let err = prepare(&missing.to_string()).await.unwrap_err();
+        let err = prepare(&missing.to_string()).unwrap_err();
         assert!(err.contains("missing workspace"), "got {err:?}");
 
         let mut empty_prefix = base.clone();
         empty_prefix["workspace"]["source_prefix"] = serde_json::json!("");
-        let err = prepare(&empty_prefix.to_string()).await.unwrap_err();
+        let err = prepare(&empty_prefix.to_string()).unwrap_err();
         assert!(
             err.contains("source_prefix must not be empty"),
             "got {err:?}"
@@ -709,18 +699,18 @@ mod tests {
 
         let mut no_contract = base.clone();
         no_contract["result_contract"] = serde_json::Value::Null;
-        let err = prepare(&no_contract.to_string()).await.unwrap_err();
+        let err = prepare(&no_contract.to_string()).unwrap_err();
         assert!(err.contains("missing result_contract"), "got {err:?}");
 
         let mut bad_result = base.clone();
         bad_result["result_contract"]["ducktape_runner_result"] = serde_json::json!(99);
-        let err = prepare(&bad_result.to_string()).await.unwrap_err();
+        let err = prepare(&bad_result.to_string()).unwrap_err();
         assert!(err.contains("runner result version 99"), "got {err:?}");
 
         // a present skill entry with no source is a mixed-network signal too.
         let mut empty_skill = base.clone();
         empty_skill["skills"][0]["source_prefix"] = serde_json::json!("");
-        let err = prepare(&empty_skill.to_string()).await.unwrap_err();
+        let err = prepare(&empty_skill.to_string()).unwrap_err();
         assert!(
             err.contains("skill entries must carry a name and source_prefix"),
             "got {err:?}"
@@ -731,7 +721,7 @@ mod tests {
         for field in ["repo", "commit", "branch"] {
             let mut empty_field = forge_base.clone();
             empty_field["workspace"][field] = serde_json::json!("");
-            let err = prepare(&empty_field.to_string()).await.unwrap_err();
+            let err = prepare(&empty_field.to_string()).unwrap_err();
             assert!(
                 err.contains(&format!("workspace.{field} must not be empty")),
                 "{field}: got {err:?}"
@@ -743,7 +733,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("commit");
-        let err = prepare(&missing_commit.to_string()).await.unwrap_err();
+        let err = prepare(&missing_commit.to_string()).unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
     }
 }

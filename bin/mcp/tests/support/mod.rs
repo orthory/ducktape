@@ -44,16 +44,22 @@ impl Harness {
     /// stand the node up and register `AGENT_ID` with exactly `allowed_actions`
     /// — the grant every assertion in the calling test is written against.
     pub fn start(allowed_actions: &[&str]) -> Self {
+        Self::start_with_forge_read(allowed_actions, &[])
+    }
+
+    /// Stand the same real node up with an explicitly bounded Forge read cap.
+    pub fn start_with_forge_read(allowed_actions: &[&str], forge_read: &[&str]) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("ducktape-mcp-e2e")
             .tempdir()
             .expect("harness tempdir");
         let port = free_port();
+        let forge_base = dir.path().join("forge");
 
         let (handle, cmd_rx, _events) = NodeHandle::channel();
         let actor = std::thread::Builder::new()
             .name("mcp-e2e-actor".into())
-            .spawn(move || run_actor(cmd_rx))
+            .spawn(move || run_actor(cmd_rx, forge_base))
             .expect("spawn actor");
 
         let server = std::thread::Builder::new()
@@ -79,7 +85,7 @@ impl Harness {
             actor: Some(actor),
         };
         harness.await_ready();
-        harness.register_agent(allowed_actions);
+        harness.register_agent(allowed_actions, forge_read);
         harness
     }
 
@@ -91,7 +97,7 @@ impl Harness {
     /// owner as the external origin, which is what makes `AgentRecord.owner`
     /// `SagaOrigin::External(b"eddy")` — the value the tool plane reads back and
     /// submits its writes as.
-    fn register_agent(&self, allowed_actions: &[&str]) {
+    fn register_agent(&self, allowed_actions: &[&str], forge_read: &[&str]) {
         let mut actions: Vec<&str> = allowed_actions.to_vec();
         // the registry canonicalizes to a sorted, deduped set; submit it that
         // way so the record's bytes are the ones the test expects.
@@ -105,6 +111,7 @@ impl Harness {
                 // no prompt pin: an agent IS its curated skills now, and this
                 // one curates none — the tool plane is what it is here to use.
                 "allowed_actions": actions,
+                "caps": {"forge_read": forge_read},
             }
         });
         let reply = self.submit("agent", payload, OWNER);
@@ -307,7 +314,7 @@ impl Drop for Harness {
 }
 
 /// the actor loop: one block per submit, queries answered inline.
-fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>) {
+fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>, forge_base: std::path::PathBuf) {
     // `runs` is here so a WRITE from the tool server reaches the module that
     // actually gates it. no run is ever dispatched in this harness — driving the
     // full engagement loop needs chat + a deterministic runtime context, and
@@ -321,6 +328,7 @@ fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>) {
         Box::new(tasks::Tasks::new("tasks")),
         Box::new(dispatch::DispatchModule::new("dispatch", "saga")),
         Box::new(tagging::TaggingModule::new("tagging")),
+        Box::new(forge::Forge::init("forge", forge_base).expect("forge module")),
         Box::new(runs::RunsModule::new(
             "runs",
             "chat",

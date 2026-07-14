@@ -196,6 +196,7 @@ export function ForgeView() {
   // one signal a REMOTE client also gets when any forge write lands (the
   // repo-list refresh and the tracker reload below both key on it).
   const forgeRoot = state.status?.modules.find((m) => m.id === "forge")?.root ?? null;
+  const remoteForgeRoot = remote ? forgeRoot : null;
 
   const loadFile = useCallback((filePath: string) => {
     const repo = activeRepoRef.current;
@@ -530,7 +531,7 @@ export function ForgeView() {
     return () => {
       alive = false;
     };
-  }, [desktop, selectedRepo, branch, remote, state.forgeHead, loadFile]);
+  }, [desktop, selectedRepo, branch, remote, state.forgeHead, remoteForgeRoot, loadFile]);
 
   const rows = useMemo(() => {
     const next: TreeRow[] = [];

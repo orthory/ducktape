@@ -20,6 +20,7 @@ test('Fleet config is CEF-only and points at owned hooks', async () => {
   })
   expect(Bun.spawnSync(['bash', '-n', join(root, 'qa/fleet/build-cef.sh')]).exitCode).toBe(0)
   const buildHook = await Bun.file(join(root, 'qa/fleet/build-cef.sh')).text()
+  expect(buildHook).toContain('export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"')
   expect(buildHook).toContain('VITE_TAURI_AGENT=1')
   expect(buildHook).toContain('tauri-agent-artifact/v1')
   expect(buildHook).toContain('Darwin)')

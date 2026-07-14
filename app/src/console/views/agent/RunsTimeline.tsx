@@ -9,8 +9,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
 import type { RunLease } from "../../../domain/dispatch-client";
+import { forgeItemTarget } from "../../../domain/forge-client";
 import { displayNameForKey, shortKey } from "../../../domain/names";
-import { recentRuns } from "../../../domain/runs-client";
+import { dispatchIdForRun, recentRuns } from "../../../domain/runs-client";
 import type { PendingRun, RunRecord } from "../../../domain/runs-client";
 import {
   isRunOutputTailItem,
@@ -20,7 +21,7 @@ import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import type { OpLedger, OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, shadow } from "../../theme/tokens";
+import { color, font } from "../../theme/tokens";
 import { wallClockMillisOf } from "../../../domain/wire";
 import { relTime } from "../forge/ui";
 import {
@@ -84,16 +85,28 @@ const shortOutputRef = (ref: string): string => {
   return ref.length > 16 ? `${ref.slice(0, 16)}…` : ref;
 };
 
-function RunOutputPane({ run }: { run: PendingRun }) {
+function RunOutputPane({
+  runLabel,
+  dispatchId,
+  panelId,
+  terminal = false,
+}: {
+  runLabel: string;
+  dispatchId: string;
+  panelId: string;
+  terminal?: boolean;
+}) {
   const { transport } = useDucktape();
   const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
+  const [unavailable, setUnavailable] = useState(!transport);
   const pane = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setEntries([]);
+    setUnavailable(!transport);
     if (!transport) return;
     let lastCursor = 0;
-    const topic = runOutputTopic(run.dispatch_id);
+    const topic = runOutputTopic(dispatchId);
     return transport.subscribe([topic], {
       onTail: (frame) => {
         if (frame.topic !== topic || !isRunOutputTailItem(frame.item)) return;
@@ -118,8 +131,11 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         };
         setEntries((prev) => appendActivityEntry(prev, line));
       },
+      onRefused: (refusedTopic) => {
+        if (refusedTopic === topic) setUnavailable(true);
+      },
     });
-  }, [transport, run.dispatch_id]);
+  }, [transport, dispatchId]);
 
   const rows = useMemo(() => parseActivityLog(entries), [entries]);
 
@@ -127,12 +143,21 @@ function RunOutputPane({ run }: { run: PendingRun }) {
     if (pane.current) pane.current.scrollTop = pane.current.scrollHeight;
   }, [rows.length]);
 
+  useEffect(() => {
+    pane.current?.focus();
+  }, []);
+
   const rowLabel = (row: ActivityLogRow): string =>
     row.kind === "blank" ? "" : row.kind.toUpperCase();
 
   return (
     <div
+      id={panelId}
       ref={pane}
+      role="log"
+      aria-label={`Execution log for run ${runLabel}`}
+      aria-live="polite"
+      tabIndex={0}
       style={{
         marginTop: 10,
         border: `1px solid ${color.borderSoft}`,
@@ -141,11 +166,16 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         padding: "8px 10px",
         maxHeight: 220,
         overflow: "auto",
+        flexBasis: "100%",
       }}
     >
       {rows.length === 0 ? (
         <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
-          waiting for output…
+          {unavailable
+            ? "Run output unavailable."
+            : terminal
+              ? "No retained output received — older output may have been evicted."
+              : "Waiting for retained output…"}
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -204,60 +234,52 @@ function RunOutputPane({ run }: { run: PendingRun }) {
   );
 }
 
-/** The daemon-lifecycle switch for job-board pickup — its own row on the
+/** The daemon-lifecycle controls for job-board pickup — their own row on the
  *  Activity tab, where background work lives. */
 export function JobsWorkerRow({
-  on,
   op,
   onToggle,
 }: {
-  on: boolean;
   op: OpRecord | undefined;
-  onToggle: () => void;
+  onToggle: (enabled: boolean) => void;
 }) {
+  const pending = op?.phase === "pending";
+  const actionStyle = {
+    ...secondaryButton,
+    cursor: pending ? "default" : "pointer",
+    opacity: pending ? 0.6 : 1,
+  };
+
   return (
     <GroupCard style={{ marginBottom: 16 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>Jobs worker</div>
           <div style={{ marginTop: 2, font: `400 11px ${font.sans}`, color: color.muted2 }}>
-            Let agents pick up background jobs.
+            {pending
+              ? "Waiting for confirmation…"
+              : "Current committed status is not readable on this network."}
           </div>
         </div>
         <FinalizationMark op={op} />
-        <button
-          type="button"
-          role="switch"
-          aria-checked={on}
-          aria-label="Jobs worker"
-          onClick={onToggle}
-          style={{
-            appearance: "none",
-            cursor: "pointer",
-            width: 40,
-            height: 22,
-            flexShrink: 0,
-            padding: 2,
-            borderRadius: 999,
-            border: `1px solid ${on ? color.dark : color.borderStrong}`,
-            background: on ? color.dark : color.chip,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: on ? "flex-end" : "flex-start",
-            transition: "background .12s, border-color .12s",
-          }}
-        >
-          <span
-            aria-hidden="true"
-            style={{
-              width: 16,
-              height: 16,
-              borderRadius: "50%",
-              background: on ? color.onDark : color.muted,
-              boxShadow: shadow.card,
-            }}
-          />
-        </button>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => onToggle(true)}
+            style={actionStyle}
+          >
+            Enable worker
+          </button>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => onToggle(false)}
+            style={actionStyle}
+          >
+            Disable worker
+          </button>
+        </div>
       </div>
     </GroupCard>
   );
@@ -290,6 +312,7 @@ function RunRow({
   mine?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const logPanelId = `run-log-${run.dispatch_id}`;
   const leaseRemaining =
     lease?.expiresAt === null || lease?.expiresAt === undefined
       ? null
@@ -307,6 +330,7 @@ function RunRow({
   const label = run.job_id
     ? `job ${run.job_id}`
     : `${channelLabel(channels, run.channel_id)} @${run.anchor_seq}`;
+  const runLabel = `${agentName} — ${label}`.replace(/\p{Cc}+/gu, " ").trim();
   return (
     <div
       style={{
@@ -365,7 +389,7 @@ function RunRow({
             <button
               type="button"
               onClick={() => onReassign(run.run_id, lease.attempt)}
-              aria-label={`Force reassign run ${run.run_id}`}
+              aria-label={`Force reassign run ${runLabel}`}
               style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28 }}
             >
               Force reassign
@@ -374,7 +398,7 @@ function RunRow({
           <button
             type="button"
             onClick={() => onCancel(run.run_id)}
-            aria-label={`Cancel run ${run.run_id}`}
+            aria-label={`Cancel run ${runLabel}`}
             style={{
               ...secondaryButton,
               marginLeft: canReassign ? 0 : "auto",
@@ -398,7 +422,8 @@ function RunRow({
             <button
               type="button"
               aria-expanded={expanded}
-              aria-label={`${expanded ? "Hide" : "Show"} live log for run ${run.run_id}`}
+              aria-controls={logPanelId}
+              aria-label={`${expanded ? "Hide" : "Show"} live log for run ${runLabel}`}
               onClick={() => setExpanded((v) => !v)}
               style={{
                 ...secondaryButton,
@@ -411,7 +436,7 @@ function RunRow({
             </button>
           </div>
           <div
-            title={`run ${run.run_id} · ${runDetail(run)}`}
+            title={`run ${runLabel} · ${runDetail(run)}`}
             style={{
               marginTop: 7,
               font: `400 11px ${font.mono}`,
@@ -427,7 +452,13 @@ function RunRow({
               ? `started ${relTime(wallClockSecs(run.created_at)!)}`
               : runDetail(run)}
           </div>
-          {expanded && <RunOutputPane run={run} />}
+          {expanded && (
+            <RunOutputPane
+              runLabel={runLabel}
+              dispatchId={run.dispatch_id}
+              panelId={logPanelId}
+            />
+          )}
         </div>
       </GroupCard>
     </div>
@@ -445,17 +476,33 @@ function HistoryRow({
   channels: Channel[];
   authorNames: Record<string, string>;
 }) {
+  const { actions } = useDucktape();
+  const [expanded, setExpanded] = useState(false);
   const delivered = rec.outcome === "delivered";
+  const agentName = agentLabel(agents, rec.agent_id);
   const anchor = rec.channel_id
     ? `${channelLabel(channels, rec.channel_id)} @${rec.anchor_seq}`
     : "job";
+  const runLabel = `${agentName} — ${anchor}`.replace(/\p{Cc}+/gu, " ").trim();
   const nodeName =
     rec.executing_node !== "unknown"
       ? (displayNameForKey(rec.executing_node, authorNames) ?? shortKey(rec.executing_node))
       : null;
+  const forgeTarget = rec.channel_id
+    ? forgeItemTarget(rec.channel_id, { messageSeq: rec.anchor_seq })
+    : null;
+  const prNumber = rec.pr_number;
+  const dispatchId = dispatchIdForRun(rec.run_id);
+  const logPanelId = `run-log-${dispatchId}`;
+  const openAnchor = () => {
+    if (forgeTarget) actions.openForgeItem(forgeTarget);
+    else if (rec.channel_id && rec.anchor_seq > 0) {
+      actions.focusMessage(rec.channel_id, rec.anchor_seq);
+    }
+  };
   return (
     <div
-      title={`run ${rec.run_id}`}
+      title={`run ${runLabel}`}
       style={{
         display: "flex",
         alignItems: "center",
@@ -475,17 +522,66 @@ function HistoryRow({
           color: color.dark,
         }}
       >
-        {agentLabel(agents, rec.agent_id)}
+        {agentName}
       </span>
       <StatusPill
         label={delivered ? "DELIVERED" : "FAILED"}
         tone={delivered ? statusTone.success : statusTone.danger}
       />
       {rec.degraded && <StatusPill label="DEGRADED" tone={statusTone.warning} />}
-      <Chip text={anchor} tone={statusTone.blue} />
+      {rec.channel_id && rec.anchor_seq > 0 ? (
+        <button
+          type="button"
+          onClick={openAnchor}
+          aria-label={`Open ${anchor}`}
+          style={{
+            ...secondaryButton,
+            minHeight: 22,
+            padding: "2px 7px",
+            color: statusTone.blue.text,
+          }}
+        >
+          {anchor}
+        </button>
+      ) : (
+        <Chip text={anchor} tone={statusTone.blue} />
+      )}
       <Chip text={runDuration(rec)} />
       {nodeName && <Chip text={`on ${nodeName}`} tone={statusTone.agent} />}
-      {rec.pr_number !== null && <Chip text={`PR #${rec.pr_number}`} tone={statusTone.success} />}
+      {prNumber !== null && forgeTarget ? (
+        <button
+          type="button"
+          onClick={() =>
+            actions.openForgeItem({ repo: forgeTarget.repo, number: prNumber })
+          }
+          aria-label={`Open PR #${prNumber}`}
+          style={{
+            ...secondaryButton,
+            minHeight: 22,
+            padding: "2px 7px",
+            color: statusTone.success.text,
+          }}
+        >
+          PR #{prNumber}
+        </button>
+      ) : prNumber !== null ? (
+        <Chip text={`PR #${prNumber}`} tone={statusTone.success} />
+      ) : null}
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={logPanelId}
+        aria-label={`${expanded ? "Hide" : "Show"} execution log for run ${runLabel}`}
+        onClick={() => setExpanded((value) => !value)}
+        style={{
+          ...secondaryButton,
+          minHeight: 22,
+          padding: "2px 8px",
+          font: `600 10px ${font.sans}`,
+        }}
+      >
+        Log
+      </button>
       {rec.output_ref && (
         <span
           title={rec.output_ref}
@@ -493,6 +589,14 @@ function HistoryRow({
         >
           {shortOutputRef(rec.output_ref)}
         </span>
+      )}
+      {expanded && (
+        <RunOutputPane
+          runLabel={runLabel}
+          dispatchId={dispatchId}
+          panelId={logPanelId}
+          terminal
+        />
       )}
     </div>
   );

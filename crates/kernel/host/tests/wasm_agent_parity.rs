@@ -23,7 +23,7 @@
 //!   an actual trigger → result → callback flow into the agent module.
 
 use agent::{
-    AgentModule, AgentMsg, AgentQuery, AgentReply, AgentRole, LoadMode, ResourceCaps, SkillRef,
+    AgentModule, AgentMsg, AgentQuery, AgentReply, LoadMode, ResourceCaps, SkillRef,
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
     MAX_AGENT_ID_LEN, MAX_SKILLS_PER_AGENT, RECIPE_HASH_LEN,
 };
@@ -468,37 +468,6 @@ async fn same_ops_inner() {
             agent_id: "quacksmith".into(),
         }),
         true,
-        false,
-    )
-    .await;
-
-    // ---- semantic roles are committed, owner-gated, hook-silent state. The
-    // second assignment is an idempotent no-op on both runtimes.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &ids,
-        8,
-        owner.clone(),
-        agent_op(&AgentMsg::SetAgentRole {
-            agent_id: "quacksmith".into(),
-            role: AgentRole::ProjectLibrarian,
-        }),
-        true,
-        false,
-    )
-    .await;
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &ids,
-        9,
-        owner.clone(),
-        agent_op(&AgentMsg::SetAgentRole {
-            agent_id: "quacksmith".into(),
-            role: AgentRole::ProjectLibrarian,
-        }),
-        false,
         false,
     )
     .await;

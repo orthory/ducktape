@@ -1,9 +1,11 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { computeAccessibleDescription, computeAccessibleName } from "dom-accessibility-api";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
+import { opKey } from "../../store/finalization";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { color } from "../../theme/tokens";
 import type { Channel } from "../../../domain/chat-client";
@@ -17,7 +19,7 @@ import {
   filledForeground,
   filledMix,
 } from "./parts";
-import type { PendingRun } from "../../../domain/runs-client";
+import type { PendingRun, RunRecord } from "../../../domain/runs-client";
 
 const channels: Channel[] = [
   {
@@ -620,7 +622,7 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
-  it("reassigns or cancels an in-progress run and toggles the jobs worker", () => {
+  it("reassigns or cancels an in-progress run and offers honest worker actions", () => {
     const { spies } = renderAgents({
       runLease: new Map([
         [
@@ -641,15 +643,58 @@ describe("AgentView", () => {
     openTab(/activity/i);
 
     fireEvent.click(
-      screen.getByRole("button", { name: /force reassign run general\/42\/summarizer/i }),
+      screen.getByRole("button", {
+        name: /force reassign run summary agent.*general @42/i,
+      }),
     );
     expect(spies.reassignRun).toHaveBeenCalledWith("general/42/summarizer", 0);
 
-    fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /cancel run summary agent.*general @42/i }),
+    );
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
 
-    fireEvent.click(screen.getByRole("switch", { name: /jobs worker/i }));
+    expect(screen.queryByRole("switch", { name: /jobs worker/i })).toBeNull();
+    expect(screen.getByText(/committed status is not readable/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /enable worker/i }));
     expect(spies.enableJobWorker).toHaveBeenCalledWith(true);
+    fireEvent.click(screen.getByRole("button", { name: /disable worker/i }));
+    expect(spies.enableJobWorker).toHaveBeenCalledWith(false);
+  });
+
+  it("exposes a rejected worker action without claiming a registration state", () => {
+    renderAgents({
+      ops: {
+        [opKey.jobWorker()]: {
+          seq: 1,
+          phase: "failed",
+          startedAt: 10,
+          settledAt: 20,
+          error: "worker cap reached",
+        },
+      },
+    });
+
+    openTab(/activity/i);
+    expect(screen.queryByRole("switch", { name: /jobs worker/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "rejected" })).toBeInTheDocument();
+  });
+
+  it("disables both jobs-worker actions while one is pending", () => {
+    renderAgents({
+      ops: {
+        [opKey.jobWorker()]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+    });
+
+    openTab(/activity/i);
+    expect(screen.getByRole("button", { name: /enable worker/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /disable worker/i })).toBeDisabled();
+    expect(screen.getByText(/waiting for confirmation/i)).toBeInTheDocument();
   });
 
   it("offers announced executors as a Runs on picker, defaulting to the first", () => {
@@ -818,6 +863,152 @@ describe("AgentView", () => {
     expect(screen.getAllByText("[node cafe1234] working")).toHaveLength(1);
   });
 
+  it("does not wait forever when a terminal run has no retained output", async () => {
+    const record: RunRecord = {
+      run_id: "forge:ducktape:56/7/summarizer",
+      agent_id: "summarizer",
+      channel_id: "forge:ducktape:56",
+      anchor_seq: 7,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 30,
+      delivered_at: 35,
+      executing_node: "unknown",
+      output_ref: "agent/item-56@abcdef0123456789",
+      pr_number: 140,
+    };
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [record] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe: vi.fn(() => () => {}),
+    });
+    renderAgents({ pendingRuns: [] }, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /show execution log for run summary agent.*forge:ducktape:56 @7/i,
+      }),
+    );
+
+    const log = screen.getByRole("log");
+    expect(
+      within(log).getByText("No retained output received — older output may have been evicted."),
+    ).toBeInTheDocument();
+    expect(within(log).queryByText("Waiting for retained output…")).not.toBeInTheDocument();
+  });
+
+  it("keyboard-opens a production-format terminal log and catches up retained output", async () => {
+    const runId = "chat\x1fforge:ducktape:56\x1f7\x1fsummarizer";
+    const record: RunRecord = {
+      run_id: runId,
+      agent_id: "summarizer",
+      channel_id: "forge:ducktape:56",
+      anchor_seq: 7,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 30,
+      delivered_at: 35,
+      executing_node: "unknown",
+      output_ref: "agent/item-56@abcdef0123456789",
+      pr_number: 140,
+    };
+    let handlers: TopicHandlers | undefined;
+    const subscribe = vi.fn((_topics, next: TopicHandlers) => {
+      handlers = next;
+      return () => {};
+    });
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [record] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe,
+    });
+    renderAgents({ pendingRuns: [] }, transport);
+
+    openTab(/activity/i);
+    const toggle = await screen.findByRole("button", {
+      name: /show execution log for run summary agent.*forge:ducktape:56 @7/i,
+    });
+    expect(toggle.getAttribute("aria-label")).not.toContain("\x1f");
+    toggle.focus();
+    expect(toggle).toHaveFocus();
+    fireEvent.click(toggle);
+
+    const log = screen.getByRole("log", {
+      name: /execution log for run summary agent.*forge:ducktape:56 @7/i,
+    });
+    expect(log.getAttribute("aria-label")).not.toContain("\x1f");
+    expect(log).toHaveFocus();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-controls", log.id);
+    for (const element of document.body.querySelectorAll("*")) {
+      expect(computeAccessibleName(element)).not.toContain("\x1f");
+      expect(computeAccessibleDescription(element)).not.toContain("\x1f");
+    }
+    expect(subscribe).toHaveBeenCalledWith(
+      ["run-output:ef0d635e287bb66490c26824198278cf8011f5679de48b0faeaf388843e9e5df"],
+      expect.any(Object),
+    );
+
+    act(() => {
+      handlers?.onTail?.({
+        type: "tail",
+        topic:
+          "run-output:ef0d635e287bb66490c26824198278cf8011f5679de48b0faeaf388843e9e5df",
+        cursor: "3",
+        item: { stream: "stderr", line: "focused test failed" },
+      });
+    });
+    expect(within(log).getByText("focused test failed")).toBeInTheDocument();
+  });
+
+  it("opens history anchors and PRs through user-facing navigation", async () => {
+    const forgeRecord: RunRecord = {
+      run_id: "forge:ducktape:56/7/summarizer",
+      agent_id: "summarizer",
+      channel_id: "forge:ducktape:56",
+      anchor_seq: 7,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 30,
+      delivered_at: 35,
+      executing_node: "unknown",
+      output_ref: null,
+      pr_number: 140,
+    };
+    const chatRecord: RunRecord = {
+      ...forgeRecord,
+      run_id: "general/42/summarizer",
+      channel_id: "general",
+      anchor_seq: 42,
+      pr_number: null,
+    };
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [forgeRecord, chatRecord] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+    });
+    const { spies } = renderAgents({ pendingRuns: [] }, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open forge:ducktape:56 @7" }),
+    );
+    expect(spies.openForgeItem).toHaveBeenCalledWith({
+      repo: "ducktape",
+      number: 56,
+      messageSeq: 7,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open General @42" }));
+    expect(spies.focusMessage).toHaveBeenCalledWith("general", 42);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open PR #140" }));
+    expect(spies.openForgeItem).toHaveBeenLastCalledWith({
+      repo: "ducktape",
+      number: 140,
+    });
+  });
+
   it("filters the timeline to the runs I requested", () => {
     const myKey = "ab".repeat(32); // 32 bytes of 0xab as hex
     const mineRun: PendingRun = {
@@ -860,24 +1051,39 @@ describe("AgentView", () => {
     openTab(/activity/i);
     // Both runs show under the default "All" filter.
     expect(
-      screen.getByRole("button", { name: /cancel run general\/50\/summarizer/i }),
+      screen.getByRole("button", { name: /cancel run summary agent.*general @50/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }),
+      screen.getByRole("button", { name: /cancel run summary agent.*general @42/i }),
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /requested by you/i }));
     // Only the run I requested remains.
     expect(
-      screen.getByRole("button", { name: /cancel run general\/50\/summarizer/i }),
+      screen.getByRole("button", { name: /cancel run summary agent.*general @50/i }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /cancel run general\/42\/summarizer/i }),
+      screen.queryByRole("button", { name: /cancel run summary agent.*general @42/i }),
     ).not.toBeInTheDocument();
   });
 });
 
 describe("RunsOnPicker", () => {
+  it("prefers medium when creating an Agent from an unpinned variant", () => {
+    renderAgents({
+      capabilities: [
+        "codex_gpt-5.6-sol_high",
+        "codex_gpt-5.6-sol_low",
+        "codex_gpt-5.6-sol_medium",
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+
+    expect(screen.getByLabelText("Effort")).toHaveValue("medium");
+    expect(screen.getByText("codex_gpt-5.6-sol_medium")).toBeInTheDocument();
+  });
+
   it("collapses Model and Effort to Default when only bare tags are announced", () => {
     const { spies } = renderAgents({ capabilities: ["claude", "codex"] });
 
@@ -910,7 +1116,9 @@ describe("RunsOnPicker", () => {
         "codex_gpt-5.5_low",
         "codex_gpt-5.5_xhigh",
         "codex_gpt-5.6-terra_high",
+        "codex_gpt-5.6-terra_medium",
         "claude_opus_max",
+        "claude_opus_medium",
       ],
     });
 
@@ -927,8 +1135,8 @@ describe("RunsOnPicker", () => {
     expect(within(model).getByRole("option", { name: "gpt-5.5" })).toBeInTheDocument();
     expect(within(model).getByRole("option", { name: "gpt-5.6-terra" })).toBeInTheDocument();
 
-    // Picking a model adopts its first announced effort; the composed tag
-    // is shown verbatim under the picker.
+    // A model without medium keeps the first-announced fallback; the composed
+    // tag is shown verbatim under the picker.
     fireEvent.change(model, { target: { value: "gpt-5.5" } });
     expect(screen.getByLabelText("Effort")).toHaveValue("low");
     expect(screen.getByText("codex_gpt-5.5_low")).toBeInTheDocument();
@@ -938,20 +1146,33 @@ describe("RunsOnPicker", () => {
 
     // Switching model narrows efforts to what that model announced.
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.6-terra" } });
-    expect(screen.getByLabelText("Effort")).toHaveValue("high");
+    expect(screen.getByLabelText("Effort")).toHaveValue("medium");
 
-    // A provider with no base tag composes its first variant.
+    // A provider with no base tag prefers its announced medium variant.
     fireEvent.change(runsOn, { target: { value: "claude" } });
     expect(screen.getByLabelText("Model")).toHaveValue("opus");
-    expect(screen.getByText("claude_opus_max")).toBeInTheDocument();
+    expect(screen.getByText("claude_opus_medium")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ capability: "claude_opus_max" }),
+      expect.objectContaining({ capability: "claude_opus_medium" }),
     );
+  });
+
+  it("keeps provider switching within the first announced model", () => {
+    renderAgents({
+      capabilities: ["codex", "claude_opus_max", "claude_sonnet_medium"],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "claude" } });
+
+    expect(screen.getByLabelText("Model")).toHaveValue("opus");
+    expect(screen.getByLabelText("Effort")).toHaveValue("max");
+    expect(screen.getByText("claude_opus_max")).toBeInTheDocument();
   });
 
   it("pins a stored tag that is no longer announced, marked offline", () => {

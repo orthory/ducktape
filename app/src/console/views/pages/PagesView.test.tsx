@@ -307,6 +307,70 @@ describe("PagesView", () => {
     expect(spies.movePageBlock).toBeUndefined();
   });
 
+  it("indents and outdents a bottom-to-top code selection without reversing it", () => {
+    const { spies } = renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["code"] }),
+        blockOf({ id: "code", kind: "code", text: "one\ntwo\nthree" }),
+      ],
+    });
+    const area = screen.getByLabelText("Edit code block 1") as HTMLTextAreaElement;
+    area.focus();
+    area.setSelectionRange(1, 7, "backward");
+    expect(fireEvent.keyDown(area, { key: "Tab" })).toBe(false);
+    expect(area).toHaveValue("\tone\n\ttwo\nthree");
+    expect([area.selectionStart, area.selectionEnd]).toEqual([2, 9]);
+    expect(area.selectionDirection).toBe("backward");
+
+    area.setSelectionRange(0, 9, "backward");
+    expect(fireEvent.keyDown(area, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(area).toHaveValue("one\ntwo\nthree");
+    expect([area.selectionStart, area.selectionEnd]).toEqual([0, 7]);
+    expect(area.selectionDirection).toBe("backward");
+    expect(document.activeElement).toBe(area);
+    expect(spies.movePageBlock).toBeUndefined();
+
+    area.setSelectionRange(area.value.length, area.value.length);
+    expect(fireEvent.keyDown(area, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(area);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      area.value.length,
+      area.value.length,
+    ]);
+  });
+
+  it("documents and allows Escape then Tab to leave code without editing it", () => {
+    renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["code"] }),
+        blockOf({ id: "code", kind: "code", text: "one\ntwo" }),
+      ],
+    });
+    const area = screen.getByLabelText("Edit code block 1") as HTMLTextAreaElement;
+    expect(area).toHaveAccessibleDescription(
+      "Tab indents code. Press Escape, then Tab to move focus.",
+    );
+
+    area.setSelectionRange(1, 6, "backward");
+    expect(fireEvent.keyDown(area, { key: "Escape" })).toBe(true);
+    expect(fireEvent.keyDown(area, { key: "Tab" })).toBe(true);
+    expect(area).toHaveValue("one\ntwo");
+    expect([area.selectionStart, area.selectionEnd, area.selectionDirection]).toEqual([
+      1,
+      6,
+      "backward",
+    ]);
+
+    fireEvent.keyDown(area, { key: "Escape" });
+    expect(fireEvent.keyDown(area, { key: "Tab", shiftKey: true })).toBe(true);
+    expect(area).toHaveValue("one\ntwo");
+
+    fireEvent.keyDown(area, { key: "Escape" });
+    fireEvent.keyDown(area, { key: "x" });
+    expect(fireEvent.keyDown(area, { key: "Tab" })).toBe(false);
+    expect(area).toHaveValue("\tone\n\ttwo");
+  });
+
   it("removes an empty block on Backspace", () => {
     const { spies } = renderPagesView({
       activePageBlocks: [
