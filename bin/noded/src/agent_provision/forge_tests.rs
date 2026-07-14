@@ -631,7 +631,7 @@ fn commit_message_selection_rejects_identity_spoofing_without_rewriting_the_fall
         ),
         Some("Unused Forge title"),
     )
-    .expect("the Forge title recovers an unsafe response");
+    .expect("the Forge title is authoritative");
     assert_eq!(message, "Unused Forge title");
 
     for trailer in [
@@ -765,21 +765,18 @@ fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
         Some("invalid\u{1f}Forge title"),
     )
     .unwrap_err();
-    assert!(
-        err.contains("no valid commit message") && !err.contains("Human"),
-        "{err:?}"
-    );
+    assert!(err.contains("missing or invalid") && !err.contains("Human"), "{err:?}");
 }
 
 #[test]
-fn the_agent_response_owns_the_exact_message_then_forge_recovers() {
+fn the_forge_title_owns_the_primary_capture_and_response_is_only_fallback() {
     assert_eq!(
         select_commit_message(
             Some("Final response subject\n\nFinal response body"),
             Some("Forge title"),
         )
         .unwrap(),
-        "Final response subject\n\nFinal response body"
+        "Forge title"
     );
     assert_eq!(
         select_commit_message(
@@ -799,7 +796,16 @@ fn the_agent_response_owns_the_exact_message_then_forge_recovers() {
             Some("Forge title"),
         )
         .unwrap(),
-        "ship it 🦆\n\nThe agent chooses its own style."
+        "Forge title"
+    );
+    assert_eq!(
+        select_commit_message(Some("Response fallback\n\nUseful detail"), None).unwrap(),
+        "Response fallback\n\nUseful detail"
+    );
+    assert_eq!(
+        select_commit_message(Some("Apply agent changes"), Some("Exact issue title")).unwrap(),
+        "Exact issue title",
+        "generic response prose must never replace bound item metadata"
     );
 }
 
@@ -834,16 +840,17 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     let oid = receipt.output_commit.expect("the new commit oid");
     assert_ne!(oid, bed.head);
     // the push CROSSED: the remote's branch is exactly the receipt's oid,
-    // and the internal run key never reaches Git text.
+    // and the verified item title — not response prose or the internal run
+    // key — owns the primary capture commit.
     assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
     assert_eq!(
         git_stdout(&ws.workdir(), &["log", "-1", "--format=%s"]),
-        "fix(forge): keep the agent's intent"
+        "Fix the flaky gate"
     );
     let body = git_stdout(&ws.workdir(), &["log", "-1", "--format=%B"]);
     assert_eq!(
         body,
-        "fix(forge): keep the agent's intent\n\nPreserve the useful explanation."
+        "Fix the flaky gate"
     );
     ws.cleanup().await;
 }
@@ -1046,7 +1053,7 @@ async fn uncommitted_work_is_captured_on_top_of_the_agents_commit() {
     assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), agent_commit);
     assert_eq!(
         git_stdout(&dir, &["log", "-2", "--format=%s"]),
-        "Capture the final edit\nKeep this commit"
+        "Fix the flaky gate\nKeep this commit"
     );
     ws.cleanup().await;
 }
@@ -1064,7 +1071,7 @@ async fn no_agent_message_or_forge_title_never_pushes_synthetic_history() {
     std::fs::write(ws.workdir().join("answer.md"), "real work\n").unwrap();
 
     let err = ws.commit("agent run s1:0", None).await.unwrap_err();
-    assert!(err.contains("no valid commit message"), "{err}");
+    assert!(err.contains("missing or invalid"), "{err}");
     assert_eq!(
         ref_oid(&bare, BRANCH),
         None,

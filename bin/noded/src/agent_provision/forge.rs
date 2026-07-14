@@ -543,20 +543,19 @@ enum CommitOutcome {
 /// the commit bracket.
 const PUSH_ATTEMPTS: u32 = 3;
 
-/// Use the agent's final response for an uncommitted tree. The committed Forge
-/// item title is recovery metadata only. Ducktape rejects structurally unsafe
-/// identity claims, but never edits or grades the chosen subject and body.
+/// Use the committed Forge item title for the primary capture commit. Model
+/// prose is publication-body material, not identity metadata; it is only a
+/// fallback when the item title is unavailable or structurally unsafe.
 fn select_commit_message(
     response_proposal: Option<&str>,
     item_title: Option<&str>,
 ) -> Result<String, String> {
-    response_proposal
+    item_title
         .into_iter()
-        .chain(item_title)
+        .chain(response_proposal)
         .find_map(commit_message_candidate)
         .ok_or_else(|| {
-            "agent supplied no valid commit message and the Forge item title was missing or invalid"
-                .to_string()
+            "Forge item title and response fallback were both missing or invalid".to_string()
         })
 }
 

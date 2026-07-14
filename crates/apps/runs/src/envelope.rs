@@ -122,8 +122,9 @@ pub(crate) enum WorkspaceSource {
     /// a forge repo checkout (M1) — the git-native workspace lane.
     Forge {
         repo: String,
-        /// the authoritative tracker title at compose height. it is commit
-        /// fallback metadata only; an agent-authored Git message wins.
+        /// the authoritative tracker title at compose height. it owns the
+        /// primary capture commit; response prose is only a missing-metadata
+        /// fallback.
         item_title: String,
         /// the pinned base: a 40-hex sha1 tip resolved from COMMITTED forge
         /// refs at compose height (I1) — the work-branch tip when born, else
