@@ -415,7 +415,7 @@ async fn coordinated_attempt(
     label: String,
     iters: u32,
 ) -> AttemptResult {
-    for _ in 0..iters {
+    for attempt in 1..=iters {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if reach
             .send(reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
@@ -442,9 +442,30 @@ async fn coordinated_attempt(
             Ok(Err(_)) => {}
             Err(_) => return AttemptResult::Failed("coordinated reply dropped".into()),
         }
-        let _ = &label; // reserved for future per-attempt tracing
+        // the line this codebase reserved for itself. `nonce` is the ONE id on
+        // BOTH sides of a join (lobby::IntroAck.nonce == our token_nonce), so an
+        // inviter's log and a joiner's log can finally be read together.
+        tracing::debug!(
+            target: "ducktape::join",
+            node = %label,
+            nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+            peer = %noded::hex_bytes(&candidate.key.as_ref()[..4]),
+            via = "coordinated",
+            attempt,
+            iters,
+            "first-contact intro not yet acked — retrying"
+        );
         tokio::time::sleep(RETRY_INTERVAL).await;
     }
+    tracing::warn!(
+        target: "ducktape::join",
+        node = %label,
+        nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+        peer = %noded::hex_bytes(&candidate.key.as_ref()[..4]),
+        via = "coordinated",
+        attempts = iters,
+        "first-contact candidate EXHAUSTED — no ack within the join window"
+    );
     AttemptResult::Failed("coordinated intro was not acked within the join window".into())
 }
 

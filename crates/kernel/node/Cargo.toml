@@ -13,6 +13,8 @@ version.workspace = true
 # sdk stays dep-clean. the real commonware simplex orderer is a later slice; it
 # is the drop-in behind the same `Orderer` trait.
 [dependencies]
+# the block spine: one `block committed` event per applying block.
+tracing = { workspace = true }
 sdk = { workspace = true }
 host = { workspace = true }
 thiserror = { workspace = true }

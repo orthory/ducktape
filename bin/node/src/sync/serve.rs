@@ -10,7 +10,7 @@ use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::read_upgrade_version_fields;
-use crate::util::{diag_log, hex};
+use crate::util::{fatal, hex};
 
 pub(crate) fn assert_floor_binds_view(
     view_base: u64,
@@ -101,8 +101,7 @@ pub(crate) async fn reopen_recovery(
             r
         }
         Err(e) => {
-            eprintln!("[node {label}] FATAL: cannot reopen the recovery store: {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot reopen the recovery store: {e}");
         }
     }
 }
@@ -244,14 +243,15 @@ where
         .as_ref()
         .map(|floor| floor.height.to_string())
         .unwrap_or_else(|| "none".to_string());
-    diag_log(format!(
-        "DIAG {diag_tag} checkpoint_height={} checkpoint_hash={} \
-         floor_height={} floor_present={}",
-        boundary.height,
-        hex(&host.app_hash()),
-        floor_height,
-        floor.is_some()
-    ));
+    tracing::debug!(
+        target: "ducktape::statesync",
+        tag = %diag_tag,
+        checkpoint_height = boundary.height,
+        checkpoint_hash = %hex(&host.app_hash()),
+        floor_height = %floor_height,
+        floor_present = floor.is_some(),
+        "checkpoint captured"
+    );
     // stamp the real committed version fields so the captured checkpoint
     // carries the same `required_min_version` a live checkpoint would; the
     // next boot then preflights against them like any restart.
@@ -271,19 +271,16 @@ where
     ) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {diag_tag} capture: {e}");
-            std::process::exit(1);
+            fatal!(label, "{diag_tag} capture: {e}");
         }
     };
     if let Err(e) = recovery.write_manifest(&ckpt).await {
-        eprintln!("[node {label}] FATAL: {diag_tag} write: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} write: {e}");
     }
     if let Some(fc) = floor
         && let Err(e) = recovery.write_floor_cert(fc).await
     {
-        eprintln!("[node {label}] FATAL: {diag_tag} floor-cert write: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} floor-cert write: {e}");
     }
     // this checkpoint IS the journal's new genesis: everything below its
     // oplog position must never roll into a boot at this base — a prior
@@ -293,8 +290,7 @@ where
     // AHEAD of its source's serving window). the engine floor at `boundary`
     // suppresses replay at or below it, so no pruned frame is needed again.
     if let Err(e) = recovery.prune_oplog(pos).await {
-        eprintln!("[node {label}] FATAL: {diag_tag} journal prune: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} journal prune: {e}");
     }
     // the checkpoint's oplog position — the caller's prune anchor when the
     // NEXT (periodic) checkpoint supersedes this one.
@@ -481,10 +477,29 @@ pub(crate) async fn drive_sync_request(
                 Ok(Err(recovery::Error::RangePruned {
                     after_height,
                     retained_start,
-                })) => statesync::SyncResponse::RangePruned {
-                    requested_after: after_height,
-                    retained_from: retained_start,
-                },
+                })) => {
+                    // THE known wedge, and neither side logged it. `checkpoint_blocks`
+                    // defaults to 32 and prune trails one checkpoint, so at a 1s block
+                    // the retention window is 32-64 SECONDS — a slow bridge or a laptop
+                    // wake is outrun, and no node anywhere recorded what the floor was
+                    // or who got refused. this is the line that answers "was my follower
+                    // too slow, or was the source pruning too aggressively" — the exact
+                    // question that ate the 07-14 live-join session.
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        requested_after = after_height,
+                        retained_from = retained_start,
+                        gap_blocks = retained_start.saturating_sub(after_height),
+                        reason = "pruned_below_retention_floor",
+                        "frame range REFUSED — the requester is below this node's retention \
+                         floor and can never catch up from here (it must full-sync; raise \
+                         `checkpoint_blocks` if this recurs)"
+                    );
+                    statesync::SyncResponse::RangePruned {
+                        requested_after: after_height,
+                        retained_from: retained_start,
+                    }
+                }
                 Ok(Err(e)) => statesync::SyncResponse::Error(format!("recovery frame range: {e}")),
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }

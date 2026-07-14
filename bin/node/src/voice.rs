@@ -431,6 +431,7 @@ async fn open_session<T: DataPlaneTransport>(
     let (control_out_tx, control_out_rx) = mpsc::channel(CTL_LANE);
 
     let task = tokio::spawn(run_session(
+        channel_id.to_string(),
         engine,
         cam_dgram,
         ctl_dgram,
@@ -642,6 +643,7 @@ impl PeerLane {
 /// drops its lane ends.
 #[allow(clippy::too_many_arguments)]
 async fn run_session<T: DataPlaneTransport>(
+    channel_id: String,
     mut engine: VoiceEngine<T>,
     video: DatagramFlow<T>,
     ctl: DatagramFlow<T>,
@@ -655,9 +657,20 @@ async fn run_session<T: DataPlaneTransport>(
     flows: Arc<ActiveFlows>,
     registered: Vec<(Service, FlowId)>,
 ) {
+    tracing::info!(target: "ducktape::voice", channel_id, "call session opened");
     let mut tick = tokio::time::interval(Duration::from_millis(FRAME_MILLIS));
     // audio has no catch-up: a missed tick's frame is gone, do not burst.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // the three counters that separate the three bugs behind "Voice connection
+    // failed." NOTHING here logs per frame, at any level — they are summarised on
+    // the EXISTING 1 Hz control tick, where every field is already computed.
+    let (mut frames_sent, mut frames_discarded, mut send_errors) = (0u64, 0u64, 0u64);
+    // the "roster never arrived" tell: we are capturing audio and throwing every
+    // frame away because we believe we are alone. warned ONCE per session, on the
+    // transition — the failure is client-side and the node should say so.
+    let mut no_recipients_warned = false;
+    let session_start = Instant::now();
 
     let mut frame_no: u32 = 0;
     let mut peer_lanes: HashMap<[u8; 32], PeerLane> = HashMap::new();
@@ -685,13 +698,34 @@ async fn run_session<T: DataPlaneTransport>(
                     .map(|raw| PeerId(*raw))
                     .collect();
                 if peers.is_empty() {
-                    continue; // alone in the huddle — nothing to send
+                    // alone in the huddle — nothing to send. but if we are STILL
+                    // alone seconds in, the roster never arrived: everything else
+                    // is green (bound, session open, tunnels up) and the user hears
+                    // silence. that failure was 100% invisible node-side.
+                    frames_discarded += 1;
+                    let elapsed = session_start.elapsed();
+                    if !no_recipients_warned && elapsed > Duration::from_secs(3) {
+                        no_recipients_warned = true;
+                        tracing::warn!(
+                            target: "ducktape::voice",
+                            channel_id,
+                            elapsed_s = elapsed.as_secs(),
+                            frames_discarded,
+                            "call has NO recipients — every captured frame is being \
+                             discarded; the roster never reached this node"
+                        );
+                    }
+                    continue;
                 }
                 let mut frame = [0i16; FRAME_SAMPLES];
                 frame.copy_from_slice(&captured);
                 // a send failure (peer unreachable, admission flapped) must
                 // not end the session — the next frame just tries again.
-                let _ = engine.send_frame(&frame, &peers).await;
+                if engine.send_frame(&frame, &peers).await.is_err() {
+                    send_errors += 1;
+                } else {
+                    frames_sent += 1;
+                }
             }
             _ = tick.tick() => {
                 if mixed_out.is_closed() {
@@ -802,6 +836,25 @@ async fn run_session<T: DataPlaneTransport>(
                 }
             }
             _ = ctl_tick.tick() => {
+                // rides the EXISTING 1 Hz beacon tick — every field here was already
+                // computed and thrown away. debug, not info: at a 1s block this would
+                // otherwise be one info per block, and the ring would hold ~68 minutes
+                // of nothing but call stats.
+                //
+                // read it by channel_id and the three failure modes separate:
+                //   frames_sent=0, peers=0   -> the roster never arrived (client-side)
+                //   frames_sent>0, received=0 -> overlay up, peer dark
+                //   no session line at all    -> the overlay never came up
+                tracing::debug!(
+                    target: "ducktape::voice",
+                    channel_id,
+                    peers = recipients.borrow().len(),
+                    frames_sent,
+                    frames_discarded,
+                    send_errors,
+                    effective_kbps,
+                    "call.stats"
+                );
                 send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
@@ -822,6 +875,15 @@ async fn run_session<T: DataPlaneTransport>(
             }
         }
     }
+    tracing::info!(
+        target: "ducktape::voice",
+        channel_id,
+        elapsed_s = session_start.elapsed().as_secs(),
+        frames_sent,
+        frames_discarded,
+        send_errors,
+        "call session closed"
+    );
     for key in &registered {
         flows.remove(key);
     }

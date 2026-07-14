@@ -191,8 +191,8 @@ impl ProvisionedWorkspace for NodedWorkspace {
             let _ = std::fs::remove_dir_all(dir.join(capability_host::RUN_RUNTIME_DIR));
             commit(&api, &dir, &message)
         })
-            .await
-            .map_err(|_| "workspace commit task panicked".to_string())?;
+        .await
+        .map_err(|_| "workspace commit task panicked".to_string())?;
         let spec = self.receipt_spec();
         match result {
             Ok(summary) => Ok(WorkspaceReceipt::committed(

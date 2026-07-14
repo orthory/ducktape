@@ -442,10 +442,7 @@ async fn gateway_browser_proxy(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
     else {
-        return error_response(
-            StatusCode::MISDIRECTED_REQUEST,
-            "missing duck authority",
-        );
+        return error_response(StatusCode::MISDIRECTED_REQUEST, "missing duck authority");
     };
     let page_origin = format!("duck://{authority}");
     if headers
@@ -579,7 +576,10 @@ async fn gateway_ws_token_mint(
     Json(request): Json<WsTokenRequest>,
 ) -> Response {
     let Some(browser_gateway) = handle.browser_gateway.clone() else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway browsing is disabled",
+        );
     };
     if request.origin.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "origin is required");
@@ -588,7 +588,9 @@ async fn gateway_ws_token_mint(
         Ok(resolved) => resolved,
         Err(failure) => return gateway_failure_response(failure),
     };
-    let token = browser_gateway.ws_tokens.mint(request.origin, account_id, name);
+    let token = browser_gateway
+        .ws_tokens
+        .mint(request.origin, account_id, name);
     Json(WsTokenReply { token }).into_response()
 }
 
@@ -602,7 +604,10 @@ async fn gateway_ws_door(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let Some(browser_gateway) = handle.browser_gateway.clone() else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway browsing is disabled",
+        );
     };
     let Some(lane) = handle.gateway.clone() else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no gateway overlay");

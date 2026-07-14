@@ -765,7 +765,10 @@ fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
         Some("invalid\u{1f}Forge title"),
     )
     .unwrap_err();
-    assert!(err.contains("missing or invalid") && !err.contains("Human"), "{err:?}");
+    assert!(
+        err.contains("missing or invalid") && !err.contains("Human"),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -848,10 +851,7 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
         "Fix the flaky gate"
     );
     let body = git_stdout(&ws.workdir(), &["log", "-1", "--format=%B"]);
-    assert_eq!(
-        body,
-        "Fix the flaky gate"
-    );
+    assert_eq!(body, "Fix the flaky gate");
     ws.cleanup().await;
 }
 

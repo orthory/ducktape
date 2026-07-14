@@ -114,6 +114,7 @@ use validator::announce::ReadinessSignaller;
 
 #[cfg(test)]
 use directory::{DirQuery, DirReply, decode_reply, encode_query};
+use crate::util::fatal;
 use duckfs_disk::SyncScratch;
 use recovery::Recovery;
 #[cfg(test)]
@@ -423,8 +424,7 @@ fn run_node(
         let mut recovery = match Recovery::open(context.child("recovery")).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: cannot open the recovery store: {e}");
-                std::process::exit(1);
+                fatal!(label, "cannot open the recovery store: {e}");
             }
         };
         // code-registry swaps realize through the blob plane: replay, catch-up,
@@ -434,8 +434,7 @@ fn run_node(
         let manifest = match recovery.manifest() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: recovery checkpoint is damaged: {e}");
-                std::process::exit(1);
+                fatal!(label, "recovery checkpoint is damaged: {e}");
             }
         };
         // breadcrumb between the surface binds and the mesh/plane wiring: a

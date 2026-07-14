@@ -700,6 +700,14 @@ fn prepare_node_command_env(cmd: &mut Command) {
     if let Some(path) = node_launch_path(std::env::var_os("PATH"), std::env::var_os("HOME")) {
         cmd.env("PATH", path);
     }
+    // The node otherwise inherits NO environment but PATH, so a developer's
+    // `RUST_LOG=…` on the app never reached the process they wanted it to reach.
+    // This is now the COLD path — the node serves POST /v1/log-filter, so a live
+    // node can be retuned without restarting it (and without destroying the wedged
+    // state you restarted it to look at).
+    if let Some(rust_log) = std::env::var_os("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
 }
 
 fn node_launch_path(current: Option<OsString>, home: Option<OsString>) -> Option<OsString> {
@@ -760,6 +768,64 @@ fn add_existing_path_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
     if dir.is_dir() && !dirs.iter().any(|existing| existing == &dir) {
         dirs.push(dir);
     }
+}
+
+/// Reap the node process and REPORT its death.
+///
+/// The shell held the ONLY handle that can report the node's exit status — and threw
+/// it away: `spawn_workspace_node` returned the `Child`, the caller took `.id()` for
+/// the pidfile, and then dropped it. Nothing ever called `wait()`.
+///
+/// So a node that OOMs, panics, or fails a schema preflight an hour into a session
+/// was reported with the only message we had — the grace-window one: *"the node
+/// exited before it came up."* Which is not what happened, and sent people looking
+/// in the wrong place. (It also left a zombie: a dropped `Child` is never reaped.)
+///
+/// Detaching is unaffected — the node still has its own process group and still
+/// outlives the window. This thread only watches.
+pub(crate) fn watch_node_exit(mut child: Child, workspace: String) {
+    let pid = child.id();
+    let started = Instant::now();
+    std::thread::Builder::new()
+        .name("node-reaper".into())
+        .spawn(move || {
+            let elapsed_s = || started.elapsed().as_secs();
+            match child.wait() {
+                // a CLEAN exit is the routine path, not an incident: every workspace
+                // switch, forget, and sandbox-apply asks this node to stop (POST
+                // /v1/shutdown → exit(0)). crying `error!` on the most common
+                // lifecycle action would be a false alarm in exactly the log someone
+                // reads BECAUSE they are chasing a death — and it would teach them to
+                // ignore the line that matters.
+                Ok(status) if status.code() == Some(0) => tracing::info!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    pid,
+                    elapsed_s = elapsed_s(),
+                    "the workspace node stopped cleanly"
+                ),
+                // anything else is a death we did not ask for — a panic, an OOM, a
+                // failed schema preflight, or an escalation to TERM/KILL because the
+                // graceful stop did not take. `code` is None when a signal killed it.
+                Ok(status) => tracing::error!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    pid,
+                    code = status.code().unwrap_or(-1),
+                    elapsed_s = elapsed_s(),
+                    "the workspace node EXITED — see this workspace's daemon.log for why"
+                ),
+                Err(err) => tracing::warn!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    pid,
+                    error = %err,
+                    elapsed_s = elapsed_s(),
+                    "lost track of the workspace node (cannot wait on it)"
+                ),
+            }
+        })
+        .ok();
 }
 
 /// `daemon.log` grows unbounded across every restart of a workspace's node. roll
@@ -998,8 +1064,20 @@ mod tests {
         // shell `user-sign-frame` with a (possibly secret) payload/password on
         // stdin — the verb AND its stdin arm must be allowlisted or every
         // user-signed submit hard-fails before the node runs.
-        assert!(validate_invocation(&["user-sign-frame", "--target", "chat", "--seq", "1"], &["deadbeef"]).is_ok());
-        assert!(validate_invocation(&["user-sign-frame", "--target", "files", "--seq", "1"], &["pw", "deadbeef"]).is_ok());
+        assert!(
+            validate_invocation(
+                &["user-sign-frame", "--target", "chat", "--seq", "1"],
+                &["deadbeef"]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_invocation(
+                &["user-sign-frame", "--target", "files", "--seq", "1"],
+                &["pw", "deadbeef"]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1023,11 +1101,15 @@ mod tests {
         // A root-owned dir writable by an arbitrary group is swappable…
         assert!(dir_replaceable_by_others(0, 12345, 0o40775, me, my_group));
         // …and other-write is always hostile without the sticky bit…
-        assert!(dir_replaceable_by_others(me, my_group, 0o40777, me, my_group));
+        assert!(dir_replaceable_by_others(
+            me, my_group, 0o40777, me, my_group
+        ));
         // …but the sticky bit clears it (/tmp's ownership rule).
         assert!(!dir_replaceable_by_others(0, 0, 0o41777, me, my_group));
         // Our own dir under our own primary group may be group-writable.
-        assert!(!dir_replaceable_by_others(me, my_group, 0o40775, me, my_group));
+        assert!(!dir_replaceable_by_others(
+            me, my_group, 0o40775, me, my_group
+        ));
         // root:admin 0775 is the macOS convention for /Applications — trusted
         // there, hostile elsewhere.
         #[cfg(target_os = "macos")]

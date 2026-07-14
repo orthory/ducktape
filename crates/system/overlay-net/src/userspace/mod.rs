@@ -38,7 +38,7 @@ pub mod seam;
 pub mod sockets;
 pub mod stack;
 
-pub use device::{PeerConfig, UnderlaySocket, WgDevice};
+pub use device::{HandshakeProbe, PeerConfig, ProbeSlot, UnderlaySocket, WgDevice};
 pub use effect::{UserspaceEffectError, UserspaceWireGuardEffect};
 pub use factory::VirtualSocketFactory;
 pub use sockets::{VirtualTcpListener, VirtualTcpStream, VirtualUdpSocket};

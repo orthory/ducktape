@@ -198,22 +198,33 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
     budget: Arc<AtomicU64>,
 ) -> io::Result<()> {
-    let refuse = |mut stream: S| async move {
+    // every refusal below was a SILENT drop through this one closure. a member
+    // that refuses every push never signals code-ready, so the upgrade never arms
+    // at R=n — and nothing anywhere said why. now each reason names itself.
+    let refuse = |mut stream: S, reason: &'static str| async move {
+        tracing::warn!(
+            target: "ducktape::modules",
+            digest = %noded::hex_bytes(&digest),
+            kind,
+            len,
+            reason,
+            "module-code push REFUSED"
+        );
         stream.write_all(&[ACK_REFUSED]).await?;
         stream.write_all(&0u64.to_be_bytes()).await
     };
     let Some(cap) = kind_cap(kind) else {
-        return refuse(stream).await;
+        return refuse(stream, "unknown_kind").await;
     };
     if len > cap {
-        return refuse(stream).await;
+        return refuse(stream, "over_kind_cap").await;
     }
     if blobs.has_chunk(&digest) {
         stream.write_all(&[ACK_ALREADY_HAVE]).await?;
         return stream.write_all(&0u64.to_be_bytes()).await;
     }
     if !inflight.lock().expect("inflight lock").insert(digest) {
-        return refuse(stream).await;
+        return refuse(stream, "already_inflight").await;
     }
     // hold the slot for the whole transfer; released on every exit below.
     let release = |budget_taken: u64| {
@@ -222,13 +233,13 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     };
     if budget.fetch_add(len, Ordering::Relaxed) + len > STAGING_BUDGET {
         release(len);
-        return refuse(stream).await;
+        return refuse(stream, "staging_budget_exhausted").await;
     }
     let mut slot = match blobs.stage(digest, len) {
         Ok(slot) => slot,
         Err(_) => {
             release(len);
-            return refuse(stream).await;
+            return refuse(stream, "stage_open_failed").await;
         }
     };
     stream.write_all(&[ACK_SEND_FROM]).await?;
@@ -252,7 +263,18 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let result = match slot.finish() {
         Ok(_) => RESULT_OK,
-        Err(blobstore::StageError::HashMismatch) => RESULT_CORRUPT,
+        Err(blobstore::StageError::HashMismatch) => {
+            // a peer sent bytes that do not hash to the COMMITTED digest. that is
+            // security-relevant, and it was detected and discarded with no local
+            // record of any kind.
+            tracing::error!(
+                target: "ducktape::modules",
+                digest = %noded::hex_bytes(&digest),
+                reason = "hash_mismatch",
+                "module-code push CORRUPT — the bytes do not hash to the committed digest"
+            );
+            RESULT_CORRUPT
+        }
         Err(_) => RESULT_STAGE_FAILED,
     };
     release(len);

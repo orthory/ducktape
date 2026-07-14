@@ -20,7 +20,7 @@ use crate::host_reads::{
     read_valset_residents, upgrade_operations,
 };
 use crate::{lobby, relay};
-use crate::util::{hex, participant_bytes, resident_bytes};
+use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_drain(&mut self) {
@@ -74,8 +74,7 @@ impl ValidatorRuntime<'_> {
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: {e} — halting");
-                std::process::exit(1);
+                fatal!(label, "{e} — halting");
             }
         };
         *applied += drained_count;
@@ -95,7 +94,14 @@ impl ValidatorRuntime<'_> {
             && node.orderer().pending_len() == 0
             && let Err(e) = node.sink_mut().sync().await
         {
-            eprintln!("[node {label}] tip-seal sync failed: {e}");
+            // the idle-transition durability sync: losing it turns the tip into a
+            // TRAILING block, which on a SOLO node can brick a self-reading op.
+            tracing::warn!(
+                target: "ducktape::consensus",
+                node = %label,
+                error = %e,
+                "tip-seal sync failed — the tip block may not be durable"
+            );
         }
         // resolve held app-surface submits against what this
         // drain finished with; every disposition is deterministic,
@@ -142,15 +148,19 @@ impl ValidatorRuntime<'_> {
                 ..noded::index_block_ops(height, height, &dispatches)
             };
             if let Err(err) = index.apply_block(&ops) {
+                // consensus stays perfectly healthy while the ENTIRE app UI
+                // silently stops updating: every module view the app reads is
+                // served from this derived index. it does not self-heal.
+                // `event` is the operational contract (#603); `target` is the
+                // filtering plane — orthogonal, so carry both.
                 tracing::error!(
+                    target: "ducktape::consensus",
                     event = "node_index_poisoned",
                     node = %label,
                     height,
-                    error = %err
-                );
-                eprintln!(
-                    "[node {label}] module index apply failed at height {height}: {err} \
-                             — wipe <storage>/index to rebuild"
+                    error = %err,
+                    "module index apply failed — the app's views are now STALE; \
+                     wipe <storage>/index to rebuild"
                 );
             }
         }
@@ -246,6 +256,32 @@ impl ValidatorRuntime<'_> {
                     Recipients::One(peer),
                     IoBuf::from(relay::encode_msg(&msg)),
                     false,
+                );
+            }
+            // BEFORE the pending_submits lookup, deliberately. An op rejected in
+            // consensus produced no record ANYWHERE: the submitter's own log says
+            // SUCCESS (the submit was accepted) while the state machine says NO.
+            //
+            // and the internal submits — oracle results, capability announces,
+            // upgrade readiness, code-ready signals — are fire-and-forget and never
+            // enter `pending_submits` at all, so the `continue` below swallows their
+            // rejection whole. That is exactly how an announcer that latches on
+            // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
+            // upgrade stuck at R<n, and nothing anywhere saying why.
+            let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
+            // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
+            // that deliberately does not exist. warning on it would fire every block
+            // forever on an idle chain, evicting the whole 4096-line ring in ~68
+            // minutes and drowning the very evidence someone came to read.
+            if d.disposition == node::Disposition::Rejected && module != NOP_TARGET {
+                tracing::warn!(
+                    target: "ducktape::submit",
+                    node = %label,
+                    frame = %noded::hex_bytes(&d.id),
+                    height = d.height,
+                    module,
+                    reason = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
+                    "op rejected in consensus"
                 );
             }
             let Some((reply, _)) = pending_submits.remove(&d.id) else {
@@ -640,8 +676,7 @@ impl ValidatorRuntime<'_> {
                     ),
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("[node {label}] FATAL: {e} — halting");
-                        std::process::exit(1);
+                        fatal!(label, "{e} — halting");
                     }
                 }
                 // ACTIVATION (design §4): realize the agreed boundary

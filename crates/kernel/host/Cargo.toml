@@ -8,6 +8,8 @@ version.workspace = true
 # modules (`global_root` — sha2 is its one hashing dep). depends on sdk (the
 # contract); it knows nothing of any concrete module beyond `dyn Module`.
 [dependencies]
+# module non-determinism is the most fork-relevant event the kernel can see.
+tracing = { workspace = true }
 sdk = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }

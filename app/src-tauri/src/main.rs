@@ -23,6 +23,7 @@ mod forge_git;
 mod huddle;
 mod lan_http;
 mod link_relay;
+mod log;
 mod menu;
 mod notify;
 mod permissions;
@@ -146,6 +147,12 @@ fn main() {
         tauri_runtime_cef::run_cef_helper_process();
         return;
     }
+
+    // AFTER the helper dispatch (CEF re-execs this binary, and 4-6 helpers would
+    // otherwise append to the same file) and BEFORE the first `.expect()` below —
+    // which, in a bundled app, currently takes the whole thing down leaving zero
+    // bytes on disk.
+    log::init();
 
     // The streaming `duck://` handler (process-global). Registered before the
     // builder so the first gateway navigation is served.

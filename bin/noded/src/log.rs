@@ -199,6 +199,39 @@ impl ModuleNotes {
     }
 }
 
+/// a first-and-every-Nth latch for a failure that REPEATS on a retry loop.
+///
+/// a peer that cannot sync retries forever, so an unconditional `warn!` on the
+/// refusal path is a log bomb: it evicts the whole 4096-line ring in seconds and
+/// destroys the surrounding context — strictly worse than silence. log the first
+/// occurrence, then every Nth, and carry the count. **the counter IS the
+/// diagnosis**: "attempts=3000" is what tells you this is wedged, not flaky.
+///
+/// keyed by a caller-supplied `&'static str`, so distinct refusal reasons latch
+/// independently and one noisy reason cannot mask another.
+pub struct Latch {
+    counts: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    every: u64,
+}
+
+impl Latch {
+    pub const fn new(every: u64) -> Self {
+        Self {
+            counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            every,
+        }
+    }
+
+    /// returns `Some(occurrences)` when this occurrence should be logged.
+    pub fn hit(&self, key: &'static str) -> Option<u64> {
+        let mut counts = self.counts.lock().expect("latch lock poisoned");
+        let count = counts.entry(key).or_insert(0);
+        *count += 1;
+        let n = *count;
+        (n == 1 || n.is_multiple_of(self.every)).then_some(n)
+    }
+}
+
 /// a stuck saga does not clear itself: the same WorkerRequest re-fires every
 /// block, forever. latch it — an `error!` in a permanent loop stops meaning
 /// anything, and it would evict every other line in the ring behind it.
@@ -232,6 +265,21 @@ fn sanitize(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_latch_logs_the_first_then_every_nth_and_counts_the_rest() {
+        let latch = Latch::new(100);
+        // a joiner refused once must be visible IMMEDIATELY — not on the 100th try.
+        assert_eq!(latch.hit("not_in_committed_standing"), Some(1));
+        for _ in 2..100 {
+            assert_eq!(latch.hit("not_in_committed_standing"), None, "no flood");
+        }
+        // ...and the count is what tells you it is WEDGED, not merely flaky.
+        assert_eq!(latch.hit("not_in_committed_standing"), Some(100));
+
+        // distinct reasons latch independently: a noisy one must never mask another.
+        assert_eq!(latch.hit("sync_proof_invalid"), Some(1));
+    }
 
     #[test]
     fn a_misspelled_level_is_refused_not_silently_skipped() {

@@ -937,8 +937,15 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     // the http shutdown route alone can't reach a parked joiner (no surface).
     // best-effort: a failed write only degrades stop back to the pgrep sweep.
     if let Err(err) = fs::write(pidfile(&dir), child.id().to_string()) {
-        eprintln!("workspace_select: could not record node pid: {err}");
+        tracing::warn!(
+            target: "ducktape::shell",
+            error = %err,
+            "could not record the node pid — teardown falls back to the pgrep sweep"
+        );
     }
+    // keep the handle instead of dropping it: it is the only thing that can ever
+    // report HOW the node died (and reap it). see `daemon::watch_node_exit`.
+    crate::daemon::watch_node_exit(child, ws.name.clone());
     // commit `active` ONLY now the node is confirmed up: a select that fails to
     // start the node must not repoint `active` at a workspace the next boot
     // then can't launch (which would strand the app on that dead workspace).
