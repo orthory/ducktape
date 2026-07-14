@@ -17,13 +17,14 @@ use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
 use crate::host_reads::{
     read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
-    read_valset_residents,
+    read_valset_residents, upgrade_operations,
 };
 use crate::{lobby, relay};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_drain(&mut self) {
+        let operation_metrics = self.metrics.clone();
         let Self {
             context,
             node,
@@ -125,7 +126,8 @@ impl ValidatorRuntime<'_> {
                 record,
                 applied,
                 latency_us,
-                op_count,
+                applied_ops,
+                rejected_ops,
                 ..
             } = action;
             // one block per height: an APPLIED block records fully
@@ -138,7 +140,7 @@ impl ValidatorRuntime<'_> {
             } else {
                 metrics.record_height(height);
             }
-            metrics.record_ops(op_count);
+            metrics.record_op_outcomes(applied_ops, rejected_ops);
             // this lane's agreed clock IS the height: the drain stamps
             // BlockContext { consensus_time: height } for every block.
             let ops = indexer::BlockOps {
@@ -149,8 +151,11 @@ impl ValidatorRuntime<'_> {
                 // consensus stays perfectly healthy while the ENTIRE app UI
                 // silently stops updating: every module view the app reads is
                 // served from this derived index. it does not self-heal.
+                // `event` is the operational contract (#603); `target` is the
+                // filtering plane — orthogonal, so carry both.
                 tracing::error!(
                     target: "ducktape::consensus",
+                    event = "node_index_poisoned",
                     node = %label,
                     height,
                     error = %err,
@@ -461,10 +466,31 @@ impl ValidatorRuntime<'_> {
                             eprintln!("[node {label}] oplog prune failed: {e}");
                         }
                         *prev_ckpt = (m.height, pos);
+                        tracing::info!(
+                            event = "node_checkpoint_written",
+                            node = %label,
+                            height = m.height.unwrap_or_default()
+                        );
                     }
-                    Err(e) => eprintln!("[node {label}] checkpoint write failed (will retry): {e}"),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "node_checkpoint_failed",
+                            node = %label,
+                            stage = "write",
+                            error = %e
+                        );
+                        eprintln!("[node {label}] checkpoint write failed (will retry): {e}");
+                    }
                 },
-                Err(e) => eprintln!("[node {label}] checkpoint capture failed (will retry): {e}"),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "node_checkpoint_failed",
+                        node = %label,
+                        stage = "capture",
+                        error = %e
+                    );
+                    eprintln!("[node {label}] checkpoint capture failed (will retry): {e}");
+                }
             }
         }
 
@@ -666,15 +692,33 @@ impl ValidatorRuntime<'_> {
                 // a separate abort-only follow-up — the one Advance owns both.
                 node.host_mut().set_active_version(plan.boundary_version());
                 match plan.upgrade_verdict() {
-                    consensus::UpgradeVerdict::Armed { name, to_version } => println!(
-                        "[node {label}] upgrade activated name={name} version={to_version} at height {}",
-                        plan.cutover_app_height()
-                    ),
-                    consensus::UpgradeVerdict::Abort { name } => println!(
-                        "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
-                        plan.cutover_app_height(),
-                        plan.boundary_version()
-                    ),
+                    consensus::UpgradeVerdict::Armed { name, to_version } => {
+                        tracing::info!(
+                            event = "node_upgrade_activated",
+                            node = %label,
+                            name = %name,
+                            to_version,
+                            height = plan.cutover_app_height()
+                        );
+                        println!(
+                            "[node {label}] upgrade activated name={name} version={to_version} at height {}",
+                            plan.cutover_app_height()
+                        );
+                    }
+                    consensus::UpgradeVerdict::Abort { name } => {
+                        tracing::warn!(
+                            event = "node_upgrade_aborted",
+                            node = %label,
+                            name = %name,
+                            height = plan.cutover_app_height(),
+                            current_version = plan.boundary_version()
+                        );
+                        println!(
+                            "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
+                            plan.cutover_app_height(),
+                            plan.boundary_version()
+                        );
+                    }
                     consensus::UpgradeVerdict::None => {}
                 }
                 // checkpoint IMMEDIATELY: the manifest must record
@@ -757,11 +801,22 @@ impl ValidatorRuntime<'_> {
         // every current member signaled), so this fires exactly when
         // readiness first reaches the full set — before H is crossed.
         if let Some(st) = read_upgrade_status_raw(node.host()).await {
+            let local_key = signer.public_key();
+            operation_metrics.update_upgrade(upgrade_operations(&st, Some(&local_key)));
             match &st.pending {
                 Some(up) => {
                     *upgrade_pending_seen = Some(up.name.clone());
                     let key = (up.name.clone(), up.to_version);
                     if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
+                        tracing::info!(
+                            event = "node_upgrade_armed",
+                            node = %label,
+                            name = %up.name,
+                            to_version = up.to_version,
+                            activation_height = up.activation_height,
+                            ready_validators = st.ready_count,
+                            required_validators = st.member_count
+                        );
                         println!(
                             "[node {label}] upgrade armed name={} to_version={} height={}",
                             up.name, up.to_version, up.activation_height
@@ -773,6 +828,11 @@ impl ValidatorRuntime<'_> {
                     if let Some(name) = upgrade_pending_seen.take() {
                         // the boundary Advance reconciled the pending
                         // (ARM flip or ABORT clear) — the slot is free.
+                        tracing::info!(
+                            event = "node_upgrade_cleared",
+                            node = %label,
+                            name = %name
+                        );
                         println!("[node {label}] upgrade cleared name={name}");
                         *upgrade_armed_latch = None;
                     }

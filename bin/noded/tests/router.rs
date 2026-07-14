@@ -82,6 +82,12 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             category: ModuleCategory::of("chat"),
                         }],
                         public_key: "ab".repeat(32),
+                        operations: noded::OperationalStatus {
+                            role: noded::NodeRole::Validator,
+                            phase: noded::NodePhase::Validating,
+                            phase_since: 1_720_000_000,
+                            ..Default::default()
+                        },
                     });
                 }
                 NodeCommand::Metrics { reply } => {
@@ -374,6 +380,9 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
     // the catalog category rides on the wire as a lowercase string.
     assert_eq!(body["modules"][0]["category"], "workspace");
+    assert_eq!(body["operations"]["role"], "validator");
+    assert_eq!(body["operations"]["phase"], "validating");
+    assert_eq!(body["operations"]["phaseSince"], 1_720_000_000u64);
 }
 
 #[tokio::test]
