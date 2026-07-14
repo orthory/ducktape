@@ -120,7 +120,7 @@ mod session;
 mod spec;
 mod variants;
 mod workspace;
-pub use sandbox::{SandboxBackend, TART_MIN_CORES, wrap_podman};
+pub use sandbox::{SandboxBackend, TART_MIN_CORES};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;

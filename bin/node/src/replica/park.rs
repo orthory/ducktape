@@ -25,10 +25,7 @@ use crate::host_reads::{
     joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
     read_valset_residents,
 };
-use crate::host_state::{
-    NetworkBindings, SyncSubstrates, restore_host, run_output_sink,
-    sync_all_modules,
-};
+use crate::host_state::{NetworkBindings, SyncSubstrates, restore_host, sync_all_modules};
 use crate::lobby;
 use crate::oracle_pool;
 use crate::relay;
@@ -481,7 +478,7 @@ pub(super) async fn park(
     let resident_provider_set = capability_host::discover(
         &me_bytes,
         agent_dirs.clone(),
-        Some(run_output_sink(stream_hub.run_output())),
+        Some(stream_hub.run_output().output_sink()),
         // the operator's `node.toml sandbox` choice (Direct or Podman), same
         // as the validator boot — a resident sandboxes its runs identically.
         sandbox,
