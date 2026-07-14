@@ -268,12 +268,27 @@ pub(super) async fn finish(
             .child("statesync_serve")
             .spawn(move |_ctx| async move {
                 let mut server = SyncServer::new();
+                // every refusal below is a SILENT DROP: "why is this joiner never
+                // syncing?" is unanswerable from the serving side, because
+                // standing-refused, proof-invalid and malformed all look identical
+                // (nothing) to both parties. these paths are peer-drivable and a
+                // blocked joiner retries forever, so they latch instead of flooding.
+                static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
                 while let Some((peer, bytes)) = ingress.next().await {
                     // mesh frames ride the AUTHENTICATED rpc envelope
                     // (requester ‖ proof ‖ id ‖ body — the id correlates).
                     let Ok((requester, proof, rpc_id, body)) =
                         statesync::decode_rpc_authed(&bytes)
                     else {
+                        if let Some(attempts) = REFUSED.hit("malformed_rpc_envelope") {
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "malformed_rpc_envelope",
+                                attempts,
+                                "statesync request dropped"
+                            );
+                        }
                         continue; // malformed rpc envelope: drop, never crash.
                     };
                     // OUR blob-fetch answers ride the same authed envelope with
@@ -315,6 +330,17 @@ pub(super) async fn finish(
                     // a failed check DROPS the request (deny-by-default, like the
                     // malformed/non-request drops), never a reply.
                     if !statesync::verify_sync_proof(requester, proof, &serve_namespace) {
+                        if let Some(attempts) = REFUSED.hit("sync_proof_invalid") {
+                            tracing::warn!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                requester = %noded::hex_bytes(&requester.as_ref()[..4]),
+                                reason = "sync_proof_invalid",
+                                attempts,
+                                "statesync request REFUSED — the requester's standing proof \
+                                 did not verify against this genesis namespace"
+                            );
+                        }
                         continue;
                     }
                     let requester = *requester;
@@ -354,6 +380,19 @@ pub(super) async fn finish(
                             continue; // state owner shutting down.
                         }
                         if !standing_rx.await.unwrap_or(false) {
+                            // THE one that makes a joiner sync forever in silence.
+                            // Both sides see nothing: the joiner just never converges,
+                            // and this node never says it was the one refusing.
+                            if let Some(attempts) = REFUSED.hit("not_in_committed_standing") {
+                                tracing::warn!(
+                                    target: "ducktape::statesync",
+                                    requester = %noded::hex_bytes(&requester.as_ref()[..4]),
+                                    reason = "not_in_committed_standing",
+                                    attempts,
+                                    "statesync REFUSED — the requester is not in committed \
+                                     standing (it must be admitted before it can sync state)"
+                                );
+                            }
                             continue; // not in committed standing: refuse (drop).
                         }
                     }

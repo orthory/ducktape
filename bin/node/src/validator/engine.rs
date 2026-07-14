@@ -19,7 +19,7 @@ use sdk::Msg;
 
 use crate::constants::{CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
 use crate::host_reads::resume_resident_keys;
-use crate::util::{diag_log, epoch_floor, fatal, hex};
+use crate::util::{epoch_floor, fatal, hex};
 
 pub(super) struct EpochSpawner<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -178,11 +178,14 @@ pub(super) async fn resume(
         .as_ref()
         .map(|floor| floor.height.to_string())
         .unwrap_or_else(|| "none".to_string());
-    diag_log(format!(
-        "DIAG promotion_recovered recovered_height={} recovered_hash={} replayed={} \
-     boot_floor_height={}",
-        recovered_height, recovered_hash, replayed, boot_floor_height
-    ));
+    tracing::debug!(
+        target: "ducktape::recovery",
+        recovered_height,
+        recovered_hash = %recovered_hash,
+        replayed,
+        boot_floor_height = %boot_floor_height,
+        "promotion recovered"
+    );
     let orderer = epoch_spawner.spawn(
         resume_epoch,
         participants.clone(),

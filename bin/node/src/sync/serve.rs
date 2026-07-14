@@ -10,7 +10,7 @@ use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::read_upgrade_version_fields;
-use crate::util::{diag_log, fatal, hex};
+use crate::util::{fatal, hex};
 
 pub(crate) fn assert_floor_binds_view(
     view_base: u64,
@@ -243,14 +243,15 @@ where
         .as_ref()
         .map(|floor| floor.height.to_string())
         .unwrap_or_else(|| "none".to_string());
-    diag_log(format!(
-        "DIAG {diag_tag} checkpoint_height={} checkpoint_hash={} \
-         floor_height={} floor_present={}",
-        boundary.height,
-        hex(&host.app_hash()),
-        floor_height,
-        floor.is_some()
-    ));
+    tracing::debug!(
+        target: "ducktape::statesync",
+        tag = %diag_tag,
+        checkpoint_height = boundary.height,
+        checkpoint_hash = %hex(&host.app_hash()),
+        floor_height = %floor_height,
+        floor_present = floor.is_some(),
+        "checkpoint captured"
+    );
     // stamp the real committed version fields so the captured checkpoint
     // carries the same `required_min_version` a live checkpoint would; the
     // next boot then preflights against them like any restart.
@@ -476,10 +477,29 @@ pub(crate) async fn drive_sync_request(
                 Ok(Err(recovery::Error::RangePruned {
                     after_height,
                     retained_start,
-                })) => statesync::SyncResponse::RangePruned {
-                    requested_after: after_height,
-                    retained_from: retained_start,
-                },
+                })) => {
+                    // THE known wedge, and neither side logged it. `checkpoint_blocks`
+                    // defaults to 32 and prune trails one checkpoint, so at a 1s block
+                    // the retention window is 32-64 SECONDS — a slow bridge or a laptop
+                    // wake is outrun, and no node anywhere recorded what the floor was
+                    // or who got refused. this is the line that answers "was my follower
+                    // too slow, or was the source pruning too aggressively" — the exact
+                    // question that ate the 07-14 live-join session.
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        requested_after = after_height,
+                        retained_from = retained_start,
+                        gap_blocks = retained_start.saturating_sub(after_height),
+                        reason = "pruned_below_retention_floor",
+                        "frame range REFUSED — the requester is below this node's retention \
+                         floor and can never catch up from here (it must full-sync; raise \
+                         `checkpoint_blocks` if this recurs)"
+                    );
+                    statesync::SyncResponse::RangePruned {
+                        requested_after: after_height,
+                        retained_from: retained_start,
+                    }
+                }
                 Ok(Err(e)) => statesync::SyncResponse::Error(format!("recovery frame range: {e}")),
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }

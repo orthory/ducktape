@@ -42,7 +42,7 @@ use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
     replica_verifier, verify_manifest_floor, write_boundary_checkpoint, ServedSeal,
 };
-use crate::util::{diag_log, fatal, hex};
+use crate::util::{fatal, hex};
 
 use super::promotion::{choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary};
 use super::reboot_self;
@@ -1917,31 +1917,30 @@ pub(super) async fn park(
                     }
                 };
                 let host_hash = host.app_hash();
-                diag_log(format!(
-                    "DIAG admission_revalidate synced_height={} synced_hash={} \
-                     latest_height={} latest_hash={} host_hash={} latest_matches_host={} \
-                     latest_floor_present={}",
-                    m.height,
-                    hex(&m.app_hash),
-                    latest.height,
-                    hex(&latest.app_hash),
-                    hex(&host_hash),
-                    latest.app_hash == host_hash,
-                    latest.floor_cert.is_some()
-                ));
+                tracing::debug!(
+                    target: "ducktape::join",
+                    synced_height = m.height,
+                    synced_hash = %hex(&m.app_hash),
+                    latest_height = latest.height,
+                    latest_hash = %hex(&latest.app_hash),
+                    host_hash = %hex(&host_hash),
+                    latest_matches_host = latest.app_hash == host_hash,
+                    latest_floor_present = latest.floor_cert.is_some(),
+                    "admission revalidate"
+                );
                 if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
                     fatal!(label, "promotion preflight failed: {e}");
                 }
                 match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
                     PromotionBoundary::Promote { boundary, source } => {
-                        diag_log(format!(
-                            "DIAG promotion_boundary chosen_height={} chosen_hash={} \
-                             chosen_floor_present={} source={}",
-                            boundary.height,
-                            hex(&boundary.app_hash),
-                            boundary.floor_cert.is_some(),
-                            source.as_str()
-                        ));
+                        tracing::debug!(
+                            target: "ducktape::join",
+                            chosen_height = boundary.height,
+                            chosen_hash = %hex(&boundary.app_hash),
+                            chosen_floor_present = boundary.floor_cert.is_some(),
+                            source = %source.as_str(),
+                            "promotion boundary chosen"
+                        );
                         let boundary = boundary.clone();
                         let boundary_floor =
                             match verify_manifest_floor(&namespace, &boundary) {
@@ -1950,10 +1949,13 @@ pub(super) async fn park(
                                     fatal!(label, "promotion floor verify: {e}");
                                 }
                             };
-                        diag_log(format!(
-                            "DIAG suffix_install from={} to={} frames=0",
-                            boundary.height, boundary.height
-                        ));
+                        tracing::debug!(
+                            target: "ducktape::join",
+                            from = boundary.height,
+                            to = boundary.height,
+                            frames = 0,
+                            "suffix install"
+                        );
                         let floor = boundary_floor.map(|cert| recovery::FloorCert {
                             epoch: boundary.epoch,
                             height: boundary.height,
