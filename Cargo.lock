@@ -6048,6 +6048,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
+ "tracing",
  "tracing-subscriber 0.3.23",
  "upgrade",
  "valset",
@@ -6106,6 +6107,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",
+ "tracing",
  "tracing-subscriber 0.3.23",
  "ts-rs",
 ]
@@ -8953,6 +8955,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "tracing",
  "upgrade",
  "valset",
 ]

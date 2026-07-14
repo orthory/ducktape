@@ -121,6 +121,12 @@ spawn_node() { # $1 = config path; detached orphan, mirrors the app's own spawn.
   # app instead of stranded in a side file. Update node.pid so the app's
   # teardown AND its process-death phase check track the LIVE node, not the one
   # it first spawned (else a hot-reload would read as a fatal crash).
+  # Roll the log past 32 MiB, exactly as the app's own spawn does (daemon.rs
+  # roll_if_oversized) — only the tail is ever read, so an append-forever file
+  # buries the boot sequence it exists to explain.
+  if [ -f "$dir/daemon.log" ] && [ "$(wc -c <"$dir/daemon.log")" -gt 33554432 ]; then
+    mv "$dir/daemon.log" "$dir/daemon.log.1"
+  fi
   nohup "$NODE_BIN" --config "$1" >>"$dir/daemon.log" 2>&1 &
   SPAWNED_PID=$!
   printf '%s\n' "$SPAWNED_PID" >"$dir/node.pid" 2>/dev/null || true

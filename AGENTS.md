@@ -60,6 +60,33 @@
   open with the risks, failed checks, or follow-up review needed instead of
   merging by default.
 
+## Logging
+
+- Use `tracing`, never `println!`/`eprintln!`. An event reaches BOTH the node's
+  stderr (tee'd into `<workspace>/daemon.log`) and the in-memory `LogRing` the
+  app's Logs tab streams over the ws `logs` topic. A `println!` reaches NEITHER:
+  it is invisible in the app and unfilterable by `RUST_LOG`. Program output is
+  not logging — a CLI's stdout (`bin/fs`, `bin/mcp`, `ducktape-node <subcommand>`)
+  stays `println!`.
+- **If it can fire more than once per block, it is not `info`.** The ring holds
+  4096 lines; one `info!` per 100 ms drain tick evicts the whole thing every
+  ~7 minutes, destroying the context around the event you were hunting.
+  `error` = stopped and will not self-heal. `warn` = we refused or dropped
+  something, for a nameable reason. `info` = a lifecycle fact, at most once per
+  {boot, block, epoch, session, connection}. `debug` = per-op / per-request.
+  `trace` = per-frame.
+- A forever-retry loop logs attempt 1, then every Nth, carrying an `attempts`
+  field. An unconditional `warn!` in one is a log bomb that evicts the very
+  evidence you need — and the counter IS the diagnosis.
+- Never log a URI path or query string (`/.duck/ws/{token}` carries a capability
+  token in the path, and the ring is streamed to the webview) or any key
+  material. A `reason` is a stable snake_case token, not prose — greppable and
+  countable.
+- Turn one plane up on a LIVE node rather than restarting it — a restart destroys
+  the wedged state you restarted to look at:
+  `curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'`
+- Doctrine and phased rollout: `docs/superpowers/plans/2026-07-14-logging-doctrine.md`.
+
 ## Rust Gates
 
 - Per-crate lint gate:

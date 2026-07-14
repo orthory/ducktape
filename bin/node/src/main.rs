@@ -50,7 +50,6 @@ use std::path::PathBuf;
 
 use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
-use tracing_subscriber::prelude::*;
 
 mod agent_plane;
 mod blob_fetch;
@@ -207,29 +206,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let log_ring = noded::LogRing::default();
-    init_tracing(log_ring.clone());
+    // ONE filter over stderr (→ daemon.log) + the ring (→ the app's Logs tab).
+    // the old two-filter setup defaulted stderr to `EnvFilter::from_default_env()`,
+    // whose no-directive default is ERROR — so with RUST_LOG unset (which is how
+    // the desktop spawns us) nothing below error ever reached daemon.log at all.
+    noded::log::init(Some(log_ring.clone()));
 
     run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
-}
-
-fn init_tracing(log_ring: noded::LogRing) {
-    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    // the stream's `logs` topic: info floor by default so hot-path debug/trace
-    // events never pay per-event formatting into the ring; RUST_LOG overrides.
-    let ring_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(log_ring)
-        .with_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        );
-    let _ = tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(ring_layer)
-        .try_init();
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
