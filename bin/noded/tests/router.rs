@@ -526,6 +526,8 @@ fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, node_key: Vec<u8>, o
                 let view = identity::AccountView {
                     account_id: owner_key.clone(),
                     display_name: None,
+                    avatar: None,
+                    bio: None,
                     nonce: 0,
                     member_keys: vec![identity::MemberKeyView {
                         pubkey: owner_key.clone(),
