@@ -317,7 +317,23 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
     duckfs_core::to_hex(bytes)
 }
 
+/// the ONE funnel every HTTP rejection flows through — 403 origin-guard, 413 body
+/// cap, 409 conflict, 503 no-mesh, every module 400. three lines light up the whole
+/// surface.
+///
+/// 4xx is `debug` ON PURPOSE: `gateway_http.rs`'s duck:// browse fallback proxies
+/// UNTRUSTED pages' fetches through this same funnel, so an unconditional `warn!`
+/// here is a log-ring DoS any page could drive. Turn it on when you care:
+///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::http=debug'
+///
+/// NEVER log the URI: `/.duck/ws/{token}` carries a capability token IN THE PATH,
+/// and the ring is streamed to the webview.
 fn error_response(status: StatusCode, message: &str) -> Response {
+    if status.is_server_error() {
+        tracing::warn!(target: "ducktape::http", status = status.as_u16(), message, "request failed");
+    } else {
+        tracing::debug!(target: "ducktape::http", status = status.as_u16(), message, "request refused");
+    }
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 

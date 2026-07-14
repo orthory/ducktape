@@ -253,6 +253,32 @@ impl ValidatorRuntime<'_> {
                     false,
                 );
             }
+            // BEFORE the pending_submits lookup, deliberately. An op rejected in
+            // consensus produced no record ANYWHERE: the submitter's own log says
+            // SUCCESS (the submit was accepted) while the state machine says NO.
+            //
+            // and the internal submits — oracle results, capability announces,
+            // upgrade readiness, code-ready signals — are fire-and-forget and never
+            // enter `pending_submits` at all, so the `continue` below swallows their
+            // rejection whole. That is exactly how an announcer that latches on
+            // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
+            // upgrade stuck at R<n, and nothing anywhere saying why.
+            let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
+            // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
+            // that deliberately does not exist. warning on it would fire every block
+            // forever on an idle chain, evicting the whole 4096-line ring in ~68
+            // minutes and drowning the very evidence someone came to read.
+            if d.disposition == node::Disposition::Rejected && module != NOP_TARGET {
+                tracing::warn!(
+                    target: "ducktape::submit",
+                    node = %label,
+                    frame = %noded::hex_bytes(&d.id),
+                    height = d.height,
+                    module,
+                    reason = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
+                    "op rejected in consensus"
+                );
+            }
             let Some((reply, _)) = pending_submits.remove(&d.id) else {
                 continue;
             };
