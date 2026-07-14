@@ -72,7 +72,7 @@ export type KeyIntent =
   | { type: "exit-to-paragraph" }
   | { type: "toggle-check" }
   | { type: "toggle-collapse" }
-  | { type: "insert-tab"; value: string; caret: number }
+  | { type: "edit-code"; value: string; selectionStart: number; selectionEnd: number }
   | { type: "indent" }
   | { type: "outdent" }
   | { type: "move-up" }
@@ -89,6 +89,51 @@ const atStart = (ctx: KeyContext): boolean => ctx.caretStart === 0 && ctx.caretE
 /** A collapsed caret sitting at the very end. */
 const atEnd = (ctx: KeyContext): boolean =>
   ctx.caretStart === ctx.value.length && ctx.caretEnd === ctx.value.length;
+
+/** Tab edits code text; it never becomes a block-tree command. A selection is
+ *  indented line-by-line so the selected code survives. Shift+Tab removes one
+ *  leading tab from each affected line and is still consumed when there is
+ *  nothing to remove, keeping focus inside the editor. */
+function editCode(ctx: KeyContext): KeyIntent {
+  const start = Math.max(0, Math.min(ctx.caretStart, ctx.value.length));
+  const end = Math.max(start, Math.min(ctx.caretEnd, ctx.value.length));
+  if (!ctx.shiftKey && start === end) {
+    return {
+      type: "edit-code",
+      value: `${ctx.value.slice(0, start)}\t${ctx.value.slice(end)}`,
+      selectionStart: start + 1,
+      selectionEnd: start + 1,
+    };
+  }
+
+  const first = ctx.value.slice(0, start).lastIndexOf("\n") + 1;
+  const stop = end > start && ctx.value[end - 1] === "\n" ? end - 1 : end;
+  const lines = [first];
+  for (let i = first; i < stop; i += 1) {
+    if (ctx.value[i] === "\n") lines.push(i + 1);
+  }
+
+  if (!ctx.shiftKey) {
+    let value = ctx.value;
+    for (const at of [...lines].reverse()) value = `${value.slice(0, at)}\t${value.slice(at)}`;
+    return {
+      type: "edit-code",
+      value,
+      selectionStart: start + 1,
+      selectionEnd: end + lines.length,
+    };
+  }
+
+  const removable = lines.filter((at) => ctx.value[at] === "\t");
+  let value = ctx.value;
+  for (const at of [...removable].reverse()) value = value.slice(0, at) + value.slice(at + 1);
+  return {
+    type: "edit-code",
+    value,
+    selectionStart: start - removable.filter((at) => at < start).length,
+    selectionEnd: end - removable.filter((at) => at < end).length,
+  };
+}
 
 export function resolveKey(ctx: KeyContext): KeyIntent {
   // the slash menu is a command in progress; it owns every key it handles.
@@ -129,14 +174,7 @@ export function resolveKey(ctx: KeyContext): KeyIntent {
   }
 
   if (ctx.key === "Tab") {
-    if (ctx.kind === "code") {
-      if (ctx.shiftKey) return NONE;
-      return {
-        type: "insert-tab",
-        value: `${ctx.value.slice(0, ctx.caretStart)}\t${ctx.value.slice(ctx.caretEnd)}`,
-        caret: ctx.caretStart + 1,
-      };
-    }
+    if (ctx.kind === "code") return editCode(ctx);
     return ctx.shiftKey ? { type: "outdent" } : { type: "indent" };
   }
 

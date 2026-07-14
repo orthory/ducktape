@@ -156,13 +156,46 @@ describe("resolveKey — structure", () => {
     expect(typeOf({ key: "Tab", shiftKey: true })).toBe("outdent");
   });
 
-  it("inserts a tab into code without moving the block", () => {
+  it("inserts a tab at a collapsed code caret without moving the block", () => {
     expect(
       resolveKey(
-        ctx({ key: "Tab", kind: "code", value: "abcd", caretStart: 1, caretEnd: 3 }),
+        ctx({ key: "Tab", kind: "code", value: "abcd", caretStart: 1, caretEnd: 1 }),
       ),
-    ).toEqual({ type: "insert-tab", value: "a\td", caret: 2 });
-    expect(typeOf({ key: "Tab", kind: "code", shiftKey: true })).toBe("none");
+    ).toEqual({ type: "edit-code", value: "a\tbcd", selectionStart: 2, selectionEnd: 2 });
+  });
+
+  it("indents selected code line-by-line without deleting it", () => {
+    expect(
+      resolveKey(
+        ctx({ key: "Tab", kind: "code", value: "one\ntwo\nthree", caretStart: 1, caretEnd: 7 }),
+      ),
+    ).toEqual({
+      type: "edit-code",
+      value: "\tone\n\ttwo\nthree",
+      selectionStart: 2,
+      selectionEnd: 9,
+    });
+  });
+
+  it("outdents affected code lines and consumes Shift+Tab even when unchanged", () => {
+    expect(
+      resolveKey(
+        ctx({
+          key: "Tab",
+          shiftKey: true,
+          kind: "code",
+          value: "\tone\n\ttwo\nthree",
+          caretStart: 1,
+          caretEnd: 9,
+        }),
+      ),
+    ).toEqual({
+      type: "edit-code",
+      value: "one\ntwo\nthree",
+      selectionStart: 0,
+      selectionEnd: 7,
+    });
+    expect(typeOf({ key: "Tab", kind: "code", shiftKey: true })).toBe("edit-code");
   });
 
   it("moves the block with Alt+Arrow", () => {
