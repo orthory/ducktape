@@ -10,7 +10,6 @@ import type { NavSection } from "../modules/module-def";
 import { nodeControlAvailable } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
-
 const navBg = (active: boolean) => (active ? color.hover : "transparent");
 const navFg = (active: boolean) => (active ? color.inkSoft : color.muted);
 const navIc = (active: boolean) => (active ? color.ink : color.iconIdle);

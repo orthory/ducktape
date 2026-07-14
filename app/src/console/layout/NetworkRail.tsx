@@ -11,7 +11,7 @@ import { isDesktop } from "../../domain/workspace-client";
 import { networksFrom, seatColor, seatInitial, type NetworkSeat } from "../store/networks";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font } from "../theme/tokens";
-import { initialsOf } from "../views/home/ProfileCard";
+import { initialsOf } from "../components/Avatar";
 
 /** The rail's fixed width. */
 export const NETWORK_RAIL_WIDTH = 62;

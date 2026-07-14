@@ -462,6 +462,8 @@ export function DucktapeProvider({
                     ? stateRef.current.messages
                     : chat.messages,
                   authorNames: people.authorNames,
+                  authorAvatars: people.authorAvatars,
+                  authorBios: people.authorBios,
                   nodeUsers: people.nodeUsers,
                   accountKeys: people.accountKeys,
                   accountHandles: people.accountHandles,

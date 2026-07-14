@@ -56,6 +56,8 @@ fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {
     AccountView {
         account_id: signer.public_key().as_ref().to_vec(),
         display_name: Some("Alice".into()),
+        avatar: None,
+        bio: None,
         nonce: 0,
         member_keys: vec![MemberKeyView {
             pubkey: signer.public_key().as_ref().to_vec(),

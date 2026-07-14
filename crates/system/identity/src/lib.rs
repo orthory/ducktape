@@ -76,12 +76,17 @@ struct MemberMeta {
     added_at: u64,
 }
 
-/// one stored account: display name, shared replay nonce, the member-key set,
-/// the bound node set, and the last-write block timestamp. `account_id` is the
-/// map key, so it is not repeated here.
+/// one stored account: display name, avatar ref + bio (the account's global
+/// profile, propagated per-network by the app), shared replay nonce, the
+/// member-key set, the bound node set, and the last-write block timestamp.
+/// `account_id` is the map key, so it is not repeated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AccountRecord {
     display_name: Option<String>,
+    /// duckfs path the app resolves the avatar image against (`None` unset).
+    avatar: Option<String>,
+    /// short bio/status line (`None` unset).
+    bio: Option<String>,
     nonce: u64,
     member_keys: BTreeMap<Vec<u8>, MemberMeta>,
     nodes: BTreeSet<Vec<u8>>,
@@ -242,6 +247,8 @@ impl Identity {
         AccountView {
             account_id: account_id.to_vec(),
             display_name: record.display_name.clone(),
+            avatar: record.avatar.clone(),
+            bio: record.bio.clone(),
             nonce: record.nonce,
             member_keys: record
                 .member_keys
@@ -262,7 +269,8 @@ impl Identity {
 
     /// canonical bytes of `accounts`: `u64-le` account count, then per sorted
     /// account -- `len+account_id`, name (flag `u8` + `len+name` if set),
-    /// `u64-le` nonce, `u64-le` member count then per sorted member
+    /// avatar (flag `u8` + `len+avatar` if set), bio (flag `u8` + `len+bio` if
+    /// set), `u64-le` nonce, `u64-le` member count then per sorted member
     /// (`len+pubkey`, kind tag `u8`, label flag + `len+label` if set,
     /// rp-hash flag + 32 bytes if set, `u64-le added_at`), `u64-le` node count
     /// then per sorted node `len+node`, and `u64-le updated_at`. both indexes
@@ -273,6 +281,8 @@ impl Identity {
         for (account_id, record) in accounts {
             push_bytes(&mut out, account_id);
             push_opt_str(&mut out, record.display_name.as_deref());
+            push_opt_str(&mut out, record.avatar.as_deref());
+            push_opt_str(&mut out, record.bio.as_deref());
             out.extend_from_slice(&record.nonce.to_le_bytes());
 
             out.extend_from_slice(&(record.member_keys.len() as u64).to_le_bytes());
@@ -365,9 +375,10 @@ impl Identity {
     fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, AccountRecord>, Error> {
         let mut cur = Cursor::new(bytes);
         let count = cur.u64("snapshot account count")?;
-        // per-account minimum: id-len(8) + name flag(1) + nonce(8) + member
-        // count(8) + node count(8) + updated_at(8) = 41 bytes.
-        const MIN_ACCOUNT_BYTES: u64 = 41;
+        // per-account minimum: id-len(8) + name flag(1) + avatar flag(1) + bio
+        // flag(1) + nonce(8) + member count(8) + node count(8) + updated_at(8)
+        // = 43 bytes.
+        const MIN_ACCOUNT_BYTES: u64 = 43;
         cur.bound(count, MIN_ACCOUNT_BYTES, "snapshot account")?;
 
         let mut accounts = BTreeMap::new();
@@ -385,6 +396,8 @@ impl Identity {
             prev_account = Some(account_id.clone());
 
             let display_name = cur.opt_str(MAX_NAME_LEN, "snapshot account name")?;
+            let avatar = cur.opt_str(MAX_AVATAR_REF_LEN, "snapshot account avatar")?;
+            let bio = cur.opt_str(MAX_BIO_LEN, "snapshot account bio")?;
             let nonce = cur.u64("snapshot account nonce")?;
 
             let member_keys = Self::decode_members(&mut cur)?;
@@ -395,6 +408,8 @@ impl Identity {
                 account_id,
                 AccountRecord {
                     display_name,
+                    avatar,
+                    bio,
                     nonce,
                     member_keys,
                     nodes,
@@ -533,6 +548,7 @@ impl Module for Identity {
             IdentityMsg::SetAccountName { display_name } => {
                 self.set_account_name(ctx, display_name)
             }
+            IdentityMsg::SetProfile { avatar, bio } => self.set_profile(ctx, avatar, bio),
         }
     }
 
@@ -663,6 +679,8 @@ impl Identity {
                     );
                     let record = AccountRecord {
                         display_name: None,
+                        avatar: None,
+                        bio: None,
                         nonce: 0,
                         member_keys,
                         nodes: BTreeSet::new(),
@@ -875,6 +893,50 @@ impl Identity {
         record.updated_at = ctx.env().consensus_time;
         self.pending.insert(account_id, Some(record));
         Ok(())
+    }
+
+    /// set the avatar ref and/or bio of the account the origin node is bound
+    /// to. origin-gated exactly like `set_account_name`; each field empty-trims
+    /// to cleared, over its byte cap rejects. no signature, no nonce bump.
+    fn set_profile(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        avatar: Option<String>,
+        bio: Option<String>,
+    ) -> Result<(), Error> {
+        let origin = Self::origin_key(ctx)?;
+        let account_id = self
+            .merged_node_index()
+            .get(&origin)
+            .cloned()
+            .ok_or_else(|| Error::Module("origin node is not bound to an account".into()))?;
+        let mut record = self
+            .merged_record(&account_id)
+            .expect("node_index only ever points at an existing record");
+
+        record.avatar = clean_field(avatar, MAX_AVATAR_REF_LEN, "avatar reference")?;
+        record.bio = clean_field(bio, MAX_BIO_LEN, "bio")?;
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
+    }
+}
+
+/// trim an optional profile field: `None` or empty-after-trim -> cleared
+/// (`None`), over `max` bytes -> reject, else the trimmed string.
+fn clean_field(value: Option<String>, max: usize, what: &str) -> Result<Option<String>, Error> {
+    match value {
+        None => Ok(None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else if trimmed.len() > max {
+                Err(Error::Module(format!("{what} exceeds the {max}-byte limit")))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
     }
 }
 

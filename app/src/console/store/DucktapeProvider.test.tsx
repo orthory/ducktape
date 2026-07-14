@@ -134,6 +134,8 @@ const JESS_USER_KEY = Array.from({ length: 32 }, (_, index) => index);
 const JESS_USER: AccountView = {
   account_id: JESS_USER_KEY,
   display_name: "Jess K",
+  avatar: null,
+  bio: null,
   nonce: 0,
   member_keys: [],
   nodes: [[0xaa]],
@@ -2330,6 +2332,8 @@ describe("pages snapshot refresh vs in-flight ops", () => {
 const SELF_ACCOUNT: AccountView = {
   account_id: JESS_USER_KEY,
   display_name: "Jess K",
+  avatar: null,
+  bio: null,
   nonce: 0,
   member_keys: [],
   nodes: [[0xaa], [0xbb]],

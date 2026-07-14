@@ -29,6 +29,12 @@ export interface MemberKeyView {
 export interface AccountView {
   account_id: number[];
   display_name: string | null;
+  /** Account avatar reference — a duckfs path (`/shared/attachments/avatars/…`)
+   *  the app resolves against the files module, or null when unset. Global to
+   *  the account; the app's reconcile-on-connect pass propagates it per-network. */
+  avatar: string | null;
+  /** Account bio/status line, or null when unset. Global to the account. */
+  bio: string | null;
   nonce: number;
   member_keys: MemberKeyView[];
   nodes: number[][];
@@ -65,6 +71,20 @@ export const setAccountName = (
   transport.submit(
     TARGET,
     { set_account_name: { display_name: params.displayName } },
+    params.origin,
+  );
+
+/** Set the account's avatar reference and/or bio. Origin-gated exactly like
+ *  `setAccountName` (a bound node is user-trusted hardware) — the shell never
+ *  signs. `null` clears a field. `avatar` is a duckfs path already committed to
+ *  the files plane; the identity module stores only the reference. */
+export const setAccountProfile = (
+  transport: NodeTransport,
+  params: { avatar: string | null; bio: string | null; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { set_profile: { avatar: params.avatar, bio: params.bio } },
     params.origin,
   );
 

@@ -209,6 +209,12 @@ export interface ConsoleState {
    *  `identity` for author rendering. Unbound nodes deliberately have no
    *  replicated display-name record. */
   authorNames: Record<string, string>;
+  /** hex(key) → the account's avatar duckfs path, keyed like `authorNames`
+   *  (account id AND every bound node hex). The Avatar component resolves the
+   *  bytes over the files plane; absent = render initials. */
+  authorAvatars: Record<string, string>;
+  /** hex(key) → the account's bio/status line, keyed like `authorNames`. */
+  authorBios: Record<string, string>;
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
    *  (null if unset), already folded into `authorNames` when present. */
@@ -810,6 +816,8 @@ export const createInitialState = (): ConsoleState => {
     channelTags: [],
     channelMembers: [],
     authorNames: {},
+    authorAvatars: {},
+    authorBios: {},
     nodeUsers: {},
     accountKeys: {},
     accountHandles: {},
@@ -905,6 +913,8 @@ export const resetNodeProjection = (): Partial<ConsoleState> => ({
   channelTags: [],
   channelMembers: [],
   authorNames: {},
+  authorAvatars: {},
+  authorBios: {},
   nodeUsers: {},
   accountKeys: {},
   accountHandles: {},
@@ -955,6 +965,8 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
+  authorAvatars: Record<string, string>;
+  authorBios: Record<string, string>;
   nodeUsers: Record<string, { accountId: string; name: string | null }>;
   accountKeys: Record<string, MemberKeyView[]>;
   accountHandles: Record<string, string>;
@@ -982,6 +994,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
+  authorAvatars: snapshot.authorAvatars,
+  authorBios: snapshot.authorBios,
   nodeUsers: snapshot.nodeUsers,
   accountKeys: snapshot.accountKeys,
   accountHandles: snapshot.accountHandles,

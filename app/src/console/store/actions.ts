@@ -64,6 +64,8 @@ import {
 import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity, type AutoBindResult } from "./auto-bind";
+import { saveAccountProfile } from "./account-profile";
+import { pushProfileEdit, reconcileProfile } from "./profile-reconcile";
 import { navSnapshotOf } from "./nav-history";
 import type { NavSnapshot } from "./nav-history";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
@@ -157,8 +159,14 @@ export interface ConsoleActions {
   setNotifyPrefs(prefs: NotifyPrefs): void;
   toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
-  /** Set this node's bound identity account display name. */
+  /** Set this node's bound identity account display name. Also mirrors the name
+   *  into the app-local account profile so it propagates to networks joined
+   *  later (not only the active one). */
   setDisplayName(name: string): void;
+  /** Save the account's global avatar/bio and push them to the active network.
+   *  `avatar`: a data URL sets a new image, `null` removes it, `undefined`
+   *  keeps the current one. Rejects with an inline error on write failure. */
+  saveProfile(edit: { bio: string; avatar: string | null | undefined }): Promise<void>;
   /** Declaratively set or clear the bound account's optional `.duck` name. */
   setDuckHandle(handle: string | null): void;
 
@@ -719,13 +727,20 @@ export function createActions({
   ): Promise<AutoBindResult> =>
     autoBindUserIdentity(transport, target).then((outcome) => {
       const pending = loadPendingDisplayName();
-      if (!pending) return outcome;
-      patch({ author: pending });
-      if (outcome !== "bound" && outcome !== "already") return outcome;
-      return identityClient
-        .setAccountName(transport, { displayName: pending, origin: pending })
-        .then(() => clearPendingDisplayName())
-        .catch(() => {}) // a bounced name stays parked for the next pass
+      const flushName =
+        pending && (outcome === "bound" || outcome === "already")
+          ? identityClient
+              .setAccountName(transport, { displayName: pending, origin: pending })
+              .then(() => clearPendingDisplayName())
+              .catch(() => {}) // a bounced name stays parked for the next pass
+          : Promise.resolve();
+      if (pending) patch({ author: pending });
+      // Reconcile the account's global profile (name/avatar/bio) to THIS
+      // network — the idempotent auto-push mirror of the bind pass. Best-effort
+      // and self-guarding on an unbound node; the next connect retries.
+      return flushName
+        .then(() => reconcileProfile(transport, { nodePub: target.pubkey }))
+        .catch(() => {})
         .then(() => outcome);
     });
 
@@ -1854,6 +1869,9 @@ export function createActions({
         return;
       }
       const previous = current.author;
+      // Mirror into the app-local account profile so the name propagates to
+      // networks joined later (reconcile-on-connect), not just the active one.
+      saveAccountProfile({ name: name.trim() || null });
       void submitTracked(
         opKey.accountName(),
         (live) =>
@@ -1862,6 +1880,37 @@ export function createActions({
       ).then((landed) => {
         // un-paint only if no newer write replaced the name mid-flight.
         if (!landed && getState().author === name) patch({ author: previous });
+      });
+    },
+
+    saveProfile: (edit) => {
+      const current = getState();
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
+      const accountId = nodeKey ? current.nodeUsers[nodeKey]?.accountId : undefined;
+      // Persist the global profile locally regardless of connection — the
+      // reconcile pass carries it to networks on their next connect.
+      saveAccountProfile({
+        bio: edit.bio.trim() || null,
+        ...(edit.avatar === undefined ? {} : { avatar: edit.avatar }),
+      });
+      if (!accountId) {
+        fail("bind this node to an identity account before editing your profile");
+        return Promise.resolve();
+      }
+      const live = getNode();
+      const nodePub = current.workspace?.pubkey;
+      if (!live || !nodePub) {
+        fail("not connected to a workspace node");
+        return Promise.resolve();
+      }
+      // Authoritative direct write to the active network (handles clears too).
+      return pushProfileEdit(live, {
+        nodePub,
+        bio: edit.bio,
+        avatar: edit.avatar,
+      }).catch((err) => {
+        fail(err);
+        throw err;
       });
     },
 
