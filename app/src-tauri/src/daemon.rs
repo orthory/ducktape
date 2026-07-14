@@ -849,6 +849,34 @@ pub(crate) fn clear_supervised(dir: &Path) {
     lock_flags().remove(dir);
 }
 
+/// persist `child`'s pid ONLY while it is still alive: `spawn_verified`'s http
+/// ready-probe can be satisfied by an ALREADY-RUNNING node on the same port, so
+/// a duplicate that bound nothing and died instantly could otherwise overwrite
+/// the live node's pidfile with a corpse pid — after which the control phase
+/// shows "Start" for a node the app is actively connected to (epic QA BUG-3).
+pub(crate) fn record_pid_if_alive(child: &mut Child, pidfile: &Path, workspace: &str) {
+    match child.try_wait() {
+        // still running — the pid is honest; a failed write only degrades stop
+        // back to the pgrep sweep.
+        Ok(None) => {
+            if let Err(err) = fs::write(pidfile, child.id().to_string()) {
+                tracing::warn!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    error = %err,
+                    "could not record the node pid — teardown falls back to the pgrep sweep"
+                );
+            }
+        }
+        _ => tracing::warn!(
+            target: "ducktape::shell",
+            %workspace,
+            pid = child.id(),
+            "spawned node already exited — not recording its pid"
+        ),
+    }
+}
+
 /// The auto-restart POLICY, factored out so it is testable without a process:
 /// revive only an UNEXPECTED exit (non-zero / signal), only when no stop was
 /// requested, and only under the crash cap.
@@ -945,10 +973,14 @@ fn maybe_restart(sup: Supervisor, restarts: u32, exit_code: Option<i32>) {
     if sup.stopping.load(Ordering::SeqCst) {
         return;
     }
-    // adopt-hardening: if a re-select (or a prior restart) already brought a node
-    // up on this workspace's listen port, DON'T double-spawn — that node is now
-    // the one; this reaper's job is done.
-    if crate::workspaces::port_listening(sup.listen_port) {
+    // adopt-hardening: if a re-select (or a prior restart) already brought a
+    // node up on this workspace's listen OR http port, DON'T double-spawn —
+    // that node is now the one; this reaper's job is done. (http too: a mesh
+    // listener on a non-loopback interface is invisible to a loopback probe —
+    // epic QA BUG-1.)
+    if crate::workspaces::port_listening(sup.listen_port)
+        || crate::workspaces::port_listening(sup.http_port)
+    {
         tracing::info!(
             target: "ducktape::shell",
             workspace = %sup.workspace,
@@ -957,8 +989,8 @@ fn maybe_restart(sup: Supervisor, restarts: u32, exit_code: Option<i32>) {
         return;
     }
     match spawn_workspace_node(&sup.config, &sup.log, Some(sup.http_port)) {
-        Ok(child) => {
-            let _ = fs::write(&sup.pidfile, child.id().to_string());
+        Ok(mut child) => {
+            record_pid_if_alive(&mut child, &sup.pidfile, &sup.workspace);
             tracing::warn!(
                 target: "ducktape::shell",
                 workspace = %sup.workspace,

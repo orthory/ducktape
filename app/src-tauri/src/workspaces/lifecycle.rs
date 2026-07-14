@@ -11,10 +11,21 @@ use super::registry::Ports;
 
 /// is something accepting connections on this localhost port right now? used as
 /// a liveness probe for an already-running workspace node.
+///
+/// BOTH loopback families are probed: the app mints the mesh listener as
+/// `[::]:<port>` (dual-stack), and on hosts where an IPv4-mapped connect to a
+/// v6 socket doesn't take, a 127.0.0.1-only probe reports a LIVE node as down —
+/// the adopt guard then double-spawns, the duplicate dies address-in-use on the
+/// mesh port, and the supervisor crash-loops to its cap (observed live, epic
+/// QA BUG-1). `::1` sees a `[::]` listener unconditionally; `127.0.0.1` sees an
+/// IPv4-bound one. Either answering means the port is held.
 pub(crate) fn port_listening(port: u16) -> bool {
-    use std::net::{SocketAddr, TcpStream};
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    let timeout = Duration::from_millis(200);
+    let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&v4, timeout).is_ok()
+        || TcpStream::connect_timeout(&v6, timeout).is_ok()
 }
 
 /// is the node WE spawned for this workspace still alive? reads the pidfile
@@ -128,6 +139,15 @@ fn workspace_node_pids(dir: &Path) -> Vec<u32> {
         .filter(|pid| *pid != ours)
         .filter(|pid| cmdline_of(*pid).is_some_and(|cmd| cmd.contains(&marker)))
         .collect()
+}
+
+/// the first LIVE, verified pid of this workspace's node — the adopt path uses
+/// it to make the pidfile honest again after a crash-loop left a corpse's pid
+/// behind (epic QA BUG-3). verification is [`workspace_node_pids`]'s exe/
+/// cmdline match; never a bare pattern kill.
+#[cfg(unix)]
+pub(super) fn live_workspace_node_pid(dir: &Path) -> Option<u32> {
+    workspace_node_pids(dir).into_iter().find(|pid| process_alive(*pid))
 }
 
 /// is `pid` a LIVE process? a zombie counts as dead: the shell never reaps its
@@ -428,5 +448,31 @@ mod tests {
         assert!(err.contains("still running"), "{err}");
         drop(listener);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// epic QA BUG-1 regression: the liveness probe must see a listener on
+    /// EITHER loopback family. The app mints the mesh listener as `[::]:<port>`;
+    /// a 127.0.0.1-only probe missing it is what double-spawned a live node
+    /// into an address-in-use crash loop.
+    #[test]
+    fn port_listening_sees_both_loopback_families() {
+        // an IPv4-loopback listener (the fleet-seed shape).
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(port_listening(v4.local_addr().unwrap().port()));
+        drop(v4);
+
+        // a v6 wildcard listener (the app-minted `[::]:<port>` mesh shape).
+        // skipped, not failed, on a host without IPv6.
+        if let Ok(v6) = TcpListener::bind("[::]:0") {
+            assert!(
+                port_listening(v6.local_addr().unwrap().port()),
+                "a [::] listener must read as held"
+            );
+            drop(v6);
+        }
+
+        // a port nobody holds reads as free.
+        let free = free_port(&[]).unwrap();
+        assert!(!port_listening(free));
     }
 }

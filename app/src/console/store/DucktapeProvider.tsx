@@ -901,6 +901,9 @@ export function DucktapeProvider({
         // status so its late slice completion cannot clear this down edge.
         hydrateGenRef.current += 1;
         if (stateRef.current.connected || !stateRef.current.connectionDown) {
+          // the raw transport reason stays in the log; the banner shows only
+          // the friendly line (epic QA BUG-5).
+          console.warn(`node connection down: ${signal.reason}`);
           dispatch({
             type: "patch",
             patch: {

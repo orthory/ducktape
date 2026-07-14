@@ -54,7 +54,12 @@ export function ConnectionBanner() {
       >
         {busy
           ? down.reason
-          : `${down.impostor ? "Connection lost — " : "Lost connection to the node — reconnecting… "}${down.reason}`}
+          : down.impostor
+            ? `Connection lost — ${down.reason}`
+            : // the raw transport reason ("stream socket closed") is log/tooltip
+              // material, not banner copy (epic QA BUG-5) — the title attr above
+              // and the console log at the down edge keep it reachable.
+              "Lost connection to the node — reconnecting…"}
       </span>
       {state.managed && !state.connected && !down.impostor && (
         <button onClick={() => actions.startNode()} style={restartBtn}>
