@@ -21,7 +21,7 @@ import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import type { OpLedger, OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, shadow } from "../../theme/tokens";
+import { color, font } from "../../theme/tokens";
 import { wallClockMillisOf } from "../../../domain/wire";
 import { relTime } from "../forge/ui";
 import {
@@ -234,60 +234,52 @@ function RunOutputPane({
   );
 }
 
-/** The daemon-lifecycle switch for job-board pickup — its own row on the
+/** The daemon-lifecycle controls for job-board pickup — their own row on the
  *  Activity tab, where background work lives. */
 export function JobsWorkerRow({
-  on,
   op,
   onToggle,
 }: {
-  on: boolean;
   op: OpRecord | undefined;
-  onToggle: () => void;
+  onToggle: (enabled: boolean) => void;
 }) {
+  const pending = op?.phase === "pending";
+  const actionStyle = {
+    ...secondaryButton,
+    cursor: pending ? "default" : "pointer",
+    opacity: pending ? 0.6 : 1,
+  };
+
   return (
     <GroupCard style={{ marginBottom: 16 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>Jobs worker</div>
           <div style={{ marginTop: 2, font: `400 11px ${font.sans}`, color: color.muted2 }}>
-            Let agents pick up background jobs.
+            {pending
+              ? "Waiting for confirmation…"
+              : "Current committed status is not readable on this network."}
           </div>
         </div>
         <FinalizationMark op={op} />
-        <button
-          type="button"
-          role="switch"
-          aria-checked={on}
-          aria-label="Jobs worker"
-          onClick={onToggle}
-          style={{
-            appearance: "none",
-            cursor: "pointer",
-            width: 40,
-            height: 22,
-            flexShrink: 0,
-            padding: 2,
-            borderRadius: 999,
-            border: `1px solid ${on ? color.dark : color.borderStrong}`,
-            background: on ? color.dark : color.chip,
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: on ? "flex-end" : "flex-start",
-            transition: "background .12s, border-color .12s",
-          }}
-        >
-          <span
-            aria-hidden="true"
-            style={{
-              width: 16,
-              height: 16,
-              borderRadius: "50%",
-              background: on ? color.onDark : color.muted,
-              boxShadow: shadow.card,
-            }}
-          />
-        </button>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => onToggle(true)}
+            style={actionStyle}
+          >
+            Enable worker
+          </button>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => onToggle(false)}
+            style={actionStyle}
+          >
+            Disable worker
+          </button>
+        </div>
       </div>
     </GroupCard>
   );

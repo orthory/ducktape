@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
+import { opKey } from "../../store/finalization";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { color } from "../../theme/tokens";
 import type { Channel } from "../../../domain/chat-client";
@@ -621,7 +622,7 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
-  it("reassigns or cancels an in-progress run and toggles the jobs worker", () => {
+  it("reassigns or cancels an in-progress run and offers honest worker actions", () => {
     const { spies } = renderAgents({
       runLease: new Map([
         [
@@ -653,8 +654,47 @@ describe("AgentView", () => {
     );
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
 
-    fireEvent.click(screen.getByRole("switch", { name: /jobs worker/i }));
+    expect(screen.queryByRole("switch", { name: /jobs worker/i })).toBeNull();
+    expect(screen.getByText(/committed status is not readable/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /enable worker/i }));
     expect(spies.enableJobWorker).toHaveBeenCalledWith(true);
+    fireEvent.click(screen.getByRole("button", { name: /disable worker/i }));
+    expect(spies.enableJobWorker).toHaveBeenCalledWith(false);
+  });
+
+  it("exposes a rejected worker action without claiming a registration state", () => {
+    renderAgents({
+      ops: {
+        [opKey.jobWorker()]: {
+          seq: 1,
+          phase: "failed",
+          startedAt: 10,
+          settledAt: 20,
+          error: "worker cap reached",
+        },
+      },
+    });
+
+    openTab(/activity/i);
+    expect(screen.queryByRole("switch", { name: /jobs worker/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "rejected" })).toBeInTheDocument();
+  });
+
+  it("disables both jobs-worker actions while one is pending", () => {
+    renderAgents({
+      ops: {
+        [opKey.jobWorker()]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+    });
+
+    openTab(/activity/i);
+    expect(screen.getByRole("button", { name: /enable worker/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /disable worker/i })).toBeDisabled();
+    expect(screen.getByText(/waiting for confirmation/i)).toBeInTheDocument();
   });
 
   it("offers announced executors as a Runs on picker, defaulting to the first", () => {
