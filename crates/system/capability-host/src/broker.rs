@@ -535,8 +535,31 @@ async fn provider_idle_control(
         }
     };
     let (status, reply, log) = state.idle_control.decide(token, request);
-    if let Some(log) = log {
-        eprintln!("[capability-host] provider idle control {log}");
+    if log.is_some() {
+        match &reply {
+            IdleControlReply::Granted {
+                request_id,
+                requested_secs,
+                hard_cap_truncated,
+                ..
+            } => tracing::debug!(
+                target: "ducktape::agent",
+                event = "provider_idle_control",
+                request_id = request_id.as_str(),
+                requested_secs = *requested_secs,
+                status = "granted",
+                hard_cap_truncated = *hard_cap_truncated,
+                "provider idle control"
+            ),
+            IdleControlReply::Denied { request_id, reason } => tracing::warn!(
+                target: "ducktape::agent",
+                event = "provider_idle_control",
+                request_id = request_id.as_deref().unwrap_or_default(),
+                status = "denied",
+                reason = *reason,
+                "provider idle control denied"
+            ),
+        }
     }
     json_response(status, &reply)
 }
