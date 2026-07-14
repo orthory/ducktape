@@ -20,7 +20,7 @@ import {
 import { useDucktape } from "../../store/use-ducktape";
 import { selfAuthorKeyOf } from "../chat/chat-helpers";
 import { accentVar, color, font, radius } from "../../theme/tokens";
-import { EDIT_BOUNDARY_MS, buildRows, subtreePlan } from "./pages-model";
+import { EDIT_BOUNDARY_MS, buildRows, subtreePlan, threadsForRange } from "./pages-model";
 import type { DuplicateOp } from "./pages-model";
 import type { FocusIntent } from "./block-keys";
 import { dropTarget } from "./page-drag";
@@ -683,9 +683,10 @@ export function PagesView() {
           anchor={commentCard.anchor}
           selection={commentCard.range}
           targetText={blocks.find((block) => block.id === commentCard.target)?.text ?? ""}
-          threads={
-            state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? []
-          }
+          threads={threadsForRange(
+            state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? [],
+            commentCard.range,
+          )}
           authorNames={state.authorNames}
           selfKey={selfKey}
           selfName={selfName}

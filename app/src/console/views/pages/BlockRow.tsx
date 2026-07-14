@@ -266,10 +266,18 @@ function BlockRowInner({
     }
   };
   const visibleMarks = rebaseMarks(block.text, draft, block.marks);
-  const commentRanges = threads
+  // each unresolved anchored thread, with its range in BOTH coordinate spaces:
+  // `live` (rebased against the draft) locates it under the caret; `anchor`
+  // (committed text) is what the store's threads are keyed by, so a click
+  // opens exactly that range's discussion.
+  const anchoredThreads = threads
     .filter(({ thread }) => !thread.resolved && thread.anchor)
-    .map(({ thread }) => rebaseRange(block.text, draft, thread.anchor as RelativeAnchor))
-    .filter((range) => range.start < range.end);
+    .map(({ thread }) => ({
+      anchor: thread.anchor as RelativeAnchor,
+      live: rebaseRange(block.text, draft, thread.anchor as RelativeAnchor),
+    }))
+    .filter(({ live }) => live.start < live.end);
+  const commentRanges = anchoredThreads.map(({ live }) => live);
   const threadCount = threads.length;
 
   // the latest commit closure lives in a ref so the boundary timer neither
@@ -538,11 +546,14 @@ function BlockRowInner({
         onClick={(event) => {
           const el = event.currentTarget;
           if (el.selectionStart !== el.selectionEnd) return;
-          if (!commentRanges.some(
-            (range) => range.start <= el.selectionStart && range.end > el.selectionStart,
-          )) return;
+          // narrowest highlighted range under the caret wins: nested ranges
+          // mean nested discussions, and the click aims at the specific one.
+          const hit = anchoredThreads
+            .filter(({ live }) => live.start <= el.selectionStart && live.end > el.selectionStart)
+            .sort((a, b) => (a.live.end - a.live.start) - (b.live.end - b.live.start))[0];
+          if (!hit) return;
           const rect = el.getBoundingClientRect();
-          handlers.openComments(block.id, { x: rect.right, y: rect.top });
+          handlers.openComments(block.id, { x: rect.right, y: rect.top }, hit.anchor);
         }}
       />
     </div>

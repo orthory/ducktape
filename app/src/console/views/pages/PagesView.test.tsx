@@ -618,7 +618,7 @@ describe("floating comment card", () => {
     const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
     area.setSelectionRange(2, 2);
     fireEvent.click(area);
-    screen.getByRole("dialog", { name: "Comments on this block" });
+    screen.getByRole("dialog", { name: "Comments on selected text" });
     expect(screen.getByLabelText("Commented text").textContent).toBe("First");
   });
 
@@ -655,6 +655,54 @@ describe("floating comment card", () => {
     fireEvent.keyDown(area, { key: "/", metaKey: true });
     screen.getByRole("dialog", { name: "Comments on selected text" });
     expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+  });
+
+  const twoRangeThreads = [
+    {
+      target: "a",
+      threads: [
+        {
+          thread: {
+            id: "t1", target: "a", opener: { user: [1] }, created_at: 1,
+            anchor: { start: 0, end: 5 }, resolved: false, resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [{
+            id: "c1", thread_id: "t1", author: { user: [1] }, text: "about First",
+            created_at: 1, edited_at: null, deleted: false,
+          }],
+        },
+        {
+          thread: {
+            id: "t2", target: "a", opener: { user: [1] }, created_at: 2,
+            anchor: { start: 6, end: 11 }, resolved: false, resolved_by: null,
+            comment_ids: ["c2"],
+          },
+          comments: [{
+            id: "c2", thread_id: "t2", author: { user: [1] }, text: "about draft",
+            created_at: 2, edited_at: null, deleted: false,
+          }],
+        },
+      ],
+    },
+  ] as ConsoleState["pageThreads"];
+
+  it("scopes the card to the clicked range's thread, not the whole block", () => {
+    renderPagesView({ pageThreads: twoRangeThreads });
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    area.setSelectionRange(2, 2); // inside "First" (t1), outside "draft" (t2)
+    fireEvent.click(area);
+    const dialog = screen.getByRole("dialog", { name: "Comments on selected text" });
+    within(dialog).getByText("about First");
+    expect(within(dialog).queryByText("about draft")).toBeNull();
+  });
+
+  it("the block affordance still shows every thread on the block", () => {
+    renderPagesView({ pageThreads: twoRangeThreads });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+    const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
+    within(dialog).getByText("about First");
+    within(dialog).getByText("about draft");
   });
 });
 
