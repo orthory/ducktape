@@ -168,6 +168,7 @@ function BlockRowInner({
   op,
   threads,
   commentOpen,
+  pendingCommentRange,
   dropEdge,
   presence,
   onCursor,
@@ -189,6 +190,10 @@ function BlockRowInner({
   threads: ThreadView[];
   /** The comment card is open on THIS block — its margin badge lights up. */
   commentOpen: boolean;
+  /** The range the open comment card is aimed at, when it has no thread yet:
+   *  the composer's anchor must stay visible while the user writes, or they
+   *  can no longer see what they're commenting on. */
+  pendingCommentRange?: RelativeAnchor;
   /** A drag is hovering this row and would land on this edge. */
   dropEdge: DropEdge | null;
   /** Live, off-consensus peers whose caret is in this block. */
@@ -284,7 +289,21 @@ function BlockRowInner({
       live: rebaseRange(block.text, draft, thread.anchor as RelativeAnchor),
     }))
     .filter(({ live }) => live.start < live.end);
-  const commentRanges = anchoredThreads.map(({ live }) => live);
+  // a fresh composer's range paints like a thread's — the anchor must not
+  // vanish the moment the guide menu closes. It only fills the gap until the
+  // thread exists: once one covers the same range, the thread's own paint wins.
+  const pendingLive =
+    pendingCommentRange &&
+    !anchoredThreads.some(
+      ({ anchor }) =>
+        anchor.start === pendingCommentRange.start && anchor.end === pendingCommentRange.end,
+    )
+      ? rebaseRange(block.text, draft, pendingCommentRange)
+      : null;
+  const commentRanges = [
+    ...anchoredThreads.map(({ live }) => live),
+    ...(pendingLive && pendingLive.start < pendingLive.end ? [pendingLive] : []),
+  ];
   const threadCount = threads.length;
   // the margin badge counts OPEN discussions; a block whose threads are all
   // resolved is done talking and gets the quiet hover affordance back.
@@ -792,6 +811,8 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.op === b.op &&
     a.threads === b.threads &&
     a.commentOpen === b.commentOpen &&
+    a.pendingCommentRange?.start === b.pendingCommentRange?.start &&
+    a.pendingCommentRange?.end === b.pendingCommentRange?.end &&
     a.dropEdge === b.dropEdge &&
     a.presence === b.presence &&
     a.onCursor === b.onCursor &&

@@ -116,10 +116,14 @@ export function DiscussionParticipants({
  *  submits, Shift+Enter breaks a line (comments render pre-wrap). */
 export function NewThreadComposer({
   composer,
+  quote,
   onSubmit,
   onCancel,
 }: {
   composer: ComposerTarget;
+  /** The selected text this thread will anchor to — echoed above the box so
+   *  the writer still sees what they're commenting on. */
+  quote?: string;
   onSubmit: (target: string, text: string) => void;
   onCancel: () => void;
 }) {
@@ -143,6 +147,24 @@ export function NewThreadComposer({
       <div style={{ font: `600 11.5px ${font.sans}`, color: color.ink, marginBottom: 6 }}>
         New comment on {composer.label}
       </div>
+      {quote ? (
+        <div
+          aria-label="Commented text"
+          style={{
+            margin: "0 0 8px",
+            padding: "6px 9px",
+            borderLeft: `2px solid ${color.amber}`,
+            borderRadius: radius.sm,
+            background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
+            color: color.muted3,
+            font: `500 11.5px/1.4 ${font.sans}`,
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {quote}
+        </div>
+      ) : null}
       <textarea
         ref={ref}
         aria-label="New comment text"

@@ -672,6 +672,17 @@ describe("floating comment card", () => {
     expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
   });
 
+  it("keeps the fresh anchor visible and quoted while composing", () => {
+    renderPagesView();
+    const area = selectFirstBlock(0, 5);
+    fireEvent.keyDown(area, { key: "/", metaKey: true });
+    const dialog = screen.getByRole("dialog", { name: "Comments on selected text" });
+    // no thread exists yet, but the range still paints behind the textarea…
+    expect(document.querySelector("[data-inline-text]")?.textContent).toBe("First draft");
+    // …and the composer echoes the selected text.
+    expect(within(dialog).getByLabelText("Commented text").textContent).toBe("First");
+  });
+
   const twoRangeThreads = [
     {
       target: "a",

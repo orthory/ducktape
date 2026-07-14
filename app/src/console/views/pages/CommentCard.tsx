@@ -207,6 +207,7 @@ export function CommentCard({
           <NewThreadComposer
             key={target}
             composer={{ target, label }}
+            quote={selection ? targetText.slice(selection.start, selection.end) : undefined}
             onSubmit={(t, text) => {
               if (selection) onSubmitNew(t, text, selection);
               else onSubmitNew(t, text);

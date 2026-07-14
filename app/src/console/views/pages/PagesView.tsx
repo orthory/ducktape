@@ -672,6 +672,9 @@ export function PagesView() {
                       op={state.ops[opKey.pageBlock(row.block.id)]}
                       threads={threadsByTarget.get(row.block.id) ?? EMPTY_THREADS}
                       commentOpen={commentCard?.target === row.block.id}
+                      pendingCommentRange={
+                        commentCard?.target === row.block.id ? commentCard.range : undefined
+                      }
                       presence={presenceByBlock.get(row.block.id) ?? EMPTY_PRESENCE}
                       onCursor={onCursor}
                       // the indicator only appears where the drop would ACTUALLY
