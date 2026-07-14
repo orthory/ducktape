@@ -31,12 +31,20 @@ pub(crate) async fn run(
     signer: &ed25519::PrivateKey,
     mesh_participants: Set<ed25519::PublicKey>,
     sync_sources: Vec<ed25519::PublicKey>,
+    metrics: noded::NodeMetrics,
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
     identity_chain_id: String,
     blobs: noded::blobs::BlobHandle,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
+    metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Syncing);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "sync_only",
+        phase = "syncing",
+        node = label
+    );
     // no consensus coordinates yet: track the genesis mesh at the
     // base index. validators ignore this index if they have rotated
     // past keeping it; connection authorization is the UNION of every
@@ -96,6 +104,15 @@ pub(crate) async fn run(
     network.start();
 
     if sync_sources.is_empty() {
+        let error = "no validator state-sync source is configured";
+        metrics.record_sync_failure(error);
+        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+        tracing::error!(
+            event = "node_sync_failed",
+            role = "sync_only",
+            node = label,
+            error
+        );
         eprintln!(
             "[node {label}] no statesync source: no validator other than this node \
              is available to serve (only validators answer the statesync channel)"
@@ -124,11 +141,13 @@ pub(crate) async fn run(
         match fetch_manifest(&client).await {
             Ok(m) => break m,
             Err(e) => {
+                metrics.record_sync_retry(e.to_string());
                 println!("[node {label}] manifest not ready ({e}); retrying");
                 context.sleep(Duration::from_millis(500)).await;
             }
         }
     };
+    metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
     println!(
         "[node {label}] manifest height={} app_hash={}",
         manifest.height,
@@ -143,10 +162,28 @@ pub(crate) async fn run(
     // model): a lying value can at worst refuse-to-boot this joiner, never
     // fork. inert on a baseline manifest.
     if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
+        metrics.record_sync_failure(e.to_string());
+        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+        tracing::error!(
+            event = "node_sync_refused",
+            role = "sync_only",
+            node = label,
+            stage = "protocol_preflight",
+            error = %e
+        );
         eprintln!("[node {label}] SYNC REFUSED: {e}");
         std::process::exit(1);
     }
     if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
+        metrics.record_sync_failure(e.to_string());
+        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+        tracing::error!(
+            event = "node_sync_refused",
+            role = "sync_only",
+            node = label,
+            stage = "schema_preflight",
+            error = %e
+        );
         eprintln!("[node {label}] SYNC REFUSED: {e}");
         std::process::exit(1);
     }
@@ -174,9 +211,27 @@ pub(crate) async fn run(
     .await
     {
         Ok(host) => {
+            metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
+            metrics.record_sync_progress(manifest.height);
+            metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Serving);
+            tracing::info!(
+                event = "node_phase_transition",
+                role = "sync_only",
+                phase = "serving",
+                node = label,
+                height = manifest.height
+            );
             println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
         }
         Err(e) => {
+            metrics.record_sync_failure(e.to_string());
+            metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+            tracing::error!(
+                event = "node_sync_failed",
+                role = "sync_only",
+                node = label,
+                error = %e
+            );
             eprintln!("[node {label}] SYNC FAILED: {e}");
             std::process::exit(1);
         }

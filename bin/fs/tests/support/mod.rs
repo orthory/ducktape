@@ -210,6 +210,7 @@ fn run_actor(duckfs_dir: std::path::PathBuf, mut cmd_rx: mpsc::Receiver<NodeComm
                             category: ModuleCategory::of("files"),
                         }],
                         public_key: String::new(),
+                        operations: Default::default(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {
