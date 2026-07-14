@@ -39,6 +39,11 @@ pub const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// contract validation and the mailbox agree with what saga can carry.
 pub const MAX_RESULT_BYTES: usize = saga::MAX_RESULT_BYTES;
 
+/// Exact successful result for a fail-fast attempt that finds occupied capacity.
+/// Kept on the shared wire surface so host producers and consensus receivers
+/// compare the same bytes.
+pub const RESOURCE_UNAVAILABLE_RESULT: &[u8] = br#"{"code":"RESOURCE_UNAVAILABLE"}"#;
+
 /// hard cap on a recipe / dispatch id.
 pub const MAX_ID_BYTES: usize = 128;
 
@@ -171,6 +176,26 @@ pub struct WorkSpec {
     /// worker reads demands from here, saga stays spec-opaque.
     #[serde(default)]
     pub demands: BTreeMap<String, u64>,
+    /// host-local resource admission behavior. Omitted legacy specs queue.
+    #[serde(default, skip_serializing_if = "AdmissionPolicy::is_queue")]
+    pub admission: AdmissionPolicy,
+}
+
+/// Host-local admission behavior for an assigned dispatch attempt.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionPolicy {
+    /// Wait for currently occupied capacity, preserving legacy behavior.
+    #[default]
+    Queue,
+    /// Attempt one atomic reservation and settle immediately when occupied.
+    FailFast,
+}
+
+impl AdmissionPolicy {
+    fn is_queue(&self) -> bool {
+        *self == Self::Queue
+    }
 }
 
 /// the delivery envelope a receiver module gets as a follow-up `Msg` from the
@@ -228,6 +253,9 @@ pub enum DispatchMsg {
         /// two can never drift.
         #[serde(default)]
         demands: BTreeMap<String, u64>,
+        /// host-local admission behavior; omitted callers retain Queue.
+        #[serde(default, skip_serializing_if = "AdmissionPolicy::is_queue")]
+        admission: AdmissionPolicy,
     },
     /// MODULE-ORIGIN ONLY, receiver-scoped: cancel an in-flight dispatch the
     /// emitting module owns. the underlying saga is cancelled in the same
@@ -330,6 +358,7 @@ mod tests {
             capability: "alpha".into(),
             payload: b"input".to_vec(),
             demands: BTreeMap::new(),
+            admission: AdmissionPolicy::Queue,
         };
         let bytes = encode_work_spec(&spec);
         assert_eq!(decode_work_spec(&bytes).unwrap(), spec);
@@ -343,5 +372,37 @@ mod tests {
 
         // a shape without the kind field at all is not a work spec.
         assert!(decode_work_spec(br#"{"run_id":"r","agent_id":"a"}"#).is_err());
+    }
+
+    #[test]
+    fn admission_defaults_to_queue_for_legacy_messages_and_specs() {
+        let legacy_msg =
+            br#"{"dispatch":{"dispatch_id":"d","recipe_id":"r","payload":[],"demands":{}}}"#;
+        let msg = decode_msg(legacy_msg).unwrap();
+        assert_eq!(encode_msg(&msg), legacy_msg);
+        assert!(matches!(
+            msg,
+            DispatchMsg::Dispatch {
+                admission: AdmissionPolicy::Queue,
+                ..
+            }
+        ));
+
+        let spec = decode_work_spec(
+            br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[],"demands":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.admission, AdmissionPolicy::Queue);
+        assert_eq!(
+            encode_work_spec(&spec),
+            br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[],"demands":{}}"#
+        );
+
+        let mut fail_fast = spec;
+        fail_fast.admission = AdmissionPolicy::FailFast;
+        assert_eq!(
+            decode_work_spec(&encode_work_spec(&fail_fast)).unwrap(),
+            fail_fast
+        );
     }
 }

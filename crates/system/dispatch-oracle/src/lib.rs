@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 
 use capability_host::{ProviderOutput, ProviderSet};
-use dispatch::{WorkSpec, decode_work_spec};
+use dispatch::{AdmissionPolicy, WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Event, Msg};
 
@@ -63,6 +63,7 @@ pub(crate) struct ExecJob {
     /// through so the pool can reserve this run's share of the host-local
     /// [`ResourceLedger`] before it starts executing.
     pub demands: BTreeMap<String, u64>,
+    pub admission: AdmissionPolicy,
 }
 
 pub(crate) struct AttemptOutput {
@@ -135,7 +136,11 @@ pub(crate) fn gate(
         // fit its demands — never claim what cannot fit; the re-emitted
         // request naming the winner is what executes.
         None => {
-            if !ledger.fits(&work.demands) {
+            let eligible = match work.admission {
+                AdmissionPolicy::Queue => ledger.fits(&work.demands),
+                AdmissionPolicy::FailFast => ledger.within_capacity(&work.demands),
+            };
+            if !eligible {
                 return Gated::Skip;
             }
             if providers.resolve(&work.capability).is_err() {
@@ -174,7 +179,9 @@ fn gate_own_lease(
     if !ledger.within_capacity(&work.demands) {
         return Gated::Skip;
     }
-    if let Err(e) = providers.resolve(&work.capability) {
+    if work.admission == AdmissionPolicy::Queue
+        && let Err(e) = providers.resolve(&work.capability)
+    {
         return Gated::Immediate(oracle_result(
             &request.saga_id,
             request.attempt,
@@ -187,6 +194,7 @@ fn gate_own_lease(
         capability: work.capability,
         input,
         demands: work.demands,
+        admission: work.admission,
     })
 }
 
@@ -299,6 +307,7 @@ format = "text"
             capability: "alpha".into(),
             payload: b"the entire input".to_vec(),
             demands: Default::default(),
+            admission: AdmissionPolicy::Queue,
         })
     }
 
@@ -405,6 +414,7 @@ format = "text"
             capability: "alpha".into(),
             payload: vec![0xff, 0xfe],
             demands: Default::default(),
+            admission: AdmissionPolicy::Queue,
         });
         match gate(
             &providers,
@@ -440,6 +450,7 @@ format = "text"
             capability: "alpha".into(),
             payload: b"the entire input".to_vec(),
             demands,
+            admission: AdmissionPolicy::Queue,
         })
     }
 
@@ -520,6 +531,29 @@ format = "text"
             gate(&providers, b"me", &ledger, &effect_for(spec, None)),
             Gated::Skip
         ));
+    }
+
+    #[test]
+    fn fail_fast_announcements_use_total_capacity_and_carry_policy_to_execution() {
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 4)]));
+        let _running = ledger
+            .try_reserve("running", &demands(&[("cores", 4)]))
+            .expect("first run fills capacity");
+        let mut work: WorkSpec =
+            decode_work_spec(&work_spec_with_demands(demands(&[("cores", 4)]))).expect("work spec");
+        work.admission = AdmissionPolicy::FailFast;
+        let spec = encode_work_spec(&work);
+
+        assert!(matches!(
+            gate(&providers, b"me", &ledger, &effect_for(spec.clone(), None)),
+            Gated::Immediate(_)
+        ));
+        let Gated::Execute(job) = gate(&providers, b"me", &ledger, &effect_for(spec, Some(b"me")))
+        else {
+            panic!("assigned fail-fast work reaches the atomic admission step")
+        };
+        assert_eq!(job.admission, AdmissionPolicy::FailFast);
     }
 
     #[test]
