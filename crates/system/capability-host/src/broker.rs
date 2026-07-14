@@ -169,12 +169,37 @@ impl BrokerInvocation {
     pub(crate) fn revoke(&self) {
         let mut state = self.idle_control.state.lock().unwrap();
         if state.token == self.endpoint.control_token {
-            state.token.clear();
-            state.hard_deadline = None;
-            state.deadline = None;
-            state.requests.clear();
-            state.cumulative_secs = 0;
+            revoke_idle_control(&mut state);
         }
+    }
+
+    /// Linearize a provisional timer wake against control grants. If a grant
+    /// won the mutex first, its watched deadline is observed and the child
+    /// continues. Otherwise expiry revokes the token before a later request
+    /// can be reported as granted.
+    pub(crate) fn continue_after_timeout_wake(
+        &self,
+        last_activity: tokio::time::Instant,
+        idle: Duration,
+        hard: tokio::time::Instant,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let mut state = self.idle_control.state.lock().unwrap();
+        if state.token != self.endpoint.control_token {
+            return false;
+        }
+        let explicit = state
+            .deadline
+            .as_ref()
+            .and_then(|deadline| *deadline.borrow());
+        let refreshed = (last_activity + idle)
+            .max(explicit.unwrap_or(last_activity + idle))
+            .min(hard);
+        if now < refreshed {
+            return true;
+        }
+        revoke_idle_control(&mut state);
+        false
     }
 }
 
@@ -182,6 +207,14 @@ impl Drop for BrokerInvocation {
     fn drop(&mut self) {
         self.revoke();
     }
+}
+
+fn revoke_idle_control(state: &mut IdleControlState) {
+    state.token.clear();
+    state.hard_deadline = None;
+    state.deadline = None;
+    state.requests.clear();
+    state.cumulative_secs = 0;
 }
 
 /// The only information that crosses into the provider child. None of these
@@ -869,6 +902,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(first.idle_deadline.borrow().is_some());
+        let boundary = tokio::time::Instant::now();
+        assert!(
+            first.continue_after_timeout_wake(
+                boundary - Duration::from_secs(1),
+                Duration::from_millis(10),
+                boundary + Duration::from_secs(60),
+                boundary,
+            ),
+            "a synchronously granted watch deadline wins over the expired old timer"
+        );
 
         let (status, replay) =
             control_call(&first.endpoint, Some(&control_token), body.clone()).await;
@@ -899,6 +942,25 @@ mod tests {
         .await;
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
         assert_eq!(cancelled["reason"], "unauthorized");
+
+        let expired = broker.begin_invocation();
+        expired.arm(tokio::time::Instant::now() + Duration::from_secs(60));
+        let expired_token = expired.endpoint.control_token.clone();
+        let boundary = tokio::time::Instant::now();
+        assert!(!expired.continue_after_timeout_wake(
+            boundary - Duration::from_secs(1),
+            Duration::from_millis(10),
+            boundary + Duration::from_secs(60),
+            boundary,
+        ));
+        let (status, denied) = control_call(
+            &expired.endpoint,
+            Some(&expired_token),
+            json!({"request_id":"too-late", "requested_secs":1}),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(denied["reason"], "unauthorized");
     }
 
     #[tokio::test]

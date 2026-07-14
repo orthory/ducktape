@@ -3007,6 +3007,17 @@ fn flush_pending_line(
     );
 }
 
+fn effective_provider_deadline(
+    last_activity: tokio::time::Instant,
+    idle: Duration,
+    explicit: Option<tokio::time::Instant>,
+    hard: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (last_activity + idle)
+        .max(explicit.unwrap_or(last_activity + idle))
+        .min(hard)
+}
+
 impl CliProvider {
     /// one child process, start to parsed answer, with an explicit argv and
     /// working directory — the shared engine under the cold and resume paths.
@@ -3126,9 +3137,8 @@ impl CliProvider {
         while out_open || err_open {
             let explicit = explicit_deadline
                 .as_ref()
-                .and_then(|deadline| *deadline.borrow())
-                .unwrap_or(last_activity + idle);
-            let deadline = (last_activity + idle).max(explicit).min(hard);
+                .and_then(|deadline| *deadline.borrow());
+            let deadline = effective_provider_deadline(last_activity, idle, explicit, hard);
             tokio::select! {
                 r = &mut feed, if fed.is_none() => fed = Some(r),
                 r = stdout_pipe.read(&mut obuf), if out_open => match r {
@@ -3194,11 +3204,50 @@ impl CliProvider {
                     }
                 },
                 _ = tokio::time::sleep_until(deadline) => {
-                    if let Some(invocation) = &broker_invocation {
-                        invocation.revoke();
+                    if ctx
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(RunCancellation::is_cancelled)
+                    {
+                        if let Some(invocation) = &broker_invocation {
+                            invocation.revoke();
+                        }
+                        live.terminate().await;
+                        return Err(format!(
+                            "{} cancelled (child terminated)",
+                            self.bin.display()
+                        ));
+                    }
+                    // A control grant and the old timer can become ready in
+                    // the same scheduler turn. The timer wake is provisional:
+                    // re-check under the controller's own mutex so either its
+                    // grant wins or this timeout revokes before it can grant.
+                    let now = tokio::time::Instant::now();
+                    let should_continue = broker_invocation.as_ref().map_or_else(
+                        || {
+                            now < effective_provider_deadline(
+                                last_activity,
+                                idle,
+                                explicit_deadline
+                                    .as_ref()
+                                    .and_then(|deadline| *deadline.borrow()),
+                                hard,
+                            )
+                        },
+                        |invocation| {
+                            invocation.continue_after_timeout_wake(
+                                last_activity,
+                                idle,
+                                hard,
+                                now,
+                            )
+                        },
+                    );
+                    if should_continue {
+                        continue;
                     }
                     live.terminate().await;
-                    return Err(if deadline == hard {
+                    return Err(if now >= hard {
                         format!(
                             "{} timed out: still running at the hard cap of {:?} \
                              ({HARD_TIMEOUT_FACTOR}x the idle window; child killed)",
@@ -5335,6 +5384,36 @@ printf '{"type":"turn.completed"}\n'"#,
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
         assert!(err.contains("no output"), "names the idle window: {err}");
+    }
+
+    #[test]
+    fn an_accepted_extension_wins_when_the_old_timer_wakes() {
+        let start = tokio::time::Instant::now();
+        let idle = Duration::from_millis(200);
+        let old_timer = start + idle;
+        let hard = start + Duration::from_secs(2);
+        assert_eq!(
+            effective_provider_deadline(start, idle, None, hard),
+            old_timer
+        );
+
+        // Model the scheduler boundary directly: the old sleep is ready at
+        // old_timer while the watch already carries the synchronously granted
+        // later deadline. The timeout branch's mandatory re-read must continue.
+        let granted = old_timer + Duration::from_millis(500);
+        let refreshed = effective_provider_deadline(start, idle, Some(granted), hard);
+        assert_eq!(refreshed, granted);
+        assert!(refreshed > old_timer);
+        assert_eq!(
+            effective_provider_deadline(
+                start,
+                idle,
+                Some(hard + Duration::from_secs(1)),
+                hard,
+            ),
+            hard,
+            "the same re-read never outranks the hard cap"
+        );
     }
 
     #[tokio::test]
