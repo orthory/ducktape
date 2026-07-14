@@ -32,10 +32,7 @@ use crate::{
     AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
     oracle_result_with_usage, renew_lease,
 };
-use dispatch::AdmissionPolicy;
-
-/// Stable successful result used when fail-fast admission finds occupied capacity.
-pub const RESOURCE_UNAVAILABLE_RESULT: &[u8] = br#"{"code":"RESOURCE_UNAVAILABLE"}"#;
+use dispatch::{AdmissionPolicy, RESOURCE_UNAVAILABLE_RESULT};
 
 /// how many provider runs may execute concurrently unless
 /// `DUCKTAPE_MAX_CONCURRENT_RUNS` says otherwise.

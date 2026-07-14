@@ -38,8 +38,7 @@ mod soul;
 mod workspace_source;
 pub use ledger::{ReservationGuard, ResourceLedger};
 pub use pool::{
-    AttemptControl, DeliverFn, DispatchPool, RESOURCE_UNAVAILABLE_RESULT, SpawnFn, SpawnKind,
-    max_concurrent_runs_from_env,
+    AttemptControl, DeliverFn, DispatchPool, SpawnFn, SpawnKind, max_concurrent_runs_from_env,
 };
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,

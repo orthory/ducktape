@@ -39,6 +39,11 @@ pub const MAX_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// contract validation and the mailbox agree with what saga can carry.
 pub const MAX_RESULT_BYTES: usize = saga::MAX_RESULT_BYTES;
 
+/// Exact successful result for a fail-fast attempt that finds occupied capacity.
+/// Kept on the shared wire surface so host producers and consensus receivers
+/// compare the same bytes.
+pub const RESOURCE_UNAVAILABLE_RESULT: &[u8] = br#"{"code":"RESOURCE_UNAVAILABLE"}"#;
+
 /// hard cap on a recipe / dispatch id.
 pub const MAX_ID_BYTES: usize = 128;
 
