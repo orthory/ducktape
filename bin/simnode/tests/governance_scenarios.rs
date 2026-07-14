@@ -597,7 +597,7 @@ fn governance_gates_the_electorate_tracks_votes_and_honors_the_deadline() {
         Some(origin(&outsider).as_str()),
     );
     assert!(
-        error.contains("submitter is not a current validator-set member"),
+        error.contains("no validator-set standing"),
         "electorate gating: {error}"
     );
 

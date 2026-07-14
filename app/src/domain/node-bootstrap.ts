@@ -95,7 +95,14 @@ export const resolveNode = (): NodeResolution => {
 /** Desktop build: wrap a selected workspace's node url as a managed
  *  resolution. The Rust side already spawned/adopted the process. */
 export const connectWorkspace = (httpUrl: string): NodeResolution => ({
-  transport: remoteTransport(httpUrl, { signFilesPayload: filesFrameSigner() }),
+  transport: remoteTransport(httpUrl, {
+    signFilesPayload: filesFrameSigner(),
+    // governance ops are account-signed on EVERY connection (ADR A1): local
+    // content stays frameless (node re-signs), but admit/promote/demote/leave
+    // ride `submitControl` → user-signed frames, so the module's standing ACL
+    // resolves the user's account via BindNode.
+    signControlPayload: contentFrameSigner(),
+  }),
   url: httpUrl,
   managed: true,
 });
@@ -113,6 +120,8 @@ export const connectRemote = (httpUrl: string): NodeResolution => ({
   transport: remoteTransport(httpUrl, {
     signFilesPayload: filesFrameSigner(),
     signPayload: contentFrameSigner(),
+    // governance ops sign on a remote connection too (same account-key lane).
+    signControlPayload: contentFrameSigner(),
   }),
   url: httpUrl,
   managed: false,

@@ -106,6 +106,7 @@ const makeFakeNode = () => {
       }
       return Promise.resolve({ height: 2, appHash: "bb".repeat(32) });
     }),
+    submitControl: vi.fn().mockResolvedValue({ height: 2, appHash: "bb".repeat(32) }),
     query: vi.fn((target: string, query: unknown) => {
       if (target === "chat" && query === "channels") {
         return Promise.resolve({

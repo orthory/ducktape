@@ -56,7 +56,13 @@ impl IdentityStub {
                         label: None,
                         added_at: 0,
                     }],
-                    nodes,
+                    nodes: nodes
+                        .into_iter()
+                        .map(|node_key| identity::NodeView {
+                            node_key,
+                            label: None,
+                        })
+                        .collect(),
                     updated_at: 0,
                 },
             );
@@ -628,5 +634,140 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .await
         .expect("switch back to account shares");
         assert!(shares(&host).await.active);
+    });
+}
+
+// ── account-signed governance frames (ADR A1, W2 migration) ──
+//
+// admit/promote/demote/leave now arrive as account-signed frames on the public
+// surface: the verified origin is an account MEMBER key, and the module
+// authorizes it by resolving that key to the account's committed bound nodes
+// and checking their valset standing. In `share_host`, the IdentityStub uses
+// account_id == member key, and each account owns the nodes listed at genesis.
+
+#[test]
+fn an_account_member_key_proposes_and_its_vote_casts_all_its_bound_node_ballots() {
+    block_on(async {
+        // validators = nodes[0..3]; account[0] owns nodes[0]+nodes[1],
+        // account[1] owns nodes[2]. Default (validator) mode: N validators = N
+        // votes, ballots node-keyed.
+        let (mut host, nodes, accounts) = share_host();
+
+        // account[0] (a member KEY, never a node key) opens a proposal.
+        submit(
+            &mut host,
+            &accounts[0],
+            1,
+            GovMsg::Propose {
+                proposal_id: "acct-signal".into(),
+                action: GovAction::Signal { text: "hi".into() },
+                voting_period: 50,
+            },
+        )
+        .await
+        .expect("an account member with bound-node standing may propose");
+
+        let opened = proposal(&host, "acct-signal").await;
+        assert_eq!(opened.voter_kind, VoterKind::ValidatorNode);
+        assert_eq!(
+            opened.proposer, accounts[0],
+            "the proposer is recorded as the ACCOUNT, not a node key"
+        );
+        // the frozen electorate is still the three validator NODES.
+        let mut electorate: Vec<Vec<u8>> = opened.electorate.iter().map(|(k, _)| k.clone()).collect();
+        electorate.sort();
+        let mut want = vec![nodes[0].clone(), nodes[1].clone(), nodes[2].clone()];
+        want.sort();
+        assert_eq!(electorate, want);
+
+        // ONE account-signed Vote casts BOTH of account[0]'s bound member
+        // nodes' ballots — the exact power it held when each node voted itself.
+        submit(
+            &mut host,
+            &accounts[0],
+            2,
+            GovMsg::Vote {
+                proposal_id: "acct-signal".into(),
+                approve: true,
+            },
+        )
+        .await
+        .expect("account vote");
+        let voted = proposal(&host, "acct-signal").await;
+        let mut yes_nodes: Vec<Vec<u8>> =
+            voted.votes.iter().filter(|(_, y)| *y).map(|(k, _)| k.clone()).collect();
+        yes_nodes.sort();
+        let mut expect_nodes = vec![nodes[0].clone(), nodes[1].clone()];
+        expect_nodes.sort();
+        assert_eq!(
+            yes_nodes, expect_nodes,
+            "one account op casts every bound electorate node's ballot"
+        );
+
+        // account[1] adds its node's yes → 3 of 3, a Signal needs a majority.
+        submit(
+            &mut host,
+            &accounts[1],
+            3,
+            GovMsg::Vote {
+                proposal_id: "acct-signal".into(),
+                approve: true,
+            },
+        )
+        .await
+        .expect("second account vote");
+        submit(
+            &mut host,
+            &nodes[0],
+            4,
+            GovMsg::Execute {
+                proposal_id: "acct-signal".into(),
+            },
+        )
+        .await
+        .expect("execute");
+        assert_eq!(proposal(&host, "acct-signal").await.status, ProposalStatus::Passed);
+    });
+}
+
+#[test]
+fn a_key_with_no_bound_member_node_is_refused() {
+    block_on(async {
+        // account[2] owns nodes[3], which is NOT in the validator set — so it
+        // holds no governance standing and cannot open a proposal.
+        let (mut host, _nodes, accounts) = share_host();
+        let err = submit(
+            &mut host,
+            &accounts[2],
+            1,
+            GovMsg::Propose {
+                proposal_id: "no-standing".into(),
+                action: GovAction::Signal { text: "nope".into() },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect_err("a key whose only bound node is not a validator has no standing");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("standing")),
+            "rejection names the missing standing, got {err:?}"
+        );
+
+        // and a total stranger (no account at all → its own node key, not a
+        // member) is likewise refused.
+        let stranger = key(200);
+        let err = submit(
+            &mut host,
+            &stranger,
+            2,
+            GovMsg::Propose {
+                proposal_id: "stranger".into(),
+                action: GovAction::Signal { text: "nope".into() },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect_err("a non-member stranger cannot propose");
+        assert!(matches!(err, SubmitError::Rejected(Error::Module(_))));
     });
 }
