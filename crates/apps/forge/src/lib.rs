@@ -1162,6 +1162,43 @@ mod tests {
     }
 
     #[test]
+    fn pr_diff_rejects_an_oversized_commit_before_identical_tree_materialization() {
+        let base = tmp_base("pr-diff-large-commit");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let target = git::commit(&repo, &tree, None, "target", 1).unwrap();
+        let mut raw = format!(
+            "tree {tree_oid}\nparent {target}\nauthor agent <agent@agents.duck> 2 +0000\ncommitter node <node@nodes.duck> 2 +0000\n\n"
+        )
+        .into_bytes();
+        raw.resize(raw.len() + MAX_PR_DIFF_COMMIT_BYTES + 1, b'x');
+        let source = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Commit, &raw)
+            .unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(git::BoundedDiffError::TooLarge { commit_bytes, .. })
+                    if commit_bytes > MAX_PR_DIFF_COMMIT_BYTES
+            ),
+            "commit headers must bound work before find_commit: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn pr_diff_preflight_handles_nested_add_delete_type_and_mode_changes() {
         let base = tmp_base("pr-diff-tree-walk");
         let repo = git::init(&base.join("repo")).unwrap();

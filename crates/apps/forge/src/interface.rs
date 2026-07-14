@@ -187,6 +187,9 @@ pub const MAX_PR_DIFF_BYTES: usize = 48 * 1024;
 pub const MAX_PR_DIFF_FILES: usize = 256;
 /// Maximum aggregate old-plus-new blob bytes examined for one PR diff.
 pub const MAX_PR_DIFF_BLOB_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum aggregate bytes of the two commit objects inspected for one PR
+/// diff. Headers are checked before libgit2 materializes either commit.
+pub const MAX_PR_DIFF_COMMIT_BYTES: usize = 256 * 1024;
 /// Maximum old-plus-new tree entries visited while preflighting one PR diff.
 pub const MAX_PR_DIFF_TREE_ENTRIES: usize = 4 * 1024;
 /// Maximum aggregate bytes of tree objects loaded while preflighting one PR

@@ -238,11 +238,13 @@ pub enum BoundedDiffError {
     TooLarge {
         files_changed: usize,
         blob_bytes: usize,
+        commit_bytes: usize,
         tree_entries: usize,
         tree_bytes: usize,
         tree_depth: usize,
         max_files: usize,
         max_blob_bytes: usize,
+        max_commit_bytes: usize,
         max_tree_entries: usize,
         max_tree_bytes: usize,
         max_tree_depth: usize,
@@ -256,17 +258,19 @@ impl std::fmt::Display for BoundedDiffError {
             Self::TooLarge {
                 files_changed,
                 blob_bytes,
+                commit_bytes,
                 tree_entries,
                 tree_bytes,
                 tree_depth,
                 max_files,
                 max_blob_bytes,
+                max_commit_bytes,
                 max_tree_entries,
                 max_tree_bytes,
                 max_tree_depth,
             } => write!(
                 f,
-                "diff is too large: {files_changed} changed files / {blob_bytes} materialized blob bytes / {tree_entries} visited tree entries / {tree_bytes} materialized tree bytes / tree depth {tree_depth} (limits: {max_files} files / {max_blob_bytes} blob bytes / {max_tree_entries} tree entries / {max_tree_bytes} tree bytes / depth {max_tree_depth})"
+                "diff is too large: {files_changed} changed files / {blob_bytes} materialized blob bytes / {commit_bytes} materialized commit bytes / {tree_entries} visited tree entries / {tree_bytes} materialized tree bytes / tree depth {tree_depth} (limits: {max_files} files / {max_blob_bytes} blob bytes / {max_commit_bytes} commit bytes / {max_tree_entries} tree entries / {max_tree_bytes} tree bytes / depth {max_tree_depth})"
             ),
         }
     }
@@ -290,11 +294,13 @@ struct TreeEntryMeta {
 struct DiffPreflight {
     paths: BTreeSet<String>,
     blob_bytes: usize,
+    commit_bytes: usize,
     tree_entries: usize,
     tree_bytes: usize,
     tree_depth: usize,
     max_files: usize,
     max_blob_bytes: usize,
+    max_commit_bytes: usize,
     max_tree_entries: usize,
     max_tree_bytes: usize,
     max_tree_depth: usize,
@@ -304,6 +310,7 @@ impl DiffPreflight {
     fn too_large(&self) -> bool {
         self.paths.len() > self.max_files
             || self.blob_bytes > self.max_blob_bytes
+            || self.commit_bytes > self.max_commit_bytes
             || self.tree_entries > self.max_tree_entries
             || self.tree_bytes > self.max_tree_bytes
             || self.tree_depth > self.max_tree_depth
@@ -313,11 +320,13 @@ impl DiffPreflight {
         BoundedDiffError::TooLarge {
             files_changed: self.paths.len(),
             blob_bytes: self.blob_bytes,
+            commit_bytes: self.commit_bytes,
             tree_entries: self.tree_entries,
             tree_bytes: self.tree_bytes,
             tree_depth: self.tree_depth,
             max_files: self.max_files,
             max_blob_bytes: self.max_blob_bytes,
+            max_commit_bytes: self.max_commit_bytes,
             max_tree_entries: self.max_tree_entries,
             max_tree_bytes: self.max_tree_bytes,
             max_tree_depth: self.max_tree_depth,
@@ -333,6 +342,28 @@ impl DiffPreflight {
             return Err(self.error());
         }
         Ok(())
+    }
+
+    fn load_commit<'repo>(
+        &mut self,
+        repo: &'repo Repository,
+        oid: Oid,
+    ) -> Result<Commit<'repo>, BoundedDiffError> {
+        let (size, kind) = repo.odb()?.read_header(oid)?;
+        if kind != ObjectType::Commit {
+            return Err(git2::Error::from_str(
+                "diff endpoint expected a commit but its object has another type",
+            )
+            .into());
+        }
+        self.commit_bytes = self
+            .commit_bytes
+            .saturating_add(size)
+            .min(self.max_commit_bytes.saturating_add(1));
+        if self.too_large() {
+            return Err(self.error());
+        }
+        Ok(repo.find_commit(oid)?)
     }
 
     fn load_tree<'repo>(
@@ -603,19 +634,25 @@ pub fn bounded_diff(
     max_files: usize,
     max_blob_bytes: usize,
 ) -> Result<(String, bool, usize, usize, usize), BoundedDiffError> {
-    let target_tree_oid = repo.find_commit(target)?.tree_id();
-    let source_tree_oid = repo.find_commit(source)?.tree_id();
     let mut preflight = DiffPreflight {
         paths: BTreeSet::new(),
         blob_bytes: 0,
+        commit_bytes: 0,
         tree_entries: 0,
         tree_bytes: 0,
         tree_depth: 0,
         max_files,
         max_blob_bytes,
+        max_commit_bytes: crate::interface::MAX_PR_DIFF_COMMIT_BYTES,
         max_tree_entries: crate::interface::MAX_PR_DIFF_TREE_ENTRIES,
         max_tree_bytes: crate::interface::MAX_PR_DIFF_TREE_BYTES,
         max_tree_depth: crate::interface::MAX_PR_DIFF_TREE_DEPTH,
+    };
+    let target_tree_oid = preflight.load_commit(repo, target)?.tree_id();
+    let source_tree_oid = if source == target {
+        target_tree_oid
+    } else {
+        preflight.load_commit(repo, source)?.tree_id()
     };
     if target_tree_oid == source_tree_oid {
         preflight.load_tree(repo, target_tree_oid, 0)?;
