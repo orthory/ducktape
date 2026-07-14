@@ -34,13 +34,19 @@ resolve_base_url() {
   printf 'http://127.0.0.1:8844'
 }
 
-query_item() {
-  local out=$1
+query_named_item() {
+  local repo=$1 number=$2 out=$3
+  [[ "$repo" =~ ^[a-z0-9._-]{1,64}$ ]] || die "Forge item query has an unsafe repo slug"
+  [[ "$number" =~ ^[1-9][0-9]*$ ]] || die "Forge item query has an invalid number"
   curl --fail --silent --show-error --max-time 10 \
     -X POST "$BASE_URL/v1/query" \
     -H 'content-type: application/json' \
-    --data "{\"target\":\"forge\",\"query\":{\"get_item\":{\"repo\":\"$FORGE_REPO\",\"number\":$PR_NUMBER}}}" \
+    --data "{\"target\":\"forge\",\"query\":{\"get_item\":{\"repo\":\"$repo\",\"number\":$number}}}" \
     >"$out"
+}
+
+query_item() {
+  query_named_item "$FORGE_REPO" "$PR_NUMBER" "$1"
 }
 
 parse_item() {
@@ -63,6 +69,39 @@ if (/[\u0000-\u001f\u007f]/.test(item.title)) fail("Forge PR title must be one p
 fs.writeFileSync(fieldsPath, [item.source_branch, item.target_branch, item.merge_oid, item.title].join("\n") + "\n");
 fs.writeFileSync(bodyPath, item.body || "");
 NODE
+}
+
+validate_epic_item_reply() {
+  local json=$1 repo=$2 number=$3 merge=$4
+  node - "$json" "$repo" "$number" "$merge" <<'NODE'
+const fs = require("node:fs");
+const [jsonPath, repo, numberText, merge] = process.argv.slice(2);
+const reply = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+const item = reply.item;
+if (!item || item.number !== Number(numberText) || item.kind !== "pr" ||
+    item.state !== "merged" || item.target_branch !== "dev" ||
+    item.merge_oid !== merge) {
+  throw new Error(`epic provenance does not match canonical Forge ${repo}#${numberText}`);
+}
+NODE
+}
+
+validate_epic_item() {
+  local repo=$1 number=$2 merge=$3 source=$4 target=$5 forge_dev=$6 json=$7
+  [ "$repo" = "$FORGE_REPO" ] ||
+    die "epic provenance repo $repo does not match Forge mirror repo $FORGE_REPO"
+  query_named_item "$repo" "$number" "$json" ||
+    die "could not read canonical Forge $repo#$number"
+  validate_epic_item_reply "$json" "$repo" "$number" "$merge" ||
+    die "epic provenance does not match canonical Forge $repo#$number"
+  git merge-base --is-ancestor "$merge" "$forge_dev" ||
+    die "epic provenance merge $merge is not in canonical Forge dev"
+  local canonical_target
+  canonical_target=$(validate_merged_selection "$merge" "$source")
+  [ "$canonical_target" = "$target" ] ||
+    die "epic provenance target does not match canonical Forge $repo#$number"
+  validate_commit_range "$target" "$source"
+  VALIDATED_EPIC_COMMITS=("${SOURCE_COMMITS[@]}")
 }
 
 neutralize_github_closing_keywords() {
@@ -352,7 +391,7 @@ if (legacies && legacyEnds) {
   const b = body.indexOf(legacyEnd, a);
   if (b < a) throw new Error("legacy epic provenance markers are out of order");
   const lines = body.slice(a, b).split("\n").map(line => line.trim()).filter(Boolean);
-  if (!lines.length || lines.length % 2 || lines.length > 2000) {
+  if (!lines.length || lines.length % 2 || lines.length > 256) {
     throw new Error("legacy epic provenance block has an unsupported shape");
   }
   const comment = /^<!-- forge-provenance:([a-z0-9._-]{1,64})#([1-9][0-9]*) merge=([0-9a-f]{40}) source=([0-9a-f]{40}) target=([0-9a-f]{40}) -->$/;
@@ -391,7 +430,7 @@ try { ledger = JSON.parse(raw); }
 catch { throw new Error("epic provenance ledger is not valid JSON"); }
 if (Array.isArray(ledger)) ledger = {version: 1, entries: ledger};
 if (ledger && !Array.isArray(ledger.entries) && ledger.repo) ledger = {version: 1, entries: [ledger]};
-if (!ledger || ledger.version !== 1 || !Array.isArray(ledger.entries) || ledger.entries.length > 1000) {
+if (!ledger || ledger.version !== 1 || !Array.isArray(ledger.entries) || ledger.entries.length > 128) {
   throw new Error("epic provenance ledger has an unsupported shape");
 }
 const oid = value => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
@@ -735,11 +774,24 @@ main() {
       previous=$branch_commit
     done
     local record_kind record_a record_b record_c record_d record_e in_current=0 current_seen=0
+    local entry_open=0 entry_source_index=0 entry_label=""
+    local -a entry_expected_sources=()
     local -a selected_source_commits=("${SOURCE_COMMITS[@]}")
     : >"$RUN_DIR/epic-records-resolved"
     while IFS=$'\t' read -r record_kind record_a record_b record_c record_d record_e; do
       [ -n "$record_kind" ] || continue
       if [ "$record_kind" = E ]; then
+        if [ "$entry_open" -eq 1 ]; then
+          [ "$entry_source_index" -eq "${#entry_expected_sources[@]}" ] ||
+            die "epic provenance for $entry_label has a partial commit range"
+        fi
+        validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
+          "$forge_dev" "$RUN_DIR/epic-item-$record_b.json"
+        entry_expected_sources=("${VALIDATED_EPIC_COMMITS[@]}")
+        SOURCE_COMMITS=("${selected_source_commits[@]}")
+        entry_open=1
+        entry_source_index=0
+        entry_label="$record_a#$record_b"
         printf 'E\t%s\t%s\t%s\t%s\t%s\n' \
           "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
           >>"$RUN_DIR/epic-records-resolved"
@@ -752,6 +804,11 @@ main() {
             die "epic provenance for $FORGE_REPO#$PR_NUMBER does not match the selected Forge PR"
         fi
       elif [ "$record_kind" = C ]; then
+        [ "$entry_open" -eq 1 ] || die "epic provenance commit has no owning Forge PR"
+        [ "$entry_source_index" -lt "${#entry_expected_sources[@]}" ] &&
+          [ "$record_a" = "${entry_expected_sources[$entry_source_index]}" ] ||
+          die "epic provenance for $entry_label names the wrong source commit"
+        entry_source_index=$((entry_source_index + 1))
         printf 'C\t%s\t%s\n' "$record_a" "$record_b" \
           >>"$RUN_DIR/epic-records-resolved"
         ledger_mirrors+=("$record_b")
@@ -761,15 +818,15 @@ main() {
           current_mirrors+=("$record_b")
         fi
       elif [ "$record_kind" = L ]; then
+        if [ "$entry_open" -eq 1 ]; then
+          [ "$entry_source_index" -eq "${#entry_expected_sources[@]}" ] ||
+            die "epic provenance for $entry_label has a partial commit range"
+        fi
+        entry_open=0
         in_current=0
-        git merge-base --is-ancestor "$record_c" "$forge_dev" ||
-          die "legacy epic provenance merge $record_c is not in canonical Forge dev"
-        local legacy_target
-        legacy_target=$(validate_merged_selection "$record_c" "$record_d")
-        [ "$legacy_target" = "$record_e" ] ||
-          die "legacy epic provenance target does not match Forge merge $record_c"
-        validate_commit_range "$record_e" "$record_d"
-        local -a legacy_sources=("${SOURCE_COMMITS[@]}")
+        validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
+          "$forge_dev" "$RUN_DIR/epic-item-$record_b.json"
+        local -a legacy_sources=("${VALIDATED_EPIC_COMMITS[@]}")
         SOURCE_COMMITS=("${selected_source_commits[@]}")
         if [ "$record_a" = "$FORGE_REPO" ] && [ "$record_b" = "$PR_NUMBER" ]; then
           current_seen=1
@@ -801,6 +858,10 @@ main() {
         die "epic provenance parser returned an invalid record"
       fi
     done <"$RUN_DIR/epic-records"
+    if [ "$entry_open" -eq 1 ]; then
+      [ "$entry_source_index" -eq "${#entry_expected_sources[@]}" ] ||
+        die "epic provenance for $entry_label has a partial commit range"
+    fi
     [ "${#ledger_mirrors[@]}" -le "${#branch_commits[@]}" ] ||
       die "epic provenance ledger names commits not present on the branch"
     local i

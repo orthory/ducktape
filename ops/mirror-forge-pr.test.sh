@@ -121,6 +121,53 @@ grep -F $'E\tducktape\t26\t' "$TEST_ROOT/epic-records" >/dev/null
 grep -F $'C\t'"$SOURCE_OID"$'\t'"$MIRROR_OID" "$TEST_ROOT/epic-records" >/dev/null
 verify_replayed_commit "$SOURCE_OID" "$MIRROR_OID" "$TEST_ROOT" 'epic test'
 
+# Every ledger entry is re-bound to its canonical merged Forge PR, not merely
+# to valid Git objects. A GitHub body edit cannot relabel old commits or alter
+# an older JSON entry's merge metadata while keeping its commit mappings.
+FORGE_REPO=ducktape
+FORGE_DEV=$(git rev-parse refs/mirror-test/forge-dev)
+node - "$TEST_ROOT/canonical-item-26" "$MERGE_OID" <<'NODE'
+const fs = require("node:fs");
+const [out, merge] = process.argv.slice(2);
+fs.writeFileSync(out, JSON.stringify({item: {
+  number: 26, kind: "pr", state: "merged", target_branch: "dev", merge_oid: merge,
+}}));
+NODE
+query_named_item() {
+  local repo=$1 number=$2 out=$3
+  if [ "$repo" = ducktape ] && [ "$number" = 26 ]; then
+    cp "$TEST_ROOT/canonical-item-26" "$out"
+  else
+    printf '{"item":null}\n' >"$out"
+  fi
+}
+read -r kind repo number merge source target < <(head -1 "$TEST_ROOT/epic-records")
+[ "$kind" = E ]
+validate_epic_item "$repo" "$number" "$merge" "$source" "$target" \
+  "$FORGE_DEV" "$TEST_ROOT/epic-item-valid"
+[ "${VALIDATED_EPIC_COMMITS[*]}" = "$SOURCE_OID" ]
+SOURCE_COMMITS=("$SOURCE_OID")
+
+node - "$TEST_ROOT/epic-body-once" "$TEST_ROOT/epic-body-wrong-repo" \
+  "$TEST_ROOT/epic-body-wrong-pr" "$TEST_ROOT/epic-body-wrong-merge" "$BASE" <<'NODE'
+const fs = require("node:fs");
+const [input, wrongRepo, wrongPr, wrongMerge, replacementMerge] = process.argv.slice(2);
+const body = fs.readFileSync(input, "utf8");
+fs.writeFileSync(wrongRepo, body.replace('"repo": "ducktape"', '"repo": "other"'));
+fs.writeFileSync(wrongPr, body.replace('"pr": 26', '"pr": 27'));
+fs.writeFileSync(wrongMerge, body.replace(/"merge": "[0-9a-f]{40}"/, `"merge": "${replacementMerge}"`));
+NODE
+for tampered in wrong-repo wrong-pr wrong-merge; do
+  parse_epic_ledger "$TEST_ROOT/epic-body-$tampered" "$TEST_ROOT/records-$tampered"
+  read -r kind repo number merge source target < <(head -1 "$TEST_ROOT/records-$tampered")
+  if (validate_epic_item "$repo" "$number" "$merge" "$source" "$target" \
+    "$FORGE_DEV" "$TEST_ROOT/item-$tampered") >/dev/null 2>&1; then
+    echo "tampered prior JSON epic entry was accepted: $tampered" >&2
+    exit 1
+  fi
+done
+SOURCE_COMMITS=("$SOURCE_OID")
+
 # PR #598 was deployed with a bounded non-JSON v1 block. Parse its redundant
 # comment/bullet pair strictly, then migrate verified commit mappings into the
 # JSON ledger while preserving all human text outside the block byte-for-byte.
