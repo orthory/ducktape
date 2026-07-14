@@ -705,6 +705,27 @@ describe("floating comment card", () => {
     within(dialog).getByText("about draft");
   });
 
+  it("badges open discussions in the margin; resolved-only blocks go quiet", () => {
+    const resolved = (threads: ConsoleState["pageThreads"]) =>
+      threads.map((group) => ({
+        ...group,
+        threads: group.threads.map((view) => ({
+          ...view,
+          thread: { ...view.thread, resolved: true, resolved_by: { user: [1] } },
+        })),
+      }));
+    const { rerender } = renderPagesView({ pageThreads: twoRangeThreads });
+    expect(
+      screen.getByRole("button", { name: "Comment on block 1" }).textContent,
+    ).toBe("2");
+    rerender({ pageThreads: resolved(twoRangeThreads) });
+    expect(screen.queryByRole("button", { name: "Comment on block 1" })).toBeNull();
+    fireEvent.mouseOver(screen.getByLabelText("Edit paragraph block 1"));
+    expect(
+      screen.getByRole("button", { name: "Comment on block 1" }).textContent,
+    ).toBe("");
+  });
+
   it("docks the card in the side rail on a wide viewport; scroll keeps it", () => {
     const wide = window.innerWidth;
     window.innerWidth = 1600;

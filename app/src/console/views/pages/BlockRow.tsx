@@ -167,6 +167,7 @@ function BlockRowInner({
   expanded,
   op,
   threads,
+  commentOpen,
   dropEdge,
   presence,
   onCursor,
@@ -186,6 +187,8 @@ function BlockRowInner({
   op: OpRecord | undefined;
   /** Live comment threads on this block, including exact selection anchors. */
   threads: ThreadView[];
+  /** The comment card is open on THIS block — its margin badge lights up. */
+  commentOpen: boolean;
   /** A drag is hovering this row and would land on this edge. */
   dropEdge: DropEdge | null;
   /** Live, off-consensus peers whose caret is in this block. */
@@ -279,6 +282,9 @@ function BlockRowInner({
     .filter(({ live }) => live.start < live.end);
   const commentRanges = anchoredThreads.map(({ live }) => live);
   const threadCount = threads.length;
+  // the margin badge counts OPEN discussions; a block whose threads are all
+  // resolved is done talking and gets the quiet hover affordance back.
+  const openThreads = threads.filter(({ thread }) => !thread.resolved).length;
 
   // the latest commit closure lives in a ref so the boundary timer neither
   // resets when the store re-renders (handlers is rebuilt per store change)
@@ -643,7 +649,7 @@ function BlockRowInner({
         }}
       >
         <FinalizationMark op={op} size={15} />
-        {threadCount > 0 || hover ? (
+        {openThreads > 0 || hover ? (
           <button
             type="button"
             aria-label={`Comment on block ${blockNumber}`}
@@ -667,13 +673,12 @@ function BlockRowInner({
               height: 28,
               padding: "0 7px",
               borderRadius: 7,
-              background: threadCount > 0 ? color.hover : "transparent",
-              color: threadCount > 0 ? accentVar : color.muted2,
-              font: `650 11px ${font.mono}`,
+              color: commentOpen ? accentVar : openThreads > 0 ? color.muted3 : color.muted2,
+              font: `650 11.5px ${font.mono}`,
             }}
           >
             <Icon name="chat" size={16} strokeWidth={1.9} />
-            {threadCount > 0 ? threadCount : null}
+            {openThreads > 0 ? openThreads : null}
           </button>
         ) : null}
       </div>
@@ -759,6 +764,7 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.expanded === b.expanded &&
     a.op === b.op &&
     a.threads === b.threads &&
+    a.commentOpen === b.commentOpen &&
     a.dropEdge === b.dropEdge &&
     a.presence === b.presence &&
     a.onCursor === b.onCursor &&

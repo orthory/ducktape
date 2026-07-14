@@ -671,6 +671,7 @@ export function PagesView() {
                       expanded={!collapsed.has(row.block.id)}
                       op={state.ops[opKey.pageBlock(row.block.id)]}
                       threads={threadsByTarget.get(row.block.id) ?? EMPTY_THREADS}
+                      commentOpen={commentCard?.target === row.block.id}
                       presence={presenceByBlock.get(row.block.id) ?? EMPTY_PRESENCE}
                       onCursor={onCursor}
                       // the indicator only appears where the drop would ACTUALLY
