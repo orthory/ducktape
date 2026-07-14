@@ -19,6 +19,7 @@ use crate::constants::*;
 use crate::first_contact_join;
 use crate::lobby;
 use crate::reachability_plane::wire_reachability_plane;
+use crate::util::fatal;
 
 use super::OverlayCtx;
 
@@ -79,12 +80,9 @@ pub(super) async fn wire(
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
-        eprintln!(
-            "[node {label}] FATAL: recovery journal exists but the checkpoint is \
+        fatal!(label, "recovery journal exists but the checkpoint is \
              missing — wipe the app state and re-join (KEEP any consensus journal \
-             partitions: they are what prevents this key from double-voting)"
-        );
-        std::process::exit(1);
+             partitions: they are what prevents this key from double-voting)");
     }
     // the parked mesh identity: genesis set at the base index (no
     // consensus coordinates yet). engine lanes are NOT black-holed
@@ -319,11 +317,17 @@ pub(super) async fn wire(
                                     reason,
                                 } => {
                                     if !restart_with_standing {
-                                        eprintln!(
-                                            "[node {race_label}] FATAL: first contact \
-                                             failed across all {tried} offered path(s) — \
-                                             {reason}. ask the inviter for a fresh invite \
-                                             once the mesh is reachable."
+                                        // NOT `fatal!`: this path exits 3, not 1 — a
+                                        // join that ran out of paths is distinct from a
+                                        // node that broke, and callers read the code.
+                                        tracing::error!(
+                                            target: "ducktape::join",
+                                            node = %race_label,
+                                            tried,
+                                            reason = %reason,
+                                            "FATAL: first contact failed across all offered \
+                                             path(s) — ask the inviter for a fresh invite once \
+                                             the mesh is reachable"
                                         );
                                         std::process::exit(3);
                                     }

@@ -20,7 +20,7 @@ use crate::host_reads::{
     read_valset_residents,
 };
 use crate::{lobby, relay};
-use crate::util::{hex, participant_bytes, resident_bytes};
+use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_drain(&mut self) {
@@ -73,8 +73,7 @@ impl ValidatorRuntime<'_> {
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: {e} — halting");
-                std::process::exit(1);
+                fatal!(label, "{e} — halting");
             }
         };
         *applied += drained_count;
@@ -94,7 +93,14 @@ impl ValidatorRuntime<'_> {
             && node.orderer().pending_len() == 0
             && let Err(e) = node.sink_mut().sync().await
         {
-            eprintln!("[node {label}] tip-seal sync failed: {e}");
+            // the idle-transition durability sync: losing it turns the tip into a
+            // TRAILING block, which on a SOLO node can brick a self-reading op.
+            tracing::warn!(
+                target: "ducktape::consensus",
+                node = %label,
+                error = %e,
+                "tip-seal sync failed — the tip block may not be durable"
+            );
         }
         // resolve held app-surface submits against what this
         // drain finished with; every disposition is deterministic,
@@ -140,9 +146,16 @@ impl ValidatorRuntime<'_> {
                 ..noded::index_block_ops(height, height, &dispatches)
             };
             if let Err(err) = index.apply_block(&ops) {
-                eprintln!(
-                    "[node {label}] module index apply failed at height {height}: {err} \
-                             — wipe <storage>/index to rebuild"
+                // consensus stays perfectly healthy while the ENTIRE app UI
+                // silently stops updating: every module view the app reads is
+                // served from this derived index. it does not self-heal.
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    height,
+                    error = %err,
+                    "module index apply failed — the app's views are now STALE; \
+                     wipe <storage>/index to rebuild"
                 );
             }
         }
@@ -611,8 +624,7 @@ impl ValidatorRuntime<'_> {
                     ),
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("[node {label}] FATAL: {e} — halting");
-                        std::process::exit(1);
+                        fatal!(label, "{e} — halting");
                     }
                 }
                 // ACTIVATION (design §4): realize the agreed boundary

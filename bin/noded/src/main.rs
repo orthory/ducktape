@@ -469,7 +469,7 @@ async fn submit_and_drain(
     {
         Ok(out) => out,
         Err(SubmitError::Fatal(err)) => {
-            eprintln!("[noded] FATAL: {err} — halting");
+            tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
@@ -513,7 +513,7 @@ async fn submit_and_drain(
                 offer_effects(workers, *height, events, &mut queue).await;
             }
             Err(SubmitError::Fatal(err)) => {
-                eprintln!("[noded] FATAL: {err} — halting");
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => {

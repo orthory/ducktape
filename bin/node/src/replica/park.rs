@@ -42,7 +42,7 @@ use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
     replica_verifier, verify_manifest_floor, write_boundary_checkpoint, ServedSeal,
 };
-use crate::util::{diag_log, hex};
+use crate::util::{diag_log, fatal, hex};
 
 use super::promotion::{choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary};
 use super::reboot_self;
@@ -313,16 +313,12 @@ pub(super) async fn park(
     // linkage names it.
     if let Some(ckpt) = manifest.as_ref() {
         if let Err(e) = ckpt.preflight(MAX_PROTOCOL_VERSION) {
-            eprintln!(
-                "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
+            fatal!(label, "cannot recover — {e} (recovered boundary needs \
                  protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                ckpt.required_min_version
-            );
-            std::process::exit(1);
+                ckpt.required_min_version);
         }
         if let Err(e) = crate::host_state::preflight_recovery_schema(ckpt) {
-            eprintln!("[node {label}] FATAL: cannot recover — {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot recover — {e}");
         }
         let restored = restore_host(
             &context,
@@ -339,8 +335,7 @@ pub(super) async fn park(
         let mut host = match restored {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: replica checkpoint restore: {e}");
-                std::process::exit(1);
+                fatal!(label, "replica checkpoint restore: {e}");
             }
         };
         // heal the derived index against the CHECKPOINT boundary
@@ -354,14 +349,11 @@ pub(super) async fn park(
         let rec = match recovery.recover_with_sink(&mut host, ckpt, None).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
-                    "[node {label}] FATAL: {e}\n\
+                fatal!(label, "{e}\n\
                      [node {label}] replica state cannot be locally recovered. wipe \
                      the app-state partitions and re-join — but ALWAYS keep the \
                      consensus journal partitions: they are the anti-equivocation \
-                     record for this key."
-                );
-                std::process::exit(1);
+                     record for this key.");
             }
         };
         // seed the shared store with every retained frame so a
@@ -612,13 +604,10 @@ pub(super) async fn park(
                                 // (issuer view lag / member busy) ⇒ fail over.
                                 Ok(lobby::GateMsg::Rejected { code, detail, terminal }) => {
                                     if terminal {
-                                        eprintln!(
-                                            "[node {label}] FATAL: join gate refused \
+                                        fatal!(label, "join gate refused \
                                              ({code:?}): {detail} — this invite cannot be \
                                              redeemed. ask the inviter for a fresh invite and \
-                                             re-join with the new blob."
-                                        );
-                                        std::process::exit(1);
+                                             re-join with the new blob.");
                                     }
                                     println!(
                                         "[node {label}] member {} declined ({code:?}): {detail} \
@@ -637,13 +626,10 @@ pub(super) async fn park(
             }
         }
         if !resident_standing {
-            eprintln!(
-                "[node {label}] FATAL: no member could settle the join gate after 3 rounds \
+            fatal!(label, "no member could settle the join gate after 3 rounds \
                  — the invite may be spent or expired, or no member is reachable; ask for a \
                  fresh invite (manual fallback: `ducktape-node invite-accept {}`)",
-                hex_bytes(&me_bytes)
-            );
-            std::process::exit(1);
+                hex_bytes(&me_bytes));
         }
     }
 
@@ -653,14 +639,11 @@ pub(super) async fn park(
             // ~30 minutes of 2s retries: parking forever is operator
             // guidance territory, not a silent spin. (a RESIDENT
             // holds standing indefinitely — that bail is gated off.)
-            eprintln!(
-                "[node {label}] FATAL: still no standing after {attempt} attempts — \
+            fatal!(label, "still no standing after {attempt} attempts — \
                  the invite may be spent or expired, or no member is reachable; \
                  ask for a fresh invite (manual fallback: `ducktape-node \
                  invite-accept {}`)",
-                hex_bytes(&me_bytes)
-            );
-            std::process::exit(1);
+                hex_bytes(&me_bytes));
         }
         // the serve window: between manifest polls, pump the local
         // read surfaces from the last pre-synced boundary. the window
@@ -1112,8 +1095,7 @@ pub(super) async fn park(
         // the finalization floor, and the checkpoint cadence.
         if let Some((served_height, node_r)) = serving.as_mut() {
             if let Err(e) = node_r.drain_delivered().await {
-                eprintln!("[node {label}] FATAL: replica fold: {e}");
-                std::process::exit(1);
+                fatal!(label, "replica fold: {e}");
             }
             let drained = node_r.take_drained();
             // The same projection the validator consumes; this loop retains
@@ -1146,13 +1128,10 @@ pub(super) async fn park(
                             );
                         }
                     }
-                    eprintln!(
-                        "[node {label}] FATAL: backfilled height {height} folded to \
+                    fatal!(label, "backfilled height {height} folded to \
                          {} but the quorum sealed {} — state diverged",
                         hex(&sealed_hash.expect("checked above")),
-                        hex(&served_hash)
-                    );
-                    std::process::exit(1);
+                        hex(&served_hash));
                 }
                 let ops = indexer::BlockOps {
                     record,
@@ -1264,10 +1243,7 @@ pub(super) async fn park(
                         )
                         .await
                     {
-                        eprintln!(
-                            "[node {label}] FATAL: replica cutover journal write: {e}"
-                        );
-                        std::process::exit(1);
+                        fatal!(label, "replica cutover journal write: {e}");
                     }
                     node_r.host_mut().set_active_version(plan.boundary_version());
                     replica_scheme =
@@ -1556,10 +1532,7 @@ pub(super) async fn park(
                         }
                     };
                     if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
-                        eprintln!(
-                            "[node {label}] FATAL: cannot observe this network — {e}"
-                        );
-                        std::process::exit(1);
+                        fatal!(label, "cannot observe this network — {e}");
                     }
                     println!(
                         "[node {label}] replica: bootstrapping at boundary {} ({} modules)",
@@ -1632,10 +1605,7 @@ pub(super) async fn park(
                             {
                                 Ok(c) => c,
                                 Err(PostRebootCatchupError::Fatal(e)) => {
-                                    eprintln!(
-                                        "[node {label}] FATAL: replica suffix fold: {e}"
-                                    );
-                                    std::process::exit(1);
+                                    fatal!(label, "replica suffix fold: {e}");
                                 }
                                 Err(e) => {
                                     println!(
@@ -1858,8 +1828,7 @@ pub(super) async fn park(
         // install/replay — a clear early refusal, not a post-sync app-hash
         // mismatch. inert on a baseline manifest.
         if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
-            eprintln!("[node {label}] FATAL: cannot promote — {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot promote — {e}");
         }
         // THE PROMOTION COLLAPSE for a FOLDING replica: it is already
         // at head with a journal that proved every block it folded —
@@ -1884,10 +1853,7 @@ pub(super) async fn park(
                 match node_r.sink_mut().floor_cert() {
                     Ok(fc) => fc.filter(|fc| fc.height <= folded_tip),
                     Err(e) => {
-                        eprintln!(
-                            "[node {label}] FATAL: replica promotion floor read: {e}"
-                        );
-                        std::process::exit(1);
+                        fatal!(label, "replica promotion floor read: {e}");
                     }
                 }
             };
@@ -1964,8 +1930,7 @@ pub(super) async fn park(
                     latest.floor_cert.is_some()
                 ));
                 if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
-                    eprintln!("[node {label}] FATAL: promotion preflight failed: {e}");
-                    std::process::exit(1);
+                    fatal!(label, "promotion preflight failed: {e}");
                 }
                 match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
                     PromotionBoundary::Promote { boundary, source } => {
@@ -1982,10 +1947,7 @@ pub(super) async fn park(
                             match verify_manifest_floor(&namespace, &boundary) {
                                 Ok(floor) => floor,
                                 Err(e) => {
-                                    eprintln!(
-                                        "[node {label}] FATAL: promotion floor verify: {e}"
-                                    );
-                                    std::process::exit(1);
+                                    fatal!(label, "promotion floor verify: {e}");
                                 }
                             };
                         diag_log(format!(

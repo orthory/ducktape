@@ -19,7 +19,7 @@ use sdk::Msg;
 
 use crate::constants::{CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
 use crate::host_reads::resume_resident_keys;
-use crate::util::{diag_log, epoch_floor, hex};
+use crate::util::{diag_log, epoch_floor, fatal, hex};
 
 pub(super) struct EpochSpawner<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -64,10 +64,11 @@ impl<'a> EpochSpawner<'a> {
         .get_mut(epoch.checked_sub(self.bank_base).expect("epochs never rebase down") as usize)
         .and_then(|s| s.take())
         .unwrap_or_else(|| {
-            eprintln!(
-                "[node {}] FATAL: epoch {epoch} exhausts the pre-registered                          channel bank ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank", self.label
+            fatal!(
+                self.label,
+                "epoch {epoch} exhausts the pre-registered channel bank \
+                 ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
             );
-            std::process::exit(1);
         });
         let (vote, certificate, resolver, payload, fetch) = slot;
         // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
@@ -84,8 +85,7 @@ impl<'a> EpochSpawner<'a> {
                 |bytes| match consensus::decode_finalization(&scheme, &bytes) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("[node {}] FATAL: {e}", self.label);
-                        std::process::exit(1);
+                        fatal!(self.label, "{e}");
                     }
                 },
             );
@@ -157,8 +157,7 @@ pub(super) async fn resume(
     let boot_floor = match recovery.floor_cert() {
         Ok(cert) => cert.filter(|c| c.epoch == resume_epoch),
         Err(e) => {
-            eprintln!("[node {label}] FATAL: persisted finalization floor is damaged: {e}");
-            std::process::exit(1);
+            fatal!(label, "persisted finalization floor is damaged: {e}");
         }
     };
     let last_cert_height = boot_floor.as_ref().map(|c| c.height);
@@ -223,8 +222,7 @@ pub(super) async fn resume(
     let resident_keys = match resume_resident_keys(resumed) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {e}");
-            std::process::exit(1);
+            fatal!(label, "{e}");
         }
     };
     let orchestrator = consensus::ValsetOrchestrator::resume(

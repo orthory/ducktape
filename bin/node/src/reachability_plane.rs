@@ -348,9 +348,16 @@ async fn reachability_plane(
             .and_then(|mut addrs| addrs.next()),
     };
     let Some(control_addr) = resolve_ingress(&advertised) else {
-        eprintln!(
-            "[node {label}] reachability: advertised {advertised:?} did not resolve — plane \
-             not started"
+        // the plane never starts and the node runs on forever with NO overlay:
+        // no tunnels, no hub, every huddle failing with a string that names none
+        // of this. it does not self-heal and nothing else reports it.
+        tracing::error!(
+            target: "ducktape::reachability",
+            node = %label,
+            advertised = ?advertised,
+            reason = "advertised_unresolvable",
+            "reachability plane NOT started — this node has no overlay for the rest of \
+             this boot (set `advertised` to a resolvable address)"
         );
         return;
     };
@@ -362,9 +369,13 @@ async fn reachability_plane(
     ) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            eprintln!(
-                "[node {label}] reachability: advertised control endpoint rejected ({err:?}) — \
-                 set `advertised` to a dialable address; plane not started"
+            tracing::error!(
+                target: "ducktape::reachability",
+                node = %label,
+                error = ?err,
+                reason = "control_endpoint_rejected",
+                "reachability plane NOT started — this node has no overlay for the rest of \
+                 this boot (set `advertised` to a dialable address)"
             );
             return;
         }

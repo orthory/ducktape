@@ -10,7 +10,7 @@ use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::CUTOVER_DELAY;
 use crate::host_reads::read_upgrade_version_fields;
-use crate::util::{diag_log, hex};
+use crate::util::{diag_log, fatal, hex};
 
 pub(crate) fn assert_floor_binds_view(
     view_base: u64,
@@ -101,8 +101,7 @@ pub(crate) async fn reopen_recovery(
             r
         }
         Err(e) => {
-            eprintln!("[node {label}] FATAL: cannot reopen the recovery store: {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot reopen the recovery store: {e}");
         }
     }
 }
@@ -271,19 +270,16 @@ where
     ) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {diag_tag} capture: {e}");
-            std::process::exit(1);
+            fatal!(label, "{diag_tag} capture: {e}");
         }
     };
     if let Err(e) = recovery.write_manifest(&ckpt).await {
-        eprintln!("[node {label}] FATAL: {diag_tag} write: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} write: {e}");
     }
     if let Some(fc) = floor
         && let Err(e) = recovery.write_floor_cert(fc).await
     {
-        eprintln!("[node {label}] FATAL: {diag_tag} floor-cert write: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} floor-cert write: {e}");
     }
     // this checkpoint IS the journal's new genesis: everything below its
     // oplog position must never roll into a boot at this base — a prior
@@ -293,8 +289,7 @@ where
     // AHEAD of its source's serving window). the engine floor at `boundary`
     // suppresses replay at or below it, so no pruned frame is needed again.
     if let Err(e) = recovery.prune_oplog(pos).await {
-        eprintln!("[node {label}] FATAL: {diag_tag} journal prune: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} journal prune: {e}");
     }
     // the checkpoint's oplog position — the caller's prune anchor when the
     // NEXT (periodic) checkpoint supersedes this one.
