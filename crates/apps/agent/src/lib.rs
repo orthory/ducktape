@@ -500,9 +500,8 @@ pub struct AgentModule {
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
     /// Recovery-only execution mode for the exact protocol-v1 native
-    /// registry. Its snapshot predates roles, so role mutations and
-    /// role-bearing snapshots must remain unavailable while that workspace
-    /// advertises the revision-1 fingerprint.
+    /// registry. Its snapshot predates roles, so role-bearing snapshots remain
+    /// unavailable while that workspace advertises the revision-1 fingerprint.
     legacy_v1: bool,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
@@ -848,22 +847,6 @@ impl AgentModule {
             }
             AgentMsg::PauseAgent { agent_id } => self.stage_active(ctx, agent_id, false, now),
             AgentMsg::ResumeAgent { agent_id } => self.stage_active(ctx, agent_id, true, now),
-            AgentMsg::SetAgentRole { agent_id, role } => {
-                if self.legacy_v1 {
-                    return Err(Error::Module(
-                        "agent roles are unavailable on the native-v1 state schema".into(),
-                    ));
-                }
-                let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
-                if state.role == role {
-                    return Ok(());
-                }
-                state.role = role;
-                state.updated_at = now;
-                Self::validate_record_size(&agent_id, &state)?;
-                self.pending_agents.insert(agent_id, state);
-                Ok(())
-            }
         }
     }
 
@@ -1913,47 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_intersection_never_widens_authority() {
-        let parent = ResourceCaps {
-            forge_read: vec!["docs".into()],
-            forge_push: vec!["code".into()],
-            duckfs_read: vec!["/shared/project".into()],
-            duckfs_write: vec!["/shared/project/generated".into()],
-            tools: vec!["git".into()],
-            secrets: vec!["vault://parent".into()],
-            pages_write: vec!["plan".into()],
-            subagent_budget: 2,
-        };
-        let child = ResourceCaps {
-            forge_read: vec!["code".into(), "docs".into(), "foreign".into()],
-            duckfs_read: vec![
-                "/shared/project/reference".into(),
-                "/shared/project/generated/report".into(),
-                "/shared/unrelated".into(),
-            ],
-            duckfs_write: vec!["/shared/project/reference/drafts".into()],
-            tools: vec!["shell".into()],
-            secrets: vec!["vault://child".into()],
-            pages_write: vec!["*".into()],
-            subagent_budget: 9,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            parent.read_only_intersection(&child),
-            ResourceCaps {
-                forge_read: vec!["code".into(), "docs".into()],
-                duckfs_read: vec![
-                    "/shared/project/generated/report".into(),
-                    "/shared/project/reference".into(),
-                ],
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn role_is_owner_assigned_committed_state_with_legacy_defaults() {
+    fn historical_role_tail_round_trips_with_legacy_defaults() {
         let legacy: AgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "bot",
             "owner": { "external": [9] },
@@ -1974,16 +1917,8 @@ mod tests {
         let mut m = module();
         let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
         exec(&mut m, &mut owner, &admin(&register("bot", &[]))).unwrap();
-        exec(
-            &mut m,
-            &mut owner,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::ProjectLibrarian,
-            }),
-        )
-        .unwrap();
         commit(&mut m);
+        m.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
         assert_eq!(
             get_agent(&m, "bot").unwrap().role,
             AgentRole::ProjectLibrarian
@@ -1997,27 +1932,10 @@ mod tests {
             get_agent(&joiner, "bot").unwrap().role,
             AgentRole::ProjectLibrarian
         );
-
-        let mut intruder = CaptureCtx::new().at(4).with_origin(user(8));
-        let err = exec(
-            &mut m,
-            &mut intruder,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::General,
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
-        abort(&mut m);
-        assert_eq!(
-            get_agent(&m, "bot").unwrap().role,
-            AgentRole::ProjectLibrarian
-        );
     }
 
     #[test]
-    fn native_v1_mode_keeps_revision_one_and_rejects_roles() {
+    fn native_v1_mode_keeps_revision_one_and_rejects_role_tails() {
         let mut legacy = module().with_legacy_v1_state();
         assert_eq!(Module::state_schema_revision(&legacy), 1);
         assert_eq!(Module::state_schema_revision(&module()), 2);
@@ -2032,21 +1950,6 @@ mod tests {
         commit(&mut legacy);
         let (legacy_bytes, legacy_root) = (legacy.snapshot(), legacy.root());
 
-        let err = exec(
-            &mut legacy,
-            &mut owner,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::ProjectLibrarian,
-            }),
-        )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unavailable on the native-v1 state schema"));
-        assert_eq!(legacy.snapshot(), legacy_bytes);
-        assert_eq!(legacy.root(), legacy_root);
-
         let mut current = module();
         exec(
             &mut current,
@@ -2054,16 +1957,8 @@ mod tests {
             &admin(&register("bot", &[])),
         )
         .unwrap();
-        exec(
-            &mut current,
-            &mut owner,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::ProjectLibrarian,
-            }),
-        )
-        .unwrap();
         commit(&mut current);
+        current.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
         let err = legacy
             .install(&current.snapshot(), current.root())
             .unwrap_err();
