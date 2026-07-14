@@ -1139,6 +1139,94 @@ mod tests {
     }
 
     #[test]
+    fn pr_diff_preflight_handles_nested_add_delete_type_and_mode_changes() {
+        let base = tmp_base("pr-diff-tree-walk");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let old_blob = repo.blob(b"old\n").unwrap();
+        let new_blob = repo.blob(b"new\n").unwrap();
+
+        let mut old_nested = repo.treebuilder(None).unwrap();
+        old_nested.insert("one.txt", old_blob, 0o100644).unwrap();
+        old_nested.insert("two.txt", old_blob, 0o100644).unwrap();
+        let old_nested_oid = old_nested.write().unwrap();
+        let mut old_root = repo.treebuilder(None).unwrap();
+        old_root.insert("node", old_nested_oid, 0o040000).unwrap();
+        old_root.insert("mode.txt", old_blob, 0o100644).unwrap();
+        old_root.insert("removed.txt", old_blob, 0o100644).unwrap();
+        let old_tree = repo.find_tree(old_root.write().unwrap()).unwrap();
+        let target = git::commit(&repo, &old_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+
+        let mut new_root = repo.treebuilder(None).unwrap();
+        new_root.insert("node", new_blob, 0o100644).unwrap();
+        new_root.insert("mode.txt", old_blob, 0o100755).unwrap();
+        new_root.insert("added.txt", new_blob, 0o100644).unwrap();
+        let new_tree = repo.find_tree(new_root.write().unwrap()).unwrap();
+        let source =
+            git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
+
+        let (patch, truncated, files_changed, _, _) = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert_eq!(files_changed, 6);
+        for path in [
+            "added.txt",
+            "mode.txt",
+            "node",
+            "node/one.txt",
+            "node/two.txt",
+            "removed.txt",
+        ] {
+            assert!(patch.contains(path), "missing {path} from {patch}");
+        }
+        assert!(patch.contains("old mode 100644"), "{patch}");
+        assert!(patch.contains("new mode 100755"), "{patch}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_rejects_a_missing_changed_blob() {
+        let base = tmp_base("pr-diff-missing-blob");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let empty_tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = repo.find_tree(empty_tree_oid).unwrap();
+        let target = git::commit(&repo, &empty_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let blob = repo.blob(b"will disappear\n").unwrap();
+        let mut source_builder = repo.treebuilder(None).unwrap();
+        source_builder.insert("missing.txt", blob, 0o100644).unwrap();
+        let source_tree = repo
+            .find_tree(source_builder.write().unwrap())
+            .unwrap();
+        let source =
+            git::commit(&repo, &source_tree, Some(&target_commit), "source", 2).unwrap();
+        let hex = blob.to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..]))
+            .unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(result, Err(git::BoundedDiffError::Git(_))),
+            "missing changed blob must fail as an unavailable git object"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn pr_diff_rejects_too_many_changed_files_before_patch_generation() {
         let base = tmp_base("pr-diff-many-files");
         let (mut forge, _, target) = materialized_pr(&base, b"initial\n");
