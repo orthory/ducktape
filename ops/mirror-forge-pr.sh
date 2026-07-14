@@ -559,44 +559,102 @@ fs.writeFileSync(outputPath, body);
 NODE
 }
 
-update_epic_pr_body() {
-  local number=$1 observed_body=$2 updated_body=$3 state_dir=$4
-  gh api --include "repos/$GH_REPO/pulls/$number" >"$state_dir/epic-pr-rest" \
-    2>"$state_dir/gh.err" || die "could not read the epic PR revision: $(tr '\n' ' ' <"$state_dir/gh.err")"
-  node - "$state_dir/epic-pr-rest" "$observed_body" "$MIRROR_BRANCH" "$state_dir/epic-pr-etag" <<'NODE'
-const fs = require("node:fs");
-const [responsePath, bodyPath, branch, etagPath] = process.argv.slice(2);
-const response = fs.readFileSync(responsePath, "utf8");
-const split = response.search(/\r?\n\r?\n\{/);
-if (split < 0) throw new Error("GitHub PR response did not include headers and JSON");
-const headers = response.slice(0, split);
-const jsonAt = response.indexOf("{", split);
-const pr = JSON.parse(response.slice(jsonAt));
-const match = headers.match(/^etag:\s*(.+)$/im);
-if (!match) throw new Error("GitHub PR response did not include an ETag");
-const observed = fs.readFileSync(bodyPath, "utf8");
-if (pr.state !== "open" || pr.draft !== true || pr.base?.ref !== "dev" ||
-    pr.head?.ref !== branch || pr.body !== observed) {
-  throw new Error("epic PR changed before the conditional ledger update; retry");
+query_epic_comments() {
+  local number=$1 out=$2
+  gh api --paginate --slurp \
+    "repos/$GH_REPO/issues/$number/comments?per_page=100&sort=created&direction=asc" >"$out" \
+    2>"$RUN_DIR/gh.err" ||
+    die "could not read epic PR provenance comments: $(tr '\n' ' ' <"$RUN_DIR/gh.err")"
 }
-fs.writeFileSync(etagPath, match[1].trim());
-NODE
-  node - "$updated_body" "$state_dir/epic-pr-patch" <<'NODE'
+
+parse_epic_comments() {
+  local comments=$1 records=$2 trusted_login=${3:-}
+  node - "$comments" "$records" "$trusted_login" <<'NODE'
 const fs = require("node:fs");
-const [bodyPath, outputPath] = process.argv.slice(2);
-fs.writeFileSync(outputPath, JSON.stringify({body: fs.readFileSync(bodyPath, "utf8")}));
+const [commentsPath, recordsPath, trustedLogin] = process.argv.slice(2);
+const reply = JSON.parse(fs.readFileSync(commentsPath, "utf8"));
+const comments = Array.isArray(reply[0]) ? reply.flat() : reply;
+if (!Array.isArray(comments) || comments.length > 10_000) {
+  throw new Error("GitHub epic comments have an unsupported shape");
+}
+if (trustedLogin && !/^[A-Za-z0-9-]{1,39}$/.test(trustedLogin)) {
+  throw new Error("GitHub epic comment author is invalid");
+}
+const start = "<!-- ducktape-forge-epic-entry:start -->";
+const end = "<!-- ducktape-forge-epic-entry:end -->";
+const oid = value => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+const seen = new Map();
+const lines = [];
+for (const comment of comments) {
+  const body = comment?.body;
+  if (typeof body !== "string" || !body.includes(start)) continue;
+  if (!trustedLogin || comment?.user?.login !== trustedLogin) continue;
+  if (body.split(start).length !== 2 || body.split(end).length !== 2) {
+    throw new Error("GitHub epic provenance comment markers are malformed or duplicated");
+  }
+  const a = body.indexOf(start) + start.length;
+  const b = body.indexOf(end, a);
+  if (b < a) throw new Error("GitHub epic provenance comment markers are out of order");
+  const raw = body.slice(a, b).trim();
+  const entry = JSON.parse(raw);
+  if (!entry || typeof entry.repo !== "string" || !/^[a-z0-9._-]{1,64}$/.test(entry.repo) ||
+      !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !oid(entry.merge) || !oid(entry.source) ||
+      !oid(entry.target) || !Array.isArray(entry.commits) || !entry.commits.length ||
+      entry.commits.some(commit => !commit || !oid(commit.source) || !oid(commit.mirror))) {
+    throw new Error("GitHub epic provenance comment contains an invalid entry");
+  }
+  const key = `${entry.repo}#${entry.pr}`;
+  if (seen.has(key)) {
+    if (seen.get(key) !== raw) throw new Error(`GitHub epic provenance conflicts for ${key}`);
+    continue;
+  }
+  seen.set(key, raw);
+  lines.push(["E", entry.repo, entry.pr, entry.merge, entry.source, entry.target].join("\t"));
+  for (const commit of entry.commits) lines.push(["C", commit.source, commit.mirror].join("\t"));
+}
+fs.writeFileSync(recordsPath, lines.length ? lines.join("\n") + "\n" : "");
 NODE
-  local etag
-  etag=$(<"$state_dir/epic-pr-etag")
-  gh api --method PATCH -H "If-Match: $etag" "repos/$GH_REPO/pulls/$number" \
-    --input "$state_dir/epic-pr-patch" >"$state_dir/gh.out" 2>"$state_dir/gh.err" ||
-    die "conditional epic PR update was refused; retry without overwriting remote edits: $(tr '\n' ' ' <"$state_dir/gh.err")"
+}
+
+write_epic_comment() {
+  local entry=$1 title=$2 output=$3
+  node - "$entry" "$title" "$output" <<'NODE'
+const fs = require("node:fs");
+const [entryPath, title, outputPath] = process.argv.slice(2);
+const entry = JSON.parse(fs.readFileSync(entryPath, "utf8"));
+const safeTitle = title.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+fs.writeFileSync(outputPath,
+  `### Forge PR #${entry.pr} — ${safeTitle}\n\n` +
+  `Verified mirror provenance for \`${entry.repo}#${entry.pr}\`.\n\n` +
+  `<!-- ducktape-forge-epic-entry:start -->\n${JSON.stringify(entry, null, 2)}\n` +
+  `<!-- ducktape-forge-epic-entry:end -->`);
+NODE
+  neutralize_github_closing_keywords "$output" "$FORGE_REPO"
+}
+
+post_epic_comment() {
+  local number=$1 comment=$2 response=$3 state_dir=$4
+  node - "$comment" "$state_dir/epic-comment-payload" <<'NODE'
+const fs = require("node:fs");
+const [commentPath, outputPath] = process.argv.slice(2);
+fs.writeFileSync(outputPath, JSON.stringify({body: fs.readFileSync(commentPath, "utf8")}));
+NODE
+  gh api --method POST "repos/$GH_REPO/issues/$number/comments" \
+    --input "$state_dir/epic-comment-payload" >"$response" 2>"$state_dir/gh.err" ||
+    die "could not append epic provenance comment: $(tr '\n' ' ' <"$state_dir/gh.err")"
+  node - "$response" "$comment" <<'NODE'
+const fs = require("node:fs");
+const [responsePath, commentPath] = process.argv.slice(2);
+const response = JSON.parse(fs.readFileSync(responsePath, "utf8"));
+const expected = fs.readFileSync(commentPath, "utf8");
+if (response?.body !== expected) throw new Error("GitHub returned a different epic provenance comment");
+NODE
 }
 
 query_epic_pr() {
   local out=$1
   gh pr list --repo "$GH_REPO" --state all --head "$MIRROR_BRANCH" --limit 100 \
-    --json number,url,state,isDraft,baseRefName,headRefName,body >"$out"
+    --json number,url,state,isDraft,baseRefName,headRefName,body,author >"$out"
 }
 
 parse_epic_pr() {
@@ -616,7 +674,10 @@ if (pr.state !== "OPEN" || pr.isDraft !== true || pr.baseRefName !== "dev" || pr
   throw new Error("epic PR must be an open draft with the requested head and dev base");
 }
 if (typeof pr.body !== "string") throw new Error("epic PR body is unavailable");
-fs.writeFileSync(fieldsPath, `${pr.number}\n${pr.url}\n`);
+if (!/^[A-Za-z0-9-]{1,39}$/.test(pr.author?.login || "")) {
+  throw new Error("epic PR author is unavailable");
+}
+fs.writeFileSync(fieldsPath, `${pr.number}\n${pr.url}\n${pr.author.login}\n`);
 fs.writeFileSync(bodyPath, pr.body);
 NODE
 }
@@ -720,7 +781,7 @@ main() {
   origin_oid=$(git rev-parse "$ORIGIN_TMP_REF^{commit}")
 
   local replay_base=$origin_oid epic_history_base=$origin_oid
-  local epic_tip="" epic_pr_number="" epic_pr_url=""
+  local epic_tip="" epic_pr_number="" epic_pr_url="" epic_pr_author=""
   local epic_recovery=0 epic_repeat=0
   local -a MIRROR_COMMITS=()
   if [ "$EPIC_MODE" -eq 1 ]; then
@@ -731,16 +792,25 @@ main() {
     local -a epic_pr_fields=()
     mapfile -t epic_pr_fields <"$RUN_DIR/epic-pr-fields"
     if [ "${#epic_pr_fields[@]}" -gt 0 ]; then
-      [ "${#epic_pr_fields[@]}" -eq 2 ] || die "GitHub epic PR metadata was incomplete"
+      [ "${#epic_pr_fields[@]}" -eq 3 ] || die "GitHub epic PR metadata was incomplete"
       epic_pr_number=${epic_pr_fields[0]}
       epic_pr_url=${epic_pr_fields[1]}
+      epic_pr_author=${epic_pr_fields[2]}
+      local github_login
+      github_login=$(gh api user --jq .login) || die "could not read the authenticated GitHub login"
+      [ "$github_login" = "$epic_pr_author" ] ||
+        die "authenticated GitHub user must match epic PR author $epic_pr_author"
+      query_epic_comments "$epic_pr_number" "$RUN_DIR/epic-comments.json"
     else
+      printf '[]\n' >"$RUN_DIR/epic-comments.json"
       printf '%s\n' \
         'Draft improvement epic for verified Forge changes.' \
         '' \
         'Each append is recorded in the machine-maintained provenance ledger below. Final clean-context review and merge remain manual.' \
         >"$RUN_DIR/epic-body"
     fi
+    parse_epic_comments "$RUN_DIR/epic-comments.json" "$RUN_DIR/epic-comment-records" \
+      "$epic_pr_author"
 
     local listed_tip=""
     listed_tip=$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH") || true
@@ -765,6 +835,7 @@ main() {
   local commit mirror_tip
   if [ "$EPIC_MODE" -eq 1 ]; then
     parse_epic_ledger "$RUN_DIR/epic-body" "$RUN_DIR/epic-records"
+    cat "$RUN_DIR/epic-comment-records" >>"$RUN_DIR/epic-records"
     local -a branch_commits=() ledger_mirrors=() current_sources=() current_mirrors=()
     mapfile -t branch_commits < <(git rev-list --reverse --topo-order "$epic_history_base..$replay_base")
     local previous=$epic_history_base branch_commit parent_line
@@ -776,9 +847,10 @@ main() {
         die "epic branch history is not one linear fast-forward chain at $branch_commit"
       previous=$branch_commit
     done
-    local record_kind record_a record_b record_c record_d record_e in_current=0 current_seen=0
+    local record_kind record_a record_b record_c record_d record_e entry_key in_current=0 current_seen=0
     local entry_open=0 entry_source_index=0 entry_label=""
     local -a entry_expected_sources=()
+    local -A seen_entries=()
     local -a selected_source_commits=("${SOURCE_COMMITS[@]}")
     : >"$RUN_DIR/epic-records-resolved"
     while IFS=$'\t' read -r record_kind record_a record_b record_c record_d record_e; do
@@ -788,6 +860,9 @@ main() {
           [ "$entry_source_index" -eq "${#entry_expected_sources[@]}" ] ||
             die "epic provenance for $entry_label has a partial commit range"
         fi
+        entry_key="$record_a#$record_b"
+        [ -z "${seen_entries[$entry_key]+x}" ] || die "epic provenance duplicates $entry_key"
+        seen_entries[$entry_key]=1
         validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
           "$forge_dev" "$RUN_DIR/epic-item-$record_b.json"
         entry_expected_sources=("${VALIDATED_EPIC_COMMITS[@]}")
@@ -827,6 +902,9 @@ main() {
         fi
         entry_open=0
         in_current=0
+        entry_key="$record_a#$record_b"
+        [ -z "${seen_entries[$entry_key]+x}" ] || die "epic provenance duplicates $entry_key"
+        seen_entries[$entry_key]=1
         validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
           "$forge_dev" "$RUN_DIR/epic-item-$record_b.json"
         local -a legacy_sources=("${VALIDATED_EPIC_COMMITS[@]}")
@@ -980,6 +1058,9 @@ EOF
       query_epic_pr "$RUN_DIR/epic-pr-final.json"
       cmp -s "$RUN_DIR/epic-pr.json" "$RUN_DIR/epic-pr-final.json" ||
         die "epic PR changed during idempotence verification; retry"
+      query_epic_comments "$epic_pr_number" "$RUN_DIR/epic-comments-final.json"
+      cmp -s "$RUN_DIR/epic-comments.json" "$RUN_DIR/epic-comments-final.json" ||
+        die "epic comments changed during idempotence verification; retry"
       [ "$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH")" = "$mirror_tip" ] ||
         die "epic branch moved during idempotence verification; retry"
       log "already appended and verified: $epic_pr_url"
@@ -1002,15 +1083,31 @@ const commits = fs.readFileSync(mappingsPath, "utf8").trim().split("\n").filter(
 });
 fs.writeFileSync(outputPath, JSON.stringify({repo, pr: Number(pr), merge, source, target, commits}));
 NODE
-    append_epic_ledger "$RUN_DIR/epic-body" "$RUN_DIR/epic-entry" \
-      "$RUN_DIR/epic-body-updated" "$RUN_DIR/epic-records-resolved"
-
     if [ -n "$epic_pr_number" ]; then
-      # If-Match ties the mutation to the exact body and PR revision just read.
-      update_epic_pr_body "$epic_pr_number" "$RUN_DIR/epic-body" \
-        "$RUN_DIR/epic-body-updated" "$RUN_DIR"
+      write_epic_comment "$RUN_DIR/epic-entry" "$PR_TITLE" "$RUN_DIR/epic-comment"
+      query_epic_comments "$epic_pr_number" "$RUN_DIR/epic-comments-before-post.json"
+      cmp -s "$RUN_DIR/epic-comments.json" "$RUN_DIR/epic-comments-before-post.json" ||
+        die "epic comments changed before the provenance append; retry"
+      post_epic_comment "$epic_pr_number" "$RUN_DIR/epic-comment" \
+        "$RUN_DIR/epic-comment-response.json" "$RUN_DIR"
       PR_CREATED=1
+      node - "$RUN_DIR/epic-comment-response.json" "$RUN_DIR/epic-comment-response-pages.json" <<'NODE'
+const fs = require("node:fs");
+const [inputPath, outputPath] = process.argv.slice(2);
+fs.writeFileSync(outputPath, JSON.stringify([[JSON.parse(fs.readFileSync(inputPath, "utf8"))]]));
+NODE
+      parse_epic_comments "$RUN_DIR/epic-comment-response-pages.json" \
+        "$RUN_DIR/epic-current-comment-records" "$epic_pr_author"
+      cat "$RUN_DIR/epic-comment-records" "$RUN_DIR/epic-current-comment-records" \
+        >"$RUN_DIR/epic-comment-records-expected"
+      query_epic_comments "$epic_pr_number" "$RUN_DIR/epic-comments-final.json"
+      parse_epic_comments "$RUN_DIR/epic-comments-final.json" \
+        "$RUN_DIR/epic-comment-records-final" "$epic_pr_author"
+      cmp -s "$RUN_DIR/epic-comment-records-expected" "$RUN_DIR/epic-comment-records-final" ||
+        die "epic provenance comments changed during the append; inspect before retrying"
     else
+      append_epic_ledger "$RUN_DIR/epic-body" "$RUN_DIR/epic-entry" \
+        "$RUN_DIR/epic-body-updated" "$RUN_DIR/epic-records-resolved"
       local epic_title="Improvement epic: $3"
       gh pr create --draft --repo "$GH_REPO" --base dev --head "$MIRROR_BRANCH" \
         --title "$epic_title" --body-file "$RUN_DIR/epic-body-updated" \
@@ -1020,13 +1117,20 @@ NODE
     fi
     query_epic_pr "$RUN_DIR/epic-pr-final.json"
     parse_epic_pr "$RUN_DIR/epic-pr-final.json" "$RUN_DIR/epic-pr-final-fields" "$RUN_DIR/epic-body-final"
-    cmp -s "$RUN_DIR/epic-body-updated" "$RUN_DIR/epic-body-final" ||
-      die "epic PR body does not contain the exact verified provenance ledger"
+    if [ -n "$epic_pr_number" ]; then
+      cmp -s "$RUN_DIR/epic-body" "$RUN_DIR/epic-body-final" ||
+        die "epic PR body changed while its provenance comment was appended; inspect before retrying"
+    else
+      cmp -s "$RUN_DIR/epic-body-updated" "$RUN_DIR/epic-body-final" ||
+        die "epic PR body does not contain the exact verified provenance ledger"
+    fi
     [ "$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH")" = "$mirror_tip" ] ||
       die "epic branch moved while its provenance ledger was updated; retry"
     local -a final_fields=()
     mapfile -t final_fields <"$RUN_DIR/epic-pr-final-fields"
-    [ "${#final_fields[@]}" -eq 2 ] || die "updated epic PR metadata is incomplete"
+    [ "${#final_fields[@]}" -eq 3 ] || die "updated epic PR metadata is incomplete"
+    [ -z "$epic_pr_author" ] || [ "${final_fields[2]}" = "$epic_pr_author" ] ||
+      die "epic PR author changed during provenance verification"
     log "draft epic: ${final_fields[1]}"
     if [ "$epic_recovery" -eq 1 ]; then
       log "recovered an already-pushed exact replay by repairing only its missing ledger entry"

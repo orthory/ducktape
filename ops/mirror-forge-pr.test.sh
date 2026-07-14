@@ -363,34 +363,62 @@ cmp "$DEST_REPO/replay.bin" <(printf '\000forge\376\n')
 [ "$(git -C "$DEST_REPO" ls-tree HEAD mode.sh | awk '{print $1}')" = 100755 ]
 quiet_git "$DEST_REPO" reset --hard "$MIRROR_OID"
 
-# The body update uses the ETag from a fresh exact-body read as an If-Match
-# precondition. A simulated 412 is refused without any live GitHub mutation.
+# Existing epic PR bodies are read-only. New provenance is appended as a
+# visible comment, and only byte-identical duplicate records are deduplicated.
 GH_REPO='example/ducktape'
 MIRROR_BRANCH='improvement/platform-quality'
-MOCK_REJECT=0
-gh() {
-  if [[ " $* " == *' --include '* ]]; then
-    printf 'HTTP/2 200 OK\netag: "revision-1"\n\n'
-    node - "$TEST_ROOT/epic-body-once" <<'NODE'
-const fs = require("node:fs");
-const body = fs.readFileSync(process.argv[2], "utf8");
-process.stdout.write(JSON.stringify({state: "open", draft: true, body,
-  base: {ref: "dev"}, head: {ref: "improvement/platform-quality"}}));
-NODE
-    return
-  fi
-  [[ " $* " == *' --method PATCH '* && " $* " == *' If-Match: "revision-1" '* ]] || return 97
-  [ "$MOCK_REJECT" -eq 0 ] || return 1
-  printf '{}\n'
-}
-update_epic_pr_body 598 "$TEST_ROOT/epic-body-once" "$TEST_ROOT/epic-598-migrated" \
-  "$TEST_ROOT/state"
-MOCK_REJECT=1
-if (update_epic_pr_body 598 "$TEST_ROOT/epic-body-once" "$TEST_ROOT/epic-598-migrated" \
-  "$TEST_ROOT/state") >/dev/null 2>&1; then
-  echo 'conditional PR-body race was accepted' >&2
+RUN_DIR="$TEST_ROOT/state"
+write_epic_comment "$TEST_ROOT/epic-entry" 'Fixes #49 <unsafe>' "$TEST_ROOT/epic-comment"
+grep -F 'addresses Forge ducktape item 49' "$TEST_ROOT/epic-comment" >/dev/null
+grep -F '&lt;unsafe&gt;' "$TEST_ROOT/epic-comment" >/dev/null
+if grep -F 'Fixes #49' "$TEST_ROOT/epic-comment" >/dev/null; then
+  echo 'closing keyword survived in an epic provenance comment' >&2
   exit 1
 fi
+node - "$TEST_ROOT/epic-comment" "$TEST_ROOT/epic-comments" \
+  "$TEST_ROOT/epic-comments-duplicate" "$TEST_ROOT/epic-comments-conflict" "$BASE" <<'NODE'
+const fs = require("node:fs");
+const [commentPath, commentsPath, duplicatePath, conflictPath, replacement] = process.argv.slice(2);
+const body = fs.readFileSync(commentPath, "utf8");
+const comment = {id: 1, body, user: {login: "epic-author"}};
+fs.writeFileSync(commentsPath, JSON.stringify([[
+  {id: 0, body: "human comment", user: {login: "reader"}},
+  {id: 4, body, user: {login: "untrusted"}},
+  comment,
+]]));
+fs.writeFileSync(duplicatePath, JSON.stringify([[comment, {
+  id: 2, body, user: {login: "epic-author"},
+}]]));
+fs.writeFileSync(conflictPath, JSON.stringify([[comment, {
+  id: 3, body: body.replace(/"source": "[0-9a-f]{40}"/, `"source": "${replacement}"`),
+  user: {login: "epic-author"},
+}]]));
+NODE
+parse_epic_comments "$TEST_ROOT/epic-comments" "$TEST_ROOT/epic-comment-records" epic-author
+grep -F $'E\tducktape\t26\t' "$TEST_ROOT/epic-comment-records" >/dev/null
+grep -F $'C\t'"$SOURCE_OID"$'\t'"$MIRROR_OID" "$TEST_ROOT/epic-comment-records" >/dev/null
+parse_epic_comments "$TEST_ROOT/epic-comments-duplicate" \
+  "$TEST_ROOT/epic-comment-records-duplicate" epic-author
+cmp "$TEST_ROOT/epic-comment-records" "$TEST_ROOT/epic-comment-records-duplicate"
+if (parse_epic_comments "$TEST_ROOT/epic-comments-conflict" \
+  "$TEST_ROOT/epic-comment-records-conflict" epic-author) >/dev/null 2>&1; then
+  echo 'conflicting duplicate epic provenance comments were accepted' >&2
+  exit 1
+fi
+gh() {
+  [[ " $* " == *' --method POST '* && " $* " == *'/issues/598/comments '* ]] || return 97
+  local args=("$@") input=""
+  for ((i = 0; i < ${#args[@]}; i += 1)); do
+    if [ "${args[$i]}" = --input ]; then input=${args[$((i + 1))]}; fi
+  done
+  node - "$input" <<'NODE'
+const fs = require("node:fs");
+process.stdout.write(JSON.stringify({id: 4, user: {login: "epic-author"},
+  ...JSON.parse(fs.readFileSync(process.argv[2], "utf8"))}));
+NODE
+}
+post_epic_comment 598 "$TEST_ROOT/epic-comment" "$TEST_ROOT/epic-comment-response" \
+  "$TEST_ROOT/state"
 unset -f gh
 
 assert_shared_dev_base "$TARGET_OID" "$GITHUB_BASE"
