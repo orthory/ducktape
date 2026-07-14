@@ -21,14 +21,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
-use agent::CapRequest;
+use agent::{AgentQuery, CapRequest};
 use chat::ChatQuery;
 use forge::ForgeQuery;
 use pages::PageQuery;
+use runs::RunsQuery;
 use tasks::TaskQuery;
 
 use super::{Tool, arg_str, opt_u64, schema};
-use crate::identity::Run;
+use crate::identity::{Run, TARGET_AGENT, TARGET_RUNS};
 use crate::node::{NodeError, Result};
 
 const TARGET_CHAT: &str = "chat";
@@ -52,6 +53,24 @@ pub(super) fn tools() -> Vec<Tool> {
                           the actions listed here.",
             schema: || schema(&[]),
             handler: whoami,
+        },
+        Tool {
+            name: "ducktape_agents",
+            description: "List every registered agent with its status, owner, allowed actions, \
+                          resource caps, and curated skills. AgentRole::ProjectLibrarian is \
+                          historical decode-only compatibility; it does not select a special \
+                          execution or knowledge path.",
+            schema: || schema(&[]),
+            handler: agents_list,
+        },
+        Tool {
+            name: "ducktape_runs",
+            description: "List in-flight run correlations and this node's recent terminal run \
+                          observations. Recent runs are a bounded derived cache and can be empty \
+                          after a snapshot join; Chat is the durable record of an agent's answer. \
+                          Live agent sessions and session keys are deliberately not exposed.",
+            schema: || schema(&[]),
+            handler: runs_list,
         },
         Tool {
             name: "ducktape_chat_channels",
@@ -194,6 +213,28 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
     }))
 }
 
+fn agents_list(run: &Run, _args: &Value) -> Result<Value> {
+    run.node.query(TARGET_AGENT, encode(&AgentQuery::Agents)?)
+}
+
+fn runs_list(run: &Run, _args: &Value) -> Result<Value> {
+    let pending = run
+        .node
+        .query(TARGET_RUNS, encode(&RunsQuery::PendingRuns)?)?;
+    let recent = run
+        .node
+        .query(TARGET_RUNS, encode(&RunsQuery::RecentRuns)?)?;
+    let field = |reply: &Value, name: &str| {
+        reply.get(name).cloned().ok_or_else(|| {
+            NodeError::Transport(format!("runs returned no {name:?} field: {reply}"))
+        })
+    };
+    Ok(json!({
+        "pending_runs": field(&pending, "pending_runs")?,
+        "recent_runs": field(&recent, "recent_runs")?,
+    }))
+}
+
 fn chat_channels(run: &Run, _args: &Value) -> Result<Value> {
     run.node.query(TARGET_CHAT, encode(&ChatQuery::Channels)?)
 }
@@ -321,6 +362,15 @@ mod tests {
         // chat renames a variant, this fails here rather than in front of a
         // model.
         assert_eq!(encode(&ChatQuery::Channels).unwrap(), json!("channels"));
+        assert_eq!(encode(&AgentQuery::Agents).unwrap(), json!("agents"));
+        assert_eq!(
+            encode(&RunsQuery::PendingRuns).unwrap(),
+            json!("pending_runs")
+        );
+        assert_eq!(
+            encode(&RunsQuery::RecentRuns).unwrap(),
+            json!("recent_runs")
+        );
         assert_eq!(
             encode(&ChatQuery::MessagesLatest {
                 channel_id: "c".into(),

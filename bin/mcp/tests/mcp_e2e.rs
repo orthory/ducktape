@@ -44,6 +44,32 @@ fn whoami_reports_the_committed_grant() {
     assert_eq!(who["owner"], json!({"external": OWNER.as_bytes()}));
 }
 
+#[test]
+fn agents_and_runs_are_read_from_the_real_modules() {
+    let h = Harness::start(&["tasks.create"]);
+
+    let results = h.session(
+        h.mcp(),
+        &[
+            json!({"name": "ducktape_agents", "arguments": {}}),
+            json!({"name": "ducktape_runs", "arguments": {}}),
+        ],
+    );
+    let agents = payload(&results[0]);
+    assert_eq!(agents["agents"][0]["agent_id"], AGENT_ID);
+    assert_eq!(agents["agents"][0]["display_name"], "Quackbot");
+    assert_eq!(agents["agents"][0]["status"], "active");
+    assert_eq!(
+        agents["agents"][0]["allowed_actions"],
+        json!(["tasks.create"])
+    );
+
+    let runs = payload(&results[1]);
+    assert_eq!(runs["pending_runs"], json!([]));
+    assert_eq!(runs["recent_runs"], json!([]));
+    assert!(runs.get("agent_sessions").is_none());
+}
+
 /// a session key bound to nothing — no run in this harness was ever dispatched.
 /// consensus must therefore refuse every action it signs, and the refusal must
 /// come from `runs`, not from the binary under test.
