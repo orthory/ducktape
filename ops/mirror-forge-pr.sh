@@ -87,7 +87,7 @@ NODE
 }
 
 validate_epic_item() {
-  local repo=$1 number=$2 merge=$3 source=$4 target=$5 forge_dev=$6 json=$7
+  local repo=$1 number=$2 merge=$3 source=$4 target=$5 forge_dev=$6 github_dev=$7 json=$8
   [ "$repo" = "$FORGE_REPO" ] ||
     die "epic provenance repo $repo does not match Forge mirror repo $FORGE_REPO"
   query_named_item "$repo" "$number" "$json" ||
@@ -100,7 +100,7 @@ validate_epic_item() {
   canonical_target=$(validate_merged_selection "$merge" "$source")
   [ "$canonical_target" = "$target" ] ||
     die "epic provenance target does not match canonical Forge $repo#$number"
-  validate_commit_range "$target" "$source"
+  validate_commit_range "$target" "$source" "$github_dev"
   VALIDATED_EPIC_COMMITS=("${SOURCE_COMMITS[@]}")
 }
 
@@ -180,6 +180,19 @@ assert_shared_dev_base() {
     die "Forge dev target $forge_target contains changes missing from GitHub dev $github_dev"
 }
 
+assert_epic_shared_dev_base() {
+  local forge_target=$1 github_dev=$2 epic_tip=$3
+  if (assert_shared_dev_base "$forge_target" "$github_dev") >/dev/null 2>&1; then
+    EPIC_BASE_REPRESENTATION=origin
+    return
+  fi
+  if (assert_shared_dev_base "$forge_target" "$epic_tip") >/dev/null 2>&1; then
+    EPIC_BASE_REPRESENTATION=epic
+    return
+  fi
+  die "Forge dev target $forge_target is represented by neither current GitHub dev nor the verified epic tip"
+}
+
 validate_merged_selection() {
   local merge=$1 source=$2
   is_oid "$merge" && is_oid "$source" || die "merge/source oid is invalid"
@@ -194,19 +207,29 @@ validate_merged_selection() {
 }
 
 validate_commit_range() {
-  local target=$1 source=$2
-  mapfile -t SOURCE_COMMITS < <(git rev-list --reverse --topo-order "$target..$source")
+  local target=$1 source=$2 github_dev=${3:-}
+  mapfile -t SOURCE_COMMITS < <(git rev-list --first-parent --reverse "$target..$source")
   [ "${#SOURCE_COMMITS[@]}" -gt 0 ] || die "Forge PR contains no commits to mirror"
   local previous="" commit line
   local -a parents
   for commit in "${SOURCE_COMMITS[@]}"; do
     line=$(git show -s --format=%P "$commit")
     read -r -a parents <<<"$line"
-    [ "${#parents[@]}" -eq 1 ] || die "Forge feature history contains merge commit $commit"
     if [ -z "$previous" ]; then
-      git merge-base --is-ancestor "${parents[0]}" "$target" ||
-        die "Forge feature history does not fork from the merged target"
+      if [ "${#parents[@]}" -eq 1 ]; then
+        git merge-base --is-ancestor "${parents[0]}" "$target" ||
+          die "Forge feature history does not fork from the merged target"
+      elif [ "${#parents[@]}" -eq 2 ]; then
+        [ "${parents[0]}" = "$target" ] ||
+          die "Forge checkpoint $commit does not start at the merged target"
+        is_oid "$github_dev" && git merge-base --is-ancestor "${parents[1]}" "$github_dev" ||
+          die "Forge checkpoint $commit does not merge represented GitHub dev history"
+      else
+        die "Forge feature history contains unsupported merge commit $commit"
+      fi
     else
+      [ "${#parents[@]}" -eq 1 ] ||
+        die "Forge feature history contains non-leading merge commit $commit"
       [ "${parents[0]}" = "$previous" ] || die "Forge feature history is not linear at $commit"
     fi
     previous=$commit
@@ -244,13 +267,33 @@ NODE
 }
 
 replay_commit() {
-  local dir=$1 source=$2 state_dir=$3
+  local dir=$1 source=$2 state_dir=$3 github_dev=${4:-}
   assert_clean "$dir"
   has_only_replayable_headers "$source" ||
     die "source commit $source has an encoding, signature, or unsupported header that cannot be preserved"
 
-  git -C "$dir" cherry-pick --no-commit "$source" || die "source commit $source does not apply cleanly"
-  git -C "$dir" diff --cached --quiet && die "source commit $source is empty on GitHub dev"
+  local source_parent_line
+  source_parent_line=$(git show -s --format=%P "$source")
+  local -a source_parents=()
+  read -r -a source_parents <<<"$source_parent_line"
+  [ "${#source_parents[@]}" -eq 1 ] || [ "${#source_parents[@]}" -eq 2 ] ||
+    die "source commit $source has an unsupported parent count"
+
+  local parent tree
+  parent=$(git -C "$dir" rev-parse HEAD)
+  local -a parent_args=(-p "$parent")
+  if [ "${#source_parents[@]}" -eq 2 ]; then
+    is_oid "$github_dev" && git merge-base --is-ancestor "${source_parents[1]}" "$github_dev" ||
+      die "source checkpoint $source does not merge represented GitHub dev history"
+    [ "$(git rev-parse "${source_parents[0]}^{tree}")" = "$(git -C "$dir" rev-parse 'HEAD^{tree}')" ] ||
+      die "source checkpoint $source first-parent tree does not match the epic tip"
+    tree=$(git rev-parse "$source^{tree}")
+    parent_args+=(-p "${source_parents[1]}")
+  else
+    git -C "$dir" cherry-pick --no-commit "$source" || die "source commit $source does not apply cleanly"
+    git -C "$dir" diff --cached --quiet && die "source commit $source is empty on GitHub dev"
+    tree=$(git -C "$dir" write-tree)
+  fi
 
   local -a meta
   mapfile -d '' -t meta < <(commit_fingerprint "$source")
@@ -260,9 +303,7 @@ replay_commit() {
   local source_message="$state_dir/source-message"
   write_raw_message "$source" "$source_raw" "$source_message"
 
-  local tree parent mirrored
-  tree=$(git -C "$dir" write-tree)
-  parent=$(git -C "$dir" rev-parse HEAD)
+  local mirrored
   mirrored=$(
     GIT_AUTHOR_NAME="${meta[0]}" \
     GIT_AUTHOR_EMAIL="${meta[1]}" \
@@ -270,12 +311,12 @@ replay_commit() {
     GIT_COMMITTER_NAME="${meta[3]}" \
     GIT_COMMITTER_EMAIL="${meta[4]}" \
     GIT_COMMITTER_DATE="${meta[5]}" \
-      git -C "$dir" -c commit.gpgSign=false commit-tree "$tree" -p "$parent" <"$source_message"
+      git -C "$dir" -c commit.gpgSign=false commit-tree "$tree" "${parent_args[@]}" <"$source_message"
   ) || die "git commit-tree failed for $source"
   is_oid "$mirrored" || die "git commit-tree returned an invalid oid"
   git -C "$dir" reset --hard "$mirrored" >/dev/null
 
-  verify_replayed_commit "$source" "$mirrored" "$state_dir" "replayed commit"
+  verify_replayed_commit "$source" "$mirrored" "$state_dir" "replayed commit" "$github_dev"
   assert_clean "$dir"
   MIRRORED_OID=$mirrored
 }
@@ -310,8 +351,15 @@ normalize_epic_branch() {
 resolve_epic_history_base() {
   local github_dev=$1 epic_tip=$2 base
   is_oid "$github_dev" && is_oid "$epic_tip" || die "epic history contains an invalid oid"
-  base=$(git merge-base "$github_dev" "$epic_tip") ||
-    die "epic branch and current origin/dev have no shared history"
+  base=
+  local candidate
+  while read -r candidate; do
+    if git merge-base --is-ancestor "$candidate" "$github_dev"; then
+      base=$candidate
+      break
+    fi
+  done < <(git rev-list --first-parent "$epic_tip")
+  [ -n "$base" ] || die "epic first-parent history and current origin/dev have no shared commit"
   is_oid "$base" || die "epic branch merge-base is invalid"
   git merge-base --is-ancestor "$base" "$github_dev" &&
     git merge-base --is-ancestor "$base" "$epic_tip" ||
@@ -320,7 +368,7 @@ resolve_epic_history_base() {
 }
 
 verify_replayed_commit() {
-  local source=$1 mirrored=$2 state_dir=$3 label=$4
+  local source=$1 mirrored=$2 state_dir=$3 label=$4 github_dev=${5:-}
   is_oid "$source" && is_oid "$mirrored" || die "$label contains an invalid commit oid"
   git cat-file -e "$source^{commit}" 2>/dev/null || die "$label source commit $source is unavailable"
   git cat-file -e "$mirrored^{commit}" 2>/dev/null || die "$label mirrored commit $mirrored is unavailable"
@@ -339,8 +387,24 @@ verify_replayed_commit() {
   local -a source_parents=() mirrored_parents=()
   read -r -a source_parents <<<"$source_parent_line"
   read -r -a mirrored_parents <<<"$mirrored_parent_line"
-  [ "${#source_parents[@]}" -eq 1 ] || die "$label source commit $source is not a single-parent commit"
-  [ "${#mirrored_parents[@]}" -eq 1 ] || die "$label mirrored commit $mirrored is not a single-parent commit"
+  if [ "${#source_parents[@]}" -eq 2 ]; then
+    [ "${#mirrored_parents[@]}" -eq 2 ] ||
+      die "$label mirrored checkpoint $mirrored is not a two-parent commit"
+    is_oid "$github_dev" && git merge-base --is-ancestor "${source_parents[1]}" "$github_dev" ||
+      die "$label source checkpoint $source does not merge represented GitHub dev history"
+    [ "${source_parents[1]}" = "${mirrored_parents[1]}" ] ||
+      die "$label changed the GitHub parent for checkpoint $source"
+    [ "$(git rev-parse "${source_parents[0]}^{tree}")" = \
+      "$(git rev-parse "${mirrored_parents[0]}^{tree}")" ] ||
+      die "$label changed the pre-checkpoint tree for $source"
+    [ "$(git rev-parse "$source^{tree}")" = "$(git rev-parse "$mirrored^{tree}")" ] ||
+      die "$label changed the checkpoint tree for $source"
+    return
+  fi
+  [ "${#source_parents[@]}" -eq 1 ] ||
+    die "$label source commit $source has an unsupported parent count"
+  [ "${#mirrored_parents[@]}" -eq 1 ] ||
+    die "$label mirrored commit $mirrored is not a single-parent commit"
 
   # Give Git the real source parent A as the merge base while representing the
   # mirrored parent tree B on a synthetic A child. Merging that child with S
@@ -779,12 +843,12 @@ main() {
     die "Forge merge $MERGE_OID is not in canonical Forge dev"
   local forge_target
   forge_target=$(validate_merged_selection "$MERGE_OID" "$SOURCE_OID")
-  validate_commit_range "$forge_target" "$SOURCE_OID"
 
   log "fetching exact GitHub dev base"
   git fetch --no-tags origin "refs/heads/dev:$ORIGIN_TMP_REF"
   local origin_oid
   origin_oid=$(git rev-parse "$ORIGIN_TMP_REF^{commit}")
+  validate_commit_range "$forge_target" "$SOURCE_OID" "$origin_oid"
 
   local replay_base=$origin_oid epic_history_base=$origin_oid
   local epic_tip="" epic_pr_number="" epic_pr_url="" epic_pr_author=""
@@ -830,8 +894,10 @@ main() {
       [ -z "$epic_pr_number" ] || die "epic PR exists but its branch is missing"
     fi
   fi
-  assert_shared_dev_base "$forge_target" "$origin_oid"
-  log "shared dev history: Forge target $forge_target is represented by GitHub $origin_oid"
+  if [ "$EPIC_MODE" -eq 0 ]; then
+    assert_shared_dev_base "$forge_target" "$origin_oid"
+    log "shared dev history: Forge target $forge_target is represented by GitHub $origin_oid"
+  fi
 
   git worktree add --detach "$MIRROR_WORKTREE" "$replay_base" >/dev/null
   WORKTREE_ADDED=1
@@ -842,14 +908,15 @@ main() {
     parse_epic_ledger "$RUN_DIR/epic-body" "$RUN_DIR/epic-records"
     cat "$RUN_DIR/epic-comment-records" >>"$RUN_DIR/epic-records"
     local -a branch_commits=() ledger_mirrors=() current_sources=() current_mirrors=()
-    mapfile -t branch_commits < <(git rev-list --reverse --topo-order "$epic_history_base..$replay_base")
+    mapfile -t branch_commits < <(git rev-list --first-parent --reverse "$epic_history_base..$replay_base")
     local previous=$epic_history_base branch_commit parent_line
     local -a branch_parents=()
     for branch_commit in "${branch_commits[@]}"; do
       parent_line=$(git show -s --format=%P "$branch_commit")
       read -r -a branch_parents <<<"$parent_line"
-      [ "${#branch_parents[@]}" -eq 1 ] && [ "${branch_parents[0]}" = "$previous" ] ||
-        die "epic branch history is not one linear fast-forward chain at $branch_commit"
+      [ "${#branch_parents[@]}" -ge 1 ] && [ "${#branch_parents[@]}" -le 2 ] &&
+        [ "${branch_parents[0]}" = "$previous" ] ||
+        die "epic branch history is not one first-parent fast-forward chain at $branch_commit"
       previous=$branch_commit
     done
     local record_kind record_a record_b record_c record_d record_e entry_key in_current=0 current_seen=0
@@ -869,7 +936,7 @@ main() {
         [ -z "${seen_entries[$entry_key]+x}" ] || die "epic provenance duplicates $entry_key"
         seen_entries[$entry_key]=1
         validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
-          "$forge_dev" "$RUN_DIR/epic-item-$record_b.json"
+          "$forge_dev" "$origin_oid" "$RUN_DIR/epic-item-$record_b.json"
         entry_expected_sources=("${VALIDATED_EPIC_COMMITS[@]}")
         SOURCE_COMMITS=("${selected_source_commits[@]}")
         entry_open=1
@@ -895,7 +962,7 @@ main() {
         printf 'C\t%s\t%s\n' "$record_a" "$record_b" \
           >>"$RUN_DIR/epic-records-resolved"
         ledger_mirrors+=("$record_b")
-        verify_replayed_commit "$record_a" "$record_b" "$RUN_DIR" "epic ledger"
+        verify_replayed_commit "$record_a" "$record_b" "$RUN_DIR" "epic ledger" "$origin_oid"
         if [ "$in_current" -eq 1 ]; then
           current_sources+=("$record_a")
           current_mirrors+=("$record_b")
@@ -911,7 +978,7 @@ main() {
         [ -z "${seen_entries[$entry_key]+x}" ] || die "epic provenance duplicates $entry_key"
         seen_entries[$entry_key]=1
         validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
-          "$forge_dev" "$RUN_DIR/epic-item-$record_b.json"
+          "$forge_dev" "$origin_oid" "$RUN_DIR/epic-item-$record_b.json"
         local -a legacy_sources=("${VALIDATED_EPIC_COMMITS[@]}")
         SOURCE_COMMITS=("${selected_source_commits[@]}")
         if [ "$record_a" = "$FORGE_REPO" ] && [ "$record_b" = "$PR_NUMBER" ]; then
@@ -931,7 +998,7 @@ main() {
             die "legacy epic provenance names history missing from the epic branch"
           legacy_mirror=${branch_commits[$branch_index]}
           verify_replayed_commit "$legacy_source" "$legacy_mirror" "$RUN_DIR" \
-            "legacy epic provenance"
+            "legacy epic provenance" "$origin_oid"
           ledger_mirrors+=("$legacy_mirror")
           printf 'C\t%s\t%s\n' "$legacy_source" "$legacy_mirror" \
             >>"$RUN_DIR/epic-records-resolved"
@@ -964,6 +1031,8 @@ main() {
         [ "${current_sources[$i]}" = "${SOURCE_COMMITS[$i]}" ] ||
           die "epic provenance for $FORGE_REPO#$PR_NUMBER names the wrong source commit"
       done
+      assert_epic_shared_dev_base "$forge_target" "$origin_oid" "$replay_base"
+      log "shared dev history: Forge target $forge_target is represented by verified $EPIC_BASE_REPRESENTATION history"
       MIRROR_COMMITS=("${current_mirrors[@]}")
       mirror_tip=$replay_base
       epic_repeat=1
@@ -975,17 +1044,21 @@ main() {
         for ((i = 0; i < uncovered; i += 1)); do
           local branch_index=$((${#ledger_mirrors[@]} + i))
           verify_replayed_commit "${SOURCE_COMMITS[$i]}" "${branch_commits[$branch_index]}" \
-            "$RUN_DIR" "partial-success recovery"
+            "$RUN_DIR" "partial-success recovery" "$origin_oid"
           MIRROR_COMMITS+=("${branch_commits[$branch_index]}")
         done
+        assert_epic_shared_dev_base "$forge_target" "$origin_oid" "$replay_base"
+        log "shared dev history: Forge target $forge_target is represented by verified $EPIC_BASE_REPRESENTATION history"
         [ -n "$epic_pr_number" ] ||
           [ "${#ledger_mirrors[@]}" -eq 0 ] || die "epic branch without a PR contains prior ledger history"
         mirror_tip=$replay_base
         epic_recovery=1
       else
+        assert_epic_shared_dev_base "$forge_target" "$origin_oid" "$replay_base"
+        log "shared dev history: Forge target $forge_target is represented by verified $EPIC_BASE_REPRESENTATION history"
         for commit in "${SOURCE_COMMITS[@]}"; do
           log "appending $commit to epic with its original message and identities"
-          replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR"
+          replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR" "$origin_oid"
           MIRROR_COMMITS+=("$MIRRORED_OID")
         done
         mirror_tip=$MIRRORED_OID
@@ -994,7 +1067,7 @@ main() {
   else
     for commit in "${SOURCE_COMMITS[@]}"; do
       log "replaying $commit with its original message and identities"
-      replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR"
+      replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR" "$origin_oid"
     done
     mirror_tip=$MIRRORED_OID
   fi

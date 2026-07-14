@@ -94,13 +94,110 @@ if (normalize_epic_branch 'refs/heads/dev') >/dev/null 2>&1; then
   exit 1
 fi
 
-# A long-lived epic keeps its original linear ledger even when origin/dev
-# advances independently. Its validation base is the histories' merge-base,
-# while the later remote-dev lease still observes the current dev tip.
+# A long-lived epic keeps its original first-parent ledger even when origin/dev
+# advances independently.
 history_tree=$(git rev-parse "$GITHUB_BASE^{tree}")
 EPIC_HISTORY_TIP=$(printf 'epic slice\n' | git commit-tree "$history_tree" -p "$GITHUB_BASE")
 ADVANCED_DEV=$(printf 'independent dev advance\n' | git commit-tree "$history_tree" -p "$GITHUB_BASE")
 [ "$(resolve_epic_history_base "$ADVANCED_DEV" "$EPIC_HISTORY_TIP")" = "$GITHUB_BASE" ]
+
+# A leading Forge merge may checkpoint GitHub history already represented by
+# current dev. Replay it as a two-parent epic commit while preserving its tree,
+# message, identities, and original GitHub second parent.
+checkpoint_message="$TEST_ROOT/checkpoint-message"
+printf 'Synchronize represented GitHub dev\n\nKeep this merge body verbatim.\n' >"$checkpoint_message"
+CHECKPOINT_SOURCE=$(
+  GIT_AUTHOR_NAME='Sync Agent' GIT_AUTHOR_EMAIL='sync@agents.duck' \
+  GIT_AUTHOR_DATE='2026-07-03T01:02:03+00:00' GIT_COMMITTER_NAME='Sync Node' \
+  GIT_COMMITTER_EMAIL='sync@nodes.duck' GIT_COMMITTER_DATE='2026-07-03T04:05:06+00:00' \
+    git -c commit.gpgSign=false commit-tree "$GITHUB_BASE^{tree}" \
+      -p "$TARGET_OID" -p "$GITHUB_BASE" <"$checkpoint_message"
+)
+CHECKPOINT_CORRECTION=$(
+  printf 'Correct the synchronized client\n' | \
+    git commit-tree "$SOURCE_OID^{tree}" -p "$CHECKPOINT_SOURCE"
+)
+validate_commit_range "$TARGET_OID" "$CHECKPOINT_CORRECTION" "$GITHUB_BASE"
+[ "${SOURCE_COMMITS[*]}" = "$CHECKPOINT_SOURCE $CHECKPOINT_CORRECTION" ]
+
+EPIC_PRE_CHECKPOINT=$(
+  printf 'verified epic before checkpoint\n' | \
+    git commit-tree "$TARGET_OID^{tree}" -p "$BASE"
+)
+quiet_git "$DEST_REPO" reset --hard "$EPIC_PRE_CHECKPOINT"
+mkdir "$TEST_ROOT/checkpoint-state"
+replay_commit "$DEST_REPO" "$CHECKPOINT_SOURCE" "$TEST_ROOT/checkpoint-state" "$GITHUB_BASE"
+CHECKPOINT_MIRROR=$MIRRORED_OID
+[ "$(git show -s --format=%P "$CHECKPOINT_MIRROR")" = \
+  "$EPIC_PRE_CHECKPOINT $GITHUB_BASE" ]
+[ "$(git rev-parse "$CHECKPOINT_MIRROR^{tree}")" = \
+  "$(git rev-parse "$CHECKPOINT_SOURCE^{tree}")" ]
+verify_replayed_commit "$CHECKPOINT_SOURCE" "$CHECKPOINT_MIRROR" \
+  "$TEST_ROOT/checkpoint-state" 'checkpoint ledger repeat' "$GITHUB_BASE"
+replay_commit "$DEST_REPO" "$CHECKPOINT_CORRECTION" "$TEST_ROOT/checkpoint-state" \
+  "$GITHUB_BASE"
+CHECKPOINT_CORRECTION_MIRROR=$MIRRORED_OID
+[ "$(resolve_epic_history_base "$GITHUB_BASE" "$CHECKPOINT_CORRECTION_MIRROR")" = "$BASE" ]
+[ "$(git rev-list --first-parent --reverse "$BASE..$CHECKPOINT_CORRECTION_MIRROR" | \
+  paste -sd ' ' -)" = \
+  "$EPIC_PRE_CHECKPOINT $CHECKPOINT_MIRROR $CHECKPOINT_CORRECTION_MIRROR" ]
+
+OUTSIDE_GITHUB=$(
+  printf 'outside current GitHub dev\n' | git commit-tree "$BASE^{tree}" -p "$BASE"
+)
+BAD_CHECKPOINT=$(
+  printf 'bad checkpoint\n' | git commit-tree "$GITHUB_BASE^{tree}" \
+    -p "$TARGET_OID" -p "$OUTSIDE_GITHUB"
+)
+if (validate_commit_range "$TARGET_OID" "$BAD_CHECKPOINT" "$GITHUB_BASE") \
+  >/dev/null 2>&1; then
+  echo 'checkpoint with an unrepresented GitHub parent was accepted' >&2
+  exit 1
+fi
+NONLEADING_BASE=$(
+  printf 'ordinary first commit\n' | git commit-tree "$TARGET_OID^{tree}" -p "$TARGET_OID"
+)
+NONLEADING_MERGE=$(
+  printf 'late merge\n' | git commit-tree "$GITHUB_BASE^{tree}" \
+    -p "$NONLEADING_BASE" -p "$GITHUB_BASE"
+)
+if (validate_commit_range "$TARGET_OID" "$NONLEADING_MERGE" "$GITHUB_BASE") \
+  >/dev/null 2>&1; then
+  echo 'non-leading Forge merge checkpoint was accepted' >&2
+  exit 1
+fi
+
+quiet_git "$DEST_REPO" reset --hard "$BASE"
+if (replay_commit "$DEST_REPO" "$CHECKPOINT_SOURCE" "$TEST_ROOT/checkpoint-state" \
+  "$GITHUB_BASE") >/dev/null 2>&1; then
+  echo 'checkpoint replay over the wrong epic tree was accepted' >&2
+  exit 1
+fi
+TAMPERED_CHECKPOINT=$(
+  GIT_AUTHOR_NAME='Sync Agent' GIT_AUTHOR_EMAIL='sync@agents.duck' \
+  GIT_AUTHOR_DATE='2026-07-03T01:02:03+00:00' GIT_COMMITTER_NAME='Sync Node' \
+  GIT_COMMITTER_EMAIL='sync@nodes.duck' GIT_COMMITTER_DATE='2026-07-03T04:05:06+00:00' \
+    git -c commit.gpgSign=false commit-tree "$CHECKPOINT_SOURCE^{tree}" \
+      -p "$EPIC_PRE_CHECKPOINT" -p "$BASE" <"$checkpoint_message"
+)
+if (verify_replayed_commit "$CHECKPOINT_SOURCE" "$TAMPERED_CHECKPOINT" \
+  "$TEST_ROOT/checkpoint-state" 'tampered checkpoint' "$GITHUB_BASE") >/dev/null 2>&1; then
+  echo 'checkpoint with a changed GitHub parent was accepted' >&2
+  exit 1
+fi
+TAMPERED_CHECKPOINT_TREE=$(
+  GIT_AUTHOR_NAME='Sync Agent' GIT_AUTHOR_EMAIL='sync@agents.duck' \
+  GIT_AUTHOR_DATE='2026-07-03T01:02:03+00:00' GIT_COMMITTER_NAME='Sync Node' \
+  GIT_COMMITTER_EMAIL='sync@nodes.duck' GIT_COMMITTER_DATE='2026-07-03T04:05:06+00:00' \
+    git -c commit.gpgSign=false commit-tree "$EPIC_PRE_CHECKPOINT^{tree}" \
+      -p "$EPIC_PRE_CHECKPOINT" -p "$GITHUB_BASE" <"$checkpoint_message"
+)
+if (verify_replayed_commit "$CHECKPOINT_SOURCE" "$TAMPERED_CHECKPOINT_TREE" \
+  "$TEST_ROOT/checkpoint-state" 'tampered checkpoint tree' "$GITHUB_BASE") >/dev/null 2>&1; then
+  echo 'checkpoint with a changed tree was accepted' >&2
+  exit 1
+fi
+quiet_git "$DEST_REPO" reset --hard "$MIRROR_OID"
 
 # The bounded marker owns only its JSON ledger; human-authored text on either
 # side survives an append byte-for-byte. The recorded replay is then proven
@@ -144,7 +241,7 @@ query_named_item() {
 read -r kind repo number merge source target < <(head -1 "$TEST_ROOT/epic-records")
 [ "$kind" = E ]
 validate_epic_item "$repo" "$number" "$merge" "$source" "$target" \
-  "$FORGE_DEV" "$TEST_ROOT/epic-item-valid"
+  "$FORGE_DEV" "$GITHUB_BASE" "$TEST_ROOT/epic-item-valid"
 [ "${VALIDATED_EPIC_COMMITS[*]}" = "$SOURCE_OID" ]
 SOURCE_COMMITS=("$SOURCE_OID")
 
@@ -161,7 +258,7 @@ for tampered in wrong-repo wrong-pr wrong-merge; do
   parse_epic_ledger "$TEST_ROOT/epic-body-$tampered" "$TEST_ROOT/records-$tampered"
   read -r kind repo number merge source target < <(head -1 "$TEST_ROOT/records-$tampered")
   if (validate_epic_item "$repo" "$number" "$merge" "$source" "$target" \
-    "$FORGE_DEV" "$TEST_ROOT/item-$tampered") >/dev/null 2>&1; then
+    "$FORGE_DEV" "$GITHUB_BASE" "$TEST_ROOT/item-$tampered") >/dev/null 2>&1; then
     echo "tampered prior JSON epic entry was accepted: $tampered" >&2
     exit 1
   fi
@@ -448,6 +545,15 @@ unset -f gh
 
 assert_shared_dev_base "$TARGET_OID" "$GITHUB_BASE"
 assert_shared_dev_base "$MERGE_OID" "$MIRROR_OID"
+assert_epic_shared_dev_base "$TARGET_OID" "$BASE" "$TARGET_OID"
+[ "$EPIC_BASE_REPRESENTATION" = epic ]
+assert_epic_shared_dev_base "$TARGET_OID" "$GITHUB_BASE" "$BASE"
+[ "$EPIC_BASE_REPRESENTATION" = origin ]
+if (assert_epic_shared_dev_base "$MERGE_OID" "$GITHUB_BASE" "$SOURCE_OID") \
+  >/dev/null 2>&1; then
+  echo 'partial target deltas split across origin and epic were accepted' >&2
+  exit 1
+fi
 bridge_tree=$(git rev-parse "$GITHUB_BASE^{tree}")
 BRIDGE=$(printf 'history-only bridge\n' | git commit-tree "$bridge_tree" -p "$GITHUB_BASE")
 assert_shared_dev_base "$BRIDGE" "$GITHUB_BASE"
@@ -488,6 +594,8 @@ quiet_git "$DEST_REPO" add later-forge.txt
 quiet_git "$DEST_REPO" commit -m 'Later Forge delta'
 LATER_FORGE_SOURCE=$(git -C "$DEST_REPO" rev-parse HEAD)
 assert_shared_dev_base "$LATER_FORGE_TARGET" "$CURRENT_GITHUB_DEV"
+assert_epic_shared_dev_base "$LATER_FORGE_TARGET" "$CURRENT_GITHUB_DEV" "$STALE_EPIC_TIP"
+[ "$EPIC_BASE_REPRESENTATION" = origin ]
 validate_commit_range "$LATER_FORGE_TARGET" "$LATER_FORGE_SOURCE"
 quiet_git "$DEST_REPO" reset --hard "$STALE_EPIC_TIP"
 mkdir "$TEST_ROOT/stale-epic-state"
@@ -499,8 +607,9 @@ printf 'missing from GitHub dev\n' >"$DEST_REPO/forge-target-only.txt"
 quiet_git "$DEST_REPO" add forge-target-only.txt
 quiet_git "$DEST_REPO" commit -m 'Forge target delta missing from GitHub'
 MISSING_FORGE_TARGET=$(git -C "$DEST_REPO" rev-parse HEAD)
-if (assert_shared_dev_base "$MISSING_FORGE_TARGET" "$CURRENT_GITHUB_DEV") >/dev/null 2>&1; then
-  echo 'a Forge target delta missing from current GitHub dev was accepted' >&2
+if (assert_epic_shared_dev_base "$MISSING_FORGE_TARGET" "$CURRENT_GITHUB_DEV" \
+  "$STALE_EPIC_TIP") >/dev/null 2>&1; then
+  echo 'a Forge target delta missing from current GitHub dev and epic was accepted' >&2
   exit 1
 fi
 quiet_git "$DEST_REPO" reset --hard "$GITHUB_BASE"
