@@ -31,6 +31,7 @@ import {
   joinRequests as fetchJoinRequests,
   type JoinRequest,
 } from "../../../domain/workspace-client";
+import { Avatar as AccountAvatar } from "../../components/Avatar";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
@@ -50,6 +51,8 @@ interface MemberVM {
   displayName: string;
   profileName: string | null;
   initials: string;
+  /** The account's avatar duckfs path, or null — resolved like `profileName`. */
+  avatarPath: string | null;
   shortKey: string;
   /** Which valset tier the key sits in — the tiers never overlap. */
   tier: "validator" | "resident";
@@ -127,6 +130,7 @@ function makeMembers(
   members: string[],
   residents: string[],
   authorNames: Record<string, string>,
+  authorAvatars: Record<string, string>,
   workspace: { pubkey: string; founder: boolean; member: boolean } | null,
   capabilitiesByNode: Map<string, string[]>,
 ): MemberVM[] {
@@ -134,6 +138,7 @@ function makeMembers(
   const toVM = (key: string, tier: MemberVM["tier"]): MemberVM => {
     const keyNorm = normalizeKey(key);
     const profileName = displayNameForKey(key, authorNames);
+    const avatarPath = displayNameForKey(key, authorAvatars);
     const isLocal = sameKey(key, localKey);
     // A founder is by definition seated — resident standing never applies.
     const isFounder = Boolean(workspace?.founder && isLocal);
@@ -152,6 +157,7 @@ function makeMembers(
       displayName,
       profileName,
       initials: initialsOf(displayName),
+      avatarPath,
       shortKey: shortKey(key),
       tier,
       role,
@@ -193,7 +199,7 @@ type MemberItem =
  *  would only repeat the name directly above its own row. */
 function groupMembersByUser(
   members: MemberVM[],
-  nodeUsers: Record<string, { accountId: string; name: string | null }>,
+  nodeUsers: Record<string, { accountId: string; name: string | null; label?: string | null }>,
 ): MemberItem[] {
   const items: MemberItem[] = [];
   const groups = new Map<string, MemberGroup>();
@@ -362,6 +368,11 @@ function ProviderPill({ group }: { group: ProviderGroup }) {
 }
 
 function Avatar({ member, size = 32 }: { member: MemberVM; size?: number }) {
+  // A propagated account avatar wins; the colored-initials circle is the
+  // fallback for keys without one (and while the image loads / on failure).
+  if (member.avatarPath) {
+    return <AccountAvatar path={member.avatarPath} name={member.displayName} size={size} />;
+  }
   const bg = member.isFounder ? color.dark : member.isLocal ? STATUS_PILLS.local.bg : color.chip;
   const fg = member.isFounder ? color.onDark : member.isLocal ? STATUS_PILLS.local.text : color.muted3;
   return (
@@ -1285,11 +1296,13 @@ export function MembersView() {
         state.members,
         state.residents,
         state.authorNames,
+        state.authorAvatars,
         state.workspace,
         state.capabilitiesByNode,
       ),
     [
       state.authorNames,
+      state.authorAvatars,
       state.capabilitiesByNode,
       state.members,
       state.residents,

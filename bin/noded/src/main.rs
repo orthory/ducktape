@@ -7,7 +7,7 @@
 //! thread and only ever talks to the actor over the command channel. every app
 //! build is a client: the web build dials this directly; the desktop shell
 //! spawns it detached (an orphan — it outlives the window) and connects the
-//! same way. POST /v1/shutdown is how a client retires it: no pid handshake,
+//! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
 //! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
@@ -123,7 +123,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_index_store(index.clone())
         // the duckfs workspace RPC materializes managed checkouts here (disk
         // state, separate from the module's own `<storage>/duckfs` dir).
-        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        // the single-writer daemon has no consensus and no on-chain owner, so
+        // admin stays loopback-trust (ADR A2/A5); `DUCKTAPE_ADMIN=off` still
+        // removes the control surface entirely.
+        .with_admin(noded::AdminConfig {
+            exposure: noded::AdminExposure::from_env(),
+            node_key: None,
+            ..Default::default()
+        });
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle is

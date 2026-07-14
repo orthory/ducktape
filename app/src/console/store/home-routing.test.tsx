@@ -1,7 +1,8 @@
 // Account-centric Home routing (store slice, Task 7):
-//   - smart boot: a desktop with workspaces registered but none active lands at
-//     the Home layer (state.atHome), NOT the first-run onboarding gate;
-//   - first run (no workspaces at all) still raises onboarding;
+//   - smart boot: a desktop with networks registered but none active lands at
+//     the Home layer (state.atHome), NOT a gate;
+//   - first run (no networks at all) ALSO lands on the account home (epic W1:
+//     the post-mnemonic auto-created workspace is gone);
 //   - goHome() shows Home without tearing down the node connection;
 //   - entering a workspace (connectActive) clears atHome.
 // Same mocked-invoke + stubbed-node harness as workspace-management.test.tsx.
@@ -128,12 +129,14 @@ describe("smart boot", () => {
     expect(screen.getByTestId("ws").textContent).toBe("none");
   });
 
-  it("raises onboarding on first run (no workspaces at all)", async () => {
+  it("lands on the account home on first run (no networks at all)", async () => {
     await act(async () => {
       bootDesktop([], null);
     });
-    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
-    expect(screen.getByTestId("home").textContent).toBe("false");
+    // epic W1: the post-mnemonic auto-created workspace is gone — first run is
+    // the account home (profile + custody + join/create CTAs), not a gate.
+    await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
+    expect(screen.getByTestId("gate").textContent).toBe("false");
   });
 
   it("clears atHome when a workspace is entered", async () => {

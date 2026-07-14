@@ -462,6 +462,8 @@ export function DucktapeProvider({
                     ? stateRef.current.messages
                     : chat.messages,
                   authorNames: people.authorNames,
+                  authorAvatars: people.authorAvatars,
+                  authorBios: people.authorBios,
                   nodeUsers: people.nodeUsers,
                   accountKeys: people.accountKeys,
                   accountHandles: people.accountHandles,
@@ -730,13 +732,12 @@ export function DucktapeProvider({
           return;
         }
         if (!active) {
-          // First run (no workspaces at all) → the onboarding gate. Workspaces
-          // registered but none active → the account-centric Home layer, not a
-          // re-onboard. Either way the shell stays hidden until one is entered.
-          dispatch({
-            type: "patch",
-            patch: all.length > 0 ? { atHome: true } : { needsOnboarding: true },
-          });
+          // No active network → the account home (epic W1). First run (zero
+          // networks) lands there too — profile + custody + join/create CTAs —
+          // NOT a full-screen onboarding gate; the post-mnemonic auto-created
+          // workspace is gone. Either way the network shell stays hidden until
+          // one is entered from the rail.
+          dispatch({ type: "patch", patch: { atHome: true } });
           return;
         }
         return actions.connectActive(active);
@@ -746,9 +747,10 @@ export function DucktapeProvider({
         // A failed boot resolution (corrupt/locked ~/.ducktape registry,
         // permissions, a concurrent instance holding a lock) used to drop to a
         // hollow, disconnected shell with a toast that then vanished — no
-        // workspace list, no way forward. Land on the onboarding gate, the
-        // actionable front door, with the error shown, never an empty console.
-        dispatch({ type: "patch", patch: { needsOnboarding: true } });
+        // network list, no way forward. Land on the account home, the
+        // actionable front door (its rail "+" reopens the connect panel), with
+        // the error shown, never an empty console.
+        dispatch({ type: "patch", patch: { atHome: true } });
         fail(err);
       });
     // Reset the guard on cleanup so StrictMode's mount→unmount→remount re-runs
@@ -899,6 +901,9 @@ export function DucktapeProvider({
         // status so its late slice completion cannot clear this down edge.
         hydrateGenRef.current += 1;
         if (stateRef.current.connected || !stateRef.current.connectionDown) {
+          // the raw transport reason stays in the log; the banner shows only
+          // the friendly line (epic QA BUG-5).
+          console.warn(`node connection down: ${signal.reason}`);
           dispatch({
             type: "patch",
             patch: {

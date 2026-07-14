@@ -164,7 +164,7 @@ describe("fetchPeopleSlices", () => {
               display_name: "Rae",
               nonce: 0,
               member_keys: [],
-              nodes: [[11]],
+              nodes: [{ node_key: [11], label: "Rae's box" }],
               updated_at: 1,
             },
           ],
@@ -184,7 +184,7 @@ describe("fetchPeopleSlices", () => {
     // resolve through the same `authorName` map.
     expect(slices.authorNames).toEqual({ "0a": "Rae", "0b": "Rae" });
     expect(slices.nodeUsers).toEqual({
-      "0b": { accountId: "0a", name: "Rae" },
+      "0b": { accountId: "0a", name: "Rae", label: "Rae's box" },
     });
     expect(slices.accountHandles).toEqual({ "0a": "rae" });
     expect(query.mock.calls.map(([target]) => target)).toEqual(["identity", "duckdns"]);

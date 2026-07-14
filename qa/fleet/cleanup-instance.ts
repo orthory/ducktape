@@ -1,47 +1,90 @@
-import { readFile, realpath, rm } from 'node:fs/promises'
+import { readFile, readdir, realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 
+// Reap EVERY workspace node of this instance home, not just the seeded
+// FLEET_INSTANCE_ID one: networks the app CREATES during a QA run get their own
+// workspace dirs, and a node reaped only-by-instance-id outlives `fleet down`
+// forever (epic QA BUG-2 — the exact orphan hazard CLAUDE.md warns about).
+// Every kill stays pid-VERIFIED (exe + --config match), never a pattern kill;
+// a stale/invalid pidfile is tolerated (removed, workspace skipped).
 const home = required('FLEET_HOME')
-const id = required('FLEET_INSTANCE_ID')
-const workspace = join(home, '.ducktape', 'workspaces', id)
-const pidfile = join(workspace, 'node.pid')
-const configPath = join(workspace, 'node.toml')
-
-let pid: number
-try { pid = Number((await readFile(pidfile, 'utf8')).trim()) } catch { process.exit(0) }
-if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('workspace node pidfile is invalid')
-
-const owned = await identity(pid)
-if (!owned) { await rm(pidfile, { force: true }); process.exit(0) }
+const instanceId = required('FLEET_INSTANCE_ID')
+const workspacesDir = join(home, '.ducktape', 'workspaces')
 const expectedExecutable = await realpath(join(required('FLEET_ARTIFACT_DIR'), 'bin', 'ducktape-node'))
-const config = await realpath(configPath)
-if (owned.pgid !== pid) throw new Error('workspace node is not the leader of its process group')
-const executable = await processExecutable(pid)
-if (executable !== expectedExecutable || !await processUsesConfig(pid, [configPath, config])) {
-  throw new Error('workspace node pidfile does not identify this Fleet instance')
-}
 
+// enumerate by DIRECTORY (every node has one), unioned with the seeded id —
+// a workspace missing from registry.json must still be reaped.
+const ids = new Set<string>([instanceId])
+try { for (const entry of await readdir(workspacesDir)) ids.add(entry) } catch { /* no workspaces dir */ }
+
+// per-workspace http ports for the graceful-shutdown attempt (best-effort).
+let httpPorts = new Map<string, number>()
 try {
   const registry = JSON.parse(await readFile(join(home, '.ducktape', 'registry.json'), 'utf8')) as {
     workspaces?: Array<{ id?: string; ports?: { http?: number } }>
   }
-  const port = registry.workspaces?.find((item) => item.id === id)?.ports?.http
-  if (Number.isInteger(port) && port! > 0 && port! <= 65_535) {
-    await fetch(`http://127.0.0.1:${port}/v1/shutdown`, { method: 'POST', signal: AbortSignal.timeout(500) }).catch(() => undefined)
-  }
+  httpPorts = new Map(
+    (registry.workspaces ?? [])
+      .filter((item) => typeof item.id === 'string' && Number.isInteger(item.ports?.http))
+      .map((item) => [item.id!, item.ports!.http!]),
+  )
 } catch { /* exact process teardown below remains authoritative */ }
 
-if (await sameProcess(pid, owned.startTime)) {
-  signalGroup(owned.pgid, 'SIGTERM')
-  await waitForExit(owned.pgid, 5_000)
+const failures: string[] = []
+for (const id of ids) failures.push(...await reapWorkspace(id))
+if (failures.length > 0) throw new Error(failures.join('; '))
+
+/** Reap one workspace's verified node. Returns failure descriptions (empty =
+ *  clean: reaped, already gone, or nothing verifiable to reap). */
+async function reapWorkspace(id: string): Promise<string[]> {
+  const workspace = join(workspacesDir, id)
+  const pidfile = join(workspace, 'node.pid')
+  const configPath = join(workspace, 'node.toml')
+
+  let pid: number
+  try { pid = Number((await readFile(pidfile, 'utf8')).trim()) } catch { return [] }
+  if (!Number.isSafeInteger(pid) || pid <= 1) {
+    // stale/garbage pidfile: nothing verifiable to kill — drop it and move on.
+    await rm(pidfile, { force: true })
+    return []
+  }
+
+  const owned = await identity(pid)
+  if (!owned) { await rm(pidfile, { force: true }); return [] }
+  // verify BEFORE any signal: leader of its own group, our built binary, and
+  // running against THIS workspace's config. a recycled pid fails verification
+  // and is left alone (stale pidfile dropped) — never signalled.
+  let config: string | undefined
+  try { config = await realpath(configPath) } catch { /* config gone */ }
+  const executable = await processExecutable(pid)
+  const verified =
+    owned.pgid === pid &&
+    executable === expectedExecutable &&
+    await processUsesConfig(pid, config ? [configPath, config] : [configPath])
+  if (!verified) {
+    await rm(pidfile, { force: true })
+    return []
+  }
+
+  // graceful first (loopback-trusted admin shutdown), then the exact teardown.
+  const port = httpPorts.get(id)
+  if (Number.isInteger(port) && port! > 0 && port! <= 65_535) {
+    await fetch(`http://127.0.0.1:${port}/v1/admin/shutdown`, { method: 'POST', signal: AbortSignal.timeout(500) }).catch(() => undefined)
+  }
+
+  if (await sameProcess(pid, owned.startTime)) {
+    signalGroup(owned.pgid, 'SIGTERM')
+    await waitForExit(owned.pgid, 5_000)
+  }
+  if (groupAlive(owned.pgid)) {
+    if (await sameProcess(pid, owned.startTime) || !await identity(pid)) signalGroup(owned.pgid, 'SIGKILL')
+    else return [`workspace ${id}: node PID was reused before cleanup completed`]
+    await waitForExit(owned.pgid, 5_000)
+  }
+  if (groupAlive(owned.pgid)) return [`workspace ${id}: node process group survived cleanup`]
+  await rm(pidfile, { force: true })
+  return []
 }
-if (groupAlive(owned.pgid)) {
-  if (await sameProcess(pid, owned.startTime) || !await identity(pid)) signalGroup(owned.pgid, 'SIGKILL')
-  else throw new Error('workspace node PID was reused before cleanup completed')
-  await waitForExit(owned.pgid, 5_000)
-}
-if (groupAlive(owned.pgid)) throw new Error('workspace node process group survived cleanup')
-await rm(pidfile, { force: true })
 
 function required(name: string): string {
   const value = process.env[name]

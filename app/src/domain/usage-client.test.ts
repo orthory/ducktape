@@ -26,6 +26,8 @@ const row = (patch: Partial<UsageRow> = {}): UsageRow => ({
 const account = (patch: Partial<AccountView> = {}): AccountView => ({
   account_id: [1, 2, 3],
   display_name: "jess",
+  avatar: null,
+  bio: null,
   nonce: 0,
   member_keys: [],
   nodes: [],

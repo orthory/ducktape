@@ -6,6 +6,9 @@ export const makeTransportStub = (
   overrides: Partial<NodeTransport> = {},
 ): NodeTransport => ({
   submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) } satisfies SubmitReceipt),
+  submitControl: vi
+    .fn()
+    .mockResolvedValue({ height: 1, appHash: "aa".repeat(32) } satisfies SubmitReceipt),
   query: vi.fn().mockResolvedValue({}),
   view: vi.fn().mockResolvedValue({ hits: [] }),
   putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),

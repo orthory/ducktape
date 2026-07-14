@@ -1,4 +1,14 @@
 fn main() {
+    // ── tauri.conf.json `security.csp` rationale (JSON carries no comments) ──
+    // `connect-src` is scheme-wide (`http: https: ws: wss:`) so a user-entered
+    // remote node origin is dialable (#599). Accepted ONLY because `script-src`
+    // stays `'self'`: no inline or remote script can run in the webview, so
+    // nothing untrusted exists to exfiltrate over the widened connect-src.
+    // Widening `script-src` re-opens this decision. The post-#599 follow-up is
+    // a runtime per-endpoint allowlist (admit exactly the node origins the user
+    // connected to). Full rationale: docs/superpowers/specs/
+    // 2026-07-14-w2-owner-control-design.md.
+
     // Pin the CEF runtime lookup to the binary's own directory. cef-dll-sys
     // stages libcef.so and its support files next to the binary on every
     // build, and the Linux `make install-app` stages the same set beside the
@@ -52,11 +62,6 @@ fn main() {
         "workspace_join_code",
         "workspace_invite_blob",
         "workspace_join_requests",
-        "workspace_admit",
-        "workspace_promote",
-        "workspace_resident_remove",
-        "workspace_demote",
-        "workspace_request_leave",
         "workspace_forget",
         "workspace_select",
         "workspace_sandbox_apply",
@@ -79,6 +84,7 @@ fn main() {
         "user_sign_remove_member",
         "user_sign_files_frame",
         "user_sign_frame",
+        "user_sign_admin",
         "touchid_available",
         "touchid_enroll",
         "touchid_enrolled",

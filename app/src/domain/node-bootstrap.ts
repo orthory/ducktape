@@ -9,11 +9,14 @@
 // workspace-client.ts; the Rust `workspace_select` command spawns/adopts that
 // workspace's node detached and hands back its url. This module only turns a
 // url into a transport and polls it up; workspace selection lives in the store.
-// Stopping is plain http — POST /v1/shutdown — because the node's port is its
-// identity; no pid crosses this boundary.
+// Stopping rides the owner-gated control surface — POST /v1/admin/shutdown
+// (ADR A2, see admin-client.ts) — because the node's port is its identity; no
+// pid crosses this boundary.
 
 import { remoteTransport } from "./transport";
 import type { NodeTransport } from "./transport";
+import { adminShutdown } from "./admin-client";
+import type { AdminSigner } from "./admin-client";
 
 // ── Types ───────────────────────────────────────────────
 
@@ -92,7 +95,14 @@ export const resolveNode = (): NodeResolution => {
 /** Desktop build: wrap a selected workspace's node url as a managed
  *  resolution. The Rust side already spawned/adopted the process. */
 export const connectWorkspace = (httpUrl: string): NodeResolution => ({
-  transport: remoteTransport(httpUrl, { signFilesPayload: filesFrameSigner() }),
+  transport: remoteTransport(httpUrl, {
+    signFilesPayload: filesFrameSigner(),
+    // governance ops are account-signed on EVERY connection (ADR A1): local
+    // content stays frameless (node re-signs), but admit/promote/demote/leave
+    // ride `submitControl` → user-signed frames, so the module's standing ACL
+    // resolves the user's account via BindNode.
+    signControlPayload: contentFrameSigner(),
+  }),
   url: httpUrl,
   managed: true,
 });
@@ -110,6 +120,8 @@ export const connectRemote = (httpUrl: string): NodeResolution => ({
   transport: remoteTransport(httpUrl, {
     signFilesPayload: filesFrameSigner(),
     signPayload: contentFrameSigner(),
+    // governance ops sign on a remote connection too (same account-key lane).
+    signControlPayload: contentFrameSigner(),
   }),
   url: httpUrl,
   managed: false,
@@ -157,13 +169,11 @@ export const waitUntilUp = (
     },
   );
 
-/** Ask a node to exit gracefully (POST /v1/shutdown). */
-export const shutdownNode = (url: string): Promise<void> =>
-  Promise.resolve()
-    .then(() => fetch(`${url.replace(/\/$/, "")}/v1/shutdown`, { method: "POST" }))
-    .then((res) => {
-      if (!res.ok) throw new Error(`shutdown failed: ${res.status}`);
-    });
+/** Ask a node to exit gracefully through its owner-gated control surface
+ *  (POST /v1/admin/shutdown — ADR A2). A local (loopback) node needs no
+ *  signature; a remote owned node passes one via `adminShutdown`. */
+export const shutdownNode = (url: string, sign?: AdminSigner): Promise<void> =>
+  adminShutdown(url, sign);
 
 // ── Helpers ─────────────────────────────────────────────
 

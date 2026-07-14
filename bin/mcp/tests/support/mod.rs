@@ -295,7 +295,7 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = http_status(self.port, "POST", "/v1/shutdown");
+        let _ = http_status(self.port, "POST", "/v1/admin/shutdown");
         if let Some(s) = self.server.take() {
             let _ = s.join();
         }

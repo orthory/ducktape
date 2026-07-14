@@ -77,13 +77,6 @@ fn validate_workspace_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_node_pubkey(pubkey: &str) -> Result<(), String> {
-    if pubkey.len() != 64 || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("node public key must be exactly 32 bytes of hex".into());
-    }
-    Ok(())
-}
-
 // ── Helpers ─────────────────────────────────────────────
 
 /// a workspace id from a display name: lowercase, dash-separated, non-empty,
@@ -582,8 +575,8 @@ pub async fn workspace_join_code(
 
 /// the join requests parked joiners delivered to this member's running node
 /// over the lobby channel — the queue the Members view renders with an
-/// "Approve" button (approve = [`workspace_admit`], the normal governance
-/// ballot). raw JSON array from the `join-requests` verb, parsed here so the
+/// "Approve" button (approve = the account-signed `admitMember` governance
+/// ceremony). raw JSON array from the `join-requests` verb, parsed here so the
 /// frontend gets typed rows.
 #[tauri::command]
 pub async fn workspace_join_requests(
@@ -609,173 +602,6 @@ fn workspace_join_requests_blocking(
     let out = run_verb(&["join-requests", "--config", &cfg.to_string_lossy()])?;
     serde_json::from_str(last_line(&out).trim())
         .map_err(|e| format!("join-requests output is not json: {e}"))
-}
-
-/// shared skeleton of the five governance member verbs: optionally validate a
-/// 32-byte hex `pubkey` argument (refusing with `err` when it isn't one),
-/// resolve the workspace's `node.toml`, and drive the verb through THIS
-/// running member node's local rpc.
-fn run_member_verb(
-    app: crate::rt::AppHandle,
-    id: String,
-    verb: &str,
-    pubkey: Option<String>,
-    err: &str,
-) -> Result<(), String> {
-    let mut args: Vec<String> = vec![verb.to_string()];
-    if let Some(pubkey) = pubkey {
-        let pubkey = pubkey.trim().to_string();
-        validate_node_pubkey(&pubkey).map_err(|_| err.to_string())?;
-        args.push(pubkey);
-    }
-    let reg = load_registry(&app)?;
-    let ws = find(&reg, &id)?;
-    let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    args.extend(["--config".to_string(), cfg.to_string_lossy().into_owned()]);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_verb(&refs).map(|_| ())
-}
-
-/// admit a joiner by pubkey: drive the governance AddValidator through THIS
-/// running member node's local rpc. the node must be started (a member serves
-/// rpc); the joiner's parked node promotes itself once the epoch cuts over.
-#[tauri::command]
-pub async fn workspace_admit(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    control: tauri::State<'_, NodeControl>,
-    id: String,
-    pubkey: String,
-) -> Result<(), String> {
-    require_main_window(&window)?;
-    let control = control.inner().clone();
-    control
-        .run(move || {
-            run_member_verb(
-                app,
-                id,
-                "invite-accept",
-                Some(pubkey),
-                "paste the joiner's 32-byte identity pubkey to admit",
-            )
-        })
-        .await
-}
-
-/// remove a validator by pubkey: drive the governance RemoveValidator through
-/// THIS running member node's local rpc. the removal counterpart of
-/// [`workspace_admit`] — it opens a removal proposal and casts this node's
-/// yes-ballot; the change only takes effect once a strict majority of members
-/// approve, and the removed node drops out at the next epoch cutover.
-#[tauri::command]
-pub async fn workspace_demote(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    control: tauri::State<'_, NodeControl>,
-    id: String,
-    pubkey: String,
-) -> Result<(), String> {
-    require_main_window(&window)?;
-    let control = control.inner().clone();
-    control
-        .run(move || {
-            run_member_verb(
-                app,
-                id,
-                "member-remove",
-                Some(pubkey),
-                "provide the validator's 32-byte public key to remove",
-            )
-        })
-        .await
-}
-
-/// promote a resident into the consensus quorum by pubkey: drive the
-/// governance AddValidator through THIS running member node's local rpc. the
-/// second, deliberate step of staged admission — [`workspace_admit`] grants
-/// resident standing; this seats the (pre-synced, warm) key as a validator at
-/// the next epoch cutover. same majority ceremony as every membership change.
-#[tauri::command]
-pub async fn workspace_promote(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    control: tauri::State<'_, NodeControl>,
-    id: String,
-    pubkey: String,
-) -> Result<(), String> {
-    require_main_window(&window)?;
-    let control = control.inner().clone();
-    control
-        .run(move || {
-            run_member_verb(
-                app,
-                id,
-                "promote",
-                Some(pubkey),
-                "provide the resident's 32-byte public key to promote",
-            )
-        })
-        .await
-}
-
-/// revoke resident standing by pubkey: drive the governance RemoveResident
-/// through THIS running member node's local rpc. the undo of
-/// [`workspace_admit`] — the key drops off the mesh at the next epoch cutover
-/// and its node parks again; re-granting is another admit. a seated validator
-/// is [`workspace_demote`]'s job (the tiers never overlap).
-#[tauri::command]
-pub async fn workspace_resident_remove(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    control: tauri::State<'_, NodeControl>,
-    id: String,
-    pubkey: String,
-) -> Result<(), String> {
-    require_main_window(&window)?;
-    let control = control.inner().clone();
-    control
-        .run(move || {
-            run_member_verb(
-                app,
-                id,
-                "resident-remove",
-                Some(pubkey),
-                "provide the resident's 32-byte public key to revoke",
-            )
-        })
-        .await
-}
-
-/// REQUEST to leave a network: drive this node's on-chain SELF-removal, and
-/// KEEP THE NODE RUNNING. the honest first half of departure — the node must
-/// stay up through its own pending removal, because it is a current validator
-/// and commonware's fault model needs every validator to sign to finalize the
-/// Execute block that completes the removal. tear the node down here and the
-/// remaining member(s) can NEVER finalize it — the network halts and this node
-/// stays a ghost validator forever.
-///
-/// so this ONLY runs `member-leave` over the running node's rpc: it opens a
-/// RemoveValidator proposal for OUR OWN key and casts our yes-ballot. in a set
-/// of two-or-more this stays PENDING until a strict majority of the REMAINING
-/// members approve; once they do, the epoch cuts over and this node drops out of
-/// the valset — at which point it is safe to [`workspace_forget`] it.
-///
-/// a solo (n==1) node is refused here by the last-validator guard (you cannot
-/// remove the last validator); a lone node just forgets its workspace directly.
-/// errors surface to the caller (unlike forget, this is not best-effort — the
-/// user asked to submit an on-chain change and deserves to know if it failed).
-#[tauri::command]
-pub async fn workspace_request_leave(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    control: tauri::State<'_, NodeControl>,
-    id: String,
-) -> Result<(), String> {
-    require_main_window(&window)?;
-    let control = control.inner().clone();
-    control
-        .run(move || run_member_verb(app, id, "member-leave", None, ""))
-        .await
 }
 
 /// FORGET a workspace: stop its node, delete its directory, and drop its
@@ -913,11 +739,22 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     let http_url = format!("http://127.0.0.1:{}", ws.ports.http);
 
     // already running? adopt it — never spawn a second process for one
-    // workspace. we probe the p2p LISTEN port, not http: the mesh listener is
-    // bound in every phase (parked, promoting, validator) on every node build,
-    // while http may lag behind, so this is the one dependable liveness port.
-    // a second spawn would collide on exactly this port anyway.
-    if port_listening(ws.ports.listen) {
+    // workspace. the p2p LISTEN port is the primary probe (bound in every
+    // phase — parked, promoting, validator — while http may lag at boot; a
+    // second spawn would collide on exactly this port), but http is probed TOO:
+    // a mesh listener bound to a non-loopback interface is invisible to a
+    // loopback probe, and missing a live node here is what spawns the
+    // address-in-use crash loop (epic QA BUG-1). http is always loopback for an
+    // app-managed node, so either port answering means "adopt".
+    if port_listening(ws.ports.listen) || port_listening(ws.ports.http) {
+        // record the adopted node's pid (verified by exe/cmdline sweep) so the
+        // control phase reads a LIVE pid instead of a stale corpse's — a stale
+        // pidfile otherwise shows "Start" for a node we are connected to
+        // (epic QA BUG-3).
+        #[cfg(unix)]
+        if let Some(pid) = lifecycle::live_workspace_node_pid(&dir) {
+            let _ = fs::write(pidfile(&dir), pid.to_string());
+        }
         return finish_selection(&app, &mut reg, ws, http_url);
     }
 
@@ -928,24 +765,32 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     // generic timeout. spawn_verified reads the real reason back out of
     // daemon.log instead. http is the readiness signal for a member/founder; a
     // parking joiner never serves it, so "still alive after the grace" carries.
-    let child =
+    let mut child =
         crate::daemon::spawn_workspace_node(&node_toml(&dir), &log_path, Some(ws.ports.http))
             .map_err(|failure| {
                 format!("the node for \"{}\" exited on start: {failure}", ws.name)
             })?;
     // record the detached pid so teardown can address the process directly —
     // the http shutdown route alone can't reach a parked joiner (no surface).
-    // best-effort: a failed write only degrades stop back to the pgrep sweep.
-    if let Err(err) = fs::write(pidfile(&dir), child.id().to_string()) {
-        tracing::warn!(
-            target: "ducktape::shell",
-            error = %err,
-            "could not record the node pid — teardown falls back to the pgrep sweep"
-        );
-    }
+    // only a STILL-ALIVE child's pid is persisted (epic QA BUG-3).
+    crate::daemon::record_pid_if_alive(&mut child, &pidfile(&dir), &ws.name);
     // keep the handle instead of dropping it: it is the only thing that can ever
-    // report HOW the node died (and reap it). see `daemon::watch_node_exit`.
-    crate::daemon::watch_node_exit(child, ws.name.clone());
+    // report HOW the node died (and reap it). the supervisor also revives a node
+    // that crashes — validator uptime for a user who knows nothing of daemons —
+    // unless a deliberate stop raised its intent flag. see `daemon::watch_node_exit`.
+    let stopping = crate::daemon::register_supervised(&dir);
+    crate::daemon::watch_node_exit(
+        child,
+        crate::daemon::Supervisor {
+            config: node_toml(&dir),
+            log: log_path.clone(),
+            http_port: ws.ports.http,
+            listen_port: ws.ports.listen,
+            pidfile: pidfile(&dir),
+            workspace: ws.name.clone(),
+            stopping,
+        },
+    );
     // commit `active` ONLY now the node is confirmed up: a select that fails to
     // start the node must not repoint `active` at a workspace the next boot
     // then can't launch (which would strand the app on that dead workspace).

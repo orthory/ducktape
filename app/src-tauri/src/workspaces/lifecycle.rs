@@ -11,10 +11,21 @@ use super::registry::Ports;
 
 /// is something accepting connections on this localhost port right now? used as
 /// a liveness probe for an already-running workspace node.
+///
+/// BOTH loopback families are probed: the app mints the mesh listener as
+/// `[::]:<port>` (dual-stack), and on hosts where an IPv4-mapped connect to a
+/// v6 socket doesn't take, a 127.0.0.1-only probe reports a LIVE node as down —
+/// the adopt guard then double-spawns, the duplicate dies address-in-use on the
+/// mesh port, and the supervisor crash-loops to its cap (observed live, epic
+/// QA BUG-1). `::1` sees a `[::]` listener unconditionally; `127.0.0.1` sees an
+/// IPv4-bound one. Either answering means the port is held.
 pub(crate) fn port_listening(port: u16) -> bool {
-    use std::net::{SocketAddr, TcpStream};
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    let timeout = Duration::from_millis(200);
+    let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&v4, timeout).is_ok()
+        || TcpStream::connect_timeout(&v6, timeout).is_ok()
 }
 
 /// is the node WE spawned for this workspace still alive? reads the pidfile
@@ -130,6 +141,15 @@ fn workspace_node_pids(dir: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// the first LIVE, verified pid of this workspace's node — the adopt path uses
+/// it to make the pidfile honest again after a crash-loop left a corpse's pid
+/// behind (epic QA BUG-3). verification is [`workspace_node_pids`]'s exe/
+/// cmdline match; never a bare pattern kill.
+#[cfg(unix)]
+pub(super) fn live_workspace_node_pid(dir: &Path) -> Option<u32> {
+    workspace_node_pids(dir).into_iter().find(|pid| process_alive(*pid))
+}
+
 /// is `pid` a LIVE process? a zombie counts as dead: the shell never reaps its
 /// spawned nodes, so a killed child lingers as `Z` — and `kill -0` keeps
 /// succeeding on it, which would burn the whole TERM+KILL grace on an
@@ -172,7 +192,7 @@ fn kill_pid(pid: u32, grace: Duration) {
 }
 
 /// stop this workspace's node FOR REAL: ask nicely over http first
-/// (/v1/shutdown), then kill every verified process of this workspace, then
+/// (/v1/admin/shutdown), then kill every verified process of this workspace, then
 /// CONFIRM its ports are released. `Err` when something still holds a port —
 /// the caller must NOT delete state a live process would just re-create (the
 /// zombie-workspace resurrection this replaces).
@@ -181,6 +201,11 @@ pub(super) fn stop_workspace_node(
     ports: &Ports,
     grace: Duration,
 ) -> Result<(), String> {
+    // raise the stop-intent BEFORE any kill: teardown escalates to TERM/KILL,
+    // which the supervisor would otherwise read as a crash and auto-restart —
+    // fighting the very teardown that is trying to release the ports. this flag
+    // is the one thing that tells a deliberate stop apart from a crash.
+    crate::daemon::mark_stopping(dir);
     // graceful first: the node exits its whole process on this route. a node
     // already down, or a parked joiner serving no http, just fails the connect.
     post_shutdown(ports.http);
@@ -225,6 +250,9 @@ pub(super) fn stop_workspace_node(
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = fs::remove_file(pidfile(dir));
+    // the node is confirmed down and its ports released; drop the supervisor
+    // registration so a later spawn starts from a fresh (cleared) flag.
+    crate::daemon::clear_supervised(dir);
     Ok(())
 }
 
@@ -234,7 +262,7 @@ fn ports_held(ports: &Ports) -> bool {
     port_listening(ports.listen) || port_listening(ports.http)
 }
 
-/// best-effort "stop this node": POST /v1/shutdown to its http surface over a
+/// best-effort "stop this node": POST /v1/admin/shutdown to its http surface over a
 /// raw tcp write. the port addresses the node (mirroring the webview's
 /// `shutdownNode` in node-bootstrap.ts), and the node exits the whole process
 /// on this route. a node already down, or a parked joiner that serves no http,
@@ -247,8 +275,12 @@ fn post_shutdown(http_port: u16) {
         return;
     };
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    // the owner-gated control surface (ADR A2). loopback-trusted here — this is
+    // a 127.0.0.1 dial to the app's own managed node, so no PoP is needed; the
+    // node's `Loopback` exposure admits it. a refusal just falls through to the
+    // pidfile/signal escalation in `stop_workspace_node`.
     let req = format!(
-        "POST /v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\
+        "POST /v1/admin/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\n\
          Content-Length: 0\r\nConnection: close\r\n\r\n"
     );
     let _ = stream.write_all(req.as_bytes());
@@ -416,5 +448,31 @@ mod tests {
         assert!(err.contains("still running"), "{err}");
         drop(listener);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// epic QA BUG-1 regression: the liveness probe must see a listener on
+    /// EITHER loopback family. The app mints the mesh listener as `[::]:<port>`;
+    /// a 127.0.0.1-only probe missing it is what double-spawned a live node
+    /// into an address-in-use crash loop.
+    #[test]
+    fn port_listening_sees_both_loopback_families() {
+        // an IPv4-loopback listener (the fleet-seed shape).
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(port_listening(v4.local_addr().unwrap().port()));
+        drop(v4);
+
+        // a v6 wildcard listener (the app-minted `[::]:<port>` mesh shape).
+        // skipped, not failed, on a host without IPv6.
+        if let Ok(v6) = TcpListener::bind("[::]:0") {
+            assert!(
+                port_listening(v6.local_addr().unwrap().port()),
+                "a [::] listener must read as held"
+            );
+            drop(v6);
+        }
+
+        // a port nobody holds reads as free.
+        let free = free_port(&[]).unwrap();
+        assert!(!port_listening(free));
     }
 }

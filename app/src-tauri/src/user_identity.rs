@@ -804,20 +804,21 @@ pub async fn user_sign_files_frame(
         .await
 }
 
-/// modules a REMOTE-connected user may sign a frame for. a thin client
-/// operates the app's CONTENT surfaces — it never touches the
-/// membership/consensus-control modules (`identity`, `valset`, `governance`,
-/// `upgrade`, `modreg`, `clients`), so this is not a blanket signing oracle
-/// even though it is one command (the `user_sign_files_frame` caution, kept).
-/// Consensus is the real gate — the submit door + each module's own origin
-/// ACL — this list is defense-in-depth so a compromised console webview
-/// cannot even ATTEMPT a control-plane op as the user.
+/// modules a user may sign a frame for. the app's CONTENT surfaces, plus
+/// `governance` — admit/promote/demote/leave are account-signed frames now
+/// (ADR A1, the W2 migration), and the governance module's OWN standing ACL
+/// (signer → committed `BindNode` → member node) is what authorizes them. the
+/// remaining membership/consensus-control modules (`identity`, `valset`,
+/// `upgrade`, `modreg`, `clients`) stay absent — no console path signs them
+/// directly, so this list is defense-in-depth: a compromised webview cannot
+/// even ATTEMPT one as the user. Consensus is the real gate.
 const CLIENT_SIGNABLE_TARGETS: &[&str] = &[
     "chat", "pages", "files", "forge", "tasks", "kv", "directory", "tagging", "inbox",
+    "governance",
 ];
 
-/// whether a remote user may sign a frame for `target` — the content-module
-/// gate. The membership/consensus-control modules are absent by design.
+/// whether a user may sign a frame for `target`. Content modules + governance
+/// (whose own ACL gates by standing); the other control modules are absent.
 fn client_target_allowed(target: &str) -> bool {
     CLIENT_SIGNABLE_TARGETS.contains(&target)
 }
@@ -870,6 +871,41 @@ pub async fn user_sign_frame(
         .await
 }
 
+/// sign one OWNER CONTROL-PLANE request (ADR A5) with the user key: the
+/// per-request proof-of-possession the node's `/v1/admin/*` gate checks under
+/// `Public` exposure. Returns the one-line JSON `{"key","ts","sig"}` the app
+/// turns into the `x-ducktape-admin-*` headers of an admin request. Distinct
+/// from `user_sign_frame` (content ops) — this is node control, authorized
+/// against the committed `BindNode` owner, so it is scoped to the admin PoP
+/// alone and never a blanket signer. `identity-locked` on a locked key.
+#[tauri::command]
+pub async fn user_sign_admin(
+    app: crate::rt::AppHandle,
+    window: crate::rt::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    method: String,
+    path: String,
+    node_key: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || {
+            run_sign_verb(
+                &app,
+                "user-sign-admin",
+                &[
+                    ("--method", &method),
+                    ("--path", &path),
+                    // the TARGET node's consensus key: folded into the signed
+                    // bytes so the PoP cannot be replayed against another node.
+                    ("--node-key", &node_key),
+                ],
+            )
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,9 +916,12 @@ mod tests {
         for t in ["chat", "pages", "files", "forge", "tasks", "kv"] {
             assert!(client_target_allowed(t), "{t} should be signable");
         }
-        // …but the membership / consensus-control modules are refused, so the
-        // signer is never a blanket oracle even as one command.
-        for t in ["identity", "valset", "governance", "upgrade", "modreg", "clients"] {
+        // …governance too (the W2 migration: admit/promote/demote/leave are
+        // account-signed frames, authorized by the module's own standing ACL)…
+        assert!(client_target_allowed("governance"), "governance must be signable (A1)");
+        // …but the remaining membership/consensus-control modules stay refused,
+        // so the signer is never a blanket oracle even as one command.
+        for t in ["identity", "valset", "upgrade", "modreg", "clients"] {
             assert!(!client_target_allowed(t), "{t} must NOT be signable by a client");
         }
         // gateway/duckdns require validator/resident standing at their own

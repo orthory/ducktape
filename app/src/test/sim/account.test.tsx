@@ -289,4 +289,47 @@ describe.skipIf(!bin)("account scenarios against the sim node", () => {
       );
     },
   );
+
+  it(
+    "a bound node's on-chain device label projects into the people slice",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot({ auto: true });
+
+      const secret = new Uint8Array(32).fill(3);
+      const nodeOrigin = "b".repeat(32);
+      const nodeKey = new TextEncoder().encode(nodeOrigin);
+      const nodeHex = keyHex(Array.from(nodeKey));
+
+      // found + bind over the bare wire, then the bound (origin-trusted) node
+      // labels itself — SetNodeLabel is origin-gated like SetAccountName, so the
+      // node's own submit carries the authority; no member signature.
+      await sim.peerBlock(
+        "identity",
+        { bind_node: { authorizer: edBindAuth(secret, nodeKey, "", 0) } },
+        nodeOrigin,
+      );
+      await sim.peerBlock(
+        "identity",
+        { set_node_label: { node_key: Array.from(nodeKey), label: "  Kim's laptop  " } },
+        nodeOrigin,
+      );
+
+      // the label lands on the node record and hydrates into nodeUsers (trimmed),
+      // where the device surface reads it.
+      await waitFor(() =>
+        expect(state().nodeUsers[nodeHex]?.label).toBe("Kim's laptop"),
+      );
+
+      // clearing (null) drops it back to no label.
+      await sim.peerBlock(
+        "identity",
+        { set_node_label: { node_key: Array.from(nodeKey), label: null } },
+        nodeOrigin,
+      );
+      await waitFor(() =>
+        expect(state().nodeUsers[nodeHex]?.label ?? null).toBeNull(),
+      );
+    },
+  );
 });
