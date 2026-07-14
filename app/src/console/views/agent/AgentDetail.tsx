@@ -212,9 +212,14 @@ export function AgentDetail({
           <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
             <button
               type="button"
+              disabled={pending}
               onClick={() => setEditing((open) => !open)}
               aria-expanded={editing}
-              style={onDarkButton}
+              style={{
+                ...onDarkButton,
+                cursor: pending ? "default" : "pointer",
+                opacity: pending ? 0.6 : 1,
+              }}
             >
               {editing ? "Close edit" : "Edit"}
             </button>
@@ -324,6 +329,7 @@ export function AgentDetail({
               agent={agent}
               capabilities={capabilities}
               capabilitiesStatus={capabilitiesStatus}
+              pending={pending}
               onUpdate={onUpdate}
               onClose={() => setEditing(false)}
             />

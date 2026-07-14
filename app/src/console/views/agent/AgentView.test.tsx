@@ -101,11 +101,13 @@ const renderAgents = (
   };
   const spies: Record<string, ReturnType<typeof vi.fn>> = {};
   let updateCapabilities: (capabilities: string[]) => void;
+  let updateOps: (ops: ConsoleState["ops"]) => void;
 
   function Harness() {
     const [state, setState] = useState(initialState);
     updateCapabilities = (capabilities) =>
       setState((prev) => ({ ...prev, capabilitiesStatus: "ready", capabilities }));
+    updateOps = (ops) => setState((prev) => ({ ...prev, ops }));
     const actions = new Proxy(
       {},
       {
@@ -130,6 +132,7 @@ const renderAgents = (
   return {
     spies,
     setCapabilities: (capabilities: string[]) => act(() => updateCapabilities(capabilities)),
+    setOps: (ops: ConsoleState["ops"]) => act(() => updateOps(ops)),
   };
 };
 
@@ -205,9 +208,38 @@ describe("AgentView", () => {
     });
 
     const pause = screen.getByRole("button", { name: /pause agent/i });
+    const edit = screen.getByRole("button", { name: /^edit$/i });
     expect(pause).toBeDisabled();
+    expect(edit).toBeDisabled();
     fireEvent.click(pause);
+    fireEvent.click(edit);
     expect(spies.pauseAgent).not.toHaveBeenCalled();
+    expect(screen.queryByRole("form", { name: /edit agent/i })).not.toBeInTheDocument();
+  });
+
+  it("blocks an open edit form when another agent write becomes pending", () => {
+    const { spies, setOps } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    const form = screen.getByRole("form", { name: /edit agent/i });
+    fireEvent.change(within(form).getByLabelText(/edit display name/i), {
+      target: { value: "Draft survives" },
+    });
+
+    setOps({
+      [opKey.agent("summarizer")]: {
+        seq: 1,
+        phase: "pending",
+        startedAt: 10,
+      },
+    });
+
+    expect(screen.getByRole("button", { name: /close edit/i })).toBeDisabled();
+    const save = within(form).getByRole("button", { name: /save changes/i });
+    expect(save).toBeDisabled();
+    expect(within(form).getByLabelText(/edit display name/i)).toHaveValue("Draft survives");
+    fireEvent.click(save);
+    expect(spies.updateAgent).not.toHaveBeenCalled();
   });
 
   it("renders roster, detail, and the three tabs after the split", () => {

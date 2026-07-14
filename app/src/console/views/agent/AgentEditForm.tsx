@@ -30,12 +30,14 @@ export function AgentEditForm({
   agent,
   capabilities,
   capabilitiesStatus,
+  pending,
   onUpdate,
   onClose,
 }: {
   agent: AgentRecord;
   capabilities: string[];
   capabilitiesStatus: "loading" | "ready" | "error";
+  pending: boolean;
   onUpdate: (params: {
     agentId: string;
     displayName?: string;
@@ -58,6 +60,7 @@ export function AgentEditForm({
   // enforces and what the run's context document is assembled against.
   const [libraryRead, setLibraryRead] = useState(canReadLibrary(agent.caps));
   const [submitting, setSubmitting] = useState(false);
+  const blocked = pending || submitting;
 
   const toggle = (name: string) =>
     setAllowedActions((prev) =>
@@ -66,7 +69,7 @@ export function AgentEditForm({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (submitting) return;
+    if (blocked) return;
     setSubmitting(true);
     const committed = await onUpdate({
       agentId: agent.agent_id,
@@ -238,8 +241,8 @@ export function AgentEditForm({
         </button>
         <button
           type="submit"
-          disabled={submitting}
-          style={primaryButton(!submitting)}
+          disabled={blocked}
+          style={primaryButton(!blocked)}
         >
           Save changes
         </button>
