@@ -631,6 +631,21 @@ describe("floating comment card", () => {
     return area;
   };
 
+  it("waits for the pointer release before showing the guide menu", () => {
+    renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    fireEvent.mouseDown(area);
+    area.setSelectionRange(0, 5);
+    fireEvent.select(area);
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+    // release over the row (bubbles to the one-shot document listener); firing
+    // straight on `document` would bypass the React root and wedge React's
+    // select-event plugin's module-level mouse state for every later test.
+    fireEvent.mouseUp(area);
+    screen.getByRole("toolbar", { name: "Selection actions" });
+  });
+
   it("turns the block into a heading from the guide menu", () => {
     const { spies } = renderPagesView();
     selectFirstBlock();

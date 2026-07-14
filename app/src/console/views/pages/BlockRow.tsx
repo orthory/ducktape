@@ -209,6 +209,10 @@ function BlockRowInner({
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
   const rowRef = useRef<HTMLDivElement | null>(null);
   const localCaretRef = useRef<number | null>(null);
+  // true from mousedown in the textarea until the pointer releases: the guide
+  // menu appears when the drag comes OFF, not on every mid-drag selection
+  // change (which would flicker a menu under the moving pointer).
+  const pointerSelecting = useRef(false);
   // focus mirrored into a ref so the draft-sync effect below reads the live
   // value without re-running on focus flips.
   const focusedRef = useRef(false);
@@ -495,6 +499,7 @@ function BlockRowInner({
         onSelect={(event) => {
           const el = event.currentTarget;
           publishCursor(el);
+          if (pointerSelecting.current) return; // menu waits for the release
           if (el.selectionStart === el.selectionEnd) {
             setSelection(null);
             return;
@@ -503,6 +508,28 @@ function BlockRowInner({
             anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
             range: { start: el.selectionStart, end: el.selectionEnd },
           });
+        }}
+        onMouseDown={() => {
+          pointerSelecting.current = true;
+          // one-shot: the release may land anywhere (drag off the block, off
+          // the window) — the document sees it even when the textarea doesn't.
+          document.addEventListener(
+            "mouseup",
+            () => {
+              pointerSelecting.current = false;
+              const el = areaRef.current;
+              if (!el) return;
+              if (el.selectionStart === el.selectionEnd) {
+                setSelection(null);
+                return;
+              }
+              setSelection({
+                anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
+                range: { start: el.selectionStart, end: el.selectionEnd },
+              });
+            },
+            { once: true },
+          );
         }}
         onFocus={(event) => {
           focusedRef.current = true;
