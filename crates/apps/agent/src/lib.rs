@@ -1891,6 +1891,13 @@ mod tests {
         assert!(!rec.permits(&CapRequest::Secret("t")));
         assert!(rec.permits(&CapRequest::SpawnSubagent));
 
+        let root = record_with_caps(ResourceCaps {
+            duckfs_read: vec!["/".into()],
+            ..Default::default()
+        });
+        assert!(root.permits(&CapRequest::DuckfsRead("/shared/child")));
+        assert!(!root.permits(&CapRequest::DuckfsRead("relative")));
+
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::SpawnSubagent));
         assert!(!empty.permits(&CapRequest::ForgeRead("r")));
@@ -1929,6 +1936,12 @@ mod tests {
             ..Default::default()
         };
         assert!(parent.can_delegate_to(&child));
+
+        let mut root_parent = parent.clone();
+        root_parent.caps.duckfs_read = vec!["/".into()];
+        let mut root_skill_child = child.clone();
+        root_skill_child.skills[0].source_prefix = "/root-readable/specialist".into();
+        assert!(root_parent.can_delegate_to(&root_skill_child));
 
         let mut escalated = child.clone();
         escalated.owner = SagaOrigin::External(vec![8; 32]);

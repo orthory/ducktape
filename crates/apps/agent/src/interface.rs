@@ -354,8 +354,9 @@ impl AgentRecord {
         let c = &self.caps;
         let has = |v: &[String], x: &str| v.iter().any(|s| s == x);
         let under = |v: &[String], p: &str| {
-            v.iter()
-                .any(|pre| p == pre || p.starts_with(&format!("{pre}/")))
+            v.iter().any(|pre| {
+                p == pre || pre == "/" && p.starts_with('/') || p.starts_with(&format!("{pre}/"))
+            })
         };
         match req {
             CapRequest::ForgeRead(r) => has(&c.forge_read, r) || has(&c.forge_push, r),
@@ -391,39 +392,49 @@ impl AgentRecord {
         let exact = |parent: &[String], child: &[String]| {
             child.iter().all(|item| parent.iter().any(|p| p == item))
         };
-        let under = |parent: &[String], path: &str| {
-            parent
-                .iter()
-                .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
-        };
 
         self.owner == child.owner
             && self.capability == child.capability
             && exact(&self.allowed_actions, &child.allowed_actions)
-            && child.skills.iter().all(|skill| {
-                self.permits(&CapRequest::DuckfsRead(&skill.source_prefix))
-            })
+            && child
+                .skills
+                .iter()
+                .all(|skill| self.permits(&CapRequest::DuckfsRead(&skill.source_prefix)))
             && child
                 .caps
                 .forge_read
                 .iter()
-                .chain(&child.caps.forge_push)
-                .all(|repo| {
-                    self.caps.forge_read.contains(repo) || self.caps.forge_push.contains(repo)
-                })
-            && exact(&self.caps.forge_push, &child.caps.forge_push)
-            && child.caps.duckfs_read.iter().all(|path| {
-                under(&self.caps.duckfs_read, path) || under(&self.caps.duckfs_write, path)
-            })
+                .all(|repo| self.permits(&CapRequest::ForgeRead(repo)))
+            && child
+                .caps
+                .forge_push
+                .iter()
+                .all(|repo| self.permits(&CapRequest::ForgePush(repo)))
+            && child
+                .caps
+                .duckfs_read
+                .iter()
+                .all(|path| self.permits(&CapRequest::DuckfsRead(path)))
             && child
                 .caps
                 .duckfs_write
                 .iter()
-                .all(|path| under(&self.caps.duckfs_write, path))
-            && exact(&self.caps.tools, &child.caps.tools)
-            && exact(&self.caps.secrets, &child.caps.secrets)
-            && (self.caps.pages_write.iter().any(|page| page == "*")
-                || exact(&self.caps.pages_write, &child.caps.pages_write))
+                .all(|path| self.permits(&CapRequest::DuckfsWrite(path)))
+            && child
+                .caps
+                .tools
+                .iter()
+                .all(|tool| self.permits(&CapRequest::Tool(tool)))
+            && child
+                .caps
+                .secrets
+                .iter()
+                .all(|secret| self.permits(&CapRequest::Secret(secret)))
+            && child
+                .caps
+                .pages_write
+                .iter()
+                .all(|page| self.permits(&CapRequest::PagesWrite(page)))
             && child.caps.subagent_budget <= self.caps.subagent_budget
     }
 }
