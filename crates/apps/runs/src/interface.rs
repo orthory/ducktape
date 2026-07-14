@@ -22,6 +22,83 @@ use agent::AgentAction;
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
+// ---- dormant Librarian call contracts ----------------------------------------
+
+/// Maximum UTF-8 byte length of a caller-chosen Librarian idempotency key.
+pub const CALL_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a Librarian question.
+pub const QUESTION_MAX_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 byte length of the answer text.
+pub const ANSWER_MAX_BYTES: usize = 48 * 1024;
+/// Maximum number of evidence references in one answer.
+pub const MAX_EVIDENCE_REFS: usize = 24;
+/// Maximum number of uncertainties in one answer.
+pub const MAX_UNCERTAINTIES: usize = 16;
+/// Maximum UTF-8 byte length of one evidence reference or uncertainty.
+pub const MAX_ENTRY_BYTES: usize = 1024;
+/// Maximum encoded size of a structured Librarian answer/result.
+pub const MAX_ENCODED_ANSWER_BYTES: usize = 96 * 1024;
+
+/// Stable dormant-fence error returned by every Librarian mutation.
+pub const LIBRARIAN_REGENESIS_REQUIRED: &str =
+    "librarian calls are unavailable until re-genesis";
+
+/// The only caller-controlled Librarian request data.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianCallRequest {
+    pub call_id: String,
+    pub question: String,
+}
+
+/// The bounded structured answer produced by a future Librarian child run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianAnswerPayload {
+    pub answer: String,
+    pub evidence_refs: Vec<String>,
+    pub uncertainties: Vec<String>,
+    pub degraded: bool,
+}
+
+/// A trusted Librarian result after strict parsing and provenance validation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianCallResult {
+    pub answer: LibrarianAnswerPayload,
+    pub child_run_id: String,
+    /// `<lowercase 32-byte node key hex>@nodes.duck`.
+    pub provenance: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarianCallStatus {
+    Pending,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Read-only view reserved for the post-re-genesis activation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianCallView {
+    pub parent_run_id: String,
+    pub call_id: String,
+    pub status: LibrarianCallStatus,
+    pub result: Option<LibrarianCallResult>,
+}
+
+/// Conservative discovery hint. This release always returns all-zero/false.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianAvailability {
+    pub feature_active: bool,
+    pub permitted: bool,
+    pub remaining_child_budget: u32,
+}
+
 // ---- watches ------------------------------------------------------------------
 
 /// how a watched channel selects which agents a user post engages.
@@ -162,6 +239,17 @@ pub enum RunsMsg {
     /// revoking a newer assignment.
     ReassignRun { run_id: String, attempt: u32 },
 
+    /// Dormant, session-signed Librarian call lane. The verified frame origin
+    /// supplies identity; callers cannot provide owner, session, context,
+    /// demands, child agent, or provenance.
+    BeginLibrarianCall {
+        run_id: String,
+        call_id: String,
+        question: String,
+    },
+    /// Dormant cancellation peer of [`RunsMsg::BeginLibrarianCall`].
+    CancelLibrarianCall { run_id: String, call_id: String },
+
     // ---- the agent session lane (mid-run writes) --------------------------
     /// the EXECUTING node binds an ephemeral session key to a live run, so the
     /// agent it is running can act DURING the run instead of only in the JSON
@@ -246,6 +334,13 @@ pub enum RunsQuery {
     /// spent. sessions prune when their run settles, so this is bounded by the
     /// in-flight runs.
     AgentSessions,
+    /// Dormant discovery query. It always reports inactive and unpermitted.
+    LibrarianAvailability { run_id: String },
+    /// Dormant point query. It always reports no record.
+    LibrarianCall {
+        parent_run_id: String,
+        call_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -255,6 +350,8 @@ pub enum RunsReply {
     Watches(Vec<WatchView>),
     RecentRuns(Vec<RunRecord>),
     AgentSessions(Vec<AgentSession>),
+    LibrarianAvailability(LibrarianAvailability),
+    LibrarianCall(Option<LibrarianCallView>),
 }
 
 // ---- codecs -------------------------------------------------------------------

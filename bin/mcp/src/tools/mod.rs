@@ -21,6 +21,8 @@ use crate::node::Result;
 
 mod read;
 mod write;
+#[cfg(test)]
+mod librarian;
 
 /// one tool: its MCP declaration and the handler behind it.
 pub struct Tool {
@@ -154,6 +156,7 @@ mod tests {
     #[test]
     fn find_resolves_by_name_and_rejects_an_unknown_one() {
         assert!(find("ducktape_whoami").is_some());
+        assert!(find("ducktape_ask_librarian").is_none());
         assert!(find("ducktape_not_a_tool").is_none());
     }
 

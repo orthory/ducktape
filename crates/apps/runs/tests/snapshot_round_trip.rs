@@ -368,6 +368,44 @@ fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
 }
 
 #[test]
+fn dormant_librarian_mutations_preserve_populated_revision_two_state() {
+    let mut module_under_test = source();
+    let frozen_bytes = module_under_test.snapshot();
+    let frozen_root = module_under_test.root();
+    assert_eq!(module_under_test.state_schema_revision(), 2);
+
+    for op in [
+        RunsMsg::BeginLibrarianCall {
+            run_id: "parent".into(),
+            call_id: "call".into(),
+            question: "question".into(),
+        },
+        RunsMsg::CancelLibrarianCall {
+            run_id: "parent".into(),
+            call_id: "call".into(),
+        },
+    ] {
+        let mut ctx = TestCtx::new(9, Origin::External(vec![9; 32]));
+        let msg = Msg {
+            target: "runs".into(),
+            payload: encode_msg(&op),
+        };
+        let err = block_on(module_under_test.execute(&mut ctx, &msg)).unwrap_err();
+        assert_eq!(
+            err,
+            Error::Module(runs::LIBRARIAN_REGENESIS_REQUIRED.into())
+        );
+        assert_eq!(module_under_test.snapshot(), frozen_bytes);
+        assert_eq!(module_under_test.root(), frozen_root);
+    }
+
+    let mut installed = module();
+    installed.install(&frozen_bytes, frozen_root).unwrap();
+    assert_eq!(installed.snapshot(), frozen_bytes);
+    assert_eq!(installed.root(), frozen_root);
+}
+
+#[test]
 fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
     let src = source();
     let src_root = src.root();

@@ -228,6 +228,29 @@ mod tests {
     }
 
     #[test]
+    fn dormant_librarian_name_retains_the_unknown_tool_behavior() {
+        let resp = handle(
+            &unbound(),
+            &request(
+                "tools/call",
+                json!({
+                    "name": "ducktape_ask_librarian",
+                    "arguments": {"call_id": "c", "question": "q"}
+                }),
+            ),
+        )
+        .expect("a request");
+        let encoded = serde_json::to_value(&resp).unwrap();
+        assert_eq!(encoded["result"]["isError"], true);
+        assert!(
+            encoded["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("is not a tool this server offers")
+        );
+    }
+
+    #[test]
     fn an_unbound_server_still_answers_every_tool_call() {
         // the failure posture: no node, no agent — and every tool still returns
         // a readable refusal rather than killing the run's tool plane.
