@@ -53,6 +53,29 @@ export interface ComposerTarget {
   label: string;
 }
 
+/** The amber "commented text" echo — one treatment, used by both the live
+ *  thread card and the new-thread composer. */
+function AnchorQuote({ margin, children }: { margin: string; children: string }) {
+  return (
+    <div
+      aria-label="Commented text"
+      style={{
+        margin,
+        padding: "6px 9px",
+        borderLeft: `2px solid ${color.amber}`,
+        borderRadius: radius.sm,
+        background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
+        color: color.muted3,
+        font: `500 11.5px/1.4 ${font.sans}`,
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 export function DiscussionParticipants({
   threads,
   authorNames,
@@ -147,24 +170,7 @@ export function NewThreadComposer({
       <div style={{ font: `600 11.5px ${font.sans}`, color: color.ink, marginBottom: 6 }}>
         New comment on {composer.label}
       </div>
-      {quote ? (
-        <div
-          aria-label="Commented text"
-          style={{
-            margin: "0 0 8px",
-            padding: "6px 9px",
-            borderLeft: `2px solid ${color.amber}`,
-            borderRadius: radius.sm,
-            background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
-            color: color.muted3,
-            font: `500 11.5px/1.4 ${font.sans}`,
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-          }}
-        >
-          {quote}
-        </div>
-      ) : null}
+      {quote ? <AnchorQuote margin="0 0 8px">{quote}</AnchorQuote> : null}
       <textarea
         ref={ref}
         aria-label="New comment text"
@@ -417,24 +423,7 @@ export function ThreadCard({
         </div>
       ) : null}
 
-      {anchorText ? (
-        <div
-          aria-label="Commented text"
-          style={{
-            margin: "12px 16px 0",
-            padding: "6px 9px",
-            borderLeft: `2px solid ${color.amber}`,
-            borderRadius: radius.sm,
-            background: `color-mix(in srgb, ${color.amber} 10%, transparent)`,
-            color: color.muted3,
-            font: `500 11.5px/1.4 ${font.sans}`,
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-          }}
-        >
-          {anchorText}
-        </div>
-      ) : null}
+      {anchorText ? <AnchorQuote margin="12px 16px 0">{anchorText}</AnchorQuote> : null}
 
       <div style={{ padding: "14px 16px 3px" }}>
         {comments.map((c) => (

@@ -92,23 +92,35 @@ export function PagesView() {
   // the doc content wrapper (column + comment rail): its width picks the
   // comment surface, its top converts viewport anchors to content coordinates.
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const [viewportW, setViewportW] = useState(() =>
-    typeof window === "undefined" ? 0 : window.innerWidth,
-  );
-  useEffect(() => {
-    const onResize = () => setViewportW(window.innerWidth);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-  // measure the real doc area when it exists; jsdom (clientWidth 0) and the
-  // first render fall back to the viewport.
-  const surface = commentSurface(contentRef.current?.clientWidth || viewportW);
+  const [docAreaW, setDocAreaW] = useState(0);
 
   const blocks = state.activePageBlocks;
   const root =
     state.activePage && blocks.length > 0 && blocks[0].id === state.activePage
       ? blocks[0]
       : null;
+
+  // measure the doc area itself, not the window: a ResizeObserver on the
+  // content wrapper sees rail changes as well as window resizes, and keeps
+  // layout reads out of the render body. jsdom (no ResizeObserver) and the
+  // pageless state fall back to the window width.
+  useEffect(() => {
+    const el = contentRef.current;
+    if (typeof ResizeObserver === "undefined" || !el) {
+      const onResize = () => setDocAreaW(window.innerWidth);
+      onResize();
+      window.addEventListener("resize", onResize);
+      return () => window.removeEventListener("resize", onResize);
+    }
+    const observer = new ResizeObserver((entries) => {
+      setDocAreaW(entries[0]?.contentRect.width ?? 0);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [root?.id]);
+  const surface = commentSurface(
+    docAreaW || (typeof window === "undefined" ? 0 : window.innerWidth),
+  );
   const rows = useMemo(() => buildRows(blocks, collapsed), [blocks, collapsed]);
   const chain = useMemo(
     () => (root ? ancestorChain(state.pages, root.id) : []),
@@ -323,6 +335,9 @@ export function PagesView() {
     }
   };
 
+  // ponytail: captured once at open — the docked card tracks scroll (it lives
+  // in the content) but NOT reflow above the anchor while open; it realigns on
+  // reopen. Live-tracking wants the block element's measured offset per render.
   const dockTopOf = (anchor: CommentAnchor) =>
     Math.max(8, anchor.y - (contentRef.current?.getBoundingClientRect().top ?? 0));
 
@@ -736,6 +751,11 @@ export function PagesView() {
                   style={{ flex: 1, minHeight: "40vh", cursor: "text" }}
                 />
                 </div>
+                {/* the card renders HERE in both tiers — the popover is
+                    position:fixed, so its DOM home is irrelevant, and one
+                    render site means a tier flip mid-composition repositions
+                    the card instead of remounting it (which would drop the
+                    draft). */}
                 <aside
                   data-comment-rail
                   aria-label="Comment rail"
@@ -745,7 +765,7 @@ export function PagesView() {
                     position: "relative",
                   }}
                 >
-                  {docked && commentCard ? cardEl(commentCard.dockTop) : null}
+                  {commentCard ? cardEl(docked ? commentCard.dockTop : null) : null}
                 </aside>
                 </div>
               )}
@@ -754,7 +774,6 @@ export function PagesView() {
 
         </div>
       </main>
-      {!docked ? cardEl(null) : null}
       {pendingPageDelete && (
         <ConfirmDialog
           title={`Delete ${pendingPageDeleteTitle}?`}

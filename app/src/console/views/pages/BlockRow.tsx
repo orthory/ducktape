@@ -361,6 +361,19 @@ function BlockRowInner({
   const publishCursor = (el: HTMLTextAreaElement) =>
     onCursor(block.id, el.selectionStart, el.selectionEnd);
 
+  // ONE rule for turning the textarea's live selection into menu state — the
+  // release handler and onSelect must never disagree about it.
+  const snapshotSelection = (el: HTMLTextAreaElement) => {
+    if (el.selectionStart === el.selectionEnd) {
+      setSelection(null);
+      return;
+    }
+    setSelection({
+      anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
+      range: { start: el.selectionStart, end: el.selectionEnd },
+    });
+  };
+
   // A pasted DOCUMENT is blocks, not one wall of literal newlines. A single
   // line is left to the browser (it is just text at the caret).
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -376,15 +389,27 @@ function BlockRowInner({
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     const el = event.currentTarget;
 
+    // a keypress means the pointer interaction is over — if a mouseup was
+    // swallowed (released off-window, native text drag), unstick the flag or
+    // keyboard selections never raise the menu again.
+    pointerSelecting.current = false;
+
     if (event.key === "Escape" && selection) {
+      // this Escape spends itself on the guide menu — a docked comment card
+      // listening on document must not close from the same press.
+      event.stopPropagation();
       setSelection(null);
       return;
     }
 
     // ⌘/ (Ctrl+/ elsewhere) comments on the live selection — the same door the
-    // guide menu's Comment row opens.
+    // guide menu's Comment row opens. Commit the draft first (onMark's rule):
+    // the range is in draft coordinates, and everything downstream — the
+    // composer quote, the pending highlight, the submitted anchor — reads it
+    // against committed text.
     if (selection && (event.metaKey || event.ctrlKey) && event.key === "/") {
       event.preventDefault();
+      maybeCommit();
       handlers.openComments(block.id, selection.anchor, selection.range);
       setSelection(null);
       return;
@@ -516,17 +541,9 @@ function BlockRowInner({
         }}
         onPaste={onPaste}
         onSelect={(event) => {
-          const el = event.currentTarget;
-          publishCursor(el);
+          publishCursor(event.currentTarget);
           if (pointerSelecting.current) return; // menu waits for the release
-          if (el.selectionStart === el.selectionEnd) {
-            setSelection(null);
-            return;
-          }
-          setSelection({
-            anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
-            range: { start: el.selectionStart, end: el.selectionEnd },
-          });
+          snapshotSelection(event.currentTarget);
         }}
         onMouseDown={() => {
           pointerSelecting.current = true;
@@ -536,16 +553,7 @@ function BlockRowInner({
             "mouseup",
             () => {
               pointerSelecting.current = false;
-              const el = areaRef.current;
-              if (!el) return;
-              if (el.selectionStart === el.selectionEnd) {
-                setSelection(null);
-                return;
-              }
-              setSelection({
-                anchor: selectionAnchorOf(el, el.selectionStart, el.selectionEnd),
-                range: { start: el.selectionStart, end: el.selectionEnd },
-              });
+              if (areaRef.current) snapshotSelection(areaRef.current);
             },
             { once: true },
           );
@@ -555,13 +563,18 @@ function BlockRowInner({
           setFocused(true);
           publishCursor(event.currentTarget);
         }}
-        onBlur={() => {
+        onBlur={(event) => {
           focusedRef.current = false;
           setFocused(false);
           // focus moved elsewhere: the guide menu must not linger over a
-          // selection the user has abandoned. (Menu buttons preventDefault on
-          // mousedown, so using the menu never blurs the textarea.)
-          setSelection(null);
+          // selection the user has abandoned — EXCEPT when focus moved INTO
+          // the menu itself (Tab), or a keyboard user could never reach it.
+          if (
+            !(event.relatedTarget instanceof Element) ||
+            !event.relatedTarget.closest("[data-selection-toolbar]")
+          ) {
+            setSelection(null);
+          }
           onCursor(null, 0, 0);
           maybeCommit();
         }}
@@ -695,13 +708,13 @@ function BlockRowInner({
         }}
       >
         <FinalizationMark op={op} size={15} />
-        {openThreads > 0 || hover ? (
+        {threadCount > 0 || hover ? (
           <button
             type="button"
             aria-label={`Comment on block ${blockNumber}`}
             title={
               threadCount > 0
-                ? `${threadCount} discussion${threadCount === 1 ? "" : "s"}`
+                ? `${openThreads} open of ${threadCount} discussion${threadCount === 1 ? "" : "s"}`
                 : "Comment"
             }
             onClick={(event) => {
@@ -719,12 +732,15 @@ function BlockRowInner({
               height: 28,
               padding: "0 7px",
               borderRadius: 7,
+              // open discussions read at full strength; a block whose threads
+              // are all resolved keeps a QUIET grey badge (the reference's
+              // closed state) so the history stays discoverable.
               color: commentOpen ? accentVar : openThreads > 0 ? color.muted3 : color.muted2,
               font: `650 11.5px ${font.mono}`,
             }}
           >
             <Icon name="chat" size={16} strokeWidth={1.9} />
-            {openThreads > 0 ? openThreads : null}
+            {openThreads > 0 ? openThreads : threadCount > 0 ? threadCount : null}
           </button>
         ) : null}
       </div>
@@ -740,8 +756,15 @@ function BlockRowInner({
             maybeCommit();
             handlers.setMark(block.id, selection.range, kind, active);
           }}
-          onTurnInto={(kind) => handlers.setKind(block.id, kind)}
+          onTurnInto={(kind) => {
+            maybeCommit();
+            handlers.setKind(block.id, kind);
+          }}
           onComment={() => {
+            // commit first (onMark's rule): the quote, the pending highlight
+            // and the submitted anchor all read this range against committed
+            // text, and the range is in draft coordinates.
+            maybeCommit();
             handlers.openComments(block.id, selection.anchor, selection.range);
             setSelection(null);
           }}

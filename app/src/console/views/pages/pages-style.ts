@@ -39,13 +39,18 @@ export const DOC_COLUMN_MAX = 620 + COLUMN_PAD_X * 2;
 /** The docked comment rail: a 340px card plus breathing room on both sides. */
 export const DOCK_RAIL_W = 380;
 
+/** The narrowest column the dock may squeeze the document to — a 560px text
+ *  measure plus the same padding the column always carries. Derived like
+ *  DOC_COLUMN_MAX, so a measure or padding change moves both together. */
+export const DOCK_MIN_COLUMN = 560 + COLUMN_PAD_X * 2;
+
 /** Which comment surface fits the doc area: docked when the column can yield
- *  the rail and still keep a readable measure (720px column ≈ 560px of text).
- *  Requiring the FULL column + rail put the threshold at 1176px of doc area —
- *  unreachable even on a maximized 1440 screen once both left rails are up.
- *  A width decision, not a mode toggle. */
+ *  the rail and still keep a readable measure. Requiring the FULL column +
+ *  rail put the threshold at 1176px of doc area — unreachable even on a
+ *  maximized 1440 screen once both left rails are up. A width decision, not
+ *  a mode toggle. */
 export const commentSurface = (availableW: number): "docked" | "popover" =>
-  availableW >= DOCK_RAIL_W + 720 ? "docked" : "popover";
+  availableW >= DOCK_RAIL_W + DOCK_MIN_COLUMN ? "docked" : "popover";
 
 /** Breathing room above a heading. Rows are otherwise uniformly spaced, which
  *  made an H1 sit as tight against the paragraph above it as another

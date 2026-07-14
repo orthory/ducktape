@@ -113,14 +113,19 @@ export function CommentCard({
     };
   }, [onClose, dock]);
 
-  const left = Math.max(
-    8,
-    Math.min(
-      selection ? anchor.x : anchor.x - CARD_WIDTH,
-      window.innerWidth - CARD_WIDTH - 8,
+  const popoverBox = () => ({
+    position: "fixed" as const,
+    zIndex: 40,
+    left: Math.max(
+      8,
+      Math.min(
+        selection ? anchor.x : anchor.x - CARD_WIDTH,
+        window.innerWidth - CARD_WIDTH - 8,
+      ),
     ),
-  );
-  const top = Math.max(8, Math.min(anchor.y + 8, window.innerHeight - 120));
+    top: Math.max(8, Math.min(anchor.y + 8, window.innerHeight - 120)),
+    width: CARD_WIDTH,
+  });
 
   return (
     <div
@@ -130,7 +135,7 @@ export function CommentCard({
       style={{
         ...(dock != null
           ? { position: "absolute", top: dock, right: 16, width: DOCKED_WIDTH }
-          : { position: "fixed", zIndex: 40, left, top, width: CARD_WIDTH }),
+          : popoverBox()),
         maxHeight: "min(560px, 76vh)",
         display: "flex",
         flexDirection: "column",

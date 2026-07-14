@@ -731,7 +731,7 @@ describe("floating comment card", () => {
     within(dialog).getByText("about draft");
   });
 
-  it("badges open discussions in the margin; resolved-only blocks go quiet", () => {
+  it("badges open discussions; resolved-only history keeps a quiet badge", () => {
     const resolved = (threads: ConsoleState["pageThreads"]) =>
       threads.map((group) => ({
         ...group,
@@ -741,15 +741,14 @@ describe("floating comment card", () => {
         })),
       }));
     const { rerender } = renderPagesView({ pageThreads: twoRangeThreads });
-    expect(
-      screen.getByRole("button", { name: "Comment on block 1" }).textContent,
-    ).toBe("2");
+    const badge = () => screen.getByRole("button", { name: "Comment on block 1" });
+    expect(badge().textContent).toBe("2");
+    expect(badge().title).toBe("2 open of 2 discussions");
+    // all resolved: the badge stays (the history is still discoverable) but
+    // reads quiet — total count, muted tone.
     rerender({ pageThreads: resolved(twoRangeThreads) });
-    expect(screen.queryByRole("button", { name: "Comment on block 1" })).toBeNull();
-    fireEvent.mouseOver(screen.getByLabelText("Edit paragraph block 1"));
-    expect(
-      screen.getByRole("button", { name: "Comment on block 1" }).textContent,
-    ).toBe("");
+    expect(badge().textContent).toBe("2");
+    expect(badge().title).toBe("0 open of 2 discussions");
   });
 
   it("docks the card in the side rail on a wide viewport; scroll keeps it", () => {
@@ -776,10 +775,29 @@ describe("floating comment card", () => {
       renderPagesView({ pageThreads: threadsOn("a") });
       fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
       const dialog = screen.getByRole("dialog", { name: "Comments on this block" });
-      expect(document.querySelector("[data-comment-rail]")?.contains(dialog)).toBe(false);
       expect(getComputedStyle(dialog).position).toBe("fixed");
       fireEvent.scroll(document);
       expect(screen.queryByRole("dialog", { name: "Comments on this block" })).toBeNull();
+    } finally {
+      window.innerWidth = wide;
+    }
+  });
+
+  it("a tier flip repositions the card without dropping the composer draft", () => {
+    const wide = window.innerWidth;
+    window.innerWidth = 1000;
+    try {
+      renderPagesView();
+      fireEvent.click(screen.getByRole("button", { name: "Comment on page" }));
+      const draft = screen.getByLabelText("New comment text") as HTMLTextAreaElement;
+      fireEvent.change(draft, { target: { value: "half-typed thought" } });
+      window.innerWidth = 1600;
+      fireEvent(window, new Event("resize"));
+      const after = screen.getByLabelText("New comment text") as HTMLTextAreaElement;
+      expect(after.value).toBe("half-typed thought");
+      expect(
+        getComputedStyle(screen.getByRole("dialog", { name: "Comments on this page" })).position,
+      ).toBe("absolute");
     } finally {
       window.innerWidth = wide;
     }

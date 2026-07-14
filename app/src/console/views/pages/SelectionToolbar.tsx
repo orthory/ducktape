@@ -85,7 +85,7 @@ export function SelectionToolbar({
         position: "fixed",
         zIndex: 35,
         left: Math.max(126, Math.min(anchor.x, window.innerWidth - 126)),
-        top: Math.min(anchor.y + 8, window.innerHeight - 148),
+        top: Math.max(8, Math.min(anchor.y + 8, window.innerHeight - 148)),
         transform: "translateX(-50%)",
         display: "flex",
         flexDirection: "column",
