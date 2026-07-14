@@ -830,8 +830,8 @@ main() {
       [ -z "$epic_pr_number" ] || die "epic PR exists but its branch is missing"
     fi
   fi
-  assert_shared_dev_base "$forge_target" "$replay_base"
-  log "shared dev history: Forge target $forge_target is represented by GitHub $replay_base"
+  assert_shared_dev_base "$forge_target" "$origin_oid"
+  log "shared dev history: Forge target $forge_target is represented by GitHub $origin_oid"
 
   git worktree add --detach "$MIRROR_WORKTREE" "$replay_base" >/dev/null
   WORKTREE_ADDED=1

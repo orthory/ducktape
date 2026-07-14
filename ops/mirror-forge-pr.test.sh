@@ -466,6 +466,45 @@ if (assert_shared_dev_base "$TARGET_OID" "$SOURCE_OID") >/dev/null 2>&1; then
   exit 1
 fi
 
+# An epic can remain forked before a baseline later represented in GitHub dev.
+# Validate against current dev, then replay only the later Forge delta on the
+# stale epic tip; a target delta absent from current dev must still fail closed.
+STALE_EPIC_TIP=$(printf 'stale epic slice\n' | git commit-tree "$BASE^{tree}" -p "$BASE")
+quiet_git "$DEST_REPO" reset --hard "$BASE"
+printf 'represented baseline\n' >"$DEST_REPO/later-baseline.txt"
+quiet_git "$DEST_REPO" add later-baseline.txt
+quiet_git "$DEST_REPO" commit -m 'GitHub receives later baseline'
+printf 'current GitHub advance\n' >"$DEST_REPO/current-github.txt"
+quiet_git "$DEST_REPO" add current-github.txt
+quiet_git "$DEST_REPO" commit -m 'GitHub advances after represented baseline'
+CURRENT_GITHUB_DEV=$(git -C "$DEST_REPO" rev-parse HEAD)
+quiet_git "$DEST_REPO" reset --hard "$BASE"
+printf 'represented baseline\n' >"$DEST_REPO/later-baseline.txt"
+quiet_git "$DEST_REPO" add later-baseline.txt
+quiet_git "$DEST_REPO" commit -m 'Forge receives later baseline'
+LATER_FORGE_TARGET=$(git -C "$DEST_REPO" rev-parse HEAD)
+printf 'later Forge delta\n' >"$DEST_REPO/later-forge.txt"
+quiet_git "$DEST_REPO" add later-forge.txt
+quiet_git "$DEST_REPO" commit -m 'Later Forge delta'
+LATER_FORGE_SOURCE=$(git -C "$DEST_REPO" rev-parse HEAD)
+assert_shared_dev_base "$LATER_FORGE_TARGET" "$CURRENT_GITHUB_DEV"
+validate_commit_range "$LATER_FORGE_TARGET" "$LATER_FORGE_SOURCE"
+quiet_git "$DEST_REPO" reset --hard "$STALE_EPIC_TIP"
+mkdir "$TEST_ROOT/stale-epic-state"
+replay_commit "$DEST_REPO" "$LATER_FORGE_SOURCE" "$TEST_ROOT/stale-epic-state"
+[ "$(git -C "$DEST_REPO" rev-parse HEAD^1)" = "$STALE_EPIC_TIP" ]
+[ "$(cat "$DEST_REPO/later-forge.txt")" = 'later Forge delta' ]
+quiet_git "$DEST_REPO" reset --hard "$LATER_FORGE_TARGET"
+printf 'missing from GitHub dev\n' >"$DEST_REPO/forge-target-only.txt"
+quiet_git "$DEST_REPO" add forge-target-only.txt
+quiet_git "$DEST_REPO" commit -m 'Forge target delta missing from GitHub'
+MISSING_FORGE_TARGET=$(git -C "$DEST_REPO" rev-parse HEAD)
+if (assert_shared_dev_base "$MISSING_FORGE_TARGET" "$CURRENT_GITHUB_DEV") >/dev/null 2>&1; then
+  echo 'a Forge target delta missing from current GitHub dev was accepted' >&2
+  exit 1
+fi
+quiet_git "$DEST_REPO" reset --hard "$GITHUB_BASE"
+
 # GitHub may add an unrelated change elsewhere in a file that already carries
 # the Forge delta. The three-tree proof accepts it without requiring whole-file
 # identity.
@@ -575,6 +614,10 @@ if (cd "$CONFLICT_REPO" && replay_commit "$CONFLICT_REPO" "$SOURCE_OID" "$TEST_R
 fi
 
 grep -F 'refs/heads/dev:$FORGE_TMP_REF' "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null
+grep -F 'assert_shared_dev_base "$forge_target" "$origin_oid"' \
+  "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null
+grep -F 'git worktree add --detach "$MIRROR_WORKTREE" "$replay_base"' \
+  "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null
 if grep -F 'refs/heads/*' "$REPO_ROOT/ops/mirror-forge-pr.sh" >/dev/null; then
   echo 'Forge wildcard fetch must not be used' >&2
   exit 1
