@@ -28,6 +28,32 @@ export const moduleTopic = (id: string): string => `module:${id}`;
 export const runOutputTopic = (dispatchId: string): string =>
   `run-output:${dispatchId}`;
 
+// ── Interactive terminal sessions (docs/…/interactive-terminal-sessions) ──
+// A term session's output rides the existing ws stream on `term:<sessionId>`
+// as an event frame carrying a base64 chunk in `item` (a ring replays it on
+// subscribe, exactly like run-output). Input rides the SAME socket as two new
+// ClientMsg ops. These two op shapes are FINAL and are being added to noded's
+// `ClientMsg` enum in parallel; once ts-rs regenerates stream.gen.ts the
+// generated `ClientMsg` will cover them and `TermClientMsg` can fold in.
+export const TERM_TOPIC_PREFIX = "term:";
+export const termTopic = (sessionId: string): string =>
+  `${TERM_TOPIC_PREFIX}${sessionId}`;
+
+/** The two app→node terminal ops, hand-authored to stay independent of
+ *  stream.gen.ts regeneration. `data` is base64 of the keystroke bytes. */
+export type TermClientMsg =
+  | { op: "termInput"; session: string; data: string }
+  | { op: "termResize"; session: string; cols: number; rows: number };
+
+/** A terminal output chunk: an event frame on a `term:` topic whose `item` is
+ *  base64 of raw terminal bytes. Distinct from the op-carrying `EventFrame`
+ *  (no `op`), so the transport routes it separately. */
+export interface TermChunkFrame {
+  type: "event";
+  topic: string;
+  item: string;
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
@@ -77,6 +103,13 @@ export const isErrorFrame = (value: unknown): value is ErrorFrame =>
   hasString(value, "topic") &&
   hasString(value, "code") &&
   hasString(value, "detail");
+
+export const isTermChunkFrame = (value: unknown): value is TermChunkFrame =>
+  isRecord(value) &&
+  value.type === "event" &&
+  hasString(value, "topic") &&
+  (value.topic as string).startsWith(TERM_TOPIC_PREFIX) &&
+  hasString(value, "item");
 
 export const isServerFrame = (value: unknown): value is ServerFrame =>
   isSubscribedFrame(value) ||

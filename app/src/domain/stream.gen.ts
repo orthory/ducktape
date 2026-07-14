@@ -2,7 +2,7 @@
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
-export type ClientMsg = { "op": "subscribe", topics: Array<string>, resume: { [key in string]: string }, } | { "op": "unsubscribe", topics: Array<string>, };
+export type ClientMsg = { "op": "subscribe", topics: Array<string>, resume: { [key in string]: string }, } | { "op": "unsubscribe", topics: Array<string>, } | { "op": "termInput", session: string, data: string, } | { "op": "termResize", session: string, cols: number, rows: number, };
 
 export type ServerFrame = { "type": "subscribed", topics: { [key in string]: string | null }, } | { "type": "event", topic: string, cursor: string, op: StreamOpRow, } | { "type": "tail", topic: string, cursor: string, item: TailItem, } | { "type": "lagged", topic: string, cursor: string, } | { "type": "heartbeat", height: number, appHash: string, timeMs: number, intervalMs: number, } | { "type": "error", topic: string, code: StreamErrorCode, detail: string, };
 
