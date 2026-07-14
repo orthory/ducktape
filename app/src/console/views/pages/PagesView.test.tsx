@@ -621,6 +621,41 @@ describe("floating comment card", () => {
     screen.getByRole("dialog", { name: "Comments on this block" });
     expect(screen.getByLabelText("Commented text").textContent).toBe("First");
   });
+
+  const selectFirstBlock = (start = 0, end = 5) => {
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(start, end);
+    fireEvent.select(area);
+    screen.getByRole("toolbar", { name: "Selection actions" });
+    return area;
+  };
+
+  it("turns the block into a heading from the guide menu", () => {
+    const { spies } = renderPagesView();
+    selectFirstBlock();
+    fireEvent.click(screen.getByRole("button", { name: "Heading 2" }));
+    expect(spies.setPageBlockKind).toHaveBeenCalledWith({ blockId: "a", kind: "heading2" });
+  });
+
+  it("dismisses the guide menu on scroll and on focus loss", () => {
+    renderPagesView();
+    selectFirstBlock();
+    fireEvent.scroll(document);
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+
+    const area = selectFirstBlock();
+    fireEvent.blur(area);
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+  });
+
+  it("⌘/ comments on the live selection", () => {
+    renderPagesView();
+    const area = selectFirstBlock(0, 5);
+    fireEvent.keyDown(area, { key: "/", metaKey: true });
+    screen.getByRole("dialog", { name: "Comments on selected text" });
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+  });
 });
 
 describe("subpages", () => {

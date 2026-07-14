@@ -344,6 +344,15 @@ function BlockRowInner({
       return;
     }
 
+    // ⌘/ (Ctrl+/ elsewhere) comments on the live selection — the same door the
+    // guide menu's Comment row opens.
+    if (selection && (event.metaKey || event.ctrlKey) && event.key === "/") {
+      event.preventDefault();
+      handlers.openComments(block.id, selection.anchor, selection.range);
+      setSelection(null);
+      return;
+    }
+
     if (slashOpen && slashOptions.length > 0) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -489,6 +498,10 @@ function BlockRowInner({
         onBlur={() => {
           focusedRef.current = false;
           setFocused(false);
+          // focus moved elsewhere: the guide menu must not linger over a
+          // selection the user has abandoned. (Menu buttons preventDefault on
+          // mousedown, so using the menu never blurs the textarea.)
+          setSelection(null);
           onCursor(null, 0, 0);
           maybeCommit();
         }}
@@ -657,6 +670,7 @@ function BlockRowInner({
       {selection ? (
         <SelectionToolbar
           blockId={block.id}
+          blockKind={block.kind}
           marks={visibleMarks}
           range={selection.range}
           anchor={selection.anchor}
@@ -664,6 +678,7 @@ function BlockRowInner({
             maybeCommit();
             handlers.setMark(block.id, selection.range, kind, active);
           }}
+          onTurnInto={(kind) => handlers.setKind(block.id, kind)}
           onComment={(anchor) => {
             handlers.openComments(block.id, anchor, selection.range);
             setSelection(null);
