@@ -29,7 +29,7 @@ import { ThreadPanel } from "./ThreadPanel";
 // A segmented Open / Members-only toggle for a channel's post policy.
 function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (policy: PostPolicy) => void }) {
   const options: { key: PostPolicy; label: string; hint: string }[] = [
-    { key: "open", label: "Open", hint: "Any member of the workspace can post" },
+    { key: "open", label: "Open", hint: "Any member of the network can post" },
     { key: "members_only", label: "Members", hint: "Only channel members can post" },
   ];
   return (

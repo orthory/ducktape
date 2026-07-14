@@ -739,11 +739,22 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     let http_url = format!("http://127.0.0.1:{}", ws.ports.http);
 
     // already running? adopt it — never spawn a second process for one
-    // workspace. we probe the p2p LISTEN port, not http: the mesh listener is
-    // bound in every phase (parked, promoting, validator) on every node build,
-    // while http may lag behind, so this is the one dependable liveness port.
-    // a second spawn would collide on exactly this port anyway.
-    if port_listening(ws.ports.listen) {
+    // workspace. the p2p LISTEN port is the primary probe (bound in every
+    // phase — parked, promoting, validator — while http may lag at boot; a
+    // second spawn would collide on exactly this port), but http is probed TOO:
+    // a mesh listener bound to a non-loopback interface is invisible to a
+    // loopback probe, and missing a live node here is what spawns the
+    // address-in-use crash loop (epic QA BUG-1). http is always loopback for an
+    // app-managed node, so either port answering means "adopt".
+    if port_listening(ws.ports.listen) || port_listening(ws.ports.http) {
+        // record the adopted node's pid (verified by exe/cmdline sweep) so the
+        // control phase reads a LIVE pid instead of a stale corpse's — a stale
+        // pidfile otherwise shows "Start" for a node we are connected to
+        // (epic QA BUG-3).
+        #[cfg(unix)]
+        if let Some(pid) = lifecycle::live_workspace_node_pid(&dir) {
+            let _ = fs::write(pidfile(&dir), pid.to_string());
+        }
         return finish_selection(&app, &mut reg, ws, http_url);
     }
 
@@ -754,21 +765,15 @@ fn workspace_select_blocking(app: crate::rt::AppHandle, id: String) -> Result<Se
     // generic timeout. spawn_verified reads the real reason back out of
     // daemon.log instead. http is the readiness signal for a member/founder; a
     // parking joiner never serves it, so "still alive after the grace" carries.
-    let child =
+    let mut child =
         crate::daemon::spawn_workspace_node(&node_toml(&dir), &log_path, Some(ws.ports.http))
             .map_err(|failure| {
                 format!("the node for \"{}\" exited on start: {failure}", ws.name)
             })?;
     // record the detached pid so teardown can address the process directly —
     // the http shutdown route alone can't reach a parked joiner (no surface).
-    // best-effort: a failed write only degrades stop back to the pgrep sweep.
-    if let Err(err) = fs::write(pidfile(&dir), child.id().to_string()) {
-        tracing::warn!(
-            target: "ducktape::shell",
-            error = %err,
-            "could not record the node pid — teardown falls back to the pgrep sweep"
-        );
-    }
+    // only a STILL-ALIVE child's pid is persisted (epic QA BUG-3).
+    crate::daemon::record_pid_if_alive(&mut child, &pidfile(&dir), &ws.name);
     // keep the handle instead of dropping it: it is the only thing that can ever
     // report HOW the node died (and reap it). the supervisor also revives a node
     // that crashes — validator uptime for a user who knows nothing of daemons —
