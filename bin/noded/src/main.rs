@@ -148,6 +148,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // duckfs checkout/commit over this SAME actor lane (the /v1/fs/workspaces
     // transport). cheap — NodeHandle is a command-lane sender + a few Arcs.
     let actor_handle = handle.clone();
+
+    // the node-local, off-chain interactive terminal-session plane (lives in the
+    // daemon like the stream hub — never consensus). Podman-only: interactive
+    // spawn refuses the Direct backend, so this is available ONLY when the
+    // operator configured a sandbox image (DUCKTAPE_SANDBOX_IMAGE); with none,
+    // create returns a clear error rather than a Direct spawn. The identity +
+    // agent dirs mirror the oracle pool's (ORACLE_ORIGIN, AgentDirs under
+    // <storage>). The manager shares the StreamHub's terminal ring so its pump
+    // appends where the ws catch-up reads.
+    let term_ring = handle.stream_hub().terminals();
+    let interactive =
+        noded::term::discover_interactive(ORACLE_ORIGIN, capability_host::AgentDirs::under(&storage));
+    tracing::info!(
+        target: "ducktape::term",
+        enabled = interactive.is_some(),
+        "terminal_plane_ready"
+    );
+    let handle = handle.with_terminals(noded::TerminalSessions::new(
+        interactive,
+        capability_host::execution_node_id(ORACLE_ORIGIN),
+        storage.join("term-sessions"),
+        term_ring,
+    ));
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
