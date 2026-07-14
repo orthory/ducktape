@@ -384,8 +384,9 @@ impl AgentRecord {
     }
 
     /// Whether `child` is a non-escalating delegation target. Delegation stays
-    /// inside one owner's trust domain, and every authority the child can
-    /// exercise must already be held by the parent.
+    /// inside one owner's execution/runtime trust domain, and every authority
+    /// or skill source the child can exercise must already be readable by the
+    /// parent.
     pub fn can_delegate_to(&self, child: &AgentRecord) -> bool {
         let exact = |parent: &[String], child: &[String]| {
             child.iter().all(|item| parent.iter().any(|p| p == item))
@@ -397,7 +398,11 @@ impl AgentRecord {
         };
 
         self.owner == child.owner
+            && self.capability == child.capability
             && exact(&self.allowed_actions, &child.allowed_actions)
+            && child.skills.iter().all(|skill| {
+                self.permits(&CapRequest::DuckfsRead(&skill.source_prefix))
+            })
             && child
                 .caps
                 .forge_read

@@ -27,7 +27,15 @@ fn delegation_registry(budget: u32) -> Registry {
         ("child-a", &[ACTION_CHAT_POST]),
         ("child-b", &[ACTION_CHAT_POST]),
     ]);
-    registry.get_mut("bot").unwrap().caps.subagent_budget = budget;
+    let parent = registry.get_mut("bot").unwrap();
+    parent.caps.subagent_budget = budget;
+    parent.caps.duckfs_read.push("/shared/skills".into());
+    registry.get_mut("child-a").unwrap().skills = vec![agent::SkillRef {
+        name: "specialist".into(),
+        source_prefix: "/shared/skills/specialist".into(),
+        source_snapshot: None,
+        load: agent::LoadMode::Always,
+    }];
     registry
 }
 
@@ -41,6 +49,7 @@ fn start_parent(registry: &Registry) -> (RunsModule, String) {
 #[test]
 fn final_response_stages_one_bounded_child_wave_with_parent_context() {
     let registry = delegation_registry(2);
+    assert!(registry["bot"].skills.is_empty());
     let mut module = watched(TurnPolicy::Mention, &registry);
     let transcript = vec![
         message(1, "root"),
@@ -120,6 +129,16 @@ fn final_response_stages_one_bounded_child_wave_with_parent_context() {
         assert_eq!(envelope["run_id"], child_run);
         assert_eq!(envelope["agent_id"], agent_id);
         assert_eq!(envelope["thread_key"], "general#1");
+        assert_eq!(
+            envelope["workspace"]["source_prefix"],
+            "/shared/agent-workspaces/bot"
+        );
+        if agent_id == "child-a" {
+            assert_eq!(
+                envelope["skills"][0]["source_prefix"],
+                "/shared/skills/specialist"
+            );
+        }
         let context = envelope["context"].as_str().unwrap();
         assert!(
             context.contains(&format!("Parent run: {parent_run}")),
@@ -147,6 +166,8 @@ fn invalid_delegation_batches_fail_without_staging_any_child() {
     for case in [
         "inactive",
         "cross-owner",
+        "different-capability",
+        "unreadable-skill",
         "authority-escalation",
         "nested",
         "duplicate",
@@ -170,6 +191,15 @@ fn invalid_delegation_batches_fail_without_staging_any_child() {
             "cross-owner" => {
                 registry.get_mut("child-a").unwrap().owner = SagaOrigin::External(vec![8; 32]);
                 vec![request("child-a", "cross owner")]
+            }
+            "different-capability" => {
+                registry.get_mut("child-a").unwrap().capability = "model-2".into();
+                vec![request("child-a", "other runtime")]
+            }
+            "unreadable-skill" => {
+                registry.get_mut("child-a").unwrap().skills[0].source_prefix =
+                    "/private/specialist".into();
+                vec![request("child-a", "unreadable specialist")]
             }
             "authority-escalation" => {
                 registry
@@ -258,6 +288,85 @@ fn hard_fanout_cap_accepts_eight_children() {
     )
     .unwrap();
     assert_eq!(ctx.dispatch_msgs().len(), MAX_DELEGATIONS_PER_RUN);
+}
+
+#[test]
+fn delegated_child_preserves_requester_and_owner_lifecycle_control() {
+    let registry = delegation_registry(1);
+    let mut module = watched(TurnPolicy::Mention, &registry);
+    let mut request_ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut module,
+        &mut request_ctx,
+        &admin(&RunsMsg::RequestRun {
+            agent_id: "bot".into(),
+            channel_id: "general".into(),
+            anchor_seq: 2,
+            demands: Default::default(),
+        }),
+    )
+    .unwrap();
+    commit(&mut module);
+    let parent_run = run_id_for("general", 2, "bot");
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut module,
+        &mut ctx,
+        &result_event(
+            &parent_run,
+            Ok(delegated_response(vec![request("child-a", "bounded work")])),
+        ),
+    )
+    .unwrap();
+    commit(&mut module);
+    let child_run = run_id_for("general", 2, "child-a");
+    assert!(get_pending(&module, &child_run).is_some());
+
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry);
+    exec(
+        &mut module,
+        &mut ctx,
+        &admin(&RunsMsg::CancelRun {
+            run_id: child_run.clone(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.dispatch_msgs(),
+        vec![DispatchMsg::CancelDispatch {
+            dispatch_id: dispatch_id_for(&child_run),
+        }]
+    );
+    abort(&mut module);
+
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(9))
+        .with_registry(&registry);
+    exec(
+        &mut module,
+        &mut ctx,
+        &admin(&RunsMsg::ReassignRun {
+            run_id: child_run.clone(),
+            attempt: 0,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.dispatch_msgs(),
+        vec![DispatchMsg::ReassignDispatch {
+            dispatch_id: dispatch_id_for(&child_run),
+            attempt: 0,
+        }]
+    );
 }
 
 #[test]

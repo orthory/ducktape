@@ -47,7 +47,8 @@
 
 use agent::{
     ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentModule,
-    AgentMsg, AgentResponse, ReplyBlock, encode_msg as agent_encode_msg, encode_response,
+    AgentMsg, AgentResponse, DelegationRequest, ReplyBlock, ResourceCaps,
+    encode_msg as agent_encode_msg, encode_response,
 };
 use chat::{
     AuthorRef, Block, Chat, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span,
@@ -175,15 +176,24 @@ fn quackbot_ref() -> AuthorRef {
 }
 
 fn register_quackbot(actions: Vec<String>) -> Msg {
+    register_agent("quackbot", "Quackbot", actions, None)
+}
+
+fn register_agent(
+    agent_id: &str,
+    display_name: &str,
+    actions: Vec<String>,
+    caps: Option<ResourceCaps>,
+) -> Msg {
     Msg {
         target: "agent".into(),
         payload: agent_encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: "quackbot".into(),
-            display_name: "Quackbot".into(),
+            agent_id: agent_id.into(),
+            display_name: display_name.into(),
             capability: "mock-llm-1".into(),
             allowed_actions: actions,
             recipe_hash: None,
-            caps: None,
+            caps,
             skills: None,
         }),
     }
@@ -279,6 +289,22 @@ fn canned_response(run_id: &str) -> Vec<u8> {
             title: "follow up on the mention".into(),
         }],
         delegations: Vec::new(),
+        commit_message: None,
+    })
+}
+
+fn delegated_response(child: &str) -> Vec<u8> {
+    encode_response(&AgentResponse {
+        reply_blocks: vec![ReplyBlock {
+            kind: "paragraph".into(),
+            text: "delegated the bounded child task".into(),
+            lang: None,
+        }],
+        actions: Vec::new(),
+        delegations: vec![DelegationRequest {
+            agent_id: child.into(),
+            instruction: "verify native and wasm parity".into(),
+        }],
         commit_message: None,
     })
 }
@@ -640,6 +666,118 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
         let _ = replies(&wasm).await;
         let _ = recent_runs(&wasm).await;
         assert_eq!(root_of(&wasm), settled, "a query moved the wasm root");
+    });
+}
+
+#[test]
+fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+    deterministic::Runner::default().start(|context| async move {
+        let mut native = native_host(&context, native_files).await;
+        let mut wasm = wasm_host_(&context, wasm_files).await;
+        let parent_run = run_id_for("general", 1, "quackbot");
+        let child_run = run_id_for("general", 1, "child");
+
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            create_channel("general"),
+            false,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            2,
+            alice(),
+            watch_channel("general"),
+            true,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            3,
+            alice(),
+            register_agent(
+                "quackbot",
+                "Quackbot",
+                vec![ACTION_CHAT_POST.into()],
+                Some(ResourceCaps {
+                    subagent_budget: 1,
+                    ..Default::default()
+                }),
+            ),
+            false,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            4,
+            alice(),
+            register_agent("child", "Child", vec![ACTION_CHAT_POST.into()], None),
+            false,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            5,
+            alice(),
+            mention_post("general", "m1"),
+            true,
+        )
+        .await;
+
+        let oracle = oracle_op(
+            &native,
+            &parent_run,
+            wrap_runner(delegated_response("child")),
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            6,
+            Origin::External(b"oracle".to_vec()),
+            oracle,
+            false,
+        )
+        .await;
+
+        let requests = roundtrip(&mut native, &mut wasm, 7, alice(), noop_block(7), true).await;
+        assert_eq!(requests.len(), 1, "one delegated child work request");
+        let work = dispatch::decode_work_spec(&requests[0].spec).expect("child work spec");
+        assert_eq!(work.dispatch_id, dispatch_id_for(&child_run));
+        assert_eq!(
+            work.demands,
+            std::collections::BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4),])
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&work.payload).expect("child envelope");
+        assert_eq!(payload["run_id"], child_run);
+        assert_eq!(payload["agent_id"], "child");
+        assert_eq!(
+            payload["workspace"]["source_prefix"],
+            "/shared/agent-workspaces/quackbot"
+        );
+        assert!(
+            payload["context"]
+                .as_str()
+                .expect("delegated context")
+                .contains(&format!("Parent run: {parent_run}"))
+        );
+        assert_eq!(pending_run_ids(&wasm).await, vec![child_run]);
+        assert!(
+            chat_message(&wasm, &reply_message_id(&parent_run))
+                .await
+                .is_some(),
+            "the parent reply follow-up landed with the child dispatch"
+        );
     });
 }
 

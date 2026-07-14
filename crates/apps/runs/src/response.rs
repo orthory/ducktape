@@ -514,7 +514,7 @@ impl RunsModule {
             }
             if !parent.can_delegate_to(&child) {
                 return Err(format!(
-                    "child agent {} is not a same-owner authority subset of {}",
+                    "child agent {} is not delegation-compatible with {}",
                     child.agent_id, parent.agent_id
                 ));
             }
@@ -533,7 +533,7 @@ impl RunsModule {
                     &run_id,
                     &entry.channel_id,
                     entry.anchor_seq,
-                    Some(&context),
+                    Some((&parent, &context)),
                 )
                 .await?;
             prepared.push(PreparedDelegation {

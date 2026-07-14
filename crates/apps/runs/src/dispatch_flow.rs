@@ -157,6 +157,15 @@ impl RunsModule {
         ctx: &dyn Ctx,
         agent: &AgentRecord,
     ) -> Result<envelope::PortableInputs, String> {
+        self.portable_inputs_with_workspace(ctx, agent, agent).await
+    }
+
+    async fn portable_inputs_with_workspace(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &AgentRecord,
+        workspace_agent: &AgentRecord,
+    ) -> Result<envelope::PortableInputs, String> {
         let source_snapshot = match self.files.clone() {
             Some(files) => self.duckfs_head(ctx, &files).await?,
             None => None,
@@ -166,7 +175,7 @@ impl RunsModule {
         // to (W2) — deterministic across validators.
         let skills = envelope::resolve_skills(agent, &source_snapshot);
         Ok(envelope::PortableInputs {
-            workspace: envelope::duckfs_workspace(agent, source_snapshot),
+            workspace: envelope::duckfs_workspace(workspace_agent, source_snapshot),
             skills,
             sink: WireSink::Chain,
             context: None,
@@ -219,9 +228,9 @@ impl RunsModule {
             .await
     }
 
-    /// The ordinary chat/Forge composition path plus one caller-supplied,
-    /// bounded context section. Delegation uses it to state parent provenance
-    /// and the child instruction without creating a second envelope shape.
+    /// The ordinary chat/Forge composition path plus delegation's parent
+    /// DuckFS workspace and bounded context. Forge already names the shared
+    /// item branch, so the workspace override applies only to generic Chat.
     pub(super) async fn prepare_dispatch_with_context(
         &self,
         ctx: &dyn Ctx,
@@ -229,12 +238,19 @@ impl RunsModule {
         run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
-        extra_context: Option<&str>,
+        delegation: Option<(&AgentRecord, &str)>,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
             Some(item_ref) => self.forge_portable_inputs(ctx, agent, &item_ref).await?,
-            None => self.portable_inputs(ctx, agent).await?,
+            None => {
+                self.portable_inputs_with_workspace(
+                    ctx,
+                    agent,
+                    delegation.map(|(parent, _)| parent).unwrap_or(agent),
+                )
+                .await?
+            }
         };
         // M2: `[[page:<id>]]` refs in the trigger message text or the injected
         // item body render referenced page subtrees into the same context
@@ -262,7 +278,7 @@ impl RunsModule {
                 None => section,
             });
         }
-        if let Some(extra) = extra_context {
+        if let Some((_, extra)) = delegation {
             portable.context = Some(match portable.context.take() {
                 Some(context) => format!("{context}\n\n{extra}"),
                 None => extra.to_string(),

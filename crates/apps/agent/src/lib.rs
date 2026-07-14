@@ -1897,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn delegation_requires_same_owner_and_a_complete_authority_subset() {
+    fn delegation_requires_same_runtime_and_parent_authority() {
         let mut parent = record_with_caps(ResourceCaps {
             forge_read: vec!["docs".into()],
             forge_push: vec!["app".into()],
@@ -1912,6 +1912,12 @@ mod tests {
         let mut child = parent.clone();
         child.agent_id = "child".into();
         child.allowed_actions = vec![ACTION_CHAT_POST.into()];
+        child.skills = vec![SkillRef {
+            name: "specialist".into(),
+            source_prefix: "/shared/read/specialist".into(),
+            source_snapshot: None,
+            load: LoadMode::Always,
+        }];
         child.caps = ResourceCaps {
             forge_read: vec!["app".into()],
             duckfs_read: vec!["/shared/write/child".into()],
@@ -1926,6 +1932,12 @@ mod tests {
 
         let mut escalated = child.clone();
         escalated.owner = SagaOrigin::External(vec![8; 32]);
+        assert!(!parent.can_delegate_to(&escalated));
+        escalated = child.clone();
+        escalated.capability = "other-model".into();
+        assert!(!parent.can_delegate_to(&escalated));
+        escalated = child.clone();
+        escalated.skills[0].source_prefix = "/unreadable/specialist".into();
         assert!(!parent.can_delegate_to(&escalated));
         for caps in [
             ResourceCaps {
