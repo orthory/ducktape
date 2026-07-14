@@ -405,8 +405,20 @@ if (parse_epic_comments "$TEST_ROOT/epic-comments-conflict" \
   echo 'conflicting duplicate epic provenance comments were accepted' >&2
   exit 1
 fi
+require_epic_author epic-author epic-author
+if (require_epic_author epic-author another-user) >/dev/null 2>&1; then
+  echo 'a different GitHub login passed the epic-author gate' >&2
+  exit 1
+fi
+MOCK_POST_FAIL=0
 gh() {
+  if [[ " $* " == *' --paginate --slurp '* &&
+        " $* " == *'/issues/598/comments?per_page=100&sort=created&direction=asc '* ]]; then
+    cat "$TEST_ROOT/epic-comments"
+    return
+  fi
   [[ " $* " == *' --method POST '* && " $* " == *'/issues/598/comments '* ]] || return 97
+  [ "$MOCK_POST_FAIL" -eq 0 ] || return 1
   local args=("$@") input=""
   for ((i = 0; i < ${#args[@]}; i += 1)); do
     if [ "${args[$i]}" = --input ]; then input=${args[$((i + 1))]}; fi
@@ -417,8 +429,21 @@ process.stdout.write(JSON.stringify({id: 4, user: {login: "epic-author"},
   ...JSON.parse(fs.readFileSync(process.argv[2], "utf8"))}));
 NODE
 }
+query_epic_comments 598 "$TEST_ROOT/epic-comments-queried"
+cmp "$TEST_ROOT/epic-comments" "$TEST_ROOT/epic-comments-queried"
 post_epic_comment 598 "$TEST_ROOT/epic-comment" "$TEST_ROOT/epic-comment-response" \
   "$TEST_ROOT/state"
+MOCK_POST_FAIL=1
+if (post_epic_comment 598 "$TEST_ROOT/epic-comment" \
+  "$TEST_ROOT/epic-comment-response-lost" "$TEST_ROOT/state") >/dev/null 2>&1; then
+  echo 'an uncertain epic-comment POST was treated as success' >&2
+  exit 1
+fi
+# The next run rereads the server; an exact duplicate from an accepted POST
+# with a lost response is already proven idempotent by the duplicate fixture.
+parse_epic_comments "$TEST_ROOT/epic-comments-duplicate" \
+  "$TEST_ROOT/epic-comment-records-after-lost-post" epic-author
+cmp "$TEST_ROOT/epic-comment-records" "$TEST_ROOT/epic-comment-records-after-lost-post"
 unset -f gh
 
 assert_shared_dev_base "$TARGET_OID" "$GITHUB_BASE"

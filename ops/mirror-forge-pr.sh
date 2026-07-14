@@ -567,6 +567,12 @@ query_epic_comments() {
     die "could not read epic PR provenance comments: $(tr '\n' ' ' <"$RUN_DIR/gh.err")"
 }
 
+require_epic_author() {
+  local expected=$1 actual=$2
+  [ "$actual" = "$expected" ] ||
+    die "authenticated GitHub user must match epic PR author $expected"
+}
+
 parse_epic_comments() {
   local comments=$1 records=$2 trusted_login=${3:-}
   node - "$comments" "$records" "$trusted_login" <<'NODE'
@@ -798,8 +804,7 @@ main() {
       epic_pr_author=${epic_pr_fields[2]}
       local github_login
       github_login=$(gh api user --jq .login) || die "could not read the authenticated GitHub login"
-      [ "$github_login" = "$epic_pr_author" ] ||
-        die "authenticated GitHub user must match epic PR author $epic_pr_author"
+      require_epic_author "$epic_pr_author" "$github_login"
       query_epic_comments "$epic_pr_number" "$RUN_DIR/epic-comments.json"
     else
       printf '[]\n' >"$RUN_DIR/epic-comments.json"
