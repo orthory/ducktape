@@ -11,6 +11,7 @@ import type { CommitInfo } from "../../../../domain/forge-git-client";
 import { useDucktape } from "../../../store/use-ducktape";
 import { color, font, radius } from "../../../theme/tokens";
 import { MarkdownPreview } from "../MarkdownPreview";
+import { useForgeRemote } from "../remote";
 import {
   ActionButton,
   CenterNote,
@@ -293,6 +294,7 @@ function BackLink({ label, onBack }: { label: string; onBack: () => void }) {
  *  the same rows as the repo's commit history. */
 function PrCommits({ repo, detail }: { repo: string; detail: ForgeItemDetail }) {
   const desktop = isForgeGitAvailable();
+  const remote = useForgeRemote();
   const [commits, setCommits] = useState<CommitInfo[] | null>(null);
   const [selectedCommitId, setSelectedCommitId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -303,7 +305,7 @@ function PrCommits({ repo, detail }: { repo: string; detail: ForgeItemDetail }) 
     if (!desktop || !sourceBranch) return;
     let alive = true;
     setSelectedCommitId(null);
-    forgeCompare(repo, targetBranch, sourceBranch)
+    forgeCompare(repo, targetBranch, sourceBranch, remote)
       .then((result) => {
         if (alive) setCommits(result.commits);
       })
@@ -313,7 +315,7 @@ function PrCommits({ repo, detail }: { repo: string; detail: ForgeItemDetail }) 
     return () => {
       alive = false;
     };
-  }, [desktop, repo, targetBranch, sourceBranch, detail.updated_at]);
+  }, [desktop, repo, targetBranch, sourceBranch, remote, detail.updated_at]);
 
   if (!desktop) {
     return <CenterNote title="Desktop app required" detail="Commit listing reads the local git repository through the desktop bridge." />;

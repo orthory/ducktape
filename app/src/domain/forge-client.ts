@@ -31,6 +31,12 @@ export interface ForgeRefHead {
   head: string;
 }
 
+/** One repo of the namespace: its slug + committed HEAD oid (null = unborn). */
+export interface ForgeRepoHead {
+  name: string;
+  head: string | null;
+}
+
 /** One row of a repo's item list. `author` is the same AuthorRef shape chat
  *  replies carry (derived from the submit origin). */
 export interface ForgeItemSummary {
@@ -290,6 +296,13 @@ export const head = (transport: NodeTransport): Promise<string | null> =>
   Promise.resolve()
     .then(() => transport.query(TARGET, "head"))
     .then((reply) => replyVariant<string | null>(reply, "head"));
+
+/** Every repo of the namespace with its committed head, sorted by name — the
+ *  repo list a client without local forge storage browses from. */
+export const listRepos = (transport: NodeTransport): Promise<ForgeRepoHead[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, "list_repos"))
+    .then((reply) => replyVariant<ForgeRepoHead[]>(reply, "repos"));
 
 /** Every ref of `repo`: short branch names + their head oids. */
 export const listRefs = (

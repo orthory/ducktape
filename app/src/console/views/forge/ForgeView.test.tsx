@@ -9,6 +9,7 @@ import { ForgeView } from "./ForgeView";
 const forgeGit = vi.hoisted(() => ({
   isForgeGitAvailable: vi.fn(() => true),
   forgeListRepos: vi.fn(),
+  forgeSyncRemote: vi.fn(),
   forgeHead: vi.fn(),
   forgeListBranches: vi.fn(),
   forgeLog: vi.fn(),
@@ -130,6 +131,14 @@ describe("ForgeView", () => {
       { name: "dev", head: HEAD },
       { name: "main", head: HEAD },
     ]);
+    forgeGit.forgeSyncRemote.mockResolvedValue({
+      id: "ducktape",
+      name: "ducktape",
+      branch: "dev",
+      defaultBranch: "dev",
+      head: HEAD,
+      browsable: true,
+    });
     forgeGit.forgeCompare.mockResolvedValue({
       mergeBase: HEAD,
       files: [],
@@ -209,6 +218,7 @@ describe("ForgeView", () => {
         COMMIT_PAGE_REQUEST,
         undefined,
         null,
+        null,
       );
     });
 
@@ -225,6 +235,7 @@ describe("ForgeView", () => {
         COMMIT_PAGE_REQUEST,
         undefined,
         oid(49),
+        null,
       );
     });
     expect(await screen.findByText("commit 50")).toBeInTheDocument();
@@ -255,6 +266,7 @@ describe("ForgeView", () => {
       reference: undefined,
       offset: 0,
       limit: FILE_PAGE_BYTES,
+      remote: null,
     });
     expect(screen.queryByText("# Part 2")).not.toBeInTheDocument();
 
@@ -265,6 +277,7 @@ describe("ForgeView", () => {
       reference: undefined,
       offset: 9,
       limit: FILE_PAGE_BYTES,
+      remote: null,
     });
   });
 
@@ -281,7 +294,41 @@ describe("ForgeView", () => {
     expect(forgeGit.forgeDiff).toHaveBeenCalledWith("ducktape", {
       from: "b".repeat(40),
       to: HEAD,
+      remote: null,
     });
+  });
+
+  it("a remote client enumerates via the node query and reads through the synced mirror", async () => {
+    const origin = "http://10.0.0.7:26800";
+    const listForgeRepos = vi
+      .fn()
+      .mockResolvedValue([{ name: "ducktape", head: HEAD }]);
+
+    renderForge({ workspace: null, nodeUrl: origin }, { listForgeRepos });
+
+    // enumeration is the consensus list_repos query — never the local scanner.
+    expect(await screen.findByText("ducktape/ducktape")).toBeInTheDocument();
+    expect(listForgeRepos).toHaveBeenCalled();
+    expect(forgeGit.forgeListRepos).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("ducktape/ducktape"));
+
+    // the mirror syncs BEFORE any read, and every git read carries the origin.
+    await waitFor(() =>
+      expect(forgeGit.forgeSyncRemote).toHaveBeenCalledWith(origin, "ducktape"),
+    );
+    await waitFor(() =>
+      expect(forgeGit.forgeTree).toHaveBeenCalledWith("ducktape", "", undefined, origin),
+    );
+    expect(forgeGit.forgeLog).toHaveBeenCalledWith(
+      "ducktape",
+      COMMIT_PAGE_REQUEST,
+      undefined,
+      null,
+      origin,
+    );
+    // the local branch reader stays untouched — the picker rides consensus refs.
+    expect(forgeGit.forgeListBranches).not.toHaveBeenCalled();
   });
 
   it("consumes a forgeFocus hand-off: selects the repo and opens the item", async () => {

@@ -112,9 +112,11 @@ pub use tracker_iface::*;
 
 mod codec;
 mod git;
-/// the multi-head pack builder, shared with bin/noded's git upload-pack
+/// the multi-head pack builders, shared with bin/noded's git upload-pack
 /// (fetch/clone) lane — packing has ONE implementation on both surfaces.
-pub use git::pack_closure_many;
+/// `pack_closure_many` is the self-contained closure; `pack_delta` bounds it
+/// by the client's common bases (the incremental fetch answer).
+pub use git::{pack_closure_many, pack_delta};
 pub mod refs;
 mod snapshot;
 pub mod tracker;
