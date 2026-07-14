@@ -330,6 +330,10 @@ pub enum AgentStatus {
 pub enum AgentRole {
     #[default]
     General,
+    /// Compatibility-only reservation: revision-2 native Agent snapshots and
+    /// revision-3 Wasm snapshots may already encode discriminant 1. Removing
+    /// or renumbering it would make committed state undecodable; it does not
+    /// select a special execution or knowledge-loading path.
     ProjectLibrarian,
 }
 

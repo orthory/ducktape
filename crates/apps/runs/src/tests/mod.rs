@@ -963,7 +963,6 @@ mod delivery;
 mod engagement;
 mod facets;
 mod job_runs;
-mod librarian;
 mod pages_actions;
 mod registry;
 mod sessions;

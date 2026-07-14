@@ -1,6 +1,6 @@
 use super::{
-    Ctx, Error, LibrarianAvailability, Module, ModuleId, Msg, Origin, RunsModule, RunsQuery,
-    RunsReply, StateRoot, StateSyncHandle, WatchView, committed_root, decode_query, encode_reply,
+    Ctx, Error, Module, ModuleId, Msg, Origin, RunsModule, RunsQuery, RunsReply, StateRoot,
+    StateSyncHandle, WatchView, committed_root, decode_query, encode_reply,
 };
 
 #[async_trait::async_trait(?Send)]
@@ -107,14 +107,6 @@ impl Module for RunsModule {
                     .collect();
                 Ok(encode_reply(&RunsReply::AgentSessions(sessions)))
             }
-            RunsQuery::LibrarianAvailability { .. } => Ok(encode_reply(
-                &RunsReply::LibrarianAvailability(LibrarianAvailability {
-                    feature_active: false,
-                    permitted: false,
-                    remaining_child_budget: 0,
-                }),
-            )),
-            RunsQuery::LibrarianCall { .. } => Ok(encode_reply(&RunsReply::LibrarianCall(None))),
         }
     }
 

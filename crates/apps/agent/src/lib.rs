@@ -1919,12 +1919,12 @@ mod tests {
             forge_push: vec!["code".into()],
             duckfs_read: vec!["/shared/project".into()],
             duckfs_write: vec!["/shared/project/generated".into()],
-            tools: vec!["ducktape_ask_librarian".into()],
+            tools: vec!["git".into()],
             secrets: vec!["vault://parent".into()],
             pages_write: vec!["plan".into()],
             subagent_budget: 2,
         };
-        let librarian = ResourceCaps {
+        let child = ResourceCaps {
             forge_read: vec!["code".into(), "docs".into(), "foreign".into()],
             duckfs_read: vec![
                 "/shared/project/reference".into(),
@@ -1933,14 +1933,14 @@ mod tests {
             ],
             duckfs_write: vec!["/shared/project/reference/drafts".into()],
             tools: vec!["shell".into()],
-            secrets: vec!["vault://librarian".into()],
+            secrets: vec!["vault://child".into()],
             pages_write: vec!["*".into()],
             subagent_budget: 9,
             ..Default::default()
         };
 
         assert_eq!(
-            parent.read_only_intersection(&librarian),
+            parent.read_only_intersection(&child),
             ResourceCaps {
                 forge_read: vec!["code".into(), "docs".into()],
                 duckfs_read: vec![

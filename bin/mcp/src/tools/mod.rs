@@ -19,8 +19,6 @@ use serde_json::{Value, json};
 use crate::identity::Run;
 use crate::node::Result;
 
-#[cfg(test)]
-mod librarian;
 mod control;
 mod read;
 mod write;
@@ -158,7 +156,6 @@ mod tests {
     #[test]
     fn find_resolves_by_name_and_rejects_an_unknown_one() {
         assert!(find("ducktape_whoami").is_some());
-        assert!(find("ducktape_ask_librarian").is_none());
         assert!(find("ducktape_not_a_tool").is_none());
     }
 

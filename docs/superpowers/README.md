@@ -25,9 +25,6 @@ The following files were reviewed and intentionally left pruned:
   `ops/coordinator/`.
 - `specs/2026-07-03-fleet-isolation-finding.md` — solved root-cause note; the
   still-useful operational warning is in `skills/qa/SKILL.md`.
-- `specs/2026-07-04-librarian-comprehension-layer-idea.md` — non-binding idea
-  note, not an accepted or active design record.
-
 Everything else from the previous deletion was restored because it was marked as
 a design of record, approved spec, active/executing plan, planned work, or was
 otherwise not proven obsolete by the review.

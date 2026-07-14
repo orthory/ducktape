@@ -1,7 +1,7 @@
 use super::{
-    AgentStatus, Ctx, DispatchMsg, Error, JobsMsg, LIBRARIAN_REGENESIS_REQUIRED, Msg, Origin,
-    RunsModule, RunsMsg, TaggingMsg, TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg,
-    dispatch_id_for, jobs_encode_msg, reject_run_separator, run_id_for, tagging_encode_msg,
+    AgentStatus, Ctx, DispatchMsg, Error, JobsMsg, Msg, Origin, RunsModule, RunsMsg, TaggingMsg,
+    TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg, dispatch_id_for,
+    jobs_encode_msg, reject_run_separator, run_id_for, tagging_encode_msg,
 };
 
 impl RunsModule {
@@ -181,11 +181,6 @@ impl RunsModule {
                     }),
                 });
                 Ok(())
-            }
-            RunsMsg::BeginLibrarianCall(_) | RunsMsg::CancelLibrarianCall(_) => {
-                // Global re-genesis fence: do not validate identity, consult the
-                // registry/budget/dispatch planes, or touch module state.
-                Err(Error::Module(LIBRARIAN_REGENESIS_REQUIRED.into()))
             }
             // the session lane (see [`super::sessions`]). deliberately NOT under
             // `admin_origin`: these two ops carry their own, STRICTER

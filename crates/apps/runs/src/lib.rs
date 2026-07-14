@@ -111,9 +111,6 @@
 mod interface;
 pub use interface::*;
 
-mod librarian;
-pub use librarian::*;
-
 // dispatch payload composition: the structured run envelope.
 mod envelope;
 
