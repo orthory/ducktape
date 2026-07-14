@@ -195,6 +195,7 @@ impl RunsModule {
                 AgentResponse {
                     reply_blocks: Vec::new(),
                     actions: vec![action.clone()],
+                    delegations: Vec::new(),
                     commit_message: None,
                 },
             )

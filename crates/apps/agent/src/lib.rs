@@ -1066,6 +1066,7 @@ mod tests {
     fn agent_response_commit_message_is_optional_and_round_trips_exactly() {
         let legacy = decode_response(br#"{"reply_blocks":[],"actions":[]}"#).unwrap();
         assert_eq!(legacy.commit_message, None);
+        assert!(legacy.delegations.is_empty());
 
         let message = "fix: exact subject\n\nExact body.";
         let response = AgentResponse {
@@ -1890,9 +1891,109 @@ mod tests {
         assert!(!rec.permits(&CapRequest::Secret("t")));
         assert!(rec.permits(&CapRequest::SpawnSubagent));
 
+        let root = record_with_caps(ResourceCaps {
+            duckfs_read: vec!["/".into()],
+            ..Default::default()
+        });
+        assert!(root.permits(&CapRequest::DuckfsRead("/shared/child")));
+        assert!(!root.permits(&CapRequest::DuckfsRead("relative")));
+
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::SpawnSubagent));
         assert!(!empty.permits(&CapRequest::ForgeRead("r")));
+    }
+
+    #[test]
+    fn delegation_requires_same_runtime_and_parent_authority() {
+        let mut parent = record_with_caps(ResourceCaps {
+            forge_read: vec!["docs".into()],
+            forge_push: vec!["app".into()],
+            duckfs_read: vec!["/shared/read".into()],
+            duckfs_write: vec!["/shared/write".into()],
+            tools: vec!["shell".into()],
+            secrets: vec!["build-token".into()],
+            pages_write: vec!["*".into()],
+            subagent_budget: 2,
+        });
+        parent.allowed_actions = vec![ACTION_CHAT_POST.into(), ACTION_DUCKFS_WRITE_TEXT.into()];
+        let mut child = parent.clone();
+        child.agent_id = "child".into();
+        child.allowed_actions = vec![ACTION_CHAT_POST.into()];
+        child.skills = vec![SkillRef {
+            name: "specialist".into(),
+            source_prefix: "/shared/read/specialist".into(),
+            source_snapshot: None,
+            load: LoadMode::Always,
+        }];
+        child.caps = ResourceCaps {
+            forge_read: vec!["app".into()],
+            duckfs_read: vec!["/shared/write/child".into()],
+            duckfs_write: vec!["/shared/write/child".into()],
+            tools: vec!["shell".into()],
+            secrets: vec!["build-token".into()],
+            pages_write: vec!["one-page".into()],
+            subagent_budget: 0,
+            ..Default::default()
+        };
+        assert!(parent.can_delegate_to(&child));
+
+        let mut root_parent = parent.clone();
+        root_parent.caps.duckfs_read = vec!["/".into()];
+        let mut root_skill_child = child.clone();
+        root_skill_child.skills[0].source_prefix = "/root-readable/specialist".into();
+        assert!(root_parent.can_delegate_to(&root_skill_child));
+
+        let mut escalated = child.clone();
+        escalated.owner = SagaOrigin::External(vec![8; 32]);
+        assert!(!parent.can_delegate_to(&escalated));
+        escalated = child.clone();
+        escalated.capability = "other-model".into();
+        assert!(!parent.can_delegate_to(&escalated));
+        escalated = child.clone();
+        escalated.skills[0].source_prefix = "/unreadable/specialist".into();
+        assert!(!parent.can_delegate_to(&escalated));
+        for caps in [
+            ResourceCaps {
+                forge_read: vec!["outside".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                forge_push: vec!["docs".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                duckfs_read: vec!["/outside".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                duckfs_write: vec!["/shared/read".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                tools: vec!["other".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                secrets: vec!["other".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                subagent_budget: 3,
+                ..child.caps.clone()
+            },
+        ] {
+            escalated = child.clone();
+            escalated.caps = caps;
+            assert!(!parent.can_delegate_to(&escalated));
+        }
+        escalated = child.clone();
+        escalated.allowed_actions.push(ACTION_TASKS_CREATE.into());
+        assert!(!parent.can_delegate_to(&escalated));
+
+        parent.caps.pages_write = vec!["one-page".into()];
+        escalated = child;
+        escalated.caps.pages_write = vec!["other-page".into()];
+        assert!(!parent.can_delegate_to(&escalated));
     }
 
     #[test]

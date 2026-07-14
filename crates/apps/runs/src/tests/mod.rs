@@ -940,6 +940,7 @@ fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
             })
             .collect(),
         actions,
+        delegations: Vec::new(),
         commit_message: None,
     })
 }
@@ -959,6 +960,7 @@ fn job_registry() -> Registry {
 }
 mod admin;
 mod composition;
+mod delegation;
 mod delivery;
 mod engagement;
 mod facets;
