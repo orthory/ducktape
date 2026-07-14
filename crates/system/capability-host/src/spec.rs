@@ -144,6 +144,23 @@ pub struct CapabilitySpec {
     /// absent = the doc rides the stdin prompt instead; a raw provider needs no
     /// convention.
     pub context: Option<ContextLocation>,
+    /// optional `[interactive]` — the argv for an INTERACTIVE (pty-backed) TUI
+    /// session, as opposed to the headless `[invoke]` argv. absent means this
+    /// executor cannot be driven interactively (the historical posture); present
+    /// makes it eligible for [`crate::interactive`]. the broker/config-home
+    /// isolation is shared with the headless path — only the argv differs.
+    pub interactive: Option<InteractiveSpec>,
+}
+
+/// the argv for an interactive, pty-backed TUI session. deliberately its own
+/// section, not a flag on `[invoke]`: the headless argv (`codex exec --json …`)
+/// is the wrong shape for a human-driven TUI, and mixing them invites a spec
+/// that half-declares one. an empty `args` is legal and meaningful — `codex`
+/// with no subcommand launches its TUI; the broker's `-c` overrides are spliced
+/// in host-side (see [`crate::interactive`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveSpec {
+    pub args: Vec<String>,
 }
 
 /// where an executor auto-loads its ambient instructions from — a CLOSED set of
@@ -243,6 +260,9 @@ struct RawSpec {
     /// optional `[context]` — the executor's native ambient-instructions file.
     #[serde(default)]
     context: Option<RawContext>,
+    /// optional `[interactive]` — the pty-backed TUI argv.
+    #[serde(default)]
+    interactive: Option<RawInteractive>,
     /// optional `[tools]` — argv injected into EVERY argv this file produces
     /// (see [`inject_tool_args`]).
     #[serde(default)]
@@ -430,6 +450,15 @@ struct RawTools {
     args: Vec<String>,
 }
 
+/// the on-disk `[interactive]` shape — a dumb serde mirror. `args` defaults to
+/// empty (a bare TUI launch); unknown fields fail loud like the rest.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInteractive {
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 /// splice `[tools].args` into every argv this spec can produce, ONCE, at load
 /// time — so nothing downstream (discovery, invoke, resume) knows tools exist:
 /// a spec in hand already has them.
@@ -599,6 +628,7 @@ impl CapabilitySpec {
                 rw_dirs,
                 isolation,
                 context,
+                interactive: raw.interactive.map(|i| InteractiveSpec { args: i.args }),
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),

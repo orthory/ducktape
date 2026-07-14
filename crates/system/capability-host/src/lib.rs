@@ -110,12 +110,41 @@ const BROKER_TOKEN_ENV: &str = "DUCKTAPE_MODEL_BROKER_TOKEN";
 /// or it would dial the provider directly and walk straight past the broker.
 const UPSTREAM_CREDENTIAL_ENV: [&str; 1] = ["OPENAI_API_KEY"];
 
+/// the `-c` overrides that aim a codex invocation at this run's loopback broker:
+/// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
+/// off), the provider selector, and a workspace trust level. shared by the
+/// headless [`CliProvider::broker_argv`] (spliced after the subcommand) and the
+/// interactive path (prepended — a TUI argv has no subcommand). the child gets a
+/// base URL and an opaque bearer; neither recovers the operator's credential.
+fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) -> Vec<String> {
+    // the workdir is a path, and codex keys `projects.<key>` by TOML string —
+    // so it must be QUOTED as one (a bare path breaks the `-c` parse).
+    let project_key = toml::Value::String(workdir.to_string_lossy().into_owned()).to_string();
+    vec![
+        "-c".into(),
+        format!(
+            "model_providers.ducktape={{ name=\"Ducktape run broker\", base_url=\"{}\", wire_api=\"responses\", env_key=\"{BROKER_TOKEN_ENV}\", request_max_retries=0, stream_max_retries=0 }}",
+            broker.base_url
+        ),
+        "-c".into(),
+        "model_provider=\"ducktape\"".into(),
+        "-c".into(),
+        format!("projects.{project_key}.trust_level=\"untrusted\""),
+    ]
+}
+
 mod broker;
+// interactive (pty) sessions are unix-only: they use libc pty primitives, which
+// are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
+#[cfg(unix)]
+mod interactive;
 mod sandbox;
 mod session;
 mod spec;
 mod variants;
 mod workspace;
+#[cfg(unix)]
+pub use interactive::InteractiveSession;
 pub use sandbox::{SandboxBackend, TART_MIN_CORES, wrap_podman};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
@@ -311,6 +340,21 @@ pub trait Provider: Send + Sync {
         self.run(prompt, ctx)
             .await
             .map(|text| ProviderOutput { text, usage: None })
+    }
+    /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
+    /// [`crate::interactive`]). The default refuses — only a spec with an
+    /// `[interactive]` argv on a Podman backend supports it; everything else
+    /// keeps the historical headless-only surface.
+    #[cfg(unix)]
+    async fn spawn_interactive(
+        &self,
+        ctx: &RunContext,
+    ) -> Result<InteractiveSession, String> {
+        let _ = ctx;
+        Err(format!(
+            "{}: this capability has no interactive session support",
+            self.capability()
+        ))
     }
 }
 
@@ -539,7 +583,7 @@ impl CliProvider {
             SandboxBackend::Direct => (self.direct_command(&args, ctx, auth)?, None),
             SandboxBackend::Podman { image } => {
                 let (command, run) =
-                    self.podman_command(image, &args, workdir, ctx, auth)?;
+                    self.podman_command(image, &args, workdir, ctx, auth, false)?;
                 (command, Some(run))
             }
             // Tart has a multi-process lifecycle (clone/set/boot, then SSH), so
@@ -620,6 +664,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
+        tty: bool,
     ) -> Result<(tokio::process::Command, PodmanRun), String> {
         let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
         let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
@@ -637,6 +682,7 @@ impl CliProvider {
             &ctx.limits,
             &run.cidfile,
             &run.labels,
+            tty,
         );
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(argv)
@@ -957,26 +1003,15 @@ impl CliProvider {
     ///
     /// the child is given a base URL and [`BROKER_TOKEN_ENV`], and neither can
     /// recover the operator's credential: the bearer is 32 random bytes minted
-    /// for this run, and the endpoint dies with it.
+    /// for this run, and the endpoint dies with it. The interactive path
+    /// ([`crate::interactive`]) shares [`broker_provider_overrides`] but PREPENDS
+    /// them (a TUI argv has no `exec` selector to splice after).
     fn broker_argv(&self, args: &[String], workdir: &Path, auth: &RunAuth<'_>) -> Vec<String> {
         let (Some(broker), Some(selector)) = (auth.broker, args.first()) else {
             return args.to_vec();
         };
-        // the workdir is a path, and codex keys `projects.<key>` by TOML string —
-        // so it must be QUOTED as one (a bare path breaks the `-c` parse).
-        let project_key = toml::Value::String(workdir.to_string_lossy().into_owned()).to_string();
-        let mut argv = vec![
-            selector.clone(),
-            "-c".into(),
-            format!(
-                "model_providers.ducktape={{ name=\"Ducktape run broker\", base_url=\"{}\", wire_api=\"responses\", env_key=\"{BROKER_TOKEN_ENV}\", request_max_retries=0, stream_max_retries=0 }}",
-                broker.base_url
-            ),
-            "-c".into(),
-            "model_provider=\"ducktape\"".into(),
-            "-c".into(),
-            format!("projects.{project_key}.trust_level=\"untrusted\""),
-        ];
+        let mut argv = vec![selector.clone()];
+        argv.extend(broker_provider_overrides(broker, workdir));
         argv.extend(args.iter().skip(1).cloned());
         argv
     }
@@ -3339,6 +3374,14 @@ impl Provider for CliProvider {
         ctx: &RunContext,
     ) -> Result<ProviderOutput, String> {
         self.run_output(prompt, ctx).await
+    }
+
+    #[cfg(unix)]
+    async fn spawn_interactive(
+        &self,
+        ctx: &RunContext,
+    ) -> Result<InteractiveSession, String> {
+        self.spawn_interactive_session(ctx).await
     }
 }
 

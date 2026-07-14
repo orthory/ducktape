@@ -1,0 +1,354 @@
+//! interactive, pty-backed CLI sessions — the same executor a headless run
+//! spawns, but attached to a pseudo-terminal so a human can drive its native
+//! TUI (codex, claude) keystroke-by-keystroke instead of feeding it one prompt
+//! on stdin.
+//!
+//! This shares the headless path's whole isolation seam — the broker holds the
+//! credential and the child gets only an opaque bearer + loopback base URL, the
+//! fresh config home stops any dotfile fallback, and the Podman backend fences
+//! the filesystem — and differs in exactly two places: the argv is the spec's
+//! `[interactive]` TUI argv (not `[invoke]`'s headless one), and the child's
+//! stdio is a pty the host holds the master of, not pipes.
+//!
+//! **Podman only.** The `Direct` backend has no mount namespace and no fresh
+//! HOME, so an interactive session on it would expose the operator's whole home
+//! to whoever is typing — the exact thing the sandbox exists to prevent. So
+//! [`CliProvider::spawn_interactive_session`] refuses anything but Podman; the
+//! pty primitive underneath ([`InteractiveSession::spawn_on_pty`]) is backend
+//! agnostic only so its behavior can be unit-tested against a plain local child.
+//!
+//! There is deliberately NO idle-timeout kill here (a terminal is idle by
+//! nature): a session ends on explicit [`InteractiveSession::close`], on the
+//! child exiting (the master read returns EIO → EOF), or when dropped. Spend is
+//! bounded by the broker's own request/byte caps, not by output silence.
+
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use tokio::io::unix::AsyncFd;
+use tokio::sync::Mutex;
+
+use crate::broker::RunBroker;
+use crate::sandbox::SandboxBackend;
+use crate::{
+    CliProvider, LiveChild, PodmanRun, RunAuth, RunContext, broker_provider_overrides,
+    canonical_mount_path, configure_process_group,
+};
+
+/// a live interactive session: the child process on one end of a pty, the host
+/// holding the master. Every method takes `&self` (the read and write halves are
+/// separate dups of the master), so the owner can wrap it in an `Arc` and pump
+/// bytes in one task while feeding input from another without splitting it.
+pub struct InteractiveSession {
+    /// the master's read half (a dup of the pty master, non-blocking).
+    reader: AsyncFd<OwnedFd>,
+    /// the master's write half (a second dup of the same master).
+    writer: AsyncFd<OwnedFd>,
+    /// the child + its Podman lifecycle, behind a lock so `close` can tear it
+    /// down through `&self`. `kill_on_drop` is the final safety net.
+    live: Mutex<LiveChild>,
+    /// held for the session's lifetime: dropping the broker tears its loopback
+    /// endpoint down, and the config home must outlive the child that reads it.
+    _broker: Option<RunBroker>,
+    _config_home: Option<PathBuf>,
+}
+
+impl InteractiveSession {
+    /// spawn `command` with its stdio wired to a fresh pty and keep the master.
+    /// `podman`/`broker`/`config_home` are the session's owned lifecycle handles.
+    /// Backend-agnostic on purpose — [`CliProvider::spawn_interactive_session`]
+    /// hands it a `podman run -it …` command; a test hands it a plain `cat`.
+    fn spawn_on_pty(
+        mut command: tokio::process::Command,
+        podman: Option<PodmanRun>,
+        broker: Option<RunBroker>,
+        config_home: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let (master, slave) = open_pty()?;
+        set_nonblocking(&master)?;
+        let writer_fd = master
+            .try_clone()
+            .map_err(|e| format!("dup pty master: {e}"))?;
+        let stdin = slave.try_clone().map_err(|e| format!("dup pty slave: {e}"))?;
+        let stdout = slave.try_clone().map_err(|e| format!("dup pty slave: {e}"))?;
+        command
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(slave))
+            .kill_on_drop(true);
+        configure_process_group(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|e| format!("spawn interactive session: {e}"))?;
+        let live = LiveChild::new(child, podman);
+        let reader = AsyncFd::new(master).map_err(|e| format!("register pty master: {e}"))?;
+        let writer = AsyncFd::new(writer_fd).map_err(|e| format!("register pty master: {e}"))?;
+        Ok(Self {
+            reader,
+            writer,
+            live: Mutex::new(live),
+            _broker: broker,
+            _config_home: config_home,
+        })
+    }
+
+    /// read the next chunk of terminal output. `Ok(0)` means end of session: on
+    /// Linux the master read returns EIO once the last slave (the child) is
+    /// gone, which we map to EOF.
+    pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let mut guard = self.reader.readable().await?;
+            let res = guard.try_io(|inner| {
+                let fd = inner.get_ref().as_raw_fd();
+                // SAFETY: fd is our live master pty; buf is valid for `buf.len()`.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    // the master EIOs when every slave has closed → treat as EOF.
+                    if e.raw_os_error() == Some(libc::EIO) {
+                        return Ok(0);
+                    }
+                    Err(e)
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match res {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// write input (keystrokes) to the terminal, in full.
+    pub async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+        while !data.is_empty() {
+            let mut guard = self.writer.writable().await?;
+            let res = guard.try_io(|inner| {
+                let fd = inner.get_ref().as_raw_fd();
+                // SAFETY: fd is our live master pty; data is valid for `data.len()`.
+                let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match res {
+                Ok(Ok(n)) => data = &data[n..],
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+        Ok(())
+    }
+
+    /// resize the terminal. Setting the master's window size makes the kernel
+    /// SIGWINCH the slave's foreground group; under Podman that is the container
+    /// process, which relays the new size to the CLI's own tty.
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let fd = self.reader.get_ref().as_raw_fd();
+        // SAFETY: fd is our live master pty; &ws is a valid winsize for the ioctl.
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+        if rc != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// end the session: terminate the child's process group and clean up the
+    /// Podman container. Idempotent-ish — safe to call once on session teardown.
+    pub async fn close(&self) {
+        self.live.lock().await.terminate().await;
+    }
+
+    #[cfg(test)]
+    fn window_size(&self) -> (u16, u16) {
+        // SAFETY: zeroed winsize is valid; ioctl fills it from the master pty.
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let fd = self.reader.get_ref().as_raw_fd();
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        assert_eq!(rc, 0, "TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+        (ws.ws_col, ws.ws_row)
+    }
+}
+
+impl CliProvider {
+    /// spawn this capability's interactive TUI on a pty. Refuses any backend but
+    /// Podman, and any spec without an `[interactive]` argv. The isolation is the
+    /// headless path's: a broker holding the credential, a fresh config home, the
+    /// container fence — only the argv and the stdio (pty, not pipes) differ.
+    pub(crate) async fn spawn_interactive_session(
+        &self,
+        ctx: &RunContext,
+    ) -> Result<InteractiveSession, String> {
+        let SandboxBackend::Podman { image } = &self.backend else {
+            return Err(format!(
+                "{}: interactive sessions require the Podman backend (this node runs {:?})",
+                self.spec.tag, self.backend
+            ));
+        };
+        let image = image.clone();
+        let Some(interactive) = self.spec.interactive.clone() else {
+            return Err(format!(
+                "{}: this capability declares no [interactive] argv",
+                self.spec.tag
+            ));
+        };
+        let workdir = self.ensure_writable_workdir(ctx)?;
+        let workdir = canonical_mount_path(&workdir, "sandbox workdir")?;
+        let config_home = self.prepare_config_home(&workdir, ctx)?;
+        let broker = self.start_broker().await?;
+        let auth = RunAuth {
+            config_home: config_home.as_deref(),
+            broker: broker.as_ref().map(|b| &b.endpoint),
+        };
+        let args = interactive_argv(&interactive.args, &auth, &workdir);
+        let (mut command, run) = self.podman_command(&image, &args, &workdir, ctx, &auth, true)?;
+        run.prepare_cidfile()?;
+        command.current_dir(&workdir);
+        InteractiveSession::spawn_on_pty(command, Some(run), broker, config_home)
+    }
+}
+
+/// the interactive TUI argv: the spec's `[interactive]` args with the broker's
+/// `-c` overrides PREPENDED (a TUI argv has no `exec` subcommand to splice them
+/// after, and codex reads `-c` as global config). No broker → the base argv,
+/// verbatim.
+fn interactive_argv(base: &[String], auth: &RunAuth<'_>, workdir: &Path) -> Vec<String> {
+    let Some(broker) = auth.broker else {
+        return base.to_vec();
+    };
+    let mut argv = broker_provider_overrides(broker, workdir);
+    argv.extend(base.iter().cloned());
+    argv
+}
+
+/// allocate a pseudo-terminal via the POSIX path (`posix_openpt` + `grantpt` +
+/// `unlockpt` + `ptsname_r` + `open`), so this needs no `libutil` link the way
+/// `openpty` would. Returns `(master, slave)`.
+fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
+    // SAFETY: posix_openpt allocates a master pty; O_NOCTTY keeps it from
+    // becoming this process's controlling terminal.
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master < 0 {
+        return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `master` is a fresh fd we now own.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let mfd = master.as_raw_fd();
+    // SAFETY: mfd is a live master pty for the two setup ioctls.
+    if unsafe { libc::grantpt(mfd) } != 0 {
+        return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::unlockpt(mfd) } != 0 {
+        return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
+    }
+    let mut name = [0 as libc::c_char; 256];
+    // SAFETY: `name` is a 256-byte buffer; ptsname_r writes the NUL-terminated
+    // slave path into it.
+    if unsafe { libc::ptsname_r(mfd, name.as_mut_ptr(), name.len()) } != 0 {
+        return Err(format!("ptsname_r: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `name` is NUL-terminated by ptsname_r.
+    let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave < 0 {
+        return Err(format!("open pty slave: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `slave` is a fresh fd we now own.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    Ok((master, slave))
+}
+
+/// mark `fd` non-blocking (`O_NONBLOCK` on the open file description, which its
+/// dups share) so [`AsyncFd`] can drive it.
+fn set_nonblocking(fd: &OwnedFd) -> Result<(), String> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: raw is a live fd we own.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!("fcntl F_GETFL: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: raw is a live fd we own; setting O_NONBLOCK on its status flags.
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!("fcntl F_SETFL: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the pty primitive pumps bytes both ways: write to the master, the child
+    /// (`cat`) echoes it back, we read it. Proves openpty + AsyncFd read/write
+    /// without needing podman or a logged-in CLI. (`cat` on a pty also sees the
+    /// line-discipline echo, so the payload is guaranteed to come back.)
+    #[tokio::test]
+    async fn pty_round_trips_bytes_through_a_child() {
+        let session =
+            InteractiveSession::spawn_on_pty(tokio::process::Command::new("cat"), None, None, None)
+                .expect("spawn cat on a pty");
+        session.write_all(b"ping\n").await.expect("write to pty");
+
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        // read until the payload appears or the child is gone.
+        for _ in 0..20 {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), session.read(&mut buf))
+                .await
+                .expect("read did not hang")
+                .expect("read from pty");
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"ping") {
+                break;
+            }
+        }
+        session.close().await;
+        assert!(
+            seen.windows(4).any(|w| w == b"ping"),
+            "expected the pty to echo 'ping', got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    /// resize sets the master's window size; the kernel reflects it back through
+    /// TIOCGWINSZ. Pure ioctl round-trip — no podman.
+    #[tokio::test]
+    async fn resize_sets_the_window_size() {
+        let session = InteractiveSession::spawn_on_pty(
+            tokio::process::Command::new("cat"),
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat on a pty");
+        session.resize(120, 40).expect("resize");
+        assert_eq!(session.window_size(), (120, 40));
+        session.close().await;
+    }
+
+    /// the broker overrides are PREPENDED for the interactive (TUI) argv, since
+    /// there is no `exec` selector to splice them after.
+    #[test]
+    fn interactive_argv_prepends_broker_overrides_and_passes_base_through() {
+        // no broker → base argv verbatim.
+        let bare = interactive_argv(
+            &["--foo".to_string()],
+            &RunAuth::default(),
+            Path::new("/w"),
+        );
+        assert_eq!(bare, vec!["--foo".to_string()]);
+    }
+}

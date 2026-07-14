@@ -128,6 +128,9 @@ pub(crate) fn expand(
             // WHERE the CLI auto-loads its ambient instructions is a property of
             // the CLI, like its auth — not of the model or effort a variant pins.
             context: base.context.clone(),
+            // interactive TUI eligibility is a property of the CLI, not the
+            // model pin, so variants inherit the parent's argv whole.
+            interactive: base.interactive.clone(),
         });
     }
     Ok(specs)

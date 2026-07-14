@@ -64,7 +64,7 @@ pub fn wrap_podman(
     limits: &BTreeMap<String, u64>,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
-        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None,
+        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false,
     )
 }
 
@@ -83,6 +83,7 @@ pub(crate) fn wrap_podman_managed(
     limits: &BTreeMap<String, u64>,
     cidfile: &Path,
     labels: &[String],
+    tty: bool,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
         image,
@@ -94,6 +95,7 @@ pub(crate) fn wrap_podman_managed(
         rw_dirs,
         limits,
         Some((cidfile, labels)),
+        tty,
     )
 }
 
@@ -108,14 +110,20 @@ fn wrap_podman_inner(
     rw_dirs: &[PathBuf],
     limits: &BTreeMap<String, u64>,
     control: Option<(&Path, &[String])>,
+    tty: bool,
 ) -> (PathBuf, Vec<String>) {
-    // -i keeps stdin open: the prompt is fed on the child's stdin.
+    // -i keeps stdin open: the prompt is fed on the child's stdin. -t adds a
+    // container-side pty for an interactive session — the host attaches podman's
+    // stdio to a pty master and podman relays terminal size/SIGWINCH into it.
     let mut argv: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
         "--network=host".into(),
         "-i".into(),
     ];
+    if tty {
+        argv.push("-t".into());
+    }
     if let Some((cidfile, labels)) = control {
         argv.extend(["--cidfile".into(), cidfile.display().to_string()]);
         for label in labels {
@@ -547,6 +555,7 @@ mod tests {
             &BTreeMap::new(),
             cidfile,
             &labels,
+            false,
         );
         let s = argv.join(" ");
         assert!(
@@ -564,6 +573,43 @@ mod tests {
                 && !s.contains("-e /host/ducktape")
                 && !s.contains("/host/ducktape/provider-runs/7.cid:"),
             "cidfile must never be mounted or exported: {s}"
+        );
+    }
+
+    #[test]
+    fn tty_flag_is_added_only_for_interactive_sessions() {
+        let cidfile = Path::new("/host/x.cid");
+        let labels: Vec<String> = vec![];
+        let build = |tty: bool| {
+            wrap_podman_managed(
+                "img",
+                Path::new("/bin/x"),
+                &[],
+                Path::new("/work"),
+                &[],
+                &[],
+                &[],
+                &BTreeMap::new(),
+                cidfile,
+                &labels,
+                tty,
+            )
+            .1
+            .join(" ")
+        };
+        let headless = build(false);
+        let interactive = build(true);
+        assert!(
+            headless.split(' ').any(|a| a == "-i"),
+            "headless keeps -i: {headless}"
+        );
+        assert!(
+            !headless.split(' ').any(|a| a == "-t"),
+            "headless has no -t: {headless}"
+        );
+        assert!(
+            interactive.split(' ').any(|a| a == "-t"),
+            "interactive adds -t: {interactive}"
         );
     }
 
