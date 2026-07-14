@@ -27,6 +27,11 @@ cef = ["dep:cef"]
 dev-cef = ["dep:cef"]
 
 [dependencies]
+# the shell's own sink (src/log.rs): its prints went to /dev/null in every
+# configuration a real user runs (no console on windows release, /dev/null from
+# macOS Launch Services), so a launch panic left ZERO bytes on disk.
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
 # The shell runs on the standalone tauri-runtime-cef crate (bundled Chromium)

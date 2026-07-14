@@ -135,8 +135,14 @@ pub fn attach(app: &crate::rt::AppHandle) {
 
 /// One line per ENFORCED decision — what Chromium was actually told, emitted by
 /// the runtime after the callback is answered, so it records what happened
-/// rather than what the policy intended. Goes to the shell's stderr, which the
-/// desktop launcher tees into the workspace log.
+/// rather than what the policy intended.
+///
+/// This is a SECURITY AUDIT record: which (possibly untrusted) `duck://` publisher
+/// was granted your microphone, camera or screen. It used to claim in this very
+/// comment that "the desktop launcher tees it into the workspace log" — nothing
+/// teed it. It was an `eprintln!` to a stderr that does not exist in a bundled app,
+/// so the one record deliberately designed to be auditable was destroyed at the
+/// instant it was written. It now lands in `~/.ducktape/shell.log`.
 fn audit(event: &PermissionAudit) {
     let permissions = event
         .kinds
@@ -154,9 +160,14 @@ fn audit(event: &PermissionAudit) {
         _ if event.granted => "granted".to_string(),
         _ => "denied".to_string(),
     };
-    eprintln!(
-        "permission {outcome}: request={} webview={:?} origin={origin} permissions=[{permissions}]",
-        event.request_id, event.webview_label,
+    tracing::info!(
+        target: "ducktape::shell",
+        outcome = %outcome,
+        request = event.request_id,
+        webview = ?event.webview_label,
+        origin = %origin,
+        permissions = %permissions,
+        "permission decision"
     );
 }
 
