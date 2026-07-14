@@ -1042,15 +1042,19 @@ export function createActions({
   // one bad anchor rejects every op behind it and the raw per-op reasons are
   // noise. It never swallows the failure: the ledger still records it and the
   // promise still resolves false.
+  const pendingSubmits = new Set<string>();
   const submitTracked = (
     key: string,
     submit: (live: NodeTransport) => Promise<unknown>,
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
     quiet = false,
   ) => {
-    if (getState().ops[key]?.phase === "pending") return Promise.resolve(false);
     const live = getNode();
     if (!live) return Promise.resolve(false);
+    if (pendingSubmits.has(key) || getState().ops[key]?.phase === "pending") {
+      return Promise.resolve(false);
+    }
+    pendingSubmits.add(key);
     const startedAt = Date.now();
     update((prev) => ({
       ...(preconfirm ? preconfirm(prev) : {}),
@@ -1078,7 +1082,8 @@ export function createActions({
         // compensating split/merge depends on this, and it stops
         // `createChildPage` from opening a page that was never created).
         return refresh().then(() => false);
-      });
+      })
+      .finally(() => pendingSubmits.delete(key));
   };
 
   // The transport gives NO ordering guarantee. `/v1/submit` is one independent

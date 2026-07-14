@@ -2040,9 +2040,6 @@ describe("submitTracked lifecycle", () => {
     let duplicate!: Promise<boolean>;
     act(() => {
       void capturedActions!.registerAgent(params);
-    });
-    expect(capturedState!.ops["agent/collision-agent"].phase).toBe("pending");
-    act(() => {
       duplicate = capturedActions!.registerAgent(params);
     });
 
