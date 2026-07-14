@@ -124,6 +124,7 @@ chacha20poly1305 = { workspace = true }
 zeroize = { workspace = true }
 # stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
 # Raise the node's inherited open-file soft limit before opening module stores.
 libc = "0.2"
 

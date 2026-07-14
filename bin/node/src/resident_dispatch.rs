@@ -582,6 +582,7 @@ format = "text"
                 .to_string()
                 .into_bytes(),
                 demands: Default::default(),
+                admission: Default::default(),
             }),
             deadline: None,
             assignee: Some(ME.to_vec()),

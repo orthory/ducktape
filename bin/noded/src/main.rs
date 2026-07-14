@@ -310,6 +310,7 @@ fn run_node(
         // one `context.encode()` then serves them alongside commonware's own
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
+        metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
 
         // OFF-LOOP execution: the pool gates effects inline but runs the
         // provider CLI on spawned tasks; a completed run re-enters as a
@@ -423,6 +424,13 @@ fn run_node(
                     let _ = reply.send(result);
                 }
                 NodeCommand::Status { reply } => {
+                    metrics.update_storage(
+                        0,
+                        index.is_poisoned(),
+                        MODULE_IDS.iter().map(|id| {
+                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                        }),
+                    );
                     let modules = MODULE_IDS
                         .iter()
                         .map(|id| ModuleStatus {
@@ -442,9 +450,17 @@ fn run_node(
                         // the embedded daemon has no mesh identity — clients
                         // treat an empty key as "no peer-routed features here".
                         public_key: String::new(),
+                        operations: metrics.operational_status(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {
+                    metrics.update_storage(
+                        0,
+                        index.is_poisoned(),
+                        MODULE_IDS.iter().map(|id| {
+                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                        }),
+                    );
                     // the context owns the registry; encode it to OpenMetrics text.
                     let _ = reply.send(context.encode());
                 }
@@ -589,7 +605,7 @@ async fn submit_one(
     let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
-    metrics.record_ops(1); // this lane is one member op per block
+    metrics.record_op_outcomes(1, 0); // this lane is one applied member op per block
 
     // fold the block into the derived per-module index LAST: canonical state
     // is already committed, so an index failure degrades the read models and

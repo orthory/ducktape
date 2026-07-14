@@ -230,6 +230,12 @@ impl<S> P2pSyncClient<S>
 where
     S: Sender,
 {
+    /// The candidate selected for the next request. Operational surfaces use
+    /// this after a successful request so source rotation stays visible.
+    pub fn current_source(&self) -> S::PublicKey {
+        self.sources.current().1
+    }
+
     /// advance the serving cursor one candidate. the transport rotates on
     /// FAILURE by itself ([`Sources::advance_past`], wave-deduped); this is
     /// for callers whose retry policy also rotates on an HONEST answer — a

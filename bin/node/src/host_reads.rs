@@ -169,6 +169,35 @@ pub(crate) async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade::Upgr
     Some(status)
 }
 
+/// Stable node-owned projection of the upgrade module's committed status.
+pub(crate) fn upgrade_operations(
+    status: &upgrade::UpgradeStatus,
+    local_validator: Option<&ed25519::PublicKey>,
+) -> noded::UpgradeOperationalStatus {
+    let locally_ready = status.pending.as_ref().and_then(|_| {
+        local_validator
+            .filter(|key| status.members.iter().any(|member| member == key.as_ref()))
+            .map(|key| status.ready.iter().any(|ready| ready == key.as_ref()))
+    });
+    noded::UpgradeOperationalStatus {
+        current_version: status.current_version as u64,
+        max_supported_version: crate::constants::MAX_PROTOCOL_VERSION as u64,
+        pending_name: status.pending.as_ref().map(|pending| pending.name.clone()),
+        pending_version: status
+            .pending
+            .as_ref()
+            .map(|pending| pending.to_version as u64),
+        activation_height: status
+            .pending
+            .as_ref()
+            .map(|pending| pending.activation_height),
+        ready_validators: status.ready_count,
+        required_validators: status.member_count,
+        locally_ready,
+        armed: status.armed,
+    }
+}
+
 /// read the governance module's committed invite redemptions — the
 /// exactly-once nonce set (committed+staged projection, between drains). an
 /// unreadable reply degrades to empty: the lobby then simply cannot pre-empt
@@ -222,4 +251,39 @@ pub(crate) fn resume_resident_keys(
         );
     }
     Ok(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::Signer as _;
+
+    #[test]
+    fn upgrade_projection_identifies_this_validators_readiness() {
+        let ready = ed25519::PrivateKey::from_seed(1).public_key();
+        let waiting = ed25519::PrivateKey::from_seed(2).public_key();
+        let status = upgrade::UpgradeStatus {
+            current_version: 1,
+            pending: Some(upgrade::ScheduledUpgrade {
+                name: "v2".into(),
+                activation_height: 50,
+                to_version: 2,
+            }),
+            members: vec![ready.as_ref().to_vec(), waiting.as_ref().to_vec()],
+            ready: vec![ready.as_ref().to_vec()],
+            member_count: 2,
+            ready_count: 1,
+            armed: false,
+        };
+
+        assert_eq!(
+            upgrade_operations(&status, Some(&ready)).locally_ready,
+            Some(true)
+        );
+        assert_eq!(
+            upgrade_operations(&status, Some(&waiting)).locally_ready,
+            Some(false)
+        );
+        assert_eq!(upgrade_operations(&status, None).locally_ready, None);
+    }
 }
