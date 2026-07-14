@@ -239,6 +239,7 @@ export function AgentView() {
                   agent={selectedAgent}
                   capabilities={state.capabilities}
                   capabilitiesStatus={state.capabilitiesStatus}
+                  op={state.ops[opKey.agent(selectedAgent.agent_id)]}
                   onPause={actions.pauseAgent}
                   onResume={actions.resumeAgent}
                   onUpdate={actions.updateAgent}

@@ -99,20 +99,24 @@ const renderAgents = (
     ],
     ...patch,
   };
-  const spies: Record<string, (...args: unknown[]) => void> = {};
-  const noop = vi.fn() as (...args: unknown[]) => void;
+  const spies: Record<string, ReturnType<typeof vi.fn>> = {};
   let updateCapabilities: (capabilities: string[]) => void;
+  let updateOps: (ops: ConsoleState["ops"]) => void;
 
   function Harness() {
     const [state, setState] = useState(initialState);
     updateCapabilities = (capabilities) =>
       setState((prev) => ({ ...prev, capabilitiesStatus: "ready", capabilities }));
+    updateOps = (ops) => setState((prev) => ({ ...prev, ops }));
     const actions = new Proxy(
       {},
       {
         get: (_target, key: string) => {
-          spies[key] ??= vi.fn() as (...args: unknown[]) => void;
-          return spies[key] ?? noop;
+          spies[key] ??=
+            key === "registerAgent" || key === "updateAgent"
+              ? vi.fn().mockResolvedValue(true)
+              : vi.fn();
+          return spies[key];
         },
       },
     ) as ConsoleActions;
@@ -128,7 +132,16 @@ const renderAgents = (
   return {
     spies,
     setCapabilities: (capabilities: string[]) => act(() => updateCapabilities(capabilities)),
+    setOps: (ops: ConsoleState["ops"]) => act(() => updateOps(ops)),
   };
+};
+
+const deferredResult = () => {
+  let resolve!: (result: boolean) => void;
+  const promise = new Promise<boolean>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 };
 
 const openTab = (name: RegExp) => fireEvent.click(screen.getByRole("tab", { name }));
@@ -181,6 +194,57 @@ describe("AgentView", () => {
     // Ask-to-respond moved onto the message in chat — the management page
     // no longer hosts the form.
     expect(screen.queryByText(/ask to respond/i)).toBeNull();
+  });
+
+  it("disables pause or resume while the agent write is pending", () => {
+    const { spies } = renderAgents({
+      ops: {
+        [opKey.agent("summarizer")]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+    });
+
+    const pause = screen.getByRole("button", { name: /pause agent/i });
+    const edit = screen.getByRole("button", { name: /^edit$/i });
+    expect(pause).toBeDisabled();
+    expect(edit).toBeDisabled();
+    fireEvent.click(pause);
+    fireEvent.click(edit);
+    expect(spies.pauseAgent).not.toHaveBeenCalled();
+    expect(screen.queryByRole("form", { name: /edit agent/i })).not.toBeInTheDocument();
+  });
+
+  it("blocks an open edit form when another agent write becomes pending", () => {
+    const { spies, setOps } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    const form = screen.getByRole("form", { name: /edit agent/i });
+    fireEvent.change(within(form).getByLabelText(/edit display name/i), {
+      target: { value: "Draft survives" },
+    });
+
+    setOps({
+      [opKey.agent("summarizer")]: {
+        seq: 1,
+        phase: "pending",
+        startedAt: 10,
+      },
+    });
+
+    expect(screen.getByRole("button", { name: /close edit/i })).toBeDisabled();
+    const save = within(form).getByRole("button", { name: /save changes/i });
+    const cancel = within(form).getByRole("button", { name: /^cancel$/i });
+    expect(save).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(form).toHaveAttribute("aria-busy", "true");
+    expect(within(form).getByLabelText(/edit display name/i)).toHaveValue("Draft survives");
+    fireEvent.click(save);
+    fireEvent.click(cancel);
+    expect(spies.updateAgent).not.toHaveBeenCalled();
+    expect(screen.getByRole("form", { name: /edit agent/i })).toBeInTheDocument();
   });
 
   it("renders roster, detail, and the three tabs after the split", () => {
@@ -348,6 +412,53 @@ describe("AgentView", () => {
     });
   });
 
+  it("keeps the registration draft through pending and failure, then closes on success", async () => {
+    const { spies } = renderAgents();
+    const pending = deferredResult();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    let attempts = 0;
+    spies.registerAgent.mockImplementation(() =>
+      (attempts += 1) === 1 ? pending.promise : Promise.resolve(false),
+    );
+    const name = screen.getByLabelText("Agent display name");
+    fireEvent.change(name, { target: { value: "Triage Agent" } });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+    const submit = screen.getByRole("button", { name: /register agent/i });
+    const cancel = screen.getByRole("button", { name: /^cancel$/i });
+    const form = screen.getByRole("region", { name: /register agent/i }).querySelector("form")!;
+
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+    expect(spies.registerAgent).toHaveBeenCalledTimes(1);
+    expect(submit).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(form).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "Registering…" })).toBeDisabled();
+    fireEvent.click(cancel);
+    expect(screen.getByRole("region", { name: /register agent/i })).toBeInTheDocument();
+    expect(name).toHaveValue("Triage Agent");
+
+    await act(async () => {
+      pending.resolve(false);
+      await pending.promise;
+    });
+    expect(submit).toBeEnabled();
+    expect(cancel).toBeEnabled();
+    expect(form).toHaveAttribute("aria-busy", "false");
+    expect(name).toHaveValue("Triage Agent");
+
+    spies.registerAgent.mockResolvedValue(true);
+    await act(async () => {
+      fireEvent.click(submit);
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("region", { name: /register agent/i })).not.toBeInTheDocument();
+  });
+
   it("grants the skill library by default, and lets the operator withhold it", () => {
     const { spies } = renderAgents();
 
@@ -393,6 +504,52 @@ describe("AgentView", () => {
         caps: { pages_write: [], duckfs_read: ["/shared/skills"] },
       }),
     );
+  });
+
+  it("keeps the edit draft through pending and failure, then closes on success", async () => {
+    const { spies } = renderAgents();
+    const pending = deferredResult();
+    let attempts = 0;
+    spies.updateAgent.mockImplementation(() =>
+      (attempts += 1) === 1 ? pending.promise : Promise.resolve(false),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    const name = screen.getByLabelText("Edit display name");
+    fireEvent.change(name, { target: { value: "Revised Agent" } });
+    const submit = screen.getByRole("button", { name: /save changes/i });
+    const form = screen.getByRole("form", { name: /edit agent/i });
+    const cancel = within(form).getByRole("button", { name: /^cancel$/i });
+
+    await act(async () => {
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+    expect(spies.updateAgent).toHaveBeenCalledTimes(1);
+    expect(submit).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(form).toHaveAttribute("aria-busy", "true");
+    expect(within(form).getByRole("button", { name: "Saving…" })).toBeDisabled();
+    fireEvent.click(cancel);
+    expect(screen.getByRole("form", { name: /edit agent/i })).toBeInTheDocument();
+    expect(name).toHaveValue("Revised Agent");
+
+    await act(async () => {
+      pending.resolve(false);
+      await pending.promise;
+    });
+    expect(submit).toBeEnabled();
+    expect(cancel).toBeEnabled();
+    expect(form).toHaveAttribute("aria-busy", "false");
+    expect(name).toHaveValue("Revised Agent");
+
+    spies.updateAgent.mockResolvedValue(true);
+    await act(async () => {
+      fireEvent.click(submit);
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("form", { name: /edit agent/i })).not.toBeInTheDocument();
   });
 
   it("curates skills: the persona is always-loaded, the rest on demand", () => {
@@ -622,6 +779,32 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
+  it("blocks both auto-reply controls while their channel key is pending", () => {
+    const { spies } = renderAgents({
+      ops: {
+        [opKey.watch("general")]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      },
+    });
+
+    openTab(/auto-reply/i);
+    const turnOff = screen.getByRole("button", { name: /stop watching general/i });
+    expect(turnOff).toBeDisabled();
+    fireEvent.click(turnOff);
+    expect(spies.unwatchChannel).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Channel to watch"), {
+      target: { value: "general" },
+    });
+    const add = screen.getByRole("button", { name: /add auto-reply/i });
+    expect(add).toBeDisabled();
+    fireEvent.click(add);
+    expect(spies.watchChannel).not.toHaveBeenCalled();
+  });
+
   it("reassigns or cancels an in-progress run and offers honest worker actions", () => {
     const { spies } = renderAgents({
       runLease: new Map([
@@ -696,6 +879,57 @@ describe("AgentView", () => {
     expect(screen.getByRole("button", { name: /disable worker/i })).toBeDisabled();
     expect(screen.getByText(/waiting for confirmation/i)).toBeInTheDocument();
   });
+
+  it.each([
+    ["force reassign", "reassignRun", "cancelRun"],
+    ["cancel", "cancelRun", "reassignRun"],
+  ] as const)(
+    "disables both run actions when %s starts for their shared key",
+    (firstAction, firstSpy, blockedSpy) => {
+      const { spies, setOps } = renderAgents({
+        runLease: new Map([
+          [
+            "general/42/summarizer",
+            {
+              assigneeHex: "cd".repeat(32),
+              attempt: 0,
+              maxAttempts: 2,
+              expiresAt: 80,
+              deadline: 100,
+              updatedAt: 40,
+              reassignable: true,
+            },
+          ],
+        ]),
+      });
+
+      openTab(/activity/i);
+      const reassign = screen.getByRole("button", {
+        name: /force reassign run summary agent.*general @42/i,
+      });
+      const cancel = screen.getByRole("button", {
+        name: /cancel run summary agent.*general @42/i,
+      });
+
+      fireEvent.click(firstAction === "force reassign" ? reassign : cancel);
+      expect(spies[firstSpy]).toHaveBeenCalledTimes(1);
+
+      setOps({
+        [opKey.run("general/42/summarizer")]: {
+          seq: 1,
+          phase: "pending",
+          startedAt: 10,
+        },
+      });
+
+      expect(reassign).toBeDisabled();
+      expect(cancel).toBeDisabled();
+      fireEvent.click(reassign);
+      fireEvent.click(cancel);
+      expect(spies[firstSpy]).toHaveBeenCalledTimes(1);
+      expect(spies[blockedSpy]).not.toHaveBeenCalled();
+    },
+  );
 
   it("offers announced executors as a Runs on picker, defaulting to the first", () => {
     renderAgents({ capabilities: ["claude", "codex"] });

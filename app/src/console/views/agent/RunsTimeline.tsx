@@ -326,6 +326,7 @@ function RunRow({
     lease?.assigneeHex !== null &&
     lease?.assigneeHex !== undefined &&
     lease.attempt + 1 < lease.maxAttempts;
+  const pending = op?.phase === "pending";
   const agentName = agentLabel(agents, run.agent_id);
   const label = run.job_id
     ? `job ${run.job_id}`
@@ -388,15 +389,23 @@ function RunRow({
           {canReassign && (
             <button
               type="button"
+              disabled={pending}
               onClick={() => onReassign(run.run_id, lease.attempt)}
               aria-label={`Force reassign run ${runLabel}`}
-              style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28 }}
+              style={{
+                ...secondaryButton,
+                marginLeft: "auto",
+                minHeight: 28,
+                cursor: pending ? "default" : "pointer",
+                opacity: pending ? 0.6 : 1,
+              }}
             >
               Force reassign
             </button>
           )}
           <button
             type="button"
+            disabled={pending}
             onClick={() => onCancel(run.run_id)}
             aria-label={`Cancel run ${runLabel}`}
             style={{
@@ -404,6 +413,8 @@ function RunRow({
               marginLeft: canReassign ? 0 : "auto",
               minHeight: 28,
               color: color.red,
+              cursor: pending ? "default" : "pointer",
+              opacity: pending ? 0.6 : 1,
             }}
           >
             Cancel

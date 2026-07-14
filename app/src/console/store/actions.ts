@@ -70,7 +70,14 @@ import { saveAccountProfile } from "./account-profile";
 import { pushProfileEdit, reconcileProfile } from "./profile-reconcile";
 import { navSnapshotOf } from "./nav-history";
 import type { NavSnapshot } from "./nav-history";
-import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
+import {
+  beginOp,
+  failOp,
+  finalizeOp,
+  opKey,
+  prepareOpSettlement,
+  receiptOf,
+} from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
@@ -470,7 +477,7 @@ export interface ConsoleActions {
     allowedActions: string[];
     caps?: agentClient.ResourceCaps;
     skills?: agentClient.SkillRef[];
-  }): void;
+  }): Promise<boolean>;
   /** Re-read the network capability registry without rebuilding the rest of the
    *  console snapshot. Used by the create form after a failed registry read. */
   refreshCapabilities(): void;
@@ -509,7 +516,7 @@ export interface ConsoleActions {
     /** REPLACES the whole curated skill set when present (an empty array clears
      *  it); omit to keep it. */
     skills?: agentClient.SkillRef[];
-  }): void;
+  }): Promise<boolean>;
   /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
    *  can process job-backed runs. */
   enableJobWorker(enabled: boolean): void;
@@ -1032,16 +1039,17 @@ export function createActions({
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
-  // key), submit, then settle the record from the node's receipt — finalized
-  // with the inclusion height + addressable op hash, or failed. Committed
-  // truth replaces the projection on the refresh that follows either way (a
-  // failed submit's refresh is the rollback).
+  // key), submit, retain that pending phase through the completion refresh,
+  // then settle it as finalized or failed. Committed truth replaces the
+  // projection before controls unlock either way (a failed submit's refresh
+  // is the rollback).
   //
   // `quiet` keeps a rejection out of the global error surface — the caller
   // reports it instead. It is for a BATCH whose ops are anchor-chained, where
   // one bad anchor rejects every op behind it and the raw per-op reasons are
   // noise. It never swallows the failure: the ledger still records it and the
   // promise still resolves false.
+  const pendingSubmitsByNode = new WeakMap<NodeTransport, Set<string>>();
   const submitTracked = (
     key: string,
     submit: (live: NodeTransport) => Promise<unknown>,
@@ -1050,6 +1058,15 @@ export function createActions({
   ) => {
     const live = getNode();
     if (!live) return Promise.resolve(false);
+    let pendingSubmits = pendingSubmitsByNode.get(live);
+    if (!pendingSubmits) {
+      pendingSubmits = new Set<string>();
+      pendingSubmitsByNode.set(live, pendingSubmits);
+    }
+    if (pendingSubmits.has(key) || getState().ops[key]?.phase === "pending") {
+      return Promise.resolve(false);
+    }
+    pendingSubmits.add(key);
     const startedAt = Date.now();
     update((prev) => ({
       ...(preconfirm ? preconfirm(prev) : {}),
@@ -1059,14 +1076,21 @@ export function createActions({
       .then(() => submit(live))
       .then((result) => {
         if (!isCurrentNode(live)) return false;
+        const receipt = receiptOf(result);
         update((prev) => ({
-          ops: finalizeOp(prev.ops, key, receiptOf(result), Date.now()),
+          ops: prepareOpSettlement(prev.ops, key, receipt),
         }));
-        return refresh().then(() => true);
+        return refresh().then(() => {
+          if (!isCurrentNode(live)) return false;
+          update((prev) => ({
+            ops: finalizeOp(prev.ops, key, receipt, Date.now()),
+          }));
+          return true;
+        });
       })
       .catch((err) => {
         if (!isCurrentNode(live)) return false;
-        update((prev) => ({ ops: failOp(prev.ops, key, String(err), Date.now()) }));
+        update((prev) => ({ ops: prepareOpSettlement(prev.ops, key) }));
         if (!quiet) fail(err);
         // resolve false rather than reject: a failed op is already surfaced to
         // the user here, and rejecting would turn every caller that ignores the
@@ -1076,8 +1100,16 @@ export function createActions({
         // longer trigger a success-only side effect (the pages editor's
         // compensating split/merge depends on this, and it stops
         // `createChildPage` from opening a page that was never created).
-        return refresh().then(() => false);
-      });
+        return refresh().then(() => {
+          if (isCurrentNode(live)) {
+            update((prev) => ({
+              ops: failOp(prev.ops, key, String(err), Date.now()),
+            }));
+          }
+          return false;
+        });
+      })
+      .finally(() => pendingSubmits.delete(key));
   };
 
   // The transport gives NO ordering guarantee. `/v1/submit` is one independent
@@ -2772,10 +2804,10 @@ export function createActions({
       const id = agentId.trim();
       const name = displayName.trim();
       const tag = capability.trim();
-      if (!id || !name || !tag) return;
+      if (!id || !name || !tag) return Promise.resolve(false);
       // No blob upload: the agent's persona is a duckfs document its skill refs
       // point at, so registration commits pins — never prompt bytes.
-      submitTracked(opKey.agent(id), (live) =>
+      return submitTracked(opKey.agent(id), (live) =>
         agentClient.registerAgent(live, {
           agentId: id,
           displayName: name,
@@ -2891,8 +2923,8 @@ export function createActions({
 
     updateAgent: ({ agentId, displayName, capability, allowedActions, caps, skills }) => {
       const id = agentId.trim();
-      if (!id) return;
-      submitTracked(
+      if (!id) return Promise.resolve(false);
+      return submitTracked(
         opKey.agent(id),
         (live) =>
           agentClient.updateAgent(live, {

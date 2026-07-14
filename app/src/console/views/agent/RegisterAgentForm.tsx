@@ -5,7 +5,7 @@
 // curates as an always-loaded skill (see SkillsField), so this form commits
 // pins, never prompt text.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import type { ResourceCaps, SkillRef } from "../../../domain/agent-client";
@@ -50,7 +50,7 @@ export function RegisterAgentForm({
     allowedActions: string[];
     caps?: ResourceCaps;
     skills?: SkillRef[];
-  }) => void;
+  }) => Promise<boolean>;
   /** Called after a successful submit (and by Cancel) so the host can close
    *  the create pane. */
   onDone?: () => void;
@@ -68,6 +68,8 @@ export function RegisterAgentForm({
   const [libraryRead, setLibraryRead] = useState(true);
   // The id is derived from the name by default; this reveals the override.
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
 
   // `slug` is total: it yields a legal `<id>@agents.duck` label (truncated to
   // the consensus cap, hyphens trimmed) or nothing at all. Nothing is the one
@@ -89,9 +91,10 @@ export function RegisterAgentForm({
       prev.includes(name) ? prev.filter((action) => action !== name) : [...prev, name],
     );
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!ready) return;
+    if (!ready || submittingRef.current) return;
+    submittingRef.current = true;
     const pages = parsePagesWrite(pagesWrite);
     const curated = cleanSkills(skills);
     // One caps record, built from both fields: the library grant is an ordinary
@@ -100,30 +103,37 @@ export function RegisterAgentForm({
       pages.length ? { pages_write: pages } : {},
       libraryRead,
     );
-    onRegister({
-      displayName: displayName.trim(),
-      agentId,
-      capability: capability.trim(),
-      allowedActions,
-      ...(Object.keys(caps).length ? { caps } : {}),
-      ...(curated.length ? { skills: curated } : {}),
-    });
-    setDisplayName("");
-    setAgentIdInput("");
-    setCapability("");
-    setSkills([]);
-    setAllowedActions(["chat.post"]);
-    setPagesWrite("");
-    setLibraryRead(true);
-    setShowAdvanced(false);
-    onDone?.();
+    setSubmitting(true);
+    try {
+      const committed = await onRegister({
+        displayName: displayName.trim(),
+        agentId,
+        capability: capability.trim(),
+        allowedActions,
+        ...(Object.keys(caps).length ? { caps } : {}),
+        ...(curated.length ? { skills: curated } : {}),
+      });
+      if (!committed) return;
+      setDisplayName("");
+      setAgentIdInput("");
+      setCapability("");
+      setSkills([]);
+      setAllowedActions(["chat.post"]);
+      setPagesWrite("");
+      setLibraryRead(true);
+      setShowAdvanced(false);
+      onDone?.();
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   };
 
   return (
     <section aria-label="Register agent" style={{ minWidth: 0 }}>
       <SectionLabel>REGISTER AGENT</SectionLabel>
       <GroupCard style={{ marginTop: 9 }}>
-        <form onSubmit={submit} style={{ padding: 16 }}>
+        <form onSubmit={submit} aria-busy={submitting} style={{ padding: 16 }}>
           <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
             <AgentAvatar name={displayName || "AI"} size={40} />
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -339,12 +349,25 @@ export function RegisterAgentForm({
               {idProblem ?? `saved as ${agentId || "—"}`}
             </span>
             {onDone && (
-              <button type="button" onClick={onDone} style={secondaryButton}>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={onDone}
+                style={{
+                  ...secondaryButton,
+                  cursor: submitting ? "default" : "pointer",
+                  opacity: submitting ? 0.6 : 1,
+                }}
+              >
                 Cancel
               </button>
             )}
-            <button type="submit" disabled={!ready} style={primaryButton(ready)}>
-              Register agent
+            <button
+              type="submit"
+              disabled={!ready || submitting}
+              style={primaryButton(ready && !submitting)}
+            >
+              {submitting ? "Registering…" : "Register agent"}
             </button>
           </div>
         </form>

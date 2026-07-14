@@ -51,6 +51,7 @@ function WatchRow({
   onUnwatch: (id: string) => void;
 }) {
   const label = channelLabel(channels, watch.channel_id);
+  const pending = op?.phase === "pending";
   return (
     <div
       style={{
@@ -107,9 +108,16 @@ function WatchRow({
       </div>
       <button
         type="button"
+        disabled={pending}
         onClick={() => onUnwatch(watch.channel_id)}
         aria-label={`Stop watching ${label}`}
-        style={{ ...secondaryButton, minHeight: 30, color: color.red }}
+        style={{
+          ...secondaryButton,
+          minHeight: 30,
+          color: color.red,
+          cursor: pending ? "default" : "pointer",
+          opacity: pending ? 0.6 : 1,
+        }}
       >
         Turn off
       </button>
@@ -120,10 +128,12 @@ function WatchRow({
 function WatchForm({
   channels,
   agents,
+  ops,
   onWatch,
 }: {
   channels: Channel[];
   agents: AgentRecord[];
+  ops: OpLedger;
   onWatch: (params: { channelId: string; policy: TurnPolicy }) => void;
 }) {
   const [channelId, setChannelId] = useState("");
@@ -132,7 +142,8 @@ function WatchForm({
 
   const policy: TurnPolicy | null =
     kind === "assigned" ? (assigned ? { assigned: assigned } : null) : kind;
-  const ready = channelId !== "" && policy !== null;
+  const pending = channelId !== "" && ops[opKey.watch(channelId)]?.phase === "pending";
+  const ready = channelId !== "" && policy !== null && !pending;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -268,7 +279,7 @@ export function WatchesPanel({
             />
           ))
         )}
-        <WatchForm channels={channels} agents={agents} onWatch={onWatch} />
+        <WatchForm channels={channels} agents={agents} ops={ops} onWatch={onWatch} />
       </GroupCard>
     </section>
   );
