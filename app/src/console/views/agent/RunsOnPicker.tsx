@@ -13,7 +13,8 @@
 //   - none announced → a disabled, actionable empty state (an arbitrary tag
 //     would register an agent that can never run);
 //   - announced → selects; an empty value defaults to the first announced
-//     tag, so a single-executor node needs no choice at all. Providers with
+//     provider/model, preferring its medium effort when available, so a
+//     single-executor node needs no choice at all. Providers with
 //     only a base tag collapse Model/Effort to "Default".
 // A stored tag absent from the registry (its host went offline) is pinned
 // with an "(offline)" mark so an edit never silently rewrites which executor
@@ -68,10 +69,17 @@ export function RunsOnPicker({
   onChange: (next: string) => void;
 }) {
   // Adopt a sane default once the registry loads: an empty value with executors
-  // available picks the first announced tag, so the common single-executor case
-  // is one fewer decision. Never overrides a value the user (or record) set.
+  // available picks the first announced provider/model, preferring its medium
+  // effort when available. Never overrides a value the user (or record) set.
   useEffect(() => {
-    if (value === "" && capabilities.length > 0) onChange(capabilities[0]);
+    if (value === "" && capabilities.length > 0) {
+      const first = parseCapabilityTag(capabilities[0]);
+      const medium = capabilities.find((tag) => {
+        const entry = parseCapabilityTag(tag);
+        return entry.key === first.key && entry.model === first.model && entry.effort === "medium";
+      });
+      onChange(medium ?? capabilities[0]);
+    }
   }, [value, capabilities, onChange]);
 
   // The registry is the source of truth. Accepting an arbitrary tag here makes
@@ -197,7 +205,10 @@ export function RunsOnPicker({
   // always one announced (or pinned) capability string, never a synthesis.
   const pickProvider = (key: string) => {
     const list = entries.filter((entry) => entry.key === key);
-    const pick = list.find((entry) => entry.model === null) ?? list[0];
+    const pick =
+      list.find((entry) => entry.model === null) ??
+      list.find((entry) => entry.effort === "medium") ??
+      list[0];
     if (pick) onChange(pick.tag);
   };
   const pickModel = (model: string) => {
@@ -207,7 +218,10 @@ export function RunsOnPicker({
       return;
     }
     const list = group.filter((entry) => entry.model === model);
-    const pick = list.find((entry) => entry.effort === current?.effort) ?? list[0];
+    const pick =
+      list.find((entry) => entry.effort === current?.effort) ??
+      list.find((entry) => entry.effort === "medium") ??
+      list[0];
     if (pick) onChange(pick.tag);
   };
   const pickEffort = (effort: string) => {

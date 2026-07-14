@@ -1029,6 +1029,21 @@ describe("AgentView", () => {
 });
 
 describe("RunsOnPicker", () => {
+  it("prefers medium when creating an Agent from an unpinned variant", () => {
+    renderAgents({
+      capabilities: [
+        "codex_gpt-5.6-sol_high",
+        "codex_gpt-5.6-sol_low",
+        "codex_gpt-5.6-sol_medium",
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+
+    expect(screen.getByLabelText("Effort")).toHaveValue("medium");
+    expect(screen.getByText("codex_gpt-5.6-sol_medium")).toBeInTheDocument();
+  });
+
   it("collapses Model and Effort to Default when only bare tags are announced", () => {
     const { spies } = renderAgents({ capabilities: ["claude", "codex"] });
 
@@ -1061,7 +1076,9 @@ describe("RunsOnPicker", () => {
         "codex_gpt-5.5_low",
         "codex_gpt-5.5_xhigh",
         "codex_gpt-5.6-terra_high",
+        "codex_gpt-5.6-terra_medium",
         "claude_opus_max",
+        "claude_opus_medium",
       ],
     });
 
@@ -1078,8 +1095,8 @@ describe("RunsOnPicker", () => {
     expect(within(model).getByRole("option", { name: "gpt-5.5" })).toBeInTheDocument();
     expect(within(model).getByRole("option", { name: "gpt-5.6-terra" })).toBeInTheDocument();
 
-    // Picking a model adopts its first announced effort; the composed tag
-    // is shown verbatim under the picker.
+    // A model without medium keeps the first-announced fallback; the composed
+    // tag is shown verbatim under the picker.
     fireEvent.change(model, { target: { value: "gpt-5.5" } });
     expect(screen.getByLabelText("Effort")).toHaveValue("low");
     expect(screen.getByText("codex_gpt-5.5_low")).toBeInTheDocument();
@@ -1089,19 +1106,19 @@ describe("RunsOnPicker", () => {
 
     // Switching model narrows efforts to what that model announced.
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.6-terra" } });
-    expect(screen.getByLabelText("Effort")).toHaveValue("high");
+    expect(screen.getByLabelText("Effort")).toHaveValue("medium");
 
-    // A provider with no base tag composes its first variant.
+    // A provider with no base tag prefers its announced medium variant.
     fireEvent.change(runsOn, { target: { value: "claude" } });
     expect(screen.getByLabelText("Model")).toHaveValue("opus");
-    expect(screen.getByText("claude_opus_max")).toBeInTheDocument();
+    expect(screen.getByText("claude_opus_medium")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Agent display name"), {
       target: { value: "Triage" },
     });
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
     expect(spies.registerAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ capability: "claude_opus_max" }),
+      expect.objectContaining({ capability: "claude_opus_medium" }),
     );
   });
 
