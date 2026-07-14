@@ -4,6 +4,7 @@ import type { CSSProperties, ReactNode } from "react";
 // source, trimmed to the icons this console uses.
 const PATHS: Record<string, ReactNode> = {
   chat: <path d="M5 7a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-6l-4 3.5V14H7a2 2 0 0 1-2-2z" />,
+  arrowUp: <path d="M12 19V5M5 12l7-7 7 7" />,
   members: (
     <>
       <circle cx="10" cy="8" r="3" />
