@@ -374,6 +374,7 @@ impl RunsModule {
                 recipe_id: recipe_id_for(&agent_id),
                 payload: prepared.payload,
                 demands,
+                admission: dispatch::AdmissionPolicy::Queue,
             }),
         });
         self.pending_overlay.insert(

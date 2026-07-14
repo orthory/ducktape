@@ -121,6 +121,7 @@ impl RunsModule {
                 recipe_id: recipe_id_for(agent_id),
                 payload,
                 demands: Default::default(),
+                admission: dispatch::AdmissionPolicy::Queue,
             }),
         });
         self.pending_overlay.insert(

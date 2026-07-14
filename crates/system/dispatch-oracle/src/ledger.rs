@@ -140,6 +140,8 @@ impl Drop for ReservationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
 
     fn res(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
@@ -189,5 +191,37 @@ mod tests {
         );
         drop(guard);
         assert!(l.fits(&res(&[("cores", 8)])), "released on drop");
+    }
+
+    #[test]
+    fn concurrent_try_reserve_has_one_winner() {
+        let ledger = Arc::new(ResourceLedger::new(res(&[("cores", 1)])));
+        let start = Arc::new(Barrier::new(3));
+        let checked = Arc::new(Barrier::new(3));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for key in ["a", "b"] {
+            let ledger = ledger.clone();
+            let start = start.clone();
+            let checked = checked.clone();
+            let winners = winners.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let reservation = ledger.try_reserve(key, &res(&[("cores", 1)]));
+                if reservation.is_some() {
+                    winners.fetch_add(1, Ordering::SeqCst);
+                }
+                checked.wait();
+                drop(reservation);
+            }));
+        }
+
+        start.wait();
+        checked.wait();
+        assert_eq!(winners.load(Ordering::SeqCst), 1);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(ledger.fits(&res(&[("cores", 1)])));
     }
 }

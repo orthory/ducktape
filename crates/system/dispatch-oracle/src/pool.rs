@@ -32,6 +32,10 @@ use crate::{
     attempt_output, clean_error, gate, oracle_result_with_usage, renew_lease, AttemptOutput,
     ExecJob, Gated, ResourceLedger,
 };
+use dispatch::AdmissionPolicy;
+
+/// Stable successful result used when fail-fast admission finds occupied capacity.
+pub const RESOURCE_UNAVAILABLE_RESULT: &[u8] = br#"{"code":"RESOURCE_UNAVAILABLE"}"#;
 
 /// how many provider runs may execute concurrently unless
 /// `DUCKTAPE_MAX_CONCURRENT_RUNS` says otherwise.
@@ -283,12 +287,36 @@ impl DispatchPool {
                 let attempt_owner = attempt_guard;
                 let admission = {
                     let admission = async {
-                        let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
-                        let Some(reservation) = ledger
-                            .reserve_when_available(&reservation_key, &job.demands, &cancellation)
-                            .await
-                        else {
-                            return Err("attempt cancelled while waiting for resources".into());
+                        let reservation = match job.admission {
+                            AdmissionPolicy::Queue => {
+                                let reservation_key =
+                                    format!("{}:{}", job.saga_id, job.attempt);
+                                let Some(reservation) = ledger
+                                    .reserve_when_available(
+                                        &reservation_key,
+                                        &job.demands,
+                                        &cancellation,
+                                    )
+                                    .await
+                                else {
+                                    return Err(
+                                        "attempt cancelled while waiting for resources".into(),
+                                    );
+                                };
+                                reservation
+                            }
+                            AdmissionPolicy::FailFast => {
+                                let mut attempts = inflight.lock().expect("attempts lock");
+                                let Some(running) = attempts.get_mut(&key) else {
+                                    return Err(
+                                        "attempt disappeared before resource admission".into(),
+                                    );
+                                };
+                                running
+                                    .reservation
+                                    .take()
+                                    .expect("fail-fast reservation is acquired before spawn")
+                            }
                         };
                         {
                             let mut attempts = inflight.lock().expect("attempts lock");
@@ -748,12 +776,28 @@ impl Worker for DispatchPool {
                     return Ok(WorkOutcome::Handled(None));
                 }
                 let cancellation = RunCancellation::new();
+                let reservation = if job.admission == AdmissionPolicy::FailFast {
+                    let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
+                    let Some(reservation) =
+                        self.ledger.try_reserve(&reservation_key, &job.demands)
+                    else {
+                        return Ok(WorkOutcome::Handled(Some(oracle_result_with_usage(
+                            &job.saga_id,
+                            job.attempt,
+                            Ok(RESOURCE_UNAVAILABLE_RESULT.to_vec()),
+                            None,
+                        ))));
+                    };
+                    Some(reservation)
+                } else {
+                    None
+                };
                 attempts.insert(
                     key.clone(),
                     RunningAttempt {
                         state: AttemptState::Running,
                         cancellation: cancellation.clone(),
-                        reservation: None,
+                        reservation,
                     },
                 );
                 drop(attempts);
@@ -1035,6 +1079,7 @@ format = "text"
                     capability: "alpha".into(),
                     payload: payload.to_vec(),
                     demands: Default::default(),
+                    admission: AdmissionPolicy::Queue,
                 }),
                 deadline: None,
                 assignee: assignee.map(|a| a.to_vec()),
@@ -1052,6 +1097,16 @@ format = "text"
         assignee: Option<&[u8]>,
         demands: BTreeMap<String, u64>,
     ) -> Event {
+        effect_with_admission(saga_id, attempt, assignee, demands, AdmissionPolicy::Queue)
+    }
+
+    fn effect_with_admission(
+        saga_id: &str,
+        attempt: u32,
+        assignee: Option<&[u8]>,
+        demands: BTreeMap<String, u64>,
+        admission: AdmissionPolicy,
+    ) -> Event {
         Event {
             source: "saga".into(),
             payload: encode_worker_request(&WorkerRequest {
@@ -1063,6 +1118,7 @@ format = "text"
                     capability: "alpha".into(),
                     payload: envelope_payload(),
                     demands,
+                    admission,
                 }),
                 deadline: None,
                 assignee: assignee.map(|a| a.to_vec()),
@@ -1136,6 +1192,101 @@ format = "text"
         })
         .await
         .is_err()
+    }
+
+    #[tokio::test]
+    async fn fail_fast_occupied_settles_without_spawn_provider_or_provisioning() {
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            Vec::new(),
+        ));
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let counted = spawn_count.clone();
+        let spawn: SpawnFn = Arc::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let deliver: DeliverFn = Arc::new(|_| Box::pin(async {}));
+        let capacity = BTreeMap::from([("cores".to_string(), 1)]);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed,
+            cleaned,
+            fail_commit: None,
+        });
+        let pool = DispatchPool::with_limit(
+            providers,
+            b"me".to_vec(),
+            spawn,
+            deliver,
+            1,
+            capacity.clone(),
+        )
+        .with_provisioner(provisioner);
+        let occupied = pool
+            .ledger
+            .try_reserve("occupied", &capacity)
+            .expect("occupy the node");
+
+        let event = effect_with_admission(
+            "nested",
+            3,
+            Some(b"me"),
+            capacity.clone(),
+            AdmissionPolicy::FailFast,
+        );
+        let WorkOutcome::Handled(Some(msg)) = pool.run(&event).await.unwrap() else {
+            panic!("occupied fail-fast attempt settles inline")
+        };
+        let SagaMsg::OracleResult {
+            saga_id,
+            attempt,
+            outcome,
+            usage,
+        } = saga::decode_msg(&msg.payload).unwrap()
+        else {
+            panic!("expected an OracleResult")
+        };
+        assert_eq!(saga_id, "nested");
+        assert_eq!(attempt, 3);
+        assert_eq!(outcome, Ok(RESOURCE_UNAVAILABLE_RESULT.to_vec()));
+        assert_eq!(usage, None);
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+        assert!(!provisioned.load(Ordering::SeqCst));
+        assert_eq!(pool.in_flight(), 0);
+        drop(occupied);
+        assert!(pool.ledger.fits(&capacity), "failed admission leaves no reservation");
+    }
+
+    #[tokio::test]
+    async fn successful_fail_fast_admission_keeps_reservation_until_settlement() {
+        let (providers, probes) = slow_providers(Duration::from_millis(100), false);
+        let capacity = BTreeMap::from([("cores".to_string(), 1)]);
+        let (pool, mut rx) = pool_with_capacity(providers, 1, capacity.clone());
+        let event = effect_with_admission(
+            "nested",
+            0,
+            Some(b"me"),
+            capacity.clone(),
+            AdmissionPolicy::FailFast,
+        );
+        assert!(matches!(
+            pool.run(&event).await.unwrap(),
+            WorkOutcome::Handled(None)
+        ));
+        assert!(!pool.ledger.fits(&capacity), "successful admission reserves once");
+        let (saga_id, attempt, outcome) = next_result(&mut rx).await;
+        assert_eq!((saga_id.as_str(), attempt), ("nested", 0));
+        assert_eq!(outcome.unwrap(), PLAIN_ANSWER);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(probes.executions.load(Ordering::SeqCst), 1);
+        assert!(pool.ledger.fits(&capacity), "settlement releases reservation");
     }
 
     #[tokio::test]

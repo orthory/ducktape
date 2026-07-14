@@ -528,6 +528,7 @@ impl DispatchModule {
         recipe_id: String,
         payload: Vec<u8>,
         demands: BTreeMap<String, u64>,
+        admission: AdmissionPolicy,
     ) -> Result<(), Error> {
         // module-origin only: the dispatching module IS the receiver, so
         // results always have somewhere to land. an external submitter has
@@ -577,6 +578,7 @@ impl DispatchModule {
                     capability: recipe.capability.clone(),
                     payload,
                     demands: demands.clone(),
+                    admission,
                 }),
                 reply_to: Some(self.id.clone()),
                 reply_payload: key.clone().into_bytes(),
@@ -799,7 +801,8 @@ impl DispatchModule {
                 recipe_id,
                 payload,
                 demands,
-            } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload, demands),
+                admission,
+            } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload, demands, admission),
             DispatchMsg::CancelDispatch { dispatch_id } => self.on_cancel(ctx, dispatch_id),
             DispatchMsg::ReassignDispatch {
                 dispatch_id,
@@ -1100,6 +1103,7 @@ mod tests {
             recipe_id: "summarize".into(),
             payload: payload.to_vec(),
             demands: BTreeMap::new(),
+            admission: AdmissionPolicy::Queue,
         }
     }
     /// run register (as the external owner) + dispatch (as module "caller"),
@@ -1297,6 +1301,7 @@ mod tests {
                 recipe_id: "nope".into(),
                 payload: b"x".to_vec(),
                 demands: BTreeMap::new(),
+                admission: AdmissionPolicy::Queue,
             },
         )
         .unwrap_err();
@@ -1379,6 +1384,7 @@ mod tests {
                 recipe_id: "summarize".into(),
                 payload: b"input".to_vec(),
                 demands: demands.clone(),
+                admission: AdmissionPolicy::FailFast,
             },
         )
         .unwrap();
@@ -1394,13 +1400,17 @@ mod tests {
         // ONE source: the trigger's demands and the work spec's demands agree
         // exactly with what was dispatched — no drift possible.
         assert_eq!(trigger_demands, demands);
-        assert_eq!(crate::decode_work_spec(&spec).unwrap().demands, demands);
+        let work = crate::decode_work_spec(&spec).unwrap();
+        assert_eq!(work.demands, demands);
+        assert_eq!(work.admission, AdmissionPolicy::FailFast);
     }
 
     #[test]
     fn work_spec_without_demands_field_still_decodes() {
         let old = br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
-        assert!(crate::decode_work_spec(old).unwrap().demands.is_empty());
+        let work = crate::decode_work_spec(old).unwrap();
+        assert!(work.demands.is_empty());
+        assert_eq!(work.admission, AdmissionPolicy::Queue);
     }
 
     #[test]
@@ -1555,6 +1565,43 @@ mod tests {
         let mut padded = snap.clone();
         padded.push(0);
         assert!(dst.install(&padded, root).is_err());
+    }
+
+    #[test]
+    fn admission_policy_does_not_change_committed_snapshot_or_root() {
+        fn dispatched(admission: AdmissionPolicy) -> DispatchModule {
+            let mut m = module();
+            let mut owner_ctx = CaptureCtx::new().with_origin(owner());
+            exec(
+                &mut m,
+                &mut owner_ctx,
+                &register(OutputContract::Json, Routing::Rendezvous),
+            )
+            .unwrap();
+            commit(&mut m);
+            let mut caller = CaptureCtx::new()
+                .at(5)
+                .with_origin(Origin::Module("caller".into()));
+            exec(
+                &mut m,
+                &mut caller,
+                &DispatchMsg::Dispatch {
+                    dispatch_id: "d1".into(),
+                    recipe_id: "summarize".into(),
+                    payload: b"input".to_vec(),
+                    demands: BTreeMap::new(),
+                    admission,
+                },
+            )
+            .unwrap();
+            commit(&mut m);
+            m
+        }
+
+        let queue = dispatched(AdmissionPolicy::Queue);
+        let fail_fast = dispatched(AdmissionPolicy::FailFast);
+        assert_eq!(queue.root(), fail_fast.root());
+        assert_eq!(queue.snapshot(), fail_fast.snapshot());
     }
 
     #[test]

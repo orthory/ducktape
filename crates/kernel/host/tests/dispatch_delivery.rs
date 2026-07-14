@@ -55,6 +55,7 @@ impl Module for Caller {
                     recipe_id: "summarize".into(),
                     payload: b"the entire input".to_vec(),
                     demands: Default::default(),
+                    admission: dispatch::AdmissionPolicy::Queue,
                 }),
             });
         }
