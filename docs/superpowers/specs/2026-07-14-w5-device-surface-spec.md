@@ -84,6 +84,40 @@ node record. W6 adds account-level profile fields — a disjoint region of
 `AccountRecord`/`AccountView`. Enum-variant + struct-field additions merge
 mechanically.
 
+## REQUIRED build step — regenerate the identity wasm component
+
+`identity` is an **adapter-ported WASM module**: the real node loads it from
+`crates/examples/identity-wasm/component.wasm` (committed, `include_bytes!` in
+`bin/node/src/host_state.rs`), the wasm compiled FROM the native crate. So a
+native-crate change is NOT live on a real node — and worse, desyncs the wire —
+until the component is rebuilt. This is precisely the app-hash move the ledger
+flags (re-seed QA nets).
+
+Regen command (the identity block of `make wasm-modules`):
+
+```
+cd crates/examples/identity-wasm && cargo build --target wasm32-unknown-unknown --release
+wasm-tools component new \
+  crates/examples/identity-wasm/target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+  -o crates/examples/identity-wasm/component.wasm
+cp crates/examples/identity-wasm/component.wasm \
+  crates/kernel/host/tests/fixtures/identity.component.wasm
+```
+
+**Blocked on this headless box**, so the committed `component.wasm` is NOT
+regenerated in this PR:
+- `clang` is absent and unroot-installable (`blst`, a transitive C dep, needs
+  it to compile to wasm32; `gcc` cannot target wasm).
+- Intermittent rustc SIGSEGV on this box's dep graph (documented trap).
+
+Consequences until regen (must happen on the epic branch / a clang build box):
+- `wasm_identity_parity` and `identity_e2e` are RED (native `AccountView` shape
+  vs. the stale wasm's old shape) — these gates ENFORCE the regen before merge.
+- `gateway_plane`'s `AccountView` decode breaks on a real node until regen, so
+  gateway route authority is affected network-wide. Flagged loudly for the epic
+  integrator. The native op logic itself is proven: identity unit tests (25) and
+  the single-node **simnode** e2e (which runs identity NATIVELY) are green.
+
 ## Non-goals
 
 - Key rotation (own ADR).

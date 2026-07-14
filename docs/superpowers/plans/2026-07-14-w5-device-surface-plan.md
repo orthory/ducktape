@@ -73,3 +73,13 @@ Spec: `docs/superpowers/specs/2026-07-14-w5-device-surface-spec.md`.
 
 - Live desktop/fleet QA skipped — happens on the epic branch later.
 - Module change moves genesis app-hash → existing QA networks need re-seed.
+
+## BLOCKED: identity wasm component regen (see spec)
+
+`identity` runs as a WASM component on the real node. The native-crate change
+requires regenerating `crates/examples/identity-wasm/component.wasm` (identity
+block of `make wasm-modules`). Blocked on this box (no clang for blst's wasm32
+build; intermittent rustc SIGSEGV). Until regenerated on a clang build box:
+`wasm_identity_parity` + `identity_e2e` are RED and gateway `AccountView` decode
+breaks on a real node. The regen IS the app-hash move. Native op logic proven by
+identity unit tests + the native simnode e2e (both green).
