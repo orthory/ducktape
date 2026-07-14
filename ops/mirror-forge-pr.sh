@@ -217,14 +217,9 @@ replay_commit() {
   mapfile -d '' -t meta < <(commit_fingerprint "$source")
   [ "${#meta[@]}" -eq 6 ] || die "could not read source commit identity"
 
-  local source_raw="$state_dir/source-commit" new_raw="$state_dir/new-commit"
-  local source_message="$state_dir/source-message" new_message="$state_dir/new-message"
-  local source_meta="$state_dir/source-meta" new_meta="$state_dir/new-meta"
-  local source_patch="$state_dir/source-patch" new_patch="$state_dir/new-patch"
+  local source_raw="$state_dir/source-commit"
+  local source_message="$state_dir/source-message"
   write_raw_message "$source" "$source_raw" "$source_message"
-  commit_identity_headers "$source" >"$source_meta"
-  git show --pretty=format: --binary "$source" | git patch-id --stable >"$source_patch"
-  [ -s "$source_patch" ] || die "source commit $source has no patch"
 
   local tree parent mirrored
   tree=$(git -C "$dir" write-tree)
@@ -241,12 +236,7 @@ replay_commit() {
   is_oid "$mirrored" || die "git commit-tree returned an invalid oid"
   git -C "$dir" reset --hard "$mirrored" >/dev/null
 
-  write_raw_message "$mirrored" "$new_raw" "$new_message"
-  commit_identity_headers "$mirrored" >"$new_meta"
-  git show --pretty=format: --binary "$mirrored" | git patch-id --stable >"$new_patch"
-  cmp -s "$source_message" "$new_message" || die "raw commit message changed while replaying $source"
-  cmp -s "$source_meta" "$new_meta" || die "raw author/committer identity changed while replaying $source"
-  cmp -s "$source_patch" "$new_patch" || die "commit patch changed while replaying $source"
+  verify_replayed_commit "$source" "$mirrored" "$state_dir" "replayed commit"
   assert_clean "$dir"
   MIRRORED_OID=$mirrored
 }
@@ -264,6 +254,331 @@ remote_ref_oid() {
   esac
 }
 
+normalize_epic_branch() {
+  local input=$1
+  [ -n "$input" ] || die "epic identifier is empty"
+  [[ "$input" != -* && "$input" != refs/* ]] || die "epic identifier is unsafe: $input"
+  if [[ "$input" == */* ]]; then
+    EPIC_BRANCH=$input
+  else
+    EPIC_BRANCH="improvement/$input"
+  fi
+  git check-ref-format --branch "$EPIC_BRANCH" >/dev/null 2>&1 ||
+    die "epic identifier does not form a safe branch: $input"
+  [ "$EPIC_BRANCH" != dev ] || die "epic branch must not be dev"
+}
+
+resolve_epic_history_base() {
+  local github_dev=$1 epic_tip=$2 base
+  is_oid "$github_dev" && is_oid "$epic_tip" || die "epic history contains an invalid oid"
+  base=$(git merge-base "$github_dev" "$epic_tip") ||
+    die "epic branch and current origin/dev have no shared history"
+  is_oid "$base" || die "epic branch merge-base is invalid"
+  git merge-base --is-ancestor "$base" "$github_dev" &&
+    git merge-base --is-ancestor "$base" "$epic_tip" ||
+    die "epic branch merge-base is not shared by both histories"
+  printf '%s\n' "$base"
+}
+
+verify_replayed_commit() {
+  local source=$1 mirrored=$2 state_dir=$3 label=$4
+  is_oid "$source" && is_oid "$mirrored" || die "$label contains an invalid commit oid"
+  git cat-file -e "$source^{commit}" 2>/dev/null || die "$label source commit $source is unavailable"
+  git cat-file -e "$mirrored^{commit}" 2>/dev/null || die "$label mirrored commit $mirrored is unavailable"
+  local source_message="$state_dir/verify-source-message" mirrored_message="$state_dir/verify-mirrored-message"
+  local source_meta="$state_dir/verify-source-meta" mirrored_meta="$state_dir/verify-mirrored-meta"
+  write_raw_message "$source" "$state_dir/verify-source-raw" "$source_message"
+  write_raw_message "$mirrored" "$state_dir/verify-mirrored-raw" "$mirrored_message"
+  commit_identity_headers "$source" >"$source_meta"
+  commit_identity_headers "$mirrored" >"$mirrored_meta"
+  cmp -s "$source_message" "$mirrored_message" || die "$label changed the raw message for $source"
+  cmp -s "$source_meta" "$mirrored_meta" || die "$label changed author or committer provenance for $source"
+
+  local source_parent_line mirrored_parent_line
+  source_parent_line=$(git show -s --format=%P "$source")
+  mirrored_parent_line=$(git show -s --format=%P "$mirrored")
+  local -a source_parents=() mirrored_parents=()
+  read -r -a source_parents <<<"$source_parent_line"
+  read -r -a mirrored_parents <<<"$mirrored_parent_line"
+  [ "${#source_parents[@]}" -eq 1 ] || die "$label source commit $source is not a single-parent commit"
+  [ "${#mirrored_parents[@]}" -eq 1 ] || die "$label mirrored commit $mirrored is not a single-parent commit"
+
+  # Give Git the real source parent A as the merge base while representing the
+  # mirrored parent tree B on a synthetic A child. Merging that child with S
+  # applies exactly A..S over B, including path, mode, rename, and binary
+  # semantics, while retaining unrelated GitHub changes already present in B.
+  local synthetic result_tree mirrored_tree
+  synthetic=$(
+    printf 'synthetic replay verification parent\n' |
+      GIT_AUTHOR_NAME='Forge replay verifier' GIT_AUTHOR_EMAIL='forge-replay@invalid' \
+      GIT_AUTHOR_DATE='2000-01-01T00:00:00+00:00' \
+      GIT_COMMITTER_NAME='Forge replay verifier' GIT_COMMITTER_EMAIL='forge-replay@invalid' \
+      GIT_COMMITTER_DATE='2000-01-01T00:00:00+00:00' \
+      git -c commit.gpgSign=false commit-tree "${mirrored_parents[0]}^{tree}" -p "${source_parents[0]}"
+  ) || die "$label could not construct its semantic replay base"
+  result_tree=$(git merge-tree --write-tree --no-messages \
+    --merge-base "${source_parents[0]}" "$synthetic" "$source") ||
+    die "$label source commit $source does not apply cleanly to the mirrored parent"
+  is_oid "$result_tree" || die "$label semantic replay returned an invalid tree oid"
+  mirrored_tree=$(git rev-parse "$mirrored^{tree}")
+  [ "$result_tree" = "$mirrored_tree" ] || die "$label changed the semantic patch for $source"
+}
+
+parse_epic_ledger() {
+  local body=$1 records=$2
+  node - "$body" "$records" <<'NODE'
+const fs = require("node:fs");
+const [bodyPath, recordsPath] = process.argv.slice(2);
+const body = fs.readFileSync(bodyPath, "utf8");
+if (Buffer.byteLength(body) > 1024 * 1024) throw new Error("GitHub epic PR body exceeds 1 MiB");
+const start = "<!-- forge-epic-provenance:start -->";
+const end = "<!-- forge-epic-provenance:end -->";
+const legacy = "<!-- forge-epic-provenance:v1 -->";
+const legacyEnd = "<!-- /forge-epic-provenance -->";
+const starts = body.split(start).length - 1;
+const ends = body.split(end).length - 1;
+const legacies = body.split(legacy).length - 1;
+const legacyEnds = body.split(legacyEnd).length - 1;
+if (starts !== ends || starts > 1 || legacies > 1 || legacyEnds > 1 ||
+    (starts && (legacies || legacyEnds)) || (!legacies && legacyEnds)) {
+  throw new Error("epic provenance markers are malformed or duplicated");
+}
+if (!starts && !legacies) {
+  fs.writeFileSync(recordsPath, "");
+  process.exit(0);
+}
+if (legacies && legacyEnds) {
+  const a = body.indexOf(legacy) + legacy.length;
+  const b = body.indexOf(legacyEnd, a);
+  if (b < a) throw new Error("legacy epic provenance markers are out of order");
+  const lines = body.slice(a, b).split("\n").map(line => line.trim()).filter(Boolean);
+  if (!lines.length || lines.length % 2 || lines.length > 2000) {
+    throw new Error("legacy epic provenance block has an unsupported shape");
+  }
+  const comment = /^<!-- forge-provenance:([a-z0-9._-]{1,64})#([1-9][0-9]*) merge=([0-9a-f]{40}) source=([0-9a-f]{40}) target=([0-9a-f]{40}) -->$/;
+  const bullet = /^- ([a-z0-9._-]{1,64})#([1-9][0-9]*) — ([0-9a-f]{40}) \(Forge merge ([0-9a-f]{40})\)$/;
+  const records = [];
+  const seen = new Set();
+  for (let i = 0; i < lines.length; i += 2) {
+    const provenance = lines[i].match(comment);
+    const summary = lines[i + 1].match(bullet);
+    if (!provenance || !summary || provenance[1] !== summary[1] ||
+        provenance[2] !== summary[2] || provenance[3] !== summary[4] ||
+        provenance[4] !== summary[3]) {
+      throw new Error("legacy epic provenance comment and summary disagree");
+    }
+    const key = `${provenance[1]}#${provenance[2]}`;
+    if (seen.has(key)) throw new Error(`legacy epic provenance duplicates ${key}`);
+    seen.add(key);
+    records.push(["L", ...provenance.slice(1)].join("\t"));
+  }
+  fs.writeFileSync(recordsPath, records.join("\n") + "\n");
+  process.exit(0);
+}
+let raw;
+if (starts) {
+  const a = body.indexOf(start) + start.length;
+  const b = body.indexOf(end, a);
+  if (b < a) throw new Error("epic provenance markers are out of order");
+  raw = body.slice(a, b).trim();
+} else {
+  raw = body.slice(body.indexOf(legacy) + legacy.length).trim();
+  const fenced = raw.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
+  if (fenced) raw = fenced[1].trim();
+}
+let ledger;
+try { ledger = JSON.parse(raw); }
+catch { throw new Error("epic provenance ledger is not valid JSON"); }
+if (Array.isArray(ledger)) ledger = {version: 1, entries: ledger};
+if (ledger && !Array.isArray(ledger.entries) && ledger.repo) ledger = {version: 1, entries: [ledger]};
+if (!ledger || ledger.version !== 1 || !Array.isArray(ledger.entries) || ledger.entries.length > 1000) {
+  throw new Error("epic provenance ledger has an unsupported shape");
+}
+const oid = value => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+const seen = new Set();
+const lines = [];
+for (const entry of ledger.entries) {
+  if (!entry || typeof entry.repo !== "string" || !/^[a-z0-9._-]{1,64}$/.test(entry.repo) ||
+      !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !oid(entry.merge) || !oid(entry.source) ||
+      !oid(entry.target) || !Array.isArray(entry.commits) || !entry.commits.length) {
+    throw new Error("epic provenance ledger contains an invalid entry");
+  }
+  const key = `${entry.repo}#${entry.pr}`;
+  if (seen.has(key)) throw new Error(`epic provenance ledger duplicates ${key}`);
+  seen.add(key);
+  lines.push(["E", entry.repo, entry.pr, entry.merge, entry.source, entry.target].join("\t"));
+  for (const commit of entry.commits) {
+    if (!commit || !oid(commit.source) || !oid(commit.mirror)) {
+      throw new Error(`epic provenance ledger contains an invalid commit for ${key}`);
+    }
+    lines.push(["C", commit.source, commit.mirror].join("\t"));
+  }
+}
+fs.writeFileSync(recordsPath, lines.length ? lines.join("\n") + "\n" : "");
+NODE
+}
+
+append_epic_ledger() {
+  local body=$1 entry=$2 output=$3 records=${4:-}
+  node - "$body" "$entry" "$output" "$records" <<'NODE'
+const fs = require("node:fs");
+const [bodyPath, entryPath, outputPath, recordsPath] = process.argv.slice(2);
+let body = fs.readFileSync(bodyPath, "utf8");
+const entry = JSON.parse(fs.readFileSync(entryPath, "utf8"));
+const start = "<!-- forge-epic-provenance:start -->";
+const end = "<!-- forge-epic-provenance:end -->";
+const legacy = "<!-- forge-epic-provenance:v1 -->";
+const legacyEnd = "<!-- /forge-epic-provenance -->";
+const a = body.indexOf(start);
+const legacyAt = body.indexOf(legacy);
+let ledger = {version: 1, entries: []};
+if (recordsPath) {
+  const lines = fs.readFileSync(recordsPath, "utf8").trim().split("\n").filter(Boolean);
+  const seen = new Set();
+  let current = null;
+  const oid = value => /^[0-9a-f]{40}$/.test(value || "");
+  for (const line of lines) {
+    const fields = line.split("\t");
+    if (fields[0] === "E" && fields.length === 6) {
+      const [, repo, prText, merge, source, target] = fields;
+      const pr = Number(prText);
+      const key = `${repo}#${prText}`;
+      if (!/^[a-z0-9._-]{1,64}$/.test(repo) || !Number.isSafeInteger(pr) || pr < 1 ||
+          !oid(merge) || !oid(source) || !oid(target) || seen.has(key)) {
+        throw new Error("resolved epic provenance records are invalid");
+      }
+      seen.add(key);
+      current = {repo, pr, merge, source, target, commits: []};
+      ledger.entries.push(current);
+    } else if (fields[0] === "C" && fields.length === 3 && current &&
+               oid(fields[1]) && oid(fields[2])) {
+      current.commits.push({source: fields[1], mirror: fields[2]});
+    } else {
+      throw new Error("resolved epic provenance records are invalid");
+    }
+  }
+  if (ledger.entries.some(old => !old.commits.length)) {
+    throw new Error("resolved epic provenance entry has no commits");
+  }
+}
+let prefix = body;
+let suffix = "";
+if (a >= 0 && legacyAt >= 0) throw new Error("epic provenance markers changed while updating");
+if (a >= 0) {
+  const contentStart = a + start.length;
+  const b = body.indexOf(end, contentStart);
+  if (b < 0 || body.indexOf(start, contentStart) >= 0 || body.indexOf(end, b + end.length) >= 0) {
+    throw new Error("epic provenance markers changed while updating");
+  }
+  if (!recordsPath) ledger = JSON.parse(body.slice(contentStart, b).trim());
+  prefix = body.slice(0, a);
+  suffix = body.slice(b + end.length);
+} else if (legacyAt >= 0) {
+  if (body.indexOf(legacy, legacyAt + legacy.length) >= 0) {
+    throw new Error("legacy epic provenance marker is duplicated");
+  }
+  prefix = body.slice(0, legacyAt);
+  const legacyEndAt = body.indexOf(legacyEnd, legacyAt + legacy.length);
+  if (legacyEndAt >= 0) {
+    if (body.indexOf(legacyEnd, legacyEndAt + legacyEnd.length) >= 0) {
+      throw new Error("legacy epic provenance end marker is duplicated");
+    }
+    suffix = body.slice(legacyEndAt + legacyEnd.length);
+    if (!recordsPath) {
+      throw new Error("legacy epic provenance requires verified commit mappings");
+    }
+  } else {
+    let raw = body.slice(legacyAt + legacy.length).trim();
+    const fenced = raw.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
+    if (fenced) raw = fenced[1].trim();
+    if (!recordsPath) {
+      ledger = JSON.parse(raw);
+      if (Array.isArray(ledger)) ledger = {version: 1, entries: ledger};
+      if (ledger && !Array.isArray(ledger.entries) && ledger.repo) {
+        ledger = {version: 1, entries: [ledger]};
+      }
+    }
+  }
+}
+if (ledger.entries.some(old => old.repo === entry.repo && old.pr === entry.pr)) {
+  throw new Error(`epic provenance already contains ${entry.repo}#${entry.pr}`);
+}
+ledger.entries.push(entry);
+const block = `${start}\n${JSON.stringify(ledger, null, 2)}\n${end}`;
+if (a >= 0 || legacyAt >= 0) {
+  body = `${prefix}${block}${suffix}`;
+} else {
+  const separator = !prefix ? "" : prefix.endsWith("\n") ? "\n" : "\n\n";
+  body = `${prefix}${separator}${block}`;
+}
+
+if (Buffer.byteLength(body) > 1024 * 1024) throw new Error("updated GitHub epic PR body exceeds 1 MiB");
+fs.writeFileSync(outputPath, body);
+NODE
+}
+
+update_epic_pr_body() {
+  local number=$1 observed_body=$2 updated_body=$3 state_dir=$4
+  gh api --include "repos/$GH_REPO/pulls/$number" >"$state_dir/epic-pr-rest" \
+    2>"$state_dir/gh.err" || die "could not read the epic PR revision: $(tr '\n' ' ' <"$state_dir/gh.err")"
+  node - "$state_dir/epic-pr-rest" "$observed_body" "$MIRROR_BRANCH" "$state_dir/epic-pr-etag" <<'NODE'
+const fs = require("node:fs");
+const [responsePath, bodyPath, branch, etagPath] = process.argv.slice(2);
+const response = fs.readFileSync(responsePath, "utf8");
+const split = response.search(/\r?\n\r?\n\{/);
+if (split < 0) throw new Error("GitHub PR response did not include headers and JSON");
+const headers = response.slice(0, split);
+const jsonAt = response.indexOf("{", split);
+const pr = JSON.parse(response.slice(jsonAt));
+const match = headers.match(/^etag:\s*(.+)$/im);
+if (!match) throw new Error("GitHub PR response did not include an ETag");
+const observed = fs.readFileSync(bodyPath, "utf8");
+if (pr.state !== "open" || pr.draft !== true || pr.base?.ref !== "dev" ||
+    pr.head?.ref !== branch || pr.body !== observed) {
+  throw new Error("epic PR changed before the conditional ledger update; retry");
+}
+fs.writeFileSync(etagPath, match[1].trim());
+NODE
+  node - "$updated_body" "$state_dir/epic-pr-patch" <<'NODE'
+const fs = require("node:fs");
+const [bodyPath, outputPath] = process.argv.slice(2);
+fs.writeFileSync(outputPath, JSON.stringify({body: fs.readFileSync(bodyPath, "utf8")}));
+NODE
+  local etag
+  etag=$(<"$state_dir/epic-pr-etag")
+  gh api --method PATCH -H "If-Match: $etag" "repos/$GH_REPO/pulls/$number" \
+    --input "$state_dir/epic-pr-patch" >"$state_dir/gh.out" 2>"$state_dir/gh.err" ||
+    die "conditional epic PR update was refused; retry without overwriting remote edits: $(tr '\n' ' ' <"$state_dir/gh.err")"
+}
+
+query_epic_pr() {
+  local out=$1
+  gh pr list --repo "$GH_REPO" --state all --head "$MIRROR_BRANCH" --limit 100 \
+    --json number,url,state,isDraft,baseRefName,headRefName,body >"$out"
+}
+
+parse_epic_pr() {
+  local json=$1 fields=$2 body=$3
+  node - "$json" "$MIRROR_BRANCH" "$fields" "$body" <<'NODE'
+const fs = require("node:fs");
+const [jsonPath, branch, fieldsPath, bodyPath] = process.argv.slice(2);
+const prs = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+if (!Array.isArray(prs) || prs.length > 1) throw new Error("epic branch has multiple GitHub PR records");
+if (!prs.length) {
+  fs.writeFileSync(fieldsPath, "");
+  fs.writeFileSync(bodyPath, "");
+  process.exit(0);
+}
+const pr = prs[0];
+if (pr.state !== "OPEN" || pr.isDraft !== true || pr.baseRefName !== "dev" || pr.headRefName !== branch) {
+  throw new Error("epic PR must be an open draft with the requested head and dev base");
+}
+if (typeof pr.body !== "string") throw new Error("epic PR body is unavailable");
+fs.writeFileSync(fieldsPath, `${pr.number}\n${pr.url}\n`);
+fs.writeFileSync(bodyPath, pr.body);
+NODE
+}
+
 cleanup() {
   local rc=$?
   trap - EXIT
@@ -277,22 +592,24 @@ cleanup() {
   fi
   [ -z "${FORGE_TMP_REF:-}" ] || git update-ref -d "$FORGE_TMP_REF" >/dev/null 2>&1 || true
   [ -z "${ORIGIN_TMP_REF:-}" ] || git update-ref -d "$ORIGIN_TMP_REF" >/dev/null 2>&1 || true
+  [ -z "${EPIC_TMP_REF:-}" ] || git update-ref -d "$EPIC_TMP_REF" >/dev/null 2>&1 || true
   if [ -n "${RUN_DIR:-}" ] && [ -d "$RUN_DIR" ]; then
-    rm -f "$RUN_DIR/item.json" "$RUN_DIR/item-recheck.json" "$RUN_DIR/item-fields" \
-      "$RUN_DIR/pr-body" "$RUN_DIR/source-message" "$RUN_DIR/new-message" \
-      "$RUN_DIR/source-commit" "$RUN_DIR/new-commit" \
-      "$RUN_DIR/source-meta" "$RUN_DIR/new-meta" "$RUN_DIR/source-patch" \
-      "$RUN_DIR/new-patch" "$RUN_DIR/gh.out" "$RUN_DIR/gh.err"
+    rm -f "$RUN_DIR"/*
     rmdir "$RUN_DIR" >/dev/null 2>&1 || warn "temporary state remains at $RUN_DIR"
   fi
   exit "$rc"
 }
 
 main() {
-  [ "$#" -eq 2 ] ||
-    die "usage: ops/mirror-forge-pr.sh <forge-pr-number> <source-head-oid>"
+  [ "$#" -eq 2 ] || [ "$#" -eq 3 ] ||
+    die "usage: ops/mirror-forge-pr.sh <forge-pr-number> <source-head-oid> [epic-branch-or-slug]"
   PR_NUMBER=$1
   SOURCE_OID=${2,,}
+  EPIC_MODE=0
+  if [ "$#" -eq 3 ]; then
+    EPIC_MODE=1
+    normalize_epic_branch "$3"
+  fi
   [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || die "Forge PR number must be a positive integer"
   is_oid "$SOURCE_OID" || die "source commit must be 40 hex characters"
   command -v curl >/dev/null || die "curl is required"
@@ -320,7 +637,12 @@ main() {
   MIRROR_WORKTREE="$RUN_DIR/worktree"
   FORGE_TMP_REF="refs/mirror-tmp/$token/forge-dev"
   ORIGIN_TMP_REF="refs/mirror-tmp/$token/origin-dev"
-  MIRROR_BRANCH="mirror/forge-pr-$PR_NUMBER-$short"
+  EPIC_TMP_REF="refs/mirror-tmp/$token/epic"
+  if [ "$EPIC_MODE" -eq 1 ]; then
+    MIRROR_BRANCH=$EPIC_BRANCH
+  else
+    MIRROR_BRANCH="mirror/forge-pr-$PR_NUMBER-$short"
+  fi
   mkdir -p "$primary/.worktree"
   mkdir "$RUN_DIR"
   trap cleanup EXIT
@@ -354,32 +676,198 @@ main() {
   git fetch --no-tags origin "refs/heads/dev:$ORIGIN_TMP_REF"
   local origin_oid
   origin_oid=$(git rev-parse "$ORIGIN_TMP_REF^{commit}")
-  assert_shared_dev_base "$forge_target" "$origin_oid"
-  log "shared dev history: Forge target $forge_target is represented by GitHub $origin_oid"
-  git worktree add --detach "$MIRROR_WORKTREE" "$origin_oid" >/dev/null
+
+  local replay_base=$origin_oid epic_history_base=$origin_oid
+  local epic_tip="" epic_pr_number="" epic_pr_url=""
+  local epic_recovery=0 epic_repeat=0
+  local -a MIRROR_COMMITS=()
+  if [ "$EPIC_MODE" -eq 1 ]; then
+    gh auth status -h github.com >/dev/null 2>&1 ||
+      die "gh is not authenticated for github.com (authenticate before mirroring)"
+    query_epic_pr "$RUN_DIR/epic-pr.json"
+    parse_epic_pr "$RUN_DIR/epic-pr.json" "$RUN_DIR/epic-pr-fields" "$RUN_DIR/epic-body"
+    local -a epic_pr_fields=()
+    mapfile -t epic_pr_fields <"$RUN_DIR/epic-pr-fields"
+    if [ "${#epic_pr_fields[@]}" -gt 0 ]; then
+      [ "${#epic_pr_fields[@]}" -eq 2 ] || die "GitHub epic PR metadata was incomplete"
+      epic_pr_number=${epic_pr_fields[0]}
+      epic_pr_url=${epic_pr_fields[1]}
+    else
+      printf '%s\n' \
+        'Draft improvement epic for verified Forge changes.' \
+        '' \
+        'Each append is recorded in the machine-maintained provenance ledger below. Final clean-context review and merge remain manual.' \
+        >"$RUN_DIR/epic-body"
+    fi
+
+    local listed_tip=""
+    listed_tip=$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH") || true
+    if [ -n "$listed_tip" ]; then
+      git fetch --no-tags origin "refs/heads/$MIRROR_BRANCH:$EPIC_TMP_REF"
+      epic_tip=$(git rev-parse "$EPIC_TMP_REF^{commit}")
+      [ "$epic_tip" = "$listed_tip" ] || die "epic branch moved while it was fetched; retry"
+      [ -n "$epic_pr_number" ] || warn "epic branch exists without a PR; only exact partial-create recovery is allowed"
+      epic_history_base=$(resolve_epic_history_base "$origin_oid" "$epic_tip")
+      replay_base=$epic_tip
+    else
+      [ -z "$epic_pr_number" ] || die "epic PR exists but its branch is missing"
+    fi
+  fi
+  assert_shared_dev_base "$forge_target" "$replay_base"
+  log "shared dev history: Forge target $forge_target is represented by GitHub $replay_base"
+
+  git worktree add --detach "$MIRROR_WORKTREE" "$replay_base" >/dev/null
   WORKTREE_ADDED=1
   assert_clean "$MIRROR_WORKTREE"
 
-  local commit
-  for commit in "${SOURCE_COMMITS[@]}"; do
-    log "replaying $commit with its original message and identities"
-    replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR"
-  done
-  local mirror_tip=$MIRRORED_OID
+  local commit mirror_tip
+  if [ "$EPIC_MODE" -eq 1 ]; then
+    parse_epic_ledger "$RUN_DIR/epic-body" "$RUN_DIR/epic-records"
+    local -a branch_commits=() ledger_mirrors=() current_sources=() current_mirrors=()
+    mapfile -t branch_commits < <(git rev-list --reverse --topo-order "$epic_history_base..$replay_base")
+    local previous=$epic_history_base branch_commit parent_line
+    local -a branch_parents=()
+    for branch_commit in "${branch_commits[@]}"; do
+      parent_line=$(git show -s --format=%P "$branch_commit")
+      read -r -a branch_parents <<<"$parent_line"
+      [ "${#branch_parents[@]}" -eq 1 ] && [ "${branch_parents[0]}" = "$previous" ] ||
+        die "epic branch history is not one linear fast-forward chain at $branch_commit"
+      previous=$branch_commit
+    done
+    local record_kind record_a record_b record_c record_d record_e in_current=0 current_seen=0
+    local -a selected_source_commits=("${SOURCE_COMMITS[@]}")
+    : >"$RUN_DIR/epic-records-resolved"
+    while IFS=$'\t' read -r record_kind record_a record_b record_c record_d record_e; do
+      [ -n "$record_kind" ] || continue
+      if [ "$record_kind" = E ]; then
+        printf 'E\t%s\t%s\t%s\t%s\t%s\n' \
+          "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
+          >>"$RUN_DIR/epic-records-resolved"
+        in_current=0
+        if [ "$record_a" = "$FORGE_REPO" ] && [ "$record_b" = "$PR_NUMBER" ]; then
+          current_seen=1
+          in_current=1
+          [ "$record_c" = "$MERGE_OID" ] && [ "$record_d" = "$SOURCE_OID" ] &&
+            [ "$record_e" = "$forge_target" ] ||
+            die "epic provenance for $FORGE_REPO#$PR_NUMBER does not match the selected Forge PR"
+        fi
+      elif [ "$record_kind" = C ]; then
+        printf 'C\t%s\t%s\n' "$record_a" "$record_b" \
+          >>"$RUN_DIR/epic-records-resolved"
+        ledger_mirrors+=("$record_b")
+        verify_replayed_commit "$record_a" "$record_b" "$RUN_DIR" "epic ledger"
+        if [ "$in_current" -eq 1 ]; then
+          current_sources+=("$record_a")
+          current_mirrors+=("$record_b")
+        fi
+      elif [ "$record_kind" = L ]; then
+        in_current=0
+        git merge-base --is-ancestor "$record_c" "$forge_dev" ||
+          die "legacy epic provenance merge $record_c is not in canonical Forge dev"
+        local legacy_target
+        legacy_target=$(validate_merged_selection "$record_c" "$record_d")
+        [ "$legacy_target" = "$record_e" ] ||
+          die "legacy epic provenance target does not match Forge merge $record_c"
+        validate_commit_range "$record_e" "$record_d"
+        local -a legacy_sources=("${SOURCE_COMMITS[@]}")
+        SOURCE_COMMITS=("${selected_source_commits[@]}")
+        if [ "$record_a" = "$FORGE_REPO" ] && [ "$record_b" = "$PR_NUMBER" ]; then
+          current_seen=1
+          [ "$record_c" = "$MERGE_OID" ] && [ "$record_d" = "$SOURCE_OID" ] &&
+            [ "$record_e" = "$forge_target" ] ||
+            die "legacy epic provenance for $FORGE_REPO#$PR_NUMBER does not match the selected Forge PR"
+          in_current=1
+        fi
+        printf 'E\t%s\t%s\t%s\t%s\t%s\n' \
+          "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
+          >>"$RUN_DIR/epic-records-resolved"
+        local legacy_source legacy_mirror branch_index
+        for legacy_source in "${legacy_sources[@]}"; do
+          branch_index=${#ledger_mirrors[@]}
+          [ "$branch_index" -lt "${#branch_commits[@]}" ] ||
+            die "legacy epic provenance names history missing from the epic branch"
+          legacy_mirror=${branch_commits[$branch_index]}
+          verify_replayed_commit "$legacy_source" "$legacy_mirror" "$RUN_DIR" \
+            "legacy epic provenance"
+          ledger_mirrors+=("$legacy_mirror")
+          printf 'C\t%s\t%s\n' "$legacy_source" "$legacy_mirror" \
+            >>"$RUN_DIR/epic-records-resolved"
+          if [ "$in_current" -eq 1 ]; then
+            current_sources+=("$legacy_source")
+            current_mirrors+=("$legacy_mirror")
+          fi
+        done
+      else
+        die "epic provenance parser returned an invalid record"
+      fi
+    done <"$RUN_DIR/epic-records"
+    [ "${#ledger_mirrors[@]}" -le "${#branch_commits[@]}" ] ||
+      die "epic provenance ledger names commits not present on the branch"
+    local i
+    for ((i = 0; i < ${#ledger_mirrors[@]}; i += 1)); do
+      [ "${ledger_mirrors[$i]}" = "${branch_commits[$i]}" ] ||
+        die "epic provenance ledger does not match branch history at ${branch_commits[$i]}"
+    done
+    if [ "$current_seen" -eq 1 ]; then
+      [ "${#ledger_mirrors[@]}" -eq "${#branch_commits[@]}" ] ||
+        die "epic branch has history missing from its provenance ledger"
+      [ "${#current_sources[@]}" -eq "${#SOURCE_COMMITS[@]}" ] ||
+        die "epic provenance for $FORGE_REPO#$PR_NUMBER has a partial commit range"
+      for ((i = 0; i < ${#SOURCE_COMMITS[@]}; i += 1)); do
+        [ "${current_sources[$i]}" = "${SOURCE_COMMITS[$i]}" ] ||
+          die "epic provenance for $FORGE_REPO#$PR_NUMBER names the wrong source commit"
+      done
+      MIRROR_COMMITS=("${current_mirrors[@]}")
+      mirror_tip=$replay_base
+      epic_repeat=1
+    else
+      local uncovered=$((${#branch_commits[@]} - ${#ledger_mirrors[@]}))
+      if [ "$uncovered" -gt 0 ]; then
+        [ "$uncovered" -eq "${#SOURCE_COMMITS[@]}" ] ||
+          die "epic branch has partial or unrelated history missing from its provenance ledger"
+        for ((i = 0; i < uncovered; i += 1)); do
+          local branch_index=$((${#ledger_mirrors[@]} + i))
+          verify_replayed_commit "${SOURCE_COMMITS[$i]}" "${branch_commits[$branch_index]}" \
+            "$RUN_DIR" "partial-success recovery"
+          MIRROR_COMMITS+=("${branch_commits[$branch_index]}")
+        done
+        [ -n "$epic_pr_number" ] ||
+          [ "${#ledger_mirrors[@]}" -eq 0 ] || die "epic branch without a PR contains prior ledger history"
+        mirror_tip=$replay_base
+        epic_recovery=1
+      else
+        for commit in "${SOURCE_COMMITS[@]}"; do
+          log "appending $commit to epic with its original message and identities"
+          replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR"
+          MIRROR_COMMITS+=("$MIRRORED_OID")
+        done
+        mirror_tip=$MIRRORED_OID
+      fi
+    fi
+  else
+    for commit in "${SOURCE_COMMITS[@]}"; do
+      log "replaying $commit with its original message and identities"
+      replay_commit "$MIRROR_WORKTREE" "$commit" "$RUN_DIR"
+    done
+    mirror_tip=$MIRRORED_OID
+  fi
   git -C "$MIRROR_WORKTREE" diff --quiet "$origin_oid..$mirror_tip" &&
     die "Forge PR has no net changes on GitHub dev"
   git -C "$MIRROR_WORKTREE" diff --check "$origin_oid..$mirror_tip"
 
-  gh auth status -h github.com >/dev/null 2>&1 ||
-    die "gh is not authenticated for github.com (authenticate before mirroring)"
+  if [ "$EPIC_MODE" -eq 0 ]; then
+    gh auth status -h github.com >/dev/null 2>&1 ||
+      die "gh is not authenticated for github.com (authenticate before mirroring)"
+  fi
+
   local remote_dev
   remote_dev=$(remote_ref_oid origin refs/heads/dev) || die "origin/dev is missing"
   [ "$remote_dev" = "$origin_oid" ] || die "origin/dev moved during replay; retry from the new base"
-  if remote_ref_oid origin "refs/heads/$MIRROR_BRANCH" >/dev/null; then
-    die "GitHub mirror branch already exists: $MIRROR_BRANCH"
-  fi
-
-  cat >>"$RUN_DIR/pr-body" <<EOF
+  if [ "$EPIC_MODE" -eq 0 ]; then
+    if remote_ref_oid origin "refs/heads/$MIRROR_BRANCH" >/dev/null; then
+      die "GitHub mirror branch already exists: $MIRROR_BRANCH"
+    fi
+    cat >>"$RUN_DIR/pr-body" <<EOF
 
 
 ---
@@ -391,15 +879,25 @@ GitHub base: $origin_oid
 
 This GitHub PR is a mirror. Merge it with a merge commit; do not squash or rebase.
 EOF
-
-  log "pushing $mirror_tip to $MIRROR_BRANCH"
-  # An absent-ref lease makes branch ownership atomic even when two runs race
-  # with the same deterministic branch and commit (a plain push may say that
-  # the second identical push is already up to date).
-  git -C "$MIRROR_WORKTREE" push \
-    --force-with-lease="refs/heads/$MIRROR_BRANCH:" \
-    origin "HEAD:refs/heads/$MIRROR_BRANCH"
-  PUSHED=1
+    log "pushing $mirror_tip to $MIRROR_BRANCH"
+    # An absent-ref lease makes branch ownership atomic even when two runs race
+    # with the same deterministic branch and commit (a plain push may say that
+    # the second identical push is already up to date).
+    git -C "$MIRROR_WORKTREE" push \
+      --force-with-lease="refs/heads/$MIRROR_BRANCH:" \
+      origin "HEAD:refs/heads/$MIRROR_BRANCH"
+    PUSHED=1
+  elif [ "$epic_repeat" -eq 0 ] && [ "$epic_recovery" -eq 0 ]; then
+    local before_push=""
+    before_push=$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH") || true
+    [ "$before_push" = "$epic_tip" ] || die "epic branch moved during replay; retry"
+    log "fast-forwarding $MIRROR_BRANCH to $mirror_tip"
+    # This deliberately is not a force push. A concurrent update or a rewrite
+    # makes the ref update fail, and the exact post-push check catches an
+    # identical/up-to-date race as well.
+    git -C "$MIRROR_WORKTREE" push origin "HEAD:refs/heads/$MIRROR_BRANCH"
+    PUSHED=1
+  fi
   local pushed_oid
   pushed_oid=$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH") || die "pushed branch is missing"
   [ "$pushed_oid" = "$mirror_tip" ] || die "pushed branch does not match the verified mirror commit"
@@ -409,6 +907,69 @@ EOF
   query_item "$RUN_DIR/item-recheck.json"
   cmp -s "$RUN_DIR/item.json" "$RUN_DIR/item-recheck.json" ||
     die "Forge PR metadata changed during mirroring; retry"
+
+  if [ "$EPIC_MODE" -eq 1 ]; then
+    [ "$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH")" = "$mirror_tip" ] ||
+      die "epic branch moved before its provenance ledger update; retry"
+    if [ "$epic_repeat" -eq 1 ]; then
+      [ -n "$epic_pr_number" ] || die "repeated epic provenance has no open draft PR"
+      query_epic_pr "$RUN_DIR/epic-pr-final.json"
+      cmp -s "$RUN_DIR/epic-pr.json" "$RUN_DIR/epic-pr-final.json" ||
+        die "epic PR changed during idempotence verification; retry"
+      [ "$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH")" = "$mirror_tip" ] ||
+        die "epic branch moved during idempotence verification; retry"
+      log "already appended and verified: $epic_pr_url"
+      log "epic finalization remains a separate manual clean-context review and merge-commit action"
+      return
+    fi
+
+    : >"$RUN_DIR/epic-mappings"
+    local i
+    for ((i = 0; i < ${#SOURCE_COMMITS[@]}; i += 1)); do
+      printf '%s\t%s\n' "${SOURCE_COMMITS[$i]}" "${MIRROR_COMMITS[$i]}" >>"$RUN_DIR/epic-mappings"
+    done
+    node - "$RUN_DIR/epic-mappings" "$RUN_DIR/epic-entry" "$FORGE_REPO" "$PR_NUMBER" \
+      "$MERGE_OID" "$SOURCE_OID" "$forge_target" <<'NODE'
+const fs = require("node:fs");
+const [mappingsPath, outputPath, repo, pr, merge, source, target] = process.argv.slice(2);
+const commits = fs.readFileSync(mappingsPath, "utf8").trim().split("\n").filter(Boolean).map(line => {
+  const [source, mirror] = line.split("\t");
+  return {source, mirror};
+});
+fs.writeFileSync(outputPath, JSON.stringify({repo, pr: Number(pr), merge, source, target, commits}));
+NODE
+    append_epic_ledger "$RUN_DIR/epic-body" "$RUN_DIR/epic-entry" \
+      "$RUN_DIR/epic-body-updated" "$RUN_DIR/epic-records-resolved"
+
+    if [ -n "$epic_pr_number" ]; then
+      # If-Match ties the mutation to the exact body and PR revision just read.
+      update_epic_pr_body "$epic_pr_number" "$RUN_DIR/epic-body" \
+        "$RUN_DIR/epic-body-updated" "$RUN_DIR"
+      PR_CREATED=1
+    else
+      local epic_title="Improvement epic: $3"
+      gh pr create --draft --repo "$GH_REPO" --base dev --head "$MIRROR_BRANCH" \
+        --title "$epic_title" --body-file "$RUN_DIR/epic-body-updated" \
+        >"$RUN_DIR/gh.out" 2>"$RUN_DIR/gh.err" ||
+        die "gh pr create failed: $(tr '\n' ' ' <"$RUN_DIR/gh.err")"
+      PR_CREATED=1
+    fi
+    query_epic_pr "$RUN_DIR/epic-pr-final.json"
+    parse_epic_pr "$RUN_DIR/epic-pr-final.json" "$RUN_DIR/epic-pr-final-fields" "$RUN_DIR/epic-body-final"
+    cmp -s "$RUN_DIR/epic-body-updated" "$RUN_DIR/epic-body-final" ||
+      die "epic PR body does not contain the exact verified provenance ledger"
+    [ "$(remote_ref_oid origin "refs/heads/$MIRROR_BRANCH")" = "$mirror_tip" ] ||
+      die "epic branch moved while its provenance ledger was updated; retry"
+    local -a final_fields=()
+    mapfile -t final_fields <"$RUN_DIR/epic-pr-final-fields"
+    [ "${#final_fields[@]}" -eq 2 ] || die "updated epic PR metadata is incomplete"
+    log "draft epic: ${final_fields[1]}"
+    if [ "$epic_recovery" -eq 1 ]; then
+      log "recovered an already-pushed exact replay by repairing only its missing ledger entry"
+    fi
+    log "epic finalization remains a separate manual clean-context review and merge-commit action"
+    return
+  fi
 
   set +e
   gh pr create --draft --repo "$GH_REPO" --base dev --head "$MIRROR_BRANCH" \
