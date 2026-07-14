@@ -37,7 +37,7 @@ mod actor_api;
 mod workspaces;
 // the REAL portable-agent-run provisioner (NodedProvisioner + agent_runs_root,
 // the D7 root). public so BOTH node binaries can build one and wire it into
-// their DispatchPool via `with_provisioner`.
+// their DispatchPool constructor.
 pub mod agent_provision;
 // realtime overlay websocket lanes: huddle and Pages-presence session/control types.
 mod call;
