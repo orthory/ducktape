@@ -182,6 +182,9 @@ export interface ConsoleActions {
   accountRemoveMember(targetKeyHex: string): Promise<void>;
   /** Evict a (lost) node from this account — its first UI consumer. */
   accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Set (or clear, with null) a bound node's on-chain device label. Origin-
+   *  gated — submitted by the connected managed node, no signing. */
+  accountSetNodeLabel(targetNodeHex: string, label: string | null): Promise<void>;
   /** Manually re-run the connect-time auto-bind for the active workspace's
    *  node — the escape hatch when that fire-and-forget pass returned
    *  locked/deferred/failed and nothing would ever retry. Resolves to the
@@ -1809,6 +1812,16 @@ export function createActions({
     accountUnbindNode: (targetNodeHex) =>
       Promise.resolve()
         .then(() => unbindNode(accountDeps(), targetNodeHex))
+        .then(() => refresh()),
+    accountSetNodeLabel: (targetNodeHex, label) =>
+      Promise.resolve()
+        .then(() => {
+          const live = getNode();
+          if (!live) throw new Error("not connected to a workspace node");
+          // Origin-gated write: the local managed node stamps its own key as
+          // origin, so no signing ceremony — mirrors the account-name write.
+          return identityClient.setNodeLabel(live, { nodeKeyHex: targetNodeHex, label });
+        })
         .then(() => refresh()),
     accountBindNode: () =>
       Promise.resolve()

@@ -52,6 +52,16 @@ pub struct MemberKeyView {
     pub added_at: u64,
 }
 
+/// one bound node as queries expose it: its node (mesh/valset) key and the
+/// optional human label a bound device set for it (`SetNodeLabel`). The label
+/// is a per-network on-chain fact, so a device's name shows on the user's other
+/// devices connected to the same network.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NodeView {
+    pub node_key: Vec<u8>,
+    pub label: Option<String>,
+}
+
 /// one account record as queries expose it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AccountView {
@@ -72,7 +82,8 @@ pub struct AccountView {
     /// the collected keys, ascending by public key. always non-empty for a
     /// live account.
     pub member_keys: Vec<MemberKeyView>,
-    pub nodes: Vec<Vec<u8>>,
+    /// the bound nodes, ascending by node key, each with its optional label.
+    pub nodes: Vec<NodeView>,
     pub updated_at: u64,
 }
 
@@ -136,6 +147,17 @@ pub enum IdentityMsg {
     SetProfile {
         avatar: Option<String>,
         bio: Option<String>,
+    },
+    /// set (or clear, on empty trim) the human label of `node_key`. ORIGIN-GATED
+    /// exactly like [`IdentityMsg::SetAccountName`]: accepted only from a node
+    /// bound to the account, and `node_key` must be bound to that SAME account
+    /// (you label your own devices). a device label is cosmetic display
+    /// metadata, not a capability — so it rides the origin gate a bound node
+    /// already carries, with no member signature and no nonce bump. over
+    /// [`MAX_LABEL_LEN`] bytes rejects.
+    SetNodeLabel {
+        node_key: Vec<u8>,
+        label: Option<String>,
     },
 }
 
@@ -332,6 +354,14 @@ mod tests {
             IdentityMsg::SetProfile {
                 avatar: None,
                 bio: Some("building ducks".into()),
+            },
+            IdentityMsg::SetNodeLabel {
+                node_key: vec![5; 32],
+                label: Some("Kim's laptop".into()),
+            },
+            IdentityMsg::SetNodeLabel {
+                node_key: vec![5; 32],
+                label: None,
             },
         ] {
             assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);

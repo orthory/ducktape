@@ -42,7 +42,7 @@ const account = (patch: Partial<AccountView> = {}): AccountView => ({
   bio: null,
   nonce: 1,
   member_keys: [{ pubkey: [1, 2, 3], kind: "ed25519", label: null, added_at: 1 }],
-  nodes: [[0xaa]],
+  nodes: [{ node_key: [0xaa], label: null }],
   updated_at: 1,
   ...patch,
 });

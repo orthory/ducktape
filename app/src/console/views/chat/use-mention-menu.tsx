@@ -37,7 +37,7 @@ import {
 } from "./mention";
 
 const EMPTY_AGENTS: AgentRecord[] = [];
-const EMPTY_NODE_USERS: Record<string, { accountId: string; name: string | null }> = {};
+const EMPTY_NODE_USERS: Record<string, { accountId: string; name: string | null; label?: string | null }> = {};
 
 /** Below this many px of headroom the list drops DOWNWARD instead — an
  *  upward menu near the window top would render off-screen while still

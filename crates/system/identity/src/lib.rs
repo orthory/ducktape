@@ -20,6 +20,9 @@
 //! - [`IdentityMsg::RemoveMemberKey`] drops a key (any member may drop any,
 //!   except the last -- an account always keeps at least one live key).
 //! - [`IdentityMsg::SetAccountName`] renames, origin-gated to a bound node.
+//! - [`IdentityMsg::SetNodeLabel`] labels a bound node, origin-gated the same
+//!   way (a bound node labels its account's own devices; the label is a
+//!   per-network on-chain fact visible to the user's other devices).
 //!
 //! state model mirrors capability's host-lent staging seam: `execute`
 //! STAGES into a `pending` overlay (committed state untouched); `query` reads
@@ -76,10 +79,18 @@ struct MemberMeta {
     added_at: u64,
 }
 
+/// per-node metadata; the node key is the map key, so it is not repeated. the
+/// label is the human name a bound device set (`SetNodeLabel`) and is dropped
+/// with the node on unbind.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct NodeMeta {
+    label: Option<String>,
+}
+
 /// one stored account: display name, avatar ref + bio (the account's global
 /// profile, propagated per-network by the app), shared replay nonce, the
-/// member-key set, the bound node set, and the last-write block timestamp.
-/// `account_id` is the map key, so it is not repeated here.
+/// member-key set, the labeled bound-node map, and the last-write block
+/// timestamp. `account_id` is the map key, so it is not repeated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AccountRecord {
     display_name: Option<String>,
@@ -89,7 +100,7 @@ struct AccountRecord {
     bio: Option<String>,
     nonce: u64,
     member_keys: BTreeMap<Vec<u8>, MemberMeta>,
-    nodes: BTreeSet<Vec<u8>>,
+    nodes: BTreeMap<Vec<u8>, NodeMeta>,
     updated_at: u64,
 }
 
@@ -260,7 +271,14 @@ impl Identity {
                     added_at: meta.added_at,
                 })
                 .collect(),
-            nodes: record.nodes.iter().cloned().collect(),
+            nodes: record
+                .nodes
+                .iter()
+                .map(|(node_key, meta)| NodeView {
+                    node_key: node_key.clone(),
+                    label: meta.label.clone(),
+                })
+                .collect(),
             updated_at: record.updated_at,
         }
     }
@@ -273,8 +291,8 @@ impl Identity {
     /// set), `u64-le` nonce, `u64-le` member count then per sorted member
     /// (`len+pubkey`, kind tag `u8`, label flag + `len+label` if set,
     /// rp-hash flag + 32 bytes if set, `u64-le added_at`), `u64-le` node count
-    /// then per sorted node `len+node`, and `u64-le updated_at`. both indexes
-    /// are derived and excluded.
+    /// then per sorted node (`len+node`, label flag `u8` + `len+label` if set),
+    /// and `u64-le updated_at`. both indexes are derived and excluded.
     fn encode_state(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(accounts.len() as u64).to_le_bytes());
@@ -301,8 +319,9 @@ impl Identity {
             }
 
             out.extend_from_slice(&(record.nodes.len() as u64).to_le_bytes());
-            for node in &record.nodes {
+            for (node, meta) in &record.nodes {
                 push_bytes(&mut out, node);
+                push_opt_str(&mut out, meta.label.as_deref());
             }
             out.extend_from_slice(&record.updated_at.to_le_bytes());
         }
@@ -321,7 +340,7 @@ impl Identity {
     fn node_index_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let mut index = BTreeMap::new();
         for (account_id, record) in accounts {
-            for node in &record.nodes {
+            for node in record.nodes.keys() {
                 index.insert(node.clone(), account_id.clone());
             }
         }
@@ -425,7 +444,7 @@ impl Identity {
         let mut seen_nodes = BTreeSet::new();
         let mut seen_members = BTreeSet::new();
         for record in accounts.values() {
-            for node in &record.nodes {
+            for node in record.nodes.keys() {
                 if !seen_nodes.insert(node.clone()) {
                     return Err(Error::Module("node bound twice in snapshot".into()));
                 }
@@ -494,10 +513,11 @@ impl Identity {
         Ok(members)
     }
 
-    fn decode_nodes(cur: &mut Cursor) -> Result<BTreeSet<Vec<u8>>, Error> {
+    fn decode_nodes(cur: &mut Cursor) -> Result<BTreeMap<Vec<u8>, NodeMeta>, Error> {
         let count = cur.u64("snapshot node count")?;
-        cur.bound(count, 8, "snapshot node")?;
-        let mut nodes = BTreeSet::new();
+        // per-node minimum: key-len(8) + label flag(1) = 9 bytes.
+        cur.bound(count, 9, "snapshot node")?;
+        let mut nodes = BTreeMap::new();
         let mut prev: Option<Vec<u8>> = None;
         for _ in 0..count {
             let node = cur.bytes("snapshot node key")?.to_vec();
@@ -506,8 +526,9 @@ impl Identity {
                     "snapshot node keys must be strictly increasing within an account".into(),
                 ));
             }
+            let label = cur.opt_str(MAX_LABEL_LEN, "snapshot node label")?;
             prev = Some(node.clone());
-            nodes.insert(node);
+            nodes.insert(node, NodeMeta { label });
         }
         Ok(nodes)
     }
@@ -549,6 +570,9 @@ impl Module for Identity {
                 self.set_account_name(ctx, display_name)
             }
             IdentityMsg::SetProfile { avatar, bio } => self.set_profile(ctx, avatar, bio),
+            IdentityMsg::SetNodeLabel { node_key, label } => {
+                self.set_node_label(ctx, node_key, label)
+            }
         }
     }
 
@@ -603,7 +627,7 @@ impl Module for Identity {
             self.member_index.retain(|_, owner| owner != &account_id);
             match change {
                 Some(record) => {
-                    for node in &record.nodes {
+                    for node in record.nodes.keys() {
                         self.node_index.insert(node.clone(), account_id.clone());
                     }
                     for member in record.member_keys.keys() {
@@ -683,7 +707,7 @@ impl Identity {
                         bio: None,
                         nonce: 0,
                         member_keys,
-                        nodes: BTreeSet::new(),
+                        nodes: BTreeMap::new(),
                         updated_at: 0,
                     };
                     (authorizer.key.clone(), record)
@@ -706,7 +730,7 @@ impl Identity {
         let preimage = bind_preimage(&self.chain_id, &origin, record.nonce);
         Self::authorize(&record, IDENTITY_BIND_NS, &preimage, &authorizer)?;
 
-        record.nodes.insert(origin);
+        record.nodes.insert(origin, NodeMeta::default());
         record.nonce += 1;
         record.updated_at = ctx.env().consensus_time;
         self.pending.insert(account_id, Some(record));
@@ -916,6 +940,45 @@ impl Identity {
 
         record.avatar = clean_field(avatar, MAX_AVATAR_REF_LEN, "avatar reference")?;
         record.bio = clean_field(bio, MAX_BIO_LEN, "bio")?;
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
+    }
+
+    /// set (or clear) the label of `node_key`. origin-gated exactly like
+    /// `set_account_name`: the submitting node must be bound to an account, and
+    /// `node_key` must be bound to that SAME account (you label your own
+    /// devices). a device label is cosmetic display metadata, so it rides the
+    /// bound-node origin gate with no member signature and no nonce bump.
+    fn set_node_label(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        node_key: Vec<u8>,
+        label: Option<String>,
+    ) -> Result<(), Error> {
+        let origin = Self::origin_key(ctx)?;
+        let index = self.merged_node_index();
+        let account_id = index
+            .get(&origin)
+            .cloned()
+            .ok_or_else(|| Error::Module("origin node is not bound to an account".into()))?;
+        // the target must be bound to the SAME account -- a bound node labels
+        // only its own account's devices, never another account's node.
+        if index.get(&node_key) != Some(&account_id) {
+            return Err(Error::Module(
+                "target node is not bound to the origin's account".into(),
+            ));
+        }
+        let mut record = self
+            .merged_record(&account_id)
+            .expect("node_index only ever points at an existing record");
+
+        let meta = record
+            .nodes
+            .get_mut(&node_key)
+            .expect("target was just found in this account's node index");
+        meta.label = clean_label(label)?;
+        // no signature is consumed here: the nonce is NOT bumped.
         record.updated_at = ctx.env().consensus_time;
         self.pending.insert(account_id, Some(record));
         Ok(())

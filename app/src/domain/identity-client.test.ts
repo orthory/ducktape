@@ -27,7 +27,7 @@ const wireAccount = (patch: Partial<AccountView> = {}): AccountView => ({
   bio: null,
   nonce: 0,
   member_keys: [{ pubkey: [1, 2, 3], kind: "ed25519", label: null, added_at: 1 }],
-  nodes: [[4, 5, 6]],
+  nodes: [{ node_key: [4, 5, 6], label: null }],
   updated_at: 1,
   ...patch,
 });
