@@ -616,12 +616,15 @@ export const isClientMode = (
   state: Pick<ConsoleState, "workspace" | "nodeUrl">,
 ): boolean => state.workspace === null && state.nodeUrl !== null;
 
-/** Node control is available (ADR A5, interim form): the active workspace's
- *  node is a managed local daemon — ours to control even while it is stopped
+/** Node control is available (ADR A5, interim form): a PER-NETWORK evaluation
+ *  of the ACTIVE seat — the active network is a local one whose daemon this app
+ *  manages (`store/networks.ts` `nodeControlForSeat`). A remote/client seat is
+ *  never controllable (A6). Ours to control even while the node is stopped
  *  (Start lives on the node console, so reachability is deliberately NOT a
- *  term here). When the public/private RPC split (A2) lands, this grows
- *  `|| (owner key && private RPC reachable)`; the UI gate moves with it and
- *  nothing else does. */
+ *  term here); under single-active only the active local seat is `managed`.
+ *  When the public/private RPC split (A2) lands, W2 grows `nodeControlForSeat`
+ *  to `|| (owner key && private RPC reachable)` — that one function is the seam;
+ *  the UI gate moves with it and nothing else does. */
 export const nodeControlAvailable = (
   state: Pick<ConsoleState, "workspace" | "managed">,
 ): boolean => state.workspace !== null && state.managed;
