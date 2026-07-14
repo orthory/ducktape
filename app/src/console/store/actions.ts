@@ -1049,7 +1049,7 @@ export function createActions({
   // one bad anchor rejects every op behind it and the raw per-op reasons are
   // noise. It never swallows the failure: the ledger still records it and the
   // promise still resolves false.
-  const pendingSubmits = new Set<string>();
+  const pendingSubmitsByNode = new WeakMap<NodeTransport, Set<string>>();
   const submitTracked = (
     key: string,
     submit: (live: NodeTransport) => Promise<unknown>,
@@ -1058,6 +1058,11 @@ export function createActions({
   ) => {
     const live = getNode();
     if (!live) return Promise.resolve(false);
+    let pendingSubmits = pendingSubmitsByNode.get(live);
+    if (!pendingSubmits) {
+      pendingSubmits = new Set<string>();
+      pendingSubmitsByNode.set(live, pendingSubmits);
+    }
     if (pendingSubmits.has(key) || getState().ops[key]?.phase === "pending") {
       return Promise.resolve(false);
     }

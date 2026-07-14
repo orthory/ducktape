@@ -2062,6 +2062,50 @@ describe("submitTracked lifecycle", () => {
     expect(capturedState!.ops["agent/collision-agent"].phase).toBe("finalized");
   });
 
+  it("scopes pending entity fences to the transport across a node switch", async () => {
+    const firstNode = makeFakeNode().transport;
+    const secondNode = makeFakeNode().transport;
+    const firstSubmit = deferred<SubmitReceipt>();
+    const secondSubmit = deferred<SubmitReceipt>();
+    vi.mocked(firstNode.submit).mockReturnValue(firstSubmit.promise);
+    vi.mocked(secondNode.submit).mockReturnValue(secondSubmit.promise);
+    nodeBootstrapMocks.remoteTransport = secondNode;
+    renderConsole(firstNode);
+    await waitFor(() => expect(capturedState!.connected).toBe(true));
+
+    const params = {
+      displayName: "Collision Agent",
+      agentId: "collision-agent",
+      capability: "mock",
+      allowedActions: ["chat.post"],
+    };
+    const onFirst = capturedActions!.registerAgent(params);
+    await waitFor(() => expect(firstNode.submit).toHaveBeenCalledTimes(1));
+
+    act(() => capturedActions!.connectRemote("http://127.0.0.1:9999"));
+    await waitFor(() =>
+      expect(capturedState!.nodeUrl).toBe("http://127.0.0.1:9999"),
+    );
+
+    const onSecond = capturedActions!.registerAgent(params);
+    await waitFor(() => expect(secondNode.submit).toHaveBeenCalledTimes(1));
+    expect(capturedState!.ops["agent/collision-agent"].phase).toBe("pending");
+
+    await act(async () => {
+      firstSubmit.resolve({ height: 2, appHash: "aa".repeat(32) });
+      await expect(onFirst).resolves.toBe(false);
+    });
+
+    await expect(capturedActions!.registerAgent(params)).resolves.toBe(false);
+    expect(secondNode.submit).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      secondSubmit.resolve({ height: 2, appHash: "bb".repeat(32) });
+      await expect(onSecond).resolves.toBe(true);
+    });
+    expect(capturedState!.ops["agent/collision-agent"].phase).toBe("finalized");
+  });
+
   it("rolls the preconfirmed render back and records the rejection on failure", async () => {
     const { transport } = makeFakeNode();
     let reject!: (err: Error) => void;
