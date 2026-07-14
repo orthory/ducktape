@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
@@ -223,108 +225,112 @@ where
     {
         let pump_label = label.to_string();
         let mut tx = reach_p2p_tx;
-        context.child("reachability_out").spawn(move |_ctx| async move {
-            while let Some(event) = ev_rx.recv().await {
-                match event {
-                    reachability::ReachabilityEvent::Send { to, bytes } => {
-                        let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
-                    }
-                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
-                        tracing::info!(
-                            target: "ducktape::reachability",
-                            node = %pump_label, epoch,
-                            "mesh verified"
-                        )
-                    }
-                    reachability::ReachabilityEvent::TunnelsApplied {
-                        epoch,
-                        interface,
-                        peers,
-                    } => {
-                        // NB: this proves only that the EFFECT ACCEPTED A CONFIG.
-                        // Nothing here proves a WireGuard handshake ever COMPLETED —
-                        // that is the difference between "overlay never came up" and
-                        // "overlay up, peer dark", and it is still unprovable from the
-                        // logs. `WgDevice::time_since_last_handshake` exists (and its
-                        // doc says "for handshake probes") but the device is owned by
-                        // the effect, which is moved into `reachability::run` — so
-                        // sampling it needs an Arc in the overlay, not a log line.
-                        // ponytail: share WgDevice behind an Arc, then sample it on the
-                        // existing nudge tick and emit peer_handshake_complete/peer_dark
-                        // on TRANSITION (zero per-packet cost).
-                        tracing::info!(
+        context
+            .child("reachability_out")
+            .spawn(move |_ctx| async move {
+                while let Some(event) = ev_rx.recv().await {
+                    match event {
+                        reachability::ReachabilityEvent::Send { to, bytes } => {
+                            let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                        }
+                        reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, epoch,
+                                "mesh verified"
+                            )
+                        }
+                        reachability::ReachabilityEvent::TunnelsApplied {
+                            epoch,
+                            interface,
+                            peers,
+                        } => {
+                            // NB: this proves only that the EFFECT ACCEPTED A CONFIG. The
+                            // completed-handshake half — the difference between "the
+                            // overlay never came up" and "the overlay is up but the peer
+                            // is dark" — is reported separately by `spawn_handshake_sampler`
+                            // as `peer handshake COMPLETE` / `peer DARK`. Read them together:
+                            // tunnels applied WITHOUT a matching handshake for a peer is
+                            // precisely the "peer dark" bug.
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, epoch, %interface, peers,
+                                backend = ?wireguard_effect,
+                                "tunnels applied (config accepted — the handshake is reported \
+                                 separately)"
+                            )
+                        }
+                        reachability::ReachabilityEvent::StandbyTunnelsApplied {
+                            epoch,
+                            interface,
+                            peers,
+                        } => tracing::info!(
                             target: "ducktape::reachability",
                             node = %pump_label, epoch, %interface, peers,
-                            backend = ?wireguard_effect,
-                            "tunnels applied (config accepted — NOT a completed handshake)"
-                        )
-                    }
-                    reachability::ReachabilityEvent::StandbyTunnelsApplied {
-                        epoch,
-                        interface,
-                        peers,
-                    } => tracing::info!(
-                        target: "ducktape::reachability",
-                        node = %pump_label, epoch, %interface, peers,
-                        "standby pre-warm tunnels applied"
-                    ),
-                    reachability::ReachabilityEvent::InvitePeerInstalled { peer, interface } => {
-                        tracing::info!(
+                            "standby pre-warm tunnels applied"
+                        ),
+                        reachability::ReachabilityEvent::InvitePeerInstalled {
+                            peer,
+                            interface,
+                        } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %interface,
+                                "invite tunnel installed"
+                            )
+                        }
+                        reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
+                            // the peer is DARK. media to it will silently go nowhere.
+                            tracing::warn!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %reason,
+                                "peer unreachable — traffic to it will go nowhere"
+                            )
+                        }
+                        reachability::ReachabilityEvent::EpochFailed { epoch, reason } => {
+                            tracing::error!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, epoch, %reason,
+                                "epoch FAILED — the mesh did not assemble"
+                            )
+                        }
+                        reachability::ReachabilityEvent::MeshRestored {
+                            epoch,
+                            interface,
+                            peers,
+                        } => tracing::info!(
                             target: "ducktape::reachability",
-                            node = %pump_label,
-                            peer = %hex_bytes(&peer.as_ref()[..4]),
-                            %interface,
-                            "invite tunnel installed"
-                        )
-                    }
-                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
-                        // the peer is DARK. media to it will silently go nowhere.
-                        tracing::warn!(
-                            target: "ducktape::reachability",
-                            node = %pump_label,
-                            peer = %hex_bytes(&peer.as_ref()[..4]),
-                            %reason,
-                            "peer unreachable — traffic to it will go nowhere"
-                        )
-                    }
-                    reachability::ReachabilityEvent::EpochFailed { epoch, reason } => tracing::error!(
-                        target: "ducktape::reachability",
-                        node = %pump_label, epoch, %reason,
-                        "epoch FAILED — the mesh did not assemble"
-                    ),
-                    reachability::ReachabilityEvent::MeshRestored {
-                        epoch,
-                        interface,
-                        peers,
-                    } => tracing::info!(
-                        target: "ducktape::reachability",
-                        node = %pump_label, epoch, %interface, peers,
-                        "persisted mesh restored — awaiting live assembly"
-                    ),
-                    reachability::ReachabilityEvent::RestoreFailed { reason } => {
-                        // #471: this was an unlevelled println that read like startup
-                        // chatter — which is exactly why it sat there being ignored
-                        // while restart-reconnect was dead. it is not chatter: the
-                        // persisted mesh is GONE for this whole boot.
-                        tracing::error!(
-                            target: "ducktape::reachability",
-                            node = %pump_label, %reason,
-                            consequence = "restart reconnect is dead for this boot; \
-                                           live assembly only",
-                            "persisted mesh NOT restored"
-                        )
-                    }
-                    reachability::ReachabilityEvent::PersistFailed { reason } => {
-                        tracing::warn!(
-                            target: "ducktape::reachability",
-                            node = %pump_label, %reason,
-                            consequence = "a cold restart will not restore this epoch",
-                            "mesh state NOT persisted"
-                        )
+                            node = %pump_label, epoch, %interface, peers,
+                            "persisted mesh restored — awaiting live assembly"
+                        ),
+                        reachability::ReachabilityEvent::RestoreFailed { reason } => {
+                            // #471: this was an unlevelled println that read like startup
+                            // chatter — which is exactly why it sat there being ignored
+                            // while restart-reconnect was dead. it is not chatter: the
+                            // persisted mesh is GONE for this whole boot.
+                            tracing::error!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, %reason,
+                                consequence = "restart reconnect is dead for this boot; \
+                                               live assembly only",
+                                "persisted mesh NOT restored"
+                            )
+                        }
+                        reachability::ReachabilityEvent::PersistFailed { reason } => {
+                            tracing::warn!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, %reason,
+                                consequence = "a cold restart will not restore this epoch",
+                                "mesh state NOT persisted"
+                            )
+                        }
                     }
                 }
-            }
-        });
+            });
     }
     cmd_tx
 }
@@ -784,8 +790,16 @@ async fn reachability_plane(
                 overlay_slot,
                 underlay,
             );
+            // take the probe BEFORE the effect is moved into the orchestrator.
+            spawn_handshake_sampler(effect.probe_slot(), label.clone());
             if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
-                eprintln!("[node {label}] reachability plane exited: {err}");
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    error = %err,
+                    "reachability plane EXITED — this node has no overlay for the rest of \
+                     this boot"
+                );
             }
         }
         WireGuardEffectKind::Tun => {
@@ -823,4 +837,74 @@ async fn reachability_plane(
             }
         }
     }
+}
+
+/// how long without a completed handshake before a peer is called DARK.
+///
+/// WireGuard rekeys well inside this (REKEY_AFTER_TIME is 120s and the timer
+/// pump drives retransmits), so exceeding it means the crypto handshake is not
+/// completing at all — not that traffic is merely idle.
+const HANDSHAKE_DARK_AFTER: Duration = Duration::from_secs(180);
+
+/// Watch whether WireGuard handshakes actually COMPLETE, and say so on transition.
+///
+/// `TunnelsApplied` proves only that the effect ACCEPTED A CONFIG. Nothing in this
+/// system proved a handshake ever completed — which is precisely the difference
+/// between "the overlay never came up" and "the overlay is up but the peer is
+/// dark". Those are two different bugs, and they presented as one string
+/// ("Voice connection failed.") for days.
+///
+/// `WgDevice::time_since_last_handshake` existed the whole time — its doc even says
+/// "for handshake probes" — but it was only ever called from tests, because the
+/// device is owned by the effect and the effect is moved into the orchestrator.
+/// `ProbeSlot` is the seam that fixes that (it mirrors the existing `StackSlot`).
+///
+/// Cost: this rides the EXISTING nudge tick and emits ONLY on a state transition.
+/// Nothing is logged per packet, per handshake, or per tick.
+fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: String) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NUDGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // peer -> was it live at the last sample? the transition IS the event.
+        let mut live: HashMap<std::net::Ipv6Addr, bool> = HashMap::new();
+        loop {
+            tick.tick().await;
+            let Some(probe) = probes.get() else {
+                // no backend yet: the overlay has not come up at all. that absence
+                // is already reported by the plane's own bind/apply events; do not
+                // duplicate it here every tick.
+                continue;
+            };
+            let peers = probe.peers();
+            for (ip, since) in &peers {
+                let is_live = since.is_some_and(|elapsed| elapsed < HANDSHAKE_DARK_AFTER);
+                match live.insert(*ip, is_live) {
+                    Some(was) if was == is_live => {}
+                    // first sight of a peer that is already handshaking, or a peer
+                    // that recovered.
+                    _ if is_live => tracing::info!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        peer_ula = %ip,
+                        since_handshake_s = since.map(|d| d.as_secs()),
+                        "peer handshake COMPLETE — the tunnel is actually carrying traffic"
+                    ),
+                    // first sight of a peer that has never handshaked, or one that
+                    // went dark. THIS is the line that was missing: config applied,
+                    // crypto never completed, media silently going nowhere.
+                    _ => tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        peer_ula = %ip,
+                        since_handshake_s = since.map(|d| d.as_secs()),
+                        ever_handshaked = since.is_some(),
+                        "peer DARK — its tunnel config is applied but no WireGuard \
+                         handshake has completed; traffic to it is going nowhere"
+                    ),
+                }
+            }
+            // a peer removed from the table (epoch change) is not a transition.
+            live.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
+        }
+    });
 }

@@ -455,9 +455,79 @@ impl WgDevice {
         tunn.time_since_last_handshake()
     }
 
+    /// a cheap, cloneable handle for HANDSHAKE PROBES that must outlive the move
+    /// of this device into the effect (and thence into the orchestrator).
+    ///
+    /// the device's state already lives behind an `Arc`, so this is a refcount
+    /// bump — it exists because applying a tunnel CONFIG and completing a
+    /// WireGuard HANDSHAKE are different events, and until now only the former
+    /// was observable. that gap is the difference between "the overlay never came
+    /// up" and "the overlay is up but the peer is dark", which are two different
+    /// bugs that presented as one string.
+    pub fn handshake_probe(&self) -> HandshakeProbe {
+        HandshakeProbe {
+            inner: self.inner.clone(),
+        }
+    }
+
     fn peer_by_ip(&self, ip: Ipv6Addr) -> Option<Arc<PeerState>> {
         let table = self.inner.peers.read().expect("peer table lock poisoned");
         table.by_ip.get(&ip).cloned()
+    }
+}
+
+/// a read-only view of the device's peer table, for liveness sampling.
+#[derive(Clone)]
+pub struct HandshakeProbe {
+    inner: Arc<DeviceInner>,
+}
+
+/// the publishable probe handle, mirroring [`super::stack::StackSlot`]: the
+/// sampler is wired before the effect (and its device) exists, so it holds this
+/// slot and reads through it once `apply` stands a backend up.
+#[derive(Clone, Default)]
+pub struct ProbeSlot(Arc<RwLock<Option<HandshakeProbe>>>);
+
+impl ProbeSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// the live probe, if a backend is up. `None` before the first `apply` —
+    /// which is itself the signal that the overlay never came up at all.
+    pub fn get(&self) -> Option<HandshakeProbe> {
+        self.0.read().expect("probe slot lock poisoned").clone()
+    }
+
+    pub(super) fn publish(&self, probe: HandshakeProbe) {
+        *self.0.write().expect("probe slot lock poisoned") = Some(probe);
+    }
+
+    pub(super) fn clear(&self) {
+        *self.0.write().expect("probe slot lock poisoned") = None;
+    }
+}
+
+impl HandshakeProbe {
+    /// every installed peer, with the time since its last COMPLETED handshake.
+    ///
+    /// `None` means the crypto handshake has never completed for that peer: its
+    /// config was accepted and nothing ever crossed. That peer is DARK, and no
+    /// event in the system said so before this.
+    pub fn peers(&self) -> Vec<(Ipv6Addr, Option<Duration>)> {
+        let table = self.inner.peers.read().expect("peer table lock poisoned");
+        table
+            .by_ip
+            .iter()
+            .map(|(ip, peer)| {
+                let since = peer
+                    .tunn
+                    .lock()
+                    .expect("tunn lock poisoned")
+                    .time_since_last_handshake();
+                (*ip, since)
+            })
+            .collect()
     }
 }
 
