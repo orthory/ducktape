@@ -47,15 +47,30 @@ fn whoami_reports_the_committed_grant() {
 #[test]
 fn agents_and_runs_are_read_from_the_real_modules() {
     let h = Harness::start(&["tasks.create"]);
+    h.submit(
+        "agent",
+        json!({"register_agent": {
+            "agent_id": "tailbot",
+            "display_name": "Tailbot",
+            "capability": "codex",
+            "allowed_actions": [],
+            "caps": {},
+        }}),
+        OWNER,
+    );
 
     let results = h.session(
         h.mcp(),
         &[
-            json!({"name": "ducktape_agents", "arguments": {}}),
+            json!({"name": "ducktape_agents", "arguments": {"other": 1}}),
+            json!({"name": "ducktape_agents", "arguments": {"limit": 1}}),
             json!({"name": "ducktape_runs", "arguments": {}}),
         ],
     );
-    let agents = payload(&results[0]);
+    let (is_error, text) = content(&results[0]);
+    assert!(is_error, "an unknown argument must be refused: {text}");
+
+    let agents = payload(&results[1]);
     assert_eq!(agents["agents"][0]["agent_id"], AGENT_ID);
     assert_eq!(agents["agents"][0]["display_name"], "Quackbot");
     assert_eq!(agents["agents"][0]["status"], "active");
@@ -63,10 +78,17 @@ fn agents_and_runs_are_read_from_the_real_modules() {
         agents["agents"][0]["allowed_actions"],
         json!(["tasks.create"])
     );
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(agents["total"], 2);
+    assert_eq!(agents["truncated"], true);
 
-    let runs = payload(&results[1]);
+    let runs = payload(&results[2]);
     assert_eq!(runs["pending_runs"], json!([]));
+    assert_eq!(runs["pending_total"], 0);
+    assert_eq!(runs["pending_truncated"], false);
     assert_eq!(runs["recent_runs"], json!([]));
+    assert_eq!(runs["recent_total"], 0);
+    assert_eq!(runs["recent_truncated"], false);
     assert!(runs.get("agent_sessions").is_none());
 }
 

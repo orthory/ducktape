@@ -37,10 +37,10 @@ const TARGET_TASKS: &str = "tasks";
 const TARGET_PAGES: &str = "pages";
 const TARGET_FORGE: &str = "forge";
 
-/// the newest-messages default: enough to reconstruct a conversation, small
-/// enough that a careless call cannot blow the model's context.
-const DEFAULT_MESSAGE_LIMIT: u64 = 50;
-const MAX_MESSAGE_LIMIT: u64 = 200;
+/// the read-list default: enough context to be useful, small enough that a
+/// careless call cannot blow the model's context.
+const DEFAULT_READ_LIMIT: u64 = 50;
+const MAX_READ_LIMIT: u64 = 200;
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![
@@ -56,11 +56,11 @@ pub(super) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "ducktape_agents",
-            description: "List every registered agent with its status, owner, allowed actions, \
+            description: "List registered agents with their status, owner, allowed actions, \
                           resource caps, and curated skills. AgentRole::ProjectLibrarian is \
                           historical decode-only compatibility; it does not select a special \
                           execution or knowledge path.",
-            schema: || schema(&[]),
+            schema: bounded_list_schema,
             handler: agents_list,
         },
         Tool {
@@ -69,7 +69,7 @@ pub(super) fn tools() -> Vec<Tool> {
                           observations. Recent runs are a bounded derived cache and can be empty \
                           after a snapshot join; Chat is the durable record of an agent's answer. \
                           Live agent sessions and session keys are deliberately not exposed.",
-            schema: || schema(&[]),
+            schema: bounded_list_schema,
             handler: runs_list,
         },
         Tool {
@@ -213,25 +213,36 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
     }))
 }
 
-fn agents_list(run: &Run, _args: &Value) -> Result<Value> {
-    run.node.query(TARGET_AGENT, encode(&AgentQuery::Agents)?)
+fn agents_list(run: &Run, args: &Value) -> Result<Value> {
+    let limit = list_limit(args)?;
+    let reply = run.node.query(TARGET_AGENT, encode(&AgentQuery::Agents)?)?;
+    let (agents, total, truncated) = bounded(reply_array(&reply, "agents")?, limit);
+    Ok(json!({
+        "agents": agents,
+        "total": total,
+        "truncated": truncated,
+    }))
 }
 
-fn runs_list(run: &Run, _args: &Value) -> Result<Value> {
+fn runs_list(run: &Run, args: &Value) -> Result<Value> {
+    let limit = list_limit(args)?;
     let pending = run
         .node
         .query(TARGET_RUNS, encode(&RunsQuery::PendingRuns)?)?;
     let recent = run
         .node
         .query(TARGET_RUNS, encode(&RunsQuery::RecentRuns)?)?;
-    let field = |reply: &Value, name: &str| {
-        reply.get(name).cloned().ok_or_else(|| {
-            NodeError::Transport(format!("runs returned no {name:?} field: {reply}"))
-        })
-    };
+    let (pending_runs, pending_total, pending_truncated) =
+        bounded(reply_array(&pending, "pending_runs")?, limit);
+    let (recent_runs, recent_total, recent_truncated) =
+        bounded(reply_array(&recent, "recent_runs")?, limit);
     Ok(json!({
-        "pending_runs": field(&pending, "pending_runs")?,
-        "recent_runs": field(&recent, "recent_runs")?,
+        "pending_runs": pending_runs,
+        "pending_total": pending_total,
+        "pending_truncated": pending_truncated,
+        "recent_runs": recent_runs,
+        "recent_total": recent_total,
+        "recent_truncated": recent_truncated,
     }))
 }
 
@@ -241,8 +252,8 @@ fn chat_channels(run: &Run, _args: &Value) -> Result<Value> {
 
 fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
     let limit = opt_u64(args, "limit")
-        .unwrap_or(DEFAULT_MESSAGE_LIMIT)
-        .min(MAX_MESSAGE_LIMIT);
+        .unwrap_or(DEFAULT_READ_LIMIT)
+        .min(MAX_READ_LIMIT);
     let query = ChatQuery::MessagesLatest {
         channel_id: arg_str(args, "channel_id")?,
         limit,
@@ -344,6 +355,57 @@ fn gate_duckfs_read(run: &Run, path: &str) -> Result<()> {
     run.permits(&record, &CapRequest::DuckfsRead(path))
 }
 
+fn bounded_list_schema() -> Value {
+    let mut value = schema(&[(
+        "limit",
+        "integer",
+        false,
+        "Maximum rows to return (default 50, minimum 1, maximum 200).",
+    )]);
+    value["properties"]["limit"]["minimum"] = json!(1);
+    value["properties"]["limit"]["maximum"] = json!(MAX_READ_LIMIT);
+    value["properties"]["limit"]["default"] = json!(DEFAULT_READ_LIMIT);
+    value["additionalProperties"] = Value::Bool(false);
+    value
+}
+
+fn list_limit(args: &Value) -> Result<usize> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| NodeError::Rejected("this tool needs an object argument".into()))?;
+    if object.keys().any(|key| key != "limit") {
+        return Err(NodeError::Rejected(
+            "this tool accepts only an optional integer \"limit\" argument".into(),
+        ));
+    }
+    let limit = match object.get("limit") {
+        None => DEFAULT_READ_LIMIT,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            NodeError::Rejected("this tool needs an integer \"limit\" argument".into())
+        })?,
+    };
+    if !(1..=MAX_READ_LIMIT).contains(&limit) {
+        return Err(NodeError::Rejected(format!(
+            "this tool needs \"limit\" between 1 and {MAX_READ_LIMIT}"
+        )));
+    }
+    Ok(limit as usize)
+}
+
+fn reply_array(reply: &Value, name: &str) -> Result<Vec<Value>> {
+    reply
+        .get(name)
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| NodeError::Transport(format!("module returned no {name:?} array: {reply}")))
+}
+
+fn bounded(mut rows: Vec<Value>, limit: usize) -> (Vec<Value>, usize, bool) {
+    let total = rows.len();
+    rows.truncate(limit);
+    (rows, total, total > limit)
+}
+
 /// a module's own query enum as the json `/v1/query` carries. the round-trip
 /// through `to_value` is what keeps this file honest: the enum, not a string
 /// literal here, defines the wire.
@@ -403,14 +465,72 @@ mod tests {
     fn the_message_limit_is_defaulted_and_clamped() {
         let clamp = |v: Value| {
             opt_u64(&v, "limit")
-                .unwrap_or(DEFAULT_MESSAGE_LIMIT)
-                .min(MAX_MESSAGE_LIMIT)
+                .unwrap_or(DEFAULT_READ_LIMIT)
+                .min(MAX_READ_LIMIT)
         };
-        assert_eq!(clamp(json!({})), DEFAULT_MESSAGE_LIMIT);
+        assert_eq!(clamp(json!({})), DEFAULT_READ_LIMIT);
         assert_eq!(clamp(json!({"limit": 10})), 10);
         // a model that asks for the whole channel does not get to blow its own
         // context: the cap is ours, not its.
-        assert_eq!(clamp(json!({"limit": 10_000})), MAX_MESSAGE_LIMIT);
+        assert_eq!(clamp(json!({"limit": 10_000})), MAX_READ_LIMIT);
+    }
+
+    #[test]
+    fn agent_and_run_schemas_are_exactly_bounded() {
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum rows to return (default 50, minimum 1, maximum 200).",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                }
+            },
+            "required": [],
+            "additionalProperties": false,
+        });
+        for name in ["ducktape_agents", "ducktape_runs"] {
+            let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+            assert_eq!((tool.schema)(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn agent_and_run_limits_reject_bad_arguments_before_querying() {
+        let bad = [
+            Value::Null,
+            json!([]),
+            json!("not an object"),
+            json!({"other": 1}),
+            json!({"limit": "1"}),
+            json!({"limit": -1}),
+            json!({"limit": 0}),
+            json!({"limit": 201}),
+        ];
+        for args in bad {
+            for handler in [agents_list as fn(&Run, &Value) -> Result<Value>, runs_list] {
+                assert!(
+                    matches!(
+                        handler(&Run::from_env(), &args),
+                        Err(NodeError::Rejected(_))
+                    ),
+                    "accepted {args}"
+                );
+            }
+        }
+        assert_eq!(list_limit(&json!({})).unwrap(), 50);
+        assert_eq!(list_limit(&json!({"limit": 1})).unwrap(), 1);
+        assert_eq!(list_limit(&json!({"limit": 200})).unwrap(), 200);
+    }
+
+    #[test]
+    fn bounded_rows_preserve_order_and_report_the_full_total() {
+        let (rows, total, truncated) = bounded(vec![json!("first"), json!("second")], 1);
+        assert_eq!(rows, vec![json!("first")]);
+        assert_eq!(total, 2);
+        assert!(truncated);
     }
 
     #[test]
