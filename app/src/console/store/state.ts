@@ -616,15 +616,30 @@ export const isClientMode = (
   state: Pick<ConsoleState, "workspace" | "nodeUrl">,
 ): boolean => state.workspace === null && state.nodeUrl !== null;
 
-/** Node control is available (ADR A5, interim form): the active workspace's
- *  node is a managed local daemon — ours to control even while it is stopped
- *  (Start lives on the node console, so reachability is deliberately NOT a
- *  term here). When the public/private RPC split (A2) lands, this grows
- *  `|| (owner key && private RPC reachable)`; the UI gate moves with it and
- *  nothing else does. */
+/** A rail seat's kind (see store/networks.ts, which re-exports this): a local
+ *  registry network, or the badged remote/client connection. Lives here so the
+ *  per-seat control rule below has no runtime edge back into networks.ts
+ *  (networks.ts value-imports from this module — same convention as the
+ *  nav-history note at the top). */
+export type SeatKind = "local" | "remote";
+
+/** Node control for one seat (ADR A5, interim form): a local seat whose daemon
+ *  this app manages. A remote seat is never controllable (A6 — no control
+ *  chrome for someone else's node). THE seam W2 replaces with
+ *  `owner(BindNode) ∧ private-RPC reachable`; the UI gate (below) delegates
+ *  here and moves with it, nothing else does. */
+export const nodeControlForSeat = (kind: SeatKind, managed: boolean): boolean =>
+  kind === "local" && managed;
+
+/** Node control is available: `nodeControlForSeat` evaluated for the ACTIVE
+ *  seat. An entered registry workspace is the active local seat; a client
+ *  connection (workspace null) is the remote seat (see networks.ts). Ours to
+ *  control even while the node is stopped — Start lives on the node console,
+ *  so reachability is deliberately NOT a term here. */
 export const nodeControlAvailable = (
   state: Pick<ConsoleState, "workspace" | "managed">,
-): boolean => state.workspace !== null && state.managed;
+): boolean =>
+  nodeControlForSeat(state.workspace !== null ? "local" : "remote", state.managed);
 
 const parseDocTabStore = (raw: string | null): Record<string, string[]> => {
   if (!raw) return {};

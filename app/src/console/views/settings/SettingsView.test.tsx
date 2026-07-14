@@ -76,7 +76,7 @@ describe("SettingsView", () => {
     expect(content.style.maxWidth).toBe("");
 
     // Workspace facts that still live here.
-    expect(screen.getByText("WORKSPACE")).toBeInTheDocument();
+    expect(screen.getByText("NETWORK")).toBeInTheDocument();
     expect(screen.getByText("Acme Research")).toBeInTheDocument();
     expect(screen.getByText("acme#abcd1234")).toBeInTheDocument();
 
@@ -92,8 +92,8 @@ describe("SettingsView", () => {
     expect(screen.queryByDisplayValue("Rae")).not.toBeInTheDocument();
 
     // Everything a module view owns is gone from Settings: ops facts belong
-    // to the Node view, invite/admit to Members.
-    expect(screen.queryByText("NETWORK")).not.toBeInTheDocument();
+    // to the Node view, invite/admit to Members. (The NETWORK section header
+    // itself stays — it is the network-lifecycle card, checked above.)
     expect(screen.queryByText(/~\/\.ducktape\/workspaces/)).not.toBeInTheDocument();
     expect(screen.queryByText(/quorum threshold/i)).not.toBeInTheDocument();
     expect(
@@ -106,7 +106,7 @@ describe("SettingsView", () => {
     fireEvent.click(screen.getByRole("button", { name: /set accent #3d63b8/i }));
     expect(spies.setAccent).toHaveBeenCalledWith("#3d63b8");
 
-    fireEvent.click(screen.getByRole("button", { name: /workspaces/i }));
+    fireEvent.click(screen.getByRole("button", { name: /networks/i }));
     expect(spies.newWorkspace).toHaveBeenCalled();
   });
 

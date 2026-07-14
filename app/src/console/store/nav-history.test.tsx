@@ -424,7 +424,7 @@ describe("browser back/forward (provider integration)", () => {
     expect(readNavEntry(window.history.state)?.snap.agent).toBe("agent-1");
   });
 
-  it("traversal is ignored while onboarding gates the window", async () => {
+  it("traversal is ignored while the account home owns the window", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
@@ -443,7 +443,9 @@ describe("browser back/forward (provider integration)", () => {
         </DucktapeProvider>,
       );
     });
-    await waitFor(() => expect(screen.getByTestId("gate").textContent).toBe("true"));
+    // epic W1: first run lands on the account home (atHome), not a gate — with
+    // no node behind it, a traversal to a shell screen must be ignored.
+    await waitFor(() => expect(screen.getByTestId("home").textContent).toBe("true"));
 
     await act(async () => {
       window.dispatchEvent(
@@ -454,6 +456,6 @@ describe("browser back/forward (provider integration)", () => {
     });
 
     expect(screen.getByTestId("screen").textContent).toBe("chat");
-    expect(screen.getByTestId("gate").textContent).toBe("true");
+    expect(screen.getByTestId("home").textContent).toBe("true");
   });
 });
