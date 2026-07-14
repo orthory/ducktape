@@ -765,12 +765,19 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Head(self.read_head(&name))))
             }
             ForgeQuery::ListRepos => {
+                // the committed INTEGRATION head (dev, falling back to legacy
+                // main) — the same branch every browse surface reads, so a
+                // dev-only repo lists as browsable, not unborn.
                 let repos = self
                     .repos
                     .iter()
                     .map(|(name, s)| RepoHead {
                         name: name.clone(),
-                        head: s.refs.get(MAIN_BRANCH).map(|oid| oid.to_string()),
+                        head: s
+                            .refs
+                            .get(INTEGRATION_BRANCH)
+                            .or_else(|| s.refs.get(MAIN_BRANCH))
+                            .map(|oid| oid.to_string()),
                     })
                     .collect();
                 Ok(encode_reply(&ForgeReply::Repos(repos)))

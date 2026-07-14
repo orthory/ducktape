@@ -160,20 +160,25 @@ fn capture(src: &Forge) -> Captured {
     }
 }
 
-/// build a single-update `PushRefs` on `main` of the default repo (empty `repo`).
-fn push_msg(prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
+/// build a single-update `PushRefs` on `branch` of the default repo (empty `repo`).
+fn push_branch_msg(branch: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
     Msg {
         target: "forge".into(),
         payload: encode_msg(&ForgeMsg::PushRefs {
             repo: String::new(),
             updates: vec![RefUpdate {
-                ref_name: "main".into(),
+                ref_name: branch.into(),
                 prev_oid: prev.map(<[u8]>::to_vec),
                 new_oid: Some(new.to_vec()),
             }],
             pack_digest: Some(digest.to_vec()),
         }),
     }
+}
+
+/// build a single-update `PushRefs` on `main` of the default repo (empty `repo`).
+fn push_msg(prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
+    push_branch_msg("main", prev, new, digest)
 }
 
 /// execute a Push and publish the block — the happy path.
@@ -192,6 +197,16 @@ fn try_push(
     digest: &[u8],
 ) -> Result<(), Error> {
     futures::executor::block_on(forge.execute(&mut TestCtx::at(0), &push_msg(prev, new, digest)))
+}
+
+/// every `(name, head)` pair `query(ListRepos)` reports.
+fn repo_heads(forge: &Forge) -> Vec<(String, Option<String>)> {
+    let reply =
+        futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListRepos))).unwrap();
+    match decode_reply(&reply).unwrap() {
+        ForgeReply::Repos(repos) => repos.into_iter().map(|r| (r.name, r.head)).collect(),
+        other => panic!("expected Repos, got {other:?}"),
+    }
 }
 
 /// the current head hex reported by `query(Head)`.
@@ -478,6 +493,48 @@ fn commit_and_push_coexist_on_one_module() {
     );
     assert_eq!(read_blob(&dst_dir, "a.txt"), b"one".to_vec());
     assert_eq!(read_blob(&dst_dir, "b.txt"), b"two".to_vec());
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dst_dir);
+}
+
+/// `list_repos` answers the INTEGRATION head: a main-only repo keeps the
+/// legacy fallback, but once `dev` is born the listing reports dev's oid —
+/// the branch every browse surface reads, so a dev-only repo must never list
+/// as unborn to a remote client.
+#[test]
+fn list_repos_reports_the_integration_head() {
+    let src_dir = tmp_repo("listrepos-src");
+    let mut src = Forge::init("forge", src_dir.clone()).unwrap();
+    commit_one(&mut src, 1, "a.txt", "one", "c1");
+    let c1 = capture(&src);
+
+    let dst_dir = tmp_repo("listrepos-dst");
+    let blobs = blobstore::BlobHandle::default();
+    let d1 = c1.stash(&blobs);
+    let mut dst = Forge::with_blobs("forge", dst_dir.clone(), blobs).unwrap();
+    commit_one(&mut dst, 1, "a.txt", "one", "c1");
+    commit_one(&mut dst, 2, "b.txt", "two", "c2");
+    let main_head = on_disk_head(&dst_dir).unwrap();
+
+    // main-only: the listing falls back to the legacy main head.
+    assert_eq!(
+        repo_heads(&dst),
+        vec![("default".into(), Some(main_head.to_string()))]
+    );
+
+    // dev born at c1 (≠ main's c2): the integration branch owns the listing.
+    futures::executor::block_on(dst.execute(
+        &mut TestCtx::at(3),
+        &push_branch_msg("dev", None, &c1.head, &d1),
+    ))
+    .unwrap();
+    futures::executor::block_on(dst.commit_block()).unwrap();
+    assert_ne!(c1.oid(), main_head, "the two branches must diverge");
+    assert_eq!(
+        repo_heads(&dst),
+        vec![("default".into(), Some(c1.oid().to_string()))]
+    );
 
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&dst_dir);
