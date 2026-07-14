@@ -704,8 +704,11 @@ export const removeTab = (
 // The device surface aggregates each joined network's bound nodes for this
 // account. Under the single-active premise there is never a live cross-network
 // query — instead the connected network's device rows are captured here on
-// every switch/refresh, keyed by chain id, and rendered as "last-known" while
-// that network is not the connected one. Mirrors the doc-tabs scope store.
+// every switch/refresh, keyed by ACCOUNT then chain id, and rendered as
+// "last-known" while that network is not the connected one. Account keying is
+// the stale-identity guard: after a key restore/re-onboard the account id
+// changes, so a previous account's rows can never render for the new one.
+// Mirrors the doc-tabs scope store.
 
 /** One bound node as the device surface shows it. */
 export interface DeviceRow {
@@ -730,53 +733,68 @@ export interface NetworkDevices {
 
 const DEVICE_CACHE_KEY = "ducktape.deviceCache";
 
-const parseDeviceCache = (raw: string | null): Record<string, NetworkDevices> => {
+/** The persisted blob: hex(account id) → chain id → last-known devices. */
+const parseDeviceCache = (
+  raw: string | null,
+): Record<string, Record<string, NetworkDevices>> => {
   if (!raw) return {};
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    // Best-effort shape filter — a malformed or older blob is discarded per key,
-    // never trusted into the UI.
-    return Object.fromEntries(
-      Object.entries(parsed as Record<string, unknown>).filter(
-        (entry): entry is [string, NetworkDevices] => {
-          const v = entry[1] as NetworkDevices;
-          return (
-            !!v &&
-            typeof v === "object" &&
-            typeof v.name === "string" &&
-            Array.isArray(v.rows) &&
-            v.rows.every((r) => r && typeof r.nodeHex === "string")
-          );
-        },
-      ),
-    );
+    // Best-effort shape filter — a malformed or pre-account-keyed blob is
+    // discarded per entry, never trusted into the UI.
+    const out: Record<string, Record<string, NetworkDevices>> = {};
+    for (const [account, nets] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!nets || typeof nets !== "object" || Array.isArray(nets)) continue;
+      const good = Object.fromEntries(
+        Object.entries(nets as Record<string, unknown>).filter(
+          (entry): entry is [string, NetworkDevices] => {
+            const v = entry[1] as NetworkDevices;
+            return (
+              !!v &&
+              typeof v === "object" &&
+              typeof v.name === "string" &&
+              Array.isArray(v.rows) &&
+              v.rows.every((r) => r && typeof r.nodeHex === "string")
+            );
+          },
+        ),
+      );
+      if (Object.keys(good).length > 0) out[account] = good;
+    }
+    return out;
   } catch {
     return {};
   }
 };
 
-/** Every network's last-known device rows, keyed by chain id. */
-export const loadDeviceCache = (): Record<string, NetworkDevices> =>
-  parseDeviceCache(safeGetItem(DEVICE_CACHE_KEY));
+/** One ACCOUNT's last-known device rows, keyed by chain id. */
+export const loadDeviceCache = (accountId: string): Record<string, NetworkDevices> =>
+  parseDeviceCache(safeGetItem(DEVICE_CACHE_KEY))[accountId] ?? {};
 
-/** Capture (overwrite) one network's device rows. Best-effort persistence. */
-export const saveNetworkDevices = (chainId: string, entry: NetworkDevices): void => {
+/** Capture (overwrite) one network's device rows for `accountId`. */
+export const saveNetworkDevices = (
+  accountId: string,
+  chainId: string,
+  entry: NetworkDevices,
+): void => {
   try {
     const store = parseDeviceCache(localStorage.getItem(DEVICE_CACHE_KEY));
-    store[chainId] = entry;
+    (store[accountId] ??= {})[chainId] = entry;
     localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(store));
   } catch {
     // best-effort; a failed write just doesn't survive the switch/restart.
   }
 };
 
-/** Drop one network's cached devices — used when a workspace is forgotten. */
-export const forgetNetworkDevices = (chainId: string): void => {
+/** Drop one network's cached devices for `accountId` — used when a workspace
+ *  is no longer registered. */
+export const forgetNetworkDevices = (accountId: string, chainId: string): void => {
   try {
     const store = parseDeviceCache(localStorage.getItem(DEVICE_CACHE_KEY));
-    if (!(chainId in store)) return;
-    delete store[chainId];
+    if (!store[accountId] || !(chainId in store[accountId])) return;
+    delete store[accountId][chainId];
+    if (Object.keys(store[accountId]).length === 0) delete store[accountId];
     localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(store));
   } catch {
     // best-effort.

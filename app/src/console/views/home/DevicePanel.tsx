@@ -185,7 +185,7 @@ function CachedDeviceRow({ row, last }: { row: DeviceRow; last: boolean }) {
 
 export function DevicePanel({ accountId }: { accountId: string | undefined }) {
   const { state, actions } = useDucktape();
-  const [cache, setCache] = useState<Record<string, NetworkDevices>>(() => loadDeviceCache());
+  const [cache, setCache] = useState<Record<string, NetworkDevices>>(() => ({}));
   const [pendingUnbind, setPendingUnbind] = useState<string | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
 
@@ -212,29 +212,37 @@ export function DevicePanel({ accountId }: { accountId: string | undefined }) {
       .sort((a, b) => a.nodeHex.localeCompare(b.nodeHex));
   }, [accountId, state.nodeUsers, state.members, state.residents, workspace]);
 
-  // Capture the connected network's rows as its last-known state (only on an
-  // actual change), and keep the cache snapshot the render reads fresh.
+  // Capture the connected network's rows as this ACCOUNT's last-known state
+  // (only on an actual change), and keep the cache snapshot the render reads
+  // fresh. Account keying means a previous identity's rows never surface here.
   useEffect(() => {
-    if (accountId && workspace && connectedChainId) {
-      const prev = loadDeviceCache()[connectedChainId];
+    if (!accountId) {
+      setCache({});
+      return;
+    }
+    if (workspace && connectedChainId) {
+      const prev = loadDeviceCache(accountId)[connectedChainId];
       if (!prev || JSON.stringify(prev.rows) !== JSON.stringify(liveRows)) {
-        saveNetworkDevices(connectedChainId, {
+        saveNetworkDevices(accountId, connectedChainId, {
           name: workspace.name,
           at: Date.now(),
           rows: liveRows,
         });
       }
     }
-    setCache(loadDeviceCache());
+    setCache(loadDeviceCache(accountId));
   }, [accountId, connectedChainId, workspace, liveRows]);
 
   // Prune cached entries whose workspace is no longer registered (forgotten).
   useEffect(() => {
+    if (!accountId) return;
     const known = new Set(state.workspaces.map((w) => w.chainId));
     for (const chainId of Object.keys(cache)) {
-      if (chainId !== connectedChainId && !known.has(chainId)) forgetNetworkDevices(chainId);
+      if (chainId !== connectedChainId && !known.has(chainId)) {
+        forgetNetworkDevices(accountId, chainId);
+      }
     }
-  }, [state.workspaces, cache, connectedChainId]);
+  }, [accountId, state.workspaces, cache, connectedChainId]);
 
   const cachedOthers = Object.entries(cache)
     .filter(([chainId]) => chainId !== connectedChainId)
@@ -250,6 +258,13 @@ export function DevicePanel({ accountId }: { accountId: string | undefined }) {
   };
   const relabel = (nodeHex: string, label: string | null) => {
     setOpError(null);
+    // The module caps the label at 64 BYTES; the input's maxLength counts
+    // UTF-16 units, so a multibyte label can pass the field yet bounce
+    // on-chain. Validate bytes here instead of round-tripping an opError.
+    if (label && new TextEncoder().encode(label).length > 64) {
+      setOpError("label is too long — keep it under 64 bytes");
+      return;
+    }
     actions.accountSetNodeLabel(nodeHex, label).catch((err) => setOpError(errMessage(err)));
   };
 

@@ -76,7 +76,7 @@ describe("DevicePanel", () => {
 
   it("shows other networks' cached devices read-only with a switch hint", () => {
     // Seed a last-known snapshot for a DIFFERENT (not connected) network.
-    saveNetworkDevices("duck-2", {
+    saveNetworkDevices("acct-1", "duck-2", {
       name: "Side Net",
       at: Date.now(),
       rows: [{ nodeHex: "dd44", label: "Work desktop", standing: "Resident", isThisDevice: false }],
@@ -91,21 +91,31 @@ describe("DevicePanel", () => {
     expect(screen.getAllByRole("button", { name: /Unbind node/ })).toHaveLength(2);
   });
 
+  it("refuses a label over 64 bytes without submitting (multibyte-safe)", () => {
+    render(<DevicePanel accountId="acct-1" />);
+    fireEvent.click(screen.getByRole("button", { name: /Rename node bb22/ }));
+    const input = screen.getByLabelText(/Label for node bb22/);
+    // 33 x '한' = 33 UTF-16 units (passes maxLength) but 99 UTF-8 bytes.
+    fireEvent.change(input, { target: { value: "한".repeat(33) } });
+    fireEvent.blur(input);
+    expect(accountSetNodeLabel).not.toHaveBeenCalled();
+    expect(screen.getByText(/64 bytes/)).toBeTruthy();
+  });
+
   it("surfaces the recovery pointer to the recovery phrase", () => {
     render(<DevicePanel accountId="acct-1" />);
     expect(screen.getByText(/reveal your recovery phrase/)).toBeTruthy();
   });
 
-  it("renders cached networks even with no live connection", () => {
-    saveNetworkDevices("duck-2", {
+  it("scopes the cache to the account: another identity's rows never render", () => {
+    // A PREVIOUS account's snapshot (forget + re-onboard scenario): the new
+    // account must never see it — the account key makes it unreachable.
+    saveNetworkDevices("acct-old", "duck-2", {
       name: "Side Net",
       at: Date.now(),
       rows: [{ nodeHex: "dd44", label: null, standing: "No seat", isThisDevice: false }],
     });
-    // accountId present but workspace-driven live group is empty for a stranger
-    // account; the cached network still shows, read-only (no Unbind anywhere).
-    render(<DevicePanel accountId="nobody" />);
-    expect(screen.getByText("Side Net")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /Unbind node/ })).toBeNull();
+    render(<DevicePanel accountId="acct-1" />);
+    expect(screen.queryByText("Side Net")).toBeNull();
   });
 });
