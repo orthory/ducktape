@@ -411,6 +411,7 @@ fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>) {
                             category: ModuleCategory::of("agent"),
                         }],
                         public_key: String::new(),
+                        operations: Default::default(),
                     });
                 }
                 NodeCommand::Metrics { reply } => {

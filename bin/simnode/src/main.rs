@@ -1138,6 +1138,11 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
+            operations: noded::OperationalStatus {
+                role: noded::NodeRole::Local,
+                phase: noded::NodePhase::Serving,
+                ..Default::default()
+            },
         }
     }
 

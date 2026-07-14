@@ -72,6 +72,13 @@ pub(crate) async fn run_validator(
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
 ) {
+    metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "validator",
+        phase = "recovering",
+        node = %label
+    );
     // (host, recovered-state, next local submit seq, last checkpoint
     // ONE index fold for the whole boot (journal replay + post-reboot
     // catch-up + post-sync refreshes): its stop flag must persist across
@@ -287,6 +294,14 @@ pub(crate) async fn run_validator(
         dev_demo,
     )
     .await;
+    metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Validating);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "validator",
+        phase = "validating",
+        node = %label,
+        epoch = orchestrator.epoch()
+    );
     run::run(run::ValidatorLoopState {
         context: &context,
         node,

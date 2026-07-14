@@ -6048,6 +6048,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
+ "tracing",
  "tracing-subscriber 0.3.23",
  "upgrade",
  "valset",
