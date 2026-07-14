@@ -515,6 +515,103 @@ async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
     );
 }
 
+/// an actor that answers exactly one thing: `identity` `OfNode` → the account
+/// that owns `node_key`, whose sole member is `owner_key`. everything else is a
+/// module error (the admin owner path only ever asks this one question).
+fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, node_key: Vec<u8>, owner_key: Vec<u8>) {
+    tokio::spawn(async move {
+        while let Some(cmd) = cmds.next().await {
+            if let NodeCommand::Query { target, reply, .. } = cmd {
+                assert_eq!(target, "identity");
+                let view = identity::AccountView {
+                    account_id: owner_key.clone(),
+                    display_name: None,
+                    nonce: 0,
+                    member_keys: vec![identity::MemberKeyView {
+                        pubkey: owner_key.clone(),
+                        kind: identity::KeyKind::Ed25519,
+                        label: None,
+                        added_at: 0,
+                    }],
+                    nodes: vec![node_key.clone()],
+                    updated_at: 0,
+                };
+                let bytes = identity::encode_reply(&identity::IdentityReply::Account(Some(view)));
+                let _ = reply.send(Ok(bytes));
+            }
+        }
+    });
+}
+
+fn admin_signed_post(
+    uri: &str,
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    claimed_key_hex: &str,
+    ts: u64,
+) -> Request<Body> {
+    let sig = noded::admin::sign_admin(signer, "POST", uri, ts);
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(noded::admin::ADMIN_KEY_HEADER, claimed_key_hex)
+        .header(noded::admin::ADMIN_TS_HEADER, ts.to_string())
+        .header(
+            noded::admin::ADMIN_SIG_HEADER,
+            duckfs_core::to_hex(sig.as_ref()),
+        )
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+/// the full `Public` owner path over the actor lane: unsigned is refused, a
+/// non-owner signature is refused, the committed owner's signature passes.
+#[tokio::test]
+async fn public_admin_enforces_the_committed_owner_pop() {
+    use commonware_cryptography::Signer as _;
+    let owner = commonware_cryptography::ed25519::PrivateKey::from_seed(77);
+    let owner_key = owner.public_key().as_ref().to_vec();
+    let node_key = vec![0xabu8; 32];
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let owner_key_hex = duckfs_core::to_hex(&owner_key);
+
+    let mk_handle = || {
+        let (handle, cmd_rx, _e) = NodeHandle::channel();
+        spawn_owner_actor(cmd_rx, node_key.clone(), owner_key.clone());
+        handle.with_admin(AdminConfig {
+            exposure: AdminExposure::Public,
+            node_key: Some(node_key.clone()),
+            ..Default::default()
+        })
+    };
+
+    // unsigned ⇒ 401.
+    let bare = noded::router(mk_handle())
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED, "public admin needs a signature");
+
+    // signed by a non-owner (valid PoP, wrong account) ⇒ 403.
+    let attacker = commonware_cryptography::ed25519::PrivateKey::from_seed(99);
+    let attacker_hex = duckfs_core::to_hex(attacker.public_key().as_ref());
+    let forged = noded::router(mk_handle())
+        .oneshot(admin_signed_post("/v1/admin/shutdown", &attacker, &attacker_hex, ts))
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN, "a non-owner signer is refused");
+
+    // the committed owner's signature ⇒ 200.
+    let ok = noded::router(mk_handle())
+        .oneshot(admin_signed_post("/v1/admin/shutdown", &owner, &owner_key_hex, ts))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "the node owner may drive control");
+}
+
 #[tokio::test]
 async fn a_dead_actor_maps_to_service_unavailable() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();

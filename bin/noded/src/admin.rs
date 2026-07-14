@@ -4,29 +4,35 @@
 //! (geth `admin_` spirit), never a second port, gated as a unit by one
 //! middleware ([`admin_guard`]) layered onto the admin sub-router alone.
 //!
-//! ## two orthogonal gates
+//! ## the exposure ladder ([`AdminExposure`], flag `DUCKTAPE_ADMIN`)
 //!
-//! - EXPOSURE (where — A4): [`AdminExposure`]. `Disabled` unregisters the routes
-//!   entirely so the surface is simply ABSENT (`router` never merges them);
-//!   `Loopback` (the default) additionally refuses any non-loopback peer;
-//!   `Public` accepts any peer the owner gate admits.
-//! - OWNER (who — A5): a per-request proof-of-possession (PoP) by the owner
-//!   account's key, verified statelessly against a PUBLIC pin — the coordinator
-//!   auth pattern (#197). the owner is a CHAIN FACT: the committed `BindNode`
-//!   that maps THIS node's key to an account (identity `OfNode`); the request's
-//!   key must be one of that account's member keys.
+//! - `Disabled` unregisters the routes entirely — the surface is simply ABSENT
+//!   (`router` never merges them), a 404, not a gated-but-present 403.
+//! - `Loopback` (the default): reachable only from loopback peers, and a
+//!   loopback peer is TRUSTED — no PoP. this matches `origin_guard`'s own model
+//!   (a loopback process can already read `user.key` off disk, so loopback is a
+//!   boundary this layer cannot tighten) and the capability matrix's "local
+//!   control is always available on loopback". frictionless local control.
+//! - `Public`: reachable off-box, so the OWNER gate (A5) is the ONLY thing
+//!   standing between a remote caller and node control — enforced for every
+//!   peer. this is the new capability W2 adds, and the case PoP exists for.
+//!
+//! ## the owner gate (A5, only under `Public`)
+//!
+//! a per-request proof-of-possession (PoP) by the owner account's key, verified
+//! statelessly against a PUBLIC pin — the coordinator auth pattern (#197). the
+//! owner is a CHAIN FACT: the committed `BindNode` that maps THIS node's key to
+//! an account (identity `OfNode`); the request's key must be one of that
+//! account's member keys.
 //!
 //! ## the bootstrap window
 //!
-//! a node with NO committed owner yet (fresh network, before the first
-//! `BindNode`) has nobody to authenticate against. rather than lock the owner
-//! out of their own fresh node, admin falls back to LOOPBACK-TRUST until the
-//! first bind commits — never reachable off-box, collapsing to the full owner
-//! gate the instant ownership exists on chain. the embedded single-writer daemon
-//! (`node_key = None`, no consensus) lives permanently in this state, which is
-//! exactly its threat model today: a loopback process can already read
-//! `user.key` off disk, so loopback is a boundary this layer cannot tighten. the
-//! PoP gate is what protects the `Public` surface — the capability W2 adds.
+//! a `Public` node with NO committed owner yet (fresh network, before the first
+//! `BindNode`) has nobody to authenticate against, so admin falls back to
+//! loopback-trust until the first bind commits — never drivable off-box with no
+//! owner check, collapsing to the full owner gate the instant ownership exists.
+//! the embedded single-writer daemon (`node_key = None`, no consensus) can only
+//! ever be loopback-trust.
 //!
 //! ## the PoP wire (mirrors `nat-traversal::auth`)
 //!
@@ -280,58 +286,70 @@ pub async fn admin_guard(
     let cfg = &handle.admin;
     let loopback = peer_is_loopback(&req);
 
-    // EXPOSURE gate.
     match cfg.exposure {
         // `router` never mounts these when disabled; this arm is belt-and-braces.
-        AdminExposure::Disabled => return error_response(StatusCode::NOT_FOUND, "not found"),
-        AdminExposure::Loopback if !loopback => {
-            return error_response(StatusCode::FORBIDDEN, "admin namespace is loopback-only");
-        }
-        _ => {}
-    }
-
-    // OWNER gate. no owner exists to check against (embedded daemon, or a full
-    // node still in the bootstrap window) ⇒ loopback-trust.
-    let Some(node_key) = cfg.node_key.as_deref() else {
-        return require_loopback(loopback, req, next).await;
-    };
-    match resolve_owner(&handle, &cfg.identity_module, node_key).await {
-        OwnerResolve::Unavailable => {
-            error_response(StatusCode::SERVICE_UNAVAILABLE, "cannot resolve node owner")
-        }
-        OwnerResolve::NoOwner => require_loopback(loopback, req, next).await,
-        OwnerResolve::Owned(members) => {
-            let method = req.method().as_str().to_string();
-            let path = req
-                .uri()
-                .path_and_query()
-                .map(|pq| pq.as_str().to_string())
-                .unwrap_or_else(|| req.uri().path().to_string());
-            match verify_pop(req.headers(), &method, &path, now_secs()) {
-                Ok(account_key) if members.contains(&account_key) => next.run(req).await,
-                Ok(_) => error_response(StatusCode::FORBIDDEN, "signer is not the node owner"),
-                Err(PopError::Stale) => {
-                    error_response(StatusCode::UNAUTHORIZED, "admin request timestamp is stale")
+        AdminExposure::Disabled => error_response(StatusCode::NOT_FOUND, "not found"),
+        // LOOPBACK exposure: on-box access is the gate. loopback-trust matches
+        // `origin_guard`'s own model — a loopback process can already read
+        // `user.key` off disk, and the capability matrix makes local control
+        // "always available on loopback". a non-loopback peer never gets in.
+        AdminExposure::Loopback => require_loopback(loopback, req, next).await,
+        // PUBLIC exposure: the surface is reachable off-box, so the OWNER PoP is
+        // the only gate that matters (ADR A5) — enforced for every peer,
+        // loopback or not. a node with no owner to authenticate against (no
+        // consensus, or the pre-bind bootstrap window) can only fall back to
+        // loopback-trust: it must not be drivable off-box with no owner check.
+        AdminExposure::Public => {
+            let Some(node_key) = cfg.node_key.as_deref() else {
+                return require_loopback(loopback, req, next).await;
+            };
+            match resolve_owner(&handle, &cfg.identity_module, node_key).await {
+                OwnerResolve::Unavailable => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "cannot resolve node owner")
                 }
-                Err(_) => error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "admin request needs a valid owner signature",
-                ),
+                OwnerResolve::NoOwner => require_loopback(loopback, req, next).await,
+                OwnerResolve::Owned(members) => enforce_owner_pop(members, req, next).await,
             }
         }
     }
 }
 
-/// in the loopback-trust states (embedded daemon / bootstrap window) a loopback
-/// peer passes; a non-loopback peer is refused even under `Public` exposure —
-/// there is no owner key to authenticate an off-box caller against.
+/// the owner PoP gate: the request must carry a fresh signature by a key that
+/// is a member of the account owning this node.
+async fn enforce_owner_pop(
+    members: Vec<Vec<u8>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let method = req.method().as_str().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    match verify_pop(req.headers(), &method, &path, now_secs()) {
+        Ok(account_key) if members.contains(&account_key) => next.run(req).await,
+        Ok(_) => error_response(StatusCode::FORBIDDEN, "signer is not the node owner"),
+        Err(PopError::Stale) => {
+            error_response(StatusCode::UNAUTHORIZED, "admin request timestamp is stale")
+        }
+        Err(_) => error_response(
+            StatusCode::UNAUTHORIZED,
+            "admin request needs a valid owner signature",
+        ),
+    }
+}
+
+/// a loopback peer passes; a non-loopback peer is refused. the loopback-trust
+/// states are LOOPBACK exposure, the embedded daemon (no owner on chain), and a
+/// full node still in its pre-bind bootstrap window.
 async fn require_loopback(loopback: bool, req: axum::extract::Request, next: Next) -> Response {
     if loopback {
         next.run(req).await
     } else {
         error_response(
             StatusCode::FORBIDDEN,
-            "node has no committed owner; admin is loopback-only until it is bound",
+            "admin namespace is not reachable off-box on this node",
         )
     }
 }
