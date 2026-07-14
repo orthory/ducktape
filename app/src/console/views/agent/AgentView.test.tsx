@@ -818,6 +818,41 @@ describe("AgentView", () => {
     expect(screen.getAllByText("[node cafe1234] working")).toHaveLength(1);
   });
 
+  it("does not wait forever when a terminal run has no retained output", async () => {
+    const record: RunRecord = {
+      run_id: "forge:ducktape:56/7/summarizer",
+      agent_id: "summarizer",
+      channel_id: "forge:ducktape:56",
+      anchor_seq: 7,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 30,
+      delivered_at: 35,
+      executing_node: "unknown",
+      output_ref: "agent/item-56@abcdef0123456789",
+      pr_number: 140,
+    };
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [record] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe: vi.fn(() => () => {}),
+    });
+    renderAgents({ pendingRuns: [] }, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /show execution log for run forge:ducktape:56\/7\/summarizer/i,
+      }),
+    );
+
+    const log = screen.getByRole("log");
+    expect(
+      within(log).getByText("No retained output received — older output may have been evicted."),
+    ).toBeInTheDocument();
+    expect(within(log).queryByText("Waiting for retained output…")).not.toBeInTheDocument();
+  });
+
   it("keyboard-opens a terminal run log and catches up retained output", async () => {
     const record: RunRecord = {
       run_id: "forge:ducktape:56/7/summarizer",
@@ -858,7 +893,6 @@ describe("AgentView", () => {
     expect(log).toHaveFocus();
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(toggle).toHaveAttribute("aria-controls", log.id);
-    expect(within(log).getByText("Waiting for retained output…")).toBeInTheDocument();
     expect(subscribe).toHaveBeenCalledWith(
       ["run-output:e48d0185525ec2e0d81bd67b787765c6609f634de38ca2358a880c4523d764bc"],
       expect.any(Object),

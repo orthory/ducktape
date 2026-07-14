@@ -89,10 +89,12 @@ function RunOutputPane({
   runId,
   dispatchId,
   panelId,
+  terminal = false,
 }: {
   runId: string;
   dispatchId: string;
   panelId: string;
+  terminal?: boolean;
 }) {
   const { transport } = useDucktape();
   const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
@@ -169,7 +171,11 @@ function RunOutputPane({
     >
       {rows.length === 0 ? (
         <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
-          {unavailable ? "Run output unavailable." : "Waiting for retained output…"}
+          {unavailable
+            ? "Run output unavailable."
+            : terminal
+              ? "No retained output received — older output may have been evicted."
+              : "Waiting for retained output…"}
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -590,7 +596,12 @@ function HistoryRow({
         </span>
       )}
       {expanded && (
-        <RunOutputPane runId={rec.run_id} dispatchId={dispatchId} panelId={logPanelId} />
+        <RunOutputPane
+          runId={rec.run_id}
+          dispatchId={dispatchId}
+          panelId={logPanelId}
+          terminal
+        />
       )}
     </div>
   );
