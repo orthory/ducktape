@@ -21,6 +21,7 @@ use crate::node::Result;
 
 #[cfg(test)]
 mod librarian;
+mod control;
 mod read;
 mod write;
 
@@ -38,6 +39,7 @@ pub struct Tool {
 /// plane, then the write plane.
 pub fn all() -> Vec<Tool> {
     let mut tools = read::tools();
+    tools.extend(control::tools());
     tools.extend(write::tools());
     tools
 }

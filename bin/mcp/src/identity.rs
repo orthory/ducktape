@@ -48,7 +48,7 @@
 //! is ambient to any local process anyway.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::{AgentRecord, CapRequest};
 use commonware_codec::DecodeExt as _;
@@ -65,6 +65,9 @@ pub const ENV_SKILLS: &str = "DUCKTAPE_RUN_SKILLS";
 pub const ENV_SESSION_KEY: &str = "DUCKTAPE_RUN_SESSION_KEY";
 /// the run this session is bound to — the `run_id` every `AgentAction` names.
 pub const ENV_RUN_ID: &str = "DUCKTAPE_RUN_ID";
+const ENV_PROVIDER_CONTROL_URL: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
+const ENV_PROVIDER_CONTROL_TOKEN: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
+const PROVIDER_CONTROL_HEADER: &str = "x-ducktape-provider-control";
 
 /// the agent-registry module id. the node's genesis registers it under this
 /// name (`bin/noded/src/main.rs`), as it does every module the tools speak to.
@@ -100,6 +103,7 @@ pub struct Run {
     /// and this binary will not fall back to a lane that would file it under
     /// somebody else's name.
     session: Option<Session>,
+    provider_control: Option<ProviderControl>,
     /// monotonic within the process — the tail of every minted id.
     ids: AtomicU64,
 }
@@ -116,6 +120,7 @@ impl Run {
             workspace: std::env::var(ENV_WORKSPACE).ok().filter(|s| !s.is_empty()),
             skills: std::env::var(ENV_SKILLS).ok().filter(|s| !s.is_empty()),
             session: session_from_env(),
+            provider_control: ProviderControl::from_env(),
             ids: AtomicU64::new(0),
         }
     }
@@ -153,6 +158,20 @@ impl Run {
         let seq = session.seq.fetch_add(1, Ordering::Relaxed);
         let frame = node::encode_frame(&session.signer, seq, &msg);
         self.node.submit_frame(frame)
+    }
+
+    /// Ask the host-local controller for more silent provider time. The model
+    /// supplies no identity or credential: both arrive as ambient run env and
+    /// the broker rotates them for every child invocation.
+    pub fn extend_provider_idle(
+        &self,
+        request_id: String,
+        requested_secs: u64,
+    ) -> Result<serde_json::Value> {
+        let Some(control) = &self.provider_control else {
+            return Ok(json!({"status":"denied", "reason":"unavailable"}));
+        };
+        control.request(request_id, requested_secs)
     }
 
     /// the agent's COMMITTED record. fetched per call rather than cached at
@@ -229,6 +248,107 @@ impl Run {
     }
 }
 
+struct ProviderControl {
+    client: reqwest::blocking::Client,
+    url: String,
+    token: String,
+}
+
+impl ProviderControl {
+    fn from_env() -> Option<Self> {
+        let url = std::env::var(ENV_PROVIDER_CONTROL_URL)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let token = std::env::var(ENV_PROVIDER_CONTROL_TOKEN)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        if !provider_control_url_allowed(&url) || !provider_control_token_allowed(&token) {
+            return None;
+        }
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("a loopback-only provider control client always builds");
+        Some(Self { client, url, token })
+    }
+
+    fn request(&self, request_id: String, requested_secs: u64) -> Result<serde_json::Value> {
+        let response = match self
+            .client
+            .post(&self.url)
+            .header(PROVIDER_CONTROL_HEADER, &self.token)
+            .json(&json!({
+                "request_id": request_id,
+                "requested_secs": requested_secs,
+            }))
+            .send()
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return Ok(json!({
+                    "status":"denied",
+                    "reason":"control_unreachable",
+                }));
+            }
+        };
+        response.json().map_err(|error| {
+            NodeError::Transport(format!(
+                "provider idle controller returned an invalid reply: {error}"
+            ))
+        })
+    }
+}
+
+fn provider_control_url_allowed(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1" | "ducktape-host"))
+        && url.port().is_some()
+        && url.path() == "/v1/control/provider-idle"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn provider_control_token_allowed(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod provider_control_tests {
+    use super::*;
+
+    #[test]
+    fn control_endpoint_and_token_are_strictly_host_local() {
+        assert!(provider_control_url_allowed(
+            "http://127.0.0.1:41043/v1/control/provider-idle"
+        ));
+        assert!(provider_control_url_allowed(
+            "http://ducktape-host:41043/v1/control/provider-idle"
+        ));
+        for rejected in [
+            "https://127.0.0.1:41043/v1/control/provider-idle",
+            "http://localhost:41043/v1/control/provider-idle",
+            "http://example.com:41043/v1/control/provider-idle",
+            "http://127.0.0.1:41043/v1/control/provider-idle?token=leak",
+            "http://127.0.0.1:41043/other",
+        ] {
+            assert!(!provider_control_url_allowed(rejected), "accepted {rejected}");
+        }
+        assert!(provider_control_token_allowed(&"a5".repeat(32)));
+        assert!(!provider_control_token_allowed(&"A5".repeat(32)));
+        assert!(!provider_control_token_allowed("short"));
+    }
+}
+
 /// a cap request in the words the agent's own grant uses, so a refusal names
 /// the field its owner would have to widen.
 fn describe(cap: &CapRequest) -> String {
@@ -250,7 +370,9 @@ fn describe(cap: &CapRequest) -> String {
 /// than guessed at: the tools then refuse to write and SAY so, which is far
 /// better than signing with something that will never verify.
 fn session_from_env() -> Option<Session> {
-    let hex = std::env::var(ENV_SESSION_KEY).ok().filter(|s| !s.is_empty())?;
+    let hex = std::env::var(ENV_SESSION_KEY)
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let run_id = std::env::var(ENV_RUN_ID).ok().filter(|s| !s.is_empty())?;
     let raw = decode_hex(&hex)?;
     let signer = ed25519::PrivateKey::decode(raw.as_slice()).ok()?;
