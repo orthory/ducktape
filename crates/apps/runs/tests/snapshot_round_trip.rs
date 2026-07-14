@@ -375,15 +375,15 @@ fn dormant_librarian_mutations_preserve_populated_revision_two_state() {
     assert_eq!(module_under_test.state_schema_revision(), 2);
 
     for op in [
-        RunsMsg::BeginLibrarianCall {
+        RunsMsg::BeginLibrarianCall(runs::LibrarianCallBegin {
             run_id: "parent".into(),
             call_id: "call".into(),
             question: "question".into(),
-        },
-        RunsMsg::CancelLibrarianCall {
+        }),
+        RunsMsg::CancelLibrarianCall(runs::LibrarianCallCancel {
             run_id: "parent".into(),
             call_id: "call".into(),
-        },
+        }),
     ] {
         let mut ctx = TestCtx::new(9, Origin::External(vec![9; 32]));
         let msg = Msg {

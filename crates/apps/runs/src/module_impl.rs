@@ -114,9 +114,7 @@ impl Module for RunsModule {
                     remaining_child_budget: 0,
                 }),
             )),
-            RunsQuery::LibrarianCall { .. } => {
-                Ok(encode_reply(&RunsReply::LibrarianCall(None)))
-            }
+            RunsQuery::LibrarianCall { .. } => Ok(encode_reply(&RunsReply::LibrarianCall(None))),
         }
     }
 

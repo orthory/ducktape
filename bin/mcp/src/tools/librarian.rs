@@ -37,6 +37,10 @@ mod tests {
             })
         );
         assert!(crate::tools::find("ducktape_ask_librarian").is_none());
-        assert!(!crate::tools::list().to_string().contains("ducktape_ask_librarian"));
+        assert!(
+            !crate::tools::list()
+                .to_string()
+                .contains("ducktape_ask_librarian")
+        );
     }
 }

@@ -19,10 +19,10 @@ use serde_json::{Value, json};
 use crate::identity::Run;
 use crate::node::Result;
 
-mod read;
-mod write;
 #[cfg(test)]
 mod librarian;
+mod read;
+mod write;
 
 /// one tool: its MCP declaration and the handler behind it.
 pub struct Tool {

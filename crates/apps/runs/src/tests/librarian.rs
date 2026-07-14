@@ -13,7 +13,7 @@ fn valid_result() -> LibrarianCallResult {
     LibrarianCallResult {
         answer: valid_payload(),
         child_run_id: "librarian-child-1".into(),
-        provenance: format!("{}@nodes.duck", "ab".repeat(32)),
+        provenance: librarian_provenance(&"ab".repeat(32)).unwrap(),
     }
 }
 
@@ -36,10 +36,8 @@ fn request_bounds_are_exact_and_unknown_fields_are_rejected() {
         assert_eq!(decode_librarian_call_request(&bytes).is_ok(), ok);
     }
     assert!(
-        decode_librarian_call_request(
-            br#"{"call_id":"c","question":"q","owner":"forged"}"#
-        )
-        .is_err()
+        decode_librarian_call_request(br#"{"call_id":"c","question":"q","owner":"forged"}"#)
+            .is_err()
     );
     assert!(decode_librarian_call_request(br#"{"call_id":"c"}"#).is_err());
 }
@@ -48,15 +46,15 @@ fn request_bounds_are_exact_and_unknown_fields_are_rejected() {
 fn answer_parser_rejects_each_bound_without_truncation() {
     let mut payload = valid_payload();
     payload.answer = "a".repeat(ANSWER_MAX_BYTES);
-    assert_eq!(decode_librarian_answer(&serde_json::to_vec(&payload).unwrap()).unwrap(), payload);
+    assert_eq!(
+        decode_librarian_answer(&serde_json::to_vec(&payload).unwrap()).unwrap(),
+        payload
+    );
 
     payload.answer.push('a');
     assert!(decode_librarian_answer(&serde_json::to_vec(&payload).unwrap()).is_err());
 
-    for (evidence, uncertainties) in [
-        (MAX_EVIDENCE_REFS + 1, 0),
-        (0, MAX_UNCERTAINTIES + 1),
-    ] {
+    for (evidence, uncertainties) in [(MAX_EVIDENCE_REFS + 1, 0), (0, MAX_UNCERTAINTIES + 1)] {
         let mut payload = valid_payload();
         payload.evidence_refs = vec!["e".into(); evidence];
         payload.uncertainties = vec!["u".into(); uncertainties];
@@ -85,32 +83,20 @@ fn answer_parser_rejects_each_bound_without_truncation() {
 }
 
 #[test]
-fn complete_results_require_valid_child_run_and_lowercase_node_provenance() {
+fn results_derive_child_run_and_node_provenance_from_committed_inputs() {
     let valid = valid_result();
     assert_eq!(
         librarian_provenance(&"ab".repeat(32)).unwrap(),
         valid.provenance
     );
-    assert_eq!(
-        decode_librarian_call_result(&serde_json::to_vec(&valid).unwrap()).unwrap(),
-        valid
-    );
-    for provenance in [
-        format!("{}@nodes.duck", "AB".repeat(32)),
-        format!("{}@nodes.duck", "ab".repeat(31)),
-        "unknown@nodes.duck".into(),
-        "ab".repeat(32),
-    ] {
-        let mut result = valid_result();
-        result.provenance = provenance;
-        assert!(validate_librarian_call_result(&result).is_err());
+    assert_eq!(valid.child_run_id, "librarian-child-1");
+    for node in ["AB".repeat(32), "ab".repeat(31), "unknown".into()] {
+        assert!(librarian_provenance(&node).is_err());
     }
-    let mut result = valid_result();
-    result.child_run_id.clear();
-    assert!(validate_librarian_call_result(&result).is_err());
-    let mut unknown = serde_json::to_value(valid_result()).unwrap();
-    unknown["owner"] = serde_json::json!("forged");
-    assert!(decode_librarian_call_result(&serde_json::to_vec(&unknown).unwrap()).is_err());
+
+    // Provider bytes are decoded only as the answer payload. Even syntactically
+    // valid run/provenance claims are unknown fields and cannot become trusted.
+    assert!(decode_librarian_answer(&serde_json::to_vec(&valid).unwrap()).is_err());
 }
 
 #[test]
@@ -124,15 +110,15 @@ fn dormant_mutations_fail_identically_without_effects_or_state_movement() {
     ];
     for origin in origins {
         for op in [
-            RunsMsg::BeginLibrarianCall {
+            RunsMsg::BeginLibrarianCall(LibrarianCallBegin {
                 run_id: "parent".into(),
                 call_id: "call".into(),
                 question: "question".into(),
-            },
-            RunsMsg::CancelLibrarianCall {
+            }),
+            RunsMsg::CancelLibrarianCall(LibrarianCallCancel {
                 run_id: "parent".into(),
                 call_id: "call".into(),
-            },
+            }),
         ] {
             let mut module = module();
             assert_eq!(module.state_schema_revision(), 2);
@@ -150,12 +136,56 @@ fn dormant_mutations_fail_identically_without_effects_or_state_movement() {
 }
 
 #[test]
+fn actual_librarian_mutation_wire_rejects_every_forbidden_field() {
+    let begin = r#"{"begin_librarian_call":{"run_id":"r","call_id":"c","question":"q"}}"#;
+    let cancel = r#"{"cancel_librarian_call":{"run_id":"r","call_id":"c"}}"#;
+    let begin_msg = RunsMsg::BeginLibrarianCall(LibrarianCallBegin {
+        run_id: "r".into(),
+        call_id: "c".into(),
+        question: "q".into(),
+    });
+    let cancel_msg = RunsMsg::CancelLibrarianCall(LibrarianCallCancel {
+        run_id: "r".into(),
+        call_id: "c".into(),
+    });
+    assert_eq!(encode_msg(&begin_msg), begin.as_bytes());
+    assert_eq!(encode_msg(&cancel_msg), cancel.as_bytes());
+    assert_eq!(decode_msg(begin.as_bytes()).unwrap(), begin_msg);
+    assert_eq!(decode_msg(cancel.as_bytes()).unwrap(), cancel_msg);
+
+    for forbidden in [
+        r#""owner":"forged""#,
+        r#""session":"forged""#,
+        r#""context":{}"#,
+        r#""demands":{"cores":99}""#,
+        r#""child_agent":"forged""#,
+        r#""provenance":"forged""#,
+    ] {
+        let begin = format!(
+            r#"{{"begin_librarian_call":{{"run_id":"r","call_id":"c","question":"q",{forbidden}}}}}"#
+        );
+        let cancel =
+            format!(r#"{{"cancel_librarian_call":{{"run_id":"r","call_id":"c",{forbidden}}}}}"#);
+        assert!(
+            decode_msg(begin.as_bytes()).is_err(),
+            "accepted {forbidden}"
+        );
+        assert!(
+            decode_msg(cancel.as_bytes()).is_err(),
+            "accepted {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn dormant_queries_are_deterministic() {
     let module = module();
     assert_eq!(
-        block_on(module.query(&encode_query(&RunsQuery::LibrarianAvailability {
-            run_id: "any".into(),
-        })))
+        block_on(
+            module.query(&encode_query(&RunsQuery::LibrarianAvailability {
+                run_id: "any".into(),
+            }))
+        )
         .unwrap(),
         encode_reply(&RunsReply::LibrarianAvailability(LibrarianAvailability {
             feature_active: false,

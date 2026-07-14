@@ -40,8 +40,7 @@ pub const MAX_ENTRY_BYTES: usize = 1024;
 pub const MAX_ENCODED_ANSWER_BYTES: usize = 96 * 1024;
 
 /// Stable dormant-fence error returned by every Librarian mutation.
-pub const LIBRARIAN_REGENESIS_REQUIRED: &str =
-    "librarian calls are unavailable until re-genesis";
+pub const LIBRARIAN_REGENESIS_REQUIRED: &str = "librarian calls are unavailable until re-genesis";
 
 /// The only caller-controlled Librarian request data.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -49,6 +48,24 @@ pub const LIBRARIAN_REGENESIS_REQUIRED: &str =
 pub struct LibrarianCallRequest {
     pub call_id: String,
     pub question: String,
+}
+
+/// Strict payload for the dormant begin mutation. `run_id` comes from the
+/// verified MCP context; the model controls only `call_id` and `question`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianCallBegin {
+    pub run_id: String,
+    pub call_id: String,
+    pub question: String,
+}
+
+/// Strict payload for the dormant cancel mutation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarianCallCancel {
+    pub run_id: String,
+    pub call_id: String,
 }
 
 /// The bounded structured answer produced by a future Librarian child run.
@@ -61,7 +78,9 @@ pub struct LibrarianAnswerPayload {
     pub degraded: bool,
 }
 
-/// A trusted Librarian result after strict parsing and provenance validation.
+/// A trusted Librarian result assembled from a parsed answer plus committed
+/// child-run and dispatch identity. Provider output must never decode as this
+/// type.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LibrarianCallResult {
@@ -242,13 +261,9 @@ pub enum RunsMsg {
     /// Dormant, session-signed Librarian call lane. The verified frame origin
     /// supplies identity; callers cannot provide owner, session, context,
     /// demands, child agent, or provenance.
-    BeginLibrarianCall {
-        run_id: String,
-        call_id: String,
-        question: String,
-    },
+    BeginLibrarianCall(LibrarianCallBegin),
     /// Dormant cancellation peer of [`RunsMsg::BeginLibrarianCall`].
-    CancelLibrarianCall { run_id: String, call_id: String },
+    CancelLibrarianCall(LibrarianCallCancel),
 
     // ---- the agent session lane (mid-run writes) --------------------------
     /// the EXECUTING node binds an ephemeral session key to a live run, so the
@@ -335,7 +350,9 @@ pub enum RunsQuery {
     /// in-flight runs.
     AgentSessions,
     /// Dormant discovery query. It always reports inactive and unpermitted.
-    LibrarianAvailability { run_id: String },
+    LibrarianAvailability {
+        run_id: String,
+    },
     /// Dormant point query. It always reports no record.
     LibrarianCall {
         parent_run_id: String,

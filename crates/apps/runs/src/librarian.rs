@@ -5,8 +5,8 @@
 
 use crate::{
     ANSWER_MAX_BYTES, CALL_ID_MAX_BYTES, LibrarianAnswerPayload, LibrarianCallRequest,
-    LibrarianCallResult, MAX_ENCODED_ANSWER_BYTES, MAX_ENTRY_BYTES, MAX_EVIDENCE_REFS,
-    MAX_UNCERTAINTIES, QUESTION_MAX_BYTES,
+    MAX_ENCODED_ANSWER_BYTES, MAX_ENTRY_BYTES, MAX_EVIDENCE_REFS, MAX_UNCERTAINTIES,
+    QUESTION_MAX_BYTES,
 };
 
 fn required_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
@@ -84,23 +84,6 @@ pub fn librarian_provenance(node_id: &str) -> Result<String, String> {
     Ok(format!("{node_id}@nodes.duck"))
 }
 
-fn validate_provenance(value: &str) -> Result<(), String> {
-    const SUFFIX: &str = "@nodes.duck";
-    let Some(node) = value.strip_suffix(SUFFIX) else {
-        return Err("provenance must be <lowercase-node-id>@nodes.duck".into());
-    };
-    validate_node_id(node)
-}
-
-/// Validate a decoded result, including child-run and node provenance data.
-pub fn validate_librarian_call_result(result: &LibrarianCallResult) -> Result<(), String> {
-    validate_librarian_answer_payload(&result.answer)?;
-    if result.child_run_id.is_empty() {
-        return Err("child_run_id must not be empty".into());
-    }
-    validate_provenance(&result.provenance)
-}
-
 /// Strictly decode an answer payload under the aggregate encoded-size fence.
 pub fn decode_librarian_answer(bytes: &[u8]) -> Result<LibrarianAnswerPayload, String> {
     if bytes.len() > MAX_ENCODED_ANSWER_BYTES {
@@ -113,18 +96,4 @@ pub fn decode_librarian_answer(bytes: &[u8]) -> Result<LibrarianAnswerPayload, S
         serde_json::from_slice(bytes).map_err(|e| format!("librarian answer decode: {e}"))?;
     validate_librarian_answer_payload(&payload)?;
     Ok(payload)
-}
-
-/// Strictly decode a complete future call result under the same encoded fence.
-pub fn decode_librarian_call_result(bytes: &[u8]) -> Result<LibrarianCallResult, String> {
-    if bytes.len() > MAX_ENCODED_ANSWER_BYTES {
-        return Err(format!(
-            "encoded librarian answer is {} bytes; the cap is {MAX_ENCODED_ANSWER_BYTES}",
-            bytes.len()
-        ));
-    }
-    let result: LibrarianCallResult =
-        serde_json::from_slice(bytes).map_err(|e| format!("librarian result decode: {e}"))?;
-    validate_librarian_call_result(&result)?;
-    Ok(result)
 }
