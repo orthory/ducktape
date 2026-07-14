@@ -3,6 +3,7 @@ set -euo pipefail
 
 : "${FLEET_ARTIFACT_DIR:?Fleet must provide FLEET_ARTIFACT_DIR}"
 : "${FLEET_ARTIFACT_MANIFEST:?Fleet must provide FLEET_ARTIFACT_MANIFEST}"
+export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 export CEF_PATH="${CEF_PATH:-$HOME/.local/share/cef}"
