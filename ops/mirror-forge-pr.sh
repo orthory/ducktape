@@ -390,7 +390,10 @@ if (legacies && legacyEnds) {
   const a = body.indexOf(legacy) + legacy.length;
   const b = body.indexOf(legacyEnd, a);
   if (b < a) throw new Error("legacy epic provenance markers are out of order");
-  const lines = body.slice(a, b).split("\n").map(line => line.trim()).filter(Boolean);
+  // PR #598's first writer stored literal "\\n" separators. Interpret either
+  // separator only inside this already-bounded legacy block; prefix and suffix
+  // bytes remain opaque and are preserved exactly during migration.
+  const lines = body.slice(a, b).split(/\r?\n|\\n/).map(line => line.trim()).filter(Boolean);
   if (!lines.length || lines.length % 2 || lines.length > 256) {
     throw new Error("legacy epic provenance block has an unsupported shape");
   }

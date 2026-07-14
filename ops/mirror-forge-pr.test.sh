@@ -168,27 +168,28 @@ for tampered in wrong-repo wrong-pr wrong-merge; do
 done
 SOURCE_COMMITS=("$SOURCE_OID")
 
-# PR #598 was deployed with a bounded non-JSON v1 block. Parse its redundant
-# comment/bullet pair strictly, then migrate verified commit mappings into the
-# JSON ledger while preserving all human text outside the block byte-for-byte.
-cat >"$TEST_ROOT/epic-598-prefix" <<'EOF'
-Draft improvement epic for verified Forge changes.
-
-The commits below were reviewed in Forge. Keep this human-authored text.
-
-EOF
-cp "$TEST_ROOT/epic-598-prefix" "$TEST_ROOT/epic-598-body"
-cat >>"$TEST_ROOT/epic-598-body" <<'EOF'
-<!-- forge-epic-provenance:v1 -->
-<!-- forge-provenance:ducktape#117 merge=d688a1104daae08c38ac1e5938c6d7737d299314 source=20d9b9efd96d3a0741c8430b13a2981d1da1f66d target=cfd1bf1ad8e37afc32a07301a20ed580aa4bb227 -->
-- ducktape#117 — 20d9b9efd96d3a0741c8430b13a2981d1da1f66d (Forge merge d688a1104daae08c38ac1e5938c6d7737d299314)
-<!-- /forge-epic-provenance -->
-
-Human-authored Forge #117 details stay after the provenance block.
-EOF
+# PR #598 was deployed with literal backslash-n separators throughout its
+# body, not newline bytes. Keep the exact deployed shape as the fixture, parse
+# its redundant pair strictly, and preserve every byte outside the markers.
+node - "$TEST_ROOT/epic-598-body" "$TEST_ROOT/epic-598-prefix" <<'NODE'
+const fs = require("node:fs");
+const [bodyPath, prefixPath] = process.argv.slice(2);
+const body = String.raw`This draft accumulates independently reviewed Ducktape Agent-system improvements before one merge into dev.\n\n## Current ledger\n\n<!-- forge-epic-provenance:v1 -->\n<!-- forge-provenance:ducktape#117 merge=d688a1104daae08c38ac1e5938c6d7737d299314 source=20d9b9efd96d3a0741c8430b13a2981d1da1f66d target=cfd1bf1ad8e37afc32a07301a20ed580aa4bb227 -->\n- ducktape#117 — 20d9b9efd96d3a0741c8430b13a2981d1da1f66d (Forge merge d688a1104daae08c38ac1e5938c6d7737d299314)\n<!-- /forge-epic-provenance -->\n\n### Forge PR #117 — Stage bounded Librarian call contracts behind the re-genesis fence\n\n- Forge merge: d688a1104daae08c38ac1e5938c6d7737d299314\n- Forge source: 20d9b9efd96d3a0741c8430b13a2981d1da1f66d\n- GitHub replay tip: 9690bc80b1fe08232d69cd3c5bc5466baaaaa622\n- Clean review: two P1 findings addressed; follow-up found no P0/P1 and high merge confidence\n- Gates: Runs and MCP tests, crate clippy, no-default-features, wasm32 check, and 252 bounded Podman tests at 2 CPU / 4 GiB / swap 0\n- Version safety: no WASM module version, current_version, or upgrade schedule changed\n\n## Operating rule\n\n- Forge keeps one atomic issue and PR per change for Agent execution, audit, and rollback.\n- This GitHub PR remains draft while verified Forge changes are appended with original messages and provenance.\n- The append mechanism is generic to an epic branch and slug; it must not special-case Librarian work or issue numbers.\n- Every slice receives a clean-context review and bounded verification.\n- Testing may compile or compatibility-check WASM, but must never bump module versions, schedule activation, or force an upgrade.\n- WASM version changes require a separate, explicitly requested release task.\n- At milestone freeze, review the full diff against current dev, keep history intact, mark ready, and merge once with a merge commit.\n- Do not squash, rebase, or add GitHub issue-closing keywords.`;
+const marker = "<!-- forge-epic-provenance:v1 -->";
+fs.writeFileSync(bodyPath, body);
+fs.writeFileSync(prefixPath, body.slice(0, body.indexOf(marker)));
+NODE
 parse_epic_ledger "$TEST_ROOT/epic-598-body" "$TEST_ROOT/epic-598-records"
 grep -F $'L\tducktape\t117\td688a1104daae08c38ac1e5938c6d7737d299314' \
   "$TEST_ROOT/epic-598-records" >/dev/null
+node - "$TEST_ROOT/epic-598-body" "$TEST_ROOT/epic-598-mixed" <<'NODE'
+const fs = require("node:fs");
+const [input, output] = process.argv.slice(2);
+const body = fs.readFileSync(input, "utf8");
+fs.writeFileSync(output, body.replace(String.raw`\n- ducktape#117`, "\n- ducktape#117"));
+NODE
+parse_epic_ledger "$TEST_ROOT/epic-598-mixed" "$TEST_ROOT/epic-598-mixed-records"
+cmp "$TEST_ROOT/epic-598-records" "$TEST_ROOT/epic-598-mixed-records"
 node - "$TEST_ROOT/epic-598-body" "$TEST_ROOT/epic-598-mismatch" <<'NODE'
 const fs = require("node:fs");
 const [input, output] = process.argv.slice(2);
@@ -223,7 +224,7 @@ const oldSuffix = before.slice(before.indexOf(oldEnd) + oldEnd.length);
 const newSuffix = after.slice(after.indexOf(newEnd) + newEnd.length);
 if (oldSuffix !== newSuffix) throw new Error("legacy migration changed human-authored suffix bytes");
 NODE
-grep -F 'Human-authored Forge #117 details stay after the provenance block.' \
+grep -F '### Forge PR #117 — Stage bounded Librarian call contracts behind the re-genesis fence' \
   "$TEST_ROOT/epic-598-migrated" >/dev/null
 [ "$(grep -Fc 'forge-epic-provenance:v1' "$TEST_ROOT/epic-598-migrated")" -eq 0 ]
 [ "$(grep -Fc 'forge-epic-provenance:start' "$TEST_ROOT/epic-598-migrated")" -eq 1 ]
