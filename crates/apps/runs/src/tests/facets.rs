@@ -182,25 +182,42 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main");
+    let oid = "1a".repeat(20);
+    let granted_facets = serde_json::json!({
+        "workspace_receipt": {
+            "source_prefix": "forge:app",
+            "source_snapshot": "2b".repeat(20),
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": false,
+            "branch": "agent/x",
+            "output_commit": oid,
+        },
+        "sink": sink["sink"].clone(),
+    });
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper("done", sink.clone()))),
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper("done", granted_facets)),
+        ),
     )
     .unwrap();
     let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
     assert_eq!(forge_ops.len(), 1, "one OpenPr emitted");
     // title = first line of the message facet; body = the full message +
     // the receipt breadcrumb block (run id, output_ref, executing node).
-    // the default wrapper receipt is a no-changes duckfs receipt and no
-    // saga record is seeded, so output/node degrade honestly.
+    // the forge receipt proves this run pushed the source branch; no saga
+    // record is seeded, so only the executing node degrades honestly.
     assert_eq!(
         forge::decode_msg(&forge_ops[0].payload).unwrap(),
         forge::ForgeMsg::OpenPr {
             repo: "app".into(),
             title: "done".into(),
             body: format!(
-                "done\n\n---\nrun: {run_id}\noutput: none (no changes this run)\nnode: unknown"
+                "done\n\n---\nrun: {run_id}\noutput: agent/x@{oid}\nnode: unknown"
             ),
             source_branch: "agent/x".into(),
             target_branch: "main".into(),
