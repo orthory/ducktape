@@ -22,15 +22,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use capability_host::{ProviderSet, RunCancellation};
-use futures::future::{select, BoxFuture, Either};
+use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
 use sdk::{Event, Msg};
 use tokio::sync::Semaphore;
 
-use crate::provision::{assemble_runner_result, bind_workspace, SharedProvisioner, WorkspaceSpec};
+use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
 use crate::{
-    attempt_output, clean_error, gate, oracle_result_with_usage, renew_lease, AttemptOutput,
-    ExecJob, Gated, ResourceLedger,
+    AttemptOutput, ExecJob, Gated, ResourceLedger, attempt_output, clean_error, gate,
+    oracle_result_with_usage, renew_lease,
 };
 use dispatch::AdmissionPolicy;
 
@@ -289,8 +289,7 @@ impl DispatchPool {
                     let admission = async {
                         let reservation = match job.admission {
                             AdmissionPolicy::Queue => {
-                                let reservation_key =
-                                    format!("{}:{}", job.saga_id, job.attempt);
+                                let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
                                 let Some(reservation) = ledger
                                     .reserve_when_available(
                                         &reservation_key,
@@ -300,7 +299,7 @@ impl DispatchPool {
                                     .await
                                 else {
                                     return Err(
-                                        "attempt cancelled while waiting for resources".into(),
+                                        "attempt cancelled while waiting for resources".into()
                                     );
                                 };
                                 reservation
@@ -309,7 +308,7 @@ impl DispatchPool {
                                 let mut attempts = inflight.lock().expect("attempts lock");
                                 let Some(running) = attempts.get_mut(&key) else {
                                     return Err(
-                                        "attempt disappeared before resource admission".into(),
+                                        "attempt disappeared before resource admission".into()
                                     );
                                 };
                                 running
@@ -778,8 +777,7 @@ impl Worker for DispatchPool {
                 let cancellation = RunCancellation::new();
                 let reservation = if job.admission == AdmissionPolicy::FailFast {
                     let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
-                    let Some(reservation) =
-                        self.ledger.try_reserve(&reservation_key, &job.demands)
+                    let Some(reservation) = self.ledger.try_reserve(&reservation_key, &job.demands)
                     else {
                         return Ok(WorkOutcome::Handled(Some(oracle_result_with_usage(
                             &job.saga_id,
@@ -815,15 +813,15 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Condvar;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
-    use dispatch::{encode_work_spec, WorkSpec, WORK_SPEC_KIND};
+    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
     use futures::StreamExt as _;
     use saga::{
-        encode_worker_control, encode_worker_request, SagaMsg, WorkerControl, WorkerRequest,
+        SagaMsg, WorkerControl, WorkerRequest, encode_worker_control, encode_worker_request,
     };
 
     fn spec_toml(tag: &str) -> capability_host::CapabilitySpec {
@@ -1255,7 +1253,10 @@ format = "text"
         assert!(!provisioned.load(Ordering::SeqCst));
         assert_eq!(pool.in_flight(), 0);
         drop(occupied);
-        assert!(pool.ledger.fits(&capacity), "failed admission leaves no reservation");
+        assert!(
+            pool.ledger.fits(&capacity),
+            "failed admission leaves no reservation"
+        );
     }
 
     #[tokio::test]
@@ -1274,7 +1275,10 @@ format = "text"
             pool.run(&event).await.unwrap(),
             WorkOutcome::Handled(None)
         ));
-        assert!(!pool.ledger.fits(&capacity), "successful admission reserves once");
+        assert!(
+            !pool.ledger.fits(&capacity),
+            "successful admission reserves once"
+        );
         let (saga_id, attempt, outcome) = next_result(&mut rx).await;
         assert_eq!((saga_id.as_str(), attempt), ("nested", 0));
         assert_eq!(outcome.unwrap(), PLAIN_ANSWER);
@@ -1286,7 +1290,10 @@ format = "text"
         .await
         .unwrap();
         assert_eq!(probes.executions.load(Ordering::SeqCst), 1);
-        assert!(pool.ledger.fits(&capacity), "settlement releases reservation");
+        assert!(
+            pool.ledger.fits(&capacity),
+            "settlement releases reservation"
+        );
     }
 
     #[tokio::test]

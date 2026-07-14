@@ -38,8 +38,8 @@ mod soul;
 mod workspace_source;
 pub use ledger::{ReservationGuard, ResourceLedger};
 pub use pool::{
-    AttemptControl, DeliverFn, DispatchPool, SpawnFn, SpawnKind, max_concurrent_runs_from_env,
-    RESOURCE_UNAVAILABLE_RESULT,
+    AttemptControl, DeliverFn, DispatchPool, RESOURCE_UNAVAILABLE_RESULT, SpawnFn, SpawnKind,
+    max_concurrent_runs_from_env,
 };
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
@@ -541,8 +541,8 @@ format = "text"
         let _running = ledger
             .try_reserve("running", &demands(&[("cores", 4)]))
             .expect("first run fills capacity");
-        let mut work: WorkSpec = decode_work_spec(&work_spec_with_demands(demands(&[("cores", 4)])))
-            .expect("work spec");
+        let mut work: WorkSpec =
+            decode_work_spec(&work_spec_with_demands(demands(&[("cores", 4)]))).expect("work spec");
         work.admission = AdmissionPolicy::FailFast;
         let spec = encode_work_spec(&work);
 
@@ -550,12 +550,8 @@ format = "text"
             gate(&providers, b"me", &ledger, &effect_for(spec.clone(), None)),
             Gated::Immediate(_)
         ));
-        let Gated::Execute(job) = gate(
-            &providers,
-            b"me",
-            &ledger,
-            &effect_for(spec, Some(b"me")),
-        ) else {
+        let Gated::Execute(job) = gate(&providers, b"me", &ledger, &effect_for(spec, Some(b"me")))
+        else {
             panic!("assigned fail-fast work reaches the atomic admission step")
         };
         assert_eq!(job.admission, AdmissionPolicy::FailFast);

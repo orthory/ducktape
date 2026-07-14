@@ -140,8 +140,8 @@ impl Drop for ReservationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn res(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
