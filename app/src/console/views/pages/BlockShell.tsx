@@ -125,8 +125,8 @@ export function BlockShell({
 }) {
   if (kind === "divider") {
     return (
-      <div aria-label={`Divider block ${blockNumber}`} style={{ padding: "10px 0" }}>
-        <div style={{ height: 1, background: color.borderStrong }} />
+      <div aria-label={`Divider block ${blockNumber}`} style={{ padding: "14px 0" }}>
+        <div style={{ height: 1, background: color.border }} />
       </div>
     );
   }
@@ -142,9 +142,9 @@ export function BlockShell({
         style={{
           position: "relative",
           background: color.sunken,
-          border: `1px solid ${color.border}`,
+          border: `1px solid ${color.borderSoft}`,
           borderRadius: radius.md,
-          padding: "10px 12px",
+          padding: "16px 18px",
         }}
       >
         <span
@@ -193,12 +193,11 @@ export function BlockShell({
         style={{
           position: "relative",
           display: "flex",
-          gap: 10,
+          gap: 12,
           background: wash.bg,
-          border: `1px solid ${wash.border}`,
           borderLeft: `3px solid ${accentVar}`,
-          borderRadius: radius.md,
-          padding: "11px 13px",
+          borderRadius: `0 ${radius.md}px ${radius.md}px 0`,
+          padding: "14px 16px",
         }}
       >
         <span

@@ -27,7 +27,7 @@ import { dropTarget } from "./page-drag";
 import { loadCollapsed, saveCollapsed } from "./page-collapse";
 import { MAX_PASTE_BLOCKS } from "./page-paste";
 import { ancestorChain } from "./page-tree";
-import { COLUMN_PAD_X } from "./pages-style";
+import { COLUMN_PAD_X, DOC_COLUMN_MAX } from "./pages-style";
 import { useRowHandlers } from "./use-row-handlers";
 import type { DragState } from "./use-row-handlers";
 import { BlockRow } from "./BlockRow";
@@ -493,9 +493,9 @@ export function PagesView() {
                 <div
                   style={{
                     width: "100%",
-                    maxWidth: 780,
+                    maxWidth: DOC_COLUMN_MAX,
                     margin: "0 auto",
-                    padding: `32px ${COLUMN_PAD_X}px 120px`,
+                    padding: `44px ${COLUMN_PAD_X}px 100px`,
                     boxSizing: "border-box",
                   }}
                 >

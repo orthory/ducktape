@@ -31,6 +31,11 @@ export const GUTTER_WIDTH = 46;
  *  so the two constants are derived, not guessed, and cannot drift apart. */
 export const COLUMN_PAD_X = MARKER_HANG + GUTTER_WIDTH + 6;
 
+/** The reference design reads best at a 620px text measure (a 700px column
+ *  with 40px side padding). Our column padding is COLUMN_PAD_X per side, so
+ *  the outer cap is derived from the measure — not the other way round. */
+export const DOC_COLUMN_MAX = 620 + COLUMN_PAD_X * 2;
+
 /** Breathing room above a heading. Rows are otherwise uniformly spaced, which
  *  made an H1 sit as tight against the paragraph above it as another
  *  paragraph would. */
@@ -45,13 +50,13 @@ export const kindFont = (kind: BlockKind): string => {
     case "heading1":
       return `700 26px/1.25 ${font.sans}`;
     case "heading2":
-      return `700 20px/1.3 ${font.sans}`;
+      return `700 22px/1.3 ${font.sans}`;
     case "heading3":
-      return `650 17px/1.4 ${font.sans}`;
+      return `650 18px/1.4 ${font.sans}`;
     case "code":
-      return `400 13px/1.7 ${font.mono}`;
+      return `400 13.5px/1.85 ${font.mono}`;
     default:
-      return `400 15px/1.75 ${font.sans}`;
+      return `400 15px/1.7 ${font.sans}`;
   }
 };
 
