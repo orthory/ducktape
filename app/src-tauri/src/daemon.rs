@@ -791,6 +791,22 @@ pub(crate) fn watch_node_exit(mut child: Child, workspace: String) {
         .spawn(move || {
             let elapsed_s = || started.elapsed().as_secs();
             match child.wait() {
+                // a CLEAN exit is the routine path, not an incident: every workspace
+                // switch, forget, and sandbox-apply asks this node to stop (POST
+                // /v1/shutdown → exit(0)). crying `error!` on the most common
+                // lifecycle action would be a false alarm in exactly the log someone
+                // reads BECAUSE they are chasing a death — and it would teach them to
+                // ignore the line that matters.
+                Ok(status) if status.code() == Some(0) => tracing::info!(
+                    target: "ducktape::shell",
+                    %workspace,
+                    pid,
+                    elapsed_s = elapsed_s(),
+                    "the workspace node stopped cleanly"
+                ),
+                // anything else is a death we did not ask for — a panic, an OOM, a
+                // failed schema preflight, or an escalation to TERM/KILL because the
+                // graceful stop did not take. `code` is None when a signal killed it.
                 Ok(status) => tracing::error!(
                     target: "ducktape::shell",
                     %workspace,
@@ -1048,8 +1064,20 @@ mod tests {
         // shell `user-sign-frame` with a (possibly secret) payload/password on
         // stdin — the verb AND its stdin arm must be allowlisted or every
         // user-signed submit hard-fails before the node runs.
-        assert!(validate_invocation(&["user-sign-frame", "--target", "chat", "--seq", "1"], &["deadbeef"]).is_ok());
-        assert!(validate_invocation(&["user-sign-frame", "--target", "files", "--seq", "1"], &["pw", "deadbeef"]).is_ok());
+        assert!(
+            validate_invocation(
+                &["user-sign-frame", "--target", "chat", "--seq", "1"],
+                &["deadbeef"]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_invocation(
+                &["user-sign-frame", "--target", "files", "--seq", "1"],
+                &["pw", "deadbeef"]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1073,11 +1101,15 @@ mod tests {
         // A root-owned dir writable by an arbitrary group is swappable…
         assert!(dir_replaceable_by_others(0, 12345, 0o40775, me, my_group));
         // …and other-write is always hostile without the sticky bit…
-        assert!(dir_replaceable_by_others(me, my_group, 0o40777, me, my_group));
+        assert!(dir_replaceable_by_others(
+            me, my_group, 0o40777, me, my_group
+        ));
         // …but the sticky bit clears it (/tmp's ownership rule).
         assert!(!dir_replaceable_by_others(0, 0, 0o41777, me, my_group));
         // Our own dir under our own primary group may be group-writable.
-        assert!(!dir_replaceable_by_others(me, my_group, 0o40775, me, my_group));
+        assert!(!dir_replaceable_by_others(
+            me, my_group, 0o40775, me, my_group
+        ));
         // root:admin 0775 is the macOS convention for /Applications — trusted
         // there, hostile elsewhere.
         #[cfg(target_os = "macos")]

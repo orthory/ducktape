@@ -845,7 +845,11 @@ impl Sim {
             {
                 Ok(committed) => Some(committed_info(&committed, "oracle")),
                 Err(err) => {
-                    eprintln!("[simnode] worker follow-up rejected: {err}");
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        error = %err,
+                        "worker follow-up REJECTED — the oracle's result never landed"
+                    );
                     None
                 }
             };
@@ -888,7 +892,11 @@ impl Sim {
                 .commit(Origin::External(ORACLE_ORIGIN.to_vec()), follow)
                 .await
             {
-                eprintln!("[simnode] worker follow-up rejected: {err}");
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %err,
+                    "worker follow-up REJECTED — the oracle's result never landed"
+                );
             }
         }
         Ok(())
@@ -919,7 +927,7 @@ impl Sim {
                 // same fail-stop as the real daemons: a half-committed host is
                 // indeterminate, and a SIM that limps past it would hand tests
                 // green runs over corrupt state.
-                eprintln!("[simnode] FATAL: {err} — halting");
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
@@ -968,9 +976,12 @@ impl Sim {
             })),
         };
         if let Err(err) = self.index.apply_block(&block_ops) {
-            eprintln!(
-                "[simnode] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-                self.height
+            tracing::error!(
+                target: "ducktape::consensus",
+                height = self.height,
+                error = %err,
+                "module index apply FAILED — the app's views are now STALE; wipe \
+                 <storage>/index to rebuild"
             );
         }
 
@@ -1025,7 +1036,7 @@ impl Sim {
             Ok(out) => out,
             Err(SubmitError::Fatal(err)) => {
                 // same fail-stop as the single-op lane and the real daemons.
-                eprintln!("[simnode] FATAL: {err} — halting");
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             // a member reject is folded into its MemberOutcome, never here: a
@@ -1110,9 +1121,12 @@ impl Sim {
             }),
         };
         if let Err(err) = self.index.apply_block(&block_ops) {
-            eprintln!(
-                "[simnode] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-                self.height
+            tracing::error!(
+                target: "ducktape::consensus",
+                height = self.height,
+                error = %err,
+                "module index apply FAILED — the app's views are now STALE; wipe \
+                 <storage>/index to rebuild"
             );
         }
 
