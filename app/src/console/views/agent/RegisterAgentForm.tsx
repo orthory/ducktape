@@ -127,7 +127,7 @@ export function RegisterAgentForm({
     <section aria-label="Register agent" style={{ minWidth: 0 }}>
       <SectionLabel>REGISTER AGENT</SectionLabel>
       <GroupCard style={{ marginTop: 9 }}>
-        <form onSubmit={submit} style={{ padding: 16 }}>
+        <form onSubmit={submit} aria-busy={submitting} style={{ padding: 16 }}>
           <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
             <AgentAvatar name={displayName || "AI"} size={40} />
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -343,7 +343,16 @@ export function RegisterAgentForm({
               {idProblem ?? `saved as ${agentId || "—"}`}
             </span>
             {onDone && (
-              <button type="button" onClick={onDone} style={secondaryButton}>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={onDone}
+                style={{
+                  ...secondaryButton,
+                  cursor: submitting ? "default" : "pointer",
+                  opacity: submitting ? 0.6 : 1,
+                }}
+              >
                 Cancel
               </button>
             )}
@@ -352,7 +361,7 @@ export function RegisterAgentForm({
               disabled={!ready || submitting}
               style={primaryButton(ready && !submitting)}
             >
-              Register agent
+              {submitting ? "Registering…" : "Register agent"}
             </button>
           </div>
         </form>

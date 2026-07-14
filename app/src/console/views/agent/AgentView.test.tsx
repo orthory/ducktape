@@ -236,10 +236,15 @@ describe("AgentView", () => {
 
     expect(screen.getByRole("button", { name: /close edit/i })).toBeDisabled();
     const save = within(form).getByRole("button", { name: /save changes/i });
+    const cancel = within(form).getByRole("button", { name: /^cancel$/i });
     expect(save).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(form).toHaveAttribute("aria-busy", "true");
     expect(within(form).getByLabelText(/edit display name/i)).toHaveValue("Draft survives");
     fireEvent.click(save);
+    fireEvent.click(cancel);
     expect(spies.updateAgent).not.toHaveBeenCalled();
+    expect(screen.getByRole("form", { name: /edit agent/i })).toBeInTheDocument();
   });
 
   it("renders roster, detail, and the three tabs after the split", () => {
@@ -417,11 +422,18 @@ describe("AgentView", () => {
     fireEvent.change(name, { target: { value: "Triage Agent" } });
     fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
     const submit = screen.getByRole("button", { name: /register agent/i });
+    const cancel = screen.getByRole("button", { name: /^cancel$/i });
+    const form = screen.getByRole("region", { name: /register agent/i }).querySelector("form")!;
 
     fireEvent.click(submit);
     fireEvent.click(submit);
     expect(spies.registerAgent).toHaveBeenCalledTimes(1);
     expect(submit).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(form).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "Registering…" })).toBeDisabled();
+    fireEvent.click(cancel);
+    expect(screen.getByRole("region", { name: /register agent/i })).toBeInTheDocument();
     expect(name).toHaveValue("Triage Agent");
 
     await act(async () => {
@@ -429,6 +441,8 @@ describe("AgentView", () => {
       await pending.promise;
     });
     expect(submit).toBeEnabled();
+    expect(cancel).toBeEnabled();
+    expect(form).toHaveAttribute("aria-busy", "false");
     expect(name).toHaveValue("Triage Agent");
 
     spies.registerAgent.mockResolvedValue(true);
@@ -495,11 +509,18 @@ describe("AgentView", () => {
     const name = screen.getByLabelText("Edit display name");
     fireEvent.change(name, { target: { value: "Revised Agent" } });
     const submit = screen.getByRole("button", { name: /save changes/i });
+    const form = screen.getByRole("form", { name: /edit agent/i });
+    const cancel = within(form).getByRole("button", { name: /^cancel$/i });
 
     fireEvent.click(submit);
     fireEvent.click(submit);
     expect(spies.updateAgent).toHaveBeenCalledTimes(1);
     expect(submit).toBeDisabled();
+    expect(cancel).toBeDisabled();
+    expect(form).toHaveAttribute("aria-busy", "true");
+    expect(within(form).getByRole("button", { name: "Saving…" })).toBeDisabled();
+    fireEvent.click(cancel);
+    expect(screen.getByRole("form", { name: /edit agent/i })).toBeInTheDocument();
     expect(name).toHaveValue("Revised Agent");
 
     await act(async () => {
@@ -507,6 +528,8 @@ describe("AgentView", () => {
       await pending.promise;
     });
     expect(submit).toBeEnabled();
+    expect(cancel).toBeEnabled();
+    expect(form).toHaveAttribute("aria-busy", "false");
     expect(name).toHaveValue("Revised Agent");
 
     spies.updateAgent.mockResolvedValue(true);
@@ -819,39 +842,56 @@ describe("AgentView", () => {
     expect(screen.getByText(/waiting for confirmation/i)).toBeInTheDocument();
   });
 
-  it("disables force reassign while the run write is pending", () => {
-    const { spies } = renderAgents({
-      ops: {
+  it.each([
+    ["force reassign", "reassignRun", "cancelRun"],
+    ["cancel", "cancelRun", "reassignRun"],
+  ] as const)(
+    "disables both run actions when %s starts for their shared key",
+    (firstAction, firstSpy, blockedSpy) => {
+      const { spies, setOps } = renderAgents({
+        runLease: new Map([
+          [
+            "general/42/summarizer",
+            {
+              assigneeHex: "cd".repeat(32),
+              attempt: 0,
+              maxAttempts: 2,
+              expiresAt: 80,
+              deadline: 100,
+              updatedAt: 40,
+              reassignable: true,
+            },
+          ],
+        ]),
+      });
+
+      openTab(/activity/i);
+      const reassign = screen.getByRole("button", {
+        name: /force reassign run summary agent.*general @42/i,
+      });
+      const cancel = screen.getByRole("button", {
+        name: /cancel run summary agent.*general @42/i,
+      });
+
+      fireEvent.click(firstAction === "force reassign" ? reassign : cancel);
+      expect(spies[firstSpy]).toHaveBeenCalledTimes(1);
+
+      setOps({
         [opKey.run("general/42/summarizer")]: {
           seq: 1,
           phase: "pending",
           startedAt: 10,
         },
-      },
-      runLease: new Map([
-        [
-          "general/42/summarizer",
-          {
-            assigneeHex: "cd".repeat(32),
-            attempt: 0,
-            maxAttempts: 2,
-            expiresAt: 80,
-            deadline: 100,
-            updatedAt: 40,
-            reassignable: true,
-          },
-        ],
-      ]),
-    });
+      });
 
-    openTab(/activity/i);
-    const reassign = screen.getByRole("button", {
-      name: /force reassign run summary agent.*general @42/i,
-    });
-    expect(reassign).toBeDisabled();
-    fireEvent.click(reassign);
-    expect(spies.reassignRun).not.toHaveBeenCalled();
-  });
+      expect(reassign).toBeDisabled();
+      expect(cancel).toBeDisabled();
+      fireEvent.click(reassign);
+      fireEvent.click(cancel);
+      expect(spies[firstSpy]).toHaveBeenCalledTimes(1);
+      expect(spies[blockedSpy]).not.toHaveBeenCalled();
+    },
+  );
 
   it("offers announced executors as a Runs on picker, defaulting to the first", () => {
     renderAgents({ capabilities: ["claude", "codex"] });

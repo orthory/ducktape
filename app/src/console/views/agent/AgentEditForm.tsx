@@ -94,6 +94,7 @@ export function AgentEditForm({
     <form
       onSubmit={submit}
       aria-label="Edit agent"
+      aria-busy={blocked}
       style={{
         marginTop: 15,
         border: `1px solid ${color.border}`,
@@ -236,7 +237,16 @@ export function AgentEditForm({
           gap: 8,
         }}
       >
-        <button type="button" onClick={onClose} style={secondaryButton}>
+        <button
+          type="button"
+          disabled={blocked}
+          onClick={onClose}
+          style={{
+            ...secondaryButton,
+            cursor: blocked ? "default" : "pointer",
+            opacity: blocked ? 0.6 : 1,
+          }}
+        >
           Cancel
         </button>
         <button
@@ -244,7 +254,7 @@ export function AgentEditForm({
           disabled={blocked}
           style={primaryButton(!blocked)}
         >
-          Save changes
+          {submitting ? "Saving…" : "Save changes"}
         </button>
       </div>
     </form>

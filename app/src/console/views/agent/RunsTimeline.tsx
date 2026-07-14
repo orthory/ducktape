@@ -405,6 +405,7 @@ function RunRow({
           )}
           <button
             type="button"
+            disabled={pending}
             onClick={() => onCancel(run.run_id)}
             aria-label={`Cancel run ${runLabel}`}
             style={{
@@ -412,6 +413,8 @@ function RunRow({
               marginLeft: canReassign ? 0 : "auto",
               minHeight: 28,
               color: color.red,
+              cursor: pending ? "default" : "pointer",
+              opacity: pending ? 0.6 : 1,
             }}
           >
             Cancel
