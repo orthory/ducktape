@@ -133,7 +133,24 @@ export const execute = (
 
 export interface CeremonyResult {
   proposalId: string;
+  /** Always `"passed"` — a ceremony that did not pass REJECTS instead (see
+   *  [`driveMembership`]), so an op tracker can never paint a rejected or
+   *  still-open ceremony as a success. */
   status: ProposalStatus;
+}
+
+/** A ceremony that landed its ballot but did not (yet) change the set. The
+ *  message is what op trackers surface, so it carries the real outcome. */
+export class CeremonyIncomplete extends Error {
+  constructor(
+    public readonly proposalId: string,
+    /** `"open"` (awaiting other validators) or `"rejected"`. */
+    public readonly status: ProposalStatus,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CeremonyIncomplete";
+  }
 }
 
 const sameAction = (a: GovAction, b: GovAction): boolean =>
@@ -164,13 +181,38 @@ export const driveMembership = async (
   await vote(transport, { proposalId, approve: true });
 
   const voted = (await proposals(transport)).find((p) => p.proposal_id === proposalId);
-  if (!voted) return { proposalId, status: "rejected" };
+  if (!voted) {
+    throw new CeremonyIncomplete(proposalId, "rejected", `proposal ${proposalId} disappeared`);
+  }
+  let outcome = voted;
   if (voted.status === "open" && canSettleEarly(voted, memberCount)) {
     await execute(transport, { proposalId });
-    const settled = (await proposals(transport)).find((p) => p.proposal_id === proposalId);
-    return { proposalId, status: settled?.status ?? "open" };
+    outcome =
+      (await proposals(transport)).find((p) => p.proposal_id === proposalId) ?? voted;
   }
-  return { proposalId, status: voted.status };
+  // Only an EXECUTED, PASSED ceremony resolves — anything else rejects with the
+  // real outcome in the message, so an op tracker (submitTracked) marks it
+  // failed instead of painting a rejected/still-open change as a success.
+  switch (outcome.status) {
+    case "passed":
+      return { proposalId, status: "passed" };
+    case "rejected":
+      throw new CeremonyIncomplete(
+        proposalId,
+        "rejected",
+        `the membership proposal was rejected (${proposalId})`,
+      );
+    default: {
+      const { yes } = tally(outcome);
+      const required = decisionThreshold(outcome, memberCount);
+      throw new CeremonyIncomplete(
+        proposalId,
+        "open",
+        `ballot cast — ${yes} of ${required} required approvals; ` +
+          `waiting on the other validators (${proposalId})`,
+      );
+    }
+  }
 };
 
 // ── Pure helpers ────────────────────────────────────────
