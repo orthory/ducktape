@@ -19,6 +19,7 @@ import { isDesktop } from "../../../domain/workspace-client";
 import { hasNodeContext } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { AccountProfilePanel } from "./AccountProfilePanel";
 import { CustodyCard } from "./CustodyCard";
 import { DevicesCard } from "./DevicesCard";
 import { NetworkNodesCard } from "./NetworkNodesCard";
@@ -72,6 +73,8 @@ export function HomeView() {
 
       <div data-home-content="full-width" style={{ width: "100%" }}>
         <ProfileCard accountId={accountId} />
+
+        <AccountProfilePanel accountId={accountId} />
 
         <WorkspacesTable />
 

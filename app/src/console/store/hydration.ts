@@ -284,6 +284,11 @@ export const fetchRunsSlices = (live: NodeTransport): Promise<RunsSlices> =>
 
 export interface PeopleSlices {
   authorNames: Record<string, string>;
+  /** account avatar duckfs path, keyed like `authorNames` (account id AND every
+   *  bound node hex). Empty when the account set none. */
+  authorAvatars: Record<string, string>;
+  /** account bio/status, keyed like `authorNames`. */
+  authorBios: Record<string, string>;
   nodeUsers: Record<string, { accountId: string; name: string | null }>;
   accountKeys: Record<string, identityClient.MemberKeyView[]>;
   accountHandles: Record<string, string>;
@@ -305,6 +310,8 @@ export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
     )
     .then(([users, registrations]) => {
       const authorNames: Record<string, string> = {};
+      const authorAvatars: Record<string, string> = {};
+      const authorBios: Record<string, string> = {};
       const nodeUsers: Record<string, { accountId: string; name: string | null }> = {};
       const accountKeys: Record<string, identityClient.MemberKeyView[]> = {};
       const accountHandles: Record<string, string> = Object.fromEntries(
@@ -321,13 +328,17 @@ export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
         // Both go through `authorName`, so the name has to be reachable under
         // both keys — keyed by node alone, every user mention rendered as hex.
         if (u.display_name) authorNames[accountId] = u.display_name;
+        if (u.avatar) authorAvatars[accountId] = u.avatar;
+        if (u.bio) authorBios[accountId] = u.bio;
         for (const node of u.nodes) {
           const nodeHex = chatClient.keyHex(node);
           nodeUsers[nodeHex] = { accountId, name: u.display_name };
           if (u.display_name) authorNames[nodeHex] = u.display_name;
+          if (u.avatar) authorAvatars[nodeHex] = u.avatar;
+          if (u.bio) authorBios[nodeHex] = u.bio;
         }
       }
-      return { authorNames, nodeUsers, accountKeys, accountHandles };
+      return { authorNames, authorAvatars, authorBios, nodeUsers, accountKeys, accountHandles };
     });
 
 export const fetchFilesSlices = (
