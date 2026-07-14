@@ -1139,6 +1139,29 @@ mod tests {
     }
 
     #[test]
+    fn pr_diff_returns_empty_when_trees_are_identical() {
+        let base = tmp_base("pr-diff-identical-trees");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let target = git::commit(&repo, &tree, None, "target", 1).unwrap();
+        let parent = repo.find_commit(target).unwrap();
+        let source = git::commit(&repo, &tree, Some(&parent), "source", 2).unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .unwrap();
+        assert_eq!(result, (String::new(), false, 0, 0, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn pr_diff_preflight_handles_nested_add_delete_type_and_mode_changes() {
         let base = tmp_base("pr-diff-tree-walk");
         let repo = git::init(&base.join("repo")).unwrap();
@@ -1188,6 +1211,95 @@ mod tests {
         }
         assert!(patch.contains("old mode 100644"), "{patch}");
         assert!(patch.contains("new mode 100755"), "{patch}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_rejects_a_wide_mostly_unchanged_tree() {
+        let base = tmp_base("pr-diff-wide-tree");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let old_blob = repo.blob(b"old\n").unwrap();
+        let new_blob = repo.blob(b"new\n").unwrap();
+        let entries = MAX_PR_DIFF_TREE_ENTRIES / 2 + 1;
+        let mut old_builder = repo.treebuilder(None).unwrap();
+        for index in 0..entries {
+            old_builder
+                .insert(format!("entry-{index:05}.txt"), old_blob, 0o100644)
+                .unwrap();
+        }
+        let old_tree = repo.find_tree(old_builder.write().unwrap()).unwrap();
+        let target = git::commit(&repo, &old_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let mut new_builder = repo.treebuilder(Some(&old_tree)).unwrap();
+        new_builder
+            .insert("entry-00000.txt", new_blob, 0o100644)
+            .unwrap();
+        let new_tree = repo.find_tree(new_builder.write().unwrap()).unwrap();
+        let source =
+            git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(git::BoundedDiffError::TooLarge { tree_entries, .. })
+                    if tree_entries > MAX_PR_DIFF_TREE_ENTRIES
+            ),
+            "wide tree traversal must stop at its own work bound: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_rejects_excessive_tree_depth() {
+        let base = tmp_base("pr-diff-deep-tree");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let empty_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = repo.find_tree(empty_oid).unwrap();
+        let target = git::commit(&repo, &empty_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let blob = repo.blob(b"deep\n").unwrap();
+        let mut leaf_builder = repo.treebuilder(None).unwrap();
+        leaf_builder.insert("leaf.txt", blob, 0o100644).unwrap();
+        let mut tree_oid = leaf_builder.write().unwrap();
+        for _ in 0..=MAX_PR_DIFF_TREE_DEPTH {
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert("nested", tree_oid, 0o040000).unwrap();
+            tree_oid = builder.write().unwrap();
+        }
+        let source_tree = repo.find_tree(tree_oid).unwrap();
+        let source = git::commit(
+            &repo,
+            &source_tree,
+            Some(&target_commit),
+            "source",
+            2,
+        )
+        .unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(git::BoundedDiffError::TooLarge { tree_depth, .. })
+                    if tree_depth > MAX_PR_DIFF_TREE_DEPTH
+            ),
+            "deep tree traversal must stop before unbounded recursion: {result:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

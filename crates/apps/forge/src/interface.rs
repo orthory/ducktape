@@ -187,6 +187,13 @@ pub const MAX_PR_DIFF_BYTES: usize = 48 * 1024;
 pub const MAX_PR_DIFF_FILES: usize = 256;
 /// Maximum aggregate old-plus-new blob bytes examined for one PR diff.
 pub const MAX_PR_DIFF_BLOB_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum old-plus-new tree entries visited while preflighting one PR diff.
+pub const MAX_PR_DIFF_TREE_ENTRIES: usize = 4 * 1024;
+/// Maximum aggregate bytes of tree objects loaded while preflighting one PR
+/// diff. Tree headers are checked before libgit2 materializes the object.
+pub const MAX_PR_DIFF_TREE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum recursive tree depth visited while preflighting one PR diff.
+pub const MAX_PR_DIFF_TREE_DEPTH: usize = 64;
 
 /// An exact source/target comparison at the committed OIDs named here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

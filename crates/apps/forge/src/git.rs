@@ -238,8 +238,14 @@ pub enum BoundedDiffError {
     TooLarge {
         files_changed: usize,
         blob_bytes: usize,
+        tree_entries: usize,
+        tree_bytes: usize,
+        tree_depth: usize,
         max_files: usize,
         max_blob_bytes: usize,
+        max_tree_entries: usize,
+        max_tree_bytes: usize,
+        max_tree_depth: usize,
     },
 }
 
@@ -250,11 +256,17 @@ impl std::fmt::Display for BoundedDiffError {
             Self::TooLarge {
                 files_changed,
                 blob_bytes,
+                tree_entries,
+                tree_bytes,
+                tree_depth,
                 max_files,
                 max_blob_bytes,
+                max_tree_entries,
+                max_tree_bytes,
+                max_tree_depth,
             } => write!(
                 f,
-                "diff is too large: {files_changed} changed files / {blob_bytes} materialized blob bytes (limits: {max_files} files / {max_blob_bytes} bytes)"
+                "diff is too large: {files_changed} changed files / {blob_bytes} materialized blob bytes / {tree_entries} visited tree entries / {tree_bytes} materialized tree bytes / tree depth {tree_depth} (limits: {max_files} files / {max_blob_bytes} blob bytes / {max_tree_entries} tree entries / {max_tree_bytes} tree bytes / depth {max_tree_depth})"
             ),
         }
     }
@@ -278,22 +290,76 @@ struct TreeEntryMeta {
 struct DiffPreflight {
     paths: BTreeSet<String>,
     blob_bytes: usize,
+    tree_entries: usize,
+    tree_bytes: usize,
+    tree_depth: usize,
     max_files: usize,
     max_blob_bytes: usize,
+    max_tree_entries: usize,
+    max_tree_bytes: usize,
+    max_tree_depth: usize,
 }
 
 impl DiffPreflight {
     fn too_large(&self) -> bool {
-        self.paths.len() > self.max_files || self.blob_bytes > self.max_blob_bytes
+        self.paths.len() > self.max_files
+            || self.blob_bytes > self.max_blob_bytes
+            || self.tree_entries > self.max_tree_entries
+            || self.tree_bytes > self.max_tree_bytes
+            || self.tree_depth > self.max_tree_depth
     }
 
     fn error(&self) -> BoundedDiffError {
         BoundedDiffError::TooLarge {
             files_changed: self.paths.len(),
             blob_bytes: self.blob_bytes,
+            tree_entries: self.tree_entries,
+            tree_bytes: self.tree_bytes,
+            tree_depth: self.tree_depth,
             max_files: self.max_files,
             max_blob_bytes: self.max_blob_bytes,
+            max_tree_entries: self.max_tree_entries,
+            max_tree_bytes: self.max_tree_bytes,
+            max_tree_depth: self.max_tree_depth,
         }
+    }
+
+    fn visit_tree_entry(&mut self) -> Result<(), BoundedDiffError> {
+        self.tree_entries = self
+            .tree_entries
+            .saturating_add(1)
+            .min(self.max_tree_entries.saturating_add(1));
+        if self.too_large() {
+            return Err(self.error());
+        }
+        Ok(())
+    }
+
+    fn load_tree<'repo>(
+        &mut self,
+        repo: &'repo Repository,
+        oid: Oid,
+        depth: usize,
+    ) -> Result<Tree<'repo>, BoundedDiffError> {
+        self.tree_depth = self.tree_depth.max(depth);
+        if self.too_large() {
+            return Err(self.error());
+        }
+        let (size, kind) = repo.odb()?.read_header(oid)?;
+        if kind != ObjectType::Tree {
+            return Err(git2::Error::from_str(
+                "tree entry expected a tree but its object has another type",
+            )
+            .into());
+        }
+        self.tree_bytes = self
+            .tree_bytes
+            .saturating_add(size)
+            .min(self.max_tree_bytes.saturating_add(1));
+        if self.too_large() {
+            return Err(self.error());
+        }
+        Ok(repo.find_tree(oid)?)
     }
 
     fn add_blob_bytes(
@@ -344,10 +410,12 @@ impl DiffPreflight {
 
 fn next_tree_entry<'repo>(
     iter: &mut impl Iterator<Item = git2::TreeEntry<'repo>>,
-) -> Result<Option<(String, TreeEntryMeta)>, git2::Error> {
+    preflight: &mut DiffPreflight,
+) -> Result<Option<(String, TreeEntryMeta)>, BoundedDiffError> {
     let Some(entry) = iter.next() else {
         return Ok(None);
     };
+    preflight.visit_tree_entry()?;
     let name = entry
         .name()
         .ok_or_else(|| git2::Error::from_str("diff path is not valid UTF-8"))?
@@ -356,7 +424,7 @@ fn next_tree_entry<'repo>(
         .kind()
         .ok_or_else(|| git2::Error::from_str("git tree entry has an invalid mode"))?;
     if !matches!(kind, ObjectType::Blob | ObjectType::Tree | ObjectType::Commit) {
-        return Err(git2::Error::from_str("unsupported git tree entry type"));
+        return Err(git2::Error::from_str("unsupported git tree entry type").into());
     }
     Ok(Some((
         name,
@@ -412,17 +480,15 @@ fn collect_tree_leaves(
     tree_oid: Oid,
     prefix: &str,
     old_side: bool,
+    depth: usize,
     preflight: &mut DiffPreflight,
 ) -> Result<(), BoundedDiffError> {
-    let tree = repo.find_tree(tree_oid)?;
+    let tree = preflight.load_tree(repo, tree_oid, depth)?;
     let mut entries = tree.iter();
-    while let Some((name, entry)) = next_tree_entry(&mut entries)? {
-        if preflight.too_large() {
-            return Err(preflight.error());
-        }
+    while let Some((name, entry)) = next_tree_entry(&mut entries, preflight)? {
         let path = join_path(prefix, &name);
         if entry.kind == ObjectType::Tree {
-            collect_tree_leaves(repo, entry.oid, &path, old_side, preflight)?;
+            collect_tree_leaves(repo, entry.oid, &path, old_side, depth + 1, preflight)?;
         } else if old_side {
             preflight.add_leaf(repo, path, Some(entry), None)?;
         } else {
@@ -440,17 +506,18 @@ fn compare_trees(
     old_oid: Oid,
     new_oid: Oid,
     prefix: &str,
+    depth: usize,
     preflight: &mut DiffPreflight,
 ) -> Result<(), BoundedDiffError> {
     if old_oid == new_oid {
         return Ok(());
     }
-    let old_tree = repo.find_tree(old_oid)?;
-    let new_tree = repo.find_tree(new_oid)?;
+    let old_tree = preflight.load_tree(repo, old_oid, depth)?;
+    let new_tree = preflight.load_tree(repo, new_oid, depth)?;
     let mut old_iter = old_tree.iter();
     let mut new_iter = new_tree.iter();
-    let mut old_entry = next_tree_entry(&mut old_iter)?;
-    let mut new_entry = next_tree_entry(&mut new_iter)?;
+    let mut old_entry = next_tree_entry(&mut old_iter, preflight)?;
+    let mut new_entry = next_tree_entry(&mut new_iter, preflight)?;
 
     while old_entry.is_some() || new_entry.is_some() {
         if preflight.too_large() {
@@ -467,19 +534,19 @@ fn compare_trees(
         let (name, old_current, new_current) = match ordering {
             Ordering::Less => {
                 let (name, entry) = old_entry.take().expect("ordering requires old entry");
-                old_entry = next_tree_entry(&mut old_iter)?;
+                old_entry = next_tree_entry(&mut old_iter, preflight)?;
                 (name, Some(entry), None)
             }
             Ordering::Greater => {
                 let (name, entry) = new_entry.take().expect("ordering requires new entry");
-                new_entry = next_tree_entry(&mut new_iter)?;
+                new_entry = next_tree_entry(&mut new_iter, preflight)?;
                 (name, None, Some(entry))
             }
             Ordering::Equal => {
                 let (name, old) = old_entry.take().expect("ordering requires old entry");
                 let (_, new) = new_entry.take().expect("ordering requires new entry");
-                old_entry = next_tree_entry(&mut old_iter)?;
-                new_entry = next_tree_entry(&mut new_iter)?;
+                old_entry = next_tree_entry(&mut old_iter, preflight)?;
+                new_entry = next_tree_entry(&mut new_iter, preflight)?;
                 (name, Some(old), Some(new))
             }
         };
@@ -495,24 +562,24 @@ fn compare_trees(
             (Some(old), Some(new))
                 if old.kind == ObjectType::Tree && new.kind == ObjectType::Tree =>
             {
-                compare_trees(repo, old.oid, new.oid, &path, preflight)?;
+                compare_trees(repo, old.oid, new.oid, &path, depth + 1, preflight)?;
             }
             (Some(old), Some(new)) if old.kind == ObjectType::Tree => {
-                collect_tree_leaves(repo, old.oid, &path, true, preflight)?;
+                collect_tree_leaves(repo, old.oid, &path, true, depth + 1, preflight)?;
                 preflight.add_leaf(repo, path, None, Some(new))?;
             }
             (Some(old), Some(new)) if new.kind == ObjectType::Tree => {
                 preflight.add_leaf(repo, path.clone(), Some(old), None)?;
-                collect_tree_leaves(repo, new.oid, &path, false, preflight)?;
+                collect_tree_leaves(repo, new.oid, &path, false, depth + 1, preflight)?;
             }
             (Some(old), Some(new)) => {
                 preflight.add_leaf(repo, path, Some(old), Some(new))?;
             }
             (Some(old), None) if old.kind == ObjectType::Tree => {
-                collect_tree_leaves(repo, old.oid, &path, true, preflight)?;
+                collect_tree_leaves(repo, old.oid, &path, true, depth + 1, preflight)?;
             }
             (None, Some(new)) if new.kind == ObjectType::Tree => {
-                collect_tree_leaves(repo, new.oid, &path, false, preflight)?;
+                collect_tree_leaves(repo, new.oid, &path, false, depth + 1, preflight)?;
             }
             (Some(old), None) => preflight.add_leaf(repo, path, Some(old), None)?,
             (None, Some(new)) => preflight.add_leaf(repo, path, None, Some(new))?,
@@ -536,15 +603,34 @@ pub fn bounded_diff(
     max_files: usize,
     max_blob_bytes: usize,
 ) -> Result<(String, bool, usize, usize, usize), BoundedDiffError> {
-    let target_tree = repo.find_commit(target)?.tree()?;
-    let source_tree = repo.find_commit(source)?.tree()?;
+    let target_tree_oid = repo.find_commit(target)?.tree_id();
+    let source_tree_oid = repo.find_commit(source)?.tree_id();
     let mut preflight = DiffPreflight {
         paths: BTreeSet::new(),
         blob_bytes: 0,
+        tree_entries: 0,
+        tree_bytes: 0,
+        tree_depth: 0,
         max_files,
         max_blob_bytes,
+        max_tree_entries: crate::interface::MAX_PR_DIFF_TREE_ENTRIES,
+        max_tree_bytes: crate::interface::MAX_PR_DIFF_TREE_BYTES,
+        max_tree_depth: crate::interface::MAX_PR_DIFF_TREE_DEPTH,
     };
-    compare_trees(repo, target_tree.id(), source_tree.id(), "", &mut preflight)?;
+    if target_tree_oid == source_tree_oid {
+        preflight.load_tree(repo, target_tree_oid, 0)?;
+        return Ok((String::new(), false, 0, 0, 0));
+    }
+    compare_trees(
+        repo,
+        target_tree_oid,
+        source_tree_oid,
+        "",
+        0,
+        &mut preflight,
+    )?;
+    let target_tree = repo.find_tree(target_tree_oid)?;
+    let source_tree = repo.find_tree(source_tree_oid)?;
     let mut opts = DiffOptions::new();
     opts.context_lines(3)
         .interhunk_lines(0)
