@@ -783,6 +783,18 @@ describe("floating comment card", () => {
     }
   });
 
+  it("Escape spends itself on the guide menu — an open card survives", () => {
+    renderPagesView({ pageThreads: threadsOn("a") });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    const area = selectFirstBlock(0, 5);
+    fireEvent.keyDown(area, { key: "Escape" });
+    expect(screen.queryByRole("toolbar", { name: "Selection actions" })).toBeNull();
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Comments on this block" })).toBeNull();
+  });
+
   it("a tier flip repositions the card without dropping the composer draft", () => {
     const wide = window.innerWidth;
     window.innerWidth = 1000;
