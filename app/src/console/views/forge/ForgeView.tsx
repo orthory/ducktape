@@ -12,6 +12,7 @@ import {
   forgeListRepos,
   forgeLog,
   forgeReadFilePage,
+  forgeSyncRemote,
   forgeTree,
   isForgeGitAvailable,
   type BranchInfo,
@@ -45,6 +46,8 @@ import {
 } from "./ui";
 import { opKey } from "../../store/finalization";
 import type { OpRecord } from "../../store/finalization";
+import { isClientMode } from "../../store/state";
+import { ForgeRemoteContext, useForgeRemote } from "./remote";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
@@ -69,6 +72,18 @@ interface TreeRow {
 }
 
 type FilePageState = Pick<FilePage, "nextOffset" | "totalBytes">;
+
+// Re-enumerations keep the OLD entry object whenever a repo's head is
+// unchanged: selectedRepo (and the whole browse effect chain) key on entry
+// identity, so a tracker-only root move must not reset the code browser —
+// and a mirror-synced branch label must not be clobbered by the list's
+// pre-sync "dev" guess.
+function mergeRepos(prev: RepoInfo[] | null, next: RepoInfo[]): RepoInfo[] {
+  return next.map((repo) => {
+    const old = prev?.find((p) => p.id === repo.id);
+    return old && old.head === repo.head ? old : repo;
+  });
+}
 
 function commitPage(commits: CommitInfo[]): { commits: CommitInfo[]; hasMore: boolean } {
   return {
@@ -105,6 +120,10 @@ function buildRows(
 export function ForgeView() {
   const { state, actions } = useDucktape();
   const desktop = isForgeGitAvailable();
+  // A direct remote client browses through its local mirror of the node's
+  // git remote — every git read below then carries this origin. Null = the
+  // local workspace repo (the classic desktop path).
+  const remote = desktop && isClientMode(state) ? state.nodeUrl : null;
 
   const [repos, setRepos] = useState<RepoInfo[] | null>(null);
   const [reposLoading, setReposLoading] = useState(false);
@@ -157,8 +176,12 @@ export function ForgeView() {
     () => repos?.find((repo) => repo.id === selectedRepoId) ?? null,
     [repos, selectedRepoId],
   );
+  // A remote client's branch list is the consensus refs the store already
+  // loads per repo (list_refs) — zero extra git traffic; local mode keeps
+  // reading the workspace repo directly.
+  const branchList: BranchInfo[] = remote ? state.forgeBranches : branches;
   const branchHead = branch
-    ? branches.find((b) => b.name === branch)?.head ?? null
+    ? branchList.find((b) => b.name === branch)?.head ?? null
     : null;
   const displayHead = branch ? branchHead : localHead ?? selectedRepo?.head ?? state.forgeHead;
 
@@ -168,6 +191,11 @@ export function ForgeView() {
   const openPulls = state.forgeItems.filter(
     (item) => item.kind === "pr" && item.state === "open",
   ).length;
+
+  // The forge module's state root — it rides every status patch, so it is the
+  // one signal a REMOTE client also gets when any forge write lands (the
+  // repo-list refresh and the tracker reload below both key on it).
+  const forgeRoot = state.status?.modules.find((m) => m.id === "forge")?.root ?? null;
 
   const loadFile = useCallback((filePath: string) => {
     const repo = activeRepoRef.current;
@@ -184,6 +212,7 @@ export function ForgeView() {
       reference: activeRefRef.current ?? undefined,
       offset: 0,
       limit: FILE_PAGE_BYTES,
+      remote,
     })
       .then((page) => {
         if (fileRequestRef.current !== req) return;
@@ -205,13 +234,13 @@ export function ForgeView() {
       .finally(() => {
         if (fileRequestRef.current === req) setFileLoading(false);
       });
-  }, []);
+  }, [remote]);
 
   const loadDir = useCallback((dir: string) => {
     const repo = activeRepoRef.current;
     if (!repo) return;
     const token = dirTokenRef.current;
-    forgeTree(repo, dir, activeRefRef.current ?? undefined)
+    forgeTree(repo, dir, activeRefRef.current ?? undefined, remote)
       .then((entries) => {
         if (dirTokenRef.current !== token) return;
         setTreeCache((cache) => ({ ...cache, [dir]: entries }));
@@ -220,7 +249,7 @@ export function ForgeView() {
         if (dirTokenRef.current !== token) return;
         setTreeError(errMsg(error));
       });
-  }, []);
+  }, [remote]);
 
   const loadMoreCommits = useCallback(() => {
     const repo = activeRepoRef.current;
@@ -230,7 +259,7 @@ export function ForgeView() {
     const token = dirTokenRef.current;
     setCommitLoadingMore(true);
     setCommitError(null);
-    forgeLog(repo, COMMIT_PAGE_REQUEST, activeRefRef.current ?? undefined, after)
+    forgeLog(repo, COMMIT_PAGE_REQUEST, activeRefRef.current ?? undefined, after, remote)
       .then((next) => {
         if (dirTokenRef.current !== token) return;
         const page = commitPage(next);
@@ -244,7 +273,7 @@ export function ForgeView() {
       .finally(() => {
         if (dirTokenRef.current === token) setCommitLoadingMore(false);
       });
-  }, [commitLoadingMore, commits]);
+  }, [commitLoadingMore, commits, remote]);
 
   const loadMoreFile = useCallback(() => {
     const repo = activeRepoRef.current;
@@ -259,6 +288,7 @@ export function ForgeView() {
       reference: activeRefRef.current ?? undefined,
       offset,
       limit: FILE_PAGE_BYTES,
+      remote,
     })
       .then((page) => {
         if (fileRequestRef.current !== req) return;
@@ -280,7 +310,7 @@ export function ForgeView() {
       .finally(() => {
         if (fileRequestRef.current === req) setFileLoadingMore(false);
       });
-  }, [fileLoadingMore, filePage?.nextOffset, selected]);
+  }, [fileLoadingMore, filePage?.nextOffset, selected, remote]);
 
   useEffect(() => {
     if (!desktop) {
@@ -292,10 +322,26 @@ export function ForgeView() {
     let alive = true;
     setReposLoading(true);
     setReposError(null);
-    forgeListRepos()
+    // A remote client enumerates over the node's committed namespace (one
+    // list_repos query — it has no local forge storage to scan); the
+    // integration branch is corrected per open by the mirror sync ("dev" is
+    // every post-migration repo's answer until then).
+    const load: Promise<RepoInfo[]> = remote
+      ? actions.listForgeRepos().then((repos) =>
+          repos.map((repo) => ({
+            id: repo.name,
+            name: repo.name,
+            branch: "dev",
+            defaultBranch: "dev",
+            head: repo.head,
+            browsable: repo.head !== null,
+          })),
+        )
+      : forgeListRepos();
+    load
       .then((next) => {
         if (!alive) return;
-        setRepos(next);
+        setRepos((prev) => mergeRepos(prev, next));
         setSelectedRepoId((current) =>
           current && !next.some((repo) => repo.id === current) ? null : current,
         );
@@ -309,7 +355,7 @@ export function ForgeView() {
     return () => {
       alive = false;
     };
-  }, [desktop, state.forgeHead]);
+  }, [desktop, remote, actions, state.forgeHead, forgeRoot]);
 
   // Consume a deep-link hand-off (state.forgeFocus, set by the provider when
   // a forge notification is clicked): select the repo, land on its tracker
@@ -355,9 +401,10 @@ export function ForgeView() {
   }, [selectedRepoId]);
 
   // Local branch heads for the picker; refreshed per committed forge write
-  // (every tracker/merge op advances the forge HEAD).
+  // (every tracker/merge op advances the forge HEAD). A remote client skips
+  // this — its picker rides state.forgeBranches (consensus refs) instead.
   useEffect(() => {
-    if (!desktop || !selectedRepo) {
+    if (!desktop || !selectedRepo || remote) {
       setBranches([]);
       return;
     }
@@ -372,7 +419,7 @@ export function ForgeView() {
     return () => {
       alive = false;
     };
-  }, [desktop, selectedRepo, state.forgeHead]);
+  }, [desktop, selectedRepo, remote, state.forgeHead]);
 
   // The tracker's per-screen slices (issues/PRs + consensus branch heads) —
   // loaded on open/repo switch and re-pulled per forge WRITE. The forge
@@ -380,7 +427,6 @@ export function ForgeView() {
   // branch (PushRefs over git smart-HTTP) and a peer's tracker op both move
   // the root without moving main, and the PR form's source branches must
   // follow list_refs without a reload. The root rides every status patch.
-  const forgeRoot = state.status?.modules.find((m) => m.id === "forge")?.root ?? null;
   useEffect(() => {
     if (!selectedRepo) return;
     void actions.loadForgeItems(selectedRepo.name);
@@ -423,30 +469,60 @@ export function ForgeView() {
     }
 
     const reference = branch ?? undefined;
-    Promise.allSettled([
-      readLocalHead(selectedRepo.name),
-      forgeTree(selectedRepo.name, "", reference),
-      forgeLog(selectedRepo.name, COMMIT_PAGE_REQUEST, reference, null),
-    ])
-      .then(([headResult, treeResult, logResult]) => {
+    // A remote client refreshes its mirror FIRST — one fetch round-trip (a
+    // bare ref advertisement when nothing moved, an incremental pack when
+    // something did); every read below then serves from local disk. A failed
+    // sync still falls through: a previously synced mirror keeps serving,
+    // with the failure noted on the tree panel.
+    const sync = remote
+      ? forgeSyncRemote(remote, selectedRepo.name).then(
+          (info) => {
+            if (!alive || dirTokenRef.current !== token) return;
+            // land the mirror's truth (real integration branch + head) on the
+            // list entry — only when it differs, so the effect chain keyed on
+            // entry identity settles instead of looping.
+            setRepos(
+              (current) =>
+                current?.map((repo) =>
+                  repo.id === info.id &&
+                  (repo.head !== info.head || repo.defaultBranch !== info.defaultBranch)
+                    ? info
+                    : repo,
+                ) ?? current,
+            );
+          },
+          (error) => {
+            if (alive && dirTokenRef.current === token) setTreeError(errMsg(error));
+          },
+        )
+      : Promise.resolve();
+    void sync
+      .then(() => {
         if (!alive || dirTokenRef.current !== token) return;
-        if (headResult.status === "fulfilled" && !branch) setLocalHead(headResult.value);
-        if (logResult.status === "fulfilled") {
-          const page = commitPage(logResult.value);
-          setCommits(page.commits);
-          setCommitHasMore(page.hasMore);
-        } else {
-          setCommits([]);
-          setCommitHasMore(false);
-          setCommitError(errMsg(logResult.reason));
-        }
-        if (treeResult.status === "fulfilled") {
-          setTreeCache({ "": treeResult.value });
-          const firstFile = sortEntries(treeResult.value).find((entry) => entry.kind === "file");
-          if (firstFile) loadFile(firstFile.name);
-        } else {
-          setTreeError(errMsg(treeResult.reason));
-        }
+        return Promise.allSettled([
+          readLocalHead(selectedRepo.name, remote),
+          forgeTree(selectedRepo.name, "", reference, remote),
+          forgeLog(selectedRepo.name, COMMIT_PAGE_REQUEST, reference, null, remote),
+        ]).then(([headResult, treeResult, logResult]) => {
+          if (!alive || dirTokenRef.current !== token) return;
+          if (headResult.status === "fulfilled" && !branch) setLocalHead(headResult.value);
+          if (logResult.status === "fulfilled") {
+            const page = commitPage(logResult.value);
+            setCommits(page.commits);
+            setCommitHasMore(page.hasMore);
+          } else {
+            setCommits([]);
+            setCommitHasMore(false);
+            setCommitError(errMsg(logResult.reason));
+          }
+          if (treeResult.status === "fulfilled") {
+            setTreeCache({ "": treeResult.value });
+            const firstFile = sortEntries(treeResult.value).find((entry) => entry.kind === "file");
+            if (firstFile) loadFile(firstFile.name);
+          } else {
+            setTreeError(errMsg(treeResult.reason));
+          }
+        });
       })
       .finally(() => {
         if (alive && dirTokenRef.current === token) setRootLoading(false);
@@ -454,7 +530,7 @@ export function ForgeView() {
     return () => {
       alive = false;
     };
-  }, [desktop, selectedRepo, branch, state.forgeHead, loadFile]);
+  }, [desktop, selectedRepo, branch, remote, state.forgeHead, loadFile]);
 
   const rows = useMemo(() => {
     const next: TreeRow[] = [];
@@ -492,6 +568,7 @@ export function ForgeView() {
   };
 
   return (
+    <ForgeRemoteContext.Provider value={remote}>
     <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: color.paper }}>
       {!desktop ? (
         <WebFallback head={state.forgeHead} op={state.ops[opKey.forgeHead()]} />
@@ -517,7 +594,7 @@ export function ForgeView() {
             fileLoading={fileLoading}
             fileLoadingMore={fileLoadingMore}
             fileError={fileError}
-            branches={branches}
+            branches={branchList}
             branch={branch}
             branchMenuOpen={branchMenuOpen}
             openIssues={openIssues}
@@ -542,6 +619,7 @@ export function ForgeView() {
         <ReposOverview repos={repos} loading={reposLoading} error={reposError} onOpen={openRepo} />
       )}
     </div>
+    </ForgeRemoteContext.Provider>
   );
 }
 
@@ -556,6 +634,7 @@ function ReposOverview({
   error: string | null;
   onOpen: (repoId: string) => void;
 }) {
+  const remote = useForgeRemote();
   return (
     <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "22px 26px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -583,7 +662,7 @@ function ReposOverview({
             whiteSpace: "nowrap",
           }}
         >
-          {repos ? `${repos.length} repositories` : "local forge repositories"}
+          {repos ? `${repos.length} repositories` : remote ? "remote forge repositories" : "local forge repositories"}
         </span>
       </div>
       <div
@@ -595,14 +674,23 @@ function ReposOverview({
           maxWidth: 560,
         }}
       >
-        Browse repositories backed by this node's local git forge.
+        {remote
+          ? "Browse repositories served by the connected node's git forge."
+          : "Browse repositories backed by this node's local git forge."}
       </div>
 
       <div style={{ marginTop: 18 }}>
         {error && <ErrorNote message={error} />}
         {!error && loading && !repos && <CenterNote title="Loading repositories..." />}
         {!error && repos && repos.length === 0 && (
-          <CenterNote title="No local forge repositories" detail="This node did not report a browsable git repository." />
+          <CenterNote
+            title={remote ? "No forge repositories" : "No local forge repositories"}
+            detail={
+              remote
+                ? "The connected node did not report a repository."
+                : "This node did not report a browsable git repository."
+            }
+          />
         )}
         {!error && repos && repos.length > 0 && (
           <>
@@ -742,6 +830,7 @@ function RepoListing({
   onToggleBranchMenu: () => void;
   onSelectBranch: (branch: string) => void;
 }) {
+  const remote = useForgeRemote();
   const latest = commits[0] ?? null;
   const browsing = tab === "code" || tab === "commits";
 
@@ -791,7 +880,7 @@ function RepoListing({
             {shortHash(head)}
           </span>
           <span style={{ marginLeft: "auto" }}>
-            <StatusPill label="desktop" tone="neutral" />
+            <StatusPill label={remote ? "remote" : "desktop"} tone="neutral" />
           </span>
         </div>
 

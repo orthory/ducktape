@@ -1,9 +1,14 @@
-// The floating comment card: Notion-style popover anchored at the affordance
-// that opened it, scoped to ONE target (a block id or the page id). A target
-// with no threads opens straight into the composer; otherwise threads render with
-// the composer behind an "Add comment" affordance. Dismissed by Escape, an
-// outside press, or any outside scroll (the anchor coordinates go stale the
-// moment the document moves).
+// The comment card, scoped to ONE target (a block id or the page id) and
+// optionally to one anchored range within it. Two surfaces, chosen by the
+// width of the doc area (see commentSurface in pages-style):
+//   popover — position:fixed at the affordance that opened it; dismissed by
+//     Escape, an outside press, or any outside scroll (the viewport anchor
+//     goes stale the moment the document moves).
+//   docked (`dock` set) — absolute inside the doc's right rail at the
+//     anchor's own height, scrolling WITH the content; scroll never dismisses
+//     it, Escape and outside presses still do.
+// A target with no threads opens straight into the composer; otherwise threads
+// render with the composer behind an "Add comment" affordance.
 
 import { useEffect, useRef, useState } from "react";
 
@@ -22,11 +27,13 @@ export interface CommentAnchor {
 }
 
 const CARD_WIDTH = 360;
+const DOCKED_WIDTH = 340;
 
 export function CommentCard({
   target,
   label,
   anchor,
+  dock,
   selection,
   targetText = "",
   threads,
@@ -45,6 +52,8 @@ export function CommentCard({
   /** "this page" | "this block" — names the card and its composer. */
   label: string;
   anchor: CommentAnchor;
+  /** Content-relative top for the docked surface; null/absent = popover. */
+  dock?: number | null;
   /** Exact range for the new thread; absent for block/page-level comments. */
   selection?: RelativeAnchor;
   /** Current target text, used to show each thread's live selected quote. */
@@ -84,31 +93,39 @@ export function CommentCard({
       }
     };
     // capture: scroll events don't bubble. The card's own list scrolling must
-    // not dismiss it — only movement outside (the doc canvas, the rail).
+    // not dismiss it — only movement outside (the doc canvas, the rail). A
+    // DOCKED card lives in the content and scrolls along, so movement never
+    // strands it: no scroll dismissal at all.
     const onScroll = (event: Event) => {
       const card = cardRef.current;
       if (card && event.target instanceof Node && card.contains(event.target)) return;
       if (inMentionMenu(event.target)) return; // scrolling the typeahead list
       onClose();
     };
+    const docked = dock != null;
     document.addEventListener("keydown", onKey);
     document.addEventListener("mousedown", onPress);
-    document.addEventListener("scroll", onScroll, true);
+    if (!docked) document.addEventListener("scroll", onScroll, true);
     return () => {
       document.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onPress);
-      document.removeEventListener("scroll", onScroll, true);
+      if (!docked) document.removeEventListener("scroll", onScroll, true);
     };
-  }, [onClose]);
+  }, [onClose, dock]);
 
-  const left = Math.max(
-    8,
-    Math.min(
-      selection ? anchor.x : anchor.x - CARD_WIDTH,
-      window.innerWidth - CARD_WIDTH - 8,
+  const popoverBox = () => ({
+    position: "fixed" as const,
+    zIndex: 40,
+    left: Math.max(
+      8,
+      Math.min(
+        selection ? anchor.x : anchor.x - CARD_WIDTH,
+        window.innerWidth - CARD_WIDTH - 8,
+      ),
     ),
-  );
-  const top = Math.max(8, Math.min(anchor.y + 8, window.innerHeight - 120));
+    top: Math.max(8, Math.min(anchor.y + 8, window.innerHeight - 120)),
+    width: CARD_WIDTH,
+  });
 
   return (
     <div
@@ -116,18 +133,16 @@ export function CommentCard({
       role="dialog"
       aria-label={`Comments on ${label}`}
       style={{
-        position: "fixed",
-        zIndex: 40,
-        left,
-        top,
-        width: CARD_WIDTH,
+        ...(dock != null
+          ? { position: "absolute", top: dock, right: 16, width: DOCKED_WIDTH }
+          : popoverBox()),
         maxHeight: "min(560px, 76vh)",
         display: "flex",
         flexDirection: "column",
         border: `1px solid ${color.border}`,
         borderRadius: radius.lg,
         background: color.paper,
-        boxShadow: shadow.card,
+        boxShadow: shadow.pop,
         overflow: "hidden",
       }}
     >
@@ -197,6 +212,7 @@ export function CommentCard({
           <NewThreadComposer
             key={target}
             composer={{ target, label }}
+            quote={selection ? targetText.slice(selection.start, selection.end) : undefined}
             onSubmit={(t, text) => {
               if (selection) onSubmitNew(t, text, selection);
               else onSubmitNew(t, text);

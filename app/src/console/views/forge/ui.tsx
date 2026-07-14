@@ -5,6 +5,7 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 
 import { forgeDiff, type CommitInfo, type FileDiff } from "../../../domain/forge-git-client";
+import { useForgeRemote } from "./remote";
 import { wallClockMillisOf } from "../../../domain/wire";
 import { Icon } from "../../components/Icon";
 import { color, font, radius, tint } from "../../theme/tokens";
@@ -266,6 +267,7 @@ export function CommitRow({
 }
 
 export function CommitDetails({ repo, commit }: { repo: string; commit: CommitInfo }) {
+  const remote = useForgeRemote();
   const [files, setFiles] = useState<FileDiff[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const from = commit.parentIds?.[0] ?? null;
@@ -275,7 +277,7 @@ export function CommitDetails({ repo, commit }: { repo: string; commit: CommitIn
     let alive = true;
     setFiles(null);
     setError(null);
-    forgeDiff(repo, { from, to: commit.id })
+    forgeDiff(repo, { from, to: commit.id, remote })
       .then((next) => {
         if (alive) setFiles(next);
       })
@@ -285,7 +287,7 @@ export function CommitDetails({ repo, commit }: { repo: string; commit: CommitIn
     return () => {
       alive = false;
     };
-  }, [commit.id, from, repo]);
+  }, [commit.id, from, repo, remote]);
 
   return (
     <div

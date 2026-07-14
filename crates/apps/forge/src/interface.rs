@@ -218,7 +218,8 @@ pub struct PrDiff {
 pub struct RepoHead {
     /// the repo's normalized slug.
     pub name: String,
-    /// the repo's committed HEAD oid as hex, or `None` if the repo is unborn.
+    /// the repo's committed INTEGRATION head (dev, falling back to legacy
+    /// main) as hex, or `None` if neither branch is born.
     pub head: Option<String>,
 }
 

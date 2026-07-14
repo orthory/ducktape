@@ -229,6 +229,7 @@ fn main() {
             forge_git::forge_diff,
             forge_git::forge_compare,
             forge_git::forge_build_merge,
+            forge_git::forge_sync_remote,
             tray::tray_open_console,
             tray::tray_quit,
             huddle::huddle_pop_out,

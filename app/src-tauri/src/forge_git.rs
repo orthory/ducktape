@@ -6,6 +6,13 @@
 //! browser-friendly shapes. The one
 //! exception is `forge_build_merge`, which builds a CLIENT-COMPUTED merge
 //! commit in a throwaway repo — the node repo itself is never written.
+//!
+//! A DIRECT REMOTE CLIENT (no local workspace) has no node repo on this disk.
+//! Every reader therefore takes an optional `remote` origin: when set, it reads
+//! a local bare MIRROR of that node's smart-HTTP remote
+//! (`<origin>/forge/<repo>`) instead, kept current by [`forge_sync_remote`].
+//! The mirror lives under `<app-data>/forge-remote/<origin-key>/<repo>`, keyed
+//! by origin so two networks' repos can never shadow each other.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -14,8 +21,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use git2::{
-    BranchType, Buf, Commit, Delta, DiffOptions, ErrorCode, ObjectType, Oid, Patch, Repository,
-    Signature, Sort, Tree,
+    BranchType, Buf, Commit, Delta, DiffOptions, ErrorCode, FetchOptions, FetchPrune, ObjectType,
+    Oid, Patch, Repository, Signature, Sort, Tree,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
@@ -144,8 +151,12 @@ pub fn forge_list_repos(app: crate::rt::AppHandle) -> Result<Vec<RepoMeta>, Stri
 }
 
 #[tauri::command]
-pub fn forge_head(app: crate::rt::AppHandle, repo: String) -> Result<Option<String>, String> {
-    let Some(git) = open_named_repo(&app, &repo)? else {
+pub fn forge_head(
+    app: crate::rt::AppHandle,
+    repo: String,
+    remote: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(git) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(None);
     };
     Ok(integration_oid(&git)?.map(|oid| oid.to_string()))
@@ -154,8 +165,12 @@ pub fn forge_head(app: crate::rt::AppHandle, repo: String) -> Result<Option<Stri
 /// Every local branch (`refs/heads/*`) by SHORT name with its 40-hex head,
 /// sorted by name — the PR pickers' branch list.
 #[tauri::command]
-pub fn forge_list_branches(app: crate::rt::AppHandle, repo: String) -> Result<Vec<BranchInfo>, String> {
-    let Some(repo) = open_named_repo(&app, &repo)? else {
+pub fn forge_list_branches(
+    app: crate::rt::AppHandle,
+    repo: String,
+    remote: Option<String>,
+) -> Result<Vec<BranchInfo>, String> {
+    let Some(repo) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(Vec::new());
     };
     let mut branches = Vec::new();
@@ -188,8 +203,9 @@ pub fn forge_log(
     limit: Option<usize>,
     reference: Option<String>,
     after: Option<String>,
+    remote: Option<String>,
 ) -> Result<Vec<CommitInfo>, String> {
-    let Some(repo) = open_named_repo(&app, &repo)? else {
+    let Some(repo) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(Vec::new());
     };
     let Some(head) = commit_at(&repo, reference.as_deref())? else {
@@ -236,9 +252,10 @@ pub fn forge_tree(
     repo: String,
     path: String,
     reference: Option<String>,
+    remote: Option<String>,
 ) -> Result<Vec<TreeEntry>, String> {
     let path = clean_repo_path(&path, true)?;
-    let Some(repo) = open_named_repo(&app, &repo)? else {
+    let Some(repo) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(Vec::new());
     };
     let Some(commit) = commit_at(&repo, reference.as_deref())? else {
@@ -279,9 +296,10 @@ pub fn forge_read_file(
     repo: String,
     path: String,
     reference: Option<String>,
+    remote: Option<String>,
 ) -> Result<Option<String>, String> {
     let path = clean_repo_path(&path, false)?;
-    let Some(repo) = open_named_repo(&app, &repo)? else {
+    let Some(repo) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(None);
     };
     let Some(commit) = commit_at(&repo, reference.as_deref())? else {
@@ -312,9 +330,10 @@ pub fn forge_read_file_page(
     reference: Option<String>,
     offset: usize,
     limit: usize,
+    remote: Option<String>,
 ) -> Result<Option<FilePage>, String> {
     let path = clean_repo_path(&path, false)?;
-    let Some(repo) = open_named_repo(&app, &repo)? else {
+    let Some(repo) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(None);
     };
     let Some(commit) = commit_at(&repo, reference.as_deref())? else {
@@ -342,8 +361,9 @@ pub fn forge_diff(
     repo: String,
     from: Option<String>,
     to: Option<String>,
+    remote: Option<String>,
 ) -> Result<Vec<FileDiff>, String> {
-    let Some(repo) = open_named_repo(&app, &repo)? else {
+    let Some(repo) = open_named_repo(&app, &repo, remote.as_deref())? else {
         return Ok(Vec::new());
     };
     let from_tree = tree_for_spec(&repo, from.as_deref(), false)?;
@@ -436,8 +456,9 @@ pub fn forge_compare(
     repo: String,
     base: String,
     head: String,
+    remote: Option<String>,
 ) -> Result<CompareResult, String> {
-    let repo = require_named_repo(&app, &repo)?;
+    let repo = require_named_repo(&app, &repo, remote.as_deref())?;
     let base_oid = require_ref_spec(&repo, &base)?;
     let head_oid = require_ref_spec(&repo, &head)?;
     let merge_base = repo
@@ -521,8 +542,9 @@ pub fn forge_build_merge(
     ours: String,
     theirs: String,
     message: String,
+    remote: Option<String>,
 ) -> Result<MergeBuildResult, String> {
-    let node_repo = require_named_repo(&app, &repo)?;
+    let node_repo = require_named_repo(&app, &repo, remote.as_deref())?;
     let ours_oid = require_ref_spec(&node_repo, &ours)?;
     let theirs_oid = require_ref_spec(&node_repo, &theirs)?;
 
@@ -653,8 +675,26 @@ fn clean_repo_name(name: &str) -> Result<&str, String> {
 /// name it wants to read (from [`list_forge_repos`]/the UI's selection), so
 /// nothing here hardcodes or guesses a repo name; the name is validated as a
 /// single path segment first so it cannot escape the base.
-fn open_named_repo(app: &crate::rt::AppHandle, repo: &str) -> Result<Option<Repository>, String> {
+///
+/// `remote` switches the source entirely: a remote client reads its local
+/// MIRROR of that origin's repo (see [`forge_sync_remote`]) and never touches
+/// the workspace bases — the two planes must not shadow each other. A mirror
+/// not synced yet reads as absent, the same empty shape an unborn local repo
+/// projects.
+fn open_named_repo(
+    app: &crate::rt::AppHandle,
+    repo: &str,
+    remote: Option<&str>,
+) -> Result<Option<Repository>, String> {
     let repo = clean_repo_name(repo)?;
+    if let Some(origin) = remote {
+        let dir = remote_repo_dir(app, origin, repo)?;
+        return match Repository::open(&dir) {
+            Ok(git) => Ok(Some(git)),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(format!("open forge mirror {}: {e}", dir.display())),
+        };
+    }
     for base in forge_base_dirs(app)? {
         let dir = base.join(repo);
         if dir.join(".git").exists() {
@@ -668,9 +708,95 @@ fn open_named_repo(app: &crate::rt::AppHandle, repo: &str) -> Result<Option<Repo
 
 /// Like [`open_named_repo`] but the repo MUST be materialized — compare/merge
 /// have no meaningful empty shape.
-fn require_named_repo(app: &crate::rt::AppHandle, repo: &str) -> Result<Repository, String> {
-    open_named_repo(app, repo)?
+fn require_named_repo(
+    app: &crate::rt::AppHandle,
+    repo: &str,
+    remote: Option<&str>,
+) -> Result<Repository, String> {
+    open_named_repo(app, repo, remote)?
         .ok_or_else(|| format!("forge repo {repo:?} is not materialized on this node"))
+}
+
+/// Where the local mirror of a REMOTE origin's repo lives:
+/// `<app-data>/forge-remote/<origin-key>/<repo>`. The key flattens the origin
+/// url into one path segment (alphanumerics, `.` and `-` survive; everything
+/// else becomes `_`) so distinct nodes can never share a mirror.
+fn remote_repo_dir(
+    app: &crate::rt::AppHandle,
+    origin: &str,
+    repo: &str,
+) -> Result<PathBuf, String> {
+    let origin = origin.trim_end_matches('/');
+    if origin.is_empty() {
+        return Err("remote origin url is required".into());
+    }
+    let key: String = origin
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("no app-data dir: {err}"))?
+        .join("forge-remote")
+        .join(key)
+        .join(repo))
+}
+
+/// Fetch `<origin>/forge/<repo>` (the node's git smart-HTTP surface) into the
+/// local bare mirror at `dir`, creating it on first sync. All branch heads
+/// come over (`+refs/heads/*:refs/heads/*`, pruned), so the browse readers and
+/// the client-computed merge see exactly what the node's repo holds. Returns
+/// the mirror's integration head — the same shape [`list_forge_repos`] lists.
+fn sync_remote_mirror(dir: &Path, origin: &str, repo: &str) -> Result<RepoMeta, String> {
+    let git = match Repository::open(dir) {
+        Ok(git) => git,
+        Err(e) if e.code() == ErrorCode::NotFound => {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("create forge mirror dir {}: {e}", dir.display()))?;
+            Repository::init_bare(dir).map_err(err)?
+        }
+        Err(e) => return Err(format!("open forge mirror {}: {e}", dir.display())),
+    };
+    let url = format!("{}/forge/{}", origin.trim_end_matches('/'), repo);
+    let mut origin_remote = git.remote_anonymous(&url).map_err(err)?;
+    let mut opts = FetchOptions::new();
+    opts.prune(FetchPrune::On);
+    origin_remote
+        .fetch(&["+refs/heads/*:refs/heads/*"], Some(&mut opts), None)
+        .map_err(|e| format!("fetch {url}: {e}"))?;
+    drop(origin_remote);
+    let (branch, head) = integration_ref(&git)?
+        .map(|(branch, oid)| (branch.to_owned(), Some(oid.to_string())))
+        .unwrap_or_else(|| ("dev".into(), None));
+    Ok(RepoMeta {
+        name: repo.to_owned(),
+        branch,
+        head,
+    })
+}
+
+/// Bring a remote client's local mirror of `<origin>/forge/<repo>` up to date
+/// and report its integration head. Network-bound, so it runs off the IPC
+/// thread; the browse readers then serve from the mirror without touching the
+/// network again.
+#[tauri::command]
+pub async fn forge_sync_remote(
+    app: crate::rt::AppHandle,
+    origin: String,
+    repo: String,
+) -> Result<RepoMeta, String> {
+    let name = clean_repo_name(&repo)?.to_owned();
+    let dir = remote_repo_dir(&app, &origin, &name)?;
+    tauri::async_runtime::spawn_blocking(move || sync_remote_mirror(&dir, &origin, &name))
+        .await
+        .map_err(|e| format!("forge remote sync task: {e}"))?
 }
 
 /// Enumerate every repo materialized under the forge base(s), by its REAL on-disk
@@ -1027,8 +1153,8 @@ fn err(e: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEV_REF, MAIN_REF, clean_repo_name, integration_oid, integration_ref, resolve_ref_spec,
-        utf8_text_page,
+        DEV_REF, MAIN_REF, clean_repo_name, commit_at, integration_oid, integration_ref,
+        resolve_ref_spec, sync_remote_mirror, utf8_text_page,
     };
     use git2::{Repository, Signature};
 
@@ -1094,6 +1220,69 @@ mod tests {
         repo.find_reference(DEV_REF).unwrap().delete().unwrap();
         assert_eq!(integration_oid(&repo).unwrap(), Some(main));
         assert_eq!(integration_ref(&repo).unwrap(), Some(("main", main)));
+    }
+
+    #[test]
+    fn remote_mirror_sync_tracks_the_origin() {
+        // origin laid out the way a node serves it: <origin>/forge/<repo>.
+        // file:// exercises the same fetch path the smart-HTTP origin takes.
+        let dir = tempfile::tempdir().unwrap();
+        let origin_dir = dir.path().join("forge").join("demo");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        let origin = Repository::init(&origin_dir).unwrap();
+        let signature = Signature::now("test", "test@example.com").unwrap();
+        let tree_id = origin.index().unwrap().write_tree().unwrap();
+        let tree = origin.find_tree(tree_id).unwrap();
+        let first = origin
+            .commit(Some(DEV_REF), &signature, &signature, "one", &tree, &[])
+            .unwrap();
+
+        let origin_url = format!("file://{}", dir.path().display());
+        let mirror_dir = dir.path().join("mirror");
+
+        // first sync creates the bare mirror and lands the dev head.
+        let meta = sync_remote_mirror(&mirror_dir, &origin_url, "demo").unwrap();
+        assert_eq!(meta.name, "demo");
+        assert_eq!(meta.branch, "dev");
+        assert_eq!(meta.head, Some(first.to_string()));
+
+        // origin advances; a re-sync follows it and the mirror serves reads.
+        let first_commit = origin.find_commit(first).unwrap();
+        let second = origin
+            .commit(
+                Some(DEV_REF),
+                &signature,
+                &signature,
+                "two",
+                &tree,
+                &[&first_commit],
+            )
+            .unwrap();
+        let meta = sync_remote_mirror(&mirror_dir, &origin_url, "demo").unwrap();
+        assert_eq!(meta.head, Some(second.to_string()));
+        let mirror = Repository::open(&mirror_dir).unwrap();
+        assert_eq!(commit_at(&mirror, None).unwrap().unwrap().id(), second);
+
+        // a branch deleted at the origin is pruned from the mirror.
+        origin
+            .commit(
+                Some("refs/heads/feature"),
+                &signature,
+                &signature,
+                "wip",
+                &tree,
+                &[&first_commit],
+            )
+            .unwrap();
+        sync_remote_mirror(&mirror_dir, &origin_url, "demo").unwrap();
+        assert!(mirror.refname_to_id("refs/heads/feature").is_ok());
+        origin
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .delete()
+            .unwrap();
+        sync_remote_mirror(&mirror_dir, &origin_url, "demo").unwrap();
+        assert!(mirror.refname_to_id("refs/heads/feature").is_err());
     }
 
     #[test]

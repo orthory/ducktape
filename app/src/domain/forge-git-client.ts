@@ -4,6 +4,11 @@
 // main on pre-migration repos) through Tauri
 // commands — plus forge_build_merge, which builds the client-computed merge
 // commit for MergePr in a throwaway repo without touching the node repo.
+//
+// A direct remote client has no node repo on this disk: every reader takes an
+// optional `remote` origin url and then serves from a local bare MIRROR of
+// that node's `<origin>/forge/<repo>` smart-HTTP remote, kept current by
+// forgeSyncRemote (the view syncs on repo open / head movement).
 
 import { invoke } from "@tauri-apps/api/core";
 
@@ -111,25 +116,34 @@ interface RepoMeta {
   head: string | null;
 }
 
+const metaToInfo = (repo: RepoMeta): RepoInfo => ({
+  id: repo.name,
+  name: repo.name,
+  branch: repo.branch,
+  defaultBranch: repo.branch,
+  head: repo.head,
+  browsable: repo.head !== null,
+});
+
 /** Every repo the node has on disk, by its real name — no hardcoded identity. */
 export const forgeListRepos = (): Promise<RepoInfo[]> =>
-  desktopInvoke<RepoMeta[]>("forge_list_repos").then((repos) =>
-    repos.map((repo) => ({
-      id: repo.name,
-      name: repo.name,
-      branch: repo.branch,
-      defaultBranch: repo.branch,
-      head: repo.head,
-      browsable: repo.head !== null,
-    })),
-  );
+  desktopInvoke<RepoMeta[]>("forge_list_repos").then((repos) => repos.map(metaToInfo));
 
-export const forgeHead = (repo: string): Promise<string | null> =>
-  desktopInvoke<string | null>("forge_head", { repo });
+/** Bring the local mirror of `origin`'s repo up to date (fetching over the
+ *  node's git smart-HTTP surface) and report its integration head — the
+ *  remote client's precondition for every read below. */
+export const forgeSyncRemote = (origin: string, repo: string): Promise<RepoInfo> =>
+  desktopInvoke<RepoMeta>("forge_sync_remote", { origin, repo }).then(metaToInfo);
+
+export const forgeHead = (repo: string, remote?: string | null): Promise<string | null> =>
+  desktopInvoke<string | null>("forge_head", { repo, remote: remote ?? null });
 
 /** Every local branch (refs/heads/*) by short name + head oid, sorted by name. */
-export const forgeListBranches = (repo: string): Promise<BranchInfo[]> =>
-  desktopInvoke<BranchInfo[]>("forge_list_branches", { repo });
+export const forgeListBranches = (
+  repo: string,
+  remote?: string | null,
+): Promise<BranchInfo[]> =>
+  desktopInvoke<BranchInfo[]>("forge_list_branches", { repo, remote: remote ?? null });
 
 /**
  * Commit log, newest first. `reference` is a branch short name or 40-hex oid
@@ -140,23 +154,41 @@ export const forgeLog = (
   limit?: number,
   reference?: string,
   after?: string | null,
+  remote?: string | null,
 ): Promise<CommitInfo[]> =>
   desktopInvoke<CommitInfo[]>("forge_log", {
     repo,
     limit: limit ?? null,
     reference: reference ?? null,
     after: after ?? null,
+    remote: remote ?? null,
   });
 
-export const forgeTree = (repo: string, path = "", reference?: string): Promise<TreeEntry[]> =>
-  desktopInvoke<TreeEntry[]>("forge_tree", { repo, path, reference: reference ?? null });
+export const forgeTree = (
+  repo: string,
+  path = "",
+  reference?: string,
+  remote?: string | null,
+): Promise<TreeEntry[]> =>
+  desktopInvoke<TreeEntry[]>("forge_tree", {
+    repo,
+    path,
+    reference: reference ?? null,
+    remote: remote ?? null,
+  });
 
 export const forgeReadFile = (
   repo: string,
   path: string,
   reference?: string,
+  remote?: string | null,
 ): Promise<string | null> =>
-  desktopInvoke<string | null>("forge_read_file", { repo, path, reference: reference ?? null });
+  desktopInvoke<string | null>("forge_read_file", {
+    repo,
+    path,
+    reference: reference ?? null,
+    remote: remote ?? null,
+  });
 
 export const forgeReadFilePage = (
   repo: string,
@@ -165,6 +197,7 @@ export const forgeReadFilePage = (
     reference?: string;
     offset: number;
     limit: number;
+    remote?: string | null;
   },
 ): Promise<FilePage | null> =>
   desktopInvoke<FilePage | null>("forge_read_file_page", {
@@ -173,6 +206,7 @@ export const forgeReadFilePage = (
     reference: params.reference ?? null,
     offset: params.offset,
     limit: params.limit,
+    remote: params.remote ?? null,
   });
 
 /**
@@ -180,8 +214,13 @@ export const forgeReadFilePage = (
  * to head, plus the commits on head not reachable from base. `base`/`head`
  * are branch short names or 40-hex oids.
  */
-export const forgeCompare = (repo: string, base: string, head: string): Promise<CompareResult> =>
-  desktopInvoke<CompareResult>("forge_compare", { repo, base, head });
+export const forgeCompare = (
+  repo: string,
+  base: string,
+  head: string,
+  remote?: string | null,
+): Promise<CompareResult> =>
+  desktopInvoke<CompareResult>("forge_compare", { repo, base, head, remote: remote ?? null });
 
 /**
  * Build the client-computed merge commit for MergePr: merge `theirs` (source
@@ -194,18 +233,27 @@ export const forgeBuildMerge = (
   ours: string,
   theirs: string,
   message: string,
+  remote?: string | null,
 ): Promise<MergeBuildResult> =>
-  desktopInvoke<MergeBuildResult>("forge_build_merge", { repo, ours, theirs, message });
+  desktopInvoke<MergeBuildResult>("forge_build_merge", {
+    repo,
+    ours,
+    theirs,
+    message,
+    remote: remote ?? null,
+  });
 
 export const forgeDiff = (
   repo: string,
   params: {
     from?: string | null;
     to?: string | null;
+    remote?: string | null;
   },
 ): Promise<FileDiff[]> =>
   desktopInvoke<FileDiff[]>("forge_diff", {
     repo,
     from: params.from ?? null,
     to: params.to ?? null,
+    remote: params.remote ?? null,
   });

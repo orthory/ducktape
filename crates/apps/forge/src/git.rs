@@ -152,6 +152,28 @@ pub fn pack_closure_many(repo: &Repository, heads: &[Oid]) -> Result<Vec<u8>, gi
     Ok(buf.to_vec())
 }
 
+/// pack only the objects reachable from `heads` but from NONE of `bases` —
+/// the fetch lane's INCREMENTAL pack. hidden commits mark their trees
+/// uninteresting, so unchanged trees/blobs never re-cross the wire. every
+/// `bases` oid must be a commit present in this repo (the caller filters the
+/// client's haves down to what the repo knows). same determinism posture as
+/// [`pack_closure_many`]: single-threaded, revwalk-driven, deduped.
+pub fn pack_delta(repo: &Repository, heads: &[Oid], bases: &[Oid]) -> Result<Vec<u8>, git2::Error> {
+    let mut pb = repo.packbuilder()?;
+    pb.set_threads(1);
+    let mut walk = repo.revwalk()?;
+    for head in heads {
+        walk.push(*head)?;
+    }
+    for base in bases {
+        walk.hide(*base)?;
+    }
+    pb.insert_walk(&mut walk)?;
+    let mut buf = Buf::new();
+    pb.write_buf(&mut buf)?;
+    Ok(buf.to_vec())
+}
+
 /// stream a packfile into the odb and commit it. libgit2's indexer re-hashes
 /// every object and checks the pack trailer as it indexes, so tampered or
 /// malformed bytes fail HERE — before anything could be referenced, with no

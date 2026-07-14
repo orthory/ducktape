@@ -112,9 +112,11 @@ pub use tracker_iface::*;
 
 mod codec;
 mod git;
-/// the multi-head pack builder, shared with bin/noded's git upload-pack
+/// the multi-head pack builders, shared with bin/noded's git upload-pack
 /// (fetch/clone) lane — packing has ONE implementation on both surfaces.
-pub use git::pack_closure_many;
+/// `pack_closure_many` is the self-contained closure; `pack_delta` bounds it
+/// by the client's common bases (the incremental fetch answer).
+pub use git::{pack_closure_many, pack_delta};
 pub mod refs;
 mod snapshot;
 pub mod tracker;
@@ -763,12 +765,19 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Head(self.read_head(&name))))
             }
             ForgeQuery::ListRepos => {
+                // the committed INTEGRATION head (dev, falling back to legacy
+                // main) — the same branch every browse surface reads, so a
+                // dev-only repo lists as browsable, not unborn.
                 let repos = self
                     .repos
                     .iter()
                     .map(|(name, s)| RepoHead {
                         name: name.clone(),
-                        head: s.refs.get(MAIN_BRANCH).map(|oid| oid.to_string()),
+                        head: s
+                            .refs
+                            .get(INTEGRATION_BRANCH)
+                            .or_else(|| s.refs.get(MAIN_BRANCH))
+                            .map(|oid| oid.to_string()),
                     })
                     .collect();
                 Ok(encode_reply(&ForgeReply::Repos(repos)))

@@ -132,7 +132,7 @@ export function BlockGutter({
             border: `1px solid ${color.border}`,
             borderRadius: radius.md,
             background: color.paper,
-            boxShadow: shadow.card,
+            boxShadow: shadow.pop,
             padding: 4,
           }}
         >
@@ -217,15 +217,15 @@ const menuItem: CSSProperties = {
   boxSizing: "border-box",
   padding: "6px 9px",
   borderRadius: radius.sm,
-  font: `500 12px ${font.sans}`,
+  font: `500 13px ${font.sans}`,
   color: color.ink,
   whiteSpace: "nowrap",
 };
 
 const sectionLabel: CSSProperties = {
-  padding: "4px 9px 5px",
-  font: `600 9px ${font.mono}`,
-  letterSpacing: ".1em",
+  padding: "6px 9px 4px",
+  font: `600 10px ${font.sans}`,
+  letterSpacing: ".05em",
   textTransform: "uppercase",
   color: color.muted2,
 };
