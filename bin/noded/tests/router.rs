@@ -8,7 +8,10 @@ use commonware_cryptography::Signer as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
-use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
+use noded::{
+    AdminConfig, AdminExposure, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeStatus,
+};
 use tower::ServiceExt as _;
 
 /// a scripted actor: answers every command the same way, like a module host
@@ -425,8 +428,11 @@ async fn shutdown_acknowledges_then_signals() {
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
+    // shutdown moved to the owner-gated admin namespace (ADR A2). the default
+    // handle is loopback-trust with no on-chain owner, and an in-process oneshot
+    // has no ConnectInfo (treated loopback), so it passes without a PoP header.
     let response = noded::router(handle)
-        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
         .await
         .unwrap();
 
@@ -441,6 +447,72 @@ async fn shutdown_acknowledges_then_signals() {
     )
     .await
     .expect("shutdown signal fired");
+}
+
+/// stamp a peer address onto a request the way `into_make_service_with_connect_info`
+/// would, so the admin guard's loopback check has something to read.
+fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        addr.parse::<std::net::SocketAddr>().expect("test peer addr"),
+    ));
+    req
+}
+
+/// shutdown left the unauthenticated public surface entirely (ADR A2). the old
+/// path is a 404 — flag-day, no alias.
+#[tokio::test]
+async fn the_old_public_shutdown_route_is_gone() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "shutdown must not answer on the public surface anymore"
+    );
+}
+
+/// `DUCKTAPE_ADMIN=off` leaves the control surface simply ABSENT — the admin
+/// routes are never registered, so they 404 (not a gated-but-present 403).
+#[tokio::test]
+async fn a_disabled_admin_namespace_is_absent() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let handle = handle.with_admin(AdminConfig {
+        exposure: AdminExposure::Disabled,
+        node_key: None,
+        ..Default::default()
+    });
+    let response = noded::router(handle)
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a disabled admin namespace is absent, not forbidden"
+    );
+}
+
+/// under the default `Loopback` exposure a non-loopback peer is refused before
+/// any owner check — the exposure gate is the outer wall.
+#[tokio::test]
+async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let request = with_peer(
+        post("/v1/admin/shutdown", serde_json::json!({})),
+        "203.0.113.7:5555",
+    );
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "loopback-only admin refuses a remote peer"
+    );
 }
 
 #[tokio::test]
