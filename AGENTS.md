@@ -68,6 +68,16 @@
   it is invisible in the app and unfilterable by `RUST_LOG`. Program output is
   not logging — a CLI's stdout (`bin/fs`, `bin/mcp`, `ducktape-node <subcommand>`)
   stays `println!`.
+- Two conventions coexist ON PURPOSE, and they are orthogonal — a `target` says
+  WHERE an event came from, an `event` field says WHAT it is:
+  - `target: "ducktape::<plane>"` — the filtering handle. `RUST_LOG=ducktape::join=debug`
+    must light up a plane that spans several crates, which a crate-path target
+    cannot express.
+  - `event = "<stable_name>"` — the operational-contract events (the node status
+    `operations` projection and the `ducktape_*` metrics). These are a MACHINE
+    contract: a dashboard keys on the name, so do not rename one without treating
+    it as a wire change.
+  Use both together on a contract event. Neither replaces the other.
 - **If it can fire more than once per block, it is not `info`.** The ring holds
   4096 lines; one `info!` per 100 ms drain tick evicts the whole thing every
   ~7 minutes, destroying the context around the event you were hunting.

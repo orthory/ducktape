@@ -243,6 +243,153 @@ pub struct NodeStatus {
     /// empty on daemons with no mesh identity (the embedded local daemon).
     #[serde(default)]
     pub public_key: String,
+    /// Node-owned operational state. This is the stable, role-aware facade for
+    /// operators; dependency-specific consensus and transport metrics remain
+    /// available on `/metrics` for deeper diagnosis.
+    #[serde(default)]
+    pub operations: OperationalStatus,
+}
+
+/// The job this process is currently performing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// Single-writer embedded daemon; no mesh or consensus participation.
+    Local,
+    Validator,
+    Resident,
+    SyncOnly,
+    /// Used only until the full node has selected its role during boot.
+    #[default]
+    Unknown,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Validator => "validator",
+            Self::Resident => "resident",
+            Self::SyncOnly => "sync_only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The role-independent lifecycle phase. A role says what the node is; a
+/// phase says what it is doing now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePhase {
+    #[default]
+    Starting,
+    Recovering,
+    Joining,
+    Syncing,
+    Validating,
+    Serving,
+    Draining,
+    Halted,
+}
+
+impl NodePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Recovering => "recovering",
+            Self::Joining => "joining",
+            Self::Syncing => "syncing",
+            Self::Validating => "validating",
+            Self::Serving => "serving",
+            Self::Draining => "draining",
+            Self::Halted => "halted",
+        }
+    }
+}
+
+/// Stable operational projection shared by `/v1/status` and the
+/// `ducktape_*` metrics. Optional sections are absent when they do not apply to
+/// the selected role, rather than being filled with misleading zeroes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalStatus {
+    pub role: NodeRole,
+    pub phase: NodePhase,
+    /// Unix seconds when `phase` last changed.
+    pub phase_since: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_finalized_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consensus: Option<ConsensusOperationalStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncOperationalStatus>,
+    pub storage: StorageOperationalStatus,
+    pub upgrade: UpgradeOperationalStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsensusOperationalStatus {
+    pub epoch: u64,
+    pub view: u64,
+    pub validators: u64,
+    pub quorum: u64,
+    /// Current validators this node can use, including itself when it is a
+    /// member. This makes the number directly comparable with `quorum`.
+    pub reachable_validators: u64,
+    pub pending_ops: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncOperationalStatus {
+    /// Source identity is useful in status and logs but intentionally not a
+    /// metric label (peer identities are unbounded cardinality).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub target_height: u64,
+    pub applied_height: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
+    pub retries: u64,
+    pub failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageOperationalStatus {
+    pub checkpoint_height: u64,
+    pub index_poisoned: bool,
+    pub indexes: Vec<IndexOperationalStatus>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexOperationalStatus {
+    pub module: String,
+    pub applied_height: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeOperationalStatus {
+    pub current_version: u64,
+    /// Highest protocol version this running binary can execute.
+    pub max_supported_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation_height: Option<u64>,
+    pub ready_validators: u64,
+    pub required_validators: u64,
+    /// Present only when this node is a validator in the boundary set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locally_ready: Option<bool>,
+    pub armed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -681,6 +828,20 @@ async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_from_an_older_node_defaults_operational_state() {
+        let status: NodeStatus = serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "appHash": "",
+            "height": 0,
+            "modules": []
+        }))
+        .expect("the additive status field stays backward-compatible");
+
+        assert_eq!(status.operations.role, NodeRole::Unknown);
+        assert_eq!(status.operations.phase, NodePhase::Starting);
+    }
 
     #[tokio::test]
     async fn shutdown_wakes_every_surface_and_remains_sticky() {

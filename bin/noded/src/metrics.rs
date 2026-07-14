@@ -6,8 +6,13 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use futures::channel::oneshot;
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{NodeCommand, NodeHandle, actor_gone};
+use crate::{
+    ConsensusOperationalStatus, IndexOperationalStatus, NodeCommand, NodeHandle, NodePhase,
+    NodeRole, OperationalStatus, SyncOperationalStatus, UpgradeOperationalStatus, actor_gone,
+};
 
 // ---------------------------------------------------------------------------
 // node metrics: the `ducktape_*` Prometheus series behind GET /metrics.
@@ -31,6 +36,22 @@ struct DispatchLabels {
     origin: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PhaseLabels {
+    role: String,
+    phase: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct OutcomeLabels {
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ModuleLabels {
+    module: String,
+}
+
 /// the low-cardinality trigger KIND of a dispatch origin — the metrics label.
 fn origin_kind(origin: &sdk::Origin) -> &'static str {
     match origin {
@@ -44,19 +65,46 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
 /// registry so one `context.encode()` (GET /metrics) serves runtime + app
 /// metrics together. each `Registered` handle is retained for the process life;
 /// updates go through its `Deref` to the underlying metric.
+#[derive(Clone)]
 pub struct NodeMetrics {
     block_height: Registered<raw::Gauge>,
     blocks_total: Registered<raw::Counter>,
     ops_total: Registered<raw::Counter>,
     apply_latency: Registered<raw::Histogram>,
     dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
+    node_phase: Registered<raw::Family<PhaseLabels, raw::Gauge>>,
+    op_outcomes: Registered<raw::Family<OutcomeLabels, raw::Counter>>,
+    consensus_epoch: Registered<raw::Gauge>,
+    consensus_view: Registered<raw::Gauge>,
+    consensus_validators: Registered<raw::Gauge>,
+    consensus_quorum: Registered<raw::Gauge>,
+    consensus_reachable: Registered<raw::Gauge>,
+    consensus_pending: Registered<raw::Gauge>,
+    last_finalized_at: Registered<raw::Gauge>,
+    sync_target_height: Registered<raw::Gauge>,
+    sync_applied_height: Registered<raw::Gauge>,
+    sync_retries: Registered<raw::Counter>,
+    sync_failures: Registered<raw::Counter>,
+    sync_last_progress_at: Registered<raw::Gauge>,
+    checkpoint_height: Registered<raw::Gauge>,
+    index_poisoned: Registered<raw::Gauge>,
+    index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
+    upgrade_current_version: Registered<raw::Gauge>,
+    upgrade_max_supported_version: Registered<raw::Gauge>,
+    upgrade_pending_version: Registered<raw::Gauge>,
+    upgrade_activation_height: Registered<raw::Gauge>,
+    upgrade_ready: Registered<raw::Gauge>,
+    upgrade_required: Registered<raw::Gauge>,
+    upgrade_local_ready: Registered<raw::Gauge>,
+    upgrade_armed: Registered<raw::Gauge>,
+    operations: Arc<RwLock<OperationalStatus>>,
 }
 
 impl NodeMetrics {
     /// register the `ducktape_*` series on the runtime context (root context, so
     /// names carry no child prefix).
     pub fn register<C: commonware_runtime::Metrics>(context: &C) -> Self {
-        Self {
+        let metrics = Self {
             block_height: context.gauge(
                 "ducktape_block_height",
                 "latest committed local block height",
@@ -85,13 +133,117 @@ impl NodeMetrics {
                 "ducktape_dispatch",
                 "module dispatches, by module and trigger-origin kind",
             ),
-        }
+            node_phase: context.family(
+                "ducktape_node_phase",
+                "whether this node is currently in a bounded role and lifecycle phase",
+            ),
+            op_outcomes: context.family(
+                "ducktape_ops_outcome",
+                "finalized member operations by applied or rejected outcome",
+            ),
+            consensus_epoch: context.gauge("ducktape_consensus_epoch", "current consensus epoch"),
+            consensus_view: context.gauge(
+                "ducktape_consensus_view",
+                "latest locally finalized view in the current epoch",
+            ),
+            consensus_validators: context.gauge(
+                "ducktape_consensus_validators",
+                "validators in the current epoch",
+            ),
+            consensus_quorum: context.gauge(
+                "ducktape_consensus_quorum",
+                "validators required to finalize in the current epoch",
+            ),
+            consensus_reachable: context.gauge(
+                "ducktape_consensus_reachable_validators",
+                "current validators reachable by this node, including itself when a member",
+            ),
+            consensus_pending: context.gauge(
+                "ducktape_consensus_pending_ops",
+                "operations staged locally or waiting in the consensus orderer",
+            ),
+            last_finalized_at: context.gauge(
+                "ducktape_last_finalized_timestamp_seconds",
+                "unix timestamp of this node's latest finalized block",
+            ),
+            sync_target_height: context.gauge(
+                "ducktape_statesync_target_height",
+                "target boundary height of the local state-sync attempt",
+            ),
+            sync_applied_height: context.gauge(
+                "ducktape_statesync_applied_height",
+                "latest height installed by the local state-sync attempt",
+            ),
+            sync_retries: context.counter(
+                "ducktape_statesync_retries",
+                "local state-sync retries since process start",
+            ),
+            sync_failures: context.counter(
+                "ducktape_statesync_failures",
+                "failed local state-sync attempts since process start",
+            ),
+            sync_last_progress_at: context.gauge(
+                "ducktape_statesync_last_progress_timestamp_seconds",
+                "unix timestamp of the latest local state-sync progress",
+            ),
+            checkpoint_height: context.gauge(
+                "ducktape_checkpoint_height",
+                "height of the latest durable recovery checkpoint",
+            ),
+            index_poisoned: context.gauge(
+                "ducktape_index_poisoned",
+                "whether the derived index has stopped accepting writes after a failure",
+            ),
+            index_height: context.family(
+                "ducktape_index_height",
+                "latest fully indexed height by bounded module id",
+            ),
+            upgrade_current_version: context.gauge(
+                "ducktape_upgrade_current_version",
+                "currently active node protocol version",
+            ),
+            upgrade_max_supported_version: context.gauge(
+                "ducktape_upgrade_max_supported_version",
+                "highest protocol version this running node binary can execute",
+            ),
+            upgrade_pending_version: context.gauge(
+                "ducktape_upgrade_pending_version",
+                "pending protocol version, or zero when none is scheduled",
+            ),
+            upgrade_activation_height: context.gauge(
+                "ducktape_upgrade_activation_height",
+                "pending upgrade activation height, or zero when none is scheduled",
+            ),
+            upgrade_ready: context.gauge(
+                "ducktape_upgrade_ready_validators",
+                "validators ready for the pending upgrade",
+            ),
+            upgrade_required: context.gauge(
+                "ducktape_upgrade_required_validators",
+                "validators required to arm the pending upgrade",
+            ),
+            upgrade_local_ready: context.gauge(
+                "ducktape_upgrade_local_ready",
+                "whether this boundary validator has committed readiness for the pending upgrade",
+            ),
+            upgrade_armed: context.gauge(
+                "ducktape_upgrade_armed",
+                "whether every required validator is ready for the pending upgrade",
+            ),
+            operations: Arc::new(RwLock::new(OperationalStatus {
+                phase_since: unix_seconds(),
+                ..OperationalStatus::default()
+            })),
+        };
+        metrics.set_role_phase(NodeRole::Unknown, NodePhase::Starting);
+        metrics
     }
 
     /// fold one applied block into the series: height, count, this node's
     /// wall-clock apply latency, and the per-module dispatch counters.
     pub fn record_block(&self, height: u64, latency_us: u64, dispatches: &[host::DispatchRecord]) {
         self.block_height.set(height as i64);
+        self.record_finalized_now();
         self.blocks_total.inc();
         // microseconds → seconds for the Prometheus convention.
         self.apply_latency.observe(latency_us as f64 / 1_000_000.0);
@@ -111,13 +263,187 @@ impl NodeMetrics {
         self.ops_total.inc_by(ops as u64);
     }
 
+    /// Record deterministic finalized outcomes while retaining the older
+    /// aggregate `ducktape_ops_total` compatibility series.
+    pub fn record_op_outcomes(&self, applied: usize, rejected: usize) {
+        self.record_ops(applied + rejected);
+        for (outcome, count) in [("applied", applied), ("rejected", rejected)] {
+            self.op_outcomes
+                .get_or_create(&OutcomeLabels {
+                    outcome: outcome.to_string(),
+                })
+                .inc_by(count as u64);
+        }
+    }
+
     /// follow the committed height WITHOUT recording a block apply — the
     /// validator lane calls this for rejected frames (a deterministic no-op
     /// advances the height but is not a sample worth the block series; the
     /// idle heartbeat nop lands here, so it never pollutes the histogram).
     pub fn record_height(&self, height: u64) {
         self.block_height.set(height as i64);
+        self.record_finalized_now();
     }
+
+    /// Change the bounded lifecycle coordinates and update the status snapshot
+    /// and phase metric together. Old coordinates remain present at zero so a
+    /// dashboard does not retain a stale `1` after a transition.
+    pub fn set_role_phase(&self, role: NodeRole, phase: NodePhase) {
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        let old = PhaseLabels {
+            role: status.role.as_str().to_string(),
+            phase: status.phase.as_str().to_string(),
+        };
+        self.node_phase.get_or_create(&old).set(0);
+        if status.role != role || status.phase != phase {
+            status.phase_since = unix_seconds();
+        }
+        status.role = role;
+        status.phase = phase;
+        self.node_phase
+            .get_or_create(&PhaseLabels {
+                role: role.as_str().to_string(),
+                phase: phase.as_str().to_string(),
+            })
+            .set(1);
+    }
+
+    pub fn operational_status(&self) -> OperationalStatus {
+        self.operations
+            .read()
+            .expect("operations lock poisoned")
+            .clone()
+    }
+
+    pub fn update_consensus(
+        &self,
+        epoch: u64,
+        view: u64,
+        validators: u64,
+        reachable_validators: u64,
+        pending_ops: u64,
+    ) {
+        let quorum = quorum(validators);
+        self.consensus_epoch.set(epoch as i64);
+        self.consensus_view.set(view as i64);
+        self.consensus_validators.set(validators as i64);
+        self.consensus_quorum.set(quorum as i64);
+        self.consensus_reachable.set(reachable_validators as i64);
+        self.consensus_pending.set(pending_ops as i64);
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        status.consensus = Some(ConsensusOperationalStatus {
+            epoch,
+            view,
+            validators,
+            quorum,
+            reachable_validators,
+            pending_ops,
+        });
+    }
+
+    pub fn begin_sync(&self, source: Option<String>, target_height: u64) {
+        self.sync_target_height.set(target_height as i64);
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        let prior = status.sync.take().unwrap_or_default();
+        status.sync = Some(SyncOperationalStatus {
+            source,
+            target_height,
+            ..prior
+        });
+    }
+
+    pub fn record_sync_progress(&self, applied_height: u64) {
+        let now = unix_seconds();
+        self.sync_applied_height.set(applied_height as i64);
+        self.sync_last_progress_at.set(now as i64);
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        let sync = status.sync.get_or_insert_with(Default::default);
+        sync.applied_height = applied_height;
+        sync.last_progress_at = Some(now);
+        sync.last_error = None;
+    }
+
+    pub fn record_sync_retry(&self, error: impl Into<String>) {
+        self.sync_retries.inc();
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        let sync = status.sync.get_or_insert_with(Default::default);
+        sync.retries += 1;
+        sync.last_error = Some(error.into());
+    }
+
+    pub fn record_sync_failure(&self, error: impl Into<String>) {
+        self.sync_failures.inc();
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        let sync = status.sync.get_or_insert_with(Default::default);
+        sync.failures += 1;
+        sync.last_error = Some(error.into());
+    }
+
+    pub fn update_storage<I, S>(&self, checkpoint_height: u64, index_poisoned: bool, indexes: I)
+    where
+        I: IntoIterator<Item = (S, u64)>,
+        S: Into<String>,
+    {
+        self.checkpoint_height.set(checkpoint_height as i64);
+        self.index_poisoned.set(i64::from(index_poisoned));
+        let indexes: Vec<_> = indexes
+            .into_iter()
+            .map(|(module, applied_height)| IndexOperationalStatus {
+                module: module.into(),
+                applied_height,
+            })
+            .collect();
+        for index in &indexes {
+            self.index_height
+                .get_or_create(&ModuleLabels {
+                    module: index.module.clone(),
+                })
+                .set(index.applied_height as i64);
+        }
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        status.storage.checkpoint_height = checkpoint_height;
+        status.storage.index_poisoned = index_poisoned;
+        status.storage.indexes = indexes;
+    }
+
+    pub fn update_upgrade(&self, upgrade: UpgradeOperationalStatus) {
+        self.upgrade_current_version
+            .set(upgrade.current_version as i64);
+        self.upgrade_max_supported_version
+            .set(upgrade.max_supported_version as i64);
+        self.upgrade_pending_version
+            .set(upgrade.pending_version.unwrap_or_default() as i64);
+        self.upgrade_activation_height
+            .set(upgrade.activation_height.unwrap_or_default() as i64);
+        self.upgrade_ready.set(upgrade.ready_validators as i64);
+        self.upgrade_required
+            .set(upgrade.required_validators as i64);
+        self.upgrade_local_ready
+            .set(i64::from(upgrade.locally_ready.unwrap_or(false)));
+        self.upgrade_armed.set(i64::from(upgrade.armed));
+        self.operations
+            .write()
+            .expect("operations lock poisoned")
+            .upgrade = upgrade;
+    }
+
+    fn record_finalized_now(&self) {
+        let now = unix_seconds();
+        self.last_finalized_at.set(now as i64);
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        status.last_finalized_at = Some(now);
+    }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn quorum(validators: u64) -> u64 {
+    validators.saturating_mul(2) / 3 + u64::from(validators > 0)
 }
 
 /// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.
@@ -139,5 +465,72 @@ pub(crate) async fn metrics(State(handle): State<NodeHandle>) -> Response {
         )
             .into_response(),
         Err(_) => actor_gone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operational_snapshot_and_scrape_follow_the_same_updates() {
+        use commonware_runtime::{Metrics as _, Runner as _};
+
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let metrics = NodeMetrics::register(&context);
+            metrics.set_role_phase(NodeRole::Validator, NodePhase::Validating);
+            metrics.update_consensus(3, 9, 4, 3, 2);
+            metrics.record_op_outcomes(5, 1);
+            metrics.begin_sync(Some("peer-a".into()), 42);
+            metrics.record_sync_retry("manifest unavailable");
+            metrics.record_sync_progress(40);
+            metrics.update_storage(36, true, [("chat", 39), ("files", 40)]);
+            metrics.update_upgrade(UpgradeOperationalStatus {
+                current_version: 1,
+                max_supported_version: 2,
+                pending_name: Some("v2".into()),
+                pending_version: Some(2),
+                activation_height: Some(50),
+                ready_validators: 3,
+                required_validators: 4,
+                locally_ready: Some(true),
+                armed: false,
+            });
+
+            let status = metrics.operational_status();
+            assert_eq!(status.role, NodeRole::Validator);
+            assert_eq!(status.phase, NodePhase::Validating);
+            assert_eq!(status.consensus.as_ref().unwrap().quorum, 3);
+            assert_eq!(status.sync.as_ref().unwrap().applied_height, 40);
+            assert_eq!(status.sync.as_ref().unwrap().retries, 1);
+            assert!(status.storage.index_poisoned);
+            assert_eq!(status.upgrade.pending_version, Some(2));
+            assert_eq!(status.upgrade.locally_ready, Some(true));
+
+            let scrape = context.encode();
+            for sample in [
+                r#"ducktape_node_phase{role="validator",phase="validating"} 1"#,
+                "ducktape_consensus_quorum 3",
+                "ducktape_consensus_reachable_validators 3",
+                r#"ducktape_ops_outcome_total{outcome="applied"} 5"#,
+                r#"ducktape_ops_outcome_total{outcome="rejected"} 1"#,
+                "ducktape_statesync_target_height 42",
+                "ducktape_statesync_applied_height 40",
+                "ducktape_statesync_retries_total 1",
+                "ducktape_checkpoint_height 36",
+                r#"ducktape_index_height{module="files"} 40"#,
+                "ducktape_index_poisoned 1",
+                "ducktape_upgrade_pending_version 2",
+                "ducktape_upgrade_max_supported_version 2",
+                "ducktape_upgrade_local_ready 1",
+                "ducktape_upgrade_activation_height 50",
+            ] {
+                assert!(scrape.contains(sample), "missing {sample:?}:\n{scrape}");
+            }
+            assert!(
+                !scrape.contains("peer-a"),
+                "sync source leaked into an unbounded metric label:\n{scrape}"
+            );
+        });
     }
 }
