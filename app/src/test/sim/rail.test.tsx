@@ -150,6 +150,9 @@ describe("network rail", () => {
       screen.getByRole("button", { name: "Account home" }).click();
     });
     expect(screen.getByTestId("home").textContent).toBe("true");
+    // at home the me chip is the active surface — the connected network keeps
+    // its seat but drops its active ring (exactly one chip reads active).
+    expect(screen.getByRole("button", { name: "Alpha" }).getAttribute("aria-current")).toBeNull();
   });
 
   it("gives a client connection a badged remote seat", async () => {

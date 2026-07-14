@@ -146,7 +146,7 @@ export function WorkspacesTable() {
                   <td style={rowCell}>
                     {active ? (
                       <span
-                        aria-label="Active workspace"
+                        aria-label="Active network"
                         style={{
                           font: `600 9px ${font.mono}`,
                           color: tint(color.green).text,

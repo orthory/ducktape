@@ -215,7 +215,10 @@ export function NetworkRail() {
       {seats.map((seat) => (
         <NetworkChip
           key={seat.id}
-          seat={seat}
+          // While the account home covers the shell, the me chip is the active
+          // surface — the connected network keeps its seat but drops its ring,
+          // so exactly one chip reads active at a time.
+          seat={state.atHome ? { ...seat, active: false } : seat}
           hovered={hover === seat.id}
           onHover={setHover}
           onClick={() => enter(seat)}

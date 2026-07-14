@@ -13,9 +13,13 @@
 // identifiers (state.workspace, Workspace, workspace_* commands) are NOT
 // renamed — epic mandate.
 
-import { isClientMode, type ConsoleState } from "./state";
+import { isClientMode, type ConsoleState, type SeatKind } from "./state";
 
-export type SeatKind = "local" | "remote";
+// The per-seat control rule is defined beside the live `nodeControlAvailable`
+// predicate (state.ts), which delegates to it — one seam for W2. Re-exported
+// here because it belongs to the seat model.
+export { nodeControlForSeat } from "./state";
+export type { SeatKind } from "./state";
 
 /** One network chip on the rail. `id` is the registry id for a local seat, or
  *  the dialed url for the remote seat (the connect layer's identity). */
@@ -65,15 +69,6 @@ export const networksFrom = (
 export const activeSeat = (
   state: Pick<ConsoleState, "workspaces" | "workspace" | "nodeUrl">,
 ): NetworkSeat | null => networksFrom(state).find((s) => s.active) ?? null;
-
-/** Node control availability for one seat (ADR A5, interim form): a local
- *  seat whose daemon this app manages. A remote seat is never controllable
- *  (A6 — no control chrome for someone else's node). W2 replaces the body with
- *  `owner(BindNode) ∧ private-RPC reachable`; this is the one seam that moves.
- *  Under single-active only the active local seat is `managed`, so this is the
- *  per-seat rule `nodeControlAvailable` evaluates for the active seat. */
-export const nodeControlForSeat = (kind: SeatKind, managed: boolean): boolean =>
-  kind === "local" && managed;
 
 // ── Chip identity (deterministic, no avatar feature) ────
 
