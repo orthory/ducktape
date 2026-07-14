@@ -718,28 +718,23 @@ fn require_named_repo(
 }
 
 /// Where the local mirror of a REMOTE origin's repo lives:
-/// `<app-data>/forge-remote/<origin-key>/<repo>`. The key flattens the origin
-/// url into one path segment (alphanumerics, `.` and `-` survive; everything
-/// else becomes `_`) so distinct nodes can never share a mirror.
+/// `<app-data>/forge-remote/<origin-key>/<repo>`. The key hex-encodes the
+/// normalized origin into one lossless path segment so distinct nodes can
+/// never share a mirror.
+fn remote_origin_key(origin: &str) -> Result<String, String> {
+    let origin = origin.trim_end_matches('/');
+    if origin.is_empty() {
+        return Err("remote origin url is required".into());
+    }
+    Ok(hex_encode(origin.as_bytes()))
+}
+
 fn remote_repo_dir(
     app: &crate::rt::AppHandle,
     origin: &str,
     repo: &str,
 ) -> Result<PathBuf, String> {
-    let origin = origin.trim_end_matches('/');
-    if origin.is_empty() {
-        return Err("remote origin url is required".into());
-    }
-    let key: String = origin
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let key = remote_origin_key(origin)?;
     Ok(app
         .path()
         .app_data_dir()
@@ -1154,7 +1149,7 @@ fn err(e: impl std::fmt::Display) -> String {
 mod tests {
     use super::{
         DEV_REF, MAIN_REF, clean_repo_name, commit_at, integration_oid, integration_ref,
-        resolve_ref_spec, sync_remote_mirror, utf8_text_page,
+        remote_origin_key, resolve_ref_spec, sync_remote_mirror, utf8_text_page,
     };
     use git2::{Repository, Signature};
 
@@ -1188,6 +1183,18 @@ mod tests {
                 "{name:?} must be rejected as a repo name"
             );
         }
+    }
+
+    #[test]
+    fn remote_origin_keys_are_lossless_and_ignore_trailing_slashes() {
+        assert_ne!(
+            remote_origin_key("http://host:26800").unwrap(),
+            remote_origin_key("http://host/26800").unwrap(),
+        );
+        assert_eq!(
+            remote_origin_key("http://host:26800").unwrap(),
+            remote_origin_key("http://host:26800/").unwrap(),
+        );
     }
 
     #[test]
