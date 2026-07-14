@@ -183,6 +183,10 @@ pub enum ForgeReply {
 /// server rather than caller-controlled so one tool call cannot consume an
 /// agent's context.
 pub const MAX_PR_DIFF_BYTES: usize = 48 * 1024;
+/// Maximum number of changed paths examined for one PR diff.
+pub const MAX_PR_DIFF_FILES: usize = 256;
+/// Maximum aggregate old-plus-new blob bytes examined for one PR diff.
+pub const MAX_PR_DIFF_BLOB_BYTES: usize = 8 * 1024 * 1024;
 
 /// An exact source/target comparison at the committed OIDs named here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -193,7 +197,9 @@ pub struct PrDiff {
     pub additions: usize,
     pub deletions: usize,
     pub patch: String,
-    /// True when `patch` is only a prefix of the full unified diff.
+    /// True when `patch` is only a prefix of the full unified diff. Statistics
+    /// are still complete because over-limit file/blob inputs fail instead of
+    /// returning a partial reply.
     pub truncated: bool,
 }
 

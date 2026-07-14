@@ -127,9 +127,10 @@ pub(super) fn tools() -> Vec<Tool> {
             name: "ducktape_forge_pr_diff",
             description: "Read a pull request's exact committed source and target OIDs plus a \
                           bounded unified patch and full diff statistics. The patch is capped at \
-                          48 KiB and reports truncation. Fails if the item is not a PR or the \
-                          pinned git objects are unavailable locally. Requires the repo to be in \
-                          your forge_read caps.",
+                          48 KiB and reports truncation; inputs beyond 256 changed files or 8 MiB \
+                          of aggregate blobs fail instead of returning partial statistics. Fails \
+                          if the item is not a PR or the pinned git objects are unavailable \
+                          locally. Requires the repo to be in your forge_read caps.",
             schema: || {
                 schema(&[
                     ("repo", "string", true, "The forge repo."),

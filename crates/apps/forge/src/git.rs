@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use git2::{
-    Buf, Commit, DiffFormat, DiffOptions, ErrorCode, Oid, Repository, RepositoryInitOptions,
-    Signature, Time, Tree,
+    Buf, Commit, DiffDelta, DiffFormat, DiffOptions, ErrorCode, ObjectType, Oid, Odb, Repository,
+    RepositoryInitOptions, Signature, Time, Tree,
 };
 
 /// the fixed author/committer identity — pinning it makes the commit oid
@@ -226,24 +226,111 @@ pub fn verify_closure(repo: &Repository, head: Oid) -> Result<(), git2::Error> {
     Ok(())
 }
 
+/// A pull-request diff that is unsafe to materialize on the synchronous query
+/// path.
+#[derive(Debug)]
+pub enum BoundedDiffError {
+    Git(git2::Error),
+    TooLarge {
+        files_changed: usize,
+        blob_bytes: usize,
+        max_files: usize,
+        max_blob_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for BoundedDiffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Git(e) => e.fmt(f),
+            Self::TooLarge {
+                files_changed,
+                blob_bytes,
+                max_files,
+                max_blob_bytes,
+            } => write!(
+                f,
+                "diff is too large: {files_changed} changed files / {blob_bytes} materialized blob bytes (limits: {max_files} files / {max_blob_bytes} bytes)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoundedDiffError {}
+
+impl From<git2::Error> for BoundedDiffError {
+    fn from(value: git2::Error) -> Self {
+        Self::Git(value)
+    }
+}
+
+fn delta_blob_bytes(odb: &Odb<'_>, delta: DiffDelta<'_>) -> Result<usize, git2::Error> {
+    let mut bytes = 0usize;
+    for file in [delta.old_file(), delta.new_file()] {
+        let oid = file.id();
+        if oid.is_zero() {
+            continue;
+        }
+        let (size, kind) = odb.read_header(oid)?;
+        if kind == ObjectType::Blob {
+            bytes = bytes.checked_add(size).ok_or_else(|| {
+                git2::Error::from_str("materialized blob byte count overflowed usize")
+            })?;
+        }
+    }
+    Ok(bytes)
+}
+
 /// Compare two materialized commits and return a bounded unified-diff prefix
-/// plus full diff statistics. No fetch or shell command is attempted.
+/// plus full statistics for a preflight-bounded diff. No fetch, rename
+/// detection, or shell command is attempted.
 pub fn bounded_diff(
     repo: &Repository,
     target: Oid,
     source: Oid,
     max_bytes: usize,
-) -> Result<(String, bool, usize, usize, usize), git2::Error> {
+    max_files: usize,
+    max_blob_bytes: usize,
+) -> Result<(String, bool, usize, usize, usize), BoundedDiffError> {
     let target_tree = repo.find_commit(target)?.tree()?;
     let source_tree = repo.find_commit(source)?.tree()?;
+    let odb = repo.odb()?;
     let mut opts = DiffOptions::new();
     opts.context_lines(3).interhunk_lines(0);
-    let mut diff = repo.diff_tree_to_tree(
+    let mut files_changed = 0usize;
+    let mut blob_bytes = 0usize;
+    let mut callback_error = None;
+    let mut too_large = false;
+    opts.notify(|delta, _matched_pathspec| {
+        files_changed = files_changed.saturating_add(1);
+        match delta_blob_bytes(&odb, delta) {
+            Ok(bytes) => blob_bytes = blob_bytes.saturating_add(bytes),
+            Err(e) => {
+                callback_error = Some(e);
+                return false;
+            }
+        }
+        too_large = files_changed > max_files || blob_bytes > max_blob_bytes;
+        !too_large
+    });
+    let diff_result = repo.diff_tree_to_tree(
         Some(&target_tree),
         Some(&source_tree),
         Some(&mut opts),
-    )?;
-    diff.find_similar(None)?;
+    );
+    drop(opts);
+    if let Some(callback_error) = callback_error {
+        return Err(callback_error.into());
+    }
+    if too_large {
+        return Err(BoundedDiffError::TooLarge {
+            files_changed,
+            blob_bytes,
+            max_files,
+            max_blob_bytes,
+        });
+    }
+    let diff = diff_result?;
     let stats = diff.stats()?;
     let counts = (
         stats.files_changed(),
@@ -253,10 +340,7 @@ pub fn bounded_diff(
 
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     let mut truncated = false;
-    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-        if truncated {
-            return true;
-        }
+    let print_result = diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
         let prefix = match line.origin() {
             'F' | 'H' | 'B' => None,
             origin => Some(origin as u8),
@@ -272,21 +356,28 @@ pub fn bounded_diff(
             let remaining = max_bytes.saturating_sub(bytes.len());
             bytes.extend_from_slice(&line.content()[..remaining.min(line.content().len())]);
             truncated = true;
-            return true;
+            return false;
         }
         if let Some(prefix) = prefix {
             bytes.push(prefix);
         }
         bytes.extend_from_slice(line.content());
         true
-    })?;
+    });
+    match print_result {
+        Ok(()) => {}
+        Err(e) if truncated && e.code() == ErrorCode::User => {}
+        Err(e) => return Err(e.into()),
+    }
     let patch = match std::str::from_utf8(&bytes) {
         Ok(_) => String::from_utf8(bytes).expect("validated UTF-8"),
         Err(e) if truncated && e.error_len().is_none() => {
             bytes.truncate(e.valid_up_to());
             String::from_utf8(bytes).expect("truncated to a UTF-8 boundary")
         }
-        Err(_) => return Err(git2::Error::from_str("diff is not valid UTF-8 text")),
+        Err(_) => {
+            return Err(git2::Error::from_str("diff is not valid UTF-8 text").into());
+        }
     };
     Ok((patch, truncated, counts.0, counts.1, counts.2))
 }

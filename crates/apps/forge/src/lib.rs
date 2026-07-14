@@ -836,12 +836,28 @@ impl Module for Forge {
                     ))
                 })?;
                 let (patch, truncated, files_changed, additions, deletions) =
-                    git::bounded_diff(&repo, target, source, MAX_PR_DIFF_BYTES).map_err(|e| {
-                        Error::Module(format!(
-                            "forge: objects for pull request #{number} are not fully materialized \
-                             (target {target}, source {source}): {e}"
-                        ))
-                    })?;
+                    match git::bounded_diff(
+                        &repo,
+                        target,
+                        source,
+                        MAX_PR_DIFF_BYTES,
+                        MAX_PR_DIFF_FILES,
+                        MAX_PR_DIFF_BLOB_BYTES,
+                    ) {
+                        Ok(diff) => diff,
+                        Err(e @ git::BoundedDiffError::TooLarge { .. }) => {
+                            return Err(Error::Module(format!(
+                                "forge: pull request #{number} diff is too large to serve \
+                                 (target {target}, source {source}): {e}"
+                            )));
+                        }
+                        Err(git::BoundedDiffError::Git(e)) => {
+                            return Err(Error::Module(format!(
+                                "forge: objects for pull request #{number} are not fully \
+                                 materialized (target {target}, source {source}): {e}"
+                            )));
+                        }
+                    };
                 Ok(encode_reply(&ForgeReply::PrDiff(PrDiff {
                     source_oid: source.to_string(),
                     target_oid: target.to_string(),
@@ -1021,6 +1037,39 @@ mod tests {
         (forge, source, target)
     }
 
+    fn replace_pr_source_with_files(
+        forge: &mut Forge,
+        base: &std::path::Path,
+        target: Oid,
+        files: usize,
+        content: &[u8],
+    ) -> Oid {
+        let repo = git::open(&base.join("demo")).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let mut tree_oid = target_commit.tree_id();
+        let blob = repo.blob(content).unwrap();
+        for index in 0..files {
+            let tree = repo.find_tree(tree_oid).unwrap();
+            tree_oid = git::build_tree(
+                &repo,
+                Some(&tree),
+                &format!("feature-{index:04}.txt"),
+                blob,
+            )
+            .unwrap();
+        }
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let source = git::commit(&repo, &tree, Some(&target_commit), "feature", 2).unwrap();
+        git::update_ref(&repo, "refs/heads/feature", source).unwrap();
+        forge
+            .repos
+            .get_mut("demo")
+            .unwrap()
+            .refs
+            .insert("feature".into(), source);
+        source
+    }
+
     #[test]
     fn pr_diff_pins_oids_and_returns_a_reviewable_patch() {
         let base = tmp_base("pr-diff");
@@ -1066,6 +1115,78 @@ mod tests {
         assert_eq!(diff.patch.len(), MAX_PR_DIFF_BYTES);
         assert_eq!(diff.files_changed, 1, "full stats survive truncation");
         assert_eq!(diff.additions, 1, "full stats survive truncation");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_stops_patch_printing_at_the_response_cap() {
+        let base = tmp_base("pr-diff-callback-stop");
+        let (_, source, target) = materialized_pr(&base, &[b'x'; 4096]);
+        let repo = git::open(&base.join("demo")).unwrap();
+        let (patch, truncated, files_changed, additions, deletions) = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            64,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .expect("the deliberate libgit2 callback abort is truncation, not an error");
+        assert!(truncated);
+        assert_eq!(patch.len(), 64);
+        assert_eq!((files_changed, additions, deletions), (1, 1, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_too_many_changed_files_before_patch_generation() {
+        let base = tmp_base("pr-diff-many-files");
+        let (mut forge, _, target) = materialized_pr(&base, b"initial\n");
+        let source = replace_pr_source_with_files(
+            &mut forge,
+            &base,
+            target,
+            MAX_PR_DIFF_FILES + 1,
+            b"x\n",
+        );
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("diff is too large to serve"), "{err}");
+        assert!(
+            err.contains(&format!("{} changed files", MAX_PR_DIFF_FILES + 1)),
+            "{err}"
+        );
+        assert!(err.contains(&source.to_string()), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_excessive_materialized_blob_bytes() {
+        let base = tmp_base("pr-diff-large-blob");
+        let content = vec![b'x'; MAX_PR_DIFF_BLOB_BYTES + 1];
+        let (forge, source, target) = materialized_pr(&base, &content);
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("diff is too large to serve"), "{err}");
+        assert!(
+            err.contains(&format!("{} materialized blob bytes", content.len())),
+            "{err}"
+        );
+        assert!(err.contains(&source.to_string()), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
