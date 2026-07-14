@@ -72,6 +72,7 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../domain/node-bootstrap")>();
   const emptyNode: NodeTransport = {
     submit: vi.fn().mockResolvedValue({ height: 0, appHash: "00".repeat(32) }),
+    submitControl: vi.fn().mockResolvedValue({ height: 0, appHash: "00".repeat(32) }),
     query: vi.fn().mockResolvedValue({}),
     view: vi.fn().mockResolvedValue({ hits: [] }),
     putBlob: vi.fn().mockResolvedValue("00".repeat(32)),

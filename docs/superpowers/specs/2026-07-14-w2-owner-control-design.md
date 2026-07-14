@@ -145,47 +145,69 @@ predicate replacement to W2. To keep the epic merge mechanical, W2 touches only:
   proper post-#599 follow-up is a runtime per-endpoint allowlist (admit exactly
   the node origins the user has connected to), tracked outside this W.
 
-## Governance ops — deferred with a migration spec (see §Governance below)
+## Governance ops — account-signed frames (SHIPPED, `feat/w2-governance-frames`)
 
-The ledger asks admit/promote/demote/leave to move off the bespoke local lane
-(node re-signs with its own key over the local RPC) to **account-signed frames
-on the public surface**, authorized by module-side ACLs. This is **deep
-consensus surgery**, not an app change:
+Operator decision Q11 reversed the earlier deferral: **all governance ops move
+at once**. admit/promote/demote/leave leave the bespoke node-local re-signing
+lane and become **account-signed frames on the public surface** (A1), authorized
+by the governance module's own standing ACL. Implemented as a separate PR
+against the epic branch (the last code before epic QA).
 
-- Governance ops are `Propose`/`Vote`/`Execute` carrying `GovAction`s; there is
-  no dedicated admit/promote op.
-- Validator-mode authorization + the frozen vote **electorate are keyed by NODE
-  keys** (valset members). An account-signed frame arrives as
-  `Origin::External(user_key)`, which is *not* a valset member — so governance
-  must gain an account→owned-node→standing resolution and the electorate
-  identity (node vs account) must be decided. Share mode already resolves
-  `account_of_node`; validator mode does not.
-- This moves the **genesis app-hash** (governance-wasm rebuild) and **must** be
-  gated on `cargo test -p simnode`, then live-QA'd — which cannot happen in a
-  parallel-agent session. A half-done version would break the simnode standing
-  gate and block the epic merge.
+### Electorate decision (Q11 — recorded)
 
-**Call:** W2 ships the admin control plane (the load-bearing A2/A5 realization
-that closes the actual exposure hole) + supervision. The governance migration is
-specified below as the explicit follow-up (its own PR against the epic branch,
-simnode-gated + live-QA'd). This is the risk-managed senior call under the
-"ship the largest coherent subset" instruction.
+**Quorum/governance stay PER-NODE in v1 — N validators = N votes.** So
+validator-mode ballots stay **node-keyed** (share mode is unchanged, account-
+keyed). An account-signed op is resolved to a governance ACTOR and casts the
+ballot of **every bound electorate node** — the exact power the account held when
+each node voted for itself; re-voting overwrites by node key, so nothing
+double-counts. This was chosen over account-keyed validator ballots because it
+keeps v1's per-node quorum semantics (`consensus_time = block height`, N=N)
+untouched — the migration changes *who may author* a governance op, not *how
+votes are weighed*.
 
-### Governance migration spec (follow-up PR)
+### Module ACL (`crates/system/governance`)
 
-1. App submits admit/promote/demote/leave as **account-signed frames** via
-   `/v1/submit/frame` (add `governance` to a control-frame signer, distinct from
-   `CLIENT_SIGNABLE_TARGETS`).
-2. Governance `external_origin()` → resolve `OfMember(user_key)` → the account →
-   its bound nodes → require one to hold valset **member** standing (reuse
-   `valset::members`). This is the module-side ACL.
-3. Decide electorate identity: **account-keyed ballots** (one account = one
-   ballot regardless of how many owned nodes are validators) is the clean shape;
-   `frozen_electorate` and `handle_vote` principal move node→account.
-4. Retire the node-resign lane in `validator/run/ingress.rs on_rpc`/`on_http`
-   Submit arms for governance targets (keep it for genuinely node-authored
-   system ops).
-5. Gate: `cargo test -p simnode`; re-seed (genesis moves); live join/promote QA.
+- `resolve_actor(origin)`: an origin that is an account MEMBER key (identity
+  `OfMember`) is an `Actor::Account { account_id, nodes }` acting for its
+  committed `BindNode` nodes; any other origin is `Actor::Node` acting as
+  itself. A node key that IS a member takes an **identity-free fast path** (a
+  validator's own key, and hosts without an identity module); an identity query
+  error ⇒ no accounts exist ⇒ the origin is its own node key.
+- Standing gate: the submitter must hold validator-set standing — directly a
+  member node, or an account member key bound to one. Rejection: "no
+  validator-set standing".
+- A validator node stays a **first-class governance actor** (its own automation/
+  tooling) — the `Actor::Node` arm is the model, not a compat alias.
+- Node side needs NO change: `/v1/submit/frame` already reaches governance with
+  `Origin::External(signer)`.
+
+### App side
+
+- `governance` added to `CLIENT_SIGNABLE_TARGETS` (the only control module that
+  is; the rest stay refused). Governance ops sign on EVERY connection via a new
+  `transport.submitControl` + `signControlPayload` (wired local AND remote) —
+  local content stays frameless, but governance is always account-signed so the
+  module's `BindNode` ACL resolves the user. `governanceClient.driveMembership`
+  runs the client-side propose→vote→execute ceremony (the replacement for the
+  deleted `drive_membership_ceremony`).
+- **Deleted (not aliased):** the app's bespoke lane — the Tauri
+  `workspace_admit`/`workspace_promote`/`workspace_demote`/
+  `workspace_resident_remove`/`workspace_request_leave` commands, their `ws.*`
+  client methods, registration (main.rs/build.rs/trusted.toml), and their
+  entries in the daemon's app-verb allowlist. The standalone `ducktape-node
+  <verb>` operator CLI (node-principal governance, invoked directly, not via the
+  app allowlist) is retained — it is the headless-operator interface and backs
+  the node cluster e2e tests, and remains valid under the new ACL as a
+  first-class `Actor::Node`; it is not an app path, so it is not the "bespoke
+  lane" the migration deletes.
+
+### App-hash + gates
+
+Genesis app-hash MOVES (governance-wasm rebuild) — re-seed required (accepted).
+Gates: `cargo test -p simnode` (standing gate — extended with `governance_frames.rs`:
+account-signed admit/demote ceremonies over the real frame wire + a no-standing
+rejection); governance/identity module tests (+ account-member-key path);
+`wasm_governance_parity` with the regenerated component; app typecheck + vitest.
 
 ## Supervision slice (rides W2, ledger §W3 note)
 
@@ -217,5 +239,5 @@ launch's spawn, per the detached-survival model).
 
 WireGuard-tunnel exposure (A4 second option — stays separate work); N-node
 concurrent supervision (W3 deferred); config-edit / invite-mint HTTP surface
-(deferred, documented above); the governance consensus migration (specified,
-follow-up PR).
+(deferred, documented above). The governance consensus migration is now SHIPPED
+(§Governance, `feat/w2-governance-frames`), no longer a non-goal.

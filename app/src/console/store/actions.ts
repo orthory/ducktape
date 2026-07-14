@@ -3313,54 +3313,85 @@ export function createActions({
         .catch(fail);
     },
 
+    // Membership ops are ACCOUNT-SIGNED governance frames now (ADR A1, the W2
+    // migration): each drives a propose→vote→execute ceremony over
+    // `submitControl`, authored by the user's account key and authorized by the
+    // governance module's own standing ACL (signer → BindNode → member node).
+    // Works identically over local and remote connections with member standing.
+    // The bespoke `ws.admit/promote/demote/leave` node-verb lane is deleted.
     admitMember: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.admitMember(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { add_resident: { key: keyBytes(hex) } },
+          "resident:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     promoteMember: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.promoteMember(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { add_validator: { key: keyBytes(hex) } },
+          "validator:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     removeResident: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.removeResident(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { remove_resident: { key: keyBytes(hex) } },
+          "resident-remove:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     demoteMember: (pubkey) => {
-      const target = getState().workspace;
-      if (!target || !pubkey.trim()) return;
-      Promise.resolve()
-        .then(() => ws.demoteMember(target.id, pubkey.trim()))
-        .then(() => refresh())
-        .catch(fail);
+      const hex = pubkey.trim();
+      if (!getState().workspace || !hex) return;
+      submitTracked(opKey.govMembership(hex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { remove_validator: { key: keyBytes(hex) } },
+          "member-remove:",
+          hex,
+          getState().members.length,
+        ),
+      );
     },
 
     requestLeaveWorkspace: () => {
-      const target = getState().workspace;
-      if (!target) return;
+      // Self-removal: a RemoveValidator targeting THIS node's own key. KEEP the
+      // node running — it must stay up through its own pending removal or quorum
+      // can't finalize it. The per-block roster re-query surfaces the pending
+      // removal; nothing is torn down here.
+      const selfHex = selfNodeHex();
+      if (!getState().workspace || !selfHex) return;
       patch({ error: null });
-      // Submit the on-chain self-removal but KEEP the node running — it must
-      // stay up through its own pending removal or quorum can't finalize it.
-      // The per-block roster re-query surfaces the pending removal; nothing is
-      // torn down here.
-      Promise.resolve()
-        .then(() => ws.requestLeaveWorkspace(target.id))
-        .then(() => refresh())
-        .catch(fail);
+      submitTracked(opKey.govMembership(selfHex), (live) =>
+        governanceClient.driveMembership(
+          live,
+          { remove_validator: { key: keyBytes(selfHex) } },
+          "leave:",
+          selfHex,
+          getState().members.length,
+        ),
+      );
     },
 
     forgetWorkspace: (force = false) => {

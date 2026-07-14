@@ -254,6 +254,15 @@ export interface NodeTransport {
    * attribute the write to it. Omitted → the daemon's default identity.
    */
   submit(target: string, payload: unknown, origin?: string): Promise<SubmitReceipt>;
+  /**
+   * Submit one CONTROL-plane op (governance) ALWAYS as an account-signed frame,
+   * on local AND remote (ADR A1 — the W2 governance migration). Unlike `submit`
+   * (which only signs on a remote connection), governance must be authored by
+   * the user's account key on every connection so the module's standing ACL
+   * resolves it via `BindNode`. Requires `signControlPayload`; throws
+   * `identity-locked`-shaped errors loud (never mis-authors as the node key).
+   */
+  submitControl(target: string, payload: unknown): Promise<SubmitReceipt>;
   /** Read committed state. The reply is the module's `*Reply` enum as json. */
   query(target: string, query: unknown): Promise<unknown>;
   /**
@@ -535,6 +544,17 @@ export interface RemoteTransportOptions {
    * refused by the door anyway.
    */
   signPayload?: (target: string, payloadHex: string) => Promise<string>;
+  /**
+   * Sign a CONTROL-plane op payload (governance) into a signed frame with the
+   * USER key — like `signPayload`, but wired on BOTH local and remote
+   * connections (the W2 governance migration, ADR A1). Governance ops must be
+   * account-signed on every connection so the module's standing ACL resolves
+   * the signer via `BindNode`; content ops on a LOCAL node still ride the
+   * frameless convenience lane (this is why it is a SEPARATE slot from
+   * `signPayload`, not the same all-targets remote signer). A locked identity
+   * FAILS LOUD — a frameless fallback would mis-author as the node key.
+   */
+  signControlPayload?: (target: string, payloadHex: string) => Promise<string>;
 }
 
 const bytesToHexString = (bytes: Uint8Array): string =>
@@ -731,6 +751,48 @@ export const remoteTransport = (
     }
   };
 
+  /** Sign a payload into a frame and POST it to /v1/submit/frame. Shared by the
+   *  all-targets remote lane (`submit` + `signPayload`) and the always-signed
+   *  control lane (`submitControl` + `signControlPayload`). */
+  const postSignedFrame = async (
+    sign: (target: string, payloadHex: string) => Promise<string>,
+    target: string,
+    payload: unknown,
+  ): Promise<SubmitReceipt> => {
+    // sign the JSON-encoded payload; module decoders are key-order /
+    // whitespace-insensitive, and each lane content-addresses its own bytes, so
+    // the signed frame need not be byte-identical to the frameless encoding.
+    const payloadHex = bytesToHexString(new TextEncoder().encode(JSON.stringify(payload)));
+    let frameHex: string;
+    try {
+      frameHex = await sign(target, payloadHex);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      // fail loud, no frameless fallback: a locked identity must not silently
+      // re-author the op as the node's key (and be refused by the door anyway).
+      if (detail === "identity-locked") {
+        throw new NodeError(
+          "httpError",
+          "unlock your identity to act on this node — the op is signed by your key",
+        );
+      }
+      throw err;
+    }
+    const res = await fetchDeadline(`${base}/v1/submit/frame`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: hexStringToBytes(frameHex),
+    });
+    if (!res.ok) {
+      throw new NodeError(
+        "httpError",
+        (await errorDetail(res)) || `node replied ${res.status}`,
+        res.status,
+      );
+    }
+    return (await res.json()) as SubmitReceipt;
+  };
+
   return {
     // With a user-key signer (remote connections), every op is user-authored
     // over the authenticated frame lane. Without one (local workspace / web),
@@ -739,41 +801,20 @@ export const remoteTransport = (
     submit: async (target, payload, origin) => {
       const sign = opts?.signPayload;
       if (sign) {
-        // sign the JSON-encoded payload; module decoders are key-order /
-        // whitespace-insensitive, and each lane content-addresses its own
-        // bytes, so the signed frame need not be byte-identical to the
-        // frameless lane's server-side encoding.
-        const payloadHex = bytesToHexString(new TextEncoder().encode(JSON.stringify(payload)));
-        let frameHex: string;
-        try {
-          frameHex = await sign(target, payloadHex);
-        } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
-          // fail loud, no frameless fallback: a locked identity must not
-          // silently re-author the op as the remote node's key.
-          if (detail === "identity-locked") {
-            throw new NodeError(
-              "httpError",
-              "unlock your identity to act on a remote node — remote ops are signed by your key",
-            );
-          }
-          throw err;
-        }
-        const res = await fetchDeadline(`${base}/v1/submit/frame`, {
-          method: "POST",
-          headers: { "content-type": "application/octet-stream" },
-          body: hexStringToBytes(frameHex),
-        });
-        if (!res.ok) {
-          throw new NodeError(
-            "httpError",
-            (await errorDetail(res)) || `node replied ${res.status}`,
-            res.status,
-          );
-        }
-        return (await res.json()) as SubmitReceipt;
+        return postSignedFrame(sign, target, payload);
       }
       return postJson<SubmitReceipt>(`${base}/v1/submit`, { target, payload, origin });
+    },
+    submitControl: async (target, payload) => {
+      const sign = opts?.signControlPayload;
+      if (!sign) {
+        // no user-key custody (web build): control ops are not drivable here.
+        throw new NodeError(
+          "httpError",
+          "this connection cannot sign control ops — governance needs an account key",
+        );
+      }
+      return postSignedFrame(sign, target, payload);
     },
     query: (target, query) =>
       postJson<unknown>(`${base}/v1/query`, { target, query }),

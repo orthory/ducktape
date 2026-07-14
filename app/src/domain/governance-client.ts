@@ -6,11 +6,13 @@
 // future proposals between validator ballots and explicit, non-transferable
 // Identity-account shares; each proposal freezes its electorate and rule.
 //
-// The embedded daemon signs every submit with THIS node's authenticated key and
-// ignores the claimed `origin` (see bin/node/src/main.rs), so a vote/propose/
-// execute from the console is authored by this node's identity — the
-// authenticated authorship governance relies on. Callers therefore pass no
-// origin here.
+// Governance ops are ACCOUNT-SIGNED FRAMES on every connection (ADR A1, the W2
+// migration): propose/vote/execute — and the admit/promote/demote/leave
+// ceremonies built on them — ride `transport.submitControl`, which signs the op
+// with the user's account key (local AND remote). The governance module's own
+// standing ACL resolves that signer, via its committed `BindNode`, to a member
+// node and authorizes accordingly. There is no node-local re-signing lane
+// anymore; the bespoke `ducktape-node invite-accept/promote/...` verbs are gone.
 
 import { keyHex } from "./chat-client";
 import type { BlockEvent, NodeTransport } from "./transport";
@@ -98,7 +100,7 @@ export const propose = (
   transport: NodeTransport,
   params: { proposalId: string; action: GovAction; votingPeriod?: number },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, {
+  transport.submitControl(TARGET, {
     propose: {
       proposal_id: params.proposalId,
       action: params.action,
@@ -110,7 +112,7 @@ export const vote = (
   transport: NodeTransport,
   params: { proposalId: string; approve: boolean },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, {
+  transport.submitControl(TARGET, {
     vote: { proposal_id: params.proposalId, approve: params.approve },
   });
 
@@ -118,7 +120,58 @@ export const execute = (
   transport: NodeTransport,
   params: { proposalId: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { execute: { proposal_id: params.proposalId } });
+  transport.submitControl(TARGET, { execute: { proposal_id: params.proposalId } });
+
+// ── Membership ceremony (admit / promote / demote / removeResident / leave) ──
+//
+// Each is a propose→vote→execute of one membership GovAction, driven to
+// consensus over the account-signed lane — the client-side replacement for the
+// deleted `ducktape-node <verb>` bespoke lane. Idempotent across members: adopt
+// an OPEN proposal for exactly this action or mint one, cast a yes ballot, then
+// execute once the frozen rule is decidable (a shortfall leaves it open for the
+// other validators, exactly as the CLI ceremony did).
+
+export interface CeremonyResult {
+  proposalId: string;
+  status: ProposalStatus;
+}
+
+const sameAction = (a: GovAction, b: GovAction): boolean =>
+  JSON.stringify(a) === JSON.stringify(b);
+
+/** Mint an unused proposal id `<prefix><subjectHex[0..16]>:<n>`. */
+const mintProposalId = (prefix: string, subjectHex: string, taken: Set<string>): string => {
+  const head = `${prefix}${subjectHex.slice(0, 16)}:`;
+  for (let n = 0; ; n += 1) {
+    const id = `${head}${n}`;
+    if (!taken.has(id)) return id;
+  }
+};
+
+export const driveMembership = async (
+  transport: NodeTransport,
+  action: GovAction,
+  idPrefix: string,
+  subjectHex: string,
+  memberCount: number,
+): Promise<CeremonyResult> => {
+  const open = await proposals(transport);
+  const existing = open.find((p) => p.status === "open" && sameAction(p.action, action));
+  const proposalId =
+    existing?.proposal_id ??
+    mintProposalId(idPrefix, subjectHex, new Set(open.map((p) => p.proposal_id)));
+  if (!existing) await propose(transport, { proposalId, action });
+  await vote(transport, { proposalId, approve: true });
+
+  const voted = (await proposals(transport)).find((p) => p.proposal_id === proposalId);
+  if (!voted) return { proposalId, status: "rejected" };
+  if (voted.status === "open" && canSettleEarly(voted, memberCount)) {
+    await execute(transport, { proposalId });
+    const settled = (await proposals(transport)).find((p) => p.proposal_id === proposalId);
+    return { proposalId, status: settled?.status ?? "open" };
+  }
+  return { proposalId, status: voted.status };
+};
 
 // ── Pure helpers ────────────────────────────────────────
 

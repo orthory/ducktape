@@ -185,11 +185,12 @@ const ALLOWED_VERBS: &[&str] = &[
     "invite",
     "join-requests",
     "join-state",
-    "invite-accept",
-    "member-remove",
-    "promote",
-    "resident-remove",
-    "member-leave",
+    // admit/promote/demote/removeResident/leave left this app-spawned verb lane
+    // in the W2 migration (ADR A1): the app drives them as account-signed
+    // governance frames now, never by spawning a node verb that re-signs with
+    // the node's key. The standalone `ducktape-node <verb>` operator CLI still
+    // exists for headless node-principal governance — it is invoked directly,
+    // not through this app allowlist.
     "member-status",
     "user-key",
     "user-sign-bind",
