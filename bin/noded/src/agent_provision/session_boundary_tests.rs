@@ -124,8 +124,11 @@ fn alice() -> Origin {
 /// the genesis set the collaboration loop runs on — chat + the tagging plane +
 /// the dispatch plane + the registry + runs.
 async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-        .with_tagging("tagging");
+    let chat = Chat::new(
+        "chat",
+        Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+    )
+    .with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
         Box::new(TaggingModule::new("tagging")),

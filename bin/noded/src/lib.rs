@@ -473,11 +473,30 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
 /// here is a log-ring DoS any page could drive. Turn it on when you care:
 ///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::http=debug'
 ///
+/// 5xx is LATCHED for the same reason, and it is not hypothetical: the gateway
+/// browse proxy maps a slow/dead publisher to a 502 (`gateway_failure_response`),
+/// so a page whose script re-fetches a failing subresource in a loop mints one
+/// line per request — enough to evict the whole 4096-line ring. First occurrence,
+/// then every 50th, carrying `occurrences`; a real outage is still visible on the
+/// first line, and the counter is what says "still broken" rather than "flapped".
+///
 /// NEVER log the URI: `/.duck/ws/{token}` carries a capability token IN THE PATH,
 /// and the ring is streamed to the webview.
 fn error_response(status: StatusCode, message: &str) -> Response {
     if status.is_server_error() {
-        tracing::warn!(target: "ducktape::http", status = status.as_u16(), message, "request failed");
+        static SERVER_ERRORS: crate::log::Latch = crate::log::Latch::new(50);
+        // keyed by class, not by message: an attacker-supplied path can vary the
+        // message, and a per-message key would let them mint an unbounded number of
+        // "first occurrences" — re-opening the exact hole this latch closes.
+        if let Some(occurrences) = SERVER_ERRORS.hit("server_error") {
+            tracing::warn!(
+                target: "ducktape::http",
+                status = status.as_u16(),
+                message,
+                occurrences,
+                "request failed"
+            );
+        }
     } else {
         tracing::debug!(target: "ducktape::http", status = status.as_u16(), message, "request refused");
     }

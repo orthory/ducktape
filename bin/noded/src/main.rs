@@ -342,9 +342,12 @@ fn run_node(
             Err(err) => {
                 // poisoned, not fatal: reads stay up, writes refuse, and the
                 // wipe-to-rebuild remedy is the same one the fold error names.
-                eprintln!(
-                    "[noded] module index rebuild failed: {err} — wipe {} to rebuild",
-                    index.base().display()
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    error = %err,
+                    index = %index.base().display(),
+                    "module index rebuild FAILED — the app's views are STALE; wipe the \
+                     index directory to rebuild"
                 );
             }
         }
@@ -483,9 +486,9 @@ async fn submit_and_drain(
     let (included, events) =
         match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await
     {
-        Ok(out) => out,
-        Err(SubmitError::Fatal(err)) => {
-            tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
+            Ok(out) => out,
+            Err(SubmitError::Fatal(err)) => {
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
@@ -533,7 +536,11 @@ async fn submit_and_drain(
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => {
-                eprintln!("[noded] worker follow-up rejected: {err}");
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %err,
+                    "worker follow-up REJECTED — the oracle's result never landed"
+                );
             }
         }
     }
@@ -620,9 +627,14 @@ async fn submit_one(
         ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
     };
     if let Err(err) = index.apply_block(&block_ops) {
-        eprintln!(
-            "[noded] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-            *height
+        // consensus stays healthy while the ENTIRE app UI silently stops updating:
+        // every module view the app reads is served from this derived index.
+        tracing::error!(
+            target: "ducktape::consensus",
+            height = *height,
+            error = %err,
+            "module index apply FAILED — the app's views are now STALE; wipe \
+             <storage>/index to rebuild"
         );
     }
 

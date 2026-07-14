@@ -31,7 +31,7 @@ use defguard_wireguard_rs::{InterfaceConfiguration, key::Key};
 use tokio::sync::mpsc;
 use wireguard::effect::WireGuardEffect;
 
-use super::device::{PeerConfig, UnderlaySocket, WgDevice};
+use super::device::{PeerConfig, ProbeSlot, UnderlaySocket, WgDevice};
 use super::stack::{StackSlot, VirtualStack};
 
 /// the chain overlay's on-link scope: member `/128`s live in the chain's ULA
@@ -149,6 +149,11 @@ pub struct UserspaceWireGuardEffect {
     /// the seam's handle to the live stack (ADR phase 2): published on the
     /// `apply` that stands a backend up, cleared whenever the backend drops.
     slot: StackSlot,
+    /// the handshake-probe seam: published on the `apply` that stands a backend
+    /// up, cleared whenever the backend drops — exactly like `slot` above. it is
+    /// what lets the plane observe a COMPLETED handshake rather than an accepted
+    /// config, which are different events and were previously indistinguishable.
+    probes: ProbeSlot,
     /// a node-owned underlay socket shared with the NAT punch (ADR phase 3),
     /// reused across interface rebuilds instead of binding per backend;
     /// `None` = each backend binds its own (the standalone posture the
@@ -162,6 +167,7 @@ impl UserspaceWireGuardEffect {
             handle,
             live: None,
             slot: StackSlot::new(),
+            probes: ProbeSlot::new(),
             shared_underlay: None,
         }
     }
@@ -180,6 +186,7 @@ impl UserspaceWireGuardEffect {
             handle,
             live: None,
             slot,
+            probes: ProbeSlot::new(),
             shared_underlay: Some(underlay),
         }
     }
@@ -189,6 +196,12 @@ impl UserspaceWireGuardEffect {
     /// tracks this effect's backend across rebuilds for the effect's lifetime.
     pub fn stack_slot(&self) -> StackSlot {
         self.slot.clone()
+    }
+
+    /// the handshake-probe handle. take it BEFORE moving this effect into the
+    /// orchestrator; it stays valid across backend rebuilds for the effect's life.
+    pub fn probe_slot(&self) -> ProbeSlot {
+        self.probes.clone()
     }
 
     /// the virtual host, for the seam's socket surface (and the loopback
@@ -297,6 +310,7 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
                 || backend.private_key != parsed.private_key
         }) {
             self.slot.clear();
+            self.probes.clear();
             *live = None;
         }
 
@@ -319,6 +333,7 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
                 let backend = build_backend(&self.handle, &parsed, self.shared_underlay.as_ref())?;
                 backend.device.replace_peers(&parsed.peers);
                 self.slot.publish(backend.stack.clone());
+                self.probes.publish(backend.device.handshake_probe());
                 *live = Some(backend);
             }
         }
@@ -330,6 +345,7 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
             return Err(UserspaceEffectError::NotCreated);
         }
         self.slot.clear();
+        self.probes.clear();
         // dropping the backend aborts the pumps and closes the socket —
         // there is no host state (no device node, no routes, no DNS) to
         // clean up, which is the point of this backend.

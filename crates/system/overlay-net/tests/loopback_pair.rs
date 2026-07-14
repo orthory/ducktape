@@ -149,6 +149,24 @@ async fn handshake_and_datagram_echo() {
         device_b.time_since_last_handshake(a.ula).is_some(),
         "b completed a handshake with a"
     );
+
+    // the PROBE SEAM reports the same truth through the slot — this is what the
+    // node's handshake sampler reads, and it is the ONLY way anything outside the
+    // effect can tell "config applied" apart from "handshake completed". Before
+    // this seam existed, that distinction was observable only from tests, which is
+    // why "the overlay never came up" and "the overlay is up but the peer is dark"
+    // were indistinguishable in production and presented as one string.
+    let probe = a.effect.probe_slot().get().expect("a live probe after apply");
+    let peers = probe.peers();
+    let (ip, since) = peers
+        .iter()
+        .find(|(ip, _)| *ip == b.ula)
+        .expect("b is in a's peer table");
+    assert_eq!(*ip, b.ula);
+    assert!(
+        since.is_some(),
+        "the probe must report b's COMPLETED handshake, not merely that a config was applied"
+    );
 }
 
 /// the family seam every real deployment crosses: the underlay binds

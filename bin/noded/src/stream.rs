@@ -435,11 +435,7 @@ impl RunOutputRegistry {
         drop(inner);
         let _ = self.watch.send(version);
         if publish {
-            let _ = self.appends.send(RunOutputEvent {
-                id,
-                stream,
-                line,
-            });
+            let _ = self.appends.send(RunOutputEvent { id, stream, line });
         }
     }
 
@@ -477,14 +473,26 @@ impl RunOutputRegistry {
 
 #[derive(Clone, Debug)]
 enum TopicState {
-    Module { module: String, cursor: String },
-    FilesWatch { cursor: String },
-    Logs { seq: u64 },
-    RunOutput { id: String, seq: u64 },
+    Module {
+        module: String,
+        cursor: String,
+    },
+    FilesWatch {
+        cursor: String,
+    },
+    Logs {
+        seq: u64,
+    },
+    RunOutput {
+        id: String,
+        seq: u64,
+    },
     /// a SNAPSHOT topic: each wakeup re-samples the whole exposition, so the
     /// cursor (the last sample's `time_ms`) is bookkeeping, never a resume
     /// point — there is no backlog to replay and the topic never lags.
-    Metrics { sampled_ms: u64 },
+    Metrics {
+        sampled_ms: u64,
+    },
 }
 
 impl TopicState {
@@ -1535,11 +1543,13 @@ mod tests {
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
-            [ServerFrame::Tail {
-                topic,
-                cursor,
-                item: TailItem::Metrics { time_ms, text },
-            }] => {
+            [
+                ServerFrame::Tail {
+                    topic,
+                    cursor,
+                    item: TailItem::Metrics { time_ms, text },
+                },
+            ] => {
                 assert_eq!(topic, "metrics");
                 assert_eq!(text, "ducktape_blocks_total 5\n");
                 assert_eq!(cursor, &time_ms.to_string());
