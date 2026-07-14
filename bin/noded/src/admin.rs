@@ -36,14 +36,21 @@
 //!
 //! ## the PoP wire (mirrors `nat-traversal::auth`)
 //!
-//! sign [`ADMIN_REQ_NS`] over `method ‖ 0x1f ‖ path_and_query ‖ 0x1f ‖ ts_be`.
+//! sign [`ADMIN_REQ_NS`] over
+//! `method ‖ 0x1f ‖ path_and_query ‖ 0x1f ‖ node_key ‖ 0x1f ‖ ts_be` — the
+//! TARGET NODE's consensus key is folded in, so a signature minted for node X
+//! can never be replayed against another node the same owner controls.
 //! headers carry the account key, the timestamp and the signature. the BODY is
 //! deliberately NOT signed: `module-code/stage` streams a large artifact the
 //! store never parks in memory, and buffering it in middleware to hash it would
 //! regress that. ceiling: on a non-TLS `Public` exposure a network attacker can
 //! tamper an owner-issued request's body within the freshness window — TLS
 //! termination is the operator's job for hostile-network exposure.
-//! ponytail: method+path+ts PoP, not body; 30s replay window; TLS is the op's job.
+//! ponytail: method+path+node+ts PoP, not body; 30s replay window; TLS is the op's job.
+//!
+//! NEVER front a `Loopback`-exposure node with a reverse proxy: the proxy's
+//! loopback dial would launder every remote caller into a trusted local peer.
+//! Off-box access is `Public` + owner PoP (+ operator TLS), nothing else.
 
 use std::net::SocketAddr;
 
@@ -134,26 +141,34 @@ impl Default for AdminConfig {
 }
 
 /// the canonical bytes an admin request's PoP signs / verifies — method, the
-/// path+query, and the timestamp, each unambiguously separated.
-fn pop_message(method: &str, path_and_query: &str, ts: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(method.len() + path_and_query.len() + 10);
+/// path+query, the TARGET NODE's consensus key, and the timestamp. the node
+/// key pins the signature to one node (no cross-node replay by a multi-node
+/// owner); the fixed-width tail (32-byte key, 8-byte ts) keeps the layout
+/// unambiguous even though the key is raw bytes.
+fn pop_message(method: &str, path_and_query: &str, node_key: &[u8], ts: u64) -> Vec<u8> {
+    let mut m =
+        Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 11);
     m.extend_from_slice(method.as_bytes());
     m.push(0x1f);
     m.extend_from_slice(path_and_query.as_bytes());
+    m.push(0x1f);
+    m.extend_from_slice(node_key);
     m.push(0x1f);
     m.extend_from_slice(&ts.to_be_bytes());
     m
 }
 
-/// sign one admin request with the owner account's key. exposed so the app's
-/// signing verb (and tests) produce the exact bytes [`verify_pop`] checks.
+/// sign one admin request with the owner account's key, bound to the TARGET
+/// node's consensus key. exposed so the app's signing verb (and tests) produce
+/// the exact bytes [`verify_pop`] checks — one source of truth.
 pub fn sign_admin(
     signer: &ed25519::PrivateKey,
     method: &str,
     path_and_query: &str,
+    node_key: &[u8],
     ts: u64,
 ) -> ed25519::Signature {
-    signer.sign(ADMIN_REQ_NS, &pop_message(method, path_and_query, ts))
+    signer.sign(ADMIN_REQ_NS, &pop_message(method, path_and_query, node_key, ts))
 }
 
 /// wall-clock seconds since the Unix epoch (saturating before 1970).
@@ -183,6 +198,7 @@ fn verify_pop(
     headers: &HeaderMap,
     method: &str,
     path_and_query: &str,
+    node_key: &[u8],
     now: u64,
 ) -> Result<Vec<u8>, PopError> {
     let key_hex = header_str(headers, ADMIN_KEY_HEADER).ok_or(PopError::MissingAuth)?;
@@ -199,7 +215,11 @@ fn verify_pop(
     let pubkey = ed25519::PublicKey::decode(key_bytes.as_slice()).map_err(|_| PopError::BadKey)?;
     let sig = ed25519::Signature::decode(sig_bytes.as_slice()).map_err(|_| PopError::BadKey)?;
 
-    if pubkey.verify(ADMIN_REQ_NS, &pop_message(method, path_and_query, ts), &sig) {
+    if pubkey.verify(
+        ADMIN_REQ_NS,
+        &pop_message(method, path_and_query, node_key, ts),
+        &sig,
+    ) {
         Ok(key_bytes)
     } else {
         Err(PopError::BadSig)
@@ -265,14 +285,15 @@ async fn resolve_owner(handle: &NodeHandle, identity_module: &str, node_key: &[u
     }
 }
 
-/// is the request's peer a loopback address? a request with NO `ConnectInfo`
-/// is an in-process (tower) caller — treated as loopback, since it never left
-/// the box.
+/// is the request's peer a loopback address? FAIL-CLOSED: a request with no
+/// `ConnectInfo` (an embedder that forgot `into_make_service_with_connect_info`)
+/// is NOT treated as loopback — an unknown peer must never inherit local trust.
+/// every real serve path (noded, bin/node, simnode) threads connect-info.
 fn peer_is_loopback(req: &axum::extract::Request) -> bool {
     req.extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 /// the ONE gate over `/v1/admin/*`: exposure, then owner PoP (with the
@@ -308,16 +329,19 @@ pub async fn admin_guard(
                     error_response(StatusCode::SERVICE_UNAVAILABLE, "cannot resolve node owner")
                 }
                 OwnerResolve::NoOwner => require_loopback(loopback, req, next).await,
-                OwnerResolve::Owned(members) => enforce_owner_pop(members, req, next).await,
+                OwnerResolve::Owned(members) => {
+                    enforce_owner_pop(members, node_key, req, next).await
+                }
             }
         }
     }
 }
 
 /// the owner PoP gate: the request must carry a fresh signature by a key that
-/// is a member of the account owning this node.
+/// is a member of the account owning this node, bound to THIS node's key.
 async fn enforce_owner_pop(
     members: Vec<Vec<u8>>,
+    node_key: &[u8],
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -327,7 +351,7 @@ async fn enforce_owner_pop(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
-    match verify_pop(req.headers(), &method, &path, now_secs()) {
+    match verify_pop(req.headers(), &method, &path, node_key, now_secs()) {
         Ok(account_key) if members.contains(&account_key) => next.run(req).await,
         Ok(_) => error_response(StatusCode::FORBIDDEN, "signer is not the node owner"),
         Err(PopError::Stale) => {
@@ -372,7 +396,10 @@ pub fn admin_router(handle: NodeHandle) -> Router<NodeHandle> {
             "/v1/admin/module-code/{digest}",
             get(crate::module_code::module_code_status),
         )
-        .layer(axum::middleware::from_fn_with_state(handle, admin_guard))
+        // route_layer, NOT layer: `layer` would also wrap this sub-router's
+        // fallback, which `merge` adopts — sending every unmatched path on the
+        // whole surface through the admin gate (a 403 where a 404 belongs).
+        .route_layer(axum::middleware::from_fn_with_state(handle, admin_guard))
 }
 
 /// GET /v1/admin/ping — a cheap authenticated liveness probe. reaching it (a
@@ -430,21 +457,28 @@ mod tests {
         h
     }
 
+    /// the target node's key in these tests.
+    const NODE: [u8; 32] = [0xab; 32];
+
     #[test]
-    fn pop_message_binds_method_path_and_time() {
-        // method, path, and timestamp each move the signed bytes — no field can
-        // bleed into another.
+    fn pop_message_binds_method_path_node_and_time() {
+        // method, path, node key, and timestamp each move the signed bytes —
+        // no field can bleed into another.
         assert_ne!(
-            pop_message("POST", "/v1/admin/shutdown", 100),
-            pop_message("GET", "/v1/admin/shutdown", 100),
+            pop_message("POST", "/v1/admin/shutdown", &NODE, 100),
+            pop_message("GET", "/v1/admin/shutdown", &NODE, 100),
         );
         assert_ne!(
-            pop_message("POST", "/v1/admin/shutdown", 100),
-            pop_message("POST", "/v1/admin/logs/tail", 100),
+            pop_message("POST", "/v1/admin/shutdown", &NODE, 100),
+            pop_message("POST", "/v1/admin/logs/tail", &NODE, 100),
         );
         assert_ne!(
-            pop_message("POST", "/v1/admin/shutdown", 100),
-            pop_message("POST", "/v1/admin/shutdown", 101),
+            pop_message("POST", "/v1/admin/shutdown", &NODE, 100),
+            pop_message("POST", "/v1/admin/shutdown", &[0xcd; 32], 100),
+        );
+        assert_ne!(
+            pop_message("POST", "/v1/admin/shutdown", &NODE, 100),
+            pop_message("POST", "/v1/admin/shutdown", &NODE, 101),
         );
     }
 
@@ -452,24 +486,24 @@ mod tests {
     fn owner_signed_request_verifies_and_forged_fails() {
         let owner = key(1);
         let now = 1_000_000;
-        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", now);
+        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", &NODE, now);
         let key_hex = duckfs_core::to_hex(owner.public_key().as_ref());
         let sig_hex = duckfs_core::to_hex(sig.as_ref());
         let headers = headers_for(&sig_hex, &key_hex, now);
-        let subject =
-            verify_pop(&headers, "POST", "/v1/admin/shutdown", now).expect("owner sig verifies");
+        let subject = verify_pop(&headers, "POST", "/v1/admin/shutdown", &NODE, now)
+            .expect("owner sig verifies");
         assert_eq!(subject, owner.public_key().as_ref().to_vec());
 
         // a different key signed it: PoP must fail.
         let attacker = key(2);
-        let forged = sign_admin(&attacker, "POST", "/v1/admin/shutdown", now);
+        let forged = sign_admin(&attacker, "POST", "/v1/admin/shutdown", &NODE, now);
         let bad = headers_for(
             &duckfs_core::to_hex(forged.as_ref()),
             &key_hex, // claims the owner's key ...
             now,
         );
         assert_eq!(
-            verify_pop(&bad, "POST", "/v1/admin/shutdown", now),
+            verify_pop(&bad, "POST", "/v1/admin/shutdown", &NODE, now),
             Err(PopError::BadSig)
         );
     }
@@ -479,23 +513,45 @@ mod tests {
         let owner = key(3);
         let now = 2_000_000;
         // signed for shutdown, replayed against logs/tail.
-        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", now);
+        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", &NODE, now);
         let headers = headers_for(
             &duckfs_core::to_hex(sig.as_ref()),
             &duckfs_core::to_hex(owner.public_key().as_ref()),
             now,
         );
         assert_eq!(
-            verify_pop(&headers, "GET", "/v1/admin/logs/tail", now),
+            verify_pop(&headers, "GET", "/v1/admin/logs/tail", &NODE, now),
             Err(PopError::BadSig)
         );
+    }
+
+    /// the cross-NODE replay: a signature minted for node X, replayed verbatim
+    /// against node Y by the same owner's traffic being captured. the node-key
+    /// binding is exactly what must make this fail.
+    #[test]
+    fn a_signature_bound_to_a_different_node_is_rejected() {
+        let owner = key(5);
+        let now = 3_000_000;
+        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", &NODE, now);
+        let headers = headers_for(
+            &duckfs_core::to_hex(sig.as_ref()),
+            &duckfs_core::to_hex(owner.public_key().as_ref()),
+            now,
+        );
+        // same method, same path, same ts — a DIFFERENT node verifying.
+        assert_eq!(
+            verify_pop(&headers, "POST", "/v1/admin/shutdown", &[0xcd; 32], now),
+            Err(PopError::BadSig)
+        );
+        // sanity: the intended node still accepts it.
+        assert!(verify_pop(&headers, "POST", "/v1/admin/shutdown", &NODE, now).is_ok());
     }
 
     #[test]
     fn stale_timestamp_is_rejected_both_directions() {
         let owner = key(4);
         let signed_at = 5_000_000;
-        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", signed_at);
+        let sig = sign_admin(&owner, "POST", "/v1/admin/shutdown", &NODE, signed_at);
         let headers = headers_for(
             &duckfs_core::to_hex(sig.as_ref()),
             &duckfs_core::to_hex(owner.public_key().as_ref()),
@@ -503,17 +559,35 @@ mod tests {
         );
         // one second past the window, both directions.
         assert_eq!(
-            verify_pop(&headers, "POST", "/v1/admin/shutdown", signed_at + ADMIN_FRESHNESS_SECS + 1),
+            verify_pop(
+                &headers,
+                "POST",
+                "/v1/admin/shutdown",
+                &NODE,
+                signed_at + ADMIN_FRESHNESS_SECS + 1
+            ),
             Err(PopError::Stale)
         );
         assert_eq!(
-            verify_pop(&headers, "POST", "/v1/admin/shutdown", signed_at - ADMIN_FRESHNESS_SECS - 1),
+            verify_pop(
+                &headers,
+                "POST",
+                "/v1/admin/shutdown",
+                &NODE,
+                signed_at - ADMIN_FRESHNESS_SECS - 1
+            ),
             Err(PopError::Stale)
         );
         // exactly the window is still fresh.
         assert!(
-            verify_pop(&headers, "POST", "/v1/admin/shutdown", signed_at + ADMIN_FRESHNESS_SECS)
-                .is_ok()
+            verify_pop(
+                &headers,
+                "POST",
+                "/v1/admin/shutdown",
+                &NODE,
+                signed_at + ADMIN_FRESHNESS_SECS
+            )
+            .is_ok()
         );
     }
 
@@ -521,7 +595,7 @@ mod tests {
     fn missing_headers_are_missing_auth_not_a_crash() {
         let empty = HeaderMap::new();
         assert_eq!(
-            verify_pop(&empty, "POST", "/v1/admin/shutdown", 1),
+            verify_pop(&empty, "POST", "/v1/admin/shutdown", &NODE, 1),
             Err(PopError::MissingAuth)
         );
     }

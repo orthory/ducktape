@@ -25,14 +25,21 @@ export interface AdminAuth {
  *  Undefined outside Tauri (web build: no user-key custody). */
 export type AdminSigner = (method: string, path: string) => Promise<AdminAuth>;
 
-/** The desktop shell's admin signer, or undefined on the web build. Rejects
- *  with `identity-locked` when the account key is encrypted and uncached —
- *  the caller should treat that as "not reachable", never mis-attribute. */
-export const adminSigner = (): AdminSigner | undefined =>
-  isTauri()
+/** The desktop shell's admin signer for ONE target node, or undefined on the
+ *  web build. `nodeKeyHex` (the node's consensus key, from /v1/status) is
+ *  folded into every signature so a PoP minted for this node can never be
+ *  replayed against another node the same owner controls. Rejects with
+ *  `identity-locked` when the account key is encrypted and uncached — the
+ *  caller should treat that as "not reachable", never mis-attribute. */
+export const adminSigner = (nodeKeyHex: string): AdminSigner | undefined =>
+  isTauri() && nodeKeyHex
     ? async (method: string, path: string) => {
         const { invoke } = await import("@tauri-apps/api/core");
-        const raw = await invoke<string>("user_sign_admin", { method, path });
+        const raw = await invoke<string>("user_sign_admin", {
+          method,
+          path,
+          nodeKey: nodeKeyHex,
+        });
         return JSON.parse(raw) as AdminAuth;
       }
     : undefined;

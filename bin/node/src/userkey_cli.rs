@@ -637,6 +637,14 @@ fn user_sign_admin(
         .get("path")
         .ok_or("user-sign-admin needs --path <path-and-query>")?
         .clone();
+    // the TARGET node's consensus key (hex): folded into the signed bytes so
+    // this signature can never be replayed against another node.
+    let node_key = config::unhex(
+        flags
+            .get("node-key")
+            .ok_or("user-sign-admin needs --node-key <hex>")?,
+    )
+    .map_err(|e| format!("--node-key hex: {e}"))?;
 
     // stdin: password ONLY (when the key is v2-encrypted) — there is no payload.
     let user = load_user_signer(&key_path, stdin)?;
@@ -644,7 +652,7 @@ fn user_sign_admin(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let sig = noded::admin::sign_admin(&user, &method, &path, ts);
+    let sig = noded::admin::sign_admin(&user, &method, &path, &node_key, ts);
     let out = serde_json::json!({
         "key": hex_bytes(user.public_key().as_ref()),
         "ts": ts.to_string(),
@@ -653,10 +661,11 @@ fn user_sign_admin(
     Ok(out.to_string())
 }
 
-/// `user-sign-admin --key <path> --method <M> --path <path-and-query>` — stdin:
-/// [password line when the key is v2-encrypted]. Prints one JSON line
-/// `{"key","ts","sig"}` the app turns into the `x-ducktape-admin-*` headers of
-/// an owner control request. Fresh `ts` per call (the PoP is replay-bounded).
+/// `user-sign-admin --key <path> --method <M> --path <path-and-query>
+/// --node-key <hex>` — stdin: [password line when the key is v2-encrypted].
+/// Prints one JSON line `{"key","ts","sig"}` the app turns into the
+/// `x-ducktape-admin-*` headers of an owner control request. Fresh `ts` per
+/// call (replay-bounded); node-key-bound (no cross-node replay).
 fn cmd_user_sign_admin(
     args: &[String],
     stdin: &mut impl std::io::BufRead,
@@ -1597,6 +1606,7 @@ mod userkey_verb_tests {
         write_legacy(&key_path, &[7u8; 32]);
 
         // plaintext key ⇒ no password line ⇒ empty stdin (no payload either).
+        let node_key = [0xabu8; 32];
         let out = user_sign_admin(
             &args_of(&[
                 "--key",
@@ -1605,6 +1615,8 @@ mod userkey_verb_tests {
                 "POST",
                 "--path",
                 "/v1/admin/shutdown",
+                "--node-key",
+                &hex_bytes(&node_key),
             ]),
             &mut empty_stdin(),
         )
@@ -1615,11 +1627,16 @@ mod userkey_verb_tests {
         // the reported key is the user's own account key.
         assert_eq!(parsed["key"], hex_bytes(signer.public_key().as_ref()));
         // the signature is exactly what the node's verifier reconstructs over
-        // the SAME (method, path, ts) — proving the verb signed the right bytes
-        // with the right key (single source of truth: noded::admin::sign_admin).
+        // the SAME (method, path, node_key, ts) — proving the verb signed the
+        // right bytes with the right key (one source: noded::admin::sign_admin).
         let ts: u64 = parsed["ts"].as_str().unwrap().parse().unwrap();
-        let expect = noded::admin::sign_admin(&signer, "POST", "/v1/admin/shutdown", ts);
+        let expect =
+            noded::admin::sign_admin(&signer, "POST", "/v1/admin/shutdown", &node_key, ts);
         assert_eq!(parsed["sig"], hex_bytes(expect.as_ref()));
+        // and it is node-bound: the same tuple against a different node differs.
+        let other =
+            noded::admin::sign_admin(&signer, "POST", "/v1/admin/shutdown", &[0xcd; 32], ts);
+        assert_ne!(parsed["sig"], hex_bytes(other.as_ref()));
     }
 
     #[test]

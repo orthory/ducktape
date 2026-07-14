@@ -884,6 +884,7 @@ pub async fn user_sign_admin(
     control: tauri::State<'_, NodeControl>,
     method: String,
     path: String,
+    node_key: String,
 ) -> Result<String, String> {
     require_main_window(&window)?;
     let control = control.inner().clone();
@@ -892,7 +893,13 @@ pub async fn user_sign_admin(
             run_sign_verb(
                 &app,
                 "user-sign-admin",
-                &[("--method", &method), ("--path", &path)],
+                &[
+                    ("--method", &method),
+                    ("--path", &path),
+                    // the TARGET node's consensus key: folded into the signed
+                    // bytes so the PoP cannot be replayed against another node.
+                    ("--node-key", &node_key),
+                ],
             )
         })
         .await

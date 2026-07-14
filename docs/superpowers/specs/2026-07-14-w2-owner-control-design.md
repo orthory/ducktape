@@ -50,10 +50,24 @@ This is the exact resolver the app's auto-bind already uses (`accountOfNode`).
 
 ### PoP shape (mirrors `nat-traversal::auth`, #197)
 
-- Sign `ADMIN_REQ_NS` over `method ‖ 0x1f ‖ path_and_query ‖ 0x1f ‖ ts_be(8)`.
+- Sign `ADMIN_REQ_NS` over
+  `method ‖ 0x1f ‖ path_and_query ‖ 0x1f ‖ node_key(32) ‖ 0x1f ‖ ts_be(8)` —
+  the **target node's consensus key is folded in** (review MEDIUM-2b), so a
+  signature minted for node X can never be replayed against another node the
+  same owner controls. The fixed-width tail keeps the layout unambiguous.
 - Headers: `x-ducktape-admin-key` (hex ed25519 account pubkey),
   `x-ducktape-admin-ts` (unix seconds), `x-ducktape-admin-sig` (hex ed25519 sig).
 - Freshness window ±30 s (replay-bounded), same as the coordinator.
+- The app mints a PoP **only after confirming ownership** (review MEDIUM-2a):
+  the connect path resolves `nodeOwnedBy` first and probes `/v1/admin/ping`
+  signed only when it holds — a non-owner connection never hands a signature,
+  even a scoped one, to an arbitrary remote node.
+- **Never front a `Loopback`-exposure node with a reverse proxy** (review
+  LOW-3): the proxy's loopback dial launders every remote caller into a trusted
+  local peer. Off-box access is `Public` + owner PoP (+ operator TLS), only.
+- The loopback peer check **fails closed** (review LOW-2): a request with no
+  `ConnectInfo` is refused, never granted local trust; every serve path
+  (noded, bin/node, simnode) threads connect-info.
 - **The body is deliberately NOT signed.** `module-code/stage` streams a large
   wasm artifact the store never parks in memory; buffering it in middleware to
   hash it would regress that path. Ceiling accepted: on a *non-TLS public*
@@ -124,7 +138,12 @@ predicate replacement to W2. To keep the epic merge mechanical, W2 touches only:
   admin surface is unreachable sees a one-line "control surface not reachable"
   hint (`owner ∧ !adminReachable`).
 - The **#599 CSP fix**: widen `connect-src` to admit user-entered node origins
-  so remote owner control is not loopback/tailnet-only.
+  so remote owner control is not loopback/tailnet-only. **Accepted ONLY because
+  `script-src` stays `'self'`** — no inline or remote script can run in the
+  webview, so nothing untrusted exists to exfiltrate over the widened
+  `connect-src`. Any future `script-src` widening re-opens this decision. The
+  proper post-#599 follow-up is a runtime per-endpoint allowlist (admit exactly
+  the node origins the user has connected to), tracked outside this W.
 
 ## Governance ops — deferred with a migration spec (see §Governance below)
 
