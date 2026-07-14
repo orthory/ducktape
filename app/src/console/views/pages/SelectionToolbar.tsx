@@ -55,7 +55,9 @@ export function SelectionToolbar({
   anchor: CommentAnchor;
   onMark: (kind: InlineMark, active: boolean) => void;
   onTurnInto: (kind: BlockKind) => void;
-  onComment: (anchor: CommentAnchor) => void;
+  /** The caller anchors the card to the SELECTION, not this menu — the docked
+   *  surface aligns with the commented line, not with wherever the menu sat. */
+  onComment: () => void;
   onDismiss: () => void;
 }) {
   useEffect(() => {
@@ -169,10 +171,7 @@ export function SelectionToolbar({
         aria-label="Comment on selected text"
         title="Comment"
         onMouseDown={(event) => event.preventDefault()}
-        onClick={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect();
-          onComment({ x: rect.left, y: rect.bottom });
-        }}
+        onClick={() => onComment()}
         style={{
           all: "unset",
           cursor: "pointer",

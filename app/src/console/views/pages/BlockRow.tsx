@@ -741,8 +741,8 @@ function BlockRowInner({
             handlers.setMark(block.id, selection.range, kind, active);
           }}
           onTurnInto={(kind) => handlers.setKind(block.id, kind)}
-          onComment={(anchor) => {
-            handlers.openComments(block.id, anchor, selection.range);
+          onComment={() => {
+            handlers.openComments(block.id, selection.anchor, selection.range);
             setSelection(null);
           }}
           onDismiss={() => setSelection(null)}
