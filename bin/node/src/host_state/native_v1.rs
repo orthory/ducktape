@@ -73,7 +73,7 @@ struct NativeV1Modules {
 
 impl NativeV1Modules {
     fn compose(self) -> Result<Host, sdk::Error> {
-        Host::genesis(vec![
+        let mut host = Host::genesis(vec![
             Box::new(self.kv),
             Box::new(self.pages),
             Box::new(self.chat),
@@ -100,7 +100,11 @@ impl NativeV1Modules {
             Box::new(self.runs),
             Box::new(self.directory),
             Box::new(self.automations),
-        ])
+        ])?;
+        // the compatibility composition still admits post-genesis modules once
+        // the protocol version that carries them is active.
+        host.set_module_factory(Box::new(super::WasmModuleFactory));
+        Ok(host)
     }
 }
 
