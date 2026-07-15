@@ -223,13 +223,19 @@ impl RunsModule {
                     return None;
                 }
                 let Some(forge) = self.forge.clone() else {
-                    self.note(ctx, format!("run {run_id} pr sink skipped: no forge module wired"));
+                    self.note(
+                        ctx,
+                        format!("run {run_id} pr sink skipped: no forge module wired"),
+                    );
                     return None;
                 };
-                let agent = match self.agent_record(&*ctx, &entry.agent_id).await {
+                let agent = match self.agent_for_run(&*ctx, entry).await {
                     Ok(Some(a)) => a,
                     _ => {
-                        self.note(ctx, format!("run {run_id} pr sink skipped: agent not registered"));
+                        self.note(
+                            ctx,
+                            format!("run {run_id} pr sink skipped: agent not registered"),
+                        );
                         return None;
                     }
                 };
@@ -284,7 +290,9 @@ impl RunsModule {
                 let item_title = match crate::forge_source::parse_forge_channel(&entry.channel_id) {
                     Some(item_ref) if item_ref.repo == repo => {
                         match self.forge_item(&*ctx, &forge, repo, item_ref.number).await {
-                            Ok(Some(item)) if item.state == ForgeItemState::Open => Some(item.title),
+                            Ok(Some(item)) if item.state == ForgeItemState::Open => {
+                                Some(item.title)
+                            }
                             Ok(Some(item)) => {
                                 self.note(
                                     ctx,

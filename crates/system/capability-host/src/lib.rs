@@ -99,6 +99,7 @@ pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 /// tree (`bin/noded/src/agent_provision.rs`, consumed by `bin/mcp`). the sandbox
 /// backends read it to know what to MOUNT — see [`CliProvider::sandbox_ro_paths`].
 const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
+const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";
 
 /// the opaque per-run bearer the broker hands the child. NOT a credential: it
 /// authenticates the child to this host's loopback endpoint and dies with the
@@ -678,10 +679,9 @@ impl CliProvider {
     /// finds its dotfiles at their identical mounted paths) but not itself
     /// mounted — the node's data dir and user key stay outside (D7).
     ///
-    /// a broker composes with this backend: `--network=host` leaves the host's
-    /// loopback reachable from inside the container, so the child can dial the
-    /// broker's `127.0.0.1:<port>` at the very address the argv names. Tart uses
-    /// its separate host-gateway mapping in [`Self::start_broker`].
+    /// Host endpoints compose with both network modes: host networking keeps
+    /// loopback intact, while a private netns uses Podman's
+    /// `host.containers.internal` gateway.
     fn podman_command(
         &self,
         image: &str,
@@ -691,7 +691,18 @@ impl CliProvider {
         auth: &RunAuth<'_>,
         tty: bool,
     ) -> Result<(tokio::process::Command, PodmanRun), String> {
-        let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
+        let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
+        if self.private_net {
+            for (key, value) in &mut envs {
+                if key == RUN_ACTION_URL_ENV {
+                    *value = value.replacen(
+                        "http://127.0.0.1:",
+                        "http://host.containers.internal:",
+                        1,
+                    );
+                }
+            }
+        }
         let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
         let workdir = canonical_mount_path(workdir, "Podman workdir")?;
         let bin_path = canonical_mount_path(&self.bin, "Podman executor")?;
@@ -728,7 +739,12 @@ impl CliProvider {
         auth: &RunAuth<'_>,
         interactive: bool,
     ) -> Result<sandbox::TartPlan, String> {
-        let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
+        let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
+        for (key, value) in &mut envs {
+            if key == RUN_ACTION_URL_ENV {
+                *value = value.replacen("http://127.0.0.1:", "http://ducktape-host:", 1);
+            }
+        }
         for dir in &rw_dirs {
             std::fs::create_dir_all(dir).map_err(|e| {
                 format!(
@@ -4476,9 +4492,16 @@ rw_dirs = ["~/.claude"]
         let provider = CliProvider::from_spec(spec, bin.clone())
             .with_backend(SandboxBackend::Podman {
                 image: "img".into(),
-            });
+            })
+            .with_private_net(true);
         let ctx = RunContext {
-            env: BTreeMap::from([("RUN_SECRET".to_string(), "not-in-argv".to_string())]),
+            env: BTreeMap::from([
+                ("RUN_SECRET".to_string(), "not-in-argv".to_string()),
+                (
+                    RUN_ACTION_URL_ENV.to_string(),
+                    "http://127.0.0.1:4321/v1/run-action".to_string(),
+                ),
+            ]),
             limits: BTreeMap::from([("cores".to_string(), 2u64)]),
             ..podman_ctx()
         };
@@ -4514,6 +4537,7 @@ rw_dirs = ["~/.claude"]
         );
         assert!(joined.contains("-e HOME"), "{joined}");
         assert!(joined.contains("-e RUN_SECRET"), "{joined}");
+        assert!(joined.contains("--network=slirp4netns"), "{joined}");
         assert!(
             !joined.contains("not-in-argv"),
             "secret value leaked in argv: {joined}"
@@ -4529,6 +4553,14 @@ rw_dirs = ["~/.claude"]
                 .find(|(key, _)| *key == std::ffi::OsStr::new("HOME"))
                 .and_then(|(_, value)| value),
             Some(std::ffi::OsStr::new(&home))
+        );
+        assert_eq!(
+            std.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(RUN_ACTION_URL_ENV))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new(
+                "http://host.containers.internal:4321/v1/run-action"
+            ))
         );
         assert!(joined.contains("--cpus 2"), "{joined}");
         assert!(
@@ -4586,6 +4618,10 @@ format = "text"
         });
         let ctx = RunContext {
             limits: BTreeMap::from([("mem_gb".to_string(), 4u64)]),
+            env: BTreeMap::from([(
+                RUN_ACTION_URL_ENV.to_string(),
+                "http://127.0.0.1:4321/v1/run-action".to_string(),
+            )]),
             ..RunContext::default()
         };
         let plan = provider
@@ -4596,6 +4632,10 @@ format = "text"
         assert_eq!(plan.run_argv.last(), Some(&plan.vm));
         assert!(!plan.guest_script.contains("ssh"));
         assert!(plan.guest_script.contains("--go"));
+        assert!(
+            plan.guest_script
+                .contains("DUCKTAPE_RUN_ACTION_URL=http://ducktape-host:4321/v1/run-action")
+        );
         assert!(plan.guest_script.contains("rsync -aO --delete"));
     }
 

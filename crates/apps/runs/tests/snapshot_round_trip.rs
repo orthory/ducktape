@@ -453,14 +453,9 @@ fn truncated_or_padded_snapshot_is_rejected() {
     assert_eq!(dst.root(), empty_root);
 }
 
-/// the canonical bytes of a minimal one-watch / one-pending-run state, built
-/// through the real op path. the layout is pinned by the asserted length so
-/// the discriminant-tampering test can index into it:
-/// watches:  count 8 | channel 8+1 | policy 1
-/// pending:  count 8 | dispatch id 8+64 | agent 8+1 | channel 8+1 | anchor 8
-///           | thread tag 1 | job id tag 1 | job claim height 8
-///           | requester disc 1 + key 8+1 | created_at 8
-/// sessions: count 8 (none open — the run holds no agent session)
+/// The canonical bytes of a minimal one-watch / one-pending-run state, built
+/// through the real op path. Tests below walk its length-prefixed fields rather
+/// than pinning offsets that change whenever PendingState gains a field.
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
     let mut m = module();
@@ -486,24 +481,82 @@ fn minimal_snapshot() -> Vec<u8> {
         },
     );
     commit(&mut m);
-    let snap = m.snapshot();
-    assert_eq!(snap.len(), 160, "the minimal layout this test indexes into");
-    snap
+    m.snapshot()
+}
+
+struct MinimalOffsets {
+    watch_policy: usize,
+    dispatch_id: usize,
+    authority_tag: usize,
+    delegation_tag: usize,
+    thread_tag: usize,
+    job_tag: usize,
+    requester: usize,
+}
+
+fn minimal_offsets(snapshot: &[u8]) -> MinimalOffsets {
+    fn skip_lp(snapshot: &[u8], cursor: &mut usize) -> usize {
+        let length = u64::from_le_bytes(snapshot[*cursor..*cursor + 8].try_into().unwrap());
+        *cursor += 8;
+        let start = *cursor;
+        *cursor += usize::try_from(length).unwrap();
+        start
+    }
+
+    let watch_policy = 8 + 8 + 1;
+    let mut cursor = watch_policy + 1 + 8;
+    let dispatch_id = skip_lp(snapshot, &mut cursor);
+    skip_lp(snapshot, &mut cursor); // run id
+    skip_lp(snapshot, &mut cursor); // agent id
+    skip_lp(snapshot, &mut cursor); // workspace agent id
+    let authority_tag = cursor;
+    cursor += 1;
+    let delegation_tag = cursor;
+    cursor += 1;
+    skip_lp(snapshot, &mut cursor); // channel id
+    cursor += 8; // anchor seq
+    let thread_tag = cursor;
+    cursor += 1;
+    let job_tag = cursor;
+    cursor += 1;
+    cursor += 8; // job claim height
+    let requester = cursor;
+    cursor += 1;
+    skip_lp(snapshot, &mut cursor); // external requester bytes
+    cursor += 8; // created_at
+    cursor += 8; // empty sessions
+    cursor += 8; // empty delegations
+    assert_eq!(
+        cursor,
+        snapshot.len(),
+        "minimal snapshot walker covers the layout"
+    );
+    MinimalOffsets {
+        watch_policy,
+        dispatch_id,
+        authority_tag,
+        delegation_tag,
+        thread_tag,
+        job_tag,
+        requester,
+    }
 }
 
 #[test]
 fn unknown_discriminants_and_tags_are_rejected() {
     let empty_root = module().root();
     let snap = minimal_snapshot();
+    let offsets = minimal_offsets(&snap);
 
-    // the watch policy (17), the pending entry's thread-root option tag
-    // (124), job-id option tag (125), and requester origin disc (134) each
-    // admit exactly their known values — a state has ONE valid encoding.
+    // Every discriminant and option tag admits only its known values — a state
+    // has one valid encoding.
     for (index, what) in [
-        (17usize, "watch policy"),
-        (124, "thread-root option tag"),
-        (125, "job-id option tag"),
-        (134, "requester origin discriminant"),
+        (offsets.watch_policy, "watch policy"),
+        (offsets.authority_tag, "authority option tag"),
+        (offsets.delegation_tag, "delegation option tag"),
+        (offsets.thread_tag, "thread-root option tag"),
+        (offsets.job_tag, "job-id option tag"),
+        (offsets.requester, "requester origin discriminant"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;
@@ -525,8 +578,7 @@ fn unknown_discriminants_and_tags_are_rejected() {
     // adopted. the id's first hex char sits right after the section count
     // and the length prefix.
     let mut bad = snap.clone();
-    let dispatch_id_start = 18 + 8 + 8;
-    bad[dispatch_id_start] = bad[dispatch_id_start].wrapping_add(1);
+    bad[offsets.dispatch_id] = bad[offsets.dispatch_id].wrapping_add(1);
     let mut dst = module();
     let err = dst.install(&bad, StateRoot::ZERO).unwrap_err();
     assert!(
@@ -558,8 +610,8 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     let snap = m.snapshot();
     let good_root = m.root();
     // watches section: count 8, then two 10-byte bodies; the pending and
-    // session counts trail.
-    assert_eq!(snap.len(), 8 + 10 * 2 + 8 + 8);
+    // session and delegation counts trail.
+    assert_eq!(snap.len(), 8 + 10 * 2 + 8 + 8 + 8);
     let body_a = snap[8..18].to_vec();
     let body_b = snap[18..28].to_vec();
 

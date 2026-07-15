@@ -60,6 +60,7 @@ const renderAgents = (
         display_name: "Summary Agent",
         capability: "alpha",
         allowed_actions: ["chat.post", "tasks.create"],
+        caps: { forge_read: ["ducktape"], subagent_budget: 2 },
         status: "active" as const,
         created_at: 10,
         updated_at: 20,
@@ -183,6 +184,8 @@ describe("AgentView", () => {
     // grant, so the two must never read as the same permission.
     expect(within(detail).getByText("Reply in chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
+    expect(within(detail).getByText("Forge read: ducktape")).toBeInTheDocument();
+    expect(within(detail).getByText("Concurrent peer calls: 2")).toBeInTheDocument();
 
     fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));
     expect(spies.pauseAgent).toHaveBeenCalledWith("summarizer");
@@ -501,7 +504,49 @@ describe("AgentView", () => {
     expect(spies.updateAgent).toHaveBeenCalledWith(
       expect.objectContaining({
         agentId: "summarizer",
-        caps: { pages_write: [], duckfs_read: ["/shared/skills"] },
+        caps: {
+          forge_read: ["ducktape"],
+          duckfs_read: ["/shared/skills"],
+          subagent_budget: 2,
+        },
+      }),
+    );
+  });
+
+  it("submits every resource cap and the whole-tree peer-call budget", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Builder Agent" },
+    });
+    fireEvent.change(screen.getByLabelText("Runs on"), { target: { value: "beta" } });
+    for (const [label, value] of [
+      ["Forge read repositories", "alpha, beta"],
+      ["Forge push repositories", "beta"],
+      ["Additional DuckFS read prefixes", "/shared/data"],
+      ["DuckFS write prefixes", "/shared/output"],
+      ["Allowed tool IDs", "browser.search"],
+      ["Secret references", "vault/github"],
+      ["Page write access", "page-1 *"],
+      ["Concurrent peer calls", "3"],
+    ]) {
+      fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        caps: {
+          forge_read: ["alpha", "beta"],
+          forge_push: ["beta"],
+          duckfs_read: ["/shared/data", "/shared/skills"],
+          duckfs_write: ["/shared/output"],
+          tools: ["browser.search"],
+          secrets: ["vault/github"],
+          pages_write: ["page-1", "*"],
+          subagent_budget: 3,
+        },
       }),
     );
   });
@@ -1031,8 +1076,7 @@ describe("AgentView", () => {
       displayName: "Renamed Agent",
       capability: "alpha",
       allowedActions: ["chat.post", "tasks.create"],
-      // the caps record rides every save (untouched field -> empty list).
-      caps: { pages_write: [] },
+      caps: { forge_read: ["ducktape"], subagent_budget: 2 },
       // so does the curated skill set — an update REPLACES it wholesale, so an
       // untouched form must send the record's own skills back unchanged.
       skills: [

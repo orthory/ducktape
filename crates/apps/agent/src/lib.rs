@@ -665,7 +665,9 @@ impl AgentModule {
                 return Err(Error::Module("skill name must not be empty".into()));
             }
             if skill.source_prefix.is_empty() {
-                return Err(Error::Module("skill source_prefix must not be empty".into()));
+                return Err(Error::Module(
+                    "skill source_prefix must not be empty".into(),
+                ));
             }
             if let Some(snapshot) = &skill.source_snapshot
                 && snapshot.is_empty()
@@ -1049,7 +1051,6 @@ mod tests {
         fn emit_event(&mut self, ev: Event) {
             self.events.push(ev);
         }
-
     }
 
     // ---- fixtures -----------------------------------------------------------
@@ -1609,7 +1610,12 @@ mod tests {
     fn snapshots_install_only_under_their_own_root() {
         let mut m = module();
         let mut ctx = CaptureCtx::new().at(1).with_origin(user(9));
-        exec(&mut m, &mut ctx, &admin(&register("alpha", &[ACTION_CHAT_POST]))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register("alpha", &[ACTION_CHAT_POST])),
+        )
+        .unwrap();
         exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
         commit(&mut m);
 
@@ -1904,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn delegation_requires_same_runtime_and_parent_authority() {
+    fn a_run_scoped_call_intersects_authority_without_making_a_hierarchy() {
         let mut parent = record_with_caps(ResourceCaps {
             forge_read: vec!["docs".into()],
             forge_push: vec!["app".into()],
@@ -1921,7 +1927,7 @@ mod tests {
         child.allowed_actions = vec![ACTION_CHAT_POST.into()];
         child.skills = vec![SkillRef {
             name: "specialist".into(),
-            source_prefix: "/shared/read/specialist".into(),
+            source_prefix: "/shared/write/child/specialist".into(),
             source_snapshot: None,
             load: LoadMode::Always,
         }];
@@ -1935,65 +1941,34 @@ mod tests {
             subagent_budget: 0,
             ..Default::default()
         };
-        assert!(parent.can_delegate_to(&child));
+        // Provider and owner are peer metadata, not a structural call gate.
+        child.owner = SagaOrigin::External(vec![8; 32]);
+        child.capability = "other-model".into();
+        child.allowed_actions.push(ACTION_TASKS_CREATE.into());
+        child.caps.forge_read.push("outside".into());
+        child.caps.tools.push("other".into());
+        child.caps.subagent_budget = 3;
+        child.skills.push(SkillRef {
+            name: "private".into(),
+            source_prefix: "/unreadable/specialist".into(),
+            source_snapshot: None,
+            load: LoadMode::Always,
+        });
+        child.allowed_actions.sort();
+        child.caps.forge_read.sort();
+        child.caps.tools.sort();
 
-        let mut root_parent = parent.clone();
-        root_parent.caps.duckfs_read = vec!["/".into()];
-        let mut root_skill_child = child.clone();
-        root_skill_child.skills[0].source_prefix = "/root-readable/specialist".into();
-        assert!(root_parent.can_delegate_to(&root_skill_child));
-
-        let mut escalated = child.clone();
-        escalated.owner = SagaOrigin::External(vec![8; 32]);
-        assert!(!parent.can_delegate_to(&escalated));
-        escalated = child.clone();
-        escalated.capability = "other-model".into();
-        assert!(!parent.can_delegate_to(&escalated));
-        escalated = child.clone();
-        escalated.skills[0].source_prefix = "/unreadable/specialist".into();
-        assert!(!parent.can_delegate_to(&escalated));
-        for caps in [
-            ResourceCaps {
-                forge_read: vec!["outside".into()],
-                ..child.caps.clone()
-            },
-            ResourceCaps {
-                forge_push: vec!["docs".into()],
-                ..child.caps.clone()
-            },
-            ResourceCaps {
-                duckfs_read: vec!["/outside".into()],
-                ..child.caps.clone()
-            },
-            ResourceCaps {
-                duckfs_write: vec!["/shared/read".into()],
-                ..child.caps.clone()
-            },
-            ResourceCaps {
-                tools: vec!["other".into()],
-                ..child.caps.clone()
-            },
-            ResourceCaps {
-                secrets: vec!["other".into()],
-                ..child.caps.clone()
-            },
-            ResourceCaps {
-                subagent_budget: 3,
-                ..child.caps.clone()
-            },
-        ] {
-            escalated = child.clone();
-            escalated.caps = caps;
-            assert!(!parent.can_delegate_to(&escalated));
-        }
-        escalated = child.clone();
-        escalated.allowed_actions.push(ACTION_TASKS_CREATE.into());
-        assert!(!parent.can_delegate_to(&escalated));
-
-        parent.caps.pages_write = vec!["one-page".into()];
-        escalated = child;
-        escalated.caps.pages_write = vec!["other-page".into()];
-        assert!(!parent.can_delegate_to(&escalated));
+        let scoped = parent.scoped_for_call(&child);
+        assert_eq!(scoped.owner, child.owner);
+        assert_eq!(scoped.capability, "other-model");
+        assert_eq!(scoped.allowed_actions, vec![ACTION_CHAT_POST]);
+        assert_eq!(scoped.caps.forge_read, vec!["app"]);
+        assert_eq!(scoped.caps.duckfs_write, vec!["/shared/write/child"]);
+        assert_eq!(scoped.caps.tools, vec!["shell"]);
+        assert_eq!(scoped.caps.pages_write, vec!["one-page"]);
+        assert_eq!(scoped.caps.subagent_budget, 2);
+        assert_eq!(scoped.skills.len(), 1);
+        assert_eq!(scoped.skills[0].name, "specialist");
     }
 
     #[test]
@@ -2042,30 +2017,21 @@ mod tests {
         assert_eq!(Module::state_schema_revision(&module()), 2);
 
         let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
-        exec(
-            &mut legacy,
-            &mut owner,
-            &admin(&register("bot", &[])),
-        )
-        .unwrap();
+        exec(&mut legacy, &mut owner, &admin(&register("bot", &[]))).unwrap();
         commit(&mut legacy);
         let (legacy_bytes, legacy_root) = (legacy.snapshot(), legacy.root());
 
         let mut current = module();
-        exec(
-            &mut current,
-            &mut owner,
-            &admin(&register("bot", &[])),
-        )
-        .unwrap();
+        exec(&mut current, &mut owner, &admin(&register("bot", &[]))).unwrap();
         commit(&mut current);
         current.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
         let err = legacy
             .install(&current.snapshot(), current.root())
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("native-v1 agent snapshot contains a role tail"));
+        assert!(
+            err.to_string()
+                .contains("native-v1 agent snapshot contains a role tail")
+        );
         assert_eq!(legacy.snapshot(), legacy_bytes);
         assert_eq!(legacy.root(), legacy_root);
     }

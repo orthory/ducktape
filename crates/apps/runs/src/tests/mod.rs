@@ -1,14 +1,14 @@
 use super::*;
-use base64::Engine as _;
 use crate::facets::{WireSink, decode_run_result_v1};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
 use agent::{
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
-    encode_event as agent_encode_event, encode_reply as agent_encode_reply,
+    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, encode_event as agent_encode_event,
+    encode_reply as agent_encode_reply,
 };
+use base64::Engine as _;
 use chat::{AuthorRef, Channel, MessageHead, decode_msg as chat_decode_msg};
 use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
@@ -518,33 +518,33 @@ impl Ctx for CaptureCtx {
                 pages::PageQuery::GetPage { page_id } => Ok(pages::encode_reply(
                     &pages::PageReply::Page(self.pages.get(&page_id).cloned()),
                 )),
-                pages::PageQuery::GetBlock { block_id } => Ok(pages::encode_reply(
-                    &pages::PageReply::Block(
+                pages::PageQuery::GetBlock { block_id } => {
+                    Ok(pages::encode_reply(&pages::PageReply::Block(
                         self.pages
                             .values()
                             .flatten()
                             .find(|b| b.id == block_id)
                             .cloned(),
-                    ),
-                )),
-                pages::PageQuery::CommentThread { thread_id } => Ok(pages::encode_reply(
-                    &pages::PageReply::CommentThread(
+                    )))
+                }
+                pages::PageQuery::CommentThread { thread_id } => {
+                    Ok(pages::encode_reply(&pages::PageReply::CommentThread(
                         self.page_threads.get(&thread_id).cloned().or_else(|| {
                             self.taken_page_ids
                                 .contains(&thread_id)
                                 .then(|| dummy_thread_view(&thread_id))
                         }),
-                    ),
-                )),
-                pages::PageQuery::GetComment { comment_id } => Ok(pages::encode_reply(
-                    &pages::PageReply::Comment(
+                    )))
+                }
+                pages::PageQuery::GetComment { comment_id } => {
+                    Ok(pages::encode_reply(&pages::PageReply::Comment(
                         self.taken_page_ids
                             .contains(&comment_id)
                             .then(|| dummy_comment(&comment_id)),
-                    ),
-                )),
-                pages::PageQuery::ThreadsForTargets { targets } => Ok(pages::encode_reply(
-                    &pages::PageReply::CommentThreads(
+                    )))
+                }
+                pages::PageQuery::ThreadsForTargets { targets } => {
+                    Ok(pages::encode_reply(&pages::PageReply::CommentThreads(
                         targets
                             .into_iter()
                             .map(|target| {
@@ -556,8 +556,8 @@ impl Ctx for CaptureCtx {
                                 pages::TargetThreads { target, threads }
                             })
                             .collect(),
-                    ),
-                )),
+                    )))
+                }
                 _ => Err(Error::QueryUnsupported),
             },
             "saga" => match saga::decode_query(req).map_err(Error::Module)? {
@@ -596,7 +596,6 @@ impl Ctx for CaptureCtx {
     fn emit_event(&mut self, ev: Event) {
         self.events.push(ev);
     }
-
 }
 
 // ---- fixtures -----------------------------------------------------------

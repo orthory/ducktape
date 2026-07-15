@@ -1,47 +1,23 @@
-//! who this run is, and what it may do — and, for writes, the key that PROVES
-//! it.
+//! who this run is, and what it may do.
 //!
-//! the environment carries which node, which agent, and this run's session key.
+//! the environment carries which node and agent, plus a narrow host endpoint
+//! for actions made by this run. The session private key never enters the child.
 //! it carries NOTHING about the grant: owner, `allowed_actions` and
 //! `ResourceCaps` are read back from the committed agent registry, so what this
 //! module reports is always what consensus actually holds.
 //!
 //! ## writes are gated in CONSENSUS, not here
 //!
-//! this binary does not decide whether a write is allowed. it signs
-//! `RunsMsg::AgentAction` with the run's session key and submits it as an op
-//! frame; the runs module then checks — on every validator — that the origin IS
+//! this binary does not decide whether a write is allowed. it asks the scoped
+//! host endpoint to sign an allowed runs message; the runs module then checks —
+//! on every validator — that the origin IS
 //! the session key bound to that run, that the run is still in flight, and that
 //! the action sits inside the agent's committed `allowed_actions` and caps. a
 //! refusal comes back as the module's own words.
 //!
-//! that is the whole point of the session key. a frame's origin is its VERIFIED
-//! public key (`node::decode_frame` binds `(origin, seq, target, payload)`), so
-//! an `AgentAction` op is PROOF that this agent's run made it. the frameless
-//! `/v1/submit` lane cannot do this: `bin/node` DISCARDS the caller's origin
-//! string outright and re-signs with the node key, so an agent write on that
-//! lane is indistinguishable from a human's, attributable to the wrong account
-//! cross-node, and gated only by whatever the host binary chose to believe.
-//!
-//! deliberately there is no host-side pre-check duplicating the on-chain gate.
-//! two validators drift; one does not.
-//!
-//! ## the session key is a BEARER CREDENTIAL, and the sandbox is what holds it
-//!
-//! under codex the agent has a shell and can read this process's environment, so
-//! assume it HAS the session key — and assume that means MORE than the action
-//! lane. the key signs frames, and a frame can carry any `Msg` to any module.
-//! consensus checks the grant on `RunsMsg::AgentAction`; nothing checks it on
-//! the key. used directly the key is just an unknown external submitter — which
-//! `chat` turns into `AuthorRef::User(key)`, admitted by any `Open` channel with
-//! no `chat.post_message` grant in sight — and it stays a valid signer after the
-//! run settles, because pruning the session only closes the `AgentAction` lane.
-//!
-//! it is contained by the codex SANDBOX (no network), not by its own authority:
-//! the model's shell cannot reach the node's HTTP lane, and this server — which
-//! can — offers only the tools below. the NODE key, by contrast, signs anything
-//! at all, which is why the node signs `OpenAgentSession` itself and never lets
-//! this process near it.
+//! a frame's origin is its verified public key. The endpoint accepts only
+//! `AgentAction` and `DelegateRun` for its exact run id, so its bearer token is
+//! not a general-purpose signer even if the child reads its environment.
 //!
 //! READS are still gated here, against the committed caps (`forge_read`,
 //! `duckfs_read`) — they cross no consensus op to be checked by, and `/v1/query`
@@ -51,8 +27,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::{AgentRecord, CapRequest};
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::ed25519;
 use serde_json::json;
 
 use crate::node::{Node, NodeError, Result};
@@ -61,8 +35,8 @@ pub const ENV_NODE: &str = "DUCKTAPE_NODE";
 pub const ENV_AGENT: &str = "DUCKTAPE_RUN_AGENT";
 pub const ENV_WORKSPACE: &str = "DUCKTAPE_RUN_WORKSPACE";
 pub const ENV_SKILLS: &str = "DUCKTAPE_RUN_SKILLS";
-/// this run's ed25519 session PRIVATE key, lowercase hex.
-pub const ENV_SESSION_KEY: &str = "DUCKTAPE_RUN_SESSION_KEY";
+pub const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
+pub const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 /// the run this session is bound to — the `run_id` every `AgentAction` names.
 pub const ENV_RUN_ID: &str = "DUCKTAPE_RUN_ID";
 const ENV_PROVIDER_CONTROL_URL: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
@@ -78,15 +52,14 @@ pub const TARGET_AGENT: &str = "agent";
 /// its `AuthorRef::Agent` attribution.
 pub const TARGET_RUNS: &str = "runs";
 
-/// this run's write credential: the ed25519 key the node bound to this run in
-/// consensus, and the run it is bound to.
-pub struct Session {
-    signer: ed25519::PrivateKey,
+/// The narrow host signer endpoint for this live run. Its random token can ask
+/// for Runs agent actions/calls only; no general-purpose private key crosses
+/// into this process.
+struct ActionControl {
+    client: reqwest::blocking::Client,
+    url: String,
+    token: String,
     pub run_id: String,
-    /// the frame sequence. a session key is FRESH per run, so this starts at 0
-    /// and every op of this run gets a distinct `(origin, seq)` — the replay
-    /// identity the ordered lane keys on.
-    seq: AtomicU64,
 }
 
 /// this run, as the tool plane sees it.
@@ -102,7 +75,7 @@ pub struct Run {
     /// loudly — there is no credential to prove the write came from this agent,
     /// and this binary will not fall back to a lane that would file it under
     /// somebody else's name.
-    session: Option<Session>,
+    action: Option<ActionControl>,
     provider_control: Option<ProviderControl>,
     /// monotonic within the process — the tail of every minted id.
     ids: AtomicU64,
@@ -119,7 +92,7 @@ impl Run {
             agent_id: std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty()),
             workspace: std::env::var(ENV_WORKSPACE).ok().filter(|s| !s.is_empty()),
             skills: std::env::var(ENV_SKILLS).ok().filter(|s| !s.is_empty()),
-            session: session_from_env(),
+            action: ActionControl::from_env(),
             provider_control: ProviderControl::from_env(),
             ids: AtomicU64::new(0),
         }
@@ -128,36 +101,55 @@ impl Run {
     /// the run this MCP session is bound to. The signer stays private; callers
     /// that only need an evidence id never get access to the session key.
     pub fn run_id(&self) -> Option<&str> {
-        self.session.as_ref().map(|session| session.run_id.as_str())
+        self.action.as_ref().map(|action| action.run_id.as_str())
     }
 
-    /// apply one action, mid-run: sign a `RunsMsg::AgentAction` with this run's
-    /// session key and submit it as an op frame.
+    /// Apply one action mid-run through this run's scoped host signer.
     ///
     /// there is NO permission check here. the runs module makes it, on every
     /// validator, against the agent's committed grant — and its refusal is what
     /// comes back. a second gate in this process could only ever drift from the
     /// one that actually decides.
     pub fn act(&self, action: agent::AgentAction) -> Result<serde_json::Value> {
-        let session = self.session.as_ref().ok_or_else(|| {
+        self.submit_runs(runs::RunsMsg::AgentAction {
+            run_id: self.run_id().unwrap_or_default().to_string(),
+            action,
+        })
+    }
+
+    pub fn delegate(
+        &self,
+        request_id: String,
+        request: agent::DelegationRequest,
+    ) -> Result<serde_json::Value> {
+        self.submit_runs(runs::RunsMsg::DelegateRun {
+            run_id: self.run_id().unwrap_or_default().to_string(),
+            request_id,
+            request,
+        })
+    }
+
+    pub fn delegations(&self) -> Result<serde_json::Value> {
+        let run_id = self.run_id().ok_or_else(|| {
             NodeError::Rejected(format!(
-                "this run has no agent session ({ENV_SESSION_KEY} is unset), so it holds no \
-                 credential to prove a write came from it — writing is refused rather than \
-                 attributed to the wrong identity"
+                "this run has no scoped action endpoint ({ENV_ACTION_URL} is unset)"
             ))
         })?;
-        let msg = sdk::Msg {
-            target: TARGET_RUNS.to_string(),
-            payload: runs::encode_msg(&runs::RunsMsg::AgentAction {
-                run_id: session.run_id.clone(),
-                action,
-            }),
-        };
-        // the frame's origin IS the session public key, bound by the signature
-        // over (origin, seq, target, payload). that is the proof.
-        let seq = session.seq.fetch_add(1, Ordering::Relaxed);
-        let frame = node::encode_frame(&session.signer, seq, &msg);
-        self.node.submit_frame(frame)
+        self.node.query(
+            TARGET_RUNS,
+            json!({"delegations": {"caller_run_id": run_id}}),
+        )
+    }
+
+    fn submit_runs(&self, message: runs::RunsMsg) -> Result<serde_json::Value> {
+        self.action
+            .as_ref()
+            .ok_or_else(|| {
+                NodeError::Rejected(format!(
+                    "this run has no scoped action endpoint ({ENV_ACTION_URL} is unset), so writing is refused"
+                ))
+            })?
+            .submit(message)
     }
 
     /// Ask the host-local controller for more silent provider time. The model
@@ -248,6 +240,76 @@ impl Run {
     }
 }
 
+const ACTION_HEADER: &str = "x-ducktape-run-action";
+
+impl ActionControl {
+    fn from_env() -> Option<Self> {
+        let url = std::env::var(ENV_ACTION_URL)
+            .ok()
+            .filter(|value| action_url_allowed(value))?;
+        let token = std::env::var(ENV_ACTION_TOKEN)
+            .ok()
+            .filter(|value| provider_control_token_allowed(value))?;
+        let run_id = std::env::var(ENV_RUN_ID)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("a loopback action client always builds");
+        Some(Self {
+            client,
+            url,
+            token,
+            run_id,
+        })
+    }
+
+    fn submit(&self, message: runs::RunsMsg) -> Result<serde_json::Value> {
+        let response = self
+            .client
+            .post(&self.url)
+            .header(ACTION_HEADER, &self.token)
+            .json(&json!({"message": message}))
+            .send()
+            .map_err(|error| NodeError::Transport(error.to_string()))?;
+        let status = response.status();
+        let value: serde_json::Value = response.json().map_err(|error| {
+            NodeError::Transport(format!("action signer returned invalid json: {error}"))
+        })?;
+        if status.is_success() {
+            Ok(value)
+        } else {
+            Err(NodeError::Rejected(
+                value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("scoped action signer rejected the request")
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+fn action_url_allowed(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "ducktape-host" | "host.containers.internal")
+        )
+        && url.port().is_some()
+        && url.path() == "/v1/run-action"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 struct ProviderControl {
     client: reqwest::blocking::Client,
     url: String,
@@ -306,7 +368,10 @@ fn provider_control_url_allowed(value: &str) -> bool {
         return false;
     };
     url.scheme() == "http"
-        && matches!(url.host_str(), Some("127.0.0.1" | "ducktape-host"))
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "ducktape-host" | "host.containers.internal")
+        )
         && url.port().is_some()
         && url.path() == "/v1/control/provider-idle"
         && url.username().is_empty()
@@ -334,6 +399,9 @@ mod provider_control_tests {
         assert!(provider_control_url_allowed(
             "http://ducktape-host:41043/v1/control/provider-idle"
         ));
+        assert!(provider_control_url_allowed(
+            "http://host.containers.internal:41043/v1/control/provider-idle"
+        ));
         for rejected in [
             "https://127.0.0.1:41043/v1/control/provider-idle",
             "http://localhost:41043/v1/control/provider-idle",
@@ -360,39 +428,8 @@ fn describe(cap: &CapRequest) -> String {
         CapRequest::Tool(t) => format!("invoking tool {t:?} (caps.tools)"),
         CapRequest::Secret(s) => format!("resolving secret {s:?} (caps.secrets)"),
         CapRequest::PagesWrite(p) => format!("writing page {p:?} (caps.pages_write)"),
-        CapRequest::SpawnSubagent => "spawning a sub-agent (caps.subagent_budget)".into(),
+        CapRequest::SpawnSubagent => "calling a peer agent (caps.subagent_budget)".into(),
     }
-}
-
-/// this run's session credential, read out of the environment the provisioner
-/// set. BOTH halves are required — a key with no run to name, or a run with no
-/// key to sign for it, is not a session — and a malformed key is dropped rather
-/// than guessed at: the tools then refuse to write and SAY so, which is far
-/// better than signing with something that will never verify.
-fn session_from_env() -> Option<Session> {
-    let hex = std::env::var(ENV_SESSION_KEY)
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let run_id = std::env::var(ENV_RUN_ID).ok().filter(|s| !s.is_empty())?;
-    let raw = decode_hex(&hex)?;
-    let signer = ed25519::PrivateKey::decode(raw.as_slice()).ok()?;
-    Some(Session {
-        signer,
-        run_id,
-        seq: AtomicU64::new(0),
-    })
-}
-
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    s.len()
-        .is_multiple_of(2)
-        .then(|| {
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-                .collect::<Option<Vec<u8>>>()
-        })
-        .flatten()
 }
 
 #[cfg(test)]
@@ -400,31 +437,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hex_decodes_only_well_formed_key_material() {
-        assert_eq!(decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
-        // an odd-length or non-hex string is NOT a key. returning None here is
-        // what makes the tools refuse to write and say why, instead of signing
-        // with garbage that could never verify.
-        assert_eq!(decode_hex("abc"), None);
-        assert_eq!(decode_hex("zz"), None);
-    }
-
-    #[test]
-    fn a_session_needs_both_a_key_and_a_run_to_name() {
-        // guarded against the half-configured node: a key with no run id names
-        // no run, and a run id with no key can prove nothing about it.
-        unsafe {
-            std::env::remove_var(ENV_SESSION_KEY);
-            std::env::set_var(ENV_RUN_ID, "s1:0");
-        }
-        assert!(session_from_env().is_none());
-        unsafe {
-            std::env::set_var(ENV_SESSION_KEY, "ab".repeat(32));
-            std::env::remove_var(ENV_RUN_ID);
-        }
-        assert!(session_from_env().is_none());
-        unsafe {
-            std::env::remove_var(ENV_SESSION_KEY);
+    fn action_endpoint_is_strictly_host_local_and_path_scoped() {
+        assert!(action_url_allowed("http://127.0.0.1:41043/v1/run-action"));
+        assert!(action_url_allowed(
+            "http://ducktape-host:41043/v1/run-action"
+        ));
+        assert!(action_url_allowed(
+            "http://host.containers.internal:41043/v1/run-action"
+        ));
+        for rejected in [
+            "https://127.0.0.1:41043/v1/run-action",
+            "http://localhost:41043/v1/run-action",
+            "http://127.0.0.1:41043/v1/submit/frame",
+            "http://127.0.0.1:41043/v1/run-action?token=leak",
+        ] {
+            assert!(!action_url_allowed(rejected), "accepted {rejected}");
         }
     }
 }

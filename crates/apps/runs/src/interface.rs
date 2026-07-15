@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use agent::AgentAction;
+use agent::{AgentAction, DelegationRequest, ReplyBlock};
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +122,49 @@ pub struct RunRecord {
     pub pr_number: Option<u64>,
 }
 
+// ---- run-scoped agent calls -------------------------------------------------
+
+/// Maximum caller-chosen idempotency-key size for one agent call.
+pub const MAX_DELEGATION_REQUEST_ID_BYTES: usize = 64;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatus {
+    Pending,
+    Delivered,
+    Failed,
+    Cancelled,
+}
+
+/// The bounded result routed back to a caller run. It is queryable only while
+/// that root run remains live; Runs removes the whole call tree with the root.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DelegationResult {
+    pub reply_blocks: Vec<ReplyBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One ephemeral caller/callee edge. This is run state, not an AgentRecord
+/// relation: both agents remain peers before and after the call.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DelegationView {
+    pub delegation_id: String,
+    pub request_id: String,
+    pub caller_run_id: String,
+    pub root_run_id: String,
+    pub callee_run_id: String,
+    pub callee_agent_id: String,
+    pub status: DelegationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<DelegationResult>,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+}
+
 // ---- ops ----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -207,6 +250,15 @@ pub enum RunsMsg {
     /// the response path validates, by the same code: the tool plane must never
     /// become a second, wider permission vocabulary.
     AgentAction { run_id: String, action: AgentAction },
+    /// Start one peer agent call while the caller is still running. The bound
+    /// session key authorizes the request; `subagent_budget` bounds concurrent
+    /// live calls across the root tree, and the callee executes with caller ∩
+    /// callee authority.
+    DelegateRun {
+        run_id: String,
+        request_id: String,
+        request: DelegationRequest,
+    },
 }
 
 // ---- the agent session lane ---------------------------------------------------
@@ -214,7 +266,7 @@ pub enum RunsMsg {
 /// required byte length of a session key (an ed25519 public key).
 pub const SESSION_KEY_LEN: usize = 32;
 
-/// hard cap on the actions ONE session may apply — the mid-run peer of
+/// hard cap on writes and peer calls ONE session may apply — the mid-run peer of
 /// [`agent::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
 /// its budget can still RETURN a response; it just cannot keep writing.
 pub const MAX_ACTIONS_PER_SESSION: u32 = 32;
@@ -255,6 +307,11 @@ pub enum RunsQuery {
     /// spent. sessions prune when their run settles, so this is bounded by the
     /// in-flight runs.
     AgentSessions,
+    /// Calls made by one live caller, including completed results waiting for
+    /// that caller to collect them.
+    Delegations {
+        caller_run_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -264,6 +321,7 @@ pub enum RunsReply {
     Watches(Vec<WatchView>),
     RecentRuns(Vec<RunRecord>),
     AgentSessions(Vec<AgentSession>),
+    Delegations(Vec<DelegationView>),
 }
 
 // ---- codecs -------------------------------------------------------------------

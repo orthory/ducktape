@@ -1,7 +1,7 @@
-# Agent session keys — consensus ACL + provenance
+# Host-owned agent session signer — consensus ACL + provenance
 
 Date: 2026-07-12
-Status: accepted, implementing
+Status: accepted; amended 2026-07-15 to keep the private key host-side
 Stacks on: `feat/agent-mcp-plane` (PR #423)
 
 ## The defect this closes
@@ -68,23 +68,26 @@ run**. That is all a session key supplies.
  │ submit (signed, NODE key) ────┼──▶  { run_id, session_key }
  │                               │      runs: origin == the run's committed
  │                               │            lease-holder?  → bind
- │ env: DUCKTAPE_RUN_SESSION_KEY │
+ │ host-only scoped signer       │
+ │ accepts AgentAction or        │
+ │ DelegateRun for this run      │
  └──────────────┬────────────────┘
-                │ (private key only)
-        ┌───────▼────────┐            RunsMsg::AgentAction
-        │  ducktape-mcp  │──signed────▶ { run_id, action }
-        │                │  w/ session   runs: origin == the bound session key?
-        └────────────────┘  key          ∧ run in-flight
+                │ random URL token, never the private key
+        ┌───────▼────────┐            RunsMsg::{AgentAction, DelegateRun}
+        │  ducktape-mcp  │──typed──────▶ host signs with session key
+        │                │  request       runs: origin == the bound session key?
+        └────────────────┘               ∧ run in-flight
                                          ∧ action ∈ allowed_actions
                                          ∧ caps permit
                                               → emit as MODULE origin
                                               → AuthorRef::Agent
 ```
 
-1. **Mint.** The provisioner generates a fresh ed25519 keypair per run. The MCP
-   server receives **only the session private key** — never the node key, which
-   can sign anything (validator votes, consensus-critical ops). A process the
-   agent can reach must not hold that.
+1. **Mint.** The provisioner generates a fresh ed25519 keypair per run and keeps
+   its private half in the host process. The MCP child receives only a random
+   token for a host endpoint that accepts two message shapes for the exact
+   run id: `AgentAction` and `DelegateRun`. It receives neither the session key
+   nor the node key.
 
 2. **Bind.** The node submits `RunsMsg::OpenAgentSession { run_id, session_key }`
    as a frame signed with its **node key**. `runs` validates that the origin is
@@ -93,8 +96,9 @@ run**. That is all a session key supplies.
    resolves from saga's committed lease. Self-authorising: no owner interaction,
    so automated issue-mention runs work, and it is correct cross-node.
 
-3. **Act.** The MCP signs `RunsMsg::AgentAction { run_id, action }` frames with the
-   session key and posts them to a new `POST /v1/submit/frame` route.
+3. **Act or call.** The MCP posts a typed Runs message to the scoped endpoint.
+   The host checks the token, message variant, and exact run id, signs the frame
+   with the private session key, and submits it on the existing frame lane.
 
 4. **Enforce, in consensus.** `runs` checks: origin *is* the session key bound to
    that run ∧ the run is still in-flight ∧ the action is in the agent's
@@ -111,16 +115,13 @@ run**. That is all a session key supplies.
    capped (`MAX_ACTIONS_PER_SESSION`), mirroring `MAX_ACTIONS_PER_RUN`'s
    blast-radius bound.
 
-### Why leaking the session key to the agent is not a hole
+### Why the session key stays host-side
 
-Under codex the agent has a shell and can read its own process environment. It
-could therefore obtain the session key. **This grants it nothing.** The session
-key's entire authority is "perform actions this agent is already permitted to
-perform, for this one run, until it settles." That is precisely least privilege:
-the key *is* the agent's authority, no more. (And under codex it has no network,
-so it cannot submit at all except through the MCP.)
-
-Contrast the node key, which is why the MCP must never hold it.
+A raw ed25519 key is a general frame signer, even if Runs only recognizes it as
+an agent session for one lane. A child that recovered it could address another
+module directly. The scoped endpoint token fixes that mismatch: the host will
+sign only the two run-scoped Runs messages above and drops the endpoint with the
+workspace. The consensus gate still decides the actual action/call authority.
 
 ### Deterministic ids
 
@@ -179,12 +180,14 @@ pub enum RunsQuery {
 }
 ```
 
-New route: `POST /v1/submit/frame` (raw frame bytes) → `NodeCommand::SubmitFrame`.
-`bin/node` hands it to `Node::submit_frame`; `bin/noded` decodes, verifies, and
-submits with the **verified** origin — which also closes the test-fidelity gap
-that let #423's defect through.
+The existing `POST /v1/submit/frame` route remains the node's authenticated
+frame ingress. Children do not receive the key needed to use it. The
+provisioner instead exposes a per-run `POST /v1/run-action` endpoint that
+accepts only typed `AgentAction` and `DelegateRun` requests for its bound run,
+then signs and submits the frame inside the trusted host process.
 
-New env: `DUCKTAPE_RUN_SESSION_KEY` (hex private key), `DUCKTAPE_RUN_ID`.
+New env: `DUCKTAPE_RUN_ACTION_URL`, `DUCKTAPE_RUN_ACTION_TOKEN`, and
+`DUCKTAPE_RUN_ID`. `DUCKTAPE_RUN_SESSION_KEY` is deliberately absent.
 
 ## Flag day
 
@@ -200,7 +203,8 @@ called out in the PR.
   action cap bounds a session; ids are deterministic across replay.
 - **frame ingress:** a tampered frame is refused; a frame's verified pubkey — not
   any caller string — becomes the origin, **on both binaries**.
-- **mcp e2e:** a granted action lands as `AuthorRef::Agent`; a denied one is
-  refused *by consensus* (assert against the chain, not the server's reply); an
-  action after the run settles is refused.
+- **mcp e2e:** writes and peer calls carry only typed run-scoped input; no raw
+  key or caller-selected identity/authority crosses the child boundary.
+- **provisioner boundary:** the endpoint rejects every other message and run id,
+  and frames accepted requests with the public key consensus bound.
 - **live:** the existing `live_runner` test, re-pointed at the session lane.

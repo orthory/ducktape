@@ -46,7 +46,10 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper(&response_text, serde_json::json!({})))),
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(&response_text, serde_json::json!({}))),
+        ),
     )
     .unwrap();
     assert_eq!(ctx.chat_msgs().len(), 1, "the run delivers its message");
@@ -199,10 +202,7 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(runner_wrapper("done", granted_facets)),
-        ),
+        &result_event(&run_id, Ok(runner_wrapper("done", granted_facets))),
     )
     .unwrap();
     let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
@@ -321,7 +321,13 @@ fn pr_sink_with_a_deleted_source_branch_degrades_without_aborting() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
         ),
     )
     .unwrap();
@@ -356,7 +362,13 @@ fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
         ),
     )
     .unwrap();
@@ -758,7 +770,13 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(forge_wrapper(message, Some("agent/x"), Some(&oid), false, None)),
+            Ok(forge_wrapper(
+                message,
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
         ),
     )
     .unwrap();
@@ -804,7 +822,13 @@ fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
         ),
     )
     .unwrap();
@@ -913,7 +937,13 @@ fn pr_sink_never_updates_an_existing_pr_when_nothing_was_pushed() {
         &mut ctx2,
         &result_event(
             &run_id2,
-            Ok(forge_wrapper("done", Some("agent/x"), None, false, Some("push CAS reject"))),
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                None,
+                false,
+                Some("push CAS reject"),
+            )),
         ),
     )
     .unwrap();
@@ -951,7 +981,13 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
         &mut ctx,
         &result_event(
             &run_id,
-            Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
         ),
     )
     .unwrap();
@@ -981,7 +1017,10 @@ fn output_none_with_a_born_stale_branch_never_opens_a_pr_from_response_prose() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(forge_wrapper("re-proposing", None, None, true, None))),
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper("re-proposing", None, None, true, None)),
+        ),
     )
     .unwrap();
     let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
@@ -1069,7 +1108,13 @@ fn a_success_result_arriving_after_cancellation_cannot_publish() {
         &mut late,
         &result_event(
             &run_id,
-            Ok(forge_wrapper("late", Some("agent/x"), Some(&oid), false, None)),
+            Ok(forge_wrapper(
+                "late",
+                Some("agent/x"),
+                Some(&oid),
+                false,
+                None,
+            )),
         ),
     )
     .unwrap();
@@ -1139,7 +1184,13 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
 #[test]
 fn workspace_receipt_mirror_decodes_the_forge_fields() {
     // present: the §5 additive fields land on the mirror.
-    let wrapper = forge_wrapper("done", Some("agent/item-7"), Some(&"1a".repeat(20)), false, None);
+    let wrapper = forge_wrapper(
+        "done",
+        Some("agent/item-7"),
+        Some(&"1a".repeat(20)),
+        false,
+        None,
+    );
     let receipt = decode_run_result_v1(&wrapper).unwrap().workspace_receipt;
     assert_eq!(receipt.branch.as_deref(), Some("agent/item-7"));
     assert_eq!(receipt.output_commit.as_deref(), Some(&*"1a".repeat(20)));

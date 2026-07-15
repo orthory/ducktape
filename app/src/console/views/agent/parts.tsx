@@ -38,9 +38,9 @@ export const ACTION_HINT: Record<string, string> = {
   "pages.set_checked": "Check off page todos",
 };
 
-/** Parse the pages_write caps field: whitespace/comma-separated page ids,
- *  the literal "*" allowed. The node canonicalizes (sort + dedup). */
-export const parsePagesWrite = (text: string): string[] =>
+/** Parse a caps list: whitespace/comma-separated ids or prefixes. The node
+ * canonicalizes each list (sort + dedup). */
+export const parseCapList = (text: string): string[] =>
   text.split(/[\s,]+/).filter(Boolean);
 
 /** One permission pill: the checkbox affordance the register and edit forms both

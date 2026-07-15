@@ -80,7 +80,7 @@ impl RunsModule {
             self.note(ctx, skip("no pages module wired"));
             return;
         };
-        let agent = match self.agent_record(&*ctx, &entry.agent_id).await {
+        let agent = match self.agent_for_run(&*ctx, entry).await {
             Ok(Some(a)) => a,
             _ => {
                 self.note(ctx, skip("agent not registered"));

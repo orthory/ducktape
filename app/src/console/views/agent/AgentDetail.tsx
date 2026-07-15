@@ -124,6 +124,17 @@ export function AgentDetail({
   }
 
   const active = agent.status === "active";
+  const caps = agent.caps ?? {};
+  const resourceGrants = [
+    ...(caps.forge_read ?? []).map((value) => `Forge read: ${value}`),
+    ...(caps.forge_push ?? []).map((value) => `Forge push: ${value}`),
+    ...(caps.duckfs_read ?? []).map((value) => `DuckFS read: ${value}`),
+    ...(caps.duckfs_write ?? []).map((value) => `DuckFS write: ${value}`),
+    ...(caps.tools ?? []).map((value) => `Tool: ${value}`),
+    ...(caps.secrets ?? []).map((value) => `Secret: ${value}`),
+    ...(caps.pages_write ?? []).map((value) => `Page write: ${value}`),
+    `Concurrent peer calls: ${caps.subagent_budget ?? 0}`,
+  ];
   return (
     <section aria-label="Agent detail" style={{ minWidth: 0 }}>
       <div
@@ -320,6 +331,15 @@ export function AgentDetail({
                   />
                 ))
               )}
+            </div>
+          </div>
+
+          <div style={{ marginTop: 15 }}>
+            <SectionLabel>RESOURCE CAPS</SectionLabel>
+            <div style={{ marginTop: 8, display: "flex", gap: 7, flexWrap: "wrap" }}>
+              {resourceGrants.map((grant) => (
+                <Chip key={grant} text={grant} tone={statusTone.neutral} />
+              ))}
             </div>
           </div>
 

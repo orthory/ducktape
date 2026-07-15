@@ -135,17 +135,20 @@ impl Harness {
         cmd
     }
 
-    /// a `ducktape-mcp` subprocess carrying a SESSION — the write-capable shape
-    /// the provisioner produces once it has bound a key to a live run.
-    ///
-    /// the seed is hexed exactly as `agent_provision::session` hexes the real
-    /// one, so the server rebuilds the same signer from it. no run is bound in
-    /// this harness, which is the point: consensus must refuse the write, and it
-    /// must be consensus that does it.
-    pub fn mcp_with_session(&self, seed: [u8; 32], run_id: &str) -> Command {
+    /// A write-capable MCP shape with a scoped endpoint that is deliberately
+    /// unavailable. Production creates this endpoint inside the provisioner;
+    /// this read/query harness does not dispatch runs.
+    pub fn mcp_with_action(&self, run_id: &str) -> Command {
         let mut cmd = self.mcp();
-        cmd.env("DUCKTAPE_RUN_SESSION_KEY", hex(&seed))
-            .env("DUCKTAPE_RUN_ID", run_id);
+        cmd.env(
+            "DUCKTAPE_RUN_ACTION_URL",
+            "http://127.0.0.1:9/v1/run-action",
+        )
+        .env(
+            "DUCKTAPE_RUN_ACTION_TOKEN",
+            "abababababababababababababababababababababababababababababababab",
+        )
+        .env("DUCKTAPE_RUN_ID", run_id);
         cmd
     }
 
@@ -442,12 +445,6 @@ pub fn payload(result: &Value) -> Value {
     let (is_error, text) = content(result);
     assert!(!is_error, "expected a success, got a refusal: {text}");
     serde_json::from_str(&text).expect("a successful tool result carries json")
-}
-
-/// the session key's wire form: lowercase hex of the 32-byte seed, exactly as
-/// `agent_provision::session` writes it into the run's environment.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn free_port() -> u16 {

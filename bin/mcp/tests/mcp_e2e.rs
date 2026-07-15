@@ -92,10 +92,9 @@ fn agents_and_runs_are_read_from_the_real_modules() {
     assert!(runs.get("agent_sessions").is_none());
 }
 
-/// a session key bound to nothing — no run in this harness was ever dispatched.
-/// consensus must therefore refuse every action it signs, and the refusal must
-/// come from `runs`, not from the binary under test.
-const SEED: [u8; 32] = [77u8; 32];
+/// No run is dispatched by this read/query harness, so its scoped action URL is
+/// intentionally unavailable. The real provisioner boundary is covered in
+/// noded's session tests.
 const UNBOUND_RUN: &str = "no-such-saga:0";
 
 #[test]
@@ -105,35 +104,26 @@ fn whoami_reports_the_run_id_without_exposing_the_session_key() {
     let sessionless = payload(&h.call(h.mcp(), "ducktape_whoami", json!({})));
     assert!(sessionless["run_id"].is_null());
 
-    let bound = payload(&h.call(
-        h.mcp_with_session(SEED, UNBOUND_RUN),
-        "ducktape_whoami",
-        json!({}),
-    ));
+    let bound = payload(&h.call(h.mcp_with_action(UNBOUND_RUN), "ducktape_whoami", json!({})));
     assert_eq!(bound["run_id"], UNBOUND_RUN);
     assert!(bound.get("session_key").is_none());
     assert!(!bound.to_string().contains(&"4d".repeat(32)));
 }
 
 #[test]
-fn a_write_is_refused_by_consensus_not_by_the_tool_server() {
-    // the agent holds tasks.create — so if anything refuses this, it is NOT the
-    // grant. it is `runs`, in consensus, observing that the session key signing
-    // the op is bound to no live run. that is the whole architecture in one
-    // assertion: the tool server no longer decides.
+fn an_unavailable_scoped_endpoint_never_falls_back_to_an_ambient_write_lane() {
     let h = Harness::start(&["tasks.create"]);
 
     let refused = h.call(
-        h.mcp_with_session(SEED, UNBOUND_RUN),
+        h.mcp_with_action(UNBOUND_RUN),
         "ducktape_task_create",
         json!({"title": "should never land"}),
     );
     let (is_error, text) = content(&refused);
     assert!(is_error, "an action for an unbound run must refuse: {text}");
-    // `runs`'s own words, reaching the model verbatim through the frame lane.
     assert!(
-        text.contains("agent session") || text.contains("not in flight"),
-        "the refusal must be the runs module's, about the session: {text}"
+        text.contains("could not reach") || text.contains("scoped action"),
+        "the refusal must identify the scoped action lane: {text}"
     );
 
     // and the chain is unmoved. a gate that refused in words but wrote anyway
@@ -146,8 +136,8 @@ fn a_write_is_refused_by_consensus_not_by_the_tool_server() {
 }
 
 #[test]
-fn a_write_without_a_session_never_reaches_the_wire_at_all() {
-    // no session key: the server has no credential to prove the write came from
+fn a_write_without_a_scoped_endpoint_never_reaches_the_wire_at_all() {
+    // No scoped endpoint: the server has no credential to prove the write came from
     // this agent, so it refuses locally rather than falling back to a lane that
     // would file the write under the executing node's identity. that fallback IS
     // the defect this whole design removes, so its absence is asserted.
@@ -155,10 +145,10 @@ fn a_write_without_a_session_never_reaches_the_wire_at_all() {
 
     let refused = h.call(h.mcp(), "ducktape_task_create", json!({"title": "nope"}));
     let (is_error, text) = content(&refused);
-    assert!(is_error, "a session-less write must refuse: {text}");
+    assert!(is_error, "an endpoint-less write must refuse: {text}");
     assert!(
-        text.contains("session"),
-        "the refusal must say the run holds no session: {text}"
+        text.contains("scoped action endpoint"),
+        "the refusal must name the missing scoped endpoint: {text}"
     );
 }
 
@@ -256,9 +246,7 @@ fn a_forge_scoped_read_only_agent_can_review_a_real_pr_diff() {
     let oid_bytes = |hex: &str| {
         hex.as_bytes()
             .chunks_exact(2)
-            .map(|pair| {
-                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
-            })
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect::<Vec<_>>()
     };
     let target = commit("base.txt", "base\n", "base");
@@ -357,18 +345,18 @@ fn a_run_with_no_agent_can_read_but_never_write() {
 fn a_refusal_reaches_the_model_verbatim() {
     let h = Harness::start(&["tasks.update_status"]);
 
-    // whatever refuses — the tool server for a missing credential, or `runs` for
-    // an unbound session — its OWN words must reach the model rather than a
+    // Whatever refuses — the tool server for a missing endpoint, or `runs` for
+    // an invalid live action — its own words must reach the model rather than a
     // reworded guess at them. an agent can only correct a mistake it can read.
     let refused = h.call(
-        h.mcp_with_session(SEED, UNBOUND_RUN),
+        h.mcp_with_action(UNBOUND_RUN),
         "ducktape_task_status",
         json!({"task_id": "no-such-task", "status": "done"}),
     );
     let (is_error, text) = content(&refused);
     assert!(is_error, "the refusal must surface as one");
     assert!(
-        text.contains("Ducktape refused the request"),
+        text.contains("could not reach") || text.contains("Ducktape refused the request"),
         "the refusal must reach the model verbatim: {text}"
     );
 }
@@ -381,7 +369,7 @@ fn a_bad_status_name_is_refused_before_it_reaches_the_node() {
     // wire names. not a permission decision — a spelling one — so answering it
     // here costs the agent a consensus round-trip it would only lose anyway.
     let refused = h.call(
-        h.mcp_with_session(SEED, UNBOUND_RUN),
+        h.mcp_with_action(UNBOUND_RUN),
         "ducktape_task_status",
         json!({"task_id": "t1", "status": "Done"}),
     );

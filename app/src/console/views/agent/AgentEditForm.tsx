@@ -11,18 +11,20 @@ import { accentVar, color, font, radius } from "../../theme/tokens";
 import {
   ACTION_HINT,
   ACTION_LABEL,
-  CapCheckbox,
   FieldLabel,
   inputStyle,
-  monoInputStyle,
-  parsePagesWrite,
   primaryButton,
   secondaryButton,
   SectionLabel,
   statusTone,
 } from "./parts";
 import { RunsOnPicker } from "./RunsOnPicker";
-import { canReadLibrary, withLibraryRead } from "./skill-library";
+import {
+  capsDraftFrom,
+  capsFromDraft,
+  ResourceCapsFields,
+} from "./ResourceCapsFields";
+import { canReadLibrary } from "./skill-library";
 import { cleanSkills } from "./skills";
 import { SkillsField } from "./SkillsField";
 
@@ -52,9 +54,7 @@ export function AgentEditForm({
   const [capability, setCapability] = useState(agent.capability);
   const [skills, setSkills] = useState<SkillRef[]>(agent.skills ?? []);
   const [allowedActions, setAllowedActions] = useState<string[]>(agent.allowed_actions);
-  const [pagesWrite, setPagesWrite] = useState(
-    (agent.caps?.pages_write ?? []).join(" "),
-  );
+  const [capsDraft, setCapsDraft] = useState(() => capsDraftFrom(agent.caps));
   // Seeded from the record: an agent registered without the grant gains it here
   // (and one that has it can lose it) — the caps are what the tool plane
   // enforces and what the run's context document is assembled against.
@@ -79,13 +79,8 @@ export function AgentEditForm({
         displayName: displayName.trim(),
         capability: capability.trim(),
         allowedActions,
-        // caps REPLACE wholesale on update: send the record's current caps with
-        // only the two fields this form owns swapped, so every other grant
-        // survives the edit.
-        caps: withLibraryRead(
-          { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
-          libraryRead,
-        ),
+        // Caps replace wholesale, and this form exposes the whole record.
+        caps: capsFromDraft(capsDraft, libraryRead),
         skills: cleanSkills(skills),
       });
       if (!committed) return;
@@ -193,37 +188,13 @@ export function AgentEditForm({
             );
           })}
         </div>
-        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-          <CapCheckbox
-            id="agent-edit-library-read"
-            label="Can search the global skill library"
-            checked={libraryRead}
-            onChange={setLibraryRead}
-          />
-        </div>
-        <div>
-          <FieldLabel htmlFor="agent-edit-pages-write">Page write access</FieldLabel>
-          <input
-            id="agent-edit-pages-write"
-            name="agent-edit-pages-write"
-            type="text"
-            spellCheck={false}
-            value={pagesWrite}
-            onChange={(event) => setPagesWrite(event.target.value)}
-            placeholder="page ids, or * for all"
-            style={monoInputStyle}
-          />
-          <div
-            style={{
-              marginTop: 5,
-              font: `400 10.5px ${font.sans}`,
-              color: color.muted2,
-            }}
-          >
-            Pages the agent may comment on or check off. Space-separated ids; * grants
-            every page.
-          </div>
-        </div>
+        <ResourceCapsFields
+          idPrefix="agent-edit"
+          draft={capsDraft}
+          onChange={setCapsDraft}
+          libraryRead={libraryRead}
+          onLibraryReadChange={setLibraryRead}
+        />
       </fieldset>
 
       <SkillsField

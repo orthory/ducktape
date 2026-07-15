@@ -18,8 +18,9 @@
 //! envelope and builds the `WorkspaceSpec` itself, exactly as production does —
 //! lets the REAL [`NodedProvisioner`] open the session off that spec, and routes
 //! the resulting op into the REAL `runs` module as the node holding the lease.
-//! then it asserts what only an end-to-end run can: the session BOUND, to the run
-//! the pending map is actually keyed by, and the agent's process was told THAT id.
+//! then it asserts what only an end-to-end run can: the session BOUND to the run
+//! the pending map is actually keyed by, and the agent got a scoped endpoint for
+//! THAT id without receiving the private signer.
 //!
 //! the duckfs checkout and the workspace commit are not the subject: their actor
 //! traffic is answered by the same stand-in the plane tests use. the `runs` ops
@@ -31,8 +32,6 @@ use std::time::Duration;
 
 use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::Signer as _;
 use commonware_runtime::{Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
@@ -386,7 +385,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             "the bound key is the one the provisioner minted"
         );
 
-        // and the AGENT was told the same id: the MCP server stamps this var onto
+        // The agent was told the same id: the MCP server stamps this var onto
         // every RunsMsg::AgentAction, so a host-local id here would make every
         // mid-run write name a run that does not exist. the bind is the LAST
         // actor call a provision makes, so the model call is still landing — wait
@@ -407,18 +406,19 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             Some(run_id.as_str()),
             "the run id in the agent's environment is the consensus one"
         );
-        let key_hex = ctx
-            .env
-            .get("DUCKTAPE_RUN_SESSION_KEY")
-            .expect("the agent holds the session's private half");
-        let seed = duckfs_core::from_hex_32(key_hex).expect("lowercase hex");
-        let public = commonware_cryptography::ed25519::PrivateKey::decode(seed.as_slice())
-            .expect("32 bytes decode")
-            .public_key();
+        assert!(
+            !ctx.env.contains_key("DUCKTAPE_RUN_SESSION_KEY"),
+            "the child never receives the private session key"
+        );
+        assert!(
+            ctx.env
+                .get("DUCKTAPE_RUN_ACTION_URL")
+                .is_some_and(|url| url.ends_with("/v1/run-action")),
+            "the child receives only the narrow action endpoint"
+        );
         assert_eq!(
-            public.as_ref().to_vec(),
-            sessions[0].session_key,
-            "the key the agent signs with is the key consensus bound — one credential"
+            ctx.env.get("DUCKTAPE_RUN_ACTION_TOKEN").map(String::len),
+            Some(64)
         );
     });
 }
