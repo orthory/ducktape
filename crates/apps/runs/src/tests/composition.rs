@@ -388,7 +388,10 @@ fn a_file_ref_in_the_trigger_message_injects_the_attachment_text() {
             b"# Handoff\nrun the flaky gate twice",
         )
         // non-utf8 bytes = an image; named, never inlined.
-        .with_file("/shared/attachments/u2/shot.png", &[0x89, 0x50, 0x4e, 0xff, 0xfe]);
+        .with_file(
+            "/shared/attachments/u2/shot.png",
+            &[0x89, 0x50, 0x4e, 0xff, 0xfe],
+        );
     let prepared = block_on(m.prepare_dispatch(
         &ctx,
         &agent,

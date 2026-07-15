@@ -49,7 +49,8 @@ fn start_parent(registry: &Registry) -> (RunsModule, String) {
 
 #[test]
 fn final_response_stages_one_bounded_child_wave_with_parent_context() {
-    let registry = delegation_registry(2);
+    let mut registry = delegation_registry(2);
+    registry.get_mut("child-a").unwrap().caps.subagent_budget = 2;
     assert!(registry["bot"].skills.is_empty());
     let mut module = watched(TurnPolicy::Mention, &registry);
     let transcript = vec![
@@ -152,9 +153,20 @@ fn final_response_stages_one_bounded_child_wave_with_parent_context() {
     commit(&mut module);
     assert!(get_pending(&module, &parent_run).is_none());
     for child in ["child-a", "child-b"] {
-        let pending = get_pending(&module, &run_id_for("general", 2, child)).unwrap();
+        let child_run = run_id_for("general", 2, child);
+        let pending = get_pending(&module, &child_run).unwrap();
         assert_eq!(pending.thread_root, Some(1));
         assert_eq!(pending.requester, SagaOrigin::Module("tagging".into()));
+        assert_eq!(
+            module.pending[&dispatch_id_for(&child_run)]
+                .authority
+                .as_ref()
+                .unwrap()
+                .caps
+                .subagent_budget,
+            0,
+            "the compatibility lane cannot escape root-wide live-call accounting"
+        );
     }
     let ChatMsg::PostMessage { thread, .. } = &ctx.chat_msgs()[0] else {
         panic!("expected the parent reply")
@@ -166,11 +178,6 @@ fn final_response_stages_one_bounded_child_wave_with_parent_context() {
 fn invalid_delegation_batches_fail_without_staging_any_child() {
     for case in [
         "inactive",
-        "cross-owner",
-        "different-capability",
-        "unreadable-skill",
-        "authority-escalation",
-        "nested",
         "duplicate",
         "over-budget",
         "over-hard-cap",
@@ -188,32 +195,6 @@ fn invalid_delegation_batches_fail_without_staging_any_child() {
                     request("child-a", "valid first"),
                     request("child-b", "paused"),
                 ]
-            }
-            "cross-owner" => {
-                registry.get_mut("child-a").unwrap().owner = SagaOrigin::External(vec![8; 32]);
-                vec![request("child-a", "cross owner")]
-            }
-            "different-capability" => {
-                registry.get_mut("child-a").unwrap().capability = "model-2".into();
-                vec![request("child-a", "other runtime")]
-            }
-            "unreadable-skill" => {
-                registry.get_mut("child-a").unwrap().skills[0].source_prefix =
-                    "/private/specialist".into();
-                vec![request("child-a", "unreadable specialist")]
-            }
-            "authority-escalation" => {
-                registry
-                    .get_mut("child-a")
-                    .unwrap()
-                    .caps
-                    .forge_push
-                    .push("app".into());
-                vec![request("child-a", "push")]
-            }
-            "nested" => {
-                registry.get_mut("child-a").unwrap().caps.subagent_budget = 1;
-                vec![request("child-a", "nest")]
             }
             "duplicate" => vec![request("child-a", "one"), request("child-a", "two")],
             "over-budget" => {
@@ -474,7 +455,11 @@ fn delegation_is_final_only_and_limited_to_chat_or_forge() {
         ..AgentResponse::default()
     };
     let entry = |channel_id: String, job_id: Option<String>| PendingState {
+        run_id: "parent".into(),
         agent_id: "bot".into(),
+        workspace_agent_id: "bot".into(),
+        authority: None,
+        delegation_id: None,
         channel_id,
         anchor_seq: 2,
         thread_root: None,
@@ -492,7 +477,7 @@ fn delegation_is_final_only_and_limited_to_chat_or_forge() {
         response(),
     ))
     .unwrap_err();
-    assert!(session.contains("final-only"), "{session}");
+    assert!(session.contains("compatibility-only"), "{session}");
 
     let forge = block_on(module.validate_response(
         &ctx,

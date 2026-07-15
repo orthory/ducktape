@@ -38,6 +38,26 @@ impl RunsModule {
         }
     }
 
+    /// The live registry record narrowed by this run's admission ceiling.
+    /// Ordinary runs have no ceiling. Delegated runs re-intersect on every
+    /// read so a later owner revocation narrows authority immediately while a
+    /// later widening cannot escape what the caller originally granted.
+    pub(super) async fn agent_for_run(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+    ) -> Result<Option<AgentRecord>, String> {
+        Ok(self
+            .agent_record(ctx, &entry.agent_id)
+            .await?
+            .map(|record| {
+                entry
+                    .authority
+                    .as_ref()
+                    .map_or(record.clone(), |authority| authority.apply(&record))
+            }))
+    }
+
     /// the record, but only while the agent may engage new runs.
     pub(super) async fn active_agent(
         &self,
@@ -416,6 +436,37 @@ impl RunsModule {
         prepared: PreparedDispatch,
         demands: BTreeMap<String, u64>,
     ) {
+        let workspace_agent_id = agent_id.clone();
+        self.stage_scoped_dispatch_run(
+            ctx,
+            run_id,
+            agent_id,
+            workspace_agent_id,
+            channel_id,
+            anchor_seq,
+            requester,
+            prepared,
+            demands,
+            None,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_scoped_dispatch_run(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        agent_id: String,
+        workspace_agent_id: String,
+        channel_id: String,
+        anchor_seq: u64,
+        requester: SagaOrigin,
+        prepared: PreparedDispatch,
+        demands: BTreeMap<String, u64>,
+        authority: Option<super::RunAuthority>,
+        delegation_id: Option<String>,
+    ) {
         let now = ctx.env().consensus_time;
         let dispatch_id = dispatch_id_for(run_id);
         ctx.emit_msg(Msg {
@@ -431,7 +482,11 @@ impl RunsModule {
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {
+                run_id: run_id.to_string(),
+                workspace_agent_id,
                 agent_id,
+                authority,
+                delegation_id,
                 channel_id,
                 anchor_seq,
                 thread_root: prepared.thread_root,

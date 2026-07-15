@@ -124,6 +124,7 @@ pub(super) async fn provision(
         source: spec.source.clone(),
         env,
         context_doc,
+        _session: session,
     }))
 }
 
@@ -140,6 +141,8 @@ struct NodedWorkspace {
     /// the run's assembled soul — its `always` skills inlined, the rest indexed.
     /// `None` when the agent curated no skills. capability-host delivers it.
     context_doc: Option<String>,
+    /// Owns the scoped signer endpoint for exactly as long as the workspace.
+    _session: Option<super::session::RunSession>,
 }
 
 impl NodedWorkspace {

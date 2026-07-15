@@ -196,6 +196,11 @@ impl RunsModule {
                 session_key,
             } => self.open_agent_session(ctx, run_id, session_key).await,
             RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
+            RunsMsg::DelegateRun {
+                run_id,
+                request_id,
+                request,
+            } => self.delegate_run(ctx, run_id, request_id, request).await,
         }
     }
 }

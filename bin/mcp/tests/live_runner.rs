@@ -63,12 +63,8 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     let prompt = "Use the ducktape MCP tools. First call ducktape_whoami. Then call \
                   ducktape_task_create with the title: live-proof. Then reply with the word \
                   DONE and nothing else.";
-    // a session key bound to no live run — this harness dispatches none. so the
-    // write MUST be refused, and refused by `runs` in consensus rather than by
-    // the tool server. that is the whole chain under test: a real runner spawns
-    // the real binary, which signs a real frame, which crosses the real router
-    // into the real module, which says no.
-    const SEED: [u8; 32] = [55u8; 32];
+    // This harness dispatches no run, so it supplies an unavailable scoped
+    // endpoint. The runner must surface the refusal and never fall back.
 
     let out = Command::new("claude")
         .args([
@@ -88,7 +84,14 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
         .env("PATH", &path)
         .env("DUCKTAPE_NODE", h.node_url())
         .env("DUCKTAPE_RUN_AGENT", AGENT_ID)
-        .env("DUCKTAPE_RUN_SESSION_KEY", support::hex(&SEED))
+        .env(
+            "DUCKTAPE_RUN_ACTION_URL",
+            "http://127.0.0.1:9/v1/run-action",
+        )
+        .env(
+            "DUCKTAPE_RUN_ACTION_TOKEN",
+            "abababababababababababababababababababababababababababababababab",
+        )
         .env("DUCKTAPE_RUN_ID", "no-such-saga:0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

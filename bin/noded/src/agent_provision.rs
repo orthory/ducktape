@@ -217,11 +217,9 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// second, unversioned copy that drifts from the record it came from the moment
 /// the registry moves. the committed record is the one truth.
 ///
-/// `DUCKTAPE_RUN_SESSION_KEY` + `DUCKTAPE_RUN_ID` are the WRITE half of the tool
-/// plane, and they appear together or not at all: the key signs the op, the run
-/// id says which session it belongs to, and neither is any use alone. absent =
-/// no session opened ([`session::open`]) = the read-only plane, which is the
-/// pre-session behaviour and never an error.
+/// `DUCKTAPE_RUN_ACTION_URL` + `DUCKTAPE_RUN_ACTION_TOKEN` + `DUCKTAPE_RUN_ID`
+/// are the write half of the tool plane. The endpoint signs only the two Runs
+/// messages scoped to this live run; the private key never enters child env.
 ///
 /// `DUCKTAPE_RUN_ID` is the session's own [`session::RunSession::run_id`] — the
 /// CONSENSUS run id, the only id space `runs` resolves. it is deliberately NOT
@@ -230,13 +228,6 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// host-local id here would make every mid-run write name a run that does not
 /// exist — which is exactly how the write plane came to be dead-on-arrival.
 ///
-/// the key is the agent's PRIVATE half, in a process the agent can read — a
-/// BEARER CREDENTIAL, not a least-privilege token. it can sign any `Msg` to any
-/// module, and consensus only re-checks the grant on the `AgentAction` lane; a
-/// leaked key posts to open channels as a plain user, run or no run. what
-/// contains it is the run's SANDBOX (no network), not its authority — see
-/// [`session`]. the NODE key, which signs validator votes and every op the human
-/// makes, must never be here at all.
 fn run_env(
     dir: &Path,
     ro_dir: Option<&Path>,
@@ -258,9 +249,10 @@ fn run_env(
         env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
     }
     if let Some(session) = session {
+        env.insert(session::ENV_ACTION_URL.into(), session.action_url.clone());
         env.insert(
-            "DUCKTAPE_RUN_SESSION_KEY".into(),
-            session.private_hex.clone(),
+            session::ENV_ACTION_TOKEN.into(),
+            session.action_token.clone(),
         );
         env.insert("DUCKTAPE_RUN_ID".into(), session.run_id.clone());
     }

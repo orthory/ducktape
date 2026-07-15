@@ -1,7 +1,10 @@
 use super::{
-    AgentSession, BTreeMap, Digest, Error, MAX_ACTIONS_PER_SESSION, PendingState,
-    RUN_KEY_SEPARATOR, SESSION_KEY_LEN, SagaOrigin, Sha256, StateRoot, TurnPolicy, dispatch_id_for,
+    AgentSession, BTreeMap, DelegationState, DelegationStatus, Digest, Error,
+    MAX_ACTIONS_PER_SESSION, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_PER_RUN,
+    PendingState, RUN_KEY_SEPARATOR, RunAuthority, SESSION_KEY_LEN, SagaOrigin, Sha256, StateRoot,
+    TurnPolicy, delegation_id_for, dispatch_id_for,
 };
+use serde::de::DeserializeOwned;
 
 // ---- canonical encoding -------------------------------------------------------
 // u64-le counts, sorted keys, every field in declaration order: u64-le length
@@ -36,6 +39,19 @@ fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
     }
 }
 
+fn put_opt_json<T: serde::Serialize>(out: &mut Vec<u8>, opt: &Option<T>) {
+    match opt {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            put_bytes(
+                out,
+                &serde_json::to_vec(value).expect("committed state serializes"),
+            );
+        }
+    }
+}
+
 fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
     match origin {
         SagaOrigin::External(key) => {
@@ -54,6 +70,7 @@ pub(super) fn encode_committed(
     watches: &BTreeMap<String, TurnPolicy>,
     pending: &BTreeMap<String, PendingState>,
     sessions: &BTreeMap<String, AgentSession>,
+    delegations: &BTreeMap<String, DelegationState>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -74,7 +91,11 @@ pub(super) fn encode_committed(
     out.extend_from_slice(&(pending.len() as u64).to_le_bytes());
     for (dispatch_id, p) in pending {
         put_bytes(&mut out, dispatch_id.as_bytes());
+        put_bytes(&mut out, p.run_id.as_bytes());
         put_bytes(&mut out, p.agent_id.as_bytes());
+        put_bytes(&mut out, p.workspace_agent_id.as_bytes());
+        put_opt_json(&mut out, &p.authority);
+        put_opt_string(&mut out, &p.delegation_id);
         put_bytes(&mut out, p.channel_id.as_bytes());
         out.extend_from_slice(&p.anchor_seq.to_le_bytes());
         put_opt_u64(&mut out, p.thread_root);
@@ -97,6 +118,15 @@ pub(super) fn encode_committed(
         out.extend_from_slice(&u64::from(s.actions).to_le_bytes());
     }
 
+    out.extend_from_slice(&(delegations.len() as u64).to_le_bytes());
+    for (delegation_id, delegation) in delegations {
+        put_bytes(&mut out, delegation_id.as_bytes());
+        put_bytes(
+            &mut out,
+            &serde_json::to_vec(delegation).expect("delegation state serializes"),
+        );
+    }
+
     out
 }
 
@@ -107,8 +137,9 @@ pub(super) fn committed_root(
     watches: &BTreeMap<String, TurnPolicy>,
     pending: &BTreeMap<String, PendingState>,
     sessions: &BTreeMap<String, AgentSession>,
+    delegations: &BTreeMap<String, DelegationState>,
 ) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(watches, pending, sessions)).into())
+    StateRoot(Sha256::digest(encode_committed(watches, pending, sessions, delegations)).into())
 }
 
 // ---- canonical decoding (UNTRUSTED input) ---------------------------------
@@ -171,6 +202,16 @@ fn take_opt_string(buf: &mut &[u8]) -> Result<Option<String>, String> {
     }
 }
 
+fn take_opt_json<T: DeserializeOwned>(buf: &mut &[u8]) -> Result<Option<T>, String> {
+    match take(buf, 1)?[0] {
+        0 => Ok(None),
+        1 => serde_json::from_slice(&take_lp_bytes(buf)?)
+            .map(Some)
+            .map_err(|error| format!("snapshot json value failed to decode: {error}")),
+        tag => Err(format!("snapshot has unknown option tag {tag}")),
+    }
+}
+
 fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
     match take(buf, 1)?[0] {
         0 => Ok(SagaOrigin::External(take_lp_bytes(buf)?)),
@@ -225,6 +266,15 @@ fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), S
     if contains_run_separator(&p.agent_id) {
         return Err("snapshot agent_id contains reserved unit separator".into());
     }
+    if p.run_id.is_empty() {
+        return Err("snapshot pending run id is empty".into());
+    }
+    if contains_run_separator(&p.workspace_agent_id) {
+        return Err("snapshot workspace agent id contains reserved unit separator".into());
+    }
+    if p.delegation_id.is_some() && p.authority.is_none() {
+        return Err("snapshot delegated run has an edge without scoped authority".into());
+    }
     match &p.job_id {
         Some(job_id) => {
             if contains_run_separator(job_id) {
@@ -245,6 +295,59 @@ fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), S
     }
     if dispatch_id != dispatch_id_for(&p.run_id()) {
         return Err("snapshot dispatch id does not match its run fields".into());
+    }
+    Ok(())
+}
+
+fn validate_decoded_delegations(
+    pending: &BTreeMap<String, PendingState>,
+    delegations: &BTreeMap<String, DelegationState>,
+) -> Result<(), String> {
+    let mut roots = BTreeMap::<&str, usize>::new();
+    for (id, state) in delegations {
+        let view = &state.view;
+        if id != &view.delegation_id
+            || id != &delegation_id_for(&view.caller_run_id, &view.request_id)
+        {
+            return Err("snapshot delegation id does not match its caller request".into());
+        }
+        if view.request_id.is_empty()
+            || view.request_id.len() > MAX_DELEGATION_REQUEST_ID_BYTES
+            || contains_run_separator(&view.request_id)
+        {
+            return Err("snapshot delegation request id is invalid".into());
+        }
+        if view.callee_agent_id != state.request.agent_id {
+            return Err("snapshot delegation callee does not match its request".into());
+        }
+        if !pending.contains_key(&dispatch_id_for(&view.root_run_id)) {
+            return Err("snapshot delegation root is not in flight".into());
+        }
+        if view.status == DelegationStatus::Pending {
+            let child = pending
+                .get(&dispatch_id_for(&view.callee_run_id))
+                .ok_or_else(|| "snapshot pending delegation has no callee run".to_string())?;
+            if child.delegation_id.as_deref() != Some(id.as_str()) {
+                return Err("snapshot callee run points at a different delegation".into());
+            }
+        }
+        *roots.entry(&view.root_run_id).or_default() += 1;
+    }
+    if roots.values().any(|count| *count > MAX_DELEGATIONS_PER_RUN) {
+        return Err("snapshot delegation tree exceeds its hard budget".into());
+    }
+    for pending_run in pending.values() {
+        let Some(id) = pending_run.delegation_id.as_deref() else {
+            continue;
+        };
+        let edge = delegations
+            .get(id)
+            .ok_or_else(|| "snapshot delegated run names no call edge".to_string())?;
+        if edge.view.status != DelegationStatus::Pending
+            || edge.view.callee_run_id != pending_run.run_id
+        {
+            return Err("snapshot delegated run does not match its pending call edge".into());
+        }
     }
     Ok(())
 }
@@ -280,6 +383,7 @@ type Committed = (
     BTreeMap<String, TurnPolicy>,
     BTreeMap<String, PendingState>,
     BTreeMap<String, AgentSession>,
+    BTreeMap<String, DelegationState>,
 );
 
 pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
@@ -288,8 +392,9 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // option tags, claim height, origin discriminant, and created_at; a session
     // its three length prefixes, opened_at, and the action counter.
     const MIN_WATCH_BYTES: u64 = 8 + 1;
-    const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
+    const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
     const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8;
+    const MIN_DELEGATION_BYTES: u64 = 8 + 8;
 
     let mut watches: BTreeMap<String, TurnPolicy> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_WATCH_BYTES, "watch")?;
@@ -312,7 +417,11 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     let count = take_count(&mut buf, MIN_PENDING_BYTES, "pending")?;
     for _ in 0..count {
         let dispatch_id = take_lp_string(&mut buf)?;
+        let run_id = take_lp_string(&mut buf)?;
         let agent_id = take_lp_string(&mut buf)?;
+        let workspace_agent_id = take_lp_string(&mut buf)?;
+        let authority = take_opt_json::<RunAuthority>(&mut buf)?;
+        let delegation_id = take_opt_string(&mut buf)?;
         let channel_id = take_lp_string(&mut buf)?;
         let anchor_seq = take_u64(&mut buf)?;
         let thread_root = take_opt_u64(&mut buf)?;
@@ -321,7 +430,11 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         let requester = take_origin(&mut buf)?;
         let created_at = take_u64(&mut buf)?;
         let entry = PendingState {
+            run_id,
             agent_id,
+            workspace_agent_id,
+            authority,
+            delegation_id,
             channel_id,
             anchor_seq,
             thread_root,
@@ -354,8 +467,18 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         insert_ascending(&mut sessions, run_id, session)?;
     }
 
+    let mut delegations: BTreeMap<String, DelegationState> = BTreeMap::new();
+    let count = take_count(&mut buf, MIN_DELEGATION_BYTES, "delegation")?;
+    for _ in 0..count {
+        let id = take_lp_string(&mut buf)?;
+        let state: DelegationState = serde_json::from_slice(&take_lp_bytes(&mut buf)?)
+            .map_err(|error| format!("snapshot delegation failed to decode: {error}"))?;
+        insert_ascending(&mut delegations, id, state)?;
+    }
+    validate_decoded_delegations(&pending, &delegations)?;
+
     if !buf.is_empty() {
         return Err("snapshot has trailing bytes".into());
     }
-    Ok((watches, pending, sessions))
+    Ok((watches, pending, sessions, delegations))
 }

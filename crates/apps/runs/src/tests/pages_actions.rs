@@ -124,7 +124,12 @@ fn comment_effect(target: &str) -> serde_json::Value {
 }
 
 fn deliver(m: &mut RunsModule, ctx: &mut CaptureCtx, run_id: &str, facets: serde_json::Value) {
-    exec(m, ctx, &result_event(run_id, Ok(runner_wrapper("done", facets)))).unwrap();
+    exec(
+        m,
+        ctx,
+        &result_event(run_id, Ok(runner_wrapper("done", facets))),
+    )
+    .unwrap();
 }
 
 /// the run's terminal record after commit — the "run DELIVERS" assertion.
@@ -233,7 +238,11 @@ fn an_ungranted_pages_action_degrades_instead_of_failing_the_run() {
 #[test]
 fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
     let (mut m, registry, run_id) = awaiting_pages_run(
-        &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED],
+        &[
+            ACTION_CHAT_POST,
+            ACTION_PAGES_COMMENT,
+            ACTION_PAGES_SET_CHECKED,
+        ],
         &["*"],
     );
     let mut ctx = delivery_ctx(&registry);
@@ -260,10 +269,15 @@ fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
     ));
     let notes = ctx.notes();
     assert!(
-        notes.iter().any(|n| n.contains("target does not exist: ghost")),
+        notes
+            .iter()
+            .any(|n| n.contains("target does not exist: ghost")),
         "{notes:?}"
     );
-    assert!(notes.iter().any(|n| n.contains("comment body is empty")), "{notes:?}");
+    assert!(
+        notes.iter().any(|n| n.contains("comment body is empty")),
+        "{notes:?}"
+    );
     assert_delivered(&mut m, &run_id);
 }
 

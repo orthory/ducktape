@@ -121,8 +121,8 @@ use agent::{
     ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery,
     AgentRecord, AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
     MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock, SkillRef,
-    decode_event as agent_decode_event, decode_reply as agent_decode_reply,
+    MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
+    ResourceCaps, SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query,
 };
 use chat::{
@@ -174,10 +174,10 @@ pub const RUN_LEASE_VIEWS: u64 = 1024;
 /// oracle attempts per run: one retry after an explicit provider failure.
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
-/// every delegated child requests this fixed sandbox profile. The owner's
-/// `subagent_budget` is therefore also the aggregate compute ceiling: budget N
-/// admits at most `min(N, 8)` children, `2*min(N, 8)` cores, and
-/// `4*min(N, 8)` GiB in one wave.
+/// every peer-call callee requests this fixed sandbox profile. One root call
+/// tree admits at most `min(root_budget, 8)` callees in total, so the same cap
+/// bounds recursive delegated compute at `2*min(root_budget, 8)` cores and
+/// `4*min(root_budget, 8)` GiB.
 pub const DELEGATED_CHILD_CORES: u64 = 2;
 pub const DELEGATED_CHILD_MEM_GB: u64 = 4;
 
@@ -254,6 +254,9 @@ pub fn reply_message_id(run_id: &str) -> String {
 pub(crate) enum Lane {
     /// the settle path: the nth action of the run's delivered response.
     Settle,
+    /// A callee's terminal response is returned to its live caller rather than
+    /// posted as another answer in the user's chat thread.
+    DelegatedSettle,
     /// the session lane: the nth action of the run's open agent session.
     Session(u32),
 }
@@ -262,7 +265,7 @@ impl Lane {
     /// the id salt of the action at `index` in this lane's action list.
     fn slot(self, index: usize) -> String {
         match self {
-            Lane::Settle => index.to_string(),
+            Lane::Settle | Lane::DelegatedSettle => index.to_string(),
             Lane::Session(actions) => format!("s{actions}"),
         }
     }
@@ -289,6 +292,27 @@ pub(crate) fn recipe_id_for(agent_id: &str) -> String {
 /// dispatch id cap; the pending map is keyed by it.
 pub fn dispatch_id_for(run_id: &str) -> String {
     hex(&Sha256::digest(run_id.as_bytes()))
+}
+
+/// Stable idempotency key for one caller-scoped agent call.
+pub fn delegation_id_for(caller_run_id: &str, request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ducktape/delegation/v1\0");
+    digest.update(caller_run_id.as_bytes());
+    digest.update([0]);
+    digest.update(request_id.as_bytes());
+    hex(&digest.finalize())
+}
+
+/// A delegated run is not another chat turn. Give it a distinct run id keyed
+/// by the call edge so the same peer may be called more than once in one turn.
+pub fn delegated_run_id_for(delegation_id: &str, callee_agent_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ducktape/delegated-run/v1\0");
+    digest.update(delegation_id.as_bytes());
+    digest.update([0]);
+    digest.update(callee_agent_id.as_bytes());
+    format!("delegate/{}", hex(&digest.finalize()))
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -348,7 +372,20 @@ use state::{
 /// result delivers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingState {
+    /// Explicit because delegated calls have their own idempotency-keyed run
+    /// ids rather than pretending to be another chat turn.
+    run_id: String,
     agent_id: String,
+    /// The root workspace inherited by a generic-chat call tree. Forge runs
+    /// already share their item branch, but keeping this explicit makes both
+    /// paths agree under nested calls.
+    workspace_agent_id: String,
+    /// `None` for an ordinary run. A callee stores the authority intersection
+    /// fixed when the call was admitted; later registry changes may narrow it
+    /// again, never widen it.
+    authority: Option<RunAuthority>,
+    /// The run-scoped call edge that created this entry.
+    delegation_id: Option<String>,
     /// empty for job-backed runs.
     channel_id: String,
     /// 0 for job-backed runs.
@@ -365,16 +402,37 @@ struct PendingState {
 }
 
 impl PendingState {
-    /// the run id these fields derive — chat- or job-keyed.
     fn run_id(&self) -> String {
-        match &self.job_id {
-            Some(job_id) => job_run_id_for(job_id, &self.agent_id, self.job_claim_height),
-            None => match page_thread_id(&self.channel_id) {
-                Some(thread_id) => page_run_id_for(thread_id, self.anchor_seq, &self.agent_id),
-                None => run_id_for(&self.channel_id, self.anchor_seq, &self.agent_id),
-            },
+        self.run_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RunAuthority {
+    allowed_actions: Vec<String>,
+    caps: ResourceCaps,
+}
+
+impl RunAuthority {
+    fn from_record(record: &AgentRecord) -> Self {
+        Self {
+            allowed_actions: record.allowed_actions.clone(),
+            caps: record.caps.clone(),
         }
     }
+
+    fn apply(&self, record: &AgentRecord) -> AgentRecord {
+        let mut ceiling = record.clone();
+        ceiling.allowed_actions = self.allowed_actions.clone();
+        ceiling.caps = self.caps.clone();
+        ceiling.scoped_for_call(record)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DelegationState {
+    view: DelegationView,
+    request: DelegationRequest,
 }
 
 /// a chat run's read-only dispatch preparation: the pinned context plus the
@@ -433,6 +491,10 @@ pub struct RunsModule {
     /// be the same on all of them. bounded by the pending runs — a session is
     /// pruned in the same block as its run's entry and can never outlive it.
     sessions: BTreeMap<String, AgentSession>,
+    /// ephemeral run-scoped call edges and their returned results. They are
+    /// committed because admission, budget and result collection must replay
+    /// identically, but a root run's settlement prunes its whole tree.
+    delegations: BTreeMap<String, DelegationState>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
     /// `commit_block`. a watch stages `None` for removal (unwatch); a pending
@@ -440,6 +502,7 @@ pub struct RunsModule {
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
     pending_sessions: BTreeMap<String, Option<AgentSession>>,
+    pending_delegations: BTreeMap<String, Option<DelegationState>>,
     /// the delivered-runs ring (last [`RUN_HISTORY_CAP`], oldest first —
     /// queries serve it reversed). DERIVED state: recorded at delivery,
     /// rebuilt by replay, never in `root()`/snapshot, empty after a
@@ -504,9 +567,11 @@ impl RunsModule {
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            delegations: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
             pending_sessions: BTreeMap::new(),
+            pending_delegations: BTreeMap::new(),
             history: VecDeque::new(),
             pending_history: Vec::new(),
         }
@@ -587,6 +652,17 @@ impl RunsModule {
         }
     }
 
+    fn delegation(&self, delegation_id: &str) -> Option<&DelegationState> {
+        match self.pending_delegations.get(delegation_id) {
+            Some(staged) => staged.as_ref(),
+            None => self.delegations.get(delegation_id),
+        }
+    }
+
+    fn delegation_ids(&self) -> Vec<String> {
+        Self::visible_ids(&self.delegations, &self.pending_delegations)
+    }
+
     fn visible_ids<'a, V, W>(
         committed: &'a BTreeMap<String, V>,
         pending: &'a BTreeMap<String, W>,
@@ -658,7 +734,12 @@ impl RunsModule {
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
     pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.watches, &self.pending, &self.sessions)
+        encode_committed(
+            &self.watches,
+            &self.pending,
+            &self.sessions,
+            &self.delegations,
+        )
     }
 
     /// adopt a peer's snapshot as own committed state — but only after the
@@ -669,8 +750,9 @@ impl RunsModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (watches, pending, sessions) = decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&watches, &pending, &sessions) != expected {
+        let (watches, pending, sessions, delegations) =
+            decode_committed(bytes).map_err(Error::Module)?;
+        if committed_root(&watches, &pending, &sessions, &delegations) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
             ));
@@ -678,9 +760,11 @@ impl RunsModule {
         self.watches = watches;
         self.pending = pending;
         self.sessions = sessions;
+        self.delegations = delegations;
         self.pending_watches.clear();
         self.pending_overlay.clear();
         self.pending_sessions.clear();
+        self.pending_delegations.clear();
         // the ring is derived per-node state: a snapshot describes a block
         // boundary this node never executed, so its history starts empty.
         self.history.clear();

@@ -5706,8 +5706,6 @@ dependencies = [
  "agent",
  "base64 0.22.1",
  "chat",
- "commonware-codec",
- "commonware-cryptography",
  "dispatch",
  "forge",
  "futures",

@@ -9,11 +9,11 @@ impl Module for RunsModule {
         self.id.clone()
     }
 
-    // Revision 2 added the committed agent-session section after watches and
-    // pending runs. Revision 1 snapshots end there and must clean-break before
-    // install rather than surfacing the misleading `snapshot truncated` error.
+    // Revision 3 makes pending run ids explicit and adds ephemeral delegation
+    // authority/results. Older snapshots clean-break at the coordinated module
+    // activation boundary instead of being mis-decoded under the new layout.
     fn state_schema_revision(&self) -> u32 {
-        2
+        3
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
@@ -24,7 +24,12 @@ impl Module for RunsModule {
     /// mid-run ACL and every validator must hold the same one. the preimage IS
     /// the snapshot encoding.
     fn root(&self) -> StateRoot {
-        committed_root(&self.watches, &self.pending, &self.sessions)
+        committed_root(
+            &self.watches,
+            &self.pending,
+            &self.sessions,
+            &self.delegations,
+        )
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -107,6 +112,16 @@ impl Module for RunsModule {
                     .collect();
                 Ok(encode_reply(&RunsReply::AgentSessions(sessions)))
             }
+            RunsQuery::Delegations { caller_run_id } => {
+                let delegations = self
+                    .delegation_ids()
+                    .into_iter()
+                    .filter_map(|id| self.delegation(&id))
+                    .filter(|state| state.view.caller_run_id == caller_run_id)
+                    .map(|state| state.view.clone())
+                    .collect();
+                Ok(encode_reply(&RunsReply::Delegations(delegations)))
+            }
         }
     }
 
@@ -141,6 +156,16 @@ impl Module for RunsModule {
                 }
             }
         }
+        for (id, staged) in std::mem::take(&mut self.pending_delegations) {
+            match staged {
+                Some(delegation) => {
+                    self.delegations.insert(id, delegation);
+                }
+                None => {
+                    self.delegations.remove(&id);
+                }
+            }
+        }
         for record in std::mem::take(&mut self.pending_history) {
             self.history.push_back(record);
             if self.history.len() > super::RUN_HISTORY_CAP {
@@ -154,6 +179,7 @@ impl Module for RunsModule {
         self.pending_watches.clear();
         self.pending_overlay.clear();
         self.pending_sessions.clear();
+        self.pending_delegations.clear();
         self.pending_history.clear();
         Ok(())
     }

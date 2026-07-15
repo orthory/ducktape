@@ -127,7 +127,11 @@ impl RunsModule {
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {
+                run_id: run_id.clone(),
+                workspace_agent_id: agent_id.to_string(),
                 agent_id: agent_id.to_string(),
+                authority: None,
+                delegation_id: None,
                 channel_id: String::new(),
                 anchor_seq: 0,
                 thread_root: None,

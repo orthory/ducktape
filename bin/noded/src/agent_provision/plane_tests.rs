@@ -12,8 +12,6 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::Signer as _;
 use dispatch_oracle::{RoMount, WorkspaceProvisioner as _, WorkspaceSource, WorkspaceSpec};
 use duckfs_client::chunk::{chunk_ids, file_object_id};
 use duckfs_core::{
@@ -86,6 +84,7 @@ pub(super) fn spawn_files_actor(
 /// submitted, so a test asserts against the wire and not against its own belief
 /// about it.
 pub(super) type SessionBinds = std::sync::Arc<std::sync::Mutex<Vec<runs::RunsMsg>>>;
+type SessionActions = std::sync::Arc<std::sync::Mutex<Vec<(sdk::Origin, runs::RunsMsg)>>>;
 
 /// a stand-in actor for the SESSION lane: it records every op the provisioner
 /// submits and answers it with `bind` — `Ok` for the node that holds the run's
@@ -95,9 +94,11 @@ pub(super) type SessionBinds = std::sync::Arc<std::sync::Mutex<Vec<runs::RunsMsg
 fn spawn_session_actor(
     mut rx: futures::channel::mpsc::Receiver<NodeCommand>,
     bind: Result<(), &'static str>,
-) -> (tokio::task::JoinHandle<()>, SessionBinds) {
+) -> (tokio::task::JoinHandle<()>, SessionBinds, SessionActions) {
     let binds: SessionBinds = Default::default();
     let seen = binds.clone();
+    let actions: SessionActions = Default::default();
+    let seen_actions = actions.clone();
     let actor = tokio::spawn(async move {
         while let Some(cmd) = rx.next().await {
             match cmd {
@@ -116,11 +117,20 @@ fn spawn_session_actor(
                 NodeCommand::Query { req, reply, .. } => {
                     let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
                 }
+                NodeCommand::SubmitFrame { frame, reply } => {
+                    let (origin, msg) = node::decode_frame(&frame).expect("a valid action frame");
+                    assert_eq!(msg.target, "runs");
+                    seen_actions.lock().unwrap().push((
+                        origin,
+                        runs::decode_msg(&msg.payload).expect("a runs action"),
+                    ));
+                    let _ = reply.send(Ok(committed_block()));
+                }
                 _ => panic!("the stand-in session actor got an unexpected command"),
             }
         }
     });
-    (actor, binds)
+    (actor, binds, actions)
 }
 
 pub(super) fn committed_block() -> crate::BlockSummary {
@@ -342,10 +352,10 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
 // ---- the agent session key --------------------------------------------------
 
 #[tokio::test]
-async fn an_agent_run_gets_a_fresh_session_key_whose_public_half_is_what_was_bound() {
+async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_side() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
-    let (_actor, binds) = spawn_session_actor(rx, Ok(()));
+    let (_actor, binds, actions) = spawn_session_actor(rx, Ok(()));
 
     let ws = NodedProvisioner::new(handle, tmp.path())
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
@@ -353,24 +363,25 @@ async fn an_agent_run_gets_a_fresh_session_key_whose_public_half_is_what_was_bou
         .expect("provision");
     let env = ws.env();
 
-    // BOTH vars or neither: the key signs the op, the run id says which session
-    // it belongs to. the id is the CONSENSUS one — the MCP server stamps this
-    // var onto every AgentAction, so the host-local `{saga_id}:{attempt}` here
-    // would make every mid-run write name a run that does not exist.
-    let key_hex = env
-        .get("DUCKTAPE_RUN_SESSION_KEY")
-        .expect("an agent run holds a session key");
+    assert!(
+        !env.contains_key("DUCKTAPE_RUN_SESSION_KEY"),
+        "the private session key must never enter the child environment"
+    );
     assert_eq!(
         env.get("DUCKTAPE_RUN_ID").map(String::as_str),
         Some(consensus_run_id().as_str()),
         "the run the AGENT names is the one runs resolves, never the spec's dir key"
     );
-    assert_eq!(key_hex.len(), 64, "32 bytes of lowercase hex");
-    let seed = duckfs_core::from_hex_32(key_hex).expect("the key is lowercase hex");
+    let action_url = env
+        .get("DUCKTAPE_RUN_ACTION_URL")
+        .expect("an agent run gets a scoped action endpoint");
+    let action_token = env
+        .get("DUCKTAPE_RUN_ACTION_TOKEN")
+        .expect("an agent run gets a scoped action token");
+    assert!(action_url.starts_with("http://127.0.0.1:"));
+    assert!(action_url.ends_with("/v1/run-action"));
+    assert_eq!(action_token.len(), 64);
 
-    // THE invariant: what consensus was asked to bind is the PUBLIC half of the
-    // key the run holds — a bind of anything else would authorize a key nobody
-    // can sign with, and the agent's ops would be refused for the rest of the run.
     let bound = match binds.lock().unwrap().as_slice() {
         [
             runs::RunsMsg::OpenAgentSession {
@@ -388,26 +399,115 @@ async fn an_agent_run_gets_a_fresh_session_key_whose_public_half_is_what_was_bou
         other => panic!("expected exactly one session bind, got {other:?}"),
     };
     assert_eq!(bound.len(), runs::SESSION_KEY_LEN);
-    let public = commonware_cryptography::ed25519::PrivateKey::decode(seed.as_slice())
-        .expect("32 bytes decode")
-        .public_key();
-    assert_eq!(
-        bound,
-        public.as_ref().to_vec(),
-        "the bound key is the pair of the private key handed to the run"
-    );
 
-    // and the NODE key is nowhere near the run: only the session key, which can
-    // do exactly what this agent may already do, for this run, until it settles.
+    let wrong_token = post_action(
+        action_url,
+        &"cd".repeat(32),
+        &serde_json::json!({"message":{"agent_action":{
+            "run_id": consensus_run_id(),
+            "action":{"create_task":{"task_id":"task-0", "title":"no"}},
+        }}}),
+    )
+    .await;
+    assert_eq!(wrong_token, 401);
+
+    let wrong_run = post_action(
+        action_url,
+        action_token,
+        &serde_json::json!({"message":{"agent_action":{
+            "run_id": "another-run",
+            "action":{"create_task":{"task_id":"task-0", "title":"no"}},
+        }}}),
+    )
+    .await;
+    assert_eq!(wrong_run, 403);
+
+    let out_of_scope = post_action(
+        action_url,
+        action_token,
+        &serde_json::json!({"message":{"open_agent_session":{
+            "run_id": consensus_run_id(),
+            "session_key": vec![0; runs::SESSION_KEY_LEN],
+        }}}),
+    )
+    .await;
+    assert_eq!(out_of_scope, 403);
+    assert!(actions.lock().unwrap().is_empty());
+
+    let action = agent::AgentAction::CreateTask {
+        task_id: "task-1".into(),
+        title: "scoped".into(),
+    };
+    let accepted = post_action(
+        action_url,
+        action_token,
+        &serde_json::json!({"message":{"agent_action":{
+            "run_id": consensus_run_id(),
+            "action": action,
+        }}}),
+    )
+    .await;
+    assert_eq!(accepted, 200);
+    {
+        let submitted = actions.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(
+            submitted[0].0,
+            sdk::Origin::External(bound),
+            "the host signs with the public key consensus bound"
+        );
+        assert!(matches!(
+            &submitted[0].1,
+            runs::RunsMsg::AgentAction { run_id, .. } if run_id == &consensus_run_id()
+        ));
+    }
+
+    // Neither the node key nor the run's private session key enters the child;
+    // it receives only the run-scoped endpoint and bearer token.
     assert!(!env.contains_key("DUCKTAPE_NODE_KEY"));
     ws.cleanup().await;
+}
+
+async fn post_action(url: &str, token: &str, value: &serde_json::Value) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let address = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(address, _)| address)
+        .expect("loopback action url");
+    let body = value.to_string();
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect action endpoint");
+    stream
+        .write_all(
+            format!(
+                "POST /v1/run-action HTTP/1.1\r\nhost: {address}\r\ncontent-type: application/json\r\n\
+                 x-ducktape-run-action: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write action request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read action response");
+    String::from_utf8_lossy(&response)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("http status")
 }
 
 #[tokio::test]
 async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
-    let (_actor, binds) = spawn_session_actor(rx, Ok(()));
+    let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
 
     let ws = NodedProvisioner::new(handle, tmp.path())
         .provision(&duckfs_spec(None, Vec::new()))
@@ -428,7 +528,7 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
 async fn an_envelope_with_no_consensus_run_id_opens_no_session_and_submits_no_bind() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
-    let (_actor, binds) = spawn_session_actor(rx, Ok(()));
+    let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
 
     // a pre-field (or foreign) envelope: an AGENT run, but no run id consensus
     // would recognize. binding on the spec's own `{saga_id}:{attempt}` would ask
@@ -463,7 +563,7 @@ async fn a_refused_bind_degrades_to_a_read_only_plane_and_never_fails_the_run() 
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     // the shape of a node that is somehow not the run's committed lease-holder.
-    let (_actor, binds) = spawn_session_actor(rx, Err("runs: not the run's assignee"));
+    let (_actor, binds, _actions) = spawn_session_actor(rx, Err("runs: not the run's assignee"));
 
     // the run STILL provisions: a session is an additive capability, and losing
     // it must never cost the run its workspace (it can still return a response).

@@ -13,6 +13,7 @@ use pages::PageMsg;
 const ASSIGNEE: [u8; 32] = [0xab; 32];
 /// the ephemeral session key the assignee mints for one run.
 const SESSION_KEY: [u8; 32] = [0xcd; 32];
+const CHILD_SESSION_KEY: [u8; 32] = [0xde; 32];
 
 /// a pages-wired module with one in-flight run for "bot" (granted `actions`,
 /// pages_write = `caps`), plus the registry and the run id.
@@ -52,6 +53,18 @@ fn act(run_id: &str, action: AgentAction) -> Msg {
     })
 }
 
+fn delegate(run_id: &str, request_id: &str, agent_id: &str, instruction: &str) -> Msg {
+    admin(&RunsMsg::DelegateRun {
+        run_id: run_id.into(),
+        request_id: request_id.into(),
+        request: DelegationRequest {
+            agent_id: agent_id.into(),
+            instruction: instruction.into(),
+            skills: Vec::new(),
+        },
+    })
+}
+
 fn comment(target: &str) -> AgentAction {
     AgentAction::AddPageComment {
         target: target.into(),
@@ -67,6 +80,17 @@ fn sessions(m: &RunsModule) -> Vec<AgentSession> {
     }
 }
 
+fn delegations(m: &RunsModule, caller_run_id: &str) -> Vec<DelegationView> {
+    let reply = block_on(m.query(&encode_query(&RunsQuery::Delegations {
+        caller_run_id: caller_run_id.into(),
+    })))
+    .unwrap();
+    match runs_decode_reply(&reply).unwrap() {
+        RunsReply::Delegations(delegations) => delegations,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
 /// a module whose run already carries a committed, freshly-opened session.
 fn with_open_session(actions: &[&str], caps: &[&str]) -> (RunsModule, Registry, String) {
     let (mut m, registry, run_id) = awaiting_session_run(actions, caps);
@@ -76,7 +100,215 @@ fn with_open_session(actions: &[&str], caps: &[&str]) -> (RunsModule, Registry, 
     (m, registry, run_id)
 }
 
+fn with_open_delegating_session(budget: u32) -> (RunsModule, Registry, String) {
+    let mut registry = registry(&[
+        ("bot", &[ACTION_CHAT_POST]),
+        ("worker", &[ACTION_CHAT_POST]),
+        ("reviewer", &[ACTION_CHAT_POST]),
+    ]);
+    registry.get_mut("bot").unwrap().caps.subagent_budget = budget;
+    registry.get_mut("worker").unwrap().caps.subagent_budget = budget;
+    let mut m = watched(TurnPolicy::All, &registry);
+    engage_post(&mut m, &registry, 2, &[]);
+    commit(&mut m);
+    let run_id = run_id_for("general", 2, "bot");
+    let mut ctx = session_ctx(&registry, &run_id, Origin::External(ASSIGNEE.to_vec()));
+    exec(&mut m, &mut ctx, &open(&run_id, &SESSION_KEY)).unwrap();
+    commit(&mut m);
+    (m, registry, run_id)
+}
+
 // ---- opening: the lease IS the authorization ---------------------------------
+
+#[test]
+fn a_live_session_calls_a_peer_and_collects_its_result_without_a_parent_record() {
+    let (mut m, registry, caller_run) = with_open_delegating_session(2);
+    let mut ctx = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    );
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&caller_run, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    assert_eq!(ctx.dispatch_msgs().len(), 1);
+    let calls = delegations(&m, &caller_run);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].status, DelegationStatus::Pending);
+    assert_eq!(calls[0].callee_agent_id, "worker");
+    assert_eq!(calls[0].root_run_id, caller_run);
+    let callee_run = calls[0].callee_run_id.clone();
+    commit(&mut m);
+
+    let mut joiner = module();
+    joiner.install(&m.snapshot(), m.root()).unwrap();
+    assert_eq!(
+        delegations(&joiner, &caller_run),
+        delegations(&m, &caller_run),
+        "the live call edge and scoped result lane round-trip through state sync"
+    );
+    assert!(get_pending(&joiner, &callee_run).is_some());
+
+    let mut result_ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut result_ctx,
+        &result_event(
+            &callee_run,
+            Ok(runner_wrapper("Worker result", serde_json::json!({}))),
+        ),
+    )
+    .unwrap();
+    assert!(
+        result_ctx.chat_msgs().is_empty(),
+        "a callee returns to its caller, not to the user's chat thread"
+    );
+    commit(&mut m);
+    let calls = delegations(&m, &caller_run);
+    assert_eq!(calls[0].status, DelegationStatus::Delivered);
+    assert_eq!(
+        calls[0].result.as_ref().unwrap().reply_blocks[0].text,
+        "Worker result"
+    );
+    assert!(
+        get_pending(&m, &caller_run).is_some(),
+        "the caller stays live"
+    );
+
+    let mut settle = CaptureCtx::new()
+        .at(9)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut settle,
+        &result_event(
+            &caller_run,
+            Ok(runner_wrapper("Done", serde_json::json!({}))),
+        ),
+    )
+    .unwrap();
+    commit(&mut m);
+    assert!(
+        delegations(&m, &caller_run).is_empty(),
+        "root settlement removes its ephemeral call tree"
+    );
+}
+
+#[test]
+fn call_ids_are_idempotent_and_the_root_budget_is_global() {
+    let (mut m, registry, caller_run) = with_open_delegating_session(1);
+    let call = delegate(&caller_run, "one", "worker", "work");
+    let mut first = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    );
+    exec(&mut m, &mut first, &call).unwrap();
+    commit(&mut m);
+
+    let mut replay = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    );
+    exec(&mut m, &mut replay, &call).unwrap();
+    assert!(replay.dispatch_msgs().is_empty(), "same request is a no-op");
+
+    let err = exec(
+        &mut m,
+        &mut replay,
+        &delegate(&caller_run, "two", "reviewer", "review"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Module(ref reason) if reason.contains("spent its budget")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_caller_exit_cancels_and_prunes_its_recursive_subtree() {
+    let (mut m, registry, root_run) = with_open_delegating_session(3);
+    let mut root_ctx = session_ctx(&registry, &root_run, Origin::External(SESSION_KEY.to_vec()));
+    exec(
+        &mut m,
+        &mut root_ctx,
+        &delegate(&root_run, "worker-call", "worker", "work"),
+    )
+    .unwrap();
+    commit(&mut m);
+    let worker_run = delegations(&m, &root_run)[0].callee_run_id.clone();
+
+    let mut open_ctx = session_ctx(&registry, &worker_run, Origin::External(ASSIGNEE.to_vec()));
+    exec(
+        &mut m,
+        &mut open_ctx,
+        &open(&worker_run, &CHILD_SESSION_KEY),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    let mut worker_ctx = session_ctx(
+        &registry,
+        &worker_run,
+        Origin::External(CHILD_SESSION_KEY.to_vec()),
+    );
+    exec(
+        &mut m,
+        &mut worker_ctx,
+        &delegate(&worker_run, "review-call", "reviewer", "review"),
+    )
+    .unwrap();
+    commit(&mut m);
+    let reviewer_run = delegations(&m, &worker_run)[0].callee_run_id.clone();
+    assert!(get_pending(&m, &reviewer_run).is_some());
+
+    let mut settle = CaptureCtx::new()
+        .at(9)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut settle,
+        &result_event(
+            &worker_run,
+            Ok(runner_wrapper("worker done", serde_json::json!({}))),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        settle.dispatch_msgs().as_slice(),
+        [DispatchMsg::CancelDispatch { dispatch_id }]
+            if dispatch_id == &dispatch_id_for(&reviewer_run)
+    ));
+    assert!(
+        get_pending(&m, &reviewer_run).is_none(),
+        "the cancelled descendant is removed immediately"
+    );
+    assert_eq!(
+        delegations(&m, &worker_run)[0].status,
+        DelegationStatus::Cancelled
+    );
+    assert_eq!(
+        delegations(&m, &root_run)[0].status,
+        DelegationStatus::Delivered
+    );
+    commit(&mut m);
+
+    let mut joiner = module();
+    joiner.install(&m.snapshot(), m.root()).unwrap();
+    assert_eq!(joiner.root(), m.root());
+}
 
 #[test]
 fn the_lease_holder_binds_a_session_and_a_stranger_cannot() {
@@ -554,7 +786,8 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
     let (m, ..) = with_open_session(&[ACTION_CHAT_POST], &[]);
 
     // an orphaned session: the same session, but the pending section is empty.
-    let orphaned = crate::state::encode_committed(&m.watches, &BTreeMap::new(), &m.sessions);
+    let orphaned =
+        crate::state::encode_committed(&m.watches, &BTreeMap::new(), &m.sessions, &m.delegations);
     let err = module().install(&orphaned, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("names no in-flight run")),
@@ -573,7 +806,7 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
             (run_id.clone(), s)
         })
         .collect();
-    let forged = crate::state::encode_committed(&m.watches, &m.pending, &stunted);
+    let forged = crate::state::encode_committed(&m.watches, &m.pending, &stunted, &m.delegations);
     let err = module().install(&forged, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("32-byte ed25519 key")),

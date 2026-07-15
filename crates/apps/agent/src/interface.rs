@@ -384,58 +384,95 @@ impl AgentRecord {
         self.permits(&CapRequest::DuckfsRead(SKILL_LIBRARY_PREFIX))
     }
 
-    /// Whether `child` is a non-escalating delegation target. Delegation stays
-    /// inside one owner's execution/runtime trust domain, and every authority
-    /// or skill source the child can exercise must already be readable by the
-    /// parent.
-    pub fn can_delegate_to(&self, child: &AgentRecord) -> bool {
-        let exact = |parent: &[String], child: &[String]| {
-            child.iter().all(|item| parent.iter().any(|p| p == item))
-        };
+    /// The callee as it may execute for this caller. Agents remain peers: a
+    /// call does not require matching owners, providers, or a permanent
+    /// parent/child relation. Authority is instead narrowed for this run to
+    /// the intersection of both agents' grants.
+    ///
+    /// The callee keeps its standing curated skills only where the caller can
+    /// also read the source. Curation itself is the callee's standing access;
+    /// the caller check prevents a call from widening that access.
+    pub fn scoped_for_call(&self, callee: &AgentRecord) -> AgentRecord {
+        let mut scoped = callee.clone();
+        scoped
+            .allowed_actions
+            .retain(|action| self.allowed_actions.binary_search(action).is_ok());
+        scoped.caps = self.caps.intersection(&callee.caps);
+        let caller = self;
+        scoped
+            .skills
+            .retain(|skill| caller.permits(&CapRequest::DuckfsRead(&skill.source_prefix)));
+        scoped
+    }
+}
 
-        self.owner == child.owner
-            && self.capability == child.capability
-            && exact(&self.allowed_actions, &child.allowed_actions)
-            && child
-                .skills
-                .iter()
-                .all(|skill| self.permits(&CapRequest::DuckfsRead(&skill.source_prefix)))
-            && child
-                .caps
-                .forge_read
-                .iter()
-                .all(|repo| self.permits(&CapRequest::ForgeRead(repo)))
-            && child
-                .caps
-                .forge_push
-                .iter()
-                .all(|repo| self.permits(&CapRequest::ForgePush(repo)))
-            && child
-                .caps
-                .duckfs_read
-                .iter()
-                .all(|path| self.permits(&CapRequest::DuckfsRead(path)))
-            && child
-                .caps
-                .duckfs_write
-                .iter()
-                .all(|path| self.permits(&CapRequest::DuckfsWrite(path)))
-            && child
-                .caps
-                .tools
-                .iter()
-                .all(|tool| self.permits(&CapRequest::Tool(tool)))
-            && child
-                .caps
-                .secrets
-                .iter()
-                .all(|secret| self.permits(&CapRequest::Secret(secret)))
-            && child
-                .caps
-                .pages_write
-                .iter()
-                .all(|page| self.permits(&CapRequest::PagesWrite(page)))
-            && child.caps.subagent_budget <= self.caps.subagent_budget
+impl ResourceCaps {
+    /// Intersection used by one run-scoped agent call. Exact-name grants use
+    /// set intersection. DuckFS prefixes use containment and keep the narrower
+    /// prefix. Read authority includes write authority, matching [`AgentRecord::permits`].
+    pub fn intersection(&self, other: &Self) -> Self {
+        fn exact(left: &[String], right: &[String]) -> Vec<String> {
+            left.iter()
+                .filter(|value| right.binary_search(value).is_ok())
+                .cloned()
+                .collect()
+        }
+
+        fn under(prefix: &str, path: &str) -> bool {
+            path == prefix
+                || prefix == "/" && path.starts_with('/')
+                || path.starts_with(&format!("{prefix}/"))
+        }
+
+        fn prefixes(left: &[String], right: &[String]) -> Vec<String> {
+            let mut out = Vec::new();
+            for a in left {
+                for b in right {
+                    if under(a, b) {
+                        out.push(b.clone());
+                    } else if under(b, a) {
+                        out.push(a.clone());
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+
+        fn readable(caps: &ResourceCaps) -> Vec<String> {
+            let mut values = caps.duckfs_read.clone();
+            values.extend(caps.duckfs_write.iter().cloned());
+            values.sort();
+            values.dedup();
+            values
+        }
+
+        fn forge_readable(caps: &ResourceCaps) -> Vec<String> {
+            let mut values = caps.forge_read.clone();
+            values.extend(caps.forge_push.iter().cloned());
+            values.sort();
+            values.dedup();
+            values
+        }
+
+        let pages_write = if self.pages_write.iter().any(|page| page == "*") {
+            other.pages_write.clone()
+        } else if other.pages_write.iter().any(|page| page == "*") {
+            self.pages_write.clone()
+        } else {
+            exact(&self.pages_write, &other.pages_write)
+        };
+        Self {
+            forge_read: exact(&forge_readable(self), &forge_readable(other)),
+            forge_push: exact(&self.forge_push, &other.forge_push),
+            duckfs_read: prefixes(&readable(self), &readable(other)),
+            duckfs_write: prefixes(&self.duckfs_write, &other.duckfs_write),
+            tools: exact(&self.tools, &other.tools),
+            secrets: exact(&self.secrets, &other.secrets),
+            pages_write,
+            subagent_budget: self.subagent_budget.min(other.subagent_budget),
+        }
     }
 }
 
@@ -453,25 +490,27 @@ pub struct ReplyBlock {
     pub lang: Option<String>,
 }
 
-/// one child Run requested by a parent's final response. Runs supplies the
-/// fixed sandbox profile and derives all identity/context from the parent;
-/// the model chooses only an existing agent and its bounded instruction.
+/// One run-scoped call to a registered peer agent. The live MCP path is the
+/// primary API; the final response field remains a compatibility path. Runs
+/// derives identity/authority from the caller and accepts only an existing
+/// agent plus a bounded instruction.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DelegationRequest {
     pub agent_id: String,
     pub instruction: String,
-    /// library skill NAMES curated for this child, on top of the child agent's
-    /// own curation — the whole point of curating at delegation: a worker keeps
+    /// Library skill names curated for this call, on top of the callee's own
+    /// curation — the whole point of curating at call time: a peer keeps
     /// its persona and gains what this one task needs. each name resolves to
-    /// `/shared/skills/<name>`, loaded on demand; a parent OFFERS a worker a
+    /// `/shared/skills/<name>`, loaded on demand; a caller offers a peer a
     /// library skill, it never authors a path or a persona-inlining body. empty
-    /// = the child's own curation verbatim.
+    /// = the callee's own curation verbatim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
 }
 
 /// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,
-/// a final-only delegation batch, and an optional workspace commit message.
+/// a compatibility-only final delegation batch, and an optional workspace
+/// commit message.
 /// lenient by construction — all fields default, unknown JSON fields are
 /// ignored — so a model answer either IS this shape or the consumer wraps it
 /// as one; validation (grants, caps, probes) is a separate, strict step.
@@ -617,9 +656,15 @@ pub enum AgentMsg {
 #[serde(rename_all = "snake_case")]
 pub enum AgentEvent {
     /// a new agent landed; the hook registers its recipe.
-    Registered { agent_id: String, capability: String },
+    Registered {
+        agent_id: String,
+        capability: String,
+    },
     /// an existing agent's capability changed; the hook retunes its recipe.
-    CapabilityChanged { agent_id: String, capability: String },
+    CapabilityChanged {
+        agent_id: String,
+        capability: String,
+    },
 }
 
 // ---- queries ------------------------------------------------------------------

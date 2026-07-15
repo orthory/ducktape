@@ -129,10 +129,7 @@ fn task_actions_without_a_configured_tasks_module_fail_the_run() {
 fn duckfs_write_text_requires_current_refs_head() {
     let head = "aa".repeat(32);
     let stale = "bb".repeat(32);
-    let mut registry = registry(&[(
-        "bot",
-        &[ACTION_CHAT_POST, agent::ACTION_DUCKFS_WRITE_TEXT],
-    )]);
+    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, agent::ACTION_DUCKFS_WRITE_TEXT])]);
     registry
         .get_mut("bot")
         .unwrap()

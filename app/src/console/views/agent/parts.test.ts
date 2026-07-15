@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { repoFile } from "../../../test/repo-file";
-import { MAX_AGENT_ID_LEN, slug } from "./parts";
+import { MAX_AGENT_ID_LEN, parseCapList, slug } from "./parts";
 
 /** The consensus rule, restated: lowercase [a-z0-9-], 1..=63, no edge hyphen. */
 const isLabel = (id: string) =>
@@ -57,4 +57,13 @@ describe("agent id derivation", () => {
     expect(cap, "MAX_AGENT_ID_LEN not found in the agent crate").not.toBeNull();
     expect(MAX_AGENT_ID_LEN).toBe(Number(cap![1]));
   });
+});
+
+it("parses comma and whitespace separated capability grants", () => {
+  expect(parseCapList("alpha, beta\n/shared/data  *")).toEqual([
+    "alpha",
+    "beta",
+    "/shared/data",
+    "*",
+  ]);
 });

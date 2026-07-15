@@ -12,12 +12,13 @@ use super::facets::{
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, AgentStatus,
     BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DELEGATED_CHILD_CORES,
-    DELEGATED_CHILD_MEM_GB, DelegationRequest, Error, FilesChange, FilesContent, FilesMsg,
-    FilesQuery, FilesReply, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
-    MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES, MAX_DELEGATIONS_PER_RUN,
-    MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg, Origin, PendingState, PreparedDispatch,
-    ReplyBlock, ResultEvent, RunsModule, SagaOrigin, TaskMsg, TaskQuery, TaskReply, TaskStatus,
-    chat_decode_reply, chat_encode_msg, chat_encode_query, decode_result_event, dispatch_id_for,
+    DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationResult, DelegationState, DelegationStatus,
+    DispatchMsg, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
+    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES,
+    MAX_DELEGATIONS_BYTES, MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES,
+    Msg, Origin, PendingState, PreparedDispatch, ReplyBlock, ResultEvent, RunsModule, SagaOrigin,
+    TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
+    chat_encode_query, decode_result_event, dispatch_encode_msg, dispatch_id_for,
     files_decode_reply, files_encode_msg, files_encode_query, page_thread_id, reply_message_id,
     run_id_for, tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
 };
@@ -203,6 +204,7 @@ pub(super) const FAILURE_EXCERPT_BYTES: usize = 400;
 struct PreparedDelegation {
     run_id: String,
     agent_id: String,
+    authority: super::RunAuthority,
     dispatch: PreparedDispatch,
 }
 
@@ -292,15 +294,217 @@ impl RunsModule {
         // the session beside it is the whole close-out. an agent's key stops
         // being an authority in the same block its run stops existing.
         self.pending_sessions.insert(run_id.clone(), None);
+        self.close_delegations_for_run(ctx, &run_id, &entry);
 
         match outcome {
             // THE single delivery path: decode the runner result and apply
             // whatever facets it carries. a plain (message-only) result carries
             // none — it delivers exactly the model prose + its parsed actions.
+            Ok(bytes) if entry.delegation_id.is_some() => {
+                self.deliver_delegated_result(ctx, &run_id, &entry, &bytes)
+                    .await
+            }
             Ok(bytes) => self.deliver_run_result(ctx, &run_id, &entry, &bytes).await,
+            Err(reason) if entry.delegation_id.is_some() => {
+                self.fail_delegated_run(ctx, &run_id, &entry, reason).await
+            }
             Err(reason) => self.fail_run(ctx, &run_id, &entry, reason).await,
         }
         Ok(())
+    }
+
+    /// Cancel unfinished descendants when their caller exits. A root exit
+    /// removes the complete ephemeral result tree; no AgentRecord relation is
+    /// left behind.
+    fn close_delegations_for_run(&mut self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState) {
+        let root_exit = entry.delegation_id.is_none();
+        let ids = self.delegation_ids();
+        let mut scoped = BTreeSet::new();
+        if root_exit {
+            for id in &ids {
+                if self
+                    .delegation(id)
+                    .is_some_and(|state| state.view.root_run_id == run_id)
+                {
+                    scoped.insert(id.clone());
+                }
+            }
+        } else {
+            let mut exiting = BTreeSet::from([run_id.to_string()]);
+            loop {
+                let mut changed = false;
+                for id in &ids {
+                    let Some(state) = self.delegation(id) else {
+                        continue;
+                    };
+                    if exiting.contains(&state.view.caller_run_id) && scoped.insert(id.clone()) {
+                        exiting.insert(state.view.callee_run_id.clone());
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        for id in scoped {
+            let Some(mut state) = self.delegation(&id).cloned() else {
+                continue;
+            };
+            if state.view.status == DelegationStatus::Pending {
+                ctx.emit_msg(Msg {
+                    target: self.dispatch.clone(),
+                    payload: dispatch_encode_msg(&DispatchMsg::CancelDispatch {
+                        dispatch_id: dispatch_id_for(&state.view.callee_run_id),
+                    }),
+                });
+                self.pending_overlay
+                    .insert(dispatch_id_for(&state.view.callee_run_id), None);
+                self.pending_sessions
+                    .insert(state.view.callee_run_id.clone(), None);
+                state.view.status = DelegationStatus::Cancelled;
+                state.view.completed_at = Some(ctx.env().consensus_time);
+                state.view.result = Some(DelegationResult {
+                    reply_blocks: Vec::new(),
+                    output_ref: None,
+                    error: Some("caller run exited before the callee settled".into()),
+                });
+                self.pending_delegations.insert(id.clone(), Some(state));
+            }
+            if root_exit {
+                self.pending_delegations.insert(id, None);
+            }
+        }
+    }
+
+    async fn deliver_delegated_result(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        bytes: &[u8],
+    ) {
+        let result = match decode_run_result_v1(bytes) {
+            Ok(result) => result,
+            Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
+        };
+        if result.status == WireStatus::Failed {
+            return self
+                .fail_delegated_run(ctx, run_id, entry, "run reported a failed status".into())
+                .await;
+        }
+        let mut response = agent_response_from_text(&result.response_text, false);
+        if !result.effects.is_empty() {
+            response.actions = match effects_to_actions(&result.effects) {
+                Ok(actions) => actions,
+                Err(reason) => {
+                    return self.fail_delegated_run(ctx, run_id, entry, reason).await;
+                }
+            };
+        }
+        let response = match self
+            .validate_response(&*ctx, run_id, entry, Lane::DelegatedSettle, response)
+            .await
+        {
+            Ok(response) => response,
+            Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
+        };
+        let reply_blocks = response.reply_blocks.clone();
+        self.emit_pages_effects(ctx, run_id, entry, Lane::DelegatedSettle, &response.actions)
+            .await;
+        self.emit_response(
+            ctx,
+            run_id,
+            entry,
+            Lane::DelegatedSettle,
+            AgentResponse {
+                reply_blocks: Vec::new(),
+                ..response
+            },
+        )
+        .await;
+        let output_ref = output_ref_of(&result.workspace_receipt);
+        self.complete_delegation(
+            entry,
+            DelegationStatus::Delivered,
+            DelegationResult {
+                reply_blocks,
+                output_ref: output_ref.clone(),
+                error: None,
+            },
+            ctx.env().consensus_time,
+        );
+        self.pending_history.push(RunRecord {
+            run_id: run_id.to_string(),
+            agent_id: entry.agent_id.clone(),
+            channel_id: entry.channel_id.clone(),
+            anchor_seq: entry.anchor_seq,
+            outcome: RunOutcome::Delivered,
+            degraded: result.status == WireStatus::Degraded,
+            created_at: entry.created_at,
+            delivered_at: ctx.env().consensus_time,
+            executing_node: self.executing_node(&*ctx, run_id).await,
+            output_ref,
+            pr_number: None,
+        });
+    }
+
+    async fn fail_delegated_run(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        reason: String,
+    ) {
+        let reason = failure_excerpt(&reason);
+        self.note(ctx, format!("delegated run {run_id} failed: {reason}"));
+        self.complete_delegation(
+            entry,
+            DelegationStatus::Failed,
+            DelegationResult {
+                reply_blocks: Vec::new(),
+                output_ref: None,
+                error: Some(reason),
+            },
+            ctx.env().consensus_time,
+        );
+        self.pending_history.push(RunRecord {
+            run_id: run_id.to_string(),
+            agent_id: entry.agent_id.clone(),
+            channel_id: entry.channel_id.clone(),
+            anchor_seq: entry.anchor_seq,
+            outcome: RunOutcome::Failed,
+            degraded: false,
+            created_at: entry.created_at,
+            delivered_at: ctx.env().consensus_time,
+            executing_node: self.executing_node(&*ctx, run_id).await,
+            output_ref: None,
+            pr_number: None,
+        });
+    }
+
+    fn complete_delegation(
+        &mut self,
+        entry: &PendingState,
+        status: DelegationStatus,
+        result: DelegationResult,
+        completed_at: u64,
+    ) {
+        let Some(id) = entry.delegation_id.as_deref() else {
+            return;
+        };
+        let Some(mut state): Option<DelegationState> = self.delegation(id).cloned() else {
+            return;
+        };
+        // A caller-exit cancellation won the race; the late dispatch result may
+        // prune its PendingRun but cannot resurrect a result nobody can collect.
+        if state.view.status == DelegationStatus::Cancelled {
+            return;
+        }
+        state.view.status = status;
+        state.view.result = Some(result);
+        state.view.completed_at = Some(completed_at);
+        self.pending_delegations.insert(id.to_string(), Some(state));
     }
 
     /// the failure triple (breadcrumb note + threaded failure reply + job
@@ -466,12 +670,21 @@ impl RunsModule {
             ));
         }
         let parent = self
-            .agent_record(ctx, &entry.agent_id)
+            .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("parent agent is not registered: {}", entry.agent_id))?;
         if parent.status != AgentStatus::Active {
             return Err(format!("parent agent is paused: {}", parent.agent_id));
         }
+        let workspace_agent = self
+            .agent_record(ctx, &entry.workspace_agent_id)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "workspace agent is not registered: {}",
+                    entry.workspace_agent_id
+                )
+            })?;
         let count = delegations.len() as u32; // already capped at 8 above
         if count > parent.caps.subagent_budget {
             return Err(format!(
@@ -506,22 +719,24 @@ impl RunsModule {
             if child.status != AgentStatus::Active {
                 return Err(format!("child agent is paused: {}", child.agent_id));
             }
-            if child.caps.subagent_budget != 0 {
-                return Err(format!(
-                    "child agent {} must have subagent_budget 0",
-                    child.agent_id
-                ));
-            }
-            if !parent.can_delegate_to(&child) {
-                return Err(format!(
-                    "child agent {} is not delegation-compatible with {}",
-                    child.agent_id, parent.agent_id
-                ));
-            }
+            let mut scoped_child = parent.scoped_for_call(&child);
+            // Legacy terminal delegation has no call edge with which to count a
+            // recursive tree. Keep that compatibility lane to one final wave;
+            // live recursive calls use DelegateRun and its root-wide budget.
+            scoped_child.caps.subagent_budget = 0;
             // the parent CURATES library skills for this child, on top of the
             // child's own — confined to the library by construction (names, not
             // paths). the child keeps its persona and gains what this task needs.
             let extra = crate::envelope::library_skills(&request.skills)?;
+            if let Some(skill) = extra
+                .iter()
+                .find(|skill| !parent.permits(&agent::CapRequest::DuckfsRead(&skill.source_prefix)))
+            {
+                return Err(format!(
+                    "the call authority cannot read delegated skill {}",
+                    skill.name
+                ));
+            }
             let run_id = run_id_for(&entry.channel_id, entry.anchor_seq, &child.agent_id);
             if self.turn_taken(ctx, &dispatch_id_for(&run_id)).await? {
                 return Err(format!("delegated child turn is already taken: {run_id}"));
@@ -533,17 +748,18 @@ impl RunsModule {
             let dispatch = self
                 .prepare_dispatch_with_context(
                     ctx,
-                    &child,
+                    &scoped_child,
                     &run_id,
                     &entry.channel_id,
                     entry.anchor_seq,
-                    Some((&parent, &context)),
+                    Some((&workspace_agent, &context)),
                     &extra,
                 )
                 .await?;
             prepared.push(PreparedDelegation {
                 run_id,
                 agent_id: child.agent_id,
+                authority: super::RunAuthority::from_record(&scoped_child),
                 dispatch,
             });
         }
@@ -557,10 +773,11 @@ impl RunsModule {
         delegations: Vec<PreparedDelegation>,
     ) {
         for child in delegations {
-            self.stage_dispatch_run(
+            self.stage_scoped_dispatch_run(
                 ctx,
                 &child.run_id,
                 child.agent_id,
+                parent.workspace_agent_id.clone(),
                 parent.channel_id.clone(),
                 parent.anchor_seq,
                 parent.requester.clone(),
@@ -569,6 +786,8 @@ impl RunsModule {
                     ("cores".into(), DELEGATED_CHILD_CORES),
                     ("mem_gb".into(), DELEGATED_CHILD_MEM_GB),
                 ]),
+                Some(child.authority),
+                None,
             );
         }
     }
@@ -602,12 +821,15 @@ impl RunsModule {
         response: AgentResponse,
     ) -> Result<AgentResponse, String> {
         let agent = self
-            .agent_record(ctx, &entry.agent_id)
+            .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
         if !response.delegations.is_empty() {
             if !matches!(lane, Lane::Settle) {
-                return Err("delegation is final-only and unavailable to agent sessions".into());
+                return Err(
+                    "terminal delegation is compatibility-only; use the live agent-call tool"
+                        .into(),
+                );
             }
             if entry.job_id.is_some() || page_thread_id(&entry.channel_id).is_some() {
                 return Err("delegation requires a chat or Forge run".into());
@@ -652,39 +874,50 @@ impl RunsModule {
         let mut staged_replies: BTreeMap<(String, u64), u64> = BTreeMap::new();
 
         if !response.reply_blocks.is_empty() {
-            let page_run = page_thread_id(&entry.channel_id).is_some();
-            let action = if page_run {
-                ACTION_PAGES_COMMENT
+            if matches!(lane, Lane::DelegatedSettle) {
+                let reply_bytes = serde_json::to_vec(&response.reply_blocks)
+                    .expect("reply blocks are serializable");
+                if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
+                    return Err(format!(
+                        "delegated result is {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
+                        reply_bytes.len()
+                    ));
+                }
             } else {
-                ACTION_CHAT_POST
-            };
-            if !allows(&agent, action) {
-                return Err(format!(
-                    "agent {} is not allowed to {action}",
-                    entry.agent_id
-                ));
-            }
-            let reply_bytes = if page_run {
-                to_page_comment_text(&response.reply_blocks).into_bytes()
-            } else {
-                serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
-                    .expect("blocks are serializable")
-            };
-            if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
-                return Err(format!(
-                    "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
-                    reply_bytes.len()
-                ));
-            }
-            if page_run {
-                self.page_reply_msg(ctx, run_id, entry, &response.reply_blocks)
-                    .await?;
-            } else {
-                self.probe_reply_postable(ctx, run_id, entry).await?;
-                if let Some(root) = entry.thread_root {
-                    *staged_replies
-                        .entry((entry.channel_id.clone(), root))
-                        .or_default() += 1;
+                let page_run = page_thread_id(&entry.channel_id).is_some();
+                let action = if page_run {
+                    ACTION_PAGES_COMMENT
+                } else {
+                    ACTION_CHAT_POST
+                };
+                if !allows(&agent, action) {
+                    return Err(format!(
+                        "agent {} is not allowed to {action}",
+                        entry.agent_id
+                    ));
+                }
+                let reply_bytes = if page_run {
+                    to_page_comment_text(&response.reply_blocks).into_bytes()
+                } else {
+                    serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
+                        .expect("blocks are serializable")
+                };
+                if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
+                    return Err(format!(
+                        "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
+                        reply_bytes.len()
+                    ));
+                }
+                if page_run {
+                    self.page_reply_msg(ctx, run_id, entry, &response.reply_blocks)
+                        .await?;
+                } else {
+                    self.probe_reply_postable(ctx, run_id, entry).await?;
+                    if let Some(root) = entry.thread_root {
+                        *staged_replies
+                            .entry((entry.channel_id.clone(), root))
+                            .or_default() += 1;
+                    }
                 }
             }
         }
@@ -943,7 +1176,7 @@ impl RunsModule {
             _ => return Err(format!("pages target is missing: {}", view.thread.target)),
         };
         let agent = self
-            .agent_record(ctx, &entry.agent_id)
+            .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
         self.check_pages_write(&agent, &target.page)?;
@@ -1070,7 +1303,7 @@ impl RunsModule {
         reason: &str,
     ) -> Result<Msg, String> {
         let agent = self
-            .agent_record(ctx, &entry.agent_id)
+            .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
         let page_run = page_thread_id(&entry.channel_id).is_some();
