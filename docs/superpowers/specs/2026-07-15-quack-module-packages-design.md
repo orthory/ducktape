@@ -1,7 +1,9 @@
 # `.quack` — the module package format
 
 Date: 2026-07-15
-Status: design, not yet implemented
+Status: design; registration half landed 2026-07-16 (PR #630), rest not yet implemented
+Citations: file:line references are anchored to `dev` as of this document's date and drift as the
+tree moves — treat them as dated pointers, not live links.
 Companion: `2026-07-14-scoped-session-keys-and-module-view-packages-design.md` (Part B is a
 prerequisite; this document supersedes that spec's Part A as the packaging story)
 
@@ -34,29 +36,36 @@ third-party surface, stronger sandbox.
 
 ## What already exists (verified)
 
-The registration and distribution machinery is three-quarters built:
+The registration machinery is **fully built as of PR #630 (2026-07-16)**:
 
-- `ModregMsg::Register { module_id: String, code_hash }` — a post-genesis registration op **already
-  exists** (`crates/system/modreg/src/interface.rs:54`), accepted from module or system origin
-  (`require_module_or_system`), refusing duplicate ids. Nothing emits it yet.
-- `WasmModule::from_bytes(id, component_bytes)` — instantiating a module from bytes **already
-  exists** (`crates/kernel/wasm-host/src/lib.rs:327`).
-- Byte distribution **already exists**: the code plane / blobstore, with mesh fetch by hash
-  (`bin/node/src/blob_fetch.rs` `FetchingCodeSource`) and the readiness protocol ("full byte
-  receipt, latched in committed state").
-- `realize_module_swaps` explicitly skips ids absent from the host registry — *"its registry entry,
-  if any, is a genesis concern"* (`crates/kernel/host/src/lib.rs:826`). That comment marks the
-  exact spot where instantiate-on-register goes.
-- View pinning **already exists**: DuckFS commit under `/home/<owner>/**` (no `check_authority`
+- `GovAction::RegisterModule` (`crates/system/governance/src/interface.rs:79`) → modreg
+  `ScheduleRegister` (`crates/system/modreg/src/interface.rs:82`): admission lands as an entry with
+  an EMPTY active hash riding the exact readiness (R=n `SignalReady` latch) + activation-height
+  machinery swaps use; cancelling before the boundary removes the entry.
+- The host instantiates at the boundary through the `ModuleFactory` hook
+  (`crates/kernel/host/src/lib.rs:880-903`, the constructor twin of `CodeSource`), wired to
+  `WasmModule::from_bytes` in both production compositions.
+- **Version-gated dormant**: `modreg::ADMISSION_ACTIVATION_VERSION = 4` is enforced at the registry
+  and the governance door, above every shipping `MAX_PROTOCOL_VERSION` — and a compile-time assert
+  in `bin/node/src/constants.rs` blocks raising past it until the restore half (below) exists.
+- Proven end to end in `crates/kernel/host/tests/module_register.rs`: boundary instantiation,
+  app-hash determinism across nodes, fail-closed on missing/tampered bytes and missing factory,
+  unready-never-arms.
+- Byte distribution **already existed**: the code plane / blobstore, mesh fetch by hash
+  (`bin/node/src/blob_fetch.rs` `FetchingCodeSource`), operator staging via
+  `POST /v1/admin/module-code/stage` with per-peer receipts, and validators' auto byte-receipt
+  signalling (`bin/node/src/validator/code_announce.rs`, keyed purely on pending swaps — admissions
+  ride it unchanged).
+- View pinning **already existed**: DuckFS commit under `/home/<owner>/**` (no `check_authority`
   change) + `GatewayMsg::SetRoute` → `RouteTarget::DuckFs { manifest_sha256 }`
   (`crates/system/gateway/src/interface.rs:119`).
-- Code-swap correctness **already tested**: `crates/kernel/host/tests/module_swap.rs` (state
-  preservation, determinism, fail-closed on tampered bytes, statesync join, unready never arms,
-  inert without modreg).
 
-What does not exist: the widget WIT world and its host-side interpreter, the `quack` CLI, the
-governance registration action, and reproducible guest builds (the Makefile says so itself:
-*"`wasm-modules-check` guards mutual consistency, not reproducibility"*).
+What does not exist: **the admitted-module restore path** (recovery/statesync composers enumerate a
+fixed module set, so a post-admission checkpoint would brick restart/join — this is the activation
+prerequisite the compile-time assert encodes), the widget WIT world and its host-side interpreter,
+the packaged-view serving loop, and reproducible guest builds (the Makefile says so itself:
+*"`wasm-modules-check` guards mutual consistency, not reproducibility"*). The `quack` CLI exists at
+`byeongsu-hong/ducktape-quack` (new/build/test/dev/verify/rebuild/audit/publish).
 
 ## 1. Composition
 
@@ -171,16 +180,13 @@ author ──quack build──▶ .quack ──share (chat/files/web)──▶ a
 - **share** — the file, over any channel. Nothing on-chain yet.
 - **publish** (publisher, once per version) — commit bytes to the code plane and DuckFS. Not yet
   active.
-- **register** (governance; new module ids only) — the one missing machine, and it is small. Three
-  pieces, each an extension of an existing pattern:
-  1. a governance action that emits `ModregMsg::Register`;
-  2. `Register` gains the pending/readiness gate `Schedule` already has — today it activates the
-     hash immediately, which would make a byte-less validator fail closed at the boundary; the
-     readiness latch guarantees every validator holds the bytes before activation arms;
-  3. instantiate-on-register at the drain boundary: where `realize_module_swaps` currently skips a
-     registry-absent id, fetch the bytes and `WasmModule::from_bytes` + `Host::register` at the
-     activation height. Registering a module changes app-hash by construction (the registry set is
-     what `app_hash()` composes over), which is exactly why it rides the R=n rail.
+- **register** (governance; new module ids only) — **landed in PR #630**: `RegisterModule` proposal
+  → vote → modreg `ScheduleRegister` (admission entry, empty active hash) → validators auto-verify
+  bytes and `SignalReady` (R=n latch) → at the activation height the host instantiates through
+  `ModuleFactory` and registers. Registering a module changes app-hash by construction (the
+  registry set is what `app_hash()` composes over), which is exactly why it rides the R=n rail.
+  Version-gated at `ADMISSION_ACTIVATION_VERSION = 4`; live ids (native or otherwise) are refused
+  via a `ctx.module_root` door; a duplicate-id refusal fails the governance Execute atomically.
 - **install** (member, local) — verify layers 1–4, mint the per-module session key
   (`scope = { targets: submits, expires_at: h + N }`, authorized by the passkey, once), ViewHost
   loads the pinned view. The module itself is already on the network: **install is an authority and
@@ -276,10 +282,14 @@ tests land before the widget vocabulary exists:
 
 | scenario | expected |
 |---|---|
-| `reload_if_changed` with a new hash | `Ok(true)`; render output switches to v2 |
-| same hash again | `Ok(false)`; no reload (thrash guard) |
+| `needs(new hash)` → caller fetches → `install` | `Ok`; render output switches to v2 |
+| unchanged pin | `needs` is `false` — no fetch (thrash guard); a redundant `install` is an idempotent no-op |
 | `sha256(bytes) != manifest_hash` | `Err(Integrity)`; **old view keeps rendering** — a tampered publish cannot blank the UI |
 | intact bytes that fail instantiation | `Err(Instantiate)`; **old view keeps rendering** — a broken publish cannot blank the UI |
+
+Fetching lives OUTSIDE the crate (the caller's async, fallible transport — `blob_fetch`/DuckFS
+distinguish miss from corruption); `install` only ever judges delivered bytes, so `Integrity`
+strictly means tampering, never a transport failure.
 
 All four verify against a fake runtime — no wasmtime, no heavy deps. The real
 `WasmtimeViewRuntime` (first shell-side wasmtime use in the tree) plugs in behind the same trait
@@ -298,8 +308,10 @@ manage pending state by hand.
    provide this half for free. ViewHost is its seam.
 2. **`quack` CLI** — build · rebuild · audit · publish · install · dev; mostly orchestration of
    existing parts.
-3. **Registration, three pieces** — governance action; `Register` pending/readiness; the
-   instantiate-on-register at the boundary. Each extends an existing pattern.
+3. **The admitted-module restore path** — recovery/statesync composition for a module the binary
+   does not enumerate (install its checkpoint state through the factory). This replaced
+   registration as the blocker: registration itself landed in PR #630, and the compile-time assert
+   on `ADMISSION_ACTIVATION_VERSION` keeps admissions dormant until this piece exists.
 4. **Reproducible guest builds** — toolchain + wasm-tools pins, path remap. Independently valuable,
    do first.
 5. **Install/approval UI** in the iced shell — capability sheet, three-state source badge, audit
@@ -333,9 +345,10 @@ the framework repo as those ABIs freeze.
 ## Verification
 
 - **ViewHost hot-swap:** the four-case matrix above, against a fake runtime (lands first).
-- **Registration:** a governance-approved `Register` for a brand-new id activates at height H on
-  every validator with app-hash continuity; a validator lacking bytes at H fails closed; the
-  registered module executes from H+1. Template: `module_swap.rs`.
+- **Registration:** landed and green — `crates/kernel/host/tests/module_register.rs` proves
+  boundary activation, app-hash continuity across nodes, fail-closed on missing bytes/factory, and
+  unready-never-arms; governance-side admission/cancel/atomic-refusal in
+  `governance_schedules_module_update.rs`.
 - **Envelope:** a package whose artifact bytes are swapped after signing fails layer 1; a package
   signed by a revoked member key fails layer 2.
 - **Reproducibility:** `quack rebuild` of a source-carrying package on a second machine yields

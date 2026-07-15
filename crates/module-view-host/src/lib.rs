@@ -1,11 +1,16 @@
 //! The hash-gated loader for packaged module views.
 //!
 //! A packaged view is pinned in consensus as a manifest sha256 (gateway
-//! `RouteTarget::DuckFs`). The shell polls that pin and calls
-//! [`ViewHost::reload_if_changed`]; this crate owns the swap decision, not the
-//! rendering. The contract mirrors `realize_module_swaps` on the module rail:
-//! fail closed, and on failure the PREVIOUS artifact keeps running — a
-//! tampered or broken publish must never blank a live UI.
+//! `RouteTarget::DuckFs`). The shell polls that pin, asks [`ViewHost::needs`]
+//! whether it changed, fetches the bytes through its own (async, fallible)
+//! transport, and hands them to [`ViewHost::install`]; this crate owns the
+//! swap decision, not the fetching or the rendering. Fetching stays outside
+//! on purpose — the real byte path (`blob_fetch`/DuckFS) is async and
+//! distinguishes transport failure from corruption, and neither concern
+//! belongs in the swap state machine. The contract mirrors
+//! `realize_module_swaps` on the module rail: fail closed, and on failure the
+//! PREVIOUS artifact keeps running — a tampered or broken publish must never
+//! blank a live UI.
 //!
 //! The runtime is a trait so the swap logic tests without wasmtime; the real
 //! wasmtime-backed runtime (widget-tree ABI) is a later, separate concern.
@@ -81,32 +86,35 @@ impl<R: ViewRuntime> ViewHost<R> {
         self.current.as_ref().map(|(h, _)| h)
     }
 
-    /// Reconcile to the consensus-pinned `manifest_hash`.
+    /// Does the consensus pin differ from what is running? `true` means the
+    /// caller should fetch the pinned bytes (its own transport, its own error
+    /// domain) and call [`Self::install`]. The thrash guard lives here: an
+    /// unchanged pin never triggers a fetch.
+    pub fn needs(&self, manifest_hash: &ViewHash) -> bool {
+        self.current_hash() != Some(manifest_hash)
+    }
+
+    /// Verify `sha256(bytes) == manifest_hash`, instantiate, swap in.
     ///
-    /// - Pin unchanged → `Ok(false)`, `fetch` is never called.
-    /// - Pin changed → fetch, verify `sha256(bytes) == manifest_hash`,
-    ///   instantiate, swap in → `Ok(true)`.
-    /// - Verification or instantiation fails → `Err`, and the previously
-    ///   loaded view (if any) KEEPS RUNNING.
-    pub fn reload_if_changed(
-        &mut self,
-        manifest_hash: ViewHash,
-        fetch: impl FnOnce() -> Vec<u8>,
-    ) -> Result<bool, ViewError> {
-        if self.current_hash() == Some(&manifest_hash) {
-            return Ok(false);
+    /// - Same hash already running → `Ok(())`, no reload (idempotent).
+    /// - Hash mismatch → `Err(Integrity)` — the DELIVERED bytes are wrong;
+    ///   transport failures never reach here, they stay the caller's.
+    /// - Instantiation failure → `Err(Instantiate)`.
+    /// - On ANY `Err` the previously loaded view KEEPS RUNNING.
+    pub fn install(&mut self, manifest_hash: ViewHash, bytes: &[u8]) -> Result<(), ViewError> {
+        if !self.needs(&manifest_hash) {
+            return Ok(());
         }
-        let bytes = fetch();
-        let got: ViewHash = Sha256::digest(&bytes).into();
+        let got: ViewHash = Sha256::digest(bytes).into();
         if got != manifest_hash {
             return Err(ViewError::Integrity {
                 expected: manifest_hash,
                 got,
             });
         }
-        let view = self.runtime.load(&bytes)?;
+        let view = self.runtime.load(bytes)?;
         self.current = Some((manifest_hash, view));
-        Ok(true)
+        Ok(())
     }
 
     pub fn render(&self, state: &[u8]) -> Result<Vec<u8>, ViewError> {
@@ -148,25 +156,29 @@ mod tests {
     }
 
     #[test]
-    fn new_hash_loads_and_renders_new_version() {
+    fn new_hash_installs_and_renders_new_version() {
         let mut host = ViewHost::new(FakeRuntime);
         let (v1, v2) = (b"view-v1".to_vec(), b"view-v2".to_vec());
 
-        assert_eq!(host.reload_if_changed(sha(&v1), || v1.clone()), Ok(true));
+        assert!(host.needs(&sha(&v1)));
+        host.install(sha(&v1), &v1).unwrap();
         assert_eq!(host.render(b"{}").unwrap(), v1);
 
-        assert_eq!(host.reload_if_changed(sha(&v2), || v2.clone()), Ok(true));
+        assert!(host.needs(&sha(&v2)));
+        host.install(sha(&v2), &v2).unwrap();
         assert_eq!(host.render(b"{}").unwrap(), v2);
     }
 
     #[test]
-    fn same_hash_is_a_noop_and_never_fetches() {
+    fn unchanged_pin_needs_nothing_and_reinstall_is_idempotent() {
         let mut host = ViewHost::new(FakeRuntime);
         let v1 = b"view-v1".to_vec();
-        host.reload_if_changed(sha(&v1), || v1.clone()).unwrap();
+        host.install(sha(&v1), &v1).unwrap();
 
-        let result = host.reload_if_changed(sha(&v1), || panic!("must not fetch"));
-        assert_eq!(result, Ok(false));
+        // the thrash guard: the caller checks `needs` and never fetches...
+        assert!(!host.needs(&sha(&v1)));
+        // ...and even a redundant install is an idempotent no-op.
+        assert_eq!(host.install(sha(&v1), &v1), Ok(()));
         assert_eq!(host.render(b"{}").unwrap(), v1);
     }
 
@@ -174,12 +186,10 @@ mod tests {
     fn tampered_bytes_are_refused_and_old_view_keeps_running() {
         let mut host = ViewHost::new(FakeRuntime);
         let v1 = b"view-v1".to_vec();
-        host.reload_if_changed(sha(&v1), || v1.clone()).unwrap();
+        host.install(sha(&v1), &v1).unwrap();
 
-        // Pin says v2, but the fetch returns tampered bytes.
-        let err = host
-            .reload_if_changed(sha(b"view-v2"), || b"evil".to_vec())
-            .unwrap_err();
+        // Pin says v2, but the delivered bytes are wrong.
+        let err = host.install(sha(b"view-v2"), b"evil").unwrap_err();
         assert!(matches!(err, ViewError::Integrity { .. }));
         assert_eq!(host.current_hash(), Some(&sha(&v1)));
         assert_eq!(host.render(b"{}").unwrap(), v1);
@@ -189,13 +199,11 @@ mod tests {
     fn broken_component_is_refused_and_old_view_keeps_running() {
         let mut host = ViewHost::new(FakeRuntime);
         let v1 = b"view-v1".to_vec();
-        host.reload_if_changed(sha(&v1), || v1.clone()).unwrap();
+        host.install(sha(&v1), &v1).unwrap();
 
         // Intact bytes (hash matches) that fail instantiation.
         let broken = b"!broken".to_vec();
-        let err = host
-            .reload_if_changed(sha(&broken), || broken.clone())
-            .unwrap_err();
+        let err = host.install(sha(&broken), &broken).unwrap_err();
         assert!(matches!(err, ViewError::Instantiate(_)));
         assert_eq!(host.current_hash(), Some(&sha(&v1)));
         assert_eq!(host.render(b"{}").unwrap(), v1);
@@ -208,18 +216,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_first_load_leaves_host_empty_then_recovers() {
+    fn failed_first_install_leaves_host_empty_then_recovers() {
         let mut host = ViewHost::new(FakeRuntime);
         let broken = b"!broken".to_vec();
-        assert!(
-            host.reload_if_changed(sha(&broken), || broken.clone())
-                .is_err()
-        );
+        assert!(host.install(sha(&broken), &broken).is_err());
         assert_eq!(host.render(b"{}").unwrap_err(), ViewError::NoView);
 
-        // A later good publish still loads: the failed hash was not latched.
+        // A later good publish still installs: the failed hash was not latched.
         let v1 = b"view-v1".to_vec();
-        assert_eq!(host.reload_if_changed(sha(&v1), || v1.clone()), Ok(true));
+        host.install(sha(&v1), &v1).unwrap();
         assert_eq!(host.render(b"{}").unwrap(), v1);
     }
 }

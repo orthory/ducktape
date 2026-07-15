@@ -2,6 +2,8 @@
 
 Date: 2026-07-14
 Status: design, not yet implemented
+Citations: file:line references are anchored to `dev` as of this document's date and drift as the
+tree moves — treat them as dated pointers, not live links.
 
 > **UI substrate update — 2026-07-15.** The desktop console is being fully ported from the
 > CEF/HTML webview to a native **iced** shell (`app/src-iced/`, branch `feat/iced-app`; ~55k lines,
@@ -480,11 +482,14 @@ blocking B.
    and is how a brand-new user with no account works. Tightening it is a separate decision.
 5. **Session key at rest in the shell.** Low-value (scoped + expiring) but still a key. Store it under
    the existing session-password seal, not plaintext.
-6. **Third-party packages still need a new module id**, and post-genesis module *registration* does not
-   exist: `Host::register` is genesis-only (`crates/kernel/host/src/lib.rs:465`) and governance has no
-   `RegisterModule` action (`crates/system/governance/src/interface.rs:60-73`). A new module needs a node
-   binary and a protocol version boundary. **This design does not solve that** — it makes the *desktop
-   app* rebuild-free, not the node. Governance-driven module registration is its own project.
+6. **Third-party packages still need a new module id** — post-genesis module *registration*
+   **landed 2026-07-16 (PR #630)**: `GovAction::RegisterModule` → modreg `ScheduleRegister` →
+   host `ModuleFactory` instantiation at the activation boundary, riding the same R=n readiness +
+   height gate as code swaps. It ships version-gated dormant (`modreg::ADMISSION_ACTIVATION_VERSION
+   = 4`, above every shipping `MAX_PROTOCOL_VERSION`, with a compile-time assert in
+   `bin/node/src/constants.rs`): activating it requires first landing the admitted-module
+   restore/statesync path — today's composers enumerate a fixed module set, so a post-admission
+   checkpoint would brick restart/join. That restore half is the remaining project.
 
 ## Verification
 
