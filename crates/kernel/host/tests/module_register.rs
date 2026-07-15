@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BASELINE_VERSION, BlockContext, CodeSource, Host, MODREG_MODULE_ID, ModuleFactory};
+use host::{BlockContext, CodeSource, Host, MODREG_MODULE_ID, ModuleFactory};
 use modreg::{ModregMsg, ModregQuery, ModregReply, Modreg};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
@@ -78,7 +78,8 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
         height,
         consensus_time: height,
         origin,
-        protocol_version: BASELINE_VERSION,
+        // admission ops are version-gated; the whole proof runs past the boundary.
+        protocol_version: modreg::ADMISSION_ACTIVATION_VERSION,
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }

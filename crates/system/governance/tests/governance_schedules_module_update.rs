@@ -77,7 +77,10 @@ async fn submit_as(
 ) -> Result<(), SubmitError> {
     host.submit_at(
         BlockContext {
-            protocol_version: 0,
+            // the admission version: UpdateModule/Cancel are ungated, and the
+            // admission flavors below need both the block env and the module
+            // branch selector past the boundary.
+            protocol_version: modreg::ADMISSION_ACTIVATION_VERSION,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -581,5 +584,42 @@ fn register_module_of_an_existing_id_fails_execute_atomically() {
         let code = module_code(&host, "hello").await.expect("hello persists");
         assert_eq!(code.active_code_hash, hash(1), "active code untouched");
         assert!(code.pending.is_none(), "no pending landed");
+    });
+}
+
+/// below the activation version the door refuses a RegisterModule proposal
+/// outright — the mixed-binary window produces identical rejections on both
+/// old binaries (decode failure) and new ones (this gate).
+#[test]
+fn register_module_is_door_refused_below_the_activation_version() {
+    block_on(async {
+        let mut host = gov_host_with_modreg().await;
+        // a block BELOW the admission boundary: submit_at realizes the block's
+        // protocol_version into every module, so the door sees the low version.
+        let refused = host
+            .submit_at(
+                BlockContext {
+                    protocol_version: modreg::ADMISSION_ACTIVATION_VERSION - 1,
+                    height: 1,
+                    consensus_time: 1,
+                    origin: Origin::External(member_key(1)),
+                },
+                Msg {
+                    target: "governance".into(),
+                    payload: gov_encode(&GovMsg::Propose {
+                        proposal_id: "adm-early".into(),
+                        action: GovAction::RegisterModule {
+                            name: "kanban-v1".into(),
+                            module_id: "kanban".into(),
+                            activation_height: 500,
+                            code_hash: hash(7),
+                        },
+                        voting_period: 100,
+                    }),
+                },
+            )
+            .await;
+        assert!(refused.is_err(), "door must refuse below the boundary");
+        assert!(proposal_status(&host, "adm-early").await.is_none());
     });
 }

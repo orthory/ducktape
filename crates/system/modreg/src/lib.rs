@@ -257,6 +257,26 @@ impl Modreg {
         if module_id.is_empty() {
             return Err(Error::Module("module_id must not be empty".into()));
         }
+        // version gate — see ADMISSION_ACTIVATION_VERSION: closes the
+        // mixed-binary window (old binaries cannot decode this op; both sides
+        // refuse identically below the activation version).
+        if ctx.env().protocol_version < ADMISSION_ACTIVATION_VERSION {
+            return Err(Error::Module(format!(
+                "module admission activates at protocol v{ADMISSION_ACTIVATION_VERSION} \
+                 (network is at v{})",
+                ctx.env().protocol_version
+            )));
+        }
+        // an id already LIVE on this host — native, genesis-wasm, or a prior
+        // admission — may not be re-admitted. the registry set is consensus
+        // state, so this read is identical on every validator. (the map check
+        // below still covers admission-pending ids, whose root does not exist
+        // yet.)
+        if ctx.module_root(&module_id).is_some() {
+            return Err(Error::Module(format!(
+                "module id {module_id} is already live on this host"
+            )));
+        }
         let mut next = self.read().clone();
         if next.modules.contains_key(&module_id) {
             return Err(Error::Module(format!(
@@ -711,6 +731,8 @@ mod tests {
         env: sdk::Env,
         /// what the stubbed valset answers a Validators query with.
         members: Vec<Vec<u8>>,
+        /// module ids the stubbed host reports as live (module_root = Some).
+        live: Vec<String>,
     }
     impl TestCtx {
         fn new(origin: Origin, height: u64) -> Self {
@@ -723,10 +745,21 @@ mod tests {
                     me: "modreg".into(),
                 },
                 members: vec![member(1)],
+                live: Vec::new(),
             }
         }
         fn with_members(mut self, members: Vec<Vec<u8>>) -> Self {
             self.members = members;
+            self
+        }
+        /// admission ops require the activation version (production submits
+        /// them only past the boundary; this mirrors that env).
+        fn at_admission_version(mut self) -> Self {
+            self.env.protocol_version = ADMISSION_ACTIVATION_VERSION;
+            self
+        }
+        fn with_live(mut self, id: &str) -> Self {
+            self.live.push(id.into());
             self
         }
     }
@@ -735,8 +768,11 @@ mod tests {
         fn env(&self) -> &sdk::Env {
             &self.env
         }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> {
-            None
+        fn module_root(&self, t: &str) -> Option<StateRoot> {
+            self.live
+                .iter()
+                .any(|id| id == t)
+                .then_some(StateRoot([0; 32]))
         }
         async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
             if target == "valset"
@@ -1328,7 +1364,7 @@ mod tests {
     #[test]
     fn admission_realizes_at_boundary_via_the_normal_readiness_gate() {
         let mut mr = mr();
-        let mut gov = TestCtx::new(Origin::Module("governance".into()), 0);
+        let mut gov = TestCtx::new(Origin::Module("governance".into()), 0).at_admission_version();
         run(&mut mr, &mut gov, &schedule_register("kanban", "v1", 10, 5)).unwrap();
         commit(&mut mr);
 
@@ -1356,7 +1392,7 @@ mod tests {
     fn admission_refuses_existing_ids_short_leads_and_external_origin() {
         let mut mr = mr();
         register(&mut mr, "hello", 1);
-        let mut sys = TestCtx::new(Origin::System, 0);
+        let mut sys = TestCtx::new(Origin::System, 0).at_admission_version();
         assert!(
             run(&mut mr, &mut sys, &schedule_register("hello", "v1", 10, 5)).is_err(),
             "an existing id goes through Schedule, never re-admission"
@@ -1375,7 +1411,7 @@ mod tests {
     #[test]
     fn cancelled_admission_removes_the_entry_entirely() {
         let mut mr = mr();
-        let mut sys = TestCtx::new(Origin::System, 0);
+        let mut sys = TestCtx::new(Origin::System, 0).at_admission_version();
         run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
         commit(&mut mr);
         run(&mut mr, &mut sys, &cancel("kanban", "v1")).unwrap();
@@ -1391,7 +1427,7 @@ mod tests {
     #[test]
     fn admission_snapshot_roundtrips() {
         let mut mr = mr();
-        let mut sys = TestCtx::new(Origin::System, 0);
+        let mut sys = TestCtx::new(Origin::System, 0).at_admission_version();
         run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
         commit(&mut mr);
         make_ready(&mut mr, "kanban", "v1");
@@ -1405,7 +1441,37 @@ mod tests {
     #[test]
     fn legacy_v1_mode_refuses_admission() {
         let mut mr = mr().with_legacy_v1_state();
-        let mut sys = TestCtx::new(Origin::System, 0);
+        let mut sys = TestCtx::new(Origin::System, 0).at_admission_version();
         assert!(run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).is_err());
+    }
+
+    #[test]
+    fn admission_refuses_below_the_activation_version() {
+        let mut mr = mr();
+        // protocol_version 0 < ADMISSION_ACTIVATION_VERSION: both an old
+        // binary (decode failure) and a new one (this gate) refuse — the
+        // mixed-binary window produces identical no-state-change rejections.
+        let mut sys = TestCtx::new(Origin::System, 0);
+        assert!(
+            run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).is_err(),
+            "admission below the activation version must refuse"
+        );
+        assert!(status(&mr).is_empty(), "nothing lands");
+    }
+
+    #[test]
+    fn admission_refuses_an_id_that_is_live_on_the_host() {
+        let mut mr = mr();
+        // "valset" is a native module: live on the host (module_root = Some)
+        // but never seeded into modreg — the map check alone would admit it
+        // and poison the registry's bookkeeping for a module it can't swap.
+        let mut sys = TestCtx::new(Origin::System, 0)
+            .at_admission_version()
+            .with_live("valset");
+        assert!(
+            run(&mut mr, &mut sys, &schedule_register("valset", "v1", 10, 5)).is_err(),
+            "a live host module id may not be re-admitted"
+        );
+        assert!(status(&mr).is_empty(), "nothing lands");
     }
 }

@@ -351,3 +351,15 @@ pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)
 }
+
+// raising `MAX_PROTOCOL_VERSION` past the admission activation version is the
+// deliberate act that turns post-genesis module ADMISSION on network-wide.
+// it must not happen before recovery/state-sync can recompose an admitted
+// module's ACCUMULATED state — today's composers enumerate a fixed module set
+// (see `host_state::ProductionModules`), so a restarting node or a fresh
+// joiner would fail closed on the first post-admission checkpoint. whoever
+// removes this assert is claiming that restore half now exists.
+const _: () = assert!(
+    MAX_PROTOCOL_VERSION < modreg::ADMISSION_ACTIVATION_VERSION,
+    "land the admitted-module restore/state-sync path before crossing the admission boundary"
+);

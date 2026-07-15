@@ -904,6 +904,18 @@ impl Governance {
                 modreg::CODE_HASH_LEN
             )));
         }
+        // admission is protocol-version gated (the registry enforces the same
+        // constant at execution; this door-check fails the proposal early,
+        // before an electorate wastes a ballot on it).
+        if matches!(&action, GovAction::RegisterModule { .. })
+            && self.active_version < modreg::ADMISSION_ACTIVATION_VERSION
+        {
+            return Err(Error::Module(format!(
+                "module admission activates at protocol v{} (network is at v{})",
+                modreg::ADMISSION_ACTIVATION_VERSION,
+                self.active_version
+            )));
+        }
         if self.get(&proposal_id).is_some() {
             return Err(Error::Module(format!(
                 "proposal already exists: {proposal_id}"
