@@ -5,6 +5,7 @@ mod policy;
 mod proxy;
 
 use std::{
+    cell::RefCell,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -211,6 +212,10 @@ cef::wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            tracing::debug!(
+                target: "ducktape::browser",
+                "CEF reported that a browser is closing"
+            );
             self.closed.store(true, Ordering::SeqCst);
         }
     }
@@ -478,29 +483,61 @@ cef::wrap_app! {
     }
 }
 
+cef::wrap_task! {
+    struct CloseBrowserTask {
+        host: BrowserHost,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            tracing::debug!(
+                target: "ducktape::browser",
+                "requesting CEF browser close on its UI thread"
+            );
+            self.host.close_browser(1);
+            tracing::debug!(
+                target: "ducktape::browser",
+                "CEF browser close request returned"
+            );
+        }
+    }
+}
+
 /// Dispatch CEF's renderer/GPU/utility re-execs before iced creates an event loop.
 pub fn dispatch_helper_processes() {
-    let args = process_args();
-    let is_browser_process = args
-        .as_cmd_line()
-        .map(|command| command.has_switch(Some(&CefString::from("type"))) != 1)
-        .unwrap_or(true);
-
-    // CEF M138+ ships macOS sandbox support as libcef_sandbox.dylib. A helper
-    // must enter it before the framework is loaded; setting no_sandbox=0 by
-    // itself does not initialize the seatbelt policy. Keep the context alive
-    // until execute_process returns and destroys it on the way out.
     #[cfg(target_os = "macos")]
-    let _sandbox = if !is_browser_process && !cef_no_sandbox() {
-        let mut sandbox = cef::sandbox::Sandbox::new();
-        sandbox.initialize(args.as_main_args());
-        Some(sandbox)
-    } else {
-        None
+    let (args, is_browser_process, sandbox) = {
+        let args = process_args();
+        // The generated command-line wrapper needs the CEF API table, but a
+        // macOS helper must enter seatbelt before the framework is loaded.
+        let is_browser_process = !is_cef_helper_process();
+        let sandbox = if !is_browser_process && !cef_no_sandbox() {
+            let mut sandbox = cef::sandbox::Sandbox::new();
+            sandbox.initialize(args.as_main_args());
+            Some(sandbox)
+        } else {
+            None
+        };
+        load_cef_library();
+        initialize_api_table();
+        (args, is_browser_process, sandbox)
     };
 
-    load_cef_library();
-    initialize_api_table();
+    #[cfg(not(target_os = "macos"))]
+    let (args, is_browser_process) = {
+        // The generated command-line wrapper is itself an API-table call.
+        // Load and validate CEF before asking it whether this re-exec is a
+        // helper; otherwise Linux traps before iced or tracing can report it.
+        load_cef_library();
+        initialize_api_table();
+        let args = process_args();
+        let is_browser_process = args
+            .as_cmd_line()
+            .map(|command| command.has_switch(Some(&CefString::from("type"))) != 1)
+            .unwrap_or(true);
+        (args, is_browser_process)
+    };
+
     if is_browser_process {
         return;
     }
@@ -514,11 +551,26 @@ pub fn dispatch_helper_processes() {
         Some(&mut app),
         windows_sandbox_info(),
     );
+    #[cfg(target_os = "macos")]
+    drop(sandbox);
     std::process::exit(exit_code.max(0));
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_cef_helper_argument(argument: &str) -> bool {
+    argument == "--type" || argument.starts_with("--type=")
+}
+
+#[cfg(target_os = "macos")]
+fn is_cef_helper_process() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|argument| is_cef_helper_argument(&argument))
 }
 
 pub struct BrowserRuntime {
     browsers: Vec<BrowserSurface>,
+    closing_browsers: Vec<BrowserSurface>,
     active_browser: usize,
     gateway: GatewayProxy,
     permissions: PermissionBroker,
@@ -530,6 +582,7 @@ pub struct BrowserRuntime {
     event_tx: Sender<BrowserEvent>,
     event_rx: Receiver<BrowserEvent>,
     cef: CefShutdown,
+    closing_since: Option<Instant>,
 }
 
 impl BrowserRuntime {
@@ -651,6 +704,7 @@ impl BrowserRuntime {
 
         Ok(Self {
             browsers: vec![browser],
+            closing_browsers: Vec::new(),
             active_browser: 0,
             gateway,
             permissions,
@@ -662,14 +716,19 @@ impl BrowserRuntime {
             event_tx,
             event_rx,
             cef,
+            closing_since: None,
         })
     }
 
-    pub fn pump(&self) {
+    pub fn pump(&mut self) {
         self.permissions.expire();
-        if self.pump.take_due(Instant::now()) {
+        if self.pump.take_due(Instant::now())
+            || self.closing_since.is_some()
+            || !self.closing_browsers.is_empty()
+        {
             cef::do_message_loop_work();
         }
+        self.reap_closed_surfaces();
     }
 
     pub fn set_bounds(&mut self, bounds: Bounds) -> Result<(), String> {
@@ -745,10 +804,10 @@ impl BrowserRuntime {
             }
         };
         if let Err(error) = surface.set_visible(self.visible) {
-            let (safe, _) = surface.close();
-            if !safe {
+            if surface.begin_close().is_err() {
                 self.cef.armed = false;
             }
+            self.closing_browsers.push(surface);
             if let Some(active) = self.browsers.get_mut(self.active_browser) {
                 let _ = active.set_visible(self.visible);
             }
@@ -786,21 +845,22 @@ impl BrowserRuntime {
         if index >= self.browsers.len() {
             return Err("browser tab index is out of range".into());
         }
-        let surface = self.browsers.remove(index);
-        let (safe_to_reuse, result) = surface.close();
-        if !safe_to_reuse {
+        let mut surface = self.browsers.remove(index);
+        if let Err(error) = surface.begin_close() {
             self.cef.armed = false;
-            return Err("CEF tab close timed out; browser runtime cannot be reused".into());
+            self.closing_browsers.push(surface);
+            return Err(format!(
+                "CEF rejected the tab close request; browser runtime cannot be reused: {error}"
+            ));
         }
-        let selection = if self.browsers.is_empty() {
+        self.closing_browsers.push(surface);
+        if self.browsers.is_empty() {
             self.active_browser = 0;
             self.new_tab(replacement_url)
         } else {
             self.active_browser = next_active.min(self.browsers.len() - 1);
             self.set_visible(self.visible)
-        };
-        selection?;
-        result
+        }
     }
 
     /// Drop all browser-owned origin state while keeping the process-wide CEF
@@ -846,10 +906,10 @@ impl BrowserRuntime {
             }
         };
         if let Err(error) = surface.set_visible(self.visible) {
-            let (safe, _) = surface.close();
-            if !safe {
+            if surface.begin_close().is_err() {
                 self.cef.armed = false;
             }
+            self.closing_browsers.push(surface);
             return Err(format!("could not show the reopened browser: {error}"));
         }
         self.request_context = Some(request_context);
@@ -869,13 +929,58 @@ impl BrowserRuntime {
         self.permissions.decide(id, allow, session)
     }
 
-    pub fn close(&mut self) -> Result<(), String> {
-        self.gateway.set_gateway_base(None)?;
+    pub fn begin_shutdown(&mut self) -> Result<(), String> {
+        if self.closing_since.is_some() {
+            return Ok(());
+        }
+        let gateway = self.gateway.set_gateway_base(None);
         self.permissions.close();
         self.event_rx.try_iter().for_each(drop);
-        let result = self.close_surfaces();
+        let mut first_error = gateway.err();
+        if let Err(error) = self.close_surfaces()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        self.closing_since = Some(Instant::now());
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub fn finish_shutdown(&mut self) -> Result<bool, String> {
+        let Some(started) = self.closing_since else {
+            return Ok(false);
+        };
+        self.reap_closed_surfaces();
+        if self
+            .closing_browsers
+            .iter()
+            .any(|surface| !surface.closed.load(Ordering::SeqCst))
+        {
+            if started.elapsed() < Duration::from_secs(5) {
+                return Ok(false);
+            }
+            self.cef.armed = false;
+            return Err("CEF browser close timed out".into());
+        }
+        self.browsers.clear();
+        self.closing_browsers.clear();
+        self.active_browser = 0;
         self.request_context = None;
-        result
+        Ok(true)
+    }
+
+    pub fn defer_shutdown_after_event_loop(&mut self) {
+        if !self.cef.armed {
+            return;
+        }
+        let shutdown = std::mem::replace(
+            &mut self.cef,
+            CefShutdown {
+                armed: false,
+                cache_path: None,
+            },
+        );
+        DEFERRED_CEF_SHUTDOWNS.with(|pending| pending.borrow_mut().push(shutdown));
     }
 
     fn surface(&self) -> Result<&BrowserSurface, String> {
@@ -886,19 +991,28 @@ impl BrowserRuntime {
 
     fn close_surfaces(&mut self) -> Result<(), String> {
         let mut first_error = None;
-        for surface in std::mem::take(&mut self.browsers) {
-            let (safe, result) = surface.close();
-            if !safe {
+        for mut surface in std::mem::take(&mut self.browsers) {
+            if let Err(error) = surface.begin_close() {
                 self.cef.armed = false;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
-            if let Err(error) = result
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+            self.closing_browsers.push(surface);
         }
         self.active_browser = 0;
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn reap_closed_surfaces(&mut self) {
+        let mut index = 0;
+        while index < self.closing_browsers.len() {
+            if !self.closing_browsers[index].closed.load(Ordering::SeqCst) {
+                index += 1;
+                continue;
+            }
+            self.closing_browsers.swap_remove(index);
+        }
     }
 }
 
@@ -1055,14 +1169,39 @@ impl MacBundlePaths {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_cef_framework_for_executable(executable: &std::path::Path) -> Result<PathBuf, String> {
+    let paths = MacBundlePaths::from_executable(executable)?;
+    let Some(frameworks) = paths
+        .app
+        .parent()
+        .filter(|path| path.file_name().and_then(|value| value.to_str()) == Some("Frameworks"))
+    else {
+        return Ok(paths.framework);
+    };
+    let contents = frameworks
+        .parent()
+        .filter(|path| path.file_name().and_then(|value| value.to_str()) == Some("Contents"))
+        .filter(|path| {
+            path.parent()
+                .and_then(|app| app.extension())
+                .and_then(|value| value.to_str())
+                == Some("app")
+        })
+        .ok_or_else(|| "CEF helper is outside the main macOS app bundle".to_string())?;
+    Ok(contents
+        .join("Frameworks")
+        .join("Chromium Embedded Framework.framework"))
+}
+
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
-        if let Err(error) = self.close() {
+        if self.cef.armed {
+            self.cef.armed = false;
             tracing::warn!(
                 target: "ducktape::browser",
-                reason = "close_failed",
-                error = %error,
-                "CEF shutdown skipped because its browser did not close cleanly"
+                reason = "runtime_dropped_before_event_loop_returned",
+                "CEF shutdown was disarmed because the runtime was dropped outside orderly quit"
             );
         }
     }
@@ -1118,18 +1257,28 @@ impl BrowserSurface {
         Ok(())
     }
 
-    fn close(self) -> (bool, Result<(), String>) {
-        self.host.close_browser(1);
-        let native = self.native.destroy();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.closed.load(Ordering::SeqCst) && Instant::now() < deadline {
-            cef::do_message_loop_work();
-            std::thread::sleep(Duration::from_millis(1));
+    fn begin_close(&mut self) -> Result<(), String> {
+        tracing::debug!(
+            target: "ducktape::browser",
+            "scheduling CEF browser close"
+        );
+        if let Err(error) = self.set_visible(false) {
+            tracing::warn!(
+                target: "ducktape::browser",
+                reason = "native_child_hide_failed",
+                error = %error,
+                "CEF child window could not be hidden before close"
+            );
         }
-        if !self.closed.load(Ordering::SeqCst) {
-            return (false, Err("CEF browser close timed out".into()));
+        let mut close = CloseBrowserTask::new(self.host.clone());
+        if cef::post_task(ThreadId::UI, Some(&mut close)) != 1 {
+            return Err("CEF rejected the browser close task".into());
         }
-        (true, native)
+        tracing::debug!(
+            target: "ducktape::browser",
+            "CEF browser close was scheduled"
+        );
+        Ok(())
     }
 }
 
@@ -1165,6 +1314,15 @@ impl PumpSchedule {
 struct CefShutdown {
     armed: bool,
     cache_path: Option<PathBuf>,
+}
+
+thread_local! {
+    static DEFERRED_CEF_SHUTDOWNS: RefCell<Vec<CefShutdown>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn shutdown_after_event_loop() {
+    let pending = DEFERRED_CEF_SHUTDOWNS.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    drop(pending);
 }
 
 impl Drop for CefShutdown {
@@ -1299,8 +1457,8 @@ fn assert_pinned_libcef() {
 #[cfg(target_os = "macos")]
 fn loaded_macos_cef_version() -> Result<[i32; 8], String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let paths = MacBundlePaths::from_executable(&executable)?;
-    let framework = paths.framework.join("Chromium Embedded Framework");
+    let framework =
+        macos_cef_framework_for_executable(&executable)?.join("Chromium Embedded Framework");
     // SAFETY: The framework is already loaded by LibraryLoader and remains
     // resident for the process lifetime. This temporary handle only resolves
     // CEF's immutable version function from that exact bundled path.
@@ -1333,7 +1491,9 @@ fn assert_pinned_libcef() {}
 
 #[cfg(test)]
 mod tests {
-    use super::{MacBundlePaths, PumpSchedule};
+    use super::{
+        MacBundlePaths, PumpSchedule, is_cef_helper_argument, macos_cef_framework_for_executable,
+    };
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -1348,6 +1508,14 @@ mod tests {
         assert!(!schedule.take_due(now + Duration::from_millis(4)));
         assert!(schedule.take_due(now + Duration::from_millis(5)));
         assert!(!schedule.take_due(now + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn cef_helper_switch_detection_does_not_need_the_cef_api_table() {
+        assert!(is_cef_helper_argument("--type"));
+        assert!(is_cef_helper_argument("--type=renderer"));
+        assert!(!is_cef_helper_argument("--typewriter=renderer"));
+        assert!(!is_cef_helper_argument("ducktape"));
     }
 
     #[test]
@@ -1384,6 +1552,20 @@ mod tests {
             MacBundlePaths::from_executable(Path::new("/build/ducktape"))
                 .unwrap_err()
                 .contains("Contents/MacOS")
+        );
+    }
+
+    #[test]
+    fn mac_helper_resolves_the_outer_cef_framework() {
+        let helper = Path::new(
+            "/build/Ducktape.app/Contents/Frameworks/ducktape Helper (Renderer).app/Contents/MacOS/ducktape Helper (Renderer)",
+        );
+
+        assert_eq!(
+            macos_cef_framework_for_executable(helper).unwrap(),
+            Path::new(
+                "/build/Ducktape.app/Contents/Frameworks/Chromium Embedded Framework.framework"
+            )
         );
     }
 }

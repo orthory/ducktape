@@ -150,12 +150,6 @@ impl NativeChild {
             }
         })
     }
-
-    pub(crate) fn destroy(&self) -> Result<(), String> {
-        with_cef_display(|xlib, display| unsafe {
-            (xlib.XDestroyWindow)(display, self.xid);
-        })
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -183,7 +177,6 @@ fn with_cef_display(
 #[cfg(target_os = "macos")]
 pub(crate) struct NativeChild {
     view: std::ptr::NonNull<objc2_app_kit::NSView>,
-    destroyed: std::cell::Cell<bool>,
     // AppKit view operations are main-thread-only. Keeping the marker in the
     // handle also makes the complete browser surface !Send and !Sync.
     _main_thread: objc2::MainThreadMarker,
@@ -206,7 +199,6 @@ impl NativeChild {
         }
         Ok(Self {
             view,
-            destroyed: std::cell::Cell::new(false),
             _main_thread: main_thread,
         })
     }
@@ -214,7 +206,7 @@ impl NativeChild {
     pub(crate) fn set_bounds(&self, bounds: Bounds) -> Result<(), String> {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-        self.ensure_live()?;
+        self.ensure_main_thread()?;
         let child = unsafe { self.view.as_ref() };
         let parent = unsafe { child.superview() }
             .ok_or_else(|| "CEF AppKit child view is detached".to_string())?;
@@ -234,29 +226,13 @@ impl NativeChild {
     }
 
     pub(crate) fn set_visible(&self, visible: bool) -> Result<(), String> {
-        self.ensure_live()?;
+        self.ensure_main_thread()?;
         unsafe { self.view.as_ref() }.setHidden(!visible);
         Ok(())
     }
 
-    pub(crate) fn destroy(&self) -> Result<(), String> {
-        if self.destroyed.get() {
-            return Ok(());
-        }
+    fn ensure_main_thread(&self) -> Result<(), String> {
         if objc2::MainThreadMarker::new().is_none() {
-            return Err("CEF AppKit child view destruction ran off the main thread".into());
-        }
-        self.destroyed.set(true);
-        let child = unsafe { self.view.as_ref() };
-        child.setHidden(true);
-        child.removeFromSuperview();
-        Ok(())
-    }
-
-    fn ensure_live(&self) -> Result<(), String> {
-        if self.destroyed.get() {
-            Err("CEF AppKit child view is already destroyed".into())
-        } else if objc2::MainThreadMarker::new().is_none() {
             Err("CEF AppKit child view operation ran off the main thread".into())
         } else {
             Ok(())
@@ -280,7 +256,6 @@ fn appkit_y(bounds: Bounds, parent_y: f64, parent_height: f64, flipped: bool) ->
 pub(crate) struct NativeChild {
     hwnd: windows::Win32::Foundation::HWND,
     thread: std::thread::ThreadId,
-    destroyed: std::cell::Cell<bool>,
 }
 
 #[cfg(target_os = "windows")]
@@ -297,7 +272,6 @@ impl NativeChild {
         Ok(Self {
             hwnd,
             thread: std::thread::current().id(),
-            destroyed: std::cell::Cell::new(false),
         })
     }
 
@@ -329,22 +303,11 @@ impl NativeChild {
         Ok(())
     }
 
-    pub(crate) fn destroy(&self) -> Result<(), String> {
-        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
-
-        self.ensure_thread()?;
-        if self.destroyed.replace(true) || !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
-            return Ok(());
-        }
-        unsafe { DestroyWindow(self.hwnd) }
-            .map_err(|error| format!("destroy CEF Win32 child: {error}"))
-    }
-
     fn ensure_live(&self) -> Result<(), String> {
         use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
         self.ensure_thread()?;
-        if self.destroyed.get() || !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
+        if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
             Err("CEF Win32 child window is already destroyed".into())
         } else {
             Ok(())
@@ -374,10 +337,6 @@ impl NativeChild {
     }
 
     pub(crate) fn set_visible(&self, _visible: bool) -> Result<(), String> {
-        Err("native CEF child windows are unsupported on this platform".into())
-    }
-
-    pub(crate) fn destroy(&self) -> Result<(), String> {
         Err("native CEF child windows are unsupported on this platform".into())
     }
 }

@@ -1,9 +1,6 @@
 use std::collections::BTreeMap;
 
-use iced::widget::{
-    Space, button, column, container, image, mouse_area, pick_list, progress_bar, row, scrollable,
-    stack, text,
-};
+use iced::widget::{Space, button, container, mouse_area, scrollable, text};
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Size, Subscription, Task, window,
 };
@@ -22,8 +19,7 @@ use crate::browser_chrome;
 use crate::community_service;
 use crate::desktop;
 use crate::forge_agents_service;
-use crate::huddle_media;
-use crate::huddle_session;
+use crate::huddle_ui;
 use crate::icons::{self, Icon};
 use crate::mac_tray;
 use crate::module_host;
@@ -38,13 +34,19 @@ use crate::screens::governance as governance_screen;
 use crate::screens::members as members_screen;
 use crate::screens::operator as operator_screens;
 use crate::screens::settings as settings_screen;
+use crate::screens::terminal as terminal_screen;
 use crate::screens::user as user_screens;
 use crate::screens::workspace as workspace_screens;
 use crate::search;
+use crate::terminal_service;
 use crate::theme::{self, Mode};
 use crate::transport::{NodeClient, ServerFrame};
 use crate::view_api::{AppIntent, Route};
 use crate::workspace_service;
+
+mod view;
+#[cfg(test)]
+use view::{titlebar_connection, workspace_initials};
 
 const TITLEBAR_HEIGHT: f32 = 44.0;
 const NETWORK_RAIL_WIDTH: f32 = 62.0;
@@ -72,6 +74,7 @@ enum Screen {
     Gateway,
     Modules,
     Sandbox,
+    Terminal,
     Metrics,
     Settings,
 }
@@ -88,11 +91,12 @@ impl Screen {
         Self::Governance,
         Self::Explorer,
     ];
-    const OPERATOR: [Self; 5] = [
+    const OPERATOR: [Self; 6] = [
         Self::Node,
         Self::Gateway,
         Self::Modules,
         Self::Sandbox,
+        Self::Terminal,
         Self::Metrics,
     ];
 
@@ -112,6 +116,7 @@ impl Screen {
             Self::Gateway => "Gateway",
             Self::Modules => "Modules",
             Self::Sandbox => "Sandbox",
+            Self::Terminal => "Terminal",
             Self::Metrics => "Metrics",
             Self::Settings => "Settings",
         }
@@ -133,6 +138,7 @@ impl Screen {
             Self::Gateway => Icon::Link,
             Self::Modules => Icon::Modules,
             Self::Sandbox => Icon::Sandbox,
+            Self::Terminal => Icon::Terminal,
             Self::Metrics => Icon::Metrics,
             Self::Settings => Icon::Settings,
         }
@@ -177,6 +183,8 @@ enum Message {
     Governance(governance_screen::Message),
     Explorer(explorer_screen::Message),
     Operator(operator_screens::Message),
+    Terminal(terminal_screen::Message),
+    TerminalTick,
     MetricsTick,
     CommunityTick,
     PageHistory(bool),
@@ -198,23 +206,9 @@ enum Message {
     OpenMain(Option<Screen>),
     Quit,
     QuitReady,
-    OpenHuddle,
+    ExitReady,
+    Huddle(huddle_ui::Message),
     HuddleOpened(window::Id),
-    CloseHuddle,
-    HuddleTick,
-    HuddleMute,
-    HuddleCamera,
-    HuddleShare,
-    HuddleLeave,
-    HuddleRetry,
-    HuddleExpand,
-    HuddleCollapse,
-    HuddleToggleLayout,
-    HuddleToggleDevices,
-    HuddleMicrophone(String),
-    HuddleCameraDevice(String),
-    HuddleSpeaker(String),
-    HuddleScreenSource(String),
     TrayTick,
     Tray(mac_tray::Event),
     TrayPositioned(window::Id, f32, f64, f64),
@@ -270,6 +264,10 @@ struct Shell {
     governance: governance_screen::State,
     explorer: explorer_screen::State,
     operator: operator_screens::State,
+    terminal_screen: terminal_screen::State,
+    terminal: Option<terminal_service::Handle>,
+    terminal_closing: Option<terminal_service::Handle>,
+    terminal_pending_start: Option<u64>,
     settings: settings_screen::State,
     workspace: workspace_screens::State,
     workspace_overlay: bool,
@@ -287,54 +285,12 @@ struct Shell {
     #[cfg(feature = "cef-browser")]
     browser_permission: Option<PermissionPrompt>,
     pending_display_name: Option<String>,
-    huddle: Option<HuddleRuntime>,
-    huddle_expanded: bool,
-    huddle_spotlight: bool,
-    huddle_device_prefs: HuddleDevicePrefs,
+    huddle: huddle_ui::State,
     page_presence: Option<PagePresenceRuntime>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HuddleStatus {
-    Connecting,
-    Reconnecting,
-    Live,
-    Unavailable,
-}
-
-struct HuddleRuntime {
-    channel: String,
-    session: Option<huddle_session::Handle>,
-    media: Option<huddle_media::Handle>,
-    status: HuddleStatus,
-    muted: bool,
-    camera_on: bool,
-    sharing: bool,
-    error: Option<String>,
-    local_frame: Option<image::Handle>,
-    peer_frames: BTreeMap<String, image::Handle>,
-    peers: BTreeMap<String, HuddlePeer>,
-    devices: huddle_media::DeviceOptions,
-    devices_open: bool,
-    level: u8,
-    speaking_until: Option<std::time::Instant>,
-    recipients: Vec<String>,
-    retry_pending: bool,
-    last_reconnect: Option<std::time::Instant>,
-}
-
-struct HuddlePeer {
-    muted: bool,
-    camera_on: bool,
-    sharing: bool,
-    seen: std::time::Instant,
-}
-
-#[derive(Default, Clone, Copy)]
-struct HuddleDevicePrefs {
-    microphone: Option<usize>,
-    camera: Option<usize>,
-    speaker: Option<usize>,
+    quitting: bool,
+    quit_services_ready: bool,
+    quit_exit_ready: bool,
+    quit_window_closing: bool,
 }
 
 struct PagePresenceRuntime {
@@ -368,6 +324,10 @@ impl Default for Shell {
             governance: governance_screen::State::default(),
             explorer: explorer_screen::State::default(),
             operator: operator_screens::State::default(),
+            terminal_screen: terminal_screen::State::default(),
+            terminal: None,
+            terminal_closing: None,
+            terminal_pending_start: None,
             settings: settings_screen::State::default(),
             workspace: workspace_screens::State::default(),
             workspace_overlay: false,
@@ -385,11 +345,12 @@ impl Default for Shell {
             #[cfg(feature = "cef-browser")]
             browser_permission: None,
             pending_display_name: None,
-            huddle: None,
-            huddle_expanded: false,
-            huddle_spotlight: false,
-            huddle_device_prefs: HuddleDevicePrefs::default(),
+            huddle: huddle_ui::State::default(),
             page_presence: None,
+            quitting: false,
+            quit_services_ready: false,
+            quit_exit_ready: false,
+            quit_window_closing: false,
         }
     }
 }
@@ -427,6 +388,12 @@ impl Shell {
         if self.screen() == screen {
             return;
         }
+        if self.screen() == Screen::Browser {
+            hide_browser(self);
+        }
+        if self.screen() == Screen::Terminal && screen != Screen::Terminal {
+            self.stop_terminal();
+        }
         self.history.truncate(self.history_index + 1);
         self.history.push(screen);
         self.history_index += 1;
@@ -436,10 +403,28 @@ impl Shell {
             Section::User
         };
     }
+
+    fn stop_terminal(&mut self) {
+        let _ = terminal_screen::update(&mut self.terminal_screen, terminal_screen::Message::Stop);
+        self.terminal_pending_start = None;
+        self.begin_terminal_close();
+    }
+
+    fn begin_terminal_close(&mut self) {
+        if self.terminal_closing.is_some() {
+            debug_assert!(self.terminal.is_none());
+            return;
+        }
+        let Some(handle) = self.terminal.take() else {
+            return;
+        };
+        handle.request_stop();
+        self.terminal_closing = Some(handle);
+    }
 }
 
 pub fn run() -> iced::Result {
-    iced::daemon(Shell::boot, update, view)
+    let result = iced::daemon(Shell::boot, update, view::view)
         .title(|state: &Shell, id| desktop::title(&state.desktop, id, state.notifications.unread))
         .theme(|state: &Shell, _| theme::iced_theme(state.mode, state.accent))
         .default_font(theme::SANS)
@@ -451,7 +436,10 @@ pub fn run() -> iced::Result {
         .font(theme::FONT_BYTES[5])
         .antialiasing(true)
         .subscription(subscription)
-        .run()
+        .run();
+    #[cfg(feature = "cef-browser")]
+    crate::browser::shutdown_after_event_loop();
+    result
 }
 
 fn update(state: &mut Shell, message: Message) -> Task<Message> {
@@ -471,146 +459,66 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             return sync_browser_visibility(state);
         }
         Message::OpenMain(screen) => {
-            if let Some(screen) = screen {
+            if let Some(screen) = screen
+                && (screen != Screen::Terminal || terminal_available(state))
+            {
                 state.navigate(screen);
             }
+            let terminal = if state.screen() == Screen::Terminal && state.terminal.is_none() {
+                start_terminal(state)
+            } else {
+                Task::none()
+            };
             if let Some(id) = state.desktop.main {
                 return Task::batch([
                     window::set_mode(id, window::Mode::Windowed),
                     window::minimize(id, false),
                     window::gain_focus(id),
                     sync_browser_visibility(state),
+                    terminal,
                 ]);
             }
             let (id, open) = window::open(desktop::main_settings());
             state.desktop.main = Some(id);
-            return open.map(Message::MainOpened);
+            return Task::batch([open.map(Message::MainOpened), terminal]);
         }
         Message::Quit => return quit(state),
-        Message::QuitReady => return iced::exit(),
-        Message::OpenHuddle => {
-            if state.huddle.is_none() {
-                return Task::none();
+        Message::QuitReady => {
+            state.quit_services_ready = true;
+            return finish_quit(state);
+        }
+        Message::ExitReady => {
+            if !state.quit_window_closing
+                && let Some(id) = state.desktop.main
+            {
+                state.quit_window_closing = true;
+                return window::close(id);
             }
-            state.huddle_expanded = false;
-            if let Some(id) = state.desktop.huddle {
-                return window::gain_focus(id);
+            tracing::debug!(target: "ducktape::shell", "desktop exit action requested");
+            return iced::exit();
+        }
+        Message::TerminalTick => return poll_terminal(state),
+        Message::Terminal(message) => {
+            if let Some(effect) = terminal_screen::update(&mut state.terminal_screen, message) {
+                return execute_terminal(state, effect);
             }
-            let (id, open) = window::open(desktop::huddle_settings());
-            state.desktop.huddle = Some(id);
-            return open.map(Message::HuddleOpened);
+        }
+        Message::Huddle(message) => {
+            let local_node = state
+                .active_workspace
+                .as_ref()
+                .map(|workspace| workspace.pubkey.as_str());
+            let action = huddle_ui::update(
+                &mut state.huddle,
+                message,
+                &state.user_screens.chat,
+                local_node,
+                state.node_client.as_ref(),
+            );
+            return execute_huddle_action(state, action);
         }
         Message::HuddleOpened(id) => {
             state.desktop.huddle = Some(id);
-        }
-        Message::CloseHuddle => {
-            if let Some(id) = state.desktop.huddle {
-                return window::close(id);
-            }
-        }
-        Message::HuddleTick => return poll_huddle(state),
-        Message::HuddleMute => {
-            if let Some(huddle) = &mut state.huddle {
-                huddle.muted = !huddle.muted;
-                if let Some(media) = &huddle.media {
-                    media.send(huddle_media::Command::SetMuted(huddle.muted));
-                }
-                send_huddle_beacon(huddle);
-            }
-        }
-        Message::HuddleCamera => {
-            if let Some(huddle) = &mut state.huddle {
-                huddle.error = None;
-                if let Some(media) = &huddle.media {
-                    media.send(huddle_media::Command::SetCamera(!huddle.camera_on));
-                }
-            }
-        }
-        Message::HuddleShare => {
-            if let Some(huddle) = &mut state.huddle {
-                huddle.error = None;
-                if let Some(media) = &huddle.media {
-                    media.send(huddle_media::Command::SetScreenShare(!huddle.sharing));
-                }
-            }
-        }
-        Message::HuddleLeave => {
-            let Some(channel) = state.huddle.as_ref().map(|huddle| huddle.channel.clone()) else {
-                return Task::none();
-            };
-            state.huddle = None;
-            state.huddle_expanded = false;
-            let leave = execute_user_screen(
-                state,
-                user_screens::Command::SetHuddle {
-                    channel,
-                    joined: false,
-                },
-            );
-            let close = close_huddle_window(state);
-            return Task::batch([leave, close]);
-        }
-        Message::HuddleRetry => {
-            state.huddle_expanded = false;
-            let Some(huddle) = &mut state.huddle else {
-                return Task::none();
-            };
-            huddle.status = HuddleStatus::Connecting;
-            huddle.error = None;
-            huddle.retry_pending = true;
-            huddle.last_reconnect = None;
-            huddle.session.take();
-            if let Some(media) = &huddle.media {
-                media.send(huddle_media::Command::Stop);
-            }
-            return restart_huddle_if_stopped(state);
-        }
-        Message::HuddleExpand => {
-            state.huddle_expanded = true;
-            hide_browser(state);
-        }
-        Message::HuddleCollapse => {
-            state.huddle_expanded = false;
-            return sync_browser_visibility(state);
-        }
-        Message::HuddleToggleLayout => state.huddle_spotlight = !state.huddle_spotlight,
-        Message::HuddleToggleDevices => {
-            if let Some(huddle) = &mut state.huddle {
-                huddle.devices_open = !huddle.devices_open;
-                if huddle.devices_open
-                    && let Some(media) = &huddle.media
-                {
-                    media.send(huddle_media::Command::RefreshDevices);
-                }
-            }
-        }
-        Message::HuddleMicrophone(value) => {
-            if let Some(huddle) = &state.huddle
-                && let Some(media) = &huddle.media
-            {
-                media.send(huddle_media::Command::SetMicrophone(device_index(&value)));
-            }
-        }
-        Message::HuddleCameraDevice(value) => {
-            if let Some(huddle) = &state.huddle
-                && let Some(media) = &huddle.media
-            {
-                media.send(huddle_media::Command::SetCameraDevice(device_index(&value)));
-            }
-        }
-        Message::HuddleSpeaker(value) => {
-            if let Some(huddle) = &state.huddle
-                && let Some(media) = &huddle.media
-            {
-                media.send(huddle_media::Command::SetSpeaker(device_index(&value)));
-            }
-        }
-        Message::HuddleScreenSource(value) => {
-            if let Some(huddle) = &state.huddle
-                && let Some(media) = &huddle.media
-            {
-                media.send(huddle_media::Command::SetScreenSource(device_index(&value)));
-            }
         }
         Message::WindowEvent(id, event) => match event {
             window::Event::FileHovered(_)
@@ -768,9 +676,8 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
         Message::NotificationResolved(Some(item)) => return present_notification(state, item),
         Message::NotificationResolved(None) => {}
         Message::BackendLoaded(Ok((backend, snapshot))) => {
-            state.huddle = None;
-            state.huddle_expanded = false;
-            let close_huddle = close_huddle_window(state);
+            state.stop_terminal();
+            let close_huddle = reset_huddle(state);
             state.node_client = None;
             state.workspace.workspaces = snapshot
                 .workspaces
@@ -814,12 +721,26 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             );
         }
         Message::Back if state.history_index > 0 => {
+            if state.history[state.history_index - 1] == Screen::Terminal
+                && !terminal_available(state)
+            {
+                return Task::none();
+            }
+            let previous = state.screen();
             state.history_index -= 1;
-            return sync_browser_visibility(state);
+            let terminal = sync_terminal_navigation(state, previous);
+            return Task::batch([sync_browser_visibility(state), terminal]);
         }
         Message::Forward if state.history_index + 1 < state.history.len() => {
+            if state.history[state.history_index + 1] == Screen::Terminal
+                && !terminal_available(state)
+            {
+                return Task::none();
+            }
+            let previous = state.screen();
             state.history_index += 1;
-            return sync_browser_visibility(state);
+            let terminal = sync_terminal_navigation(state, previous);
+            return Task::batch([sync_browser_visibility(state), terminal]);
         }
         Message::Navigate(screen)
             if state.screen() == Screen::Home
@@ -837,7 +758,13 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             return Task::batch([cancel, Task::done(Message::Navigate(screen))]);
         }
         Message::Navigate(screen) => {
+            if screen == Screen::Terminal && !terminal_available(state) {
+                return Task::none();
+            }
             state.navigate(screen);
+            if screen == Screen::Terminal {
+                return Task::batch([start_terminal(state), sync_browser_visibility(state)]);
+            }
             if screen == Screen::Forge
                 && let Some(command) =
                     forge_screen::update(&mut state.forge, forge_screen::Message::Load)
@@ -1171,9 +1098,12 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             }
         }
         Message::WorkspaceSnapshotLoaded(Ok(snapshot)) => {
-            state.huddle = None;
-            state.huddle_expanded = false;
-            let close_huddle = close_huddle_window(state);
+            if state.screen() == Screen::Terminal {
+                state.navigate(Screen::Node);
+            } else {
+                state.stop_terminal();
+            }
+            let close_huddle = reset_huddle(state);
             state.notification_matcher = notifications::Matcher::default();
             state.active_workspace = snapshot.active.clone();
             state.node_client = snapshot
@@ -1346,6 +1276,7 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                     state.browser = Some(browser);
                     state.browser_chrome.loading = false;
                     state.browser_error = None;
+                    return sync_browser_visibility(state);
                 }
                 Err(error) => {
                     state.browser_chrome.loading = false;
@@ -1364,6 +1295,16 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                 state.screen() == Screen::Browser && !state.workspace_overlay && !state.search.open;
             if let Some(browser) = &mut state.browser {
                 browser.pump();
+                if state.quitting
+                    && let Err(error) = browser.begin_shutdown()
+                {
+                    tracing::warn!(
+                        target: "ducktape::browser",
+                        reason = "close_request_failed",
+                        error = %error,
+                        "CEF browser close request was only partially applied"
+                    );
+                }
                 for event in browser.take_events() {
                     match event {
                         BrowserEvent::NavigationCommitted { browser_id, url } => {
@@ -1388,6 +1329,9 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                         state.browser_error = Some(error);
                     }
                 }
+            }
+            if state.quitting {
+                return finish_quit(state);
             }
         }
         #[cfg(feature = "cef-browser")]
@@ -1425,6 +1369,9 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
 }
 
 fn subscription(state: &Shell) -> Subscription<Message> {
+    if state.quit_exit_ready {
+        return iced::time::every(std::time::Duration::from_millis(10)).map(|_| Message::ExitReady);
+    }
     let mut subscriptions = vec![
         window::events().map(|(id, event)| Message::WindowEvent(id, event)),
         iced::event::listen_with(global_shortcut),
@@ -1440,9 +1387,15 @@ fn subscription(state: &Shell) -> Subscription<Message> {
                 .map(|_| Message::UserScreen(user_screens::Message::AccountTick)),
         );
     }
-    if state.huddle.is_some() {
+    if state.huddle.is_active() {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::HuddleTick),
+            iced::time::every(std::time::Duration::from_millis(33))
+                .map(|_| Message::Huddle(huddle_ui::Message::Tick)),
+        );
+    }
+    if state.terminal.is_some() || state.terminal_closing.is_some() {
+        subscriptions.push(
+            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::TerminalTick),
         );
     }
     if state.page_presence.is_some() {
@@ -1483,177 +1436,56 @@ fn subscription(state: &Shell) -> Subscription<Message> {
     Subscription::batch(subscriptions)
 }
 
-fn joined_huddle(state: &Shell) -> Option<(String, Vec<String>)> {
-    let user_screens::Resource::Ready(data) = &state.user_screens.chat.data else {
-        return None;
-    };
-    let self_key = data.self_key.as_ref()?;
-    let channel = data
-        .channels
-        .iter()
-        .find(|channel| {
-            channel.id.as_str()
-                == state
-                    .user_screens
-                    .chat
-                    .active_channel
-                    .as_deref()
-                    .unwrap_or("")
-                && channel.huddle.iter().any(|member| &member.user == self_key)
-        })
-        .or_else(|| {
-            data.channels
-                .iter()
-                .find(|channel| channel.huddle.iter().any(|member| &member.user == self_key))
-        })?;
+fn sync_huddle_runtime(state: &mut Shell) -> Task<Message> {
     let local_node = state
         .active_workspace
         .as_ref()
         .map(|workspace| workspace.pubkey.as_str());
-    let mut recipients = channel
-        .huddle
-        .iter()
-        .filter(|member| Some(member.node.as_str()) != local_node)
-        .map(|member| member.node.clone())
-        .collect::<Vec<_>>();
-    recipients.sort();
-    recipients.dedup();
-    recipients.truncate(64);
-    Some((channel.id.clone(), recipients))
+    let action = huddle_ui::sync(
+        &mut state.huddle,
+        &state.user_screens.chat,
+        local_node,
+        state.node_client.as_ref(),
+    );
+    execute_huddle_action(state, action)
 }
 
-fn sync_huddle_runtime(state: &mut Shell) -> Task<Message> {
-    let Some((channel, recipients)) = joined_huddle(state) else {
-        let stopped = state.huddle.take().is_some();
-        state.huddle_expanded = false;
-        return if stopped {
+fn execute_huddle_action(state: &mut Shell, action: Option<huddle_ui::Action>) -> Task<Message> {
+    match action {
+        Some(huddle_ui::Action::PopOut) => {
+            if let Some(id) = state.desktop.huddle {
+                return window::gain_focus(id);
+            }
+            let (id, open) = window::open(desktop::huddle_settings());
+            state.desktop.huddle = Some(id);
+            open.map(Message::HuddleOpened)
+        }
+        Some(huddle_ui::Action::PopIn | huddle_ui::Action::ClosePopout) => {
             close_huddle_window(state)
-        } else {
+        }
+        Some(huddle_ui::Action::OpenChat) => Task::done(Message::OpenMain(Some(Screen::Chat))),
+        Some(huddle_ui::Action::Leave(channel)) => Task::batch([
+            execute_user_screen(
+                state,
+                user_screens::Command::SetHuddle {
+                    channel,
+                    joined: false,
+                },
+            ),
+            close_huddle_window(state),
+        ]),
+        Some(huddle_ui::Action::HideBrowser) => {
+            hide_browser(state);
             Task::none()
-        };
-    };
-    if let Some(huddle) = &mut state.huddle
-        && huddle.channel == channel
-    {
-        if huddle.recipients != recipients {
-            huddle.recipients.clone_from(&recipients);
-            if let Some(session) = &huddle.session {
-                let _ = session
-                    .control
-                    .try_send(huddle_session::Control::Recipients(recipients));
-            }
         }
-        return Task::none();
-    }
-
-    state.huddle = Some(start_huddle_runtime(
-        state,
-        channel,
-        recipients,
-        true,
-        HuddleStatus::Connecting,
-        None,
-    ));
-    Task::none()
-}
-
-fn start_huddle_runtime(
-    state: &Shell,
-    channel: String,
-    recipients: Vec<String>,
-    muted: bool,
-    status: HuddleStatus,
-    last_reconnect: Option<std::time::Instant>,
-) -> HuddleRuntime {
-    let started = state
-        .node_client
-        .as_ref()
-        .ok_or_else(|| "connect to the workspace before starting a huddle".to_string())
-        .and_then(|client| huddle_session::Handle::start(client, &channel));
-    let (session, media, error) = match started {
-        Ok((session, port)) => {
-            let _ = session
-                .control
-                .try_send(huddle_session::Control::Recipients(recipients.clone()));
-            let _ = session.control.try_send(huddle_session::Control::Beacon {
-                muted,
-                camera_on: false,
-                sharing: false,
-            });
-            let media = huddle_media::Handle::start(port);
-            if !muted {
-                media.send(huddle_media::Command::SetMuted(false));
-            }
-            if state.huddle_device_prefs.microphone.is_some() {
-                media.send(huddle_media::Command::SetMicrophone(
-                    state.huddle_device_prefs.microphone,
-                ));
-            }
-            if state.huddle_device_prefs.camera.is_some() {
-                media.send(huddle_media::Command::SetCameraDevice(
-                    state.huddle_device_prefs.camera,
-                ));
-            }
-            if state.huddle_device_prefs.speaker.is_some() {
-                media.send(huddle_media::Command::SetSpeaker(
-                    state.huddle_device_prefs.speaker,
-                ));
-            }
-            (Some(session), Some(media), None)
-        }
-        Err(error) => (None, None, Some(error)),
-    };
-    HuddleRuntime {
-        channel,
-        session,
-        media,
-        status: if error.is_some() {
-            HuddleStatus::Unavailable
-        } else {
-            status
-        },
-        muted,
-        camera_on: false,
-        sharing: false,
-        error,
-        local_frame: None,
-        peer_frames: BTreeMap::new(),
-        peers: BTreeMap::new(),
-        devices: huddle_media::DeviceOptions::default(),
-        devices_open: false,
-        level: 0,
-        speaking_until: None,
-        recipients,
-        retry_pending: false,
-        last_reconnect,
+        Some(huddle_ui::Action::SyncBrowser) => sync_browser_visibility(state),
+        None => Task::none(),
     }
 }
 
-fn restart_huddle_if_stopped(state: &mut Shell) -> Task<Message> {
-    let ready = state.huddle.as_ref().is_some_and(|huddle| {
-        huddle.retry_pending
-            && huddle
-                .media
-                .as_ref()
-                .is_none_or(huddle_media::Handle::is_stopped)
-    });
-    if !ready {
-        return Task::none();
-    }
-    let previous = state.huddle.take().expect("retry checked a huddle");
-    let Some((channel, recipients)) = joined_huddle(state) else {
-        state.huddle_expanded = false;
-        return close_huddle_window(state);
-    };
-    state.huddle = Some(start_huddle_runtime(
-        state,
-        channel,
-        recipients,
-        previous.muted,
-        previous.status,
-        previous.last_reconnect,
-    ));
-    Task::none()
+fn reset_huddle(state: &mut Shell) -> Task<Message> {
+    state.huddle.reset();
+    close_huddle_window(state)
 }
 
 fn close_huddle_window(state: &Shell) -> Task<Message> {
@@ -1754,208 +1586,6 @@ fn poll_page_presence(state: &mut Shell) {
             .map(|(peer, _)| peer.clone())
             .collect();
     }
-}
-
-fn send_huddle_beacon(huddle: &HuddleRuntime) {
-    if let Some(session) = &huddle.session {
-        let _ = session.control.try_send(huddle_session::Control::Beacon {
-            muted: huddle.muted,
-            camera_on: huddle.camera_on,
-            sharing: huddle.sharing,
-        });
-    }
-}
-
-fn poll_huddle(state: &mut Shell) -> Task<Message> {
-    let Some(huddle) = &mut state.huddle else {
-        return Task::none();
-    };
-    let mut terminal = None;
-    if let Some(session) = &mut huddle.session {
-        for _ in 0..16 {
-            match session.events.try_recv() {
-                Ok(huddle_session::Event::Connecting) => {
-                    if huddle.status != HuddleStatus::Reconnecting {
-                        huddle.status = HuddleStatus::Connecting;
-                    }
-                }
-                Ok(huddle_session::Event::Live) => {
-                    huddle.status = HuddleStatus::Live;
-                    huddle.error = None;
-                }
-                Ok(huddle_session::Event::PeerBeacon {
-                    peer,
-                    muted,
-                    camera_on,
-                    sharing,
-                }) => {
-                    if !camera_on && !sharing {
-                        huddle.peer_frames.remove(&peer);
-                    }
-                    huddle.peers.insert(
-                        peer,
-                        HuddlePeer {
-                            muted,
-                            camera_on,
-                            sharing,
-                            seen: std::time::Instant::now(),
-                        },
-                    );
-                }
-                Ok(huddle_session::Event::Closed) => {
-                    terminal = Some(None);
-                    break;
-                }
-                Ok(huddle_session::Event::Failed(error)) => {
-                    terminal = Some(Some(error));
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-    }
-    if let Some(error) = terminal {
-        let now = std::time::Instant::now();
-        let reconnect = error.is_none()
-            && huddle.status == HuddleStatus::Live
-            && huddle
-                .last_reconnect
-                .is_none_or(|last| now.duration_since(last) > std::time::Duration::from_secs(30));
-        huddle.session.take();
-        if let Some(media) = &huddle.media {
-            media.send(huddle_media::Command::Stop);
-        }
-        if reconnect {
-            huddle.status = HuddleStatus::Reconnecting;
-            huddle.error = None;
-            huddle.retry_pending = true;
-            huddle.last_reconnect = Some(now);
-        } else {
-            huddle.status = HuddleStatus::Unavailable;
-            huddle.error =
-                Some(error.unwrap_or_else(|| "The huddle connection closed".to_string()));
-        }
-    }
-    if let Some(media) = &huddle.media {
-        for _ in 0..16 {
-            match media.events.try_recv() {
-                Ok(huddle_media::Event::Ready) => {}
-                Ok(huddle_media::Event::Devices(devices)) => {
-                    state.huddle_device_prefs = HuddleDevicePrefs {
-                        microphone: devices.microphone,
-                        camera: devices.camera,
-                        speaker: devices.speaker,
-                    };
-                    if !devices.screen_sources.is_empty() && devices.screen_source.is_none() {
-                        huddle.devices_open = true;
-                    }
-                    huddle.devices = devices;
-                }
-                Ok(huddle_media::Event::VideoState { camera_on, sharing }) => {
-                    huddle.camera_on = camera_on;
-                    huddle.sharing = sharing;
-                    if !camera_on && !sharing {
-                        huddle.local_frame = None;
-                    }
-                    if sharing && !huddle.devices.screen_sources.is_empty() {
-                        huddle.devices_open = false;
-                    }
-                    send_huddle_beacon(huddle);
-                }
-                Ok(huddle_media::Event::LocalFrame(frame)) => {
-                    huddle.local_frame = Some(image::Handle::from_rgba(
-                        frame.width,
-                        frame.height,
-                        frame.rgba.as_ref().to_vec(),
-                    ));
-                }
-                Ok(huddle_media::Event::PeerFrame { peer, frame }) => {
-                    if huddle.peer_frames.len() < 8 || huddle.peer_frames.contains_key(&peer) {
-                        huddle.peer_frames.insert(
-                            peer,
-                            image::Handle::from_rgba(
-                                frame.width,
-                                frame.height,
-                                frame.rgba.as_ref().to_vec(),
-                            ),
-                        );
-                    }
-                }
-                Ok(huddle_media::Event::RequestKeyframe(peer)) => {
-                    if let Some(session) = &huddle.session {
-                        let _ = session
-                            .control
-                            .try_send(huddle_session::Control::RequestKeyframe(peer));
-                    }
-                }
-                Ok(huddle_media::Event::Failed { kind, detail }) => {
-                    huddle.error = Some(format!("{}: {detail}", kind.label()));
-                    if matches!(
-                        kind,
-                        huddle_media::FailureKind::MicrophoneDenied
-                            | huddle_media::FailureKind::MicrophoneUnavailable
-                            | huddle_media::FailureKind::Unsupported
-                    ) {
-                        huddle.status = HuddleStatus::Unavailable;
-                    }
-                }
-                Ok(huddle_media::Event::Stopped) => {
-                    if !huddle.retry_pending {
-                        huddle.status = HuddleStatus::Unavailable;
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        huddle.level = media.level();
-        if huddle.level >= 8 {
-            huddle.speaking_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
-        }
-    }
-    restart_huddle_if_stopped(state)
-}
-
-fn huddle_speaking(huddle: &HuddleRuntime) -> bool {
-    huddle
-        .speaking_until
-        .is_some_and(|until| std::time::Instant::now() < until)
-}
-
-fn device_index(value: &str) -> Option<usize> {
-    if value == "System default" {
-        None
-    } else {
-        value
-            .split_once(" · ")
-            .and_then(|(index, _)| index.parse::<usize>().ok())
-            .and_then(|index| index.checked_sub(1))
-    }
-}
-
-fn device_labels(options: &[String]) -> Vec<String> {
-    std::iter::once("System default".to_string())
-        .chain(
-            options
-                .iter()
-                .enumerate()
-                .map(|(index, label)| format!("{} · {label}", index + 1)),
-        )
-        .collect()
-}
-
-fn selected_device(options: &[String], selection: Option<usize>) -> Option<String> {
-    Some(selection.map_or_else(
-        || "System default".to_string(),
-        |index| {
-            options.get(index).map_or_else(
-                || "System default".to_string(),
-                |label| format!("{} · {label}", index + 1),
-            )
-        },
-    ))
 }
 
 fn apply_page_shortcut(state: &mut Shell, shortcut: PageShortcut) -> Task<Message> {
@@ -2075,49 +1705,80 @@ fn close_window(state: &mut Shell, id: window::Id) -> Task<Message> {
 }
 
 fn quit(state: &mut Shell) -> Task<Message> {
-    let channel = state.huddle.take().map(|huddle| huddle.channel);
-    state.huddle_expanded = false;
-    close_browser(state);
-    let Some(channel) = channel else {
-        return iced::exit();
-    };
+    if state.quitting {
+        return Task::none();
+    }
+    tracing::debug!(target: "ducktape::shell", "desktop quit requested");
+    state.quitting = true;
+    let channel = state.huddle.take_channel();
+    state.terminal_pending_start = None;
+    let terminals = [state.terminal.take(), state.terminal_closing.take()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let _ = terminal_screen::update(&mut state.terminal_screen, terminal_screen::Message::Stop);
+    #[cfg(feature = "cef-browser")]
+    {
+        state.browser_permission = None;
+    }
+    if channel.is_none() && terminals.is_empty() {
+        state.quit_services_ready = true;
+        return finish_quit(state);
+    }
     let backend = state.backend.clone();
     let workspace = state.active_workspace.clone();
     let client = state.node_client.clone();
     Task::perform(
         async move {
-            let leave = crate::screen_service::execute(
-                backend,
-                workspace,
-                client,
-                user_screens::Command::SetHuddle {
-                    channel,
-                    joined: false,
-                },
-            );
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), leave).await;
+            for terminal in terminals {
+                terminal.shutdown().await;
+            }
+            if let Some(channel) = channel {
+                let leave = crate::screen_service::execute(
+                    backend,
+                    workspace,
+                    client,
+                    user_screens::Command::SetHuddle {
+                        channel,
+                        joined: false,
+                    },
+                );
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), leave).await;
+            }
         },
         |_| Message::QuitReady,
     )
 }
 
-#[cfg(feature = "cef-browser")]
-fn close_browser(state: &mut Shell) {
-    if let Some(mut browser) = state.browser.take()
-        && let Err(error) = browser.close()
-    {
-        tracing::warn!(
-            target: "ducktape::browser",
-            reason = "close_failed",
-            error = %error,
-            "CEF browser did not close cleanly before its parent window closed"
-        );
+fn finish_quit(state: &mut Shell) -> Task<Message> {
+    if !state.quit_services_ready || state.quit_exit_ready {
+        return Task::none();
     }
-    state.browser_permission = None;
+    if let Some(backend) = &state.backend {
+        backend.shutdown();
+    }
+    #[cfg(feature = "cef-browser")]
+    if let Some(browser) = &mut state.browser {
+        match browser.finish_shutdown() {
+            Ok(false) => return Task::none(),
+            Ok(true) => {}
+            Err(error) => tracing::warn!(
+                target: "ducktape::browser",
+                reason = "close_failed",
+                error = %error,
+                "CEF browser did not close cleanly before its parent window closed"
+            ),
+        }
+    }
+    #[cfg(feature = "cef-browser")]
+    if let Some(mut browser) = state.browser.take() {
+        browser.defer_shutdown_after_event_loop();
+        drop(browser);
+    }
+    state.quit_exit_ready = true;
+    tracing::debug!(target: "ducktape::shell", "desktop services are ready to exit");
+    Task::none()
 }
-
-#[cfg(not(feature = "cef-browser"))]
-fn close_browser(_state: &mut Shell) {}
 
 fn open_notification_target(state: &mut Shell, target: notifications::Target) -> Task<Message> {
     if let Some((repository, number)) = target
@@ -2835,6 +2496,156 @@ fn execute_operator(state: &mut Shell, command: operator_screens::Command) -> Ta
     )
 }
 
+fn start_terminal(state: &mut Shell) -> Task<Message> {
+    if state.terminal.is_some() || state.terminal_pending_start.is_some() {
+        return Task::none();
+    }
+    terminal_screen::update(&mut state.terminal_screen, terminal_screen::Message::Start)
+        .map_or_else(Task::none, |effect| execute_terminal(state, effect))
+}
+
+fn sync_terminal_navigation(state: &mut Shell, previous: Screen) -> Task<Message> {
+    match (
+        previous == Screen::Terminal,
+        state.screen() == Screen::Terminal,
+    ) {
+        (true, false) => {
+            state.stop_terminal();
+            Task::none()
+        }
+        (false, true) => start_terminal(state),
+        _ => Task::none(),
+    }
+}
+
+fn execute_terminal(state: &mut Shell, effect: terminal_screen::Effect) -> Task<Message> {
+    match effect {
+        terminal_screen::Effect::Start { generation } => {
+            state.terminal_pending_start = Some(generation);
+            state.begin_terminal_close();
+            if state.terminal_closing.is_none() {
+                state.terminal_pending_start = None;
+                begin_terminal(state, generation);
+            }
+        }
+        terminal_screen::Effect::Stop { generation } => {
+            state.terminal_pending_start = None;
+            if state
+                .terminal
+                .as_ref()
+                .is_some_and(|handle| handle.generation() == generation)
+            {
+                state.begin_terminal_close();
+            }
+        }
+        terminal_screen::Effect::Input { generation, bytes } => {
+            let accepted = state
+                .terminal
+                .as_ref()
+                .filter(|handle| handle.generation() == generation)
+                .is_some_and(|handle| handle.send_input(bytes));
+            if !accepted {
+                terminal_failed(state, generation, "Terminal input queue is unavailable.");
+            }
+        }
+        terminal_screen::Effect::Resize {
+            generation,
+            cols,
+            rows,
+        } => {
+            let accepted = state
+                .terminal
+                .as_ref()
+                .filter(|handle| handle.generation() == generation)
+                .is_some_and(|handle| handle.resize(cols, rows));
+            if !accepted {
+                terminal_failed(state, generation, "Terminal resize queue is unavailable.");
+            }
+        }
+    }
+    Task::none()
+}
+
+fn begin_terminal(state: &mut Shell, generation: u64) {
+    if state.screen() != Screen::Terminal || state.terminal_screen.generation() != generation {
+        return;
+    }
+    let Some(client) = state
+        .node_client
+        .clone()
+        .filter(|_| terminal_available(state))
+    else {
+        terminal_failed(
+            state,
+            generation,
+            "Terminal sessions require a connected local node.",
+        );
+        return;
+    };
+    state.terminal = Some(terminal_service::Handle::start(client, generation));
+}
+
+fn terminal_failed(state: &mut Shell, generation: u64, detail: &str) {
+    let _ = terminal_screen::update(
+        &mut state.terminal_screen,
+        terminal_screen::Message::Failed {
+            generation,
+            detail: detail.into(),
+        },
+    );
+    state.terminal_pending_start = None;
+    state.begin_terminal_close();
+}
+
+fn poll_terminal(state: &mut Shell) -> Task<Message> {
+    if state
+        .terminal_closing
+        .as_ref()
+        .is_some_and(terminal_service::Handle::is_stopped)
+    {
+        state.terminal_closing.take();
+        if let Some(generation) = state.terminal_pending_start.take()
+            && state.screen() == Screen::Terminal
+            && state.terminal_screen.generation() == generation
+        {
+            begin_terminal(state, generation);
+        }
+    }
+    let events = state
+        .terminal
+        .as_ref()
+        .map(terminal_service::Handle::take_events)
+        .unwrap_or_default();
+    let mut tasks = Vec::new();
+    for event in events {
+        let message = match event {
+            terminal_service::Event::Connected { generation } => {
+                terminal_screen::Message::Connected { generation }
+            }
+            terminal_service::Event::Reconnecting { generation, detail } => {
+                terminal_screen::Message::Reconnecting { generation, detail }
+            }
+            terminal_service::Event::Output { generation, bytes } => {
+                terminal_screen::Message::Output { generation, bytes }
+            }
+            terminal_service::Event::Failed { generation, detail } => {
+                terminal_screen::Message::Failed { generation, detail }
+            }
+        };
+        if let Some(effect) = terminal_screen::update(&mut state.terminal_screen, message) {
+            tasks.push(execute_terminal(state, effect));
+        }
+    }
+    Task::batch(tasks)
+}
+
+fn terminal_available(state: &Shell) -> bool {
+    let (Some(workspace), Some(client)) = (&state.active_workspace, &state.node_client) else {
+        return false;
+    };
+    NodeClient::local(workspace.ports.http).is_ok_and(|managed| managed.origin() == client.origin())
+}
+
 fn execute_forge(state: &Shell, command: forge_screen::Command) -> Task<Message> {
     Task::perform(
         forge_agents_service::execute_forge(
@@ -2966,16 +2777,16 @@ fn open_app_intent(state: &mut Shell, intent: AppIntent) -> Task<Message> {
                 browser_chrome::update(&mut state.browser_chrome, browser_chrome::Message::Open)
             {
                 #[cfg(feature = "cef-browser")]
-                if let Some(browser) = &state.browser {
-                    if let Err(error) = browser.navigate(&_url) {
-                        state.browser_chrome.loading = false;
-                        state.browser_chrome.error = Some(error);
-                    }
+                if let Some(browser) = &state.browser
+                    && let Err(error) = browser.navigate(&_url)
+                {
+                    state.browser_chrome.loading = false;
+                    state.browser_chrome.error = Some(error);
                 }
             }
             sync_browser_visibility(state)
         }
-        AppIntent::PopOutHuddle => Task::done(Message::OpenHuddle),
+        AppIntent::PopOutHuddle => Task::done(Message::Huddle(huddle_ui::Message::PopOut)),
     }
 }
 
@@ -3022,183 +2833,6 @@ fn refresh_search_members(state: &mut Shell) {
     if state.search.open {
         let members = search_members(state);
         let _ = search::update(&mut state.search, search::Message::MembersLoaded(members));
-    }
-}
-
-fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-        .on_press(Message::CloseNotifications);
-    let mut items = column![].spacing(2);
-    if state.notifications.recent.is_empty() {
-        items = items.push(
-            container(
-                column![
-                    text("No notifications").size(12).font(theme::SANS_SEMIBOLD),
-                    text("Mentions, replies, huddles, runs, Forge, and governance updates appear here.")
-                        .size(10.5)
-                        .color(p.muted),
-                ]
-                .spacing(5),
-            )
-            .padding([14, 12]),
-        );
-    } else {
-        let groups = notifications::groups(&state.notifications.recent, |id| {
-            match &state.user_screens.chat.data {
-                user_screens::Resource::Ready(data) => data
-                    .channels
-                    .iter()
-                    .find(|channel| channel.id == id)
-                    .map(|channel| channel.name.clone())
-                    .unwrap_or_else(|| id.to_owned()),
-                _ => id.to_owned(),
-            }
-        });
-        for group in groups {
-            if group.indices.len() == 1 {
-                let index = group.indices[0];
-                if let Some(item) = state.notifications.recent.get(index) {
-                    items = items.push(notification_item_row(item, index, p));
-                }
-                continue;
-            }
-            let expanded = state.notifications.expanded.as_deref() == Some(&group.key);
-            items = items.push(
-                button(
-                    column![
-                        row![
-                            text(if expanded { "▾" } else { "▸" })
-                                .size(10.5)
-                                .color(p.muted_2),
-                            text(group.label.clone())
-                                .size(11)
-                                .font(theme::SANS_SEMIBOLD)
-                                .width(Length::Fill),
-                            text(notification_time(
-                                state.notifications.recent[group.indices[0]].at
-                            ))
-                            .size(9.5)
-                            .color(p.muted_2),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                        text(group.summary(&state.notifications.recent))
-                            .size(10.5)
-                            .color(p.muted),
-                    ]
-                    .spacing(3),
-                )
-                .width(Length::Fill)
-                .padding([7, 9])
-                .on_press(Message::ToggleNotificationGroup(group.key.clone()))
-                .style(move |_, status| notification_row_style(status, p)),
-            );
-            if expanded {
-                let mut nested = column![].spacing(2).padding(iced::Padding {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: 12.0,
-                });
-                for index in group.indices {
-                    if let Some(item) = state.notifications.recent.get(index) {
-                        nested = nested.push(notification_item_row(item, index, p));
-                    }
-                }
-                items = items.push(nested);
-            }
-        }
-    }
-    let panel = container(
-        column![
-            row![
-                text("Notifications")
-                    .size(12.5)
-                    .font(theme::SANS_SEMIBOLD)
-                    .width(Length::Fill),
-                text("Seen").size(9.5).font(theme::MONO).color(p.muted),
-            ]
-            .align_y(Alignment::Center),
-            scrollable(items).height(Length::Shrink),
-        ]
-        .spacing(6),
-    )
-    .width(320)
-    .max_height(400)
-    .padding(4)
-    .style(move |_| bordered(p.paper, p.border, 8.0));
-    let anchored = container(panel)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(iced::alignment::Horizontal::Right)
-        .align_y(iced::alignment::Vertical::Top)
-        .padding(iced::Padding {
-            top: 48.0,
-            right: 13.0,
-            bottom: 0.0,
-            left: 0.0,
-        });
-    stack![dismiss, anchored]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-}
-
-fn notification_item_row<'a>(
-    item: &'a notifications::Item,
-    index: usize,
-    p: &'a theme::Palette,
-) -> Element<'a, Message> {
-    button(
-        column![
-            row![
-                text(&item.title)
-                    .size(11.5)
-                    .font(theme::SANS_SEMIBOLD)
-                    .width(Length::Fill),
-                text(notification_time(item.at)).size(9.5).color(p.muted_2),
-            ]
-            .spacing(8),
-            text(if item.body.is_empty() {
-                item.category.fallback_screen()
-            } else {
-                &item.body
-            })
-            .size(10.5)
-            .color(p.muted),
-        ]
-        .spacing(4),
-    )
-    .width(Length::Fill)
-    .padding([7, 9])
-    .on_press(Message::OpenNotification(index))
-    .style(move |_, status| notification_row_style(status, p))
-    .into()
-}
-
-fn notification_row_style(status: button::Status, p: &theme::Palette) -> button::Style {
-    button::Style {
-        background: matches!(status, button::Status::Hovered).then_some(Background::Color(p.hover)),
-        text_color: p.ink,
-        border: Border {
-            radius: 5.0.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    }
-}
-
-fn notification_time(at: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64);
-    let seconds = now.saturating_sub(at) / 1_000;
-    match seconds {
-        0..=59 => "now".into(),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => format!("{}h", seconds / 3_600),
-        _ => format!("{}d", seconds / 86_400),
     }
 }
 
@@ -3351,9 +2985,8 @@ fn execute_workspace(state: &mut Shell, command: workspace_screens::Command) -> 
                 );
             }
             workspace_screens::ConnectionTarget::Remote(url) => {
-                state.huddle = None;
-                state.huddle_expanded = false;
-                let close_huddle = close_huddle_window(state);
+                state.navigate(Screen::Chat);
+                let close_huddle = reset_huddle(state);
                 state.section = Section::User;
                 state.node_client = NodeClient::new(&url).ok();
                 state.active_workspace = None;
@@ -3367,9 +3000,8 @@ fn execute_workspace(state: &mut Shell, command: workspace_screens::Command) -> 
             return sync_browser_visibility(state);
         }
         workspace_screens::Command::ActivateWorkspace { .. } => {
-            state.huddle = None;
-            state.huddle_expanded = false;
-            let close_huddle = close_huddle_window(state);
+            state.stop_terminal();
+            let close_huddle = reset_huddle(state);
             state.node_client = None;
             reset_browser_gateway(state);
             return Task::batch([
@@ -3454,1765 +3086,27 @@ const fn operator_screen(screen: Screen) -> Option<operator_screens::Screen> {
     }
 }
 
-fn view(state: &Shell, id: window::Id) -> Element<'_, Message> {
-    match state.desktop.kind(id) {
-        desktop::Kind::Main => main_view(state),
-        desktop::Kind::Huddle => huddle_view(state),
-        desktop::Kind::Tray => tray_view(state),
-    }
-}
-
-fn main_view(state: &Shell) -> Element<'_, Message> {
-    let palette = theme::palette(state.mode);
-    let body: Element<'_, Message> = if state.onboarding.is_ready() {
-        let frame = app_frame(state);
-        if state.workspace_overlay {
-            stack![
-                frame,
-                workspace_screens::view(&state.workspace, state.mode).map(Message::Workspace)
-            ]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-        } else {
-            frame
-        }
-    } else {
-        onboarding::view(&state.onboarding, state.mode).map(Message::Onboarding)
-    };
-    let mut content = column![titlebar(state)].spacing(0);
-    if let Some(error) = &state.backend_error {
-        content = content.push(
-            container(text(format!("Desktop backend unavailable: {error}")).size(11))
-                .padding([7, 14])
-                .width(Length::Fill)
-                .style(move |_| {
-                    bordered(palette.danger_soft, palette.danger_border, 0.0).color(palette.danger)
-                }),
-        );
-    }
-    content = content.push(body);
-    let base: Element<'_, Message> = container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| container::Style::default().background(palette.paper))
-        .into();
-    #[cfg(feature = "cef-browser")]
-    let layered: Element<'_, Message> = if let Some(prompt) = &state.browser_permission
-        && !state.search.open
-    {
-        stack![base, permission_prompt_view(prompt, state.mode)]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    } else {
-        base
-    };
-    #[cfg(not(feature = "cef-browser"))]
-    let layered: Element<'_, Message> = base;
-    let layered = if state.notifications.open && !state.search.open {
-        stack![layered, notifications_overlay(state)]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    } else {
-        layered
-    };
-    let layered: Element<'_, Message> = if state.search.open {
-        stack![
-            layered,
-            search::view(&state.search, state.mode).map(Message::Search)
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-    } else {
-        layered
-    };
-    if state.huddle_expanded && state.huddle.is_some() && state.desktop.huddle.is_none() {
-        return huddle_stage_view(state);
-    }
-    if state.huddle.is_some()
-        && state.desktop.huddle.is_none()
-        && !state.workspace_overlay
-        && !state.search.open
-    {
-        let dock = container(huddle_dock_view(state))
-            .width(320)
-            .max_height(520)
-            .align_x(iced::alignment::Horizontal::Left)
-            .align_y(iced::alignment::Vertical::Bottom)
-            .padding(iced::Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 12.0,
-                left: NETWORK_RAIL_WIDTH + MODULE_RAIL_WIDTH + 12.0,
-            });
-        stack![layered, dock]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    } else {
-        layered
-    }
-}
-
-fn huddle_dock_view(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let huddle = state.huddle.as_ref().expect("dock requires a huddle");
-    let (status, status_color) = huddle_status(huddle, p);
-    let count = huddle_member_count(state, &huddle.channel);
-    let header = row![
-        container(Space::new())
-            .width(8)
-            .height(8)
-            .style(move |_| rounded(status_color, 4.0)),
-        column![
-            text(format!("Huddle · #{}", huddle.channel))
-                .size(12.5)
-                .font(theme::SANS_SEMIBOLD),
-            text(format!("{status} · {count} in call"))
-                .size(10)
-                .color(p.muted),
-        ]
-        .spacing(1)
-        .width(Length::Fill),
-        button(text("Expand").size(10))
-            .on_press(Message::HuddleExpand)
-            .padding([4, 7]),
-        button(text("Pop out").size(10))
-            .on_press(Message::OpenHuddle)
-            .padding([4, 7]),
-    ]
-    .spacing(7)
-    .align_y(Alignment::Center);
-
-    let mut body = column![header].spacing(8);
-    if let Some(error) = &huddle.error {
-        body = body.push(
-            container(text(error).size(10).color(p.danger))
-                .width(Length::Fill)
-                .padding([6, 8])
-                .style(move |_| bordered(p.danger_soft, p.danger_border, 5.0)),
-        );
-    }
-    body = body.push(huddle_compact_body(state, p));
-    if huddle.devices_open {
-        body = body.push(huddle_devices_view(huddle, p));
-    }
-    body = body.push(huddle_controls_view(state, false, p));
-    container(body)
-        .padding(10)
-        .width(320)
-        .style(move |_| {
-            bordered(p.paper, p.border_strong, 9.0).shadow(iced::Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.14),
-                offset: iced::Vector::new(0.0, 5.0),
-                blur_radius: 16.0,
-            })
-        })
-        .into()
-}
-
-fn huddle_stage_view(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let huddle = state.huddle.as_ref().expect("stage requires a huddle");
-    let (status, status_color) = huddle_status(huddle, p);
-    let count = huddle_member_count(state, &huddle.channel);
-    let header = row![
-        container(Space::new())
-            .width(9)
-            .height(9)
-            .style(move |_| rounded(status_color, 4.5)),
-        text(format!("#{}", huddle.channel))
-            .size(14)
-            .font(theme::SANS_SEMIBOLD),
-        text(format!("{status} · {count} in call"))
-            .size(11)
-            .color(p.muted),
-        Space::new().width(Length::Fill),
-        button(
-            text(if state.huddle_spotlight {
-                "Gallery"
-            } else {
-                "Spotlight"
-            })
-            .size(11)
-        )
-        .on_press(Message::HuddleToggleLayout)
-        .padding([7, 11]),
-        button(text("Pop out").size(11))
-            .on_press(Message::OpenHuddle)
-            .padding([7, 11]),
-        button(text("Collapse").size(11))
-            .on_press(Message::HuddleCollapse)
-            .padding([7, 11]),
-    ]
-    .spacing(9)
-    .align_y(Alignment::Center);
-    let mut notices = column![].spacing(6);
-    if let Some(error) = &huddle.error {
-        notices = notices.push(text(error).size(10.5).color(p.danger));
-    }
-    if huddle.muted && huddle_speaking(huddle) {
-        notices = notices.push(
-            text("Your mic is muted, but it is picking you up.")
-                .size(10.5)
-                .color(p.danger),
-        );
-    }
-    let center = if huddle_member_count(state, &huddle.channel) <= 1 {
-        huddle_self_check(state, p)
-    } else {
-        huddle_gallery(state, p, state.huddle_spotlight)
-    };
-    let controls = column![
-        if huddle.devices_open {
-            huddle_devices_view(huddle, p)
-        } else {
-            Space::new().height(0).into()
-        },
-        huddle_controls_view(state, true, p),
-    ]
-    .spacing(8)
-    .align_x(Alignment::Center);
-    container(
-        column![header, notices, center, controls]
-            .spacing(10)
-            .height(Length::Fill),
-    )
-    .padding([10, 14])
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .style(move |_| container::Style::default().background(p.paper).color(p.ink))
-    .into()
-}
-
-fn huddle_status(huddle: &HuddleRuntime, p: &theme::Palette) -> (&'static str, Color) {
-    match huddle.status {
-        HuddleStatus::Live => ("Live", p.green),
-        HuddleStatus::Connecting => ("Connecting", p.amber),
-        HuddleStatus::Reconnecting => ("Reconnecting", p.amber),
-        HuddleStatus::Unavailable => ("Unavailable", p.danger),
-    }
-}
-
-fn huddle_channel<'a>(state: &'a Shell, channel: &str) -> Option<&'a user_screens::Channel> {
-    let user_screens::Resource::Ready(chat) = &state.user_screens.chat.data else {
-        return None;
-    };
-    chat.channels
-        .iter()
-        .find(|candidate| candidate.id == channel || candidate.name == channel)
-}
-
-fn huddle_member_count(state: &Shell, channel: &str) -> usize {
-    huddle_channel(state, channel).map_or(1, |channel| channel.huddle.len().max(1))
-}
-
-fn huddle_compact_body<'a>(state: &'a Shell, p: &'a theme::Palette) -> Element<'a, Message> {
-    let huddle = state
-        .huddle
-        .as_ref()
-        .expect("compact huddle requires runtime");
-    let participants = huddle_participants(state, huddle);
-    if participants.is_empty() {
-        return container(
-            column![
-                text("Huddle is ready").size(11).font(theme::SANS_SEMIBOLD),
-                text("Waiting for participants…").size(10).color(p.muted),
-            ]
-            .spacing(3),
-        )
-        .width(Length::Fill)
-        .padding([8, 9])
-        .style(move |_| bordered(p.canvas, p.border, 6.0))
-        .into();
-    }
-    let overflow = participants.len().saturating_sub(4);
-    let mut tiles = participants
-        .into_iter()
-        .take(4)
-        .map(|participant| huddle_participant_tile(participant, p, 84.0));
-    let mut grid = column![].spacing(6);
-    loop {
-        let Some(first) = tiles.next() else {
-            break;
-        };
-        let mut line = row![first].spacing(6).width(Length::Fill);
-        line = if let Some(second) = tiles.next() {
-            line.push(second)
-        } else {
-            line.push(Space::new().width(Length::Fill))
-        };
-        grid = grid.push(line);
-    }
-    if overflow > 0 {
-        grid = grid.push(
-            text(format!("+{overflow} more not shown"))
-                .size(9)
-                .color(p.muted),
-        );
-    }
-    grid.into()
-}
-fn huddle_devices_view<'a>(
-    huddle: &'a HuddleRuntime,
-    p: &'a theme::Palette,
-) -> Element<'a, Message> {
-    let microphones = device_labels(&huddle.devices.microphones);
-    let cameras = device_labels(&huddle.devices.cameras);
-    let speakers = device_labels(&huddle.devices.speakers);
-    let mut devices = column![
-        row![
-            text("Devices")
-                .size(11)
-                .font(theme::SANS_SEMIBOLD)
-                .width(Length::Fill),
-            button(text("Close").size(9.5))
-                .on_press(Message::HuddleToggleDevices)
-                .padding([3, 6]),
-        ]
-        .align_y(Alignment::Center),
-        text("Microphone").size(9.5).color(p.muted),
-        pick_list(
-            microphones,
-            selected_device(&huddle.devices.microphones, huddle.devices.microphone),
-            Message::HuddleMicrophone,
-        )
-        .text_size(10.5)
-        .width(Length::Fill),
-        text("Camera").size(9.5).color(p.muted),
-        pick_list(
-            cameras,
-            selected_device(&huddle.devices.cameras, huddle.devices.camera),
-            Message::HuddleCameraDevice,
-        )
-        .text_size(10.5)
-        .width(Length::Fill),
-        text("Speaker").size(9.5).color(p.muted),
-        pick_list(
-            speakers,
-            selected_device(&huddle.devices.speakers, huddle.devices.speaker),
-            Message::HuddleSpeaker,
-        )
-        .text_size(10.5)
-        .width(Length::Fill),
-    ]
-    .spacing(5);
-    if !huddle.devices.screen_sources.is_empty() {
-        let screen_sources = huddle
-            .devices
-            .screen_sources
-            .iter()
-            .enumerate()
-            .map(|(index, label)| format!("{} · {label}", index + 1))
-            .collect::<Vec<_>>();
-        let selected = huddle
-            .devices
-            .screen_source
-            .and_then(|index| screen_sources.get(index).cloned());
-        devices = devices.push(
-            container(
-                column![
-                    text("Choose what to share")
-                        .size(10)
-                        .font(theme::SANS_SEMIBOLD),
-                    text("Select a display or window to start sharing.")
-                        .size(9.5)
-                        .color(p.muted),
-                    pick_list(screen_sources, selected, Message::HuddleScreenSource,)
-                        .placeholder("Select a screen source")
-                        .text_size(10.5)
-                        .width(Length::Fill),
-                ]
-                .spacing(4),
-            )
-            .padding([5, 0]),
-        );
-    }
-    container(devices)
-        .padding(8)
-        .width(Length::Fill)
-        .style(move |_| bordered(p.canvas, p.border, 6.0))
-        .into()
-}
-
-fn huddle_controls_view<'a>(
-    state: &'a Shell,
-    comfortable: bool,
-    p: &'a theme::Palette,
-) -> Element<'a, Message> {
-    let huddle = state.huddle.as_ref().expect("controls require a huddle");
-    let live = huddle.status == HuddleStatus::Live;
-    let video_allowed = live && huddle_member_count(state, &huddle.channel) <= 8;
-    let padding = if comfortable { [7, 12] } else { [5, 7] };
-    let mut controls = row![]
-        .spacing(if comfortable { 8 } else { 4 })
-        .align_y(Alignment::Center);
-    controls = controls.push(huddle_control_button(
-        if huddle.muted {
-            "Unmute"
-        } else if comfortable {
-            "Mute"
-        } else {
-            "Mic"
-        },
-        live.then_some(Message::HuddleMute),
-        huddle.muted,
-        false,
-        padding,
-        p,
-    ));
-    controls = controls.push(huddle_control_button(
-        if huddle.camera_on {
-            "Camera off"
-        } else if comfortable {
-            "Camera"
-        } else {
-            "Cam"
-        },
-        video_allowed.then_some(Message::HuddleCamera),
-        huddle.camera_on,
-        false,
-        padding,
-        p,
-    ));
-    controls = controls.push(huddle_control_button(
-        if huddle.sharing {
-            "Stop share"
-        } else {
-            "Share"
-        },
-        video_allowed.then_some(Message::HuddleShare),
-        huddle.sharing,
-        false,
-        padding,
-        p,
-    ));
-    controls = controls.push(huddle_control_button(
-        if comfortable { "Devices" } else { "Dev" },
-        Some(Message::HuddleToggleDevices),
-        huddle.devices_open,
-        false,
-        padding,
-        p,
-    ));
-    if huddle.status == HuddleStatus::Unavailable {
-        controls = controls.push(huddle_control_button(
-            "Retry",
-            Some(Message::HuddleRetry),
-            false,
-            false,
-            padding,
-            p,
-        ));
-    }
-    controls = controls.push(huddle_control_button(
-        "Leave",
-        Some(Message::HuddleLeave),
-        false,
-        true,
-        padding,
-        p,
-    ));
-    controls.into()
-}
-
-fn huddle_control_button<'a>(
-    label: &'a str,
-    message: Option<Message>,
-    active: bool,
-    danger: bool,
-    padding: [u16; 2],
-    p: &'a theme::Palette,
-) -> Element<'a, Message> {
-    button(text(label).size(10.5))
-        .on_press_maybe(message)
-        .padding(padding)
-        .style(move |_, status| button::Style {
-            background: Some(Background::Color(if danger {
-                p.danger_soft
-            } else if active {
-                p.filled
-            } else if matches!(status, button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            })),
-            text_color: if danger {
-                p.danger
-            } else if active {
-                p.on_filled
-            } else {
-                p.ink
-            },
-            border: Border {
-                color: if danger { p.danger_border } else { p.border },
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..button::Style::default()
-        })
-        .into()
-}
-
-fn huddle_self_check<'a>(state: &'a Shell, p: &'a theme::Palette) -> Element<'a, Message> {
-    let huddle = state.huddle.as_ref().expect("self-check requires a huddle");
-    let speaking = huddle_speaking(huddle);
-    let preview: Element<'a, Message> = if let Some(handle) = &huddle.local_frame {
-        huddle_video_tile_sized(
-            handle,
-            "You",
-            p,
-            300.0,
-            speaking && !huddle.muted,
-            huddle.sharing,
-        )
-    } else {
-        container(
-            column![
-                text("Camera is off").size(14).font(theme::SANS_SEMIBOLD),
-                button(text("Turn on camera").size(11))
-                    .on_press_maybe(
-                        (huddle.status == HuddleStatus::Live).then_some(Message::HuddleCamera)
-                    )
-                    .padding([7, 11]),
-            ]
-            .spacing(9)
-            .align_x(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .height(300)
-        .center_x(Length::Fill)
-        .center_y(300)
-        .style(move |_| bordered(p.canvas, p.border, 8.0))
-        .into()
-    };
-    container(
-        column![
-            text("You're the only one here")
-                .size(16)
-                .font(theme::SANS_SEMIBOLD),
-            text("Check your camera and microphone while others join.")
-                .size(11)
-                .color(p.muted),
-            preview,
-            row![
-                text(if huddle.muted {
-                    "Mic muted"
-                } else {
-                    "Microphone"
-                })
-                .size(10)
-                .width(82),
-                progress_bar(0.0..=100.0, f32::from(huddle.level)),
-                text(format!("{}%", huddle.level)).size(9.5).color(p.muted),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(8)
-        .align_x(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .max_width(720)
-    .center_x(Length::Fill)
-    .into()
-}
-
-struct HuddleParticipantView<'a> {
-    label: &'a str,
-    frame: Option<&'a image::Handle>,
-    muted: bool,
-    sharing: bool,
-    speaking: bool,
-    stale: bool,
-}
-
-fn huddle_participants<'a>(
-    state: &'a Shell,
-    huddle: &'a HuddleRuntime,
-) -> Vec<HuddleParticipantView<'a>> {
-    let self_key = match &state.user_screens.chat.data {
-        user_screens::Resource::Ready(chat) => chat.self_key.as_deref(),
-        _ => None,
-    };
-    let Some(channel) = huddle_channel(state, &huddle.channel) else {
-        return Vec::new();
-    };
-    channel
-        .huddle
-        .iter()
-        .map(|member| {
-            let is_self = self_key.is_some_and(|key| key == member.user || key == member.node);
-            let peer = (!is_self).then(|| huddle.peers.get(&member.node)).flatten();
-            let sharing = if is_self {
-                huddle.sharing
-            } else {
-                peer.is_some_and(|peer| peer.sharing)
-            };
-            let video_on = if is_self {
-                huddle.camera_on || huddle.sharing
-            } else {
-                peer.is_some_and(|peer| peer.camera_on || peer.sharing)
-            };
-            let frame = if !video_on {
-                None
-            } else if is_self {
-                huddle.local_frame.as_ref()
-            } else {
-                huddle.peer_frames.get(&member.node)
-            };
-            HuddleParticipantView {
-                label: if is_self {
-                    "You"
-                } else {
-                    huddle_member_label(state, &member.user)
-                },
-                frame,
-                muted: if is_self {
-                    huddle.muted
-                } else {
-                    peer.is_some_and(|peer| peer.muted)
-                },
-                sharing,
-                speaking: is_self && huddle_speaking(huddle) && !huddle.muted,
-                stale: peer.is_some_and(|peer| peer.seen.elapsed().as_secs() > 10),
-            }
-        })
-        .collect()
-}
-
-fn huddle_member_label<'a>(state: &'a Shell, key: &'a str) -> &'a str {
-    if let members_screen::Resource::Ready(data) = &state.members.data
-        && let Some(member) = data
-            .members
-            .iter()
-            .find(|member| member.key.eq_ignore_ascii_case(key))
-    {
-        return &member.display_name;
-    }
-    key.get(..8).unwrap_or(key)
-}
-
-fn huddle_participant_tile<'a>(
-    participant: HuddleParticipantView<'a>,
-    p: &'a theme::Palette,
-    height: f32,
-) -> Element<'a, Message> {
-    let media: Element<'a, Message> = participant.frame.map_or_else(
-        || {
-            let initials = participant
-                .label
-                .chars()
-                .take(2)
-                .flat_map(char::to_uppercase)
-                .collect::<String>();
-            container(
-                text(initials)
-                    .size(if height > 300.0 { 28 } else { 15 })
-                    .color(p.muted_3),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(move |_| rounded(p.panel, 7.0))
-            .into()
-        },
-        |handle| {
-            image(handle.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(if participant.sharing {
-                    iced::ContentFit::Contain
-                } else {
-                    iced::ContentFit::Cover
-                })
-                .into()
-        },
-    );
-    let mut name = row![text(participant.label).size(10).color(p.on_filled)]
-        .spacing(5)
-        .align_y(Alignment::Center);
-    if participant.sharing {
-        name = name.push(text("screen").size(8.5).color(p.on_filled));
-    }
-    if participant.muted {
-        name = name.push(text("muted").size(8.5).color(p.on_filled));
-    }
-    let name = container(name)
-        .padding([4, 7])
-        .style(move |_| rounded(Color::from_rgba8(0, 0, 0, 0.68), 5.0));
-    let top: Element<'a, Message> = if participant.stale {
-        container(text("no signal").size(8.5).color(Color::WHITE))
-            .padding([3, 6])
-            .style(move |_| rounded(p.danger, 5.0))
-            .into()
-    } else {
-        Space::new().height(0).into()
-    };
-    let overlay = column![
-        row![Space::new().width(Length::Fill), top],
-        Space::new().height(Length::Fill),
-        row![name, Space::new().width(Length::Fill)],
-    ]
-    .padding(6);
-    container(stack![media, overlay])
-        .height(height)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(p.panel)),
-            border: Border {
-                color: if participant.speaking {
-                    p.green
-                } else {
-                    p.border
-                },
-                width: if participant.speaking { 2.0 } else { 1.0 },
-                radius: 7.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
-
-fn huddle_gallery<'a>(
-    state: &'a Shell,
-    p: &'a theme::Palette,
-    spotlight: bool,
-) -> Element<'a, Message> {
-    let huddle = state.huddle.as_ref().expect("gallery requires a huddle");
-    let mut participants = huddle_participants(state, huddle);
-    if participants.is_empty() {
-        return huddle_empty_stage(p);
-    }
-    if spotlight {
-        let selected = participants
-            .iter()
-            .position(|participant| participant.speaking)
-            .unwrap_or(0);
-        let selected = participants.remove(selected);
-        let has_filmstrip = !participants.is_empty();
-        let mut filmstrip = row![].spacing(8);
-        for participant in participants {
-            filmstrip = filmstrip.push(
-                container(huddle_participant_tile(participant, p, 96.0))
-                    .width(150)
-                    .height(96),
-            );
-        }
-        let mut stage = column![huddle_participant_tile(selected, p, 390.0)]
-            .spacing(9)
-            .height(Length::Fill);
-        if has_filmstrip {
-            stage = stage.push(
-                scrollable(filmstrip)
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::new(),
-                    ))
-                    .height(100),
-            );
-        }
-        return container(stage)
-            .max_width(920)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .into();
-    }
-
-    let columns = match participants.len() {
-        0 | 1 => 1,
-        2..=4 => 2,
-        _ => 3,
-    };
-    let mut tiles = participants
-        .into_iter()
-        .map(|participant| huddle_participant_tile(participant, p, 220.0));
-    let mut grid = column![].spacing(8);
-    loop {
-        let Some(first) = tiles.next() else {
-            break;
-        };
-        let mut line = row![first].spacing(8).width(Length::Fill);
-        for _ in 1..columns {
-            line = if let Some(tile) = tiles.next() {
-                line.push(tile)
-            } else {
-                line.push(Space::new().width(Length::Fill))
-            };
-        }
-        grid = grid.push(line);
-    }
-    container(scrollable(grid).height(Length::Fill))
-        .max_width(980)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .into()
-}
-fn huddle_empty_stage(p: &theme::Palette) -> Element<'_, Message> {
-    container(
-        column![
-            text("Waiting for video")
-                .size(15)
-                .font(theme::SANS_SEMIBOLD),
-            text("Participant video and screen shares appear here.")
-                .size(10.5)
-                .color(p.muted),
-        ]
-        .spacing(6)
-        .align_x(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .style(move |_| bordered(p.canvas, p.border, 8.0))
-    .into()
-}
-
-fn huddle_view(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let Some(huddle) = &state.huddle else {
-        return container(text("Not in a huddle").size(12).color(p.muted))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(move |_| {
-                container::Style::default()
-                    .background(p.canvas)
-                    .color(p.ink)
-            })
-            .into();
-    };
-    let (status, status_color) = huddle_status(huddle, p);
-    let count = huddle_member_count(state, &huddle.channel);
-    let header = row![
-        container(Space::new())
-            .width(8)
-            .height(8)
-            .style(move |_| rounded(status_color, 4.0)),
-        column![
-            text(format!("Huddle · #{}", huddle.channel))
-                .size(12.5)
-                .font(theme::SANS_SEMIBOLD),
-            text(format!("{status} · {count} in call"))
-                .size(9.5)
-                .color(p.muted),
-        ]
-        .spacing(1)
-        .width(Length::Fill),
-        button(text("Chat").size(10))
-            .on_press(Message::OpenMain(Some(Screen::Chat)))
-            .padding([4, 7]),
-        button(text("Pop in").size(10))
-            .on_press(Message::CloseHuddle)
-            .padding([4, 7]),
-    ]
-    .spacing(7)
-    .align_y(Alignment::Center);
-    let mut content = column![header].spacing(7);
-    if let Some(error) = &huddle.error {
-        content = content.push(text(error).size(9.5).color(p.danger));
-    }
-    content = content.push(huddle_compact_body(state, p));
-    content = content.push(
-        row![
-            text(if huddle.muted {
-                "Mic muted"
-            } else {
-                "Microphone"
-            })
-            .size(9.5)
-            .width(75),
-            progress_bar(0.0..=100.0, f32::from(huddle.level)),
-        ]
-        .spacing(7)
-        .align_y(Alignment::Center),
-    );
-    if huddle.devices_open {
-        content = content.push(huddle_devices_view(huddle, p));
-    }
-    content = content.push(huddle_controls_view(state, false, p));
-    container(scrollable(content).height(Length::Fill))
-        .padding(10)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| {
-            container::Style::default()
-                .background(p.canvas)
-                .color(p.ink)
-        })
-        .into()
-}
-
-fn huddle_video_tile_sized<'a>(
-    handle: &'a image::Handle,
-    label: &'a str,
-    p: &'a theme::Palette,
-    height: f32,
-    speaking: bool,
-    contain: bool,
-) -> Element<'a, Message> {
-    container(stack![
-        image(handle.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(if contain {
-                iced::ContentFit::Contain
-            } else {
-                iced::ContentFit::Cover
-            }),
-        container(text(label).size(10).color(p.on_filled))
-            .padding([4, 7])
-            .style(move |_| rounded(Color::from_rgba8(0, 0, 0, 0.58), 5.0)),
-    ])
-    .height(height)
-    .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(p.panel)),
-        border: Border {
-            color: if speaking { p.green } else { p.border },
-            width: if speaking { 2.0 } else { 1.0 },
-            radius: 7.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-fn tray_view(state: &Shell) -> Element<'_, Message> {
-    let canvas = Color::from_rgba8(20, 20, 23, 0.92);
-    let panel = Color::from_rgba8(0, 0, 0, 0.18);
-    let hairline = Color::from_rgba8(255, 255, 255, 0.12);
-    let text_color = Color::from_rgba8(255, 255, 255, 0.94);
-    let dim = Color::from_rgba8(255, 255, 255, 0.55);
-    let connected = state.node_client.is_some();
-    let workspace = state
-        .active_workspace
-        .as_ref()
-        .map(|workspace| workspace.name.as_str())
-        .unwrap_or("No network");
-    let rail = column![
-        tray_nav("Node", Icon::Node, Screen::Node, text_color, dim),
-        tray_nav("Chat", Icon::Chat, Screen::Chat, text_color, dim),
-        tray_nav("Pages", Icon::Pages, Screen::Pages, text_color, dim),
-        tray_nav("Files", Icon::Files, Screen::Files, text_color, dim),
-        tray_nav("Browser", Icon::Browser, Screen::Browser, text_color, dim),
-        tray_nav("Forge", Icon::Forge, Screen::Forge, text_color, dim),
-        tray_nav("Agents", Icon::Agent, Screen::Agents, text_color, dim),
-        tray_nav("Members", Icon::Members, Screen::Members, text_color, dim),
-        Space::new().height(Length::Fill),
-        tray_nav(
-            "Settings",
-            Icon::Settings,
-            Screen::Settings,
-            text_color,
-            dim
-        ),
-        button(
-            row![
-                icons::view(Icon::Close, 15.0, dim),
-                text("Quit").size(11.5).color(text_color)
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .padding([7, 10])
-        .style(move |_, status| tray_button_style(status, text_color))
-        .on_press(Message::Quit),
-    ]
-    .spacing(2);
-    let detail = column![
-        text("Node").size(15).font(theme::SANS_SEMIBOLD),
-        tray_field("Network", workspace, text_color, dim),
-        tray_field(
-            "Status",
-            if connected { "Synced" } else { "Stopped" },
-            text_color,
-            dim,
-        ),
-        tray_field(
-            "Role",
-            state
-                .active_workspace
-                .as_ref()
-                .map_or("—", |workspace| if workspace.founder {
-                    "genesis · validator"
-                } else if workspace.member {
-                    "member · validator"
-                } else {
-                    "guest"
-                }),
-            text_color,
-            dim,
-        ),
-        Space::new().height(8),
-        text("SOFTWARE").size(10).color(dim),
-        tray_field("Version", env!("CARGO_PKG_VERSION"), text_color, dim),
-        Space::new().height(Length::Fill),
-        button(text("Open in console").size(11.5))
-            .width(Length::Fill)
-            .padding([7, 10])
-            .style(move |_, status| tray_button_style(status, text_color))
-            .on_press(Message::OpenMain(Some(Screen::Node))),
-    ]
-    .spacing(10);
-    let header = row![
-        container(text("D").size(11).color(Color::WHITE))
-            .center_x(24)
-            .center_y(24)
-            .style(move |_| rounded(theme::ACCENTS[0], 6.0)),
-        column![
-            text("Ducktape").size(12.5).font(theme::SANS_SEMIBOLD),
-            text(if connected {
-                "●  Synced"
-            } else {
-                "●  Stopped"
-            })
-            .size(10)
-            .font(theme::MONO)
-            .color(if connected {
-                Color::from_rgb8(92, 180, 95)
-            } else {
-                Color::from_rgb8(207, 106, 94)
-            }),
-        ]
-        .spacing(2),
-    ]
-    .spacing(9)
-    .align_y(Alignment::Center);
-    container(column![
-        container(header)
-            .padding([10, 12])
-            .width(Length::Fill)
-            .style(move |_| bordered(panel, hairline, 0.0)),
-        row![
-            container(rail)
-                .width(150)
-                .height(Length::Fill)
-                .padding([8, 7])
-                .style(move |_| bordered(panel, hairline, 0.0)),
-            container(detail)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding([12, 13]),
-        ]
-        .height(Length::Fill),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .style(move |_| {
-        container::Style::default()
-            .background(canvas)
-            .color(text_color)
-    })
-    .into()
-}
-
-fn tray_nav(
-    label: &'static str,
-    icon: Icon,
-    screen: Screen,
-    text_color: Color,
-    dim: Color,
-) -> Element<'static, Message> {
-    button(
-        row![
-            icons::view(icon, 15.0, dim),
-            text(label).size(11.5).color(text_color)
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .padding([7, 10])
-    .style(move |_, status| tray_button_style(status, text_color))
-    .on_press(Message::OpenMain(Some(screen)))
-    .into()
-}
-
-fn tray_button_style(status: button::Status, text_color: Color) -> button::Style {
-    button::Style {
-        background: matches!(status, button::Status::Hovered)
-            .then(|| Background::Color(Color::from_rgba8(255, 255, 255, 0.08))),
-        text_color,
-        border: Border {
-            radius: 5.0.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    }
-}
-
-fn tray_field(
-    label: &'static str,
-    value: &str,
-    text_color: Color,
-    dim: Color,
-) -> Element<'static, Message> {
-    row![
-        text(label).size(10.5).color(dim).width(70),
-        text(value.to_owned()).size(11).color(text_color),
-    ]
-    .align_y(Alignment::Center)
-    .into()
-}
-
-#[cfg(feature = "cef-browser")]
-fn permission_prompt_view(prompt: &PermissionPrompt, mode: Mode) -> Element<'_, Message> {
-    let p = *theme::palette(mode);
-    let site = prompt
-        .origin
-        .strip_prefix("duck://")
-        .unwrap_or(prompt.origin.as_str());
-    let mut permissions = column![].spacing(5);
-    for permission in &prompt.permissions {
-        let label = match permission.label() {
-            "microphone" => "Your microphone",
-            "camera" => "Your camera",
-            "screen-capture" => "Your screen",
-            other => other,
-        };
-        permissions = permissions.push(text(format!("• {label}")).size(12.5));
-    }
-    let card = container(
-        column![
-            container(text("Remote content").size(10.5).color(p.danger))
-                .padding([2, 7])
-                .style(move |_| bordered(p.danger_soft, p.danger_border, 4.0)),
-            column![
-                text(site).size(14).font(theme::SANS_SEMIBOLD),
-                text(&prompt.origin)
-                    .size(10.5)
-                    .font(theme::MONO)
-                    .color(p.muted),
-            ]
-            .spacing(3),
-            column![text("wants to use:").size(12).color(p.muted), permissions].spacing(4),
-            text(
-                "This is a page published on your Ducktape network. It is not part of Ducktape and it is not asking for these on Ducktape's behalf."
-            )
-            .size(11.5)
-            .color(p.muted),
-            Space::new().height(Length::Fill),
-            permission_button(
-                "Allow while this page is open",
-                Message::BrowserPermissionDecision {
-                    id: prompt.id,
-                    allow: true,
-                    session: true,
-                },
-                true,
-                p,
-            ),
-            row![
-                permission_button(
-                    "Allow once",
-                    Message::BrowserPermissionDecision {
-                        id: prompt.id,
-                        allow: true,
-                        session: false,
-                    },
-                    false,
-                    p,
-                ),
-                permission_button(
-                    "Don't allow",
-                    Message::BrowserPermissionDecision {
-                        id: prompt.id,
-                        allow: false,
-                        session: true,
-                    },
-                    false,
-                    p,
-                ),
-            ]
-            .spacing(7),
-        ]
-        .spacing(13),
-    )
-    .width(460)
-    .height(360)
-    .padding([18, 20])
-    .style(move |_| bordered(p.paper, p.border_strong, 9.0));
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .style(move |_| {
-            rounded(
-                Color {
-                    a: 0.28,
-                    ..p.filled
-                },
-                0.0,
-            )
-        })
-        .into()
-}
-
-#[cfg(feature = "cef-browser")]
-fn permission_button(
-    label: &'static str,
-    message: Message,
-    primary: bool,
-    p: theme::Palette,
-) -> Element<'static, Message> {
-    button(container(text(label).size(12)).center_x(Length::Fill))
-        .width(Length::Fill)
-        .padding([7, 10])
-        .on_press(message)
-        .style(move |_, status| button::Style {
-            background: Some(Background::Color(if primary {
-                if matches!(status, button::Status::Hovered) {
-                    p.ink_soft
-                } else {
-                    p.filled
-                }
-            } else if matches!(status, button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            })),
-            text_color: if primary { p.on_filled } else { p.ink },
-            border: Border {
-                color: if primary { p.filled } else { p.border },
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..button::Style::default()
-        })
-        .into()
-}
-
-fn titlebar(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let (connection_label, connection_color) = titlebar_connection(state, p);
-    let back = icon_button(
-        Icon::ChevronLeft,
-        Message::Back,
-        state.history_index > 0,
-        state,
-    );
-    let forward = icon_button(
-        Icon::ChevronRight,
-        Message::Forward,
-        state.history_index + 1 < state.history.len(),
-        state,
-    );
-    let identity = mouse_area(
-        container(
-            row![
-                container(text("D").size(11).color(p.on_filled))
-                    .center_x(22)
-                    .center_y(22)
-                    .style(move |_| rounded(p.filled, 5.0)),
-                text(
-                    state
-                        .active_workspace
-                        .as_ref()
-                        .map(|workspace| workspace.name.as_str())
-                        .unwrap_or_else(|| {
-                            if state.node_client.is_some() {
-                                "Remote node"
-                            } else {
-                                "Ducktape"
-                            }
-                        }),
-                )
-                .size(12),
-                text(connection_label).size(9).color(connection_color),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_y(Alignment::Center),
-    )
-    .on_press(Message::Window(WindowAction::Drag));
-    let search = button(
-        row![
-            icons::view(Icon::Search, 14.0, p.muted_2),
-            text("Search").size(12).color(p.muted),
-            Space::new().width(Length::Fill),
-            text(if cfg!(target_os = "macos") {
-                "⌘ K"
-            } else {
-                "Ctrl K"
-            })
-            .size(10)
-            .color(p.muted_2),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .padding([0, 12])
-    .width(340)
-    .height(28)
-    .on_press(Message::ToggleSearch)
-    .style(move |_, status| button::Style {
-        background: Some(Background::Color(
-            if matches!(status, button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            },
-        )),
-        text_color: p.ink,
-        border: Border {
-            color: p.border,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..button::Style::default()
-    });
-    let mut bell_content = row![icons::view(
-        Icon::Bell,
-        15.0,
-        if state.notifications.unread > 0 {
-            p.ink
-        } else {
-            p.muted_2
-        },
-    )]
-    .spacing(4)
-    .align_y(Alignment::Center);
-    if state.notifications.unread > 0 {
-        bell_content = bell_content.push(
-            container(
-                text(if state.notifications.unread > 99 {
-                    "99+".into()
-                } else {
-                    state.notifications.unread.to_string()
-                })
-                .size(8.5)
-                .font(theme::MONO)
-                .color(Color::WHITE),
-            )
-            .padding([1, 5])
-            .style(move |_| rounded(state.accent, 8.0)),
-        );
-    }
-    let bell = button(bell_content)
-        .padding([3, 5])
-        .on_press(Message::ToggleNotifications)
-        .style(move |_, status| button::Style {
-            background: matches!(status, button::Status::Hovered)
-                .then_some(Background::Color(p.hover)),
-            text_color: p.ink,
-            border: Border {
-                radius: 5.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        });
-    let mut controls = row![bell].spacing(1).align_y(Alignment::Center);
-    if !cfg!(target_os = "macos") {
-        controls = controls
-            .push(icon_button(
-                Icon::Minimize,
-                Message::Window(WindowAction::Minimize),
-                true,
-                state,
-            ))
-            .push(icon_button(
-                Icon::Maximize,
-                Message::Window(WindowAction::Maximize),
-                true,
-                state,
-            ))
-            .push(icon_button(
-                Icon::Close,
-                Message::Window(WindowAction::Close),
-                true,
-                state,
-            ));
-    }
-    let native_titlebar_inset = Space::new().width(if cfg!(target_os = "macos") { 68 } else { 0 });
-    container(
-        row![
-            row![native_titlebar_inset, back, forward, identity]
-                .spacing(2)
-                .align_y(Alignment::Center)
-                .width(Length::FillPortion(1)),
-            search,
-            container(controls)
-                .width(Length::FillPortion(1))
-                .align_x(iced::alignment::Horizontal::Right),
-        ]
-        .padding([0, 10])
-        .spacing(12)
-        .align_y(Alignment::Center),
-    )
-    .height(TITLEBAR_HEIGHT)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(p.titlebar)),
-        border: Border {
-            color: p.window_border,
-            width: 0.0,
-            radius: 0.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-fn titlebar_connection(state: &Shell, p: &theme::Palette) -> (String, Color) {
-    if state.node_client.is_none() {
-        return ("OFFLINE".into(), p.muted_2);
-    }
-    let mode = if state.active_workspace.is_some() {
-        "LOCAL"
-    } else {
-        "REMOTE"
-    };
-    match &state.operator.node.data {
-        operator_screens::Resource::Ready(snapshot) if snapshot.connected => {
-            (format!("{mode} · #{}", snapshot.height), p.green)
-        }
-        operator_screens::Resource::Error(_) => (format!("{mode} · RECONNECTING"), p.amber),
-        _ => (mode.into(), state.accent),
-    }
-}
-
-fn app_frame(state: &Shell) -> Element<'_, Message> {
-    row![network_rail(state), module_rail(state), screen_view(state)]
-        .spacing(0)
-        .height(Length::Fill)
-        .into()
-}
-
-fn workspace_initials(name: &str) -> String {
-    let mut words = name
-        .split_whitespace()
-        .filter_map(|word| word.chars().next());
-    match (words.next(), words.next()) {
-        (Some(first), Some(second)) => [first, second]
-            .into_iter()
-            .flat_map(char::to_uppercase)
-            .collect(),
-        (Some(first), None) => first.to_uppercase().take(2).collect(),
-        (None, _) => "?".into(),
-    }
-}
-
-fn network_rail(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let item = |letter: String, active: bool, message| {
-        button(container(text(letter).size(13)).center_x(34).center_y(34))
-            .padding(0)
-            .on_press(message)
-            .style(move |_, status| rail_circle(p, state.accent, active, status))
-    };
-    let mut networks = column![item(
-        "⌂".into(),
-        state.screen() == Screen::Home,
-        Message::Navigate(Screen::Home),
-    )]
-    .spacing(10)
-    .align_x(Alignment::Center);
-    for workspace in &state.workspace.workspaces {
-        let active = state
-            .active_workspace
-            .as_ref()
-            .is_some_and(|current| current.id == workspace.id);
-        networks = networks.push(item(
-            workspace_initials(&workspace.name),
-            active,
-            Message::Workspace(workspace_screens::Message::SelectWorkspace(
-                workspace.id.clone(),
-            )),
-        ));
-    }
-    if state.active_workspace.is_none() && state.node_client.is_some() {
-        networks = networks.push(item("R".into(), true, Message::Navigate(Screen::Home)));
-    }
-    networks = networks
-        .push(item(
-            "+".into(),
-            false,
-            Message::Workspace(workspace_screens::Message::Open),
-        ))
-        .push(Space::new().height(Length::Fill));
-    container(networks.padding([10, 0]))
-        .width(NETWORK_RAIL_WIDTH)
-        .height(Length::Fill)
-        .style(move |_| right_border(p.sidebar, p.border))
-        .into()
-}
-
-fn module_rail(state: &Shell) -> Element<'_, Message> {
-    let p = theme::palette(state.mode);
-    let local_managed = state.active_workspace.is_some();
-    let tabs = if local_managed {
-        row![
-            section_button("USER", Section::User, state),
-            section_button("NODE", Section::Operator, state),
-        ]
-        .spacing(2)
-    } else {
-        row![section_button("USER", Section::User, state)].spacing(2)
-    };
-    let screens = match (state.section, local_managed) {
-        (Section::User, _) | (Section::Operator, false) => &Screen::USER[..],
-        (Section::Operator, true) => &Screen::OPERATOR[..],
-    };
-    let mut modules = column![tabs].spacing(4).align_x(Alignment::Center);
-    for &screen in screens {
-        modules = modules.push(module_button(screen, state));
-    }
-    modules = modules
-        .push(Space::new().height(Length::Fill))
-        .push(module_button(Screen::Settings, state))
-        .push(icon_button(
-            match state.mode {
-                Mode::Light => Icon::Sun,
-                Mode::Dark => Icon::Moon,
-            },
-            Message::ToggleTheme,
-            true,
-            state,
-        ));
-    container(modules.padding([8, 4]))
-        .width(MODULE_RAIL_WIDTH)
-        .height(Length::Fill)
-        .style(move |_| right_border(p.sidebar, p.border))
-        .into()
-}
-
-fn screen_view(state: &Shell) -> Element<'_, Message> {
-    if let Some(screen) = user_screen(state.screen()) {
-        return user_screens::view(&state.user_screens, screen, state.mode)
-            .map(Message::UserScreen);
-    }
-    if state.screen() == Screen::Browser {
-        #[cfg(feature = "cef-browser")]
-        let cef_ready = state.browser.is_some();
-        #[cfg(not(feature = "cef-browser"))]
-        let cef_ready = false;
-        return browser_chrome::view(&state.browser_chrome, state.mode, cef_ready)
-            .map(Message::Browser);
-    }
-    if state.screen() == Screen::Forge {
-        return forge_screen::view(&state.forge, state.mode).map(Message::Forge);
-    }
-    if state.screen() == Screen::Agents {
-        return agents_screen::view(&state.agents, state.mode, state.accent).map(Message::Agents);
-    }
-    if state.screen() == Screen::Members {
-        return members_screen::view(&state.members, state.mode).map(Message::Members);
-    }
-    if state.screen() == Screen::Governance {
-        return governance_screen::view(&state.governance, state.mode).map(Message::Governance);
-    }
-    if state.screen() == Screen::Explorer {
-        return explorer_screen::view(&state.explorer, state.mode).map(Message::Explorer);
-    }
-    if let Some(screen) = operator_screen(state.screen()) {
-        return operator_screens::view(&state.operator, screen, state.mode).map(Message::Operator);
-    }
-    if state.screen() == Screen::Settings {
-        return settings_screen::view(&state.settings).map(Message::Settings);
-    }
-    let p = theme::palette(state.mode);
-    let screen = state.screen();
-    container(
-        column![
-            container(text(screen.label()).size(16))
-                .height(50)
-                .width(Length::Fill)
-                .align_y(Alignment::Center)
-                .padding([0, 20])
-                .style(move |_| container::Style {
-                    border: Border {
-                        color: p.border,
-                        width: 0.0,
-                        radius: 0.0.into(),
-                    },
-                    ..container::Style::default()
-                }),
-            container(
-                column![
-                    icons::view(screen.icon(), 30.0, p.icon_idle),
-                    text(screen.label()).size(16),
-                    text("Native iced surface").size(12).color(p.muted),
-                ]
-                .spacing(10)
-                .align_x(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill),
-        ]
-        .spacing(0),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .style(move |_| container::Style::default().background(p.paper))
-    .into()
-}
-
-fn icon_button<'a>(
-    icon: Icon,
-    message: Message,
-    enabled: bool,
-    state: &Shell,
-) -> Element<'a, Message> {
-    let p = theme::palette(state.mode);
-    button(icons::view(
-        icon,
-        15.0,
-        if enabled { p.muted_3 } else { p.icon_idle },
-    ))
-    .width(32)
-    .height(32)
-    .padding(8)
-    .on_press_maybe(enabled.then_some(message))
-    .style(move |_, status| transparent_button(p, status))
-    .into()
-}
-
-fn section_button<'a>(
-    label: &'static str,
-    section: Section,
-    state: &Shell,
-) -> Element<'a, Message> {
-    let p = theme::palette(state.mode);
-    let active = state.section == section;
-    button(text(label).size(8))
-        .height(28)
-        .padding([0, 5])
-        .on_press(Message::Section(section))
-        .style(move |_, status| tab_style(p, active, status))
-        .into()
-}
-
-fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
-    let p = theme::palette(state.mode);
-    let active = state.screen() == screen;
-    button(
-        column![
-            icons::view(
-                screen.icon(),
-                18.0,
-                if active { p.ink } else { p.icon_idle }
-            ),
-            text(screen.label())
-                .size(9)
-                .color(if active { p.ink } else { p.muted }),
-        ]
-        .spacing(5)
-        .align_x(Alignment::Center),
-    )
-    .width(66)
-    .height(54)
-    .padding([7, 2])
-    .on_press(Message::Navigate(screen))
-    .style(move |_, status| tab_style(p, active, status))
-    .into()
-}
-
-fn rounded(background: Color, radius: f32) -> container::Style {
-    container::Style::default()
-        .background(background)
-        .border(Border {
-            radius: radius.into(),
-            ..Border::default()
-        })
-}
-
-fn bordered(background: Color, border: Color, radius: f32) -> container::Style {
-    container::Style::default()
-        .background(background)
-        .border(Border {
-            color: border,
-            width: 1.0,
-            radius: radius.into(),
-        })
-}
-
-fn right_border(background: Color, border: Color) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(background)),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn transparent_button(p: &theme::Palette, status: button::Status) -> button::Style {
-    button::Style {
-        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-            .then_some(Background::Color(p.hover)),
-        text_color: p.ink,
-        border: Border {
-            radius: theme::RADIUS_SM.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    }
-}
-
-fn tab_style(p: &theme::Palette, active: bool, status: button::Status) -> button::Style {
-    let background = if active {
-        Some(Background::Color(p.paper))
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        Some(Background::Color(p.hover))
-    } else {
-        None
-    };
-    button::Style {
-        background,
-        text_color: if active { p.ink } else { p.muted },
-        border: Border {
-            radius: theme::RADIUS_SM.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    }
-}
-
-fn rail_circle(
-    p: &theme::Palette,
-    accent: Color,
-    active: bool,
-    status: button::Status,
-) -> button::Style {
-    let background = if active {
-        accent
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        p.hover
-    } else {
-        p.panel
-    };
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: if active { Color::WHITE } else { p.ink },
-        border: Border {
-            color: if active { p.paper } else { p.border },
-            width: if active { 2.0 } else { 1.0 },
-            radius: 17.0.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_workspace() -> Workspace {
+        Workspace {
+            id: "local".into(),
+            name: "Local".into(),
+            chain_id: "local-chain".into(),
+            pubkey: "local-key".into(),
+            founder: true,
+            member: true,
+            ports: crate::backend::WorkspacePorts {
+                listen: 41_000,
+                http: 41_001,
+                rpc: 41_002,
+                wireguard: None,
+                invite: None,
+            },
+        }
+    }
 
     fn key_press(
         key: iced::keyboard::Key,
@@ -5351,6 +3245,88 @@ mod tests {
         assert_eq!(titlebar_connection(&shell, palette).0, "OFFLINE");
         shell.node_client = Some(NodeClient::new("https://node.example").unwrap());
         assert_eq!(titlebar_connection(&shell, palette).0, "REMOTE");
+    }
+
+    #[test]
+    fn terminal_is_operator_only_and_ordered_between_sandbox_and_metrics() {
+        assert_eq!(
+            Screen::OPERATOR,
+            [
+                Screen::Node,
+                Screen::Gateway,
+                Screen::Modules,
+                Screen::Sandbox,
+                Screen::Terminal,
+                Screen::Metrics,
+            ]
+        );
+        assert!(!Screen::USER.contains(&Screen::Terminal));
+    }
+
+    #[test]
+    fn terminal_fails_closed_without_a_local_workspace_and_stops_on_navigation() {
+        let mut shell = Shell {
+            active_workspace: Some(local_workspace()),
+            node_client: Some(NodeClient::new("https://node.example").unwrap()),
+            ..Shell::default()
+        };
+        drop(update(&mut shell, Message::Navigate(Screen::Terminal)));
+        assert_eq!(shell.screen(), Screen::Chat);
+        assert_eq!(
+            shell.terminal_screen.status(),
+            terminal_screen::Status::Idle
+        );
+        assert!(shell.terminal.is_none());
+
+        shell.node_client = Some(NodeClient::local(41_001).unwrap());
+        assert!(terminal_available(&shell));
+        shell.navigate(Screen::Terminal);
+        let effect =
+            terminal_screen::update(&mut shell.terminal_screen, terminal_screen::Message::Start);
+        assert!(matches!(
+            effect,
+            Some(terminal_screen::Effect::Start { .. })
+        ));
+        let generation = shell.terminal_screen.generation();
+        assert_eq!(
+            shell.terminal_screen.status(),
+            terminal_screen::Status::Starting
+        );
+
+        shell.navigate(Screen::Metrics);
+        assert_eq!(
+            shell.terminal_screen.status(),
+            terminal_screen::Status::Idle
+        );
+        assert_ne!(shell.terminal_screen.generation(), generation);
+    }
+
+    #[test]
+    fn workspace_switch_navigates_away_from_a_stopped_terminal() {
+        let mut shell = Shell::default();
+        shell.navigate(Screen::Terminal);
+        let effect =
+            terminal_screen::update(&mut shell.terminal_screen, terminal_screen::Message::Start);
+        assert!(matches!(
+            effect,
+            Some(terminal_screen::Effect::Start { .. })
+        ));
+
+        drop(update(
+            &mut shell,
+            Message::WorkspaceSnapshotLoaded(Ok(WorkspaceSnapshot {
+                workspaces: vec![local_workspace()],
+                active: Some(local_workspace()),
+            })),
+        ));
+
+        assert_eq!(shell.screen(), Screen::Node);
+        assert_eq!(
+            shell.terminal_screen.status(),
+            terminal_screen::Status::Idle
+        );
+        assert!(shell.terminal.is_none());
+        assert!(terminal_available(&shell));
     }
 
     #[test]

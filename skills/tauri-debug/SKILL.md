@@ -41,8 +41,10 @@ make macos-cef-smoke
 ```
 
 The first validates native window activation and close-to-menu-bar behavior;
-the second stages the dedicated CEF probe and validates child creation,
-navigation, bounds, and teardown. Accessibility permission is required.
+the second stages the dedicated CEF probe and validates child creation, the
+native bounds-update call, hide/show and reload requests, and zero-helper
+teardown. Signed `.duck` routing and policy still require the normal app and a
+seeded workspace. Accessibility permission is required.
 
 On Linux/Windows, launch the staged package and inspect native accessibility
 or screenshot tools supplied by the host. Do not infer native behavior from

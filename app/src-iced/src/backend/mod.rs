@@ -105,6 +105,11 @@ impl Backend {
     pub(crate) fn state_root(&self) -> PathBuf {
         self.root.clone()
     }
+
+    /// Stop the bounded blocking actor before iced tears down its Tokio runtime.
+    pub(crate) fn shutdown(&self) {
+        self.control.shutdown();
+    }
 }
 
 fn refuse_elevated_process() -> Result<(), String> {

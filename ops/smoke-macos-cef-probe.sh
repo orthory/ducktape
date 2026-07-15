@@ -32,11 +32,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-HOME="$tmp_home" "$binary" >"$tmp_home/probe.log" 2>&1 &
+DUCKTAPE_CEF_PROBE_SMOKE=1 RUST_LOG=ducktape::browser=info \
+  HOME="$tmp_home" "$binary" >"$tmp_home/probe.log" 2>&1 &
 pid=$!
 deadline=$((SECONDS + 45))
 window_ready=0
 renderer_ready=0
+smoke_ready=0
+
+helpers_alive() {
+  ps -axo command= \
+    | grep -F "$app/Contents/Frameworks/ducktape Helper" \
+    | grep -q -- '--type='
+}
+
 while [ "$SECONDS" -lt "$deadline" ]; do
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "[macos-cef-smoke] probe exited early" >&2
@@ -58,8 +67,11 @@ APPLESCRIPT
   if ps -axo command= | grep -F "$app/Contents/Frameworks/ducktape Helper (Renderer).app/Contents/MacOS/ducktape Helper (Renderer)" | grep -q -- '--type=renderer'; then
     renderer_ready=1
   fi
-  if [ "$window_ready" = 1 ] && [ "$renderer_ready" = 1 ]; then
-    echo "[macos-cef-smoke] native iced window + bundled CEF renderer are live"
+  if grep -q 'cef_probe_smoke_ready' "$tmp_home/probe.log"; then
+    smoke_ready=1
+  fi
+  if [ "$window_ready" = 1 ] && [ "$renderer_ready" = 1 ] && [ "$smoke_ready" = 1 ]; then
+    echo "[macos-cef-smoke] native window + renderer accepted bounds, hide/show, and reload requests"
     osascript <<APPLESCRIPT
 tell application "System Events"
   set frontmost of first application process whose unix id is $pid to true
@@ -74,17 +86,26 @@ APPLESCRIPT
       echo "[macos-cef-smoke] Cmd+Q did not complete orderly CEF shutdown" >&2
       exit 1
     fi
-    pid=""
-    if ps -axo command= | grep -F "$app/Contents/Frameworks/ducktape Helper" | grep -q -- '--type='; then
+    if ! wait "$pid"; then
+      echo "[macos-cef-smoke] probe returned a failure after Cmd+Q" >&2
+      tail -60 "$tmp_home/probe.log" >&2 || true
+      exit 1
+    fi
+    for _ in $(seq 1 40); do
+      helpers_alive || break
+      sleep 0.25
+    done
+    if helpers_alive; then
       echo "[macos-cef-smoke] a bundled CEF helper survived Cmd+Q" >&2
       exit 1
     fi
+    pid=""
     echo "[macos-cef-smoke] Cmd+Q closed the browser and all helpers"
     exit 0
   fi
   sleep 0.25
 done
 
-echo "[macos-cef-smoke] timed out (window=$window_ready renderer=$renderer_ready)" >&2
+echo "[macos-cef-smoke] timed out (window=$window_ready renderer=$renderer_ready smoke=$smoke_ready)" >&2
 tail -60 "$tmp_home/probe.log" >&2 || true
 exit 1

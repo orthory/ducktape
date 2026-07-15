@@ -47,11 +47,14 @@ fn main() -> iced::Result {
     #[cfg(target_os = "macos")]
     browser::prepare_macos_application();
 
-    iced::application(Probe::boot, Probe::update, Probe::view)
+    let result = iced::application(Probe::boot, Probe::update, Probe::view)
         .title("Ducktape iced + CEF probe")
         .window_size((920.0, 680.0))
+        .exit_on_close_request(false)
         .subscription(Probe::subscription)
-        .run()
+        .run();
+    browser::shutdown_after_event_loop();
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -68,6 +71,7 @@ struct Probe {
     status: String,
     visible: bool,
     large: bool,
+    closing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +93,7 @@ impl Probe {
                 status: "Waiting for iced's native window…".into(),
                 visible: true,
                 large: false,
+                closing: false,
             },
             window::latest().map(Message::WindowReady),
         )
@@ -105,7 +110,28 @@ impl Probe {
             }
             Message::ParentReady(Ok(parent)) => {
                 match BrowserRuntime::create(parent, SMALL, PROBE_URL) {
-                    Ok(browser) => {
+                    Ok(mut browser) => {
+                        if smoke_requested() {
+                            if let Err(error) = exercise_browser(&mut browser) {
+                                tracing::error!(
+                                    target: "ducktape::browser",
+                                    event = "cef_probe_smoke_failed",
+                                    reason = "browser_exercise_failed",
+                                    error = %error,
+                                    "CEF probe smoke sequence failed"
+                                );
+                                self.status = error;
+                                self.browser = Some(browser);
+                                self.begin_shutdown();
+                                return Task::none();
+                            }
+                            self.large = true;
+                            tracing::info!(
+                                target: "ducktape::browser",
+                                event = "cef_probe_smoke_ready",
+                                "CEF probe completed bounds, visibility, and reload request checks"
+                            );
+                        }
                         self.browser = Some(browser);
                         self.status = "CEF child browser is live".into();
                     }
@@ -116,21 +142,21 @@ impl Probe {
             Message::Pump => {
                 #[cfg(target_os = "macos")]
                 if browser::take_macos_terminate_request() {
-                    if let Some(mut browser) = self.browser.take() {
-                        let _ = browser.close();
-                    }
-                    return iced::exit();
+                    self.begin_shutdown();
                 }
-                if let Some(browser) = &self.browser {
+                if let Some(browser) = &mut self.browser {
                     browser.pump();
+                }
+                if self.closing {
+                    return self.finish_shutdown();
                 }
             }
             Message::ToggleVisible => {
                 self.visible = !self.visible;
-                if let Some(browser) = &mut self.browser {
-                    if let Err(error) = browser.set_visible(self.visible) {
-                        self.status = error;
-                    }
+                if let Some(browser) = &mut self.browser
+                    && let Err(error) = browser.set_visible(self.visible)
+                {
+                    self.status = error;
                 }
             }
             Message::ToggleBounds => {
@@ -143,26 +169,24 @@ impl Probe {
                 }
             }
             Message::Reload => {
-                if let Some(browser) = &self.browser {
-                    if let Err(error) = browser.navigate(PROBE_URL) {
-                        self.status = error;
-                    }
+                if let Some(browser) = &self.browser
+                    && let Err(error) = browser.navigate(PROBE_URL)
+                {
+                    self.status = error;
                 }
             }
             Message::CloseBrowser => {
-                if let Some(mut browser) = self.browser.take() {
-                    match browser.close() {
-                        Ok(()) => self.status = "CEF child browser closed".into(),
-                        Err(error) => self.status = error,
-                    }
-                }
+                self.begin_shutdown();
             }
         }
         Task::none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(8)).map(|_| Message::Pump)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(8)).map(|_| Message::Pump),
+            window::close_requests().map(|_| Message::CloseBrowser),
+        ])
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -193,4 +217,41 @@ impl Probe {
         .height(Length::Fill)
         .into()
     }
+
+    fn begin_shutdown(&mut self) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        if let Some(browser) = &mut self.browser
+            && let Err(error) = browser.begin_shutdown()
+        {
+            self.status = error;
+        }
+    }
+
+    fn finish_shutdown(&mut self) -> Task<Message> {
+        let Some(browser) = &mut self.browser else {
+            return iced::exit();
+        };
+        match browser.finish_shutdown() {
+            Ok(false) => return Task::none(),
+            Ok(true) => {}
+            Err(error) => self.status = error,
+        }
+        let mut browser = self.browser.take().expect("browser presence checked");
+        browser.defer_shutdown_after_event_loop();
+        iced::exit()
+    }
+}
+
+fn smoke_requested() -> bool {
+    std::env::var("DUCKTAPE_CEF_PROBE_SMOKE").as_deref() == Ok("1")
+}
+
+fn exercise_browser(browser: &mut BrowserRuntime) -> Result<(), String> {
+    browser.set_bounds(LARGE)?;
+    browser.set_visible(false)?;
+    browser.set_visible(true)?;
+    browser.navigate(PROBE_URL)
 }

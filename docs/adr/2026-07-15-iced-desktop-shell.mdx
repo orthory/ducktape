@@ -9,11 +9,11 @@ shipped application.
 
 ## Boundaries
 
-The shell owns windows, navigation, workspace selection, process lifecycle,
-notifications, media, and other native capabilities. User-facing views update
-capability-free state and emit typed effects through `view_api` and
-`module_host`. Only trusted adapters may turn those effects into node, backend,
-filesystem, process, clipboard, or browser work.
+The shell owns native window IDs, navigation, workspace selection, process
+lifecycle, notifications, and other application-wide capabilities. User-facing
+views update capability-free state and emit typed effects through `view_api`
+and `module_host`. Only trusted adapters may turn those effects into node,
+backend, filesystem, process, clipboard, or browser work.
 
 The composition is deliberately static. Concrete enums make the authority and
 event source visible without committing the project to a plugin ABI. A view may
@@ -23,6 +23,32 @@ boundary; file size alone is not a reason to introduce another layer.
 Dependency tests reject backend, transport, browser, OS, filesystem, network,
 and process imports from the view boundary. This is the contract future view
 packages inherit.
+
+Home and Chat are concrete, cohesive view modules behind the existing user
+facade. Pages and Files keep their own domain boundaries. Huddle owns its UI,
+session, and media runtime as one unit, while the shell retains the native
+window ID, CEF visibility, and backend dispatch. Operator screens and their
+trusted services use matching concrete domain modules behind stable facades;
+the signed Gateway mutation and recovery transaction remains cohesive. The
+shell's private presentation child owns only titlebar, rail, notification, and
+window composition. These seams follow actual state and capability ownership;
+the application does not split views merely to meet a file-size target.
+
+## Native Terminal
+
+The operator Terminal is an Iced view backed by a trusted Rust service. It is
+not a browser tab and never creates a CEF surface. The capability-free view
+owns terminal presentation, keyboard and IME input, selection, scrollback, and
+geometry. The trusted service owns the single node WebSocket used to create,
+subscribe to, write to, resize, and close the Codex terminal session.
+
+Terminal output carries a monotonic cursor. A reconnect resumes after the last
+delivered cursor instead of replaying retained ANSI bytes into an already
+populated emulator. A lagged stream is fatal because an evicted VT prefix
+cannot be reconstructed safely; the UI asks the user to restart the session
+rather than displaying a plausibly wrong terminal. Leaving Terminal, changing
+workspace, or quitting serializes session shutdown before another session may
+start.
 
 ## Browser exception
 

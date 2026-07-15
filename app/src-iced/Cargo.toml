@@ -15,7 +15,7 @@ cef = { version = "=148.0.0", features = ["build-util", "linux-x11", "sandbox"],
 # cef's published manifest permits newer 148.x bindings, which are not wire-
 # compatible with its generated 148.0.0 wrapper. Pin both halves explicitly.
 cef-dll-sys = { version = "=148.0.0", optional = true }
-iced = { version = "=0.14.0", features = ["tokio", "advanced-shaping", "svg", "image"] }
+iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "thread-pool", "x11", "wayland", "tokio", "advanced", "advanced-shaping", "svg", "image"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -29,6 +29,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+vt100 = "=0.16.2"
 tiny_http = "0.12"
 toml = "0.8"
 rfd = { version = "0.15", default-features = false, features = ["tokio", "xdg-portal"] }

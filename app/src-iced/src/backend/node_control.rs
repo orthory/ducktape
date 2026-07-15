@@ -26,6 +26,7 @@ type ControlJob = Box<dyn FnOnce() + Send + 'static>;
 #[derive(Debug, Clone)]
 pub(super) struct NodeControl {
     queue: mpsc::Sender<ControlJob>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl NodeControl {
@@ -34,12 +35,17 @@ impl NodeControl {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "node-control must start inside the iced Tokio executor".to_string())?;
         let (queue, mut receiver) = mpsc::channel::<ControlJob>(CONTROL_QUEUE_CAPACITY);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         runtime.spawn_blocking(move || {
-            while let Some(job) = receiver.blocking_recv() {
+            while !worker_stopping.load(Ordering::Acquire) {
+                let Some(job) = receiver.blocking_recv() else {
+                    break;
+                };
                 job();
             }
         });
-        Ok(Self { queue })
+        Ok(Self { queue, stopping })
     }
 
     pub(super) async fn run<T, F>(&self, operation: F) -> Result<T, String>
@@ -68,10 +74,22 @@ impl NodeControl {
     }
 
     fn enqueue(&self, job: ControlJob) -> Result<(), String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("node-control is shutting down".to_string());
+        }
         self.queue.try_send(job).map_err(|_| {
             "node-control queue is full or unavailable — wait for the current operation to finish"
                 .to_string()
         })
+    }
+
+    pub(super) fn shutdown(&self) {
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Wake an idle blocking receiver. If the queue is full, it is already
+        // awake and will observe `stopping` after its current bounded job.
+        let _ = self.queue.try_send(Box::new(|| {}));
     }
 }
 
@@ -961,6 +979,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, "node-control operation panicked");
         assert_eq!(control.run(|| Ok(7)).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent_and_rejects_new_jobs() {
+        let control = NodeControl::new().unwrap();
+        let clone = control.clone();
+
+        control.shutdown();
+        clone.shutdown();
+
+        assert_eq!(
+            clone.run(|| Ok(7)).await.unwrap_err(),
+            "node-control is shutting down"
+        );
     }
 
     #[test]
