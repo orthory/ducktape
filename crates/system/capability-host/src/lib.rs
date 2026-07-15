@@ -1059,10 +1059,17 @@ impl CliProvider {
             Some(BrokerKind::AnthropicMessages) => {
                 set("ANTHROPIC_BASE_URL", broker.base_url.clone());
                 set("ANTHROPIC_AUTH_TOKEN", broker.run_bearer.clone());
-                // hardening: scrub creds from subprocesses the CLI spawns, kill
-                // non-essential outbound traffic, and disable the auto-updater —
-                // all of which would otherwise dial Anthropic around the broker.
-                set("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1".into());
+                // hardening: kill non-essential outbound traffic + the auto-updater
+                // so the CLI never dials Anthropic around the broker.
+                //
+                // NOTE: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is deliberately NOT set.
+                // It scrubs ANTHROPIC_* from the CLI's subprocesses, but our only
+                // ANTHROPIC_* var is the OPAQUE run bearer (not a real credential —
+                // it authenticates to the loopback broker and dies with the run), so
+                // scrubbing it protects nothing. And live-verified it actively breaks
+                // the CLI: headless `claude -p` refuses to run with the scrub set
+                // unless allowedTools is declared ("Permission mode forced to
+                // default"). The real credential never enters the container at all.
                 set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into());
                 set("DISABLE_AUTOUPDATER", "1".into());
             }
@@ -4995,7 +5002,10 @@ broker = "anthropic-messages"
             Some(config_home.to_str().unwrap()),
             "the fresh config home blocks the ~/.claude fallback"
         );
-        assert_eq!(got("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB").as_deref(), Some("1"));
+        // SUBPROCESS_ENV_SCRUB is deliberately NOT set — it breaks headless
+        // `claude -p` and protects nothing here (the only ANTHROPIC_* var is the
+        // opaque run bearer). See apply_auth_env.
+        assert_eq!(got("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"), None);
         assert_eq!(got("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(), Some("1"));
         assert_eq!(got("DISABLE_AUTOUPDATER").as_deref(), Some("1"));
         // the codex bearer var is NOT set for a claude broker.

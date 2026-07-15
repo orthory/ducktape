@@ -535,6 +535,201 @@ mod tests {
         );
     }
 
+    /// build the Podman provider set the live model-turn tests share.
+    #[cfg(test)]
+    fn live_podman_set() -> Option<crate::ProviderSet> {
+        if !podman_available() {
+            eprintln!("skipping live model turn: no working podman");
+            return None;
+        }
+        let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "localhost/ducktape-agent:dev".into());
+        Some(
+            crate::discover(
+                b"verify-node-000000000000000000000",
+                crate::AgentDirs::under(std::path::Path::new("/tmp/ducktape-live-verify")),
+                None,
+                crate::SandboxBackend::Podman { image },
+            )
+            .expect("discover on Podman"),
+        )
+    }
+
+    #[cfg(test)]
+    fn live_ctx(agent: &str) -> RunContext {
+        RunContext {
+            agent_id: Some(agent.into()),
+            executing_node: Some(crate::execution_node_id(b"verify-node-000000000000000000000")),
+            env: std::iter::once(("TERM".to_string(), "xterm-256color".to_string())).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// FULL codex MODEL TURN through the broker: `provider.run` a trivial prompt
+    /// in the container; the broker (holding ~/.codex/auth.json) reaches the
+    /// model and codex returns an answer. Proves credential-isolated model access
+    /// end-to-end. `#[ignore]` — spends a tiny bit of the operator's codex quota.
+    #[tokio::test]
+    #[ignore = "live model turn: spends codex quota; needs podman + ~/.codex/auth.json"]
+    async fn codex_model_turn_through_the_broker() {
+        let Some(set) = live_podman_set() else { return };
+        let provider = set.resolve("codex").expect("codex provider");
+        let answer = provider
+            .run(
+                "Reply with exactly one word: PONG. Nothing else.",
+                &live_ctx("verify-codex"),
+            )
+            .await
+            .expect("codex model turn failed");
+        eprintln!("--- codex answer ---\n{answer}\n--- end ---");
+        assert!(!answer.trim().is_empty(), "codex returned an empty answer");
+    }
+
+    /// FULL claude MODEL TURN through the Anthropic broker (PR2): `provider.run`
+    /// a trivial prompt; the broker (holding ~/.claude/.credentials.json) proxies
+    /// /v1/messages to api.anthropic.com and claude returns an answer. Exercises
+    /// the SSE broker + the OAuth path against the REAL upstream. `#[ignore]` —
+    /// spends a tiny bit of the operator's claude quota.
+    #[tokio::test]
+    #[ignore = "live model turn: spends claude quota; needs podman + ~/.claude/.credentials.json"]
+    async fn claude_model_turn_through_the_broker() {
+        let Some(set) = live_podman_set() else { return };
+        let provider = set.resolve("claude").expect("claude provider");
+        let answer = provider
+            .run(
+                "Reply with exactly one word: PONG. Nothing else.",
+                &live_ctx("verify-claude"),
+            )
+            .await
+            .expect("claude model turn failed");
+        eprintln!("--- claude answer ---\n{answer}\n--- end ---");
+        assert!(!answer.trim().is_empty(), "claude returned an empty answer");
+    }
+
+    /// read whatever the session emits for ~`secs` seconds into `sink`.
+    #[cfg(test)]
+    async fn drain_for(sink: &mut Vec<u8>, session: &InteractiveSession, secs: u64) {
+        let mut buf = [0u8; 8192];
+        for _ in 0..(secs * 10) {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                session.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) => return,
+                Ok(Ok(n)) => sink.extend_from_slice(&buf[..n]),
+                Err(_) => {} // 100ms tick with nothing — keep waiting
+            }
+        }
+    }
+
+    /// strip ANSI/control noise so a dumped TUI screen is human-readable.
+    #[cfg(test)]
+    fn deansi(bytes: &[u8]) -> String {
+        let s = String::from_utf8_lossy(bytes);
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // skip CSI/OSC etc until a letter/BEL terminates it
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() || n == '\x07' {
+                        break;
+                    }
+                }
+            } else if c == '\r' || (!c.is_control() || c == '\n') {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// drive an interactive session: let the TUI fully init, type `prompt`,
+    /// submit (Enter, twice to be robust to a not-yet-ready composer), read the
+    /// reply. Returns the full raw transcript.
+    #[cfg(test)]
+    async fn drive_tui(session: &InteractiveSession, prompt: &str) -> Vec<u8> {
+        use std::time::Duration;
+        let mut all = Vec::new();
+        drain_for(&mut all, session, 7).await; // initial render / first-run dialog
+        // claude's first run in a fresh workspace shows a "trust this folder?"
+        // dialog whose default is Yes — confirm it. codex has no such dialog, so
+        // this Enter lands in an empty composer and is a harmless no-op.
+        session.write_all(b"\r").await.ok();
+        drain_for(&mut all, session, 3).await; // composer becomes ready
+        session.write_all(prompt.as_bytes()).await.ok();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        session.write_all(b"\r").await.ok(); // submit
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        session.write_all(b"\r").await.ok(); // again, in case the first was pre-ready
+        drain_for(&mut all, session, 40).await; // model reply
+        all
+    }
+
+    /// does `needle` appear in `hay` once every NON-alphanumeric byte (ANSI,
+    /// cursor moves, spaces, newlines) is stripped? A TUI renders each glyph in
+    /// its own cell with cursor moves between, so the reply is never contiguous
+    /// RAW — but stripping the noise leaves its letters adjacent. Contiguous (not
+    /// subsequence) match, so scattered chrome letters can't spuriously satisfy it.
+    #[cfg(test)]
+    fn letters_contains(hay: &[u8], needle: &str) -> bool {
+        // strip ANSI FIRST (its parameter digits/letters would otherwise splice
+        // into the text stream), then keep only alphanumerics.
+        let letters: String = deansi(hay)
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        letters.contains(needle)
+    }
+
+    // The prompt asks the model to TRANSFORM a word to uppercase, so the reply
+    // (ZEPHYR) is distinguishable from the prompt's own echo (zephyr).
+    #[cfg(test)]
+    const TURN_PROMPT: &str = "Reply with ONLY the uppercase form of the word zephyr and nothing else.";
+    #[cfg(test)]
+    const TURN_REPLY: &str = "ZEPHYR";
+
+    /// LIVE interactive MODEL TURN for codex: launch the TUI, type a prompt, and
+    /// read the model's rendered reply. `#[ignore]` — spends codex quota.
+    #[tokio::test]
+    #[ignore = "live interactive turn: spends codex quota"]
+    async fn codex_interactive_model_turn() {
+        let Some(set) = live_podman_set() else { return };
+        let provider = set.resolve("codex").expect("codex provider");
+        let session = provider
+            .spawn_interactive(&live_ctx("verify-codex-tui"))
+            .await
+            .expect("spawn codex TUI");
+        let raw = drive_tui(&session, TURN_PROMPT).await;
+        session.close().await;
+        eprintln!("=== codex TUI transcript (deansi) ===\n{}\n=== end ===", deansi(&raw));
+        assert!(
+            letters_contains(&raw, TURN_REPLY),
+            "codex TUI never rendered the model reply ({TURN_REPLY})"
+        );
+    }
+
+    /// LIVE interactive MODEL TURN for claude: same, against the Anthropic broker.
+    #[tokio::test]
+    #[ignore = "live interactive turn: spends claude quota"]
+    async fn claude_interactive_model_turn() {
+        let Some(set) = live_podman_set() else { return };
+        let provider = set.resolve("claude").expect("claude provider");
+        let session = provider
+            .spawn_interactive(&live_ctx("verify-claude-tui"))
+            .await
+            .expect("spawn claude TUI");
+        let raw = drive_tui(&session, TURN_PROMPT).await;
+        session.close().await;
+        eprintln!("=== claude TUI transcript (deansi) ===\n{}\n=== end ===", deansi(&raw));
+        assert!(
+            letters_contains(&raw, TURN_REPLY),
+            "claude TUI never rendered the model reply ({TURN_REPLY})"
+        );
+    }
+
     /// REAL podman: `-t` gives the CONTAINER process a genuine tty — what a TUI
     /// needs. `test -t 0` is true only over a real pty.
     #[tokio::test]

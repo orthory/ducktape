@@ -749,6 +749,13 @@ async fn forward_messages(
                 | "content-length"
                 | "connection"
                 | "transfer-encoding"
+                // Drop accept-encoding so upstream replies UNCOMPRESSED: our
+                // reqwest is built without the gzip/brotli features, so it does
+                // NOT auto-decompress, and we forward only content-type (not
+                // content-encoding) — leave it in and the client would get gzip
+                // bytes labelled as plain and fail with "Failed to parse JSON"
+                // (live-verified against api.anthropic.com).
+                | "accept-encoding"
         ) {
             continue;
         }
