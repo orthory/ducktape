@@ -64,8 +64,9 @@ pub enum ClientMsg {
     },
     /// a submitted COMMAND for an interactive session — the ordered "command
     /// grain" (a prompt / line), not raw keystrokes. `origin` is the
-    /// caller-supplied attribution (the app passes a member label; empty is
-    /// treated as `"local"`). Gated exactly like [`Self::TermInput`] (the
+    /// caller-supplied attribution (the app passes a member label), stored
+    /// verbatim and UNTRUSTED until consensus signs it (PR 2). Gated exactly
+    /// like [`Self::TermInput`] (the
     /// connection must be subscribed to the session's `term:<id>` topic); the
     /// session's serial consumer assigns the total order and feeds `text` +
     /// Enter to the pty. This is the `CommandSource` seam consensus (PR 2) will
