@@ -487,6 +487,54 @@ mod tests {
         );
     }
 
+    /// FULL codex path: `discover` the real embedded codex spec on a Podman
+    /// backend, `spawn_interactive`, and confirm codex's TUI actually renders in
+    /// the container through our argv + mount + broker + pty. `#[ignore]` — it
+    /// needs podman + a host codex binary + `~/.codex/auth.json` (the broker's
+    /// upstream) and runs a real container; drive with:
+    ///   PATH=<podman helpers> cargo test -p capability-host -- --ignored --nocapture codex_tui_renders
+    /// It does NOT submit a prompt, so it makes no model call / spends nothing.
+    #[tokio::test]
+    #[ignore = "live: needs podman + host codex + ~/.codex/auth.json"]
+    async fn codex_tui_renders_in_a_real_container() {
+        if !podman_available() {
+            eprintln!("skipping: no working podman");
+            return;
+        }
+        let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "localhost/ducktape-agent:dev".into());
+        let dirs = crate::AgentDirs::under(std::path::Path::new("/tmp/ducktape-codex-verify"));
+        let set = crate::discover(
+            b"verify-node-000000000000000000000",
+            dirs,
+            None,
+            crate::SandboxBackend::Podman { image },
+        )
+        .expect("discover codex on Podman");
+        let provider = set.resolve("codex").expect("codex provider present");
+        let ctx = RunContext {
+            agent_id: Some("verify".into()),
+            executing_node: Some(crate::execution_node_id(
+                b"verify-node-000000000000000000000",
+            )),
+            env: std::iter::once(("TERM".to_string(), "xterm-256color".to_string())).collect(),
+            ..Default::default()
+        };
+        let session = match provider.spawn_interactive(&ctx).await {
+            Ok(s) => s,
+            Err(e) => panic!("spawn_interactive(codex) failed: {e}"),
+        };
+        // read codex's initial TUI render (no prompt submitted → no model call).
+        let seen = read_until(&session, b"\x1b[", 40).await; // any ANSI = a TUI drew
+        session.close().await;
+        let text = String::from_utf8_lossy(&seen);
+        eprintln!("--- codex TUI output ({} bytes) ---\n{text}\n--- end ---", seen.len());
+        assert!(
+            !seen.is_empty(),
+            "codex produced no output in the container — TUI did not launch"
+        );
+    }
+
     /// REAL podman: `-t` gives the CONTAINER process a genuine tty — what a TUI
     /// needs. `test -t 0` is true only over a real pty.
     #[tokio::test]

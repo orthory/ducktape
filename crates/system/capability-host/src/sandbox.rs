@@ -117,20 +117,23 @@ fn wrap_podman_inner(
 ) -> (PathBuf, Vec<String>) {
     let mut argv: Vec<String> = vec!["run".into(), "--rm".into()];
     if private_net {
-        // A PRIVATE netns (podman's default rootless net, pasta/slirp): the
-        // container gets its OWN loopback, so it can no longer scan the host's —
-        // the lateral reach `--network=host` gave, letting a member hit other
-        // runs' brokers / the node RPC. It reaches this run's broker (bound to a
-        // routable interface, base_url = host.containers.internal) only via the
-        // gateway podman adds to /etc/hosts.
+        // A PRIVATE netns via slirp4netns: the container gets its OWN loopback,
+        // so it can no longer scan the host's — the lateral reach `--network=host`
+        // gave, letting a member hit other runs' brokers / the node RPC. slirp4netns
+        // auto-adds `host.containers.internal` (→ the host's routable IP), which is
+        // how the child reaches this run's broker (bound to a routable interface;
+        // base_url = host.containers.internal — see `broker::Reachability`).
         //
-        // PENDING podman-host validation (this box has no podman): whether the
-        // gateway forwards to host-loopback services or the broker must bind the
-        // gateway address, and a full OUTBOUND egress allowlist (block the
-        // internet, allow only the broker + node RPC). Off by default — enabled
-        // per-node by DUCKTAPE_SANDBOX_PRIVATE_NET — so nothing regresses until
-        // it is validated and made default.
-        argv.push("--add-host=host.containers.internal:host-gateway".into());
+        // slirp4netns is named EXPLICITLY, not left to podman's default: the
+        // default is pasta, which a host may not have installed (verified: a box
+        // with only slirp4netns fails `podman run` with the default). slirp4netns
+        // is the widely-available backend and reachability is verified with it.
+        //
+        // STILL DEFERRED (needs more podman-host work): a full OUTBOUND egress
+        // allowlist (block the internet, allow only the broker + node RPC) — a
+        // private netns alone still NATs outbound. Off by default (enabled per node
+        // by DUCKTAPE_SANDBOX_PRIVATE_NET) so nothing regresses meanwhile.
+        argv.push("--network=slirp4netns".into());
     } else {
         // `--network=host`: the container shares the host netns, so the broker /
         // MCP on 127.0.0.1 are reachable at the address the argv names. The
@@ -672,13 +675,13 @@ mod tests {
         };
         let host = build(false);
         let private = build(true);
-        // default: shared host netns, no gateway mapping.
+        // default: shared host netns.
         assert!(host.contains("--network=host"), "host mode: {host}");
-        assert!(!host.contains("host.containers.internal"), "host mode: {host}");
-        // private: no --network=host, the gateway is mapped instead.
+        // private: a slirp4netns netns instead (verified reachable via
+        // host.containers.internal), never the host netns.
         assert!(!private.contains("--network=host"), "private: {private}");
         assert!(
-            private.contains("--add-host=host.containers.internal:host-gateway"),
+            private.contains("--network=slirp4netns"),
             "private: {private}"
         );
     }
