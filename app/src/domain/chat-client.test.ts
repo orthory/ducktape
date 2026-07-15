@@ -243,6 +243,14 @@ describe("isModuleChannel", () => {
     expect(isModuleChannel("general")).toBe(false);
     expect(isModuleChannel("release-2026")).toBe(false);
   });
+
+  it("hides shared-terminal command channels but not lookalike user ids", () => {
+    expect(isModuleChannel("term-00000000deadbeef")).toBe(true);
+    expect(isModuleChannel("term-0123456789abcdef")).toBe(true);
+    // a member's own channel that merely starts with "term-" stays visible.
+    expect(isModuleChannel("term-notes")).toBe(false);
+    expect(isModuleChannel("term-00000000deadbee")).toBe(false); // 15 hex, not a session id
+  });
 });
 
 describe("rendering helpers", () => {

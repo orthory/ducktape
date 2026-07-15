@@ -107,12 +107,18 @@ const TARGET = "chat";
 /** Query page bound mirrored from the interface crate (MAX_QUERY_LIMIT). */
 export const MAX_QUERY_LIMIT = 256;
 
-/** Module-reserved channel? A ":" in the id marks a channel a module minted
- *  for its own surface (forge's per-item discussion channels are
- *  `forge:<repo>:<number>`) — user-created ids can never carry one
- *  (channelIdOf strips to [a-z0-9-]). These are HIDDEN from the chat UI: the
- *  rail, default-channel selection, and search results all filter on this. */
-export const isModuleChannel = (id: string): boolean => id.includes(":");
+/** Hidden from the social chat surface? Two kinds are carriers, not rooms, so
+ *  the rail, default-channel selection, and search results all filter on this:
+ *   - Module-reserved ids — a ":" marks a channel a module minted for its own
+ *     surface (forge's per-item discussion channels are `forge:<repo>:<number>`);
+ *     user-created ids can never carry one (channelIdOf strips to [a-z0-9-]).
+ *   - Shared-terminal command channels — `term-<16 hex session id>`, minted
+ *     node-side to carry a shared session's consensus command lane (see
+ *     `bin/noded/src/term_consensus.rs`). Non-colon by necessity (a live node
+ *     can only author `User`-origin ids), so matched by its exact shape here —
+ *     a member's own `term-notes` channel is left visible. */
+export const isModuleChannel = (id: string): boolean =>
+  id.includes(":") || /^term-[0-9a-f]{16}$/.test(id);
 
 // ── Rendering helpers (wire → display) ──────────────────
 
