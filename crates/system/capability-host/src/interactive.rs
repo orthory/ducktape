@@ -430,4 +430,85 @@ mod tests {
         );
         assert_eq!(claude, vec!["--foo".to_string()]);
     }
+
+    // ---- live podman integration (skips when podman is unavailable) ---------
+    // These exercise the SAME pty primitive against a REAL `podman run -it`
+    // container — the bridge PR1 could only argv-assert off a podman host.
+
+    fn podman_available() -> bool {
+        std::process::Command::new("podman")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    async fn read_until(session: &InteractiveSession, needle: &[u8], rounds: usize) -> Vec<u8> {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..rounds {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                session.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+            }
+            if seen.windows(needle.len()).any(|w| w == needle) {
+                break;
+            }
+        }
+        seen
+    }
+
+    /// REAL podman: openpty + `podman run -it … cat` bridges bytes both ways.
+    #[tokio::test]
+    async fn pty_bridges_a_real_podman_container() {
+        if !podman_available() {
+            eprintln!("skipping pty_bridges_a_real_podman_container: no working podman");
+            return;
+        }
+        let mut cmd = tokio::process::Command::new("podman");
+        cmd.args([
+            "run", "--rm", "-i", "-t", "--network=host",
+            "docker.io/library/debian:13-slim", "cat",
+        ]);
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+            .expect("spawn podman on a pty");
+        session.write_all(b"ping\n").await.expect("write to pty");
+        let seen = read_until(&session, b"ping", 60).await;
+        session.close().await;
+        assert!(
+            seen.windows(4).any(|w| w == b"ping"),
+            "container cat should echo 'ping', got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    /// REAL podman: `-t` gives the CONTAINER process a genuine tty — what a TUI
+    /// needs. `test -t 0` is true only over a real pty.
+    #[tokio::test]
+    async fn podman_dash_t_gives_the_container_a_real_tty() {
+        if !podman_available() {
+            eprintln!("skipping podman tty test: no working podman");
+            return;
+        }
+        let mut cmd = tokio::process::Command::new("podman");
+        cmd.args([
+            "run", "--rm", "-i", "-t", "--network=host",
+            "docker.io/library/debian:13-slim",
+            "sh", "-c", "test -t 0 && printf ISATTY; sleep 1",
+        ]);
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+            .expect("spawn podman on a pty");
+        let seen = read_until(&session, b"ISATTY", 60).await;
+        session.close().await;
+        assert!(
+            seen.windows(6).any(|w| w == b"ISATTY"),
+            "container stdin should be a tty under -t, got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
 }
