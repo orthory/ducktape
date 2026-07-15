@@ -151,6 +151,15 @@ pub enum RunsMsg {
         /// demandless. empty = legacy demandless run.
         #[serde(default)]
         demands: BTreeMap<String, u64>,
+        /// library skill NAMES curated for THIS run, on top of the agent's own
+        /// curation — the explicit-request surface only (mention, page, forge,
+        /// and jobs intakes have no requester to choose them). each resolves to
+        /// `/shared/skills/<name>`, loaded on demand. skills are NOT part of the
+        /// run's identity: the turn is claimed on (channel, anchor, agent), so a
+        /// second request at one anchor with a different curation is the same
+        /// turn and no-ops. empty = the agent's curation verbatim.
+        #[serde(default)]
+        skills: Vec<String>,
     },
     /// cancel a PENDING run — only the run-creating origin or the agent's
     /// owner. cancels the underlying dispatch in the same block; the plane's

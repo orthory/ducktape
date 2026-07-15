@@ -53,10 +53,15 @@ const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktap
 pub use agent::SKILL_LIBRARY_PREFIX;
 
 /// the tier-2 pointer. named tools with their real parameter names, because a
-/// model that has to guess the call will guess wrong: `ducktape_files_grep`
-/// takes `pattern` + `prefix`, `ducktape_files_read` takes `path`
-/// (`bin/mcp/src/tools/read.rs`).
-const SKILL_LIBRARY_SECTION: &str = "## The shared skill library\nBeyond the skills above, Ducktape carries a shared library of skills in duckfs under `/shared/skills/`, one directory per skill: `/shared/skills/<name>/SKILL.md`, whose YAML frontmatter carries a one-line `description`. It is NOT loaded into this context and costs you nothing until you read it. When your own skills do not cover the task in front of you, search the library with the `ducktape_files_grep` tool (`prefix`: `/shared/skills/`, `pattern`: what you are looking for), then read the skill you want in full with `ducktape_files_read` (`path`: `/shared/skills/<name>/SKILL.md`). Reading one is cheap; guessing at a task the library already answers is not.";
+/// model that has to guess the call will guess wrong: `ducktape_files_ls` takes
+/// `path`, `ducktape_files_grep` takes `pattern` + `prefix`, and
+/// `ducktape_files_read` takes `path` (`bin/mcp/src/tools/read.rs`).
+///
+/// `ducktape_files_ls` is named FIRST, and it was the missing one: the library
+/// has no index file, so listing the directory is the only way to see every
+/// skill it holds — an agent told only to grep can find a skill it can already
+/// describe and nothing else.
+const SKILL_LIBRARY_SECTION: &str = "## The shared skill library\nBeyond the skills above, Ducktape carries a shared library of skills in duckfs under `/shared/skills/`, one directory per skill: `/shared/skills/<name>/SKILL.md`, whose YAML frontmatter carries a one-line `description`. It is NOT loaded into this context and costs you nothing until you read it. When your own skills do not cover the task in front of you, list the library with the `ducktape_files_ls` tool (`path`: `/shared/skills/`) to see every skill it holds, or search it with `ducktape_files_grep` (`prefix`: `/shared/skills/`, `pattern`: what you are looking for) — then read the skill you want in full with `ducktape_files_read` (`path`: `/shared/skills/<name>/SKILL.md`). Reading one is cheap; guessing at a task the library already answers is not.";
 
 /// hard cap on the TOTAL bytes of inlined `always` bodies — the persona's
 /// context budget. over it the run FAILS: truncating a persona would hand the

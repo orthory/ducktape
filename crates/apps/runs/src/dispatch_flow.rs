@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{
     AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
     DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
-    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin,
+    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin, SkillRef,
     agent_decode_reply, agent_encode_query, chat_decode_reply, chat_encode_query,
     dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope,
     files_decode_reply, files_encode_query, inject, recipe_id_for,
@@ -156,15 +156,21 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         agent: &AgentRecord,
+        extra: &[SkillRef],
     ) -> Result<envelope::PortableInputs, String> {
-        self.portable_inputs_with_workspace(ctx, agent, agent).await
+        self.portable_inputs_with_workspace(ctx, agent, agent, extra)
+            .await
     }
 
+    /// `extra` is the requester's per-run skill curation (`RequestRun.skills` or
+    /// a delegation's), appended to the composed agent's own. every intake
+    /// without a requester to choose them passes none.
     async fn portable_inputs_with_workspace(
         &self,
         ctx: &dyn Ctx,
         agent: &AgentRecord,
         workspace_agent: &AgentRecord,
+        extra: &[SkillRef],
     ) -> Result<envelope::PortableInputs, String> {
         let source_snapshot = match self.files.clone() {
             Some(files) => self.duckfs_head(ctx, &files).await?,
@@ -173,7 +179,7 @@ impl RunsModule {
         // a pinned skill passes its snapshot through; a tracking skill (no
         // pin) resolves to the SAME committed head this run pins its workspace
         // to (W2) — deterministic across validators.
-        let skills = envelope::resolve_skills(agent, &source_snapshot);
+        let skills = envelope::resolve_skills(agent, extra, &source_snapshot);
         Ok(envelope::PortableInputs {
             workspace: envelope::duckfs_workspace(workspace_agent, source_snapshot),
             skills,
@@ -223,14 +229,16 @@ impl RunsModule {
         run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
+        extra: &[SkillRef],
     ) -> Result<PreparedDispatch, String> {
-        self.prepare_dispatch_with_context(ctx, agent, run_id, channel_id, anchor_seq, None)
+        self.prepare_dispatch_with_context(ctx, agent, run_id, channel_id, anchor_seq, None, extra)
             .await
     }
 
     /// The ordinary chat/Forge composition path plus delegation's parent
     /// DuckFS workspace and bounded context. Forge already names the shared
     /// item branch, so the workspace override applies only to generic Chat.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_dispatch_with_context(
         &self,
         ctx: &dyn Ctx,
@@ -239,15 +247,20 @@ impl RunsModule {
         channel_id: &str,
         anchor_seq: u64,
         delegation: Option<(&AgentRecord, &str)>,
+        extra: &[SkillRef],
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
-            Some(item_ref) => self.forge_portable_inputs(ctx, agent, &item_ref).await?,
+            Some(item_ref) => {
+                self.forge_portable_inputs(ctx, agent, &item_ref, extra)
+                    .await?
+            }
             None => {
                 self.portable_inputs_with_workspace(
                     ctx,
                     agent,
                     delegation.map(|(parent, _)| parent).unwrap_or(agent),
+                    extra,
                 )
                 .await?
             }
@@ -362,7 +375,7 @@ impl RunsModule {
             Ok(pages::PageReply::Block(Some(block))) => block.page,
             _ => return Err(format!("pages target is missing: {}", view.thread.target)),
         };
-        let mut portable = self.portable_inputs(ctx, agent).await?;
+        let mut portable = self.portable_inputs(ctx, agent, &[]).await?;
         let blocks = self.page_blocks(ctx, pages, &page_id).await;
         portable.context = Some(inject::render_pages_section(&[(page_id, blocks)]));
         let payload = envelope::render_page_comment_payload(

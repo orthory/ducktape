@@ -372,6 +372,9 @@ fn delegated_response(child: &str) -> Vec<u8> {
         delegations: vec![DelegationRequest {
             agent_id: child.into(),
             instruction: "verify native and wasm parity".into(),
+            // a library skill CURATED for this child — it crosses the wasm
+            // boundary and unions onto the child's own "specialist".
+            skills: vec!["rust-gates".into()],
         }],
         commit_message: None,
     })
@@ -858,6 +861,7 @@ fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
                 channel_id: "general".into(),
                 anchor_seq: 1,
                 demands: Default::default(),
+                skills: Vec::new(),
             }),
             true,
         )
@@ -902,6 +906,13 @@ fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
             payload["skills"][0]["source_prefix"],
             "/shared/skills/specialist"
         );
+        // the parent's curated library skill unions on, on demand, after the
+        // child's own — identical on both runtimes.
+        assert_eq!(
+            payload["skills"][1]["source_prefix"],
+            "/shared/skills/rust-gates"
+        );
+        assert_eq!(payload["skills"][1]["always"], false);
         assert_eq!(
             payload["workspace"]["source_prefix"],
             "/shared/agent-workspaces/quackbot"
@@ -1027,6 +1038,7 @@ fn rejections_match_and_leave_no_trace() {
                     channel_id: "general".into(),
                     anchor_seq: 1,
                     demands: Default::default(),
+                    skills: Vec::new(),
                 }),
                 "unknown agent: ghost",
             ),
@@ -1037,6 +1049,7 @@ fn rejections_match_and_leave_no_trace() {
                     channel_id: "general".into(),
                     anchor_seq: 1,
                     demands: Default::default(),
+                    skills: Vec::new(),
                 }),
                 "run requests require a non-empty submitter id",
             ),
@@ -1168,6 +1181,7 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
             channel_id: "side".into(),
             anchor_seq: 1,
             demands: Default::default(),
+            skills: Vec::new(),
         });
         let batch = vec![(alice(), request.clone()), (alice(), request)];
         let n_out = native

@@ -88,7 +88,7 @@ impl RunsModule {
         // unclaimed on the board, not claimed into a run that could never
         // execute. the portable resolve is a loud skip like the rest of this
         // no-fail arm.
-        let portable = match self.portable_inputs(&*ctx, &agent).await {
+        let portable = match self.portable_inputs(&*ctx, &agent, &[]).await {
             Ok(portable) => portable,
             Err(reason) => {
                 self.note(ctx, format!("job run skipped for {run_id}: {reason}"));

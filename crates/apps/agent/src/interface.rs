@@ -460,6 +460,14 @@ pub struct ReplyBlock {
 pub struct DelegationRequest {
     pub agent_id: String,
     pub instruction: String,
+    /// library skill NAMES curated for this child, on top of the child agent's
+    /// own curation — the whole point of curating at delegation: a worker keeps
+    /// its persona and gains what this one task needs. each name resolves to
+    /// `/shared/skills/<name>`, loaded on demand; a parent OFFERS a worker a
+    /// library skill, it never authors a path or a persona-inlining body. empty
+    /// = the child's own curation verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,

@@ -19,6 +19,7 @@ fn a_run_composes_v3_with_or_without_files_wired() {
         &crate::run_id_for("general", 2, "bot"),
         "general",
         2,
+        &[],
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -40,6 +41,7 @@ fn a_run_composes_v3_with_or_without_files_wired() {
         &crate::run_id_for("general", 2, "bot"),
         "general",
         2,
+        &[],
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -91,7 +93,7 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
 
     // files wired + a committed head: head pinned, skills resolved.
     let ctx4 = CaptureCtx::new().with_files_head(&head);
-    let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap();
+    let inputs = block_on(m.portable_inputs(&ctx4, &agent, &[])).unwrap();
     assert_eq!(duckfs_pin(&inputs).as_deref(), Some(head.as_str()));
     assert!(inputs.sink.is_chain(), "the duckfs lane requests no sink");
     assert!(
@@ -115,7 +117,7 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
 
     // files wired + an unresolved head: a null pin (fresh network).
     let ctx_empty = CaptureCtx::new();
-    let inputs = block_on(m.portable_inputs(&ctx_empty, &agent)).unwrap();
+    let inputs = block_on(m.portable_inputs(&ctx_empty, &agent, &[])).unwrap();
     assert!(
         duckfs_pin(&inputs).is_none(),
         "an unresolved head is a legitimate null pin"
@@ -125,7 +127,7 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
     // skills still resolve (a tracking skill then has no head to pin to).
     let unwired = module();
     let ctx0 = CaptureCtx::new().with_files_head(&head);
-    let inputs = block_on(unwired.portable_inputs(&ctx0, &agent)).unwrap();
+    let inputs = block_on(unwired.portable_inputs(&ctx0, &agent, &[])).unwrap();
     assert!(
         duckfs_pin(&inputs).is_none(),
         "an unwired files module composes a null pin, never a files query"
@@ -218,6 +220,7 @@ fn compose_forge(
         &crate::run_id_for(channel, 2, "bot"),
         channel,
         2,
+        &[],
     ))?;
     Ok(serde_json::from_slice(&prepared.payload).expect("payload is JSON"))
 }
@@ -345,6 +348,7 @@ fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
         &crate::run_id_for("general", 2, "bot"),
         "general",
         2,
+        &[],
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -391,6 +395,7 @@ fn a_file_ref_in_the_trigger_message_injects_the_attachment_text() {
         &crate::run_id_for("general", 1, "bot"),
         "general",
         1,
+        &[],
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -424,6 +429,7 @@ fn an_unresolvable_file_ref_composes_its_marker_never_a_failure() {
         &crate::run_id_for("general", 1, "bot"),
         "general",
         1,
+        &[],
     ))
     .expect("an unresolvable attachment never fails compose");
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -486,6 +492,7 @@ fn a_missing_page_ref_composes_its_marker_never_a_failure() {
         &crate::run_id_for("general", 1, "bot"),
         "general",
         1,
+        &[],
     ))
     .expect("an unresolvable ref never fails compose");
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -507,6 +514,7 @@ fn page_refs_without_a_wired_pages_module_compose_no_page_section() {
         &crate::run_id_for("general", 1, "bot"),
         "general",
         1,
+        &[],
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -530,8 +538,8 @@ fn page_injection_composes_byte_deterministically() {
     };
     let agent = registry.get("bot").unwrap();
     let run = crate::run_id_for("forge:app:7", 2, "bot");
-    let a = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2)).unwrap();
-    let b = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2)).unwrap();
+    let a = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2, &[])).unwrap();
+    let b = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2, &[])).unwrap();
     assert_eq!(a.payload, b.payload, "same committed state, same bytes");
 }
 
@@ -666,6 +674,7 @@ fn a_request_run_on_a_forge_channel_without_the_cap_rejects_with_the_reason() {
             channel_id: "forge:app:7".into(),
             anchor_seq: 2,
             demands: Default::default(),
+            skills: Vec::new(),
         }),
     )
     .unwrap_err();

@@ -145,6 +145,7 @@ fn request_run_validates_agent_origin_and_anchor() {
             channel_id: "general".into(),
             anchor_seq: seq,
             demands: Default::default(),
+            skills: Vec::new(),
         })
     };
 
@@ -217,6 +218,7 @@ fn request_run_threads_demands_into_the_dispatch_emit() {
             channel_id: "general".into(),
             anchor_seq: 3,
             demands: demands.clone(),
+            skills: Vec::new(),
         }),
     )
     .unwrap();
@@ -247,6 +249,7 @@ fn cancel_run_is_gated_to_the_requester_or_the_owner() {
             channel_id: "general".into(),
             anchor_seq: 3,
             demands: Default::default(),
+            skills: Vec::new(),
         }),
     )
     .unwrap();
@@ -367,4 +370,116 @@ fn cancel_run_is_gated_to_the_requester_or_the_owner() {
     )
     .unwrap();
     assert_eq!(ctx.dispatch_msgs().len(), 1);
+}
+
+// ---- per-run skill curation on the operator RequestRun path -------------------
+
+/// the skill names the run's composed envelope carries, in order.
+fn dispatched_skills(ctx: &CaptureCtx) -> Vec<String> {
+    let DispatchMsg::Dispatch { payload, .. } = ctx
+        .dispatch_msgs()
+        .into_iter()
+        .next()
+        .expect("a run was dispatched")
+    else {
+        panic!("expected a Dispatch");
+    };
+    let v: serde_json::Value = serde_json::from_slice(&payload).expect("envelope is JSON");
+    v["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .map(|s| s["name"].as_str().expect("skill name").to_string())
+        .collect()
+}
+
+fn request_with_skills(agent: &str, seq: u64, skills: &[&str]) -> Msg {
+    admin(&RunsMsg::RequestRun {
+        agent_id: agent.into(),
+        channel_id: "general".into(),
+        anchor_seq: seq,
+        demands: Default::default(),
+        skills: skills.iter().map(|s| s.to_string()).collect(),
+    })
+}
+
+#[test]
+fn request_skills_are_curated_onto_the_agents_own() {
+    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    registry.get_mut("bot").unwrap().skills = vec![agent::SkillRef {
+        name: "persona".into(),
+        source_prefix: "/shared/skills/persona".into(),
+        source_snapshot: None,
+        load: agent::LoadMode::Always,
+    }];
+    let mut m = watched(TurnPolicy::Mention, &registry);
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript("general", transcript(3));
+    exec(
+        &mut m,
+        &mut ctx,
+        &request_with_skills("bot", 3, &["rust-gates"]),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatched_skills(&ctx),
+        ["persona", "rust-gates"],
+        "the agent keeps its persona and gains what the request curated"
+    );
+}
+
+#[test]
+fn a_request_naming_a_non_library_skill_is_refused() {
+    // the request carries NAMES, not paths — so a name that is not a single
+    // library entry (a traversal, a slash, empty) cannot resolve to an
+    // arbitrary duckfs subtree. this is the trust boundary: the ro-mount reads
+    // on node authority with no cap gate, so a requester must never name a path.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let mut m = watched(TurnPolicy::Mention, &registry);
+    for bad in ["../agents/victim/persona", "a/b", ".."] {
+        let mut ctx = CaptureCtx::new()
+            .with_origin(user(1))
+            .with_registry(&registry)
+            .with_transcript("general", transcript(3));
+        let err = exec(&mut m, &mut ctx, &request_with_skills("bot", 3, &[bad])).unwrap_err();
+        assert!(
+            matches!(&err, Error::Module(reason)
+                if reason.contains("single shared-library entry") || reason.contains("dot segment")),
+            "{bad:?} must be refused: {err:?}"
+        );
+        abort(&mut m);
+    }
+}
+
+#[test]
+fn request_skills_are_not_part_of_a_runs_identity() {
+    // the turn is claimed on (channel, anchor, agent). a second request at the
+    // same anchor with a DIFFERENT curation is the same turn — first wins, the
+    // second no-ops. re-running with different skills means a new anchor.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let mut m = watched(TurnPolicy::Mention, &registry);
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript("general", transcript(3));
+    exec(&mut m, &mut ctx, &request_with_skills("bot", 3, &["first"])).unwrap();
+    assert_eq!(dispatched_skills(&ctx), ["first"]);
+    commit(&mut m);
+
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript("general", transcript(3));
+    exec(
+        &mut m,
+        &mut ctx,
+        &request_with_skills("bot", 3, &["second"]),
+    )
+    .unwrap();
+    assert!(
+        ctx.dispatch_msgs().is_empty(),
+        "the turn was already claimed; a new curation does not mint a new one"
+    );
 }
