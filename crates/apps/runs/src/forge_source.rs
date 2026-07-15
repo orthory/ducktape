@@ -12,7 +12,7 @@
 //! and dev-only conformance tests pin every mirror against the real forge
 //! codec so the wire cannot silently drift.
 
-use agent::{AgentRecord, CapRequest};
+use agent::{AgentRecord, CapRequest, SkillRef};
 use sdk::Ctx;
 use serde::{Deserialize, Serialize};
 
@@ -199,6 +199,7 @@ impl RunsModule {
         ctx: &dyn Ctx,
         agent: &AgentRecord,
         item_ref: &ForgeItemRef<'_>,
+        extra: &[SkillRef],
     ) -> Result<PortableInputs, String> {
         let repo = item_ref.repo;
         // 1. the cap gate FIRST — before any tracker read.
@@ -293,7 +294,7 @@ impl RunsModule {
                 branch,
                 branch_born,
             },
-            skills: envelope::resolve_skills(agent, &head),
+            skills: envelope::resolve_skills(agent, extra, &head),
             sink,
             context: Some(context),
         })

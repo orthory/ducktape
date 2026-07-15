@@ -518,6 +518,10 @@ impl RunsModule {
                     child.agent_id, parent.agent_id
                 ));
             }
+            // the parent CURATES library skills for this child, on top of the
+            // child's own — confined to the library by construction (names, not
+            // paths). the child keeps its persona and gains what this task needs.
+            let extra = crate::envelope::library_skills(&request.skills)?;
             let run_id = run_id_for(&entry.channel_id, entry.anchor_seq, &child.agent_id);
             if self.turn_taken(ctx, &dispatch_id_for(&run_id)).await? {
                 return Err(format!("delegated child turn is already taken: {run_id}"));
@@ -534,6 +538,7 @@ impl RunsModule {
                     &entry.channel_id,
                     entry.anchor_seq,
                     Some((&parent, &context)),
+                    &extra,
                 )
                 .await?;
             prepared.push(PreparedDelegation {

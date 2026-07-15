@@ -4,6 +4,7 @@ fn request(agent_id: &str, instruction: impl Into<String>) -> DelegationRequest 
     DelegationRequest {
         agent_id: agent_id.into(),
         instruction: instruction.into(),
+        skills: Vec::new(),
     }
 }
 
@@ -306,6 +307,7 @@ fn delegated_child_preserves_requester_and_owner_lifecycle_control() {
             channel_id: "general".into(),
             anchor_seq: 2,
             demands: Default::default(),
+            skills: Vec::new(),
         }),
     )
     .unwrap();
@@ -401,6 +403,7 @@ fn delegated_child_inherits_the_pinned_forge_item_workspace() {
             channel_id: channel.into(),
             anchor_seq: 2,
             demands: Default::default(),
+            skills: Vec::new(),
         }),
     )
     .unwrap();
@@ -510,4 +513,95 @@ fn delegation_is_final_only_and_limited_to_chat_or_forge() {
                 .unwrap_err();
         assert!(reason.contains("chat or Forge"), "{reason}");
     }
+}
+
+// ---- per-child skill curation on a delegation --------------------------------
+// a parent delegating a wave curates library skills for each child, on top of
+// the child's own — the child keeps its persona and gains what this task needs.
+
+fn request_with_skills(agent_id: &str, instruction: &str, skills: &[&str]) -> DelegationRequest {
+    DelegationRequest {
+        agent_id: agent_id.into(),
+        instruction: instruction.into(),
+        skills: skills.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn child_skills(ctx: &CaptureCtx, agent_id: &str) -> Vec<String> {
+    let dispatch = ctx
+        .dispatch_msgs()
+        .into_iter()
+        .find(|d| matches!(d, DispatchMsg::Dispatch { recipe_id, .. } if recipe_id == &recipe_id_for(agent_id)))
+        .expect("a dispatch for the child");
+    let DispatchMsg::Dispatch { payload, .. } = dispatch else {
+        unreachable!()
+    };
+    let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    v["skills"]
+        .as_array()
+        .expect("skills")
+        .iter()
+        .map(|s| s["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+#[test]
+fn a_delegation_curates_library_skills_onto_the_child() {
+    // child-a already curates "specialist" (Always) in `delegation_registry`.
+    let registry = delegation_registry(2);
+    let (mut module, parent_run) = start_parent(&registry);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut module,
+        &mut ctx,
+        &result_event(
+            &parent_run,
+            Ok(delegated_response(vec![request_with_skills(
+                "child-a",
+                "Implement the parser.",
+                &["rust-gates"],
+            )])),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        child_skills(&ctx, "child-a"),
+        ["specialist", "rust-gates"],
+        "the child keeps its own persona and gains the parent's curated skill"
+    );
+}
+
+#[test]
+fn a_delegation_naming_a_non_library_skill_fails_the_wave() {
+    // the parent supplies skill NAMES, not paths — a traversal cannot resolve
+    // to an arbitrary duckfs subtree, and an invalid one fails the whole wave
+    // before any child is staged (the batch is all-or-nothing).
+    let registry = delegation_registry(2);
+    let (mut module, parent_run) = start_parent(&registry);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut module,
+        &mut ctx,
+        &result_event(
+            &parent_run,
+            Ok(delegated_response(vec![request_with_skills(
+                "child-a",
+                "do it",
+                &["../agents/victim/persona"],
+            )])),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.dispatch_msgs().is_empty(),
+        "an invalid curated skill stages no child"
+    );
 }

@@ -1,6 +1,6 @@
 use super::{
     AgentStatus, Ctx, DispatchMsg, Error, JobsMsg, Msg, Origin, RunsModule, RunsMsg, TaggingMsg,
-    TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg, dispatch_id_for,
+    TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg, dispatch_id_for, envelope,
     jobs_encode_msg, reject_run_separator, run_id_for, tagging_encode_msg,
 };
 
@@ -106,6 +106,7 @@ impl RunsModule {
                 channel_id,
                 anchor_seq,
                 demands,
+                skills,
             } => {
                 // an explicit turn claim: same run id, same dedup as the
                 // engagement path — first in consensus order wins, the loser
@@ -118,6 +119,9 @@ impl RunsModule {
                     }
                     other => canonical_origin(other),
                 };
+                // the requester's per-run skills, confined to the library by
+                // construction (names, not paths) — see `library_skills`.
+                let extra = envelope::library_skills(&skills).map_err(Error::Module)?;
                 let Some(agent) = self
                     .agent_record(&*ctx, &agent_id)
                     .await
@@ -141,7 +145,7 @@ impl RunsModule {
                 // on a failed preparation: this is the root op of its own
                 // block, so an error poisons nothing but the request itself.
                 let prepared = self
-                    .prepare_dispatch(&*ctx, &agent, &run_id, &channel_id, anchor_seq)
+                    .prepare_dispatch(&*ctx, &agent, &run_id, &channel_id, anchor_seq, &extra)
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(

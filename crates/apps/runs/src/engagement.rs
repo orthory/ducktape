@@ -125,7 +125,7 @@ impl RunsModule {
                 self.prepare_page_dispatch(&*ctx, &agent, &run_id, &container, seq)
                     .await
             } else {
-                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq)
+                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq, &[])
                     .await
             };
             match prepared {

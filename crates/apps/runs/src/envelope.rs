@@ -25,8 +25,11 @@
 //! unreachable exactly when it looked configured. now it is reached by the
 //! absence of always-skills — a state you can see.
 
-use agent::{AgentRecord, LoadMode};
+use std::collections::BTreeSet;
+
+use agent::{AgentRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
 use chat::{AuthorRef, Block, MessageView};
+use duckfs_core::paths::canonical as canonical_duckfs_path;
 use serde::Serialize;
 
 use crate::facets::WireSink;
@@ -51,7 +54,7 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// [`agent::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"delegations":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Delegations are an optional final-only child wave shaped as {"agent_id":"<registered agent>","instruction":"..."}; use them only with an owner-granted subagent_budget. Budget N admits at most min(N, 8) children at a fixed 2 cores and 4 GiB each, an aggregate estimate of 2*min(N, 8) cores and 4*min(N, 8) GiB. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Delegations are an optional final-only child wave shaped as {"agent_id":"<registered agent>","instruction":"...","skills":["<library skill name>"]}; use them only with an owner-granted subagent_budget. skills is optional: name shared-library skills (see the shared skill library section) to curate the child for its task, on top of that agent's own skills. Budget N admits at most min(N, 8) children at a fixed 2 cores and 4 GiB each, an aggregate estimate of 2*min(N, 8) cores and 4*min(N, 8) GiB. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -200,18 +203,30 @@ pub(crate) fn duckfs_workspace(
     }
 }
 
-/// resolve an agent's C4 skill refs against the committed duckfs head: a
+/// resolve the skill refs of a run against the committed duckfs head: a
 /// pinned skill passes its snapshot through; a tracking skill (no pin)
 /// resolves to the SAME committed head (W2) — deterministic across
 /// validators. shared by the duckfs and forge compose lanes (skills are
 /// duckfs subtrees either way).
 ///
-/// curation ORDER is preserved verbatim: it is the order the host assembles the
-/// always-bodies in, so a reordered list is a different soul.
-pub(crate) fn resolve_skills(agent: &AgentRecord, head: &Option<String>) -> Vec<SkillEnvelope> {
+/// TWO tiers land here. `agent.skills` is WHO THE AGENT IS — its standing
+/// curation. `extra` is WHAT THIS TASK NEEDS — the skills the requester (an
+/// operator's `RequestRun`, or a parent delegating this child) curated for this
+/// one run; every other intake passes none. The union is ADDITIVE and the
+/// agent leads: a name the agent already curates is kept as the agent's own ref
+/// (a task supplements a persona, it never rewrites one), and `extra` appends
+/// only what the agent lacks. curation ORDER is the order the host inlines the
+/// `always` bodies in, so the persona always assembles first.
+pub(crate) fn resolve_skills(
+    agent: &AgentRecord,
+    extra: &[SkillRef],
+    head: &Option<String>,
+) -> Vec<SkillEnvelope> {
+    let have: BTreeSet<&str> = agent.skills.iter().map(|s| s.name.as_str()).collect();
     agent
         .skills
         .iter()
+        .chain(extra.iter().filter(|s| !have.contains(s.name.as_str())))
         .map(|s| SkillEnvelope {
             name: s.name.clone(),
             source_prefix: s.source_prefix.clone(),
@@ -219,6 +234,55 @@ pub(crate) fn resolve_skills(agent: &AgentRecord, head: &Option<String>) -> Vec<
             always: matches!(s.load, LoadMode::Always),
         })
         .collect()
+}
+
+/// expand requester-supplied library skill NAMES into on-demand refs, confined
+/// to the shared library by CONSTRUCTION (`/shared/skills/<name>`).
+///
+/// this is the one place a run gains skills it was not curated with, and the
+/// ro-mount that materializes them runs on the node's duckfs authority with no
+/// read-cap gate — so a requester must never get to name a raw path. taking
+/// NAMES, not refs, means a requester can only ever point at a library entry:
+/// the name is canonicalized as the last segment of the library prefix, so a
+/// `/` or `..` in it fails to resolve to a single entry and is refused. no
+/// pinned snapshot, no `always` — a requester offers a library skill on demand;
+/// only an owner's own record inlines a persona.
+pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> {
+    // the SAME ceiling the agent record's own curation carries — the resolved
+    // set is bounded there, and an unbounded request would otherwise commit a
+    // giant dispatch payload and force one duckfs checkout per name on the
+    // executing node for a run the assembler was always going to refuse.
+    if names.len() > MAX_SKILLS_PER_AGENT {
+        return Err(format!(
+            "a run may curate at most {MAX_SKILLS_PER_AGENT} skills, got {}",
+            names.len()
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut refs = Vec::with_capacity(names.len());
+    for name in names {
+        let source_prefix = format!("{SKILL_LIBRARY_PREFIX}/{name}");
+        let seg =
+            canonical_duckfs_path(&source_prefix).map_err(|e| format!("skill {name:?}: {e}"))?;
+        // exactly `/shared/skills/<name>` — one segment past the library root.
+        // a name carrying a `/` or `..` lands at a different depth (or fails to
+        // canonicalize), so this rejects anything but a direct library entry.
+        if seg.len() != 3 {
+            return Err(format!(
+                "a per-run skill must be a single shared-library entry, got {name:?}"
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(format!("skill named twice: {name}"));
+        }
+        refs.push(SkillRef {
+            name: name.clone(),
+            source_prefix,
+            source_snapshot: None,
+            load: LoadMode::OnDemand,
+        });
+    }
+    Ok(refs)
 }
 
 /// serialize one envelope — deterministic: fixed field order (see
@@ -546,7 +610,7 @@ mod tests {
             skill_ref("persona", LoadMode::Always),
             skill_ref("release", LoadMode::OnDemand),
         ]);
-        let skills = resolve_skills(&agent, &None);
+        let skills = resolve_skills(&agent, &[], &None);
         let payload = render_payload(
             "runs",
             &agent,
@@ -628,6 +692,64 @@ mod tests {
         );
     }
 
+    /// the per-run union: the agent's own skills lead, and `extra` appends only
+    /// the names the agent does not already carry — a task supplements a
+    /// persona, never rewrites it, and order is the `always`-inline order.
+    #[test]
+    fn extra_skills_append_after_the_agents_and_only_when_new() {
+        let agent = agent_with_skills(vec![
+            skill_ref("persona", LoadMode::Always),
+            skill_ref("rust-gates", LoadMode::Always),
+        ]);
+        let extra = library_skills(&["rust-gates".into(), "qa".into()]).unwrap();
+        let resolved = resolve_skills(&agent, &extra, &None);
+        let names: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["persona", "rust-gates", "qa"],
+            "the already-curated name is kept once (as the agent's own ref), qa is added"
+        );
+        // the agent's own rust-gates ref wins the collision — its Always load
+        // mode is preserved, not downgraded to the extra's OnDemand.
+        assert!(
+            resolved[1].always,
+            "a task supplements; it does not downgrade the agent's own skill"
+        );
+    }
+
+    /// `library_skills` confines by construction and refuses anything that is
+    /// not a single library entry.
+    #[test]
+    fn library_skills_confines_names_to_the_library() {
+        let ok = library_skills(&["rust-gates".into(), "qa".into()]).unwrap();
+        assert_eq!(ok[0].source_prefix, "/shared/skills/rust-gates");
+        assert!(matches!(ok[0].load, LoadMode::OnDemand));
+        assert!(ok[0].source_snapshot.is_none());
+
+        for bad in [
+            "../agents/victim/persona", // escapes the library
+            "a/b",                      // not a single entry
+            "",                         // empty
+            "..",                       // parent
+        ] {
+            assert!(
+                library_skills(&[bad.into()]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        // a name repeated in one request is refused (it would mount twice).
+        assert!(library_skills(&["qa".into(), "qa".into()]).is_err());
+
+        // and the count is capped in consensus — the same ceiling the agent
+        // record carries — so a huge request cannot commit a giant payload or
+        // force a checkout per name for a doomed run.
+        let too_many: Vec<String> = (0..=agent::MAX_SKILLS_PER_AGENT)
+            .map(|i| format!("s{i}"))
+            .collect();
+        assert!(library_skills(&too_many).is_err());
+        assert!(library_skills(&too_many[..agent::MAX_SKILLS_PER_AGENT]).is_ok());
+    }
+
     /// a tracking skill (no pin) still resolves to the committed head, and its
     /// load mode is untouched by that resolution.
     #[test]
@@ -639,7 +761,7 @@ mod tests {
             load: LoadMode::Always,
         }]);
         let head = Some("aa".repeat(32));
-        let resolved = resolve_skills(&agent, &head);
+        let resolved = resolve_skills(&agent, &[], &head);
         assert_eq!(resolved[0].source_snapshot, head);
         assert!(resolved[0].always);
     }
@@ -706,7 +828,7 @@ mod tests {
             1,
             None,
             &[],
-            portable(None, resolve_skills(&agent, &None)),
+            portable(None, resolve_skills(&agent, &[], &None)),
         );
         let v = parse(&payload);
         assert_eq!(v["instructions"], DEFAULT_PROMPT);
