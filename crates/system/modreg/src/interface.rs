@@ -60,6 +60,18 @@ pub enum ModregMsg {
         activation_height: u64,
         code_hash: Vec<u8>,
     },
+    /// schedule the ADMISSION of a brand-new module post-genesis: creates the
+    /// entry with an EMPTY active hash and this pending, readiness-latched
+    /// initial code. the module has no running code until the boundary
+    /// realizes the swap; the host instantiates it from the fetched bytes at
+    /// activation. cancelling before the boundary removes the entry entirely.
+    /// `Origin::Module | System` only.
+    ScheduleRegister {
+        name: String,
+        module_id: String,
+        activation_height: u64,
+        code_hash: Vec<u8>,
+    },
     /// clear a pending swap before its boundary. `Origin::Module | System` only.
     Cancel { name: String, module_id: String },
     /// a validator records that it HOLDS (verified locally) the pending

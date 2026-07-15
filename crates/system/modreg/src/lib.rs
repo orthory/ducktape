@@ -240,6 +240,52 @@ impl Modreg {
         Ok(())
     }
 
+    /// admission of a brand-new module: like `handle_schedule`, but the entry
+    /// must NOT exist yet. the created entry carries an EMPTY active hash —
+    /// "registered, not yet running" — and the normal readiness/advance
+    /// machinery realizes the initial code at the boundary.
+    async fn handle_schedule_register(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        name: String,
+        module_id: String,
+        activation_height: u64,
+        code_hash: Vec<u8>,
+    ) -> Result<(), Error> {
+        Self::require_module_or_system(ctx)?;
+        Self::require_hash_len(&code_hash)?;
+        if module_id.is_empty() {
+            return Err(Error::Module("module_id must not be empty".into()));
+        }
+        let mut next = self.read().clone();
+        if next.modules.contains_key(&module_id) {
+            return Err(Error::Module(format!(
+                "module {module_id} is already registered (code changes go through Schedule)"
+            )));
+        }
+        let floor = ctx.env().height.saturating_add(MIN_SWAP_LEAD);
+        if activation_height <= floor {
+            return Err(Error::Module(format!(
+                "activation_height {activation_height} must exceed height+MIN_SWAP_LEAD ({floor})"
+            )));
+        }
+        next.modules.insert(
+            module_id,
+            ModuleEntry {
+                active_code_hash: Vec::new(),
+                pending: Some(ScheduledSwap {
+                    name,
+                    activation_height,
+                    code_hash,
+                    readiness: Vec::new(),
+                    ready: false,
+                }),
+            },
+        );
+        self.staged = Some(next);
+        Ok(())
+    }
+
     async fn handle_cancel(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -266,6 +312,11 @@ impl Modreg {
             }
         }
         entry.pending = None;
+        // cancelling an ADMISSION (empty active hash: the module never ran)
+        // removes the entry entirely — modreg must never claim a codeless module.
+        if entry.active_code_hash.is_empty() {
+            next.modules.remove(&module_id);
+        }
         self.staged = Some(next);
         Ok(())
     }
@@ -483,6 +534,19 @@ impl Module for Modreg {
                 self.handle_schedule(ctx, name, module_id, activation_height, code_hash)
                     .await
             }
+            ModregMsg::ScheduleRegister { .. } if self.legacy_v1 => Err(Error::Module(
+                "post-genesis module admission is unavailable in native v1 compatibility mode"
+                    .into(),
+            )),
+            ModregMsg::ScheduleRegister {
+                name,
+                module_id,
+                activation_height,
+                code_hash,
+            } => {
+                self.handle_schedule_register(ctx, name, module_id, activation_height, code_hash)
+                    .await
+            }
             ModregMsg::Cancel { name, module_id } => self.handle_cancel(ctx, name, module_id).await,
             ModregMsg::SignalReady { name, module_id } => {
                 self.handle_signal_ready(ctx, name, module_id).await
@@ -568,7 +632,9 @@ fn decode_state(bytes: &[u8], legacy_v1: bool) -> Result<ModregState, Error> {
             ));
         }
         let active_code_hash = take_vec(&mut buf)?;
-        if active_code_hash.len() != CODE_HASH_LEN {
+        // EMPTY = admission-pending (`ScheduleRegister`): registered, no active
+        // code until its boundary realizes the initial hash.
+        if active_code_hash.len() != CODE_HASH_LEN && !active_code_hash.is_empty() {
             return Err(Error::Module("snapshot: bad active hash length".into()));
         }
         let pending = match take_u8(&mut buf)? {
@@ -1246,5 +1312,100 @@ mod tests {
         futures::executor::block_on(mr.abort_block()).unwrap();
         assert_eq!(mr.root(), before, "aborted schedule leaves root untouched");
         assert!(status(&mr)[0].pending.is_none());
+    }
+
+    // ---- post-genesis admission (ScheduleRegister) ---------------------------
+
+    fn schedule_register(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
+        msg(ModregMsg::ScheduleRegister {
+            name: name.into(),
+            module_id: module_id.into(),
+            activation_height: ah,
+            code_hash: hash(code),
+        })
+    }
+
+    #[test]
+    fn admission_realizes_at_boundary_via_the_normal_readiness_gate() {
+        let mut mr = mr();
+        let mut gov = TestCtx::new(Origin::Module("governance".into()), 0);
+        run(&mut mr, &mut gov, &schedule_register("kanban", "v1", 10, 5)).unwrap();
+        commit(&mut mr);
+
+        // registered, not yet running: empty active hash, one pending swap.
+        let s = status(&mr);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].active_code_hash.is_empty());
+        assert_eq!(s[0].pending.as_ref().unwrap().code_hash, hash(5));
+        // not armed until ready, even past the height.
+        assert!(armed_at(&mr, 10).is_empty());
+
+        make_ready(&mut mr, "kanban", "v1");
+        assert!(armed_at(&mr, 9).is_empty(), "height floor still gates");
+        assert_eq!(armed_at(&mr, 10)[0].code_hash, hash(5));
+
+        let mut at_ten = TestCtx::new(Origin::System, 10);
+        run(&mut mr, &mut at_ten, &advance()).unwrap();
+        commit(&mut mr);
+        let s = status(&mr);
+        assert_eq!(s[0].active_code_hash, hash(5));
+        assert!(s[0].pending.is_none());
+    }
+
+    #[test]
+    fn admission_refuses_existing_ids_short_leads_and_external_origin() {
+        let mut mr = mr();
+        register(&mut mr, "hello", 1);
+        let mut sys = TestCtx::new(Origin::System, 0);
+        assert!(
+            run(&mut mr, &mut sys, &schedule_register("hello", "v1", 10, 5)).is_err(),
+            "an existing id goes through Schedule, never re-admission"
+        );
+        assert!(
+            run(&mut mr, &mut sys, &schedule_register("kanban", "v1", MIN_SWAP_LEAD, 5)).is_err(),
+            "activation must exceed the min-lead floor"
+        );
+        let mut ext = TestCtx::new(Origin::External(member(1)), 0);
+        assert!(
+            run(&mut mr, &mut ext, &schedule_register("kanban", "v1", 10, 5)).is_err(),
+            "admission is governance/system-authored, never external"
+        );
+    }
+
+    #[test]
+    fn cancelled_admission_removes_the_entry_entirely() {
+        let mut mr = mr();
+        let mut sys = TestCtx::new(Origin::System, 0);
+        run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
+        commit(&mut mr);
+        run(&mut mr, &mut sys, &cancel("kanban", "v1")).unwrap();
+        commit(&mut mr);
+        assert!(
+            status(&mr).is_empty(),
+            "modreg must never claim a module with no code"
+        );
+        // and a fresh admission of the same id is allowed again.
+        run(&mut mr, &mut sys, &schedule_register("kanban", "v2", 10, 6)).unwrap();
+    }
+
+    #[test]
+    fn admission_snapshot_roundtrips() {
+        let mut mr = mr();
+        let mut sys = TestCtx::new(Origin::System, 0);
+        run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
+        commit(&mut mr);
+        make_ready(&mut mr, "kanban", "v1");
+        let (bytes, root) = (mr.snapshot(), mr.root());
+        let mut dst = Modreg::new("modreg", "valset");
+        dst.install(&bytes, root).expect("admission snapshot installs");
+        assert_eq!(dst.root(), root);
+        assert_eq!(armed_at(&dst, 10)[0].code_hash, hash(5));
+    }
+
+    #[test]
+    fn legacy_v1_mode_refuses_admission() {
+        let mut mr = mr().with_legacy_v1_state();
+        let mut sys = TestCtx::new(Origin::System, 0);
+        assert!(run(&mut mr, &mut sys, &schedule_register("kanban", "v1", 10, 5)).is_err());
     }
 }
