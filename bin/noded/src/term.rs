@@ -955,10 +955,30 @@ pub async fn create_session(
         )
             .into_response();
     };
-    match terminals.create(&body.agent, body.mode).await {
-        Ok(created) => (StatusCode::OK, Json(created)).into_response(),
-        Err(err) => err.response(),
+    let created = match terminals.create(&body.agent, body.mode).await {
+        Ok(created) => created,
+        Err(err) => return err.response(),
+    };
+    // PR2 consensus command source: a Shared session's ordered command lane is a
+    // dedicated chat channel — consensus signs + orders + persists each command
+    // for free (a Single session has no lane, so nothing to wire). Ensure the
+    // channel exists BEFORE returning, so a member cannot post a command before
+    // its carrier does; then spawn the off-loop projector that drives committed
+    // posts into this node's pty. A channel-create failure degrades to PR1's
+    // node-local ws `TermCommand` path — the session still works single-node,
+    // just without the consensus lane — so it warns and continues.
+    if body.mode == SessionMode::Shared {
+        let channel = crate::term_consensus::session_channel(&created.session_id);
+        match crate::term_consensus::ensure_channel(&handle, &channel).await {
+            Ok(()) => {
+                crate::term_consensus::spawn_projector(handle.clone(), created.session_id.clone());
+            }
+            Err(reason) => {
+                tracing::warn!(target: "ducktape::term", session = %created.session_id, reason = %reason, "term consensus channel not created");
+            }
+        }
     }
+    (StatusCode::OK, Json(created)).into_response()
 }
 
 /// POST /v1/term/sessions/{id}/close — end a session. Idempotent: a closed or

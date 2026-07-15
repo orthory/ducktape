@@ -76,6 +76,14 @@ pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStag
 // `main.rs` can build the manager and wire it onto the handle.
 pub mod term;
 pub use term::{TermChunkEvent, TermCommandEvent, TermCommandRing, TermRing, TerminalSessions};
+// PR2 consensus command source: the chat<->pty bridge (channel scheme + the
+// off-loop projector that drives committed chat commands into a session's pty).
+mod term_consensus;
+// the command wire contract, public so a client / integration test can build
+// the exact chat post a member submits and decode it back the way the pty host
+// does: `command_blocks(line)` -> a `PostMessage` body, `command_text(blocks)`
+// -> the line, `session_channel(id)` -> the carrier channel.
+pub use term_consensus::{command_blocks, command_text, session_channel};
 // the derived-index tier: store construction, rebuilds, /v1/index/* + /v1/blocks.
 mod index;
 pub use index::{
