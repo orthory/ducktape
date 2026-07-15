@@ -19,6 +19,19 @@ pub const DEFAULT_MODREG_ID: &str = "modreg";
 /// the length of a code hash: sha256 over the component bytes.
 pub const CODE_HASH_LEN: usize = 32;
 
+/// the protocol version post-genesis module ADMISSION activates at. below it,
+/// `ScheduleRegister` (and governance's `RegisterModule` door) refuse
+/// deterministically — which closes the mixed-binary window: an old binary
+/// rejects the op because it cannot decode it, a new binary rejects it here,
+/// and both leave state untouched. deliberately ABOVE every shipping
+/// `MAX_PROTOCOL_VERSION` (a compile-time assert in `bin/node/src/constants.rs`
+/// enforces it): raising the network past this version is the deliberate act
+/// that turns admissions on, and it must not happen before the recovery /
+/// state-sync composition can restore an admitted module's accumulated state
+/// (today's composers enumerate a fixed module set — the restore half of
+/// admissions is follow-up work).
+pub const ADMISSION_ACTIVATION_VERSION: u32 = 4;
+
 /// coordinates of a scheduled code swap for one module. **at most one** is ever
 /// pending per module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -55,6 +68,18 @@ pub enum ModregMsg {
     /// schedule a height-gated code swap for a registered module.
     /// `Origin::Module | System` only.
     Schedule {
+        name: String,
+        module_id: String,
+        activation_height: u64,
+        code_hash: Vec<u8>,
+    },
+    /// schedule the ADMISSION of a brand-new module post-genesis: creates the
+    /// entry with an EMPTY active hash and this pending, readiness-latched
+    /// initial code. the module has no running code until the boundary
+    /// realizes the swap; the host instantiates it from the fetched bytes at
+    /// activation. cancelling before the boundary removes the entry entirely.
+    /// `Origin::Module | System` only.
+    ScheduleRegister {
         name: String,
         module_id: String,
         activation_height: u64,

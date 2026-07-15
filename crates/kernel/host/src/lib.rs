@@ -139,6 +139,17 @@ impl CodeSource for NoCodeSource {
     }
 }
 
+/// instantiates a freshly-ADMITTED module from its verified component bytes at
+/// the activation boundary — the constructor twin of [`CodeSource`]. the node
+/// wires the wasm runtime's `from_bytes` here; the host itself stays
+/// wasm-runtime-agnostic. a host without a factory FAILS CLOSED (loudly) when
+/// an admission arms, and a net that never admits modules never notices.
+pub trait ModuleFactory: Send + Sync {
+    /// a module instance for `id` from component bytes already verified
+    /// against the committed code hash.
+    fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Box<dyn Module>, Error>;
+}
+
 /// sha256 content hash of component bytes — the verify side of a code swap.
 fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
@@ -449,6 +460,9 @@ pub struct Host {
     /// changes the registry itself. Empty for ordinary/fresh hosts.
     activation_versions: BTreeMap<ModuleId, u32>,
     active_version: u32,
+    /// instantiates post-genesis ADMISSIONS at the activation boundary.
+    /// `None` fails closed the moment an admission arms — never before.
+    module_factory: Option<Box<dyn ModuleFactory>>,
 }
 
 impl Host {
@@ -458,7 +472,14 @@ impl Host {
             dormant: BTreeMap::new(),
             activation_versions: BTreeMap::new(),
             active_version: BASELINE_VERSION,
+            module_factory: None,
         }
+    }
+
+    /// wire the constructor for post-genesis module admissions (the node
+    /// injects the wasm runtime's `from_bytes`; same shape as `CodeSource`).
+    pub fn set_module_factory(&mut self, factory: Box<dyn ModuleFactory>) {
+        self.module_factory = Some(factory);
     }
 
     /// register a module under its own [`Module::id`]. genesis-time wiring.
@@ -821,12 +842,25 @@ impl Host {
                 _ => m.active_code_hash,
             };
             // only reconcile a module this node actually runs AS a hot-swappable
-            // component: an absent id, or a native module (no `code_hash`), is
-            // nothing to realize — its registry entry, if any, is a genesis concern.
-            let Some(current) = self.registry.get(&m.module_id).and_then(|x| x.code_hash()) else {
-                continue;
+            // component: a native module (no `code_hash`) is nothing to realize —
+            // its registry entry is a genesis concern. an id absent from the
+            // registry (and not dormant) whose committed target is NON-empty is
+            // a post-genesis ADMISSION this boundary must realize by
+            // instantiating the module from its verified bytes; an empty target
+            // is an admission not yet armed.
+            let current = match self.registry.get(&m.module_id) {
+                Some(module) => match module.code_hash() {
+                    Some(current) => Some(current),
+                    None => continue, // native module — genesis concern.
+                },
+                None => {
+                    if target.is_empty() || self.dormant.contains_key(&m.module_id) {
+                        continue;
+                    }
+                    None // admission to realize below.
+                }
             };
-            if current == target {
+            if current.as_ref() == Some(&target) {
                 continue; // already on the designated code — idempotent no-op.
             }
             let bytes = src.fetch(&target).await.ok_or_else(|| {
@@ -843,7 +877,31 @@ impl Host {
                     hex32(&target),
                 )));
             }
-            self.swap_module_code(&m.module_id, &bytes)?;
+            match current {
+                Some(_) => self.swap_module_code(&m.module_id, &bytes)?,
+                None => {
+                    // the admission path: registration changes app-hash by
+                    // construction (the registry set is what `app_hash`
+                    // composes over), which is exactly why it rides the same
+                    // readiness/height gate as a swap and realizes at one
+                    // deterministic boundary on every validator.
+                    let Some(factory) = &self.module_factory else {
+                        return Err(Error::Module(format!(
+                            "module {} admitted but no module factory is wired — fail-closed",
+                            m.module_id,
+                        )));
+                    };
+                    let module = factory.instantiate(&m.module_id, &bytes)?;
+                    if module.id() != m.module_id {
+                        return Err(Error::Module(format!(
+                            "module factory instantiated `{}` for admission `{}` — fail-closed",
+                            module.id(),
+                            m.module_id,
+                        )));
+                    }
+                    self.registry.insert(module.id(), module);
+                }
+            }
         }
         Ok(())
     }

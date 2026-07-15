@@ -68,6 +68,21 @@ pub enum GovAction {
         /// sha256 of the target component bytes (32 bytes).
         code_hash: Vec<u8>,
     },
+    /// AUTHORIZE the post-genesis ADMISSION of a brand-new wasm module: emits
+    /// `ModregMsg::ScheduleRegister { name, module_id, activation_height,
+    /// code_hash }` on execution. governance only authorizes — the code
+    /// registry owns the not-already-registered / min-lead gates, the R = n
+    /// readiness quorum arms it, and the host instantiates the module from the
+    /// content-addressed bytes at the activation boundary. cancellation before
+    /// the boundary rides `CancelModuleUpdate` (an admission cancel removes
+    /// the registry entry entirely).
+    RegisterModule {
+        name: String,
+        module_id: String,
+        activation_height: u64,
+        /// sha256 of the initial component bytes (32 bytes).
+        code_hash: Vec<u8>,
+    },
     /// AUTHORIZE clearing a pending module code swap before its boundary: emits
     /// `ModregMsg::Cancel { name, module_id }` on execution.
     CancelModuleUpdate { name: String, module_id: String },

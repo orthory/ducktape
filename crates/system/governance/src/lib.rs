@@ -623,6 +623,18 @@ impl Governance {
                     push_bytes(&mut out, name.as_bytes());
                     push_bytes(&mut out, module_id.as_bytes());
                 }
+                GovAction::RegisterModule {
+                    name,
+                    module_id,
+                    activation_height,
+                    code_hash,
+                } => {
+                    out.push(12);
+                    push_bytes(&mut out, name.as_bytes());
+                    push_bytes(&mut out, module_id.as_bytes());
+                    out.extend_from_slice(&activation_height.to_le_bytes());
+                    push_bytes(&mut out, code_hash);
+                }
             }
             push_bytes(&mut out, &p.proposer);
             out.extend_from_slice(&p.created_at.to_le_bytes());
@@ -867,6 +879,7 @@ impl Governance {
         // registry deterministically rejects these (genesis wiring is identical
         // on every node).
         if let GovAction::UpdateModule { name, module_id, .. }
+        | GovAction::RegisterModule { name, module_id, .. }
         | GovAction::CancelModuleUpdate { name, module_id } = &action
         {
             if self.modreg_id.is_none() {
@@ -882,12 +895,25 @@ impl Governance {
                 return Err(Error::Module("module_id must not be empty".into()));
             }
         }
-        if let GovAction::UpdateModule { code_hash, .. } = &action
+        if let GovAction::UpdateModule { code_hash, .. }
+        | GovAction::RegisterModule { code_hash, .. } = &action
             && code_hash.len() != modreg::CODE_HASH_LEN
         {
             return Err(Error::Module(format!(
                 "code_hash must be {} bytes (sha256 of the component)",
                 modreg::CODE_HASH_LEN
+            )));
+        }
+        // admission is protocol-version gated (the registry enforces the same
+        // constant at execution; this door-check fails the proposal early,
+        // before an electorate wastes a ballot on it).
+        if matches!(&action, GovAction::RegisterModule { .. })
+            && self.active_version < modreg::ADMISSION_ACTIVATION_VERSION
+        {
+            return Err(Error::Module(format!(
+                "module admission activates at protocol v{} (network is at v{})",
+                modreg::ADMISSION_ACTIVATION_VERSION,
+                self.active_version
             )));
         }
         if self.get(&proposal_id).is_some() {
@@ -1133,6 +1159,26 @@ impl Governance {
                     Some(modreg) => ctx.emit_msg(Msg {
                         target: modreg.clone(),
                         payload: modreg_encode_msg(&ModregMsg::Schedule {
+                            name: name.clone(),
+                            module_id: module_id.clone(),
+                            activation_height: *activation_height,
+                            code_hash: code_hash.clone(),
+                        }),
+                    }),
+                    None => proposal.status = ProposalStatus::Rejected,
+                },
+                // a passing ADMISSION is performed the same way; the code
+                // registry owns the not-already-registered / min-lead gates and
+                // the R=n readiness quorum is what arms it.
+                GovAction::RegisterModule {
+                    name,
+                    module_id,
+                    activation_height,
+                    code_hash,
+                } => match &self.modreg_id {
+                    Some(modreg) => ctx.emit_msg(Msg {
+                        target: modreg.clone(),
+                        payload: modreg_encode_msg(&ModregMsg::ScheduleRegister {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -1589,6 +1635,12 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             11 => GovAction::CancelModuleUpdate {
                 name: cur.string("snapshot module update name")?,
                 module_id: cur.string("snapshot module id")?,
+            },
+            12 => GovAction::RegisterModule {
+                name: cur.string("snapshot module update name")?,
+                module_id: cur.string("snapshot module id")?,
+                activation_height: cur.u64("snapshot activation height")?,
+                code_hash: cur.bytes("snapshot code hash")?.to_vec(),
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };

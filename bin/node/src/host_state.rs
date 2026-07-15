@@ -120,6 +120,18 @@ impl host::CodeSource for BlobCodeSource {
     }
 }
 
+/// the wasm-runtime [`host::ModuleFactory`]: a post-genesis ADMISSION
+/// (governance `RegisterModule` → modreg `ScheduleRegister`) instantiates its
+/// module from the verified component bytes at the activation boundary — the
+/// constructor twin of [`BlobCodeSource`].
+pub(super) struct WasmModuleFactory;
+
+impl host::ModuleFactory for WasmModuleFactory {
+    fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn sdk::Module>, sdk::Error> {
+        Ok(Box::new(WasmModule::from_bytes(id, bytes)?))
+    }
+}
+
 /// the directory module's GENESIS component — the first REAL production tenant
 /// of the module runtime. bytes-compatible with the retired native
 /// implementation (`directory-wasm` stores the same keys/values under the same
@@ -574,7 +586,7 @@ impl ProductionModules {
     /// consensus-relevant (the host keys modules in a `BTreeMap`) — only the
     /// module set and each module's constructed state compose the app-hash.
     fn compose(self) -> Result<Host, sdk::Error> {
-        Host::genesis(vec![
+        let mut host = Host::genesis(vec![
             Box::new(self.kv),
             Box::new(self.pages),
             Box::new(self.chat),
@@ -601,7 +613,11 @@ impl ProductionModules {
             Box::new(self.runs),
             Box::new(self.directory),
             Box::new(self.automations),
-        ])
+        ])?;
+        // every production host admits post-genesis modules through the wasm
+        // runtime — genesis, restore, and statesync compositions alike.
+        host.set_module_factory(Box::new(WasmModuleFactory));
+        Ok(host)
     }
 }
 
