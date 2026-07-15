@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ducktape Architecture Review — flows</title>
+<style>
+  :root {
+    --bg: #f7f8f9;
+    --ink: #21262c;
+    --muted: #5d6771;
+    --accent: #2e6e8e;
+    --rule: #dfe3e7;
+    --code-bg: #eef1f3;
+    --card-bg: #ffffff;
+    --callout-bg: #e9eff3;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181b; --ink: #dee3e8; --muted: #97a1ab; --accent: #74b4d4;
+      --rule: #2c3238; --code-bg: #1e2226; --card-bg: #1b1e22; --callout-bg: #1c2329;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f8f9; --ink: #21262c; --muted: #5d6771; --accent: #2e6e8e;
+    --rule: #dfe3e7; --code-bg: #eef1f3; --card-bg: #ffffff; --callout-bg: #e9eff3;
+  }
+  :root[data-theme="dark"] {
+    --bg: #16181b; --ink: #dee3e8; --muted: #97a1ab; --accent: #74b4d4;
+    --rule: #2c3238; --code-bg: #1e2226; --card-bg: #1b1e22; --callout-bg: #1c2329;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+  main { max-width: 68rem; margin: 0 auto; padding: 2.5rem 1.5rem 6rem; }
+
+  .eyebrow {
+    font-size: .75rem; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; margin: 0 0 .4rem;
+  }
+  h1 { font-size: 1.9rem; line-height: 1.2; letter-spacing: -.014em; margin: 0; text-wrap: balance; }
+  header.doc .meta { color: var(--muted); font-size: .9rem; margin-top: .6rem; max-width: 78ch; }
+  header.doc { border-bottom: 1px solid var(--rule); padding-bottom: 1.4rem; margin-bottom: 1.6rem; }
+
+  nav.toc { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0 0 2.5rem; }
+  nav.toc a {
+    font-size: .82rem; font-weight: 600; text-decoration: none;
+    color: var(--accent); background: var(--code-bg);
+    border: 1px solid var(--rule); border-radius: 999px; padding: .3rem .85rem;
+  }
+  nav.toc a:hover { border-color: var(--accent); }
+
+  section { margin: 0 0 3.5rem; }
+  h2 {
+    font-size: 1.35rem; letter-spacing: -.012em; line-height: 1.25;
+    margin: 0 0 .35rem; padding-top: 1.6rem; border-top: 2px solid var(--rule);
+    text-wrap: balance;
+  }
+  h2 .no { color: var(--accent); font-variant-numeric: tabular-nums; margin-right: .4rem; }
+  .lede { color: var(--muted); max-width: 80ch; margin: 0 0 1.2rem; }
+  h3 { font-size: 1.02rem; margin: 1.8rem 0 .6rem; letter-spacing: -.008em; }
+  p, ul, ol { max-width: 80ch; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  strong { font-weight: 650; }
+
+  code {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .86em; background: var(--code-bg); border-radius: 3px; padding: .08em .3em;
+  }
+
+  pre.mermaid {
+    background: var(--card-bg); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 1.1rem; margin: 1.1rem 0; text-align: center; overflow-x: auto;
+  }
+  pre.mermaid:not([data-processed]) {
+    text-align: left;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: .8rem; line-height: 1.5; color: var(--muted);
+  }
+  pre.mermaid svg { max-width: 100%; height: auto; }
+
+  .table-wrap { overflow-x: auto; margin: 1rem 0; border: 1px solid var(--rule); border-radius: 8px; }
+  table { border-collapse: collapse; font-size: .86rem; line-height: 1.5; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; vertical-align: top; padding: .55rem .8rem; border-bottom: 1px solid var(--rule); }
+  tr:last-child td { border-bottom: none; }
+  th {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); background: var(--code-bg); border-bottom: 1px solid var(--rule);
+  }
+  td.step { color: var(--accent); font-weight: 650; white-space: nowrap; }
+  td .t {
+    display: inline-block; font-size: .72rem; font-weight: 650; letter-spacing: .04em;
+    color: var(--muted); background: var(--code-bg); border: 1px solid var(--rule);
+    border-radius: 4px; padding: 0 .4rem; white-space: nowrap;
+  }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: .8rem; margin: 1.1rem 0; }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--rule); border-radius: 8px;
+    padding: .85rem 1rem; font-size: .88rem;
+  }
+  .card b { display: block; margin-bottom: .25rem; font-weight: 650; }
+  .card .k { color: var(--accent); }
+
+  .review {
+    border-left: 3px solid var(--accent); background: var(--callout-bg);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.15rem; margin: 1.3rem 0; max-width: 80ch;
+  }
+  .review .tag {
+    font-size: .72rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--accent); display: block; margin-bottom: .3rem;
+  }
+  .review ul { margin: .2rem 0 0 1.1rem; padding: 0; }
+  .review li { margin: .25rem 0; }
+
+  footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1.2rem; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+</head>
+<body>
+<main>
+
+<header class="doc">
+  <p class="eyebrow">Ducktape · architecture review · 2026-07-16</p>
+  <h1>How Ducktape actually flows</h1>
+  <p class="meta">Flow-first companion to
+    <a href="https://github.com/orthory/ducktape/blob/dev/docs/records/architecture/2026-07-16-system-architecture.md"><code>docs/records/architecture/2026-07-16-system-architecture.md</code></a>
+    (dev@256cd887 — <code>file:line</code> evidence lives there). Every reference on
+    this page is a fully qualified path or <code>Type::function</code> name.
+    Mermaid diagrams render via one CDN fetch; offline, each diagram degrades to
+    readable source text.</p>
+</header>
+
+<nav class="toc">
+  <a href="#glance">At a glance</a>
+  <a href="#join">Flow 1 · Invite &amp; join</a>
+  <a href="#tx">Flow 2 · Transaction</a>
+  <a href="#async">Flow 3 · Async engine</a>
+  <a href="#transport">Flow 4 · Transport bring-up</a>
+  <a href="#loops">Loop ownership</a>
+  <a href="#reference">Reference</a>
+  <a href="#hitlist">Drift &amp; questions</a>
+</nav>
+
+<!-- ============================================================ -->
+<section id="glance">
+  <h2><span class="no">0</span>The system at a glance</h2>
+  <p class="lede">One BFT-replicated state machine hosting isolated modules;
+  each <code>sdk::Module</code> exposes one 32-byte <code>sdk::StateRoot</code>, and
+  <code>host::global_root</code> (<code>crates/kernel/host/src/lib.rs:55</code>) folds the
+  sorted <code>(ModuleId, StateRoot)</code> pairs into the app-hash that consensus commits.</p>
+
+  <pre class="mermaid">
+flowchart TB
+    subgraph desktop["Desktop machine"]
+        shell["Ducktape.app (app/src-tauri, CEF shell)"]
+        webview["React console webview (app/src)"]
+        node["ducktape-node (bin/node) — one per workspace,<br/>detached orphan"]
+        shell -- "app/src-tauri/src/daemon.rs::spawn_workspace_node" --> node
+        webview -- "http/ws /v1/* (loopback)" --> node
+        shell --- webview
+    end
+    peer1["ducktape-node (validator arm)"]
+    peer2["ducktape-node (replica arm, resident)"]
+    coord["ducktape-coordinator (bin/coordinator)<br/>untrusted UDP rendezvous, :3478"]
+    node <-- "commonware-p2p control mesh (TCP)<br/>+ WireGuard data tunnels (UDP)" --> peer1
+    node <--> peer2
+    node -.->|"nat_traversal::NatClient — reflexive discovery,<br/>hole punch, invite shelf"| coord
+    peer1 -.-> coord
+  </pre>
+
+  <div class="cards">
+    <div class="card"><b class="k">Ducktape.app spawns <code>ducktape-node</code>, not <code>noded</code></b>
+      <code>app/src-tauri/src/daemon.rs::resolve_node_bin</code> picks the bundled
+      <code>ducktape-node</code>. <code>bin/noded</code> and <code>bin/simnode</code> are dev twins.
+      All three serve the byte-identical <code>/v1</code> surface via <code>noded::serve</code> /
+      <code>noded::router</code> (<code>bin/noded/src/lib.rs:524,880</code>).</div>
+    <div class="card"><b class="k">Kernel crates spawn no tasks</b>
+      <code>crates/kernel/host</code> and <code>crates/kernel/node</code> are passive libraries.
+      Every loop in §5 lives in a binary; only <code>crates/kernel/consensus</code> spawns
+      engine tasks (<code>SimplexOrderer</code>).</div>
+    <div class="card"><b class="k">One binary, three role arms</b>
+      <code>bin/node/src/main.rs::run_node</code> dispatches to
+      <code>boot::sync_only::run</code>, <code>replica::run</code> (park → sync → promote), or
+      <code>validator::run_validator</code>, decided by recovery checkpoint + genesis membership
+      (<code>bin/node/src/main.rs:465-537</code>).</div>
+    <div class="card"><b class="k">Two genesis sets</b>
+      <code>bin/node/src/host_state.rs::ProductionModules</code> = 26 modules;
+      <code>bin/noded/src/main.rs::MODULE_IDS</code> = 16 (no membership tier —
+      a single-writer daemon has nothing to govern).</div>
+    <div class="card"><b class="k">Determinism contract</b>
+      Between consensus delivery and <code>sdk::Module::root</code>, no wall clock, rng,
+      network, or LLM may run inside <code>sdk::Module::execute</code>. Non-determinism
+      re-enters as ordered ops (§3).</div>
+    <div class="card"><b class="k"><code>bin/coordinator</code> is untrusted</b>
+      <code>nat_traversal::Coordinator</code> holds an advert book +
+      <code>nat_traversal::InviteStore</code>, no key material; blob integrity rides the
+      envelope signature, never the server.</div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="join">
+  <h2><span class="no">1</span>Flow — invitation → join → resident → validator</h2>
+  <p class="lede"><strong>Minting the invite IS the admission decision.</strong>
+  A targeted single-use token redeems automatically through
+  <code>governance::Governance::handle_redeem</code> and grants <em>resident</em> standing
+  (mesh + statesync + submit relay, no quorum seat). A validator seat is a separate
+  governance act. Join Protocol v1 (<code>docs/adr/2026-07-13-join-protocol.mdx</code>)
+  is fully implemented: <code>bin/node/src/lobby.rs::GateMsg</code>,
+  <code>bin/node/src/validator/run/ingress.rs::on_lobby</code>,
+  <code>bin/node/src/replica/park.rs</code>.</p>
+
+  <pre class="mermaid">
+stateDiagram-v2
+    [*] --> Unjoined
+    Unjoined --> GateInProgress : park.rs sends GateMsg Request
+    GateInProgress --> Admitted : GateMsg Admitted (height)
+    GateInProgress --> Rejected : GateMsg Rejected (terminal)
+    Admitted --> Synced : P2pSyncClient + sign_sync_proof
+    Synced --> Promoted : epoch cutover + reboot_self()
+    Rejected --> [*] : process exits
+  </pre>
+
+  <pre class="mermaid">
+sequenceDiagram
+    participant I as Inviter (bin/node validator)
+    participant C as bin/coordinator
+    participant J as Joiner (bin/node replica arm)
+    participant V as Gating validator
+    participant BFT as consensus::SimplexOrderer
+
+    Note over I: 0. cli.rs cmd_invite - targeted token<br/>blob adds descriptor, WG bootstrap, fronts
+    opt short invite
+        I->>C: NatClient invite_put (InviteStore shelf)
+    end
+    Note over J: 1. cli.rs cmd_join - decode_invite fail-closed,<br/>target-lock check, load_or_generate_identity
+    J->>I: 2. IntroRequest (UDP, first_contact_join.rs —<br/>or hole-punched via C when inviter is NATed)
+    Note over I: 3. reachability_plane.rs handle_intro -<br/>verify_intro BEFORE InstallInvitePeer
+    I-->>J: IntroAck + join-window WG peer
+    J->>V: 4. GateMsg Request (CHANNEL_LOBBY 5, up to 3 rounds)
+    Note over V: 5. ingress.rs on_lobby - checklist V1-V9<br/>(only V7 IssuerUnknown is non-terminal)
+    V->>BFT: GovMsg Redeem (settle-then-answer, GATE_SETTLE_TIMEOUT 30s)
+    BFT-->>V: committed - Governance handle_redeem emits ValsetMsg Grant
+    V-->>J: 6. GateMsg Admitted (height) - the reply IS the admission
+    Note over J: park.rs persists standing, DELETES invite token
+    J->>V: 7. statesync (CHANNEL_STATE_SYNC 4, real-key sign_sync_proof)
+    Note over V: sync/serve.rs fail-closed - no standing, no bytes
+    J->>V: 8. steady state - signed frames via CHANNEL_SUBMIT_RELAY 3
+    Note over J: 9. optional - promotion.rs detects seat,<br/>reboot_self() into validator::run_validator
+  </pre>
+
+  <div class="table-wrap"><table>
+    <tr><th>#</th><th>Step</th><th>Transport</th><th>What happens</th></tr>
+    <tr><td class="step">0</td><td>Mint</td><td><span class="t">local CLI</span></td>
+      <td><code>bin/node/src/cli.rs::cmd_invite</code> requires <code>--target</code> — no bearer
+      invites. <code>governance::invite::mint_invite_token</code> signs
+      <code>{issuer, nonce, target, role, expires_unix_secs}</code> (TTL 7d). Blob adds the
+      inviter's <code>InviteWireGuard</code> bootstrap + <b>fronts</b> from
+      <code>&lt;storage&gt;/mesh-state.json</code>. <code>--short</code> shelves the blob via
+      <code>nat_traversal::NatClient::invite_put</code>.</td></tr>
+    <tr><td class="step">1</td><td>Joiner boots</td><td><span class="t">local CLI</span></td>
+      <td><code>bin/node/src/cli.rs::cmd_join</code> runs <code>decode_invite</code> fail-closed,
+      aborts if <code>token.target ≠ signer.public_key()</code> <em>before</em> touching disk,
+      and mints the workspace node key via <code>load_or_generate_identity</code>.</td></tr>
+    <tr><td class="step">2–3</td><td>First contact</td><td><span class="t">UDP → WG</span></td>
+      <td><code>bin/node/src/first_contact_join.rs</code> races <code>{inviter} ∪ fronts</code>.
+      Direct candidate: install join-window WG peer + send <code>IntroRequest</code>
+      (WG-key binding under <code>INTRO_WG_NAMESPACE</code>, <code>bin/node/src/lobby.rs:265-332</code>).
+      Endpoint-less candidate: <code>ReachabilityCommand::BootstrapCoordinatedInvitePeer</code>
+      hole-punches first. Server side:
+      <code>bin/node/src/reachability_plane.rs::handle_intro</code> runs <code>verify_intro</code>
+      <em>before</em> <code>InstallInvitePeer</code> — a doomed join never gets a tunnel.</td></tr>
+    <tr><td class="step">4–5</td><td>Admission gate</td><td><span class="t">CHANNEL_LOBBY = 5</span></td>
+      <td>Joiner FSM (<code>bin/node/src/replica/park.rs:540-671</code>) sends
+      <code>lobby::GateMsg::Request</code>, ≤3 rounds. Member
+      (<code>bin/node/src/validator/run/ingress.rs::on_lobby</code>) runs checklist V1–V9 via
+      <code>lobby::verify_join_request</code>, submits <code>GovMsg::Redeem</code>, and <b>awaits the
+      frame's consensus fate</b> (<code>GATE_SETTLE_TIMEOUT = 30s</code>).
+      <code>governance::Governance::handle_redeem</code> re-verifies everything except
+      wall-clock expiry and emits <code>ValsetMsg::Grant</code> into the resident set.</td></tr>
+    <tr><td class="step">6</td><td>Admitted</td><td><span class="t">CHANNEL_LOBBY = 5</span></td>
+      <td><code>bin/node/src/validator/run/drain.rs:183-211</code> maps the frame fate to
+      <code>GateMsg::Admitted{height}</code> / <code>GateMsg::Rejected</code>. On Admitted,
+      <code>replica/park.rs</code> persists standing, stores the <code>CoordCap</code> via
+      <code>save_coord_cap</code>, and <b>deletes the on-disk invite token</b>. A terminal
+      Rejected exits the process — no retry-forever exists in the join path.</td></tr>
+    <tr><td class="step">7</td><td>Statesync</td><td><span class="t">CHANNEL_STATE_SYNC = 4</span></td>
+      <td>Strictly after admission. <code>P2pSyncClient</code>
+      (<code>bin/node/src/replica/park.rs:204-220</code>) rotates validators; every
+      <code>SyncRequest</code> carries <code>sign_sync_proof</code> — proof-of-possession of the
+      <b>real</b> key, checked in <code>bin/node/src/sync/serve.rs</code> against committed
+      members ∪ residents. Fail-closed.</td></tr>
+    <tr><td class="step">8</td><td>Resident</td><td><span class="t">CHANNEL_SUBMIT_RELAY = 3</span></td>
+      <td>Reads served locally. Writes: <code>relay_runtime::ResidentRelay</code> ships
+      self-signed frames to a validator, which reports each frame's fate
+      (<code>bin/node/src/relay.rs</code>). Overlay <code>/128</code> is never assigned:
+      <code>wireguard::ula_v6_member_addr(chain_id, identity)</code> is a pure function of
+      public inputs.</td></tr>
+    <tr><td class="step">9</td><td>Promotion</td><td><span class="t">consensus + re-exec</span></td>
+      <td>A member's <code>AddValidator</code> (<code>bin/node/src/cli.rs:1249</code>) seats the key.
+      At epoch cutover, <code>replica::promotion::choose_promotion_boundary</code> detects the
+      key in <code>latest.participants</code>; <code>replica/park.rs</code> syncs all modules,
+      fabricates the boundary checkpoint (<code>write_boundary_checkpoint</code>), and
+      <code>reboot_self()</code> re-execs into <code>validator::run_validator</code>.</td></tr>
+  </table></div>
+
+  <div class="review"><span class="tag">Review here</span><ul>
+    <li>V4 expiry is enforceable only at joiner decode + the gating member's wall clock
+      (<code>consensus_time</code> is block height). Comfortable with single-use nonces as the residual bound?</li>
+    <li><code>InviteRole::Client</code> (submit-only ACL via <code>crates/system/clients</code>) is
+      minted-but-gated-off until protocol v1 — intended sequencing?</li>
+    <li>Promotion-by-re-exec (<code>reboot_self()</code>): durable design, or a phase-2 artifact?
+      In-process fold is the noted follow-up in <code>bin/node/src/main.rs:465-480</code>.</li>
+  </ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="tx">
+  <h2><span class="no">2</span>Flow — transaction lifecycle</h2>
+  <p class="lede"><code>OrderedNode::submit_frame</code> never applies. An op is enqueued,
+  BFT-ordered as <code>sha256(frame)</code>, and applied only when
+  <code>OrderedNode::drain_delivered</code> receives it — identically on every validator
+  (<code>crates/kernel/node/src/lib.rs:49-80</code>). <code>bin/noded</code> collapses the middle:
+  every submit is immediately its own block (<code>bin/noded/src/main.rs::submit_and_drain</code>).</p>
+
+  <pre class="mermaid">
+flowchart LR
+    A["POST /v1/submit<br/>trusted origin string<br/>(bin/noded only)"] --> Q
+    B["POST /v1/submit/frame<br/>ed25519 frame, FRAME_NS<br/>node::decode_frame"] --> Q
+    B -.-> R["relay.rs verify_relay_submit<br/>CHANNEL_SUBMIT_RELAY 3<br/>(grants no authority)"] -.-> Q
+    Q["OrderedNode custody<br/>outstanding + pending_batch<br/><b>no mempool</b>"]
+    Q --> F["OrderedNode flush_batch<br/>encode_batch super-frames"]
+    F --> S["SimplexOrderer<br/>orders sha256(frame)<br/>BLOCK_TIME = 1s"]
+    S --> D["OrderedNode drain_delivered<br/>height = view_base + view<br/>realize_module_swaps first"]
+    D --> H["Host submit_block<br/>execute + same-block follow-ups<br/>commit_block in registry order"]
+    H --> AH["host global_root<br/>sorted (id, root) sha256"]
+    H --> IX["IndexStore apply_block<br/>fluent31, derived, rebuildable"]
+    IX --> WS["StreamHub publish_block<br/>ws topics via cursor re-scan"]
+  </pre>
+
+  <div class="table-wrap"><table>
+    <tr><th>Stage</th><th>Owner</th><th>The load-bearing fact</th></tr>
+    <tr><td class="step">Submit</td><td><code>bin/noded/src/lib.rs::submit / submit_frame</code> → <code>NodeCommand</code> lane</td>
+      <td>Two lanes coexist on purpose. The <code>/v1/submit</code> origin string is honored only by
+      <code>bin/noded/src/main.rs::run_node</code>; the validator intake
+      (<code>bin/node/src/validator/run/ingress.rs::on_http</code>) discards it. Authorship =
+      the frame signature under <code>FRAME_NS = "ducktape:op-frame:v2"</code>
+      (<code>crates/kernel/node/src/lib.rs:95</code>), never a session.</td></tr>
+    <tr><td class="step">Order</td><td><code>consensus::SimplexOrderer</code> engine tasks</td>
+      <td><code>ConsensusAutomaton::propose</code> <em>peeks</em> the pending FIFO — a digest is
+      removed exactly once, at finalization (<code>SimplexReporter::report</code>).
+      <code>ConsensusAutomaton::verify</code> votes only for digests whose bytes sit in
+      <code>ContentStore</code> — payload availability.</td></tr>
+    <tr><td class="step">Execute</td><td><code>bin/node/src/validator/run/drain.rs</code> (100ms <code>DRAIN_TICK</code>)</td>
+      <td><code>OrderedNode::drain_delivered</code> applies the whole batch as one block via
+      <code>Host::submit_block</code>. <code>Ctx::emit_msg</code> follow-ups are the only
+      cross-module write path; <code>MAX_DISPATCHES = 1024</code> caps the drain.</td></tr>
+    <tr><td class="step">Commit</td><td><code>host::Host</code></td>
+      <td><code>SubmitError::Rejected</code> = deterministic no-op on every validator.
+      <code>SubmitError::Fatal</code> = commit/abort hook failed, registry indeterminate →
+      fail-stop. Reject-on-replay inside <code>Host::submit_block</code>
+      (<code>crates/kernel/host/src/lib.rs:1233-1266</code>) is the built-in non-determinism detector.</td></tr>
+    <tr><td class="step">Index + push</td><td>binary block loop → <code>indexer::IndexStore</code>, <code>noded::StreamHub</code></td>
+      <td><code>IndexStore::apply_block</code> failure poisons the store (reads keep serving,
+      writes refuse) — never the block. <code>StreamHub::publish_block</code> wakes
+      <code>noded::stream::stream_session</code> tasks, which <b>re-scan the op-log after each
+      client's cursor</b> (<code>bin/noded/src/stream.rs:919-1041</code>) — reconnect replay and
+      live tail are one code path.</td></tr>
+    <tr><td class="step">Read</td><td>two tiers</td>
+      <td>Point/typed reads: <code>POST /v1/query</code> → <code>Host::query</code> →
+      <code>sdk::Module::query_with</code> over committed state. Scans/views:
+      <code>/v1/index/{module}/*</code> → <code>IndexStore::scan / view</code> on MVCC snapshots.
+      Rule (<code>docs/records/specs/indexable-spec.md</code>): nothing a <code>root()</code>
+      commits to is ever read back from the derived tier.</td></tr>
+  </table></div>
+
+  <div class="review"><span class="tag">Review here</span><ul>
+    <li>Is the <code>/v1/submit</code> (trusted string) vs <code>/v1/submit/frame</code> (signed)
+      boundary crisp enough that a future contributor can't widen the trusted lane onto a
+      networked surface?</li>
+    <li><code>host::global_root</code> is a plain sorted sha256 — defers light-client membership
+      proofs (comment at <code>crates/kernel/host/src/lib.rs:50-54</code>). Keep the deferral?</li>
+    <li>Fastblocks (<code>docs/adr/2026-07-10-ducktape-fastblocks.mdx</code>) is still Proposed —
+      <code>sdk::Module::submission_class</code> does not exist in the shipped trait. Priority?</li>
+  </ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="async">
+  <h2><span class="no">3</span>Flow — the async engine (oracle-as-op)</h2>
+  <p class="lede">Non-determinism never runs inside <code>sdk::Module::execute</code>. It leaves
+  as an <code>sdk::Event</code>, runs off-loop, and re-enters as an ordinary signed op in a
+  <em>later</em> block. <code>host::worker::Worker</code> never holds a module handle — the
+  returned <code>sdk::Msg</code> is the only way back in, enforced by type
+  (<code>crates/kernel/host/src/worker.rs:93-95</code>).</p>
+
+  <pre class="mermaid">
+flowchart LR
+    M["sdk::Module execute<br/>stages writes, emits Event"] --> SG["saga::SagaModule records<br/>pending continuation<br/>(in app-hash)"]
+    SG --> W["host::worker seam<br/>Event offered to Workers"]
+    W --> P["dispatch_oracle::DispatchPool<br/>resolves capability tag to<br/>capability_host::Provider<br/>(TOML spec, sandboxed CLI)"]
+    P --> O["result submitted as<br/>signed saga OracleResult op"]
+    O --> V["consensus orders it;<br/>dispatch::DispatchModule validates<br/>the Recipe output contract"]
+    V --> DL["mailbox -> System-origin<br/>DispatchMsg DeliverPending<br/>in a LATER block"]
+  </pre>
+
+  <div class="cards">
+    <div class="card"><b class="k"><code>crates/system/saga</code></b> deterministic continuation
+      ledger: <code>(saga_id, attempt)</code> idempotency (P5), same-block
+      <code>SagaCallback</code> on terminal transitions (P6), permissionless
+      <code>SagaMsg::Crank</code> deadlines on <code>consensus_time</code> (P7).</div>
+    <div class="card"><b class="k"><code>dispatch</code> / <code>dispatch-oracle</code></b> the twin split:
+      <code>dispatch::DispatchModule</code> validates <code>Recipe</code> contracts in consensus;
+      <code>dispatch_oracle::DispatchPool</code> runs the provider CLI and is opinion-free —
+      no prompt authored, no output parsed, no credentials touched.</div>
+    <div class="card"><b class="k"><code>capability</code> / <code>capability-host</code></b>
+      <code>CapabilityMsg::Announce</code> replicates who-provides-what as consensus state.
+      Executors are <em>data</em>: <code>crates/system/capability-host/specs/codex.toml</code> and
+      <code>specs/claude.toml</code>. Credentials stay host-side behind a per-run loopback broker.</div>
+    <div class="card"><b class="k">Never-pop-stack</b> a validated result lands in a mailbox and
+      is delivered by a System-origin <code>DispatchMsg::DeliverPending</code> injected by
+      <code>host::Host</code> in a <em>later</em> block
+      (<code>crates/kernel/host/src/lib.rs:724</code>) — results never re-enter the block that
+      agreed on them.</div>
+  </div>
+
+  <p>The full agent beat (also <code>bin/demo</code> block 7): chat mention →
+  <code>runs::RunsModule</code> composes the <em>entire</em> model input in consensus
+  (prompt = committed hash resolved from the blob lane) →
+  <code>dispatch::DispatchModule</code> stages <code>SagaMsg::Trigger</code> →
+  <code>bin/node/src/oracle_pool.rs</code> / <code>bin/noded/src/oracle_pool.rs</code> runs the
+  provider CLI in its sandbox → the result re-enters signed →
+  <code>dispatch::DispatchModule</code> validates the contract → next-block delivery →
+  <code>inbox::Inbox</code> / <code>chat::Chat</code> follow-ups fan out in that block.</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="transport">
+  <h2><span class="no">4</span>Flow — transport bring-up (what kicks in when)</h2>
+  <p class="lede">Two orthogonal planes (<code>crates/system/reachability/src/lib.rs:9-12</code>):
+  the commonware-p2p TCP <b>control mesh</b> is untouched by all WireGuard machinery,
+  which drives only the <b>data tunnel</b>. Addresses are deterministic ULAs —
+  <code>wireguard::ula_v6_prefix</code> (<code>/48 = fd ‖ hash(chain_id)</code>) and
+  <code>wireguard::ula_v6_member_addr</code> (<code>/128 = hash(chain_id ‖ identity)</code>,
+  <code>crates/system/wireguard/src/lib.rs:540-566</code>) — so the mesh agrees with zero
+  coordination.</p>
+
+  <pre class="mermaid">
+flowchart TD
+    start["need endpoint for peer"] --> adv{"peer advertised a<br/>dialable endpoint?"}
+    adv -- yes --> direct["Resolution Advertised<br/>dial as-is"]
+    adv -- no --> coord{"coordinator<br/>configured?"}
+    coord -- no --> fail["PeerFailed<br/>(there is NO relay tier;<br/>DERP wire tags 8/9 are tombstones)"]
+    coord -- yes --> punch["orchestrator.rs do_resolve<br/>3 tries: send_lookup -> PunchSync<br/>both sides -> send_punch_to"]
+    punch -- success --> punched["Resolution Punched (reflexive)"]
+    punch -- all fail --> fail
+    direct --> roam["apply_tunnel_plans installs peer;<br/>WG roaming repins to authenticated<br/>source, 25s keepalive"]
+    punched --> roam
+  </pre>
+
+  <div class="cards">
+    <div class="card"><b class="k">Backend choice</b> one trait —
+      <code>wireguard::effect::WireGuardEffect</code> — two impls:
+      <code>wireguard::effect::DefguardWireGuardEffect</code> (TUN, kernel-routed, needs root;
+      servers) vs <code>overlay_net::userspace::UserspaceWireGuardEffect</code>
+      (boringtun <code>Tunn</code> + smoltcp <code>VirtualStack</code> in-process; desktop default).
+      Wire-compatible by construction — one crypto core.</div>
+    <div class="card"><b class="k">Tunnel-peer layering</b> the only "upgrade" ladder
+      (<code>reachability/src/orchestrator.rs:161-217</code>):
+      <code>ReachabilityCommand::InstallInvitePeer</code> (join window) → standby pre-warm
+      records → the epoch's validated plans (signed, mesh-versioned, checked by
+      <code>wireguard::validate_upgrade_as</code>). Weakest dissolves as stronger lands.</div>
+    <div class="card"><b class="k">Per-epoch, not per-connection</b>
+      <code>reachability::orchestrator::run</code> turns each valset cutover into one mesh:
+      <code>EndpointRecord</code> gossip → <code>EndpointAdvertisement</code> →
+      <code>MeshView::verify</code> → per-pair handshake → <em>one</em>
+      <code>apply_tunnel_plans</code> per epoch.</div>
+    <div class="card"><b class="k">Per-use data planes</b>
+      <code>data_plane::OverlaySockets</code> binds the member <code>/128</code> per
+      <code>data_plane::Service</code> (Voice=2, Video=3, Gateway=6, ModuleCode=8, Term=9 —
+      datagram vs stream classes never unified), throttled by one shared
+      <code>overlay_book::shared_bulk_pacer</code>. Never the control mesh.</div>
+  </div>
+
+  <div class="review"><span class="tag">Review here</span><ul>
+    <li>Punch-failure-is-terminal (<code>orchestrator.rs:855-858</code>): a symmetric-NAT pair with
+      no dialable side simply fails. Still right as the user base broadens?</li>
+    <li>Invite / standby / validated = three peer lifetimes managed in one
+      <code>reachability::orchestrator::Driver</code> — is the complexity paying rent?</li>
+  </ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="loops">
+  <h2><span class="no">5</span>Who owns every loop</h2>
+  <p class="lede">The kernel owns none — every loop lives in a binary. Two folklore
+  corrections: <code>DRAIN_TICK = 100ms</code> (<code>bin/node/src/constants.rs:92</code>) is
+  <em>validator-only</em> — the <code>bin/noded</code> node actor has no timer at all; and
+  <code>crates/apps/automations</code> is not a scheduler — <code>Automations</code> is an
+  in-consensus hook reactor with no loop.</p>
+
+  <h3>ducktape-node · validator arm</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Loop</th><th>Driven by</th><th>Owns</th></tr>
+    <tr><td><code>validator/run.rs:495</code> drain arm</td>
+      <td><code>DRAIN_TICK = 100ms</code> absolute deadline (floor, never starved)</td>
+      <td><code>OrderedNode::drain_delivered</code>; <code>drain.rs::pump_heartbeat</code>
+      (block cadence + <code>consensus.nop</code>); <code>pump_saga_crank</code>,
+      <code>pump_dispatch_nudge</code>, upgrade-readiness + capability announce pumps;
+      gate-reply settlement (<code>drain.rs:183-211</code>)</td></tr>
+    <tr><td><code>validator/run/ingress.rs</code> arm</td>
+      <td>same <code>select_biased!</code>: RPC jobs, http commands, lobby/statesync/relay channels</td>
+      <td><code>on_lobby</code> checklist V1–V9, <code>on_http</code> submit custody,
+      <code>RpcRequest::JoinState</code> replies</td></tr>
+    <tr><td><code>consensus::SimplexOrderer</code> tasks</td>
+      <td>commonware runtime</td>
+      <td>simplex engine + resolver fetch + payload drain; all aborted by <code>Drop</code>
+      at epoch cutover (<code>consensus/src/lib.rs:1149-1159</code>)</td></tr>
+    <tr><td><code>bin/node/src/sync/serve.rs</code></td>
+      <td><code>CHANNEL_STATE_SYNC = 4</code> requests, answered between drains</td>
+      <td>manifest/chunk/module/frames service; fail-closed real-key standing check</td></tr>
+    <tr><td><code>reachability::orchestrator::run</code></td>
+      <td>own OS thread (<code>reachability_plane.rs:180-206</code>); <code>ReachabilityCommand</code>
+      channel; <code>Nudge</code> interval</td>
+      <td>the epoch mesh state machine (§4)</td></tr>
+    <tr><td><code>orchestrator.rs::establish_then_pump</code>, <code>rendezvous_pump</code>,
+      <code>rendezvous_keepalive</code></td>
+      <td>UDP socket events; <code>RENDEZVOUS_KEEPALIVE = 25s</code></td>
+      <td>reflexive discovery + registration (3s→30s backoff), lookup/punch service,
+      NAT-mapping keepalive</td></tr>
+    <tr><td><code>overlay_net::userspace</code> pumps</td>
+      <td>socket recv; <code>TIMER_TICK = 250ms</code></td>
+      <td><code>WgDevice::spawn</code>: <code>demux_pump</code> / <code>inbound_pump</code> /
+      <code>outbound_pump</code> / <code>timer_pump</code> (<code>Tunn::update_timers</code>);
+      <code>VirtualStack::spawn</code>: the smoltcp <code>poll_loop</code></td></tr>
+    <tr><td><code>reachability_plane.rs::spawn_handshake_sampler</code></td>
+      <td>interval</td>
+      <td>samples WG handshake completion from <code>ProbeSlot</code> — "config applied" vs "peer dark"</td></tr>
+    <tr><td><code>noded::serve</code> + planes (<code>boot/surfaces.rs</code>)</td>
+      <td>axum; per-service <code>OverlaySockets</code></td>
+      <td>the shared <code>/v1</code> surface; <code>voice_plane.rs</code> Opus hub;
+      <code>term_plane.rs</code> shared-terminal fan-out; <code>bin/node/src/oracle_pool.rs</code></td></tr>
+  </table></div>
+
+  <h3>ducktape-node · replica/joiner arm</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Loop</th><th>Driven by</th><th>Owns</th></tr>
+    <tr><td><code>replica/park.rs:540-671</code> park loop</td>
+      <td>gate FSM rounds (<code>GATE_ATTEMPT_TIMEOUT</code>, 3 rounds), then sync cadence</td>
+      <td>the joiner FSM (§1), standing persistence, invite-token deletion,
+      <code>RpcRequest::JoinState</code></td></tr>
+    <tr><td><code>P2pSyncClient</code> (<code>park.rs:204-220</code>, <code>sync/catchup.rs</code>)</td>
+      <td>manifest polling post-admission</td>
+      <td>validator rotation, <code>sign_sync_proof</code>, boundary folds</td></tr>
+    <tr><td><code>replica/promotion.rs::choose_promotion_boundary</code></td>
+      <td>epoch cutover observation</td>
+      <td>self-detect in <code>latest.participants</code> → <code>write_boundary_checkpoint</code> →
+      <code>reboot_self()</code></td></tr>
+    <tr><td><code>relay_runtime::ResidentRelay</code></td>
+      <td>local submits</td>
+      <td>self-signed frames on <code>CHANNEL_SUBMIT_RELAY = 3</code>, fate reporting</td></tr>
+  </table></div>
+
+  <h3>noded · embedded daemon</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Loop</th><th>Driven by</th><th>Owns</th></tr>
+    <tr><td><code>bin/noded/src/main.rs::run_node</code> node actor</td>
+      <td><code>NodeCommand</code> mpsc — strictly serial, <b>no timer</b></td>
+      <td>the non-Send <code>host::Host</code>; <code>submit_and_drain</code> (1-op-1-block);
+      <code>IndexStore::apply_block</code>; <code>StreamHub::publish_block</code></td></tr>
+    <tr><td><code>noded::serve</code> (axum)</td>
+      <td>plain tokio, main thread</td>
+      <td><code>/v1</code> surface; reaches the actor only via the <code>NodeCommand</code> lane</td></tr>
+    <tr><td><code>bin/noded/src/oracle_pool.rs::oracle_workers</code></td>
+      <td>spawned per claimed effect</td>
+      <td>provider CLI off-loop; completions re-enter as <code>NodeCommand::Submit</code>
+      under <code>ORACLE_ORIGIN</code></td></tr>
+    <tr><td><code>noded::stream::stream_session</code> (per ws connection)</td>
+      <td><code>select!</code>: inbound frames, block wakeups, 3s heartbeat, watch channels</td>
+      <td>per-topic cursors, catch-up, lag-to-live</td></tr>
+    <tr><td><code>noded::term</code> tasks (per session)</td>
+      <td>pty output; command lane; 4h reaper (<code>MAX_SESSION_LIFETIME</code>)</td>
+      <td><code>spawn_pump</code> (pty→ring), <code>spawn_command_consumer</code> (the
+      shared-session total order), <code>spawn_reaper</code></td></tr>
+  </table></div>
+
+  <h3>everything else</h3>
+  <div class="table-wrap"><table>
+    <tr><th>Process</th><th>Loop</th><th>Owns</th></tr>
+    <tr><td>Ducktape.app</td>
+      <td><code>app/src-tauri/src/daemon.rs::NodeControl</code> actor thread (queue 32, 30s expiry);
+      <code>daemon.rs::watch_with_restarts</code> supervisor</td>
+      <td>every node exec (allow-listed CLI verbs + <code>spawn_workspace_node</code>);
+      reap + auto-restart (≤5), adopt-don't-respawn</td></tr>
+    <tr><td>bin/coordinator</td>
+      <td><code>nat_traversal::client::run_coordinator_workers_with_metrics</code></td>
+      <td><code>AdvertBook</code> (observed reflexives, TTL), <code>InviteStore</code>,
+      per-request <code>AuthVerifier</code></td></tr>
+    <tr><td>bin/simnode</td>
+      <td><code>bin/simnode/src/main.rs</code> sim actor: <code>NodeCommand</code> + <code>/sim/*</code> lane</td>
+      <td>held-submit semantics; logical clock
+      <code>SIM_EPOCH_MS + height × SIM_BLOCK_MS</code> — the deterministic <code>/v1</code> twin</td></tr>
+  </table></div>
+
+  <div class="review"><span class="tag">Review here</span><ul>
+    <li>Is anything missing from this inventory (duckdns ingress OS thread in
+      <code>boot/surfaces.rs</code>? gateway data-plane accept loops)?</li>
+    <li>Should any of these loops move out of <code>bin/node</code> wiring into a crate?</li>
+  </ul></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="reference">
+  <h2><span class="no">6</span>Reference — tiers in one screen</h2>
+
+  <div class="table-wrap"><table>
+    <tr><th>Tier</th><th>Crates</th><th>Rule that keeps it honest</th></tr>
+    <tr><td><b>crates/kernel</b></td>
+      <td>sdk · host · node · consensus · statesync · recovery · indexer · wasm-host (+ module-guest WIT)</td>
+      <td>spawn-free except <code>consensus</code>; <code>host</code> reads
+      <code>upgrade</code>/<code>dispatch</code>/<code>modreg</code> via wire types only;
+      <code>indexer</code> may not depend on <code>sdk</code>/<code>host</code> at all</td></tr>
+    <tr><td><b>crates/system</b></td>
+      <td>kv valset clients governance identity upgrade saga capability dispatch tagging modreg
+      duckdns gateway + off-consensus: blobstore, dispatch-oracle, capability-host, wireguard,
+      nat-traversal, reachability, overlay-net, data-plane</td>
+      <td>the <code>-host</code>/<code>-oracle</code> suffix = impure host-side twin of a
+      consensus module</td></tr>
+    <tr><td><b>crates/apps</b></td>
+      <td>chat pages forge files agent runs tasks inbox jobs automations vaults</td>
+      <td>modules link <code>sdk</code> + types-only <code>interface.rs</code> surfaces, never
+      another module's impl; reads via <code>sdk::Ctx::query</code>, writes via
+      <code>sdk::Ctx::emit_msg</code> follow-ups</td></tr>
+    <tr><td><b>crates/duckfs</b></td>
+      <td>core (pure, wasm-ready) · disk · client (OS-side)</td>
+      <td>the core/disk split IS the <code>cargo check -p files --no-default-features</code> wasm
+      gate; NFC-<em>rejecting</em> <code>duckfs_core::paths::canonical</code> is a determinism
+      requirement</td></tr>
+    <tr><td><b>crates/labs</b></td>
+      <td>evm · multisig</td>
+      <td>deliberately absent from every genesis set; revm/alloy/k256 quarantined</td></tr>
+  </table></div>
+
+  <p>Module one-liners, state substrates, and the client tier
+  (<code>docs/adr/2026-07-10-desktop-node-control-boundary.mdx</code>,
+  <code>docs/adr/2026-07-14-duck-uri-protocol.mdx</code>, <code>bin/mcp</code>,
+  <code>bin/fs</code>) are in
+  <a href="https://github.com/orthory/ducktape/blob/dev/docs/records/architecture/2026-07-16-system-architecture.md"><code>docs/records/architecture/2026-07-16-system-architecture.md</code></a>
+  §9–§10.</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="hitlist">
+  <h2><span class="no">7</span>Verified drift + the open questions</h2>
+  <p class="lede">Each item verified in code while writing
+  <code>docs/records/architecture/2026-07-16-system-architecture.md</code>; each is a
+  cheap cleanup PR once confirmed.</p>
+  <ol>
+    <li><b><code>README.md</code> layout table is stale</b> — names <code>crates/kernel/state</code>,
+      <code>reactor</code>, <code>wireguard-upgrade</code>, <code>document</code>, <code>memory</code>;
+      none exist. The Run-The-App section predates the join gate.</li>
+    <li><b><code>docs/adr/2026-07-13-join-protocol.mdx:3-8</code> status line is stale</b> — says
+      "lands as campaign PR4"; <code>bin/node/src/lobby.rs::GateMsg</code>,
+      <code>ingress.rs::on_lobby</code>, and the <code>join-state</code> RPC are merged.</li>
+    <li><b><code>docs/records/admission/validator-onboarding.md</code> and
+      <code>invitation-protocol-deep-dive.md</code></b> describe the retired
+      advisory-announce flow.</li>
+    <li><b>Observers→Residents leftover</b> —
+      <code>crates/system/governance/tests/invite_redemption.rs:155</code> still panics with
+      "expected Observers" on a <code>ValsetReply::Residents</code> arm.</li>
+    <li><b><code>docs/superpowers/plans/2026-07-07-user-node-identity-split.md</code></b> predates
+      the implemented v2 account format (multi-scheme <code>MemberAuth</code>, WebAuthn-P256).</li>
+    <li><b>Workspace <code>Cargo.toml</code> header still claims <code>evm</code> is
+      genesis-registered</b> — <code>evm</code> moved to <code>crates/labs</code> and nothing
+      registers it.</li>
+  </ol>
+  <div class="review"><span class="tag">All open questions</span><ul>
+    <li><code>bin/noded/src/main.rs::MODULE_IDS</code> (16) vs
+      <code>bin/node/src/host_state.rs::ProductionModules</code> (26): pin by parity test, or
+      intended divergence?</li>
+    <li><code>host::global_root</code> plain-sorted hash vs light-client proofs — keep the deferral?</li>
+    <li>§5 loop inventory completeness; crate-vs-<code>bin/node</code>-wiring placement.</li>
+    <li>No-relay stance for symmetric NAT
+      (<code>reachability/src/orchestrator.rs:855-858</code>); three-layer tunnel lifetime
+      complexity in <code>orchestrator::Driver</code>.</li>
+    <li>Wall-clock invite expiry (V4); gated-off <code>InviteRole::Client</code>;
+      promotion-by-re-exec (<code>replica/park.rs::reboot_self</code>).</li>
+    <li><code>/v1/submit</code> trusted-string vs <code>/v1/submit/frame</code> signed-frame
+      lane boundary.</li>
+  </ul></div>
+</section>
+
+<footer>
+  Companion to <code>docs/records/architecture/2026-07-16-system-architecture.md</code>
+  (the evidence-cited record). Rendered 2026-07-16 against dev@256cd887.
+</footer>
+
+</main>
+
+<script type="module">
+  const dark = document.documentElement.dataset.theme === "dark" ||
+    (document.documentElement.dataset.theme !== "light" &&
+     window.matchMedia("(prefers-color-scheme: dark)").matches);
+  try {
+    const { default: mermaid } = await import(
+      "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+    );
+    for (const el of document.querySelectorAll("pre.mermaid")) {
+      el.textContent = el.textContent.trim();
+    }
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: dark ? "dark" : "neutral",
+      fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif",
+    });
+    await mermaid.run({ querySelector: "pre.mermaid" });
+  } catch {
+    /* offline: the source blocks stay readable */
+  }
+</script>
+</body>
+</html>
