@@ -10,7 +10,7 @@
 //! everything here runs unprivileged: no TUN, no CAP_NET_ADMIN, no external
 //! binaries — the property the whole ADR exists to win.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
@@ -64,13 +64,19 @@ fn stand_up(key_seed: u8, host: u16) -> Node {
         effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
         secret,
         ula: ula(host),
-        endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        // the underlay is a real IPv4 socket, so loopback fixtures dial the
+        // V4 loopback literal — the same family production crosses.
+        endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     };
     node.effect.create_interface().expect("create");
     node.effect
         .apply(&config(&node, 0, Vec::new()))
         .expect("first apply binds the underlay");
     let bound = node.effect.local_underlay_addr().expect("underlay bound");
+    assert!(
+        bound.is_ipv4(),
+        "the underlay must bind a real IPv4 socket, got {bound}"
+    );
     node.endpoint.set_port(bound.port());
     node
 }
@@ -169,17 +175,17 @@ async fn handshake_and_datagram_echo() {
     );
 }
 
-/// the family seam every real deployment crosses: the underlay binds
-/// dual-stack `[::]`, but configured endpoints (adverts, punched
-/// reflexives) are V4 literals. the initiator's handshake toward a V4
-/// endpoint must ride the v6 socket as v4-mapped v6 (EINVAL on macOS
-/// otherwise), and the passive side's roamed endpoint must canonicalize
-/// back to V4 — the all-v6-loopback tests above never cross it.
+/// the family every real deployment runs on: a real IPv4 underlay toward a
+/// V4 endpoint (adverts, punched reflexives are V4 literals). the initiator
+/// dials b's V4 endpoint directly — no v4-mapped-v6 detour — and the passive
+/// side (endpoint-less) learns a's V4 endpoint by roaming. this is the path
+/// macOS CLAT46 broke when the underlay was dual-stack `[::]` with v4-mapped
+/// sends: a real AF_INET socket takes the same NAT translation the punch did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handshake_completes_toward_a_v4_endpoint() {
     let (mut a, mut b) = (stand_up(0x51, 0xa), stand_up(0x62, 0xb));
-    // a dials b at its V4 loopback literal, not the v6 form.
-    let b_v4 = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), b.endpoint.port());
+    // a dials b at its V4 loopback literal (the real IPv4 underlay's family).
+    let b_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), b.endpoint.port());
     let (a_port, b_port) = (a.endpoint.port(), b.endpoint.port());
     let peers_for_a = vec![peer_entry(&b, Some(b_v4))];
     let peers_for_b = vec![peer_entry(&a, None)];
@@ -477,7 +483,7 @@ async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
         ),
         secret: Key::new(defguard_boringtun_secret(0x17)),
         ula: ula(0xa),
-        endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     };
     a.effect.create_interface().expect("create");
     a.effect
@@ -500,7 +506,7 @@ async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
 
     // a NAT-protocol datagram to the SAME port lands on the bypass lane
     // (tag 7 = Punch: never a valid WireGuard header), with its true source.
-    let scratch = tokio::net::UdpSocket::bind("[::1]:0")
+    let scratch = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("scratch");
     let punch: Vec<u8> = std::iter::once(7u8).chain([0x5au8; 32]).collect();

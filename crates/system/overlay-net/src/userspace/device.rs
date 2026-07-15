@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -72,6 +72,11 @@ type WgLane = Arc<RwLock<Option<mpsc::Sender<Datagram>>>>;
 /// pinhole stays open — while the tunnel itself is torn down and re-applied.
 pub struct UnderlaySocket {
     udp: Arc<UdpSocket>,
+    /// the address the underlay actually bound (port-0 resolved) — captured
+    /// once so [`send_to`](Self::send_to) can gate its family handling on the
+    /// socket's OWN family without a per-send syscall. a real IPv4 (`0.0.0.0`)
+    /// bind in production; the family is fixed for the socket's life.
+    local: SocketAddr,
     /// the WG lane's sender — installed by each [`WgDevice`] at spawn, so a
     /// rebuilt device re-attaches to the same socket; `None` (or a closed
     /// sender) while no device is live, when WG datagrams are dropped
@@ -84,8 +89,20 @@ pub struct UnderlaySocket {
 }
 
 impl UnderlaySocket {
-    /// bind the underlay socket (dual-stack `[::]:port`, so a peer endpoint
-    /// of either family reaches it) and spawn its receive pump on `handle`.
+    /// bind the underlay socket (a real IPv4 `0.0.0.0:port` socket) and spawn
+    /// its receive pump on `handle`.
+    ///
+    /// a REAL AF_INET socket, not dual-stack `[::]` with v4-mapped sends: on
+    /// macOS 464XLAT (CLAT46) networks, a dual-stack socket's v4-mapped
+    /// datagrams take a different NAT translation path than a true IPv4
+    /// socket — the coordinator sees a different public mapping, and the peer
+    /// hole punch that mapping vouches for never lands (the punch `send`
+    /// succeeds, the peer's punch never arrives). every underlay endpoint a
+    /// node talks to — coordinators, advertised endpoints, punched reflexives
+    /// — is a V4 literal, and the overlay's own addressing is ULA-v6 INSIDE
+    /// the tunnel, independent of this underlay family. so bind V4 and let the
+    /// punch ride the same real IPv4 5-tuple the standalone resolver always
+    /// used.
     ///
     /// binding absorbs a predecessor's asynchronous teardown: a replace
     /// cycle (remove→create→apply, or a rebuild inside `apply`) drops the
@@ -99,11 +116,13 @@ impl UnderlaySocket {
         std_socket.set_nonblocking(true)?;
         let _runtime = handle.enter();
         let udp = Arc::new(UdpSocket::from_std(std_socket)?);
+        let local = udp.local_addr()?;
         let wg_lane: WgLane = Arc::new(RwLock::new(None));
         let (bypass_tx, bypass_rx) = mpsc::channel(LANE_CHANNEL);
         let pump = handle.spawn(demux_pump(udp.clone(), wg_lane.clone(), bypass_tx));
         Ok(Arc::new(Self {
             udp,
+            local,
             wg_lane,
             bypass: Mutex::new(Some(bypass_rx)),
             pump,
@@ -112,18 +131,24 @@ impl UnderlaySocket {
 
     /// the underlay address the socket actually bound (resolves port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.udp.local_addr()
+        Ok(self.local)
     }
 
     /// send one datagram from the shared socket — the tunnel's exact
     /// 5-tuple, which is the property the NAT punch shares it for.
     pub async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
-        // the socket is dual-stack `[::]` — a V4 destination (a configured
-        // v4 endpoint, a punched v4 reflexive) must be sent as v4-MAPPED v6,
-        // or the send is EINVAL on macOS (and family-mismatched everywhere).
-        let dst = match dst {
-            SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
-            SocketAddr::V6(_) => dst,
+        // family handling keys off the socket's OWN family (as
+        // `NatSocket::send_to` does): a real IPv4 underlay sends a V4
+        // destination directly; only a V6-bound socket must map a V4
+        // destination to v4-MAPPED v6 (EINVAL otherwise). production binds
+        // V4, so this is the identity — the point of the V4 bind is that the
+        // datagram leaves as real IPv4, taking the same NAT translation the
+        // punch established.
+        let dst = match (self.local, dst) {
+            (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            _ => dst,
         };
         self.udp.send_to(buf, dst).await
     }
@@ -159,7 +184,7 @@ impl Drop for UnderlaySocket {
 fn bind_retrying(port: u16) -> io::Result<std::net::UdpSocket> {
     let mut last = None;
     for _ in 0..200 {
-        match std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)) {
+        match std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
             Ok(socket) => return Ok(socket),
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
                 last = Some(err);
@@ -183,9 +208,11 @@ async fn demux_pump(udp: Arc<UdpSocket>, wg_lane: WgLane, bypass: mpsc::Sender<D
             Ok(received) => received,
             Err(_) => continue,
         };
-        // a v4 sender observed through the dual-stack socket reports as
-        // `::ffff:a.b.c.d` — canonicalize to V4 so roamed endpoints compare
-        // equal to the V4 addresses configs and coordinators carry.
+        // the real IPv4 underlay already reports V4 sources as plain V4, so
+        // this is a defensive identity today; it stays because a V6-bound
+        // socket would surface a v4 sender as `::ffff:a.b.c.d`, which must
+        // canonicalize to V4 to compare equal to the addresses configs and
+        // coordinators carry.
         let src = match src {
             SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
                 Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
