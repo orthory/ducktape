@@ -105,6 +105,13 @@ resume_args = [
 # exact TUI invocation is pending live validation against the real codex binary
 # on a podman host (see the design spec).
 args = []
+# The RESTRICTED argv for a SHARED (command-lane) session: read-only + never
+# ask. A shared session is driven by ordered commands, so no single member is
+# there to answer a TUI approval prompt — codex must never stop to ask, and
+# read-only makes not-asking safe (it can read + reason + reply, never write or
+# exec). `-c` broker overrides are still prepended host-side, so the same
+# credential isolation holds. Absent this key, a capability is solo-only.
+restricted_args = ["--sandbox", "read-only", "--ask-for-approval", "never"]
 
 [isolation]
 # THE STRONG AUTH PATH: the operator's credential never enters the codex

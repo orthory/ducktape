@@ -353,13 +353,15 @@ pub trait Provider: Send + Sync {
     /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
     /// [`crate::interactive`]). The default refuses — only a spec with an
     /// `[interactive]` argv on a Podman backend supports it; everything else
-    /// keeps the historical headless-only surface.
+    /// keeps the historical headless-only surface. `restricted` selects the
+    /// read-only, non-prompting argv for a SHARED (command-lane) session.
     #[cfg(unix)]
     async fn spawn_interactive(
         &self,
         ctx: &RunContext,
+        restricted: bool,
     ) -> Result<InteractiveSession, String> {
-        let _ = ctx;
+        let _ = (ctx, restricted);
         Err(format!(
             "{}: this capability has no interactive session support",
             self.capability()
@@ -3623,8 +3625,9 @@ impl Provider for CliProvider {
     async fn spawn_interactive(
         &self,
         ctx: &RunContext,
+        restricted: bool,
     ) -> Result<InteractiveSession, String> {
-        self.spawn_interactive_session(ctx).await
+        self.spawn_interactive_session(ctx, restricted).await
     }
 }
 

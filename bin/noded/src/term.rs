@@ -345,8 +345,24 @@ pub struct Command {
 /// Dropping the entry also drops `cmd_tx`, the lane's only long-lived sender, so
 /// the serial consumer's `recv()` returns `None` and it exits — the same
 /// drop-driven teardown the pump takes on EOF, no separate cancel needed.
+/// how a session is driven — chosen at create, enforced for its whole life.
+///
+/// `Single` (the default): ONE member, RAW keystrokes straight to the pty — the
+/// solo terminal. `Shared`: ordered, attributed `TermCommand`s through the lane
+/// (the consensus-ready path). The two are MUTUALLY EXCLUSIVE per session: a
+/// shared session refuses raw input (else a keystroke would bypass the total
+/// order), and a single session refuses commands (it has no lane/consumer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    #[default]
+    Single,
+    Shared,
+}
+
 struct Live {
     session: Arc<InteractiveSession>,
+    mode: SessionMode,
     cmd_tx: mpsc::UnboundedSender<Command>,
     _reaper_cancel: oneshot::Sender<()>,
 }
@@ -442,7 +458,11 @@ impl TerminalSessions {
     /// create a session for `agent`, spawning its interactive TUI on a pty.
     /// Reserves a slot against the cap BEFORE the spawn await so concurrent
     /// creates can't both slip past a stale count.
-    pub async fn create(&self, agent: &str) -> Result<CreatedSession, TermError> {
+    pub async fn create(
+        &self,
+        agent: &str,
+        mode: SessionMode,
+    ) -> Result<CreatedSession, TermError> {
         let inner = &self.0;
         let Some(providers) = inner.providers.as_ref() else {
             tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "session create refused");
@@ -454,7 +474,7 @@ impl TerminalSessions {
             tracing::warn!(target: "ducktape::term", reason = "at_capacity", cap = MAX_TERM_SESSIONS, "session create refused");
             return Err(TermError::AtCapacity);
         }
-        match self.spawn(providers, agent).await {
+        match self.spawn(providers, agent, mode).await {
             Ok(created) => Ok(created),
             Err(err) => {
                 inner.active.fetch_sub(1, Ordering::SeqCst);
@@ -465,7 +485,12 @@ impl TerminalSessions {
 
     /// resolve the provider, build the run context, spawn the pty session, and
     /// register it + its pump. The reservation is held by the caller.
-    async fn spawn(&self, providers: &ProviderSet, agent: &str) -> Result<CreatedSession, TermError> {
+    async fn spawn(
+        &self,
+        providers: &ProviderSet,
+        agent: &str,
+        mode: SessionMode,
+    ) -> Result<CreatedSession, TermError> {
         let provider = providers.resolve(agent).map_err(|detail| {
             tracing::warn!(target: "ducktape::term", reason = "unknown_agent", agent, "session create refused");
             TermError::Resolve(detail)
@@ -483,10 +508,16 @@ impl TerminalSessions {
             portable: true,
             ..Default::default()
         };
-        let session = provider.spawn_interactive(&ctx).await.map_err(|detail| {
-            tracing::warn!(target: "ducktape::term", reason = "spawn_failed", agent, "interactive spawn failed");
-            TermError::Spawn(detail)
-        })?;
+        // a Shared session runs the restricted (read-only, non-prompting) argv;
+        // a Single session runs the full solo TUI.
+        let restricted = mode == SessionMode::Shared;
+        let session = provider
+            .spawn_interactive(&ctx, restricted)
+            .await
+            .map_err(|detail| {
+                tracing::warn!(target: "ducktape::term", reason = "spawn_failed", agent, mode = ?mode, "interactive spawn failed");
+                TermError::Spawn(detail)
+            })?;
         let session = Arc::new(session);
         // dropping `cancel_tx` (when the entry leaves the map) cancels the
         // reaper; holding it in the map keeps the ceiling armed for the session.
@@ -502,14 +533,19 @@ impl TerminalSessions {
                 id.clone(),
                 Live {
                     session: session.clone(),
+                    mode,
                     cmd_tx,
                     _reaper_cancel: cancel_tx,
                 },
             );
         self.spawn_pump(id.clone(), session.clone());
-        self.spawn_command_consumer(id.clone(), session, cmd_rx);
+        // the ordered command lane exists only for a Shared session; a Single
+        // session drives the pty with raw keystrokes (no lane, no consumer).
+        if mode == SessionMode::Shared {
+            self.spawn_command_consumer(id.clone(), session, cmd_rx);
+        }
         self.spawn_reaper(id.clone(), cancel_rx);
-        tracing::info!(target: "ducktape::term", session = %id, agent, "session_created");
+        tracing::info!(target: "ducktape::term", session = %id, agent, mode = ?mode, "session_created");
         Ok(CreatedSession {
             topic: topic(&id),
             session_id: id,
@@ -618,23 +654,38 @@ impl TerminalSessions {
     /// session id is a no-op + `warn` (`unknown_session`), exactly like the
     /// input/resize handlers; never a panic. Never logs the command text.
     pub fn enqueue_command(&self, session: &str, origin: String, text: String) {
-        // clone the sender out and drop the guard before sending (send is sync
-        // and non-blocking, but this keeps the manager's no-work-under-lock
-        // discipline uniform).
-        let tx = self
+        // read the mode + sender under the lock, drop the guard before sending
+        // (send is sync and non-blocking, but this keeps the manager's
+        // no-work-under-lock discipline uniform).
+        let found = self
             .0
             .sessions
             .lock()
             .expect("term sessions lock poisoned")
             .get(session)
-            .map(|live| live.cmd_tx.clone());
-        let Some(tx) = tx else {
+            .map(|live| (live.mode, live.cmd_tx.clone()));
+        let Some((mode, tx)) = found else {
             tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term command dropped");
             return;
         };
+        // commands are the SHARED-session path; a Single session has no lane.
+        if mode != SessionMode::Shared {
+            tracing::warn!(target: "ducktape::term", session = %session, reason = "command_on_single", "term command dropped");
+            return;
+        }
         // a send failure means the consumer already exited (a teardown race with
         // finish()); the session is ending, so the drop is benign.
         let _ = tx.send(Command { origin, text });
+    }
+
+    /// the mode a session was created with (for the ws input gates), if live.
+    pub fn mode(&self, id: &str) -> Option<SessionMode> {
+        self.0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .get(id)
+            .map(|live| live.mode)
     }
 
     /// the live session for `id`, if any (for `TermInput`/`TermResize`).
@@ -746,6 +797,10 @@ pub fn backend_from_env() -> SandboxBackend {
 #[derive(Deserialize)]
 pub struct CreateSessionBody {
     pub agent: String,
+    /// `"single"` (default, back-compat) = raw-keystroke solo terminal;
+    /// `"shared"` = ordered `TermCommand` lane.
+    #[serde(default)]
+    pub mode: SessionMode,
 }
 
 /// POST /v1/term/sessions — create an interactive session and return its id +
@@ -762,7 +817,7 @@ pub async fn create_session(
         )
             .into_response();
     };
-    match terminals.create(&body.agent).await {
+    match terminals.create(&body.agent, body.mode).await {
         Ok(created) => (StatusCode::OK, Json(created)).into_response(),
         Err(err) => err.response(),
     }

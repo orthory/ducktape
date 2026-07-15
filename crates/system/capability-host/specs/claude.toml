@@ -76,6 +76,13 @@ resume_args_append = ["--resume", "{session_id}"]
 # blocks any ~/.claude fallback. Pending live validation against the real claude
 # binary on a podman host (see the design spec).
 args = []
+# The RESTRICTED argv for a SHARED (command-lane) session: read-only + never
+# prompt. A shared session is driven by ordered commands, so no single member is
+# there to answer a permission prompt — plan mode is read-only and does not stop
+# to ask, so it can neither wedge nor do damage. The [isolation] broker still
+# aims claude by ENV, so the same credential isolation holds. Absent this key, a
+# capability is solo-only.
+restricted_args = ["--permission-mode", "plan"]
 
 [isolation]
 # THE STRONG AUTH PATH: the operator's credential never enters the claude

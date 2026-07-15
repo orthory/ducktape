@@ -36,6 +36,27 @@ What falls out for free:
 - **Audit/replay** — replay the ordered command log (the answers differ — the
   model is non-deterministic — but the *asks* are an exact, attributed log).
 
+### Two modes on one plane: `single` and `shared`
+
+A session is created with a `mode` (`SessionMode::{Single, Shared}`, default
+`Single`). The two are mutually exclusive per session and pick BOTH the input
+discipline and the CLI's own posture:
+
+- **`single`** — the solo terminal shipped in dev. Raw keystrokes (`TermInput`)
+  drive a full interactive TUI; `TermCommand` is refused (`command_on_single`).
+  One member, unrestricted argv, answers its own prompts.
+- **`shared`** — the command-lane session. Raw `TermInput` is refused
+  (`raw_input_on_shared`); the only way in is the ordered `TermCommand` lane. And
+  because a shared session is driven by *commands*, not a person at a keyboard,
+  **no one is there to answer a TUI approval prompt** — so the CLI runs a
+  RESTRICTED, non-prompting argv: read-only + never-ask (codex `--sandbox
+  read-only --ask-for-approval never`, claude `--permission-mode plan`).
+  Read-only is what makes never-asking *safe* (the CLI can read + reason + reply
+  but cannot write or exec), and non-prompting is what stops the session
+  wedging on an unanswerable dialog. The restricted argv is a new
+  `[interactive] restricted_args` spec key; a capability that omits it is
+  solo-only and a shared spawn on it is refused, never silently unrestricted.
+
 ### The necessary consequence: grain = COMMAND, not keystroke
 
 Per-keystroke consensus is absurd (block-time latency per character). So what is
@@ -128,10 +149,12 @@ These surfaced re-reviewing the spec. #1/#2/#5 are real defects that become
 reachable once sessions are actually SHARED (PR 2/3), so PR 1 flags them and the
 implementation lands with the sharing:
 
-1. **Raw `TermInput` bypasses the ordered lane.** A command-lane session must
-   REJECT raw keystroke input — otherwise it hits the pty without a `seq`, log,
-   or attribution and the total-order guarantee is false. Raw input and the
-   command lane are **mutually exclusive per session** (raw = solo only).
+1. **Raw `TermInput` bypasses the ordered lane.** — RESOLVED in PR 1. A
+   `shared` session now REJECTS raw keystroke input (`raw_input_on_shared`) and a
+   `single` session rejects `TermCommand` (`command_on_single`): `mode` makes raw
+   input and the command lane mutually exclusive per session (see "Two modes"
+   above). Without this the pty took input with no `seq`, log, or attribution and
+   the total-order guarantee was false.
 2. **The command lane needs a bound / backpressure.** An unbounded lane lets any
    subscribed member flood commands, each burning model tokens — a spend +
    memory DoS in a shared session. Bound it (+ per-member rate) when sharing

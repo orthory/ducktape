@@ -849,6 +849,12 @@ async fn handle_term_input(
         tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
         return;
     };
+    // raw keystrokes are the SINGLE-session path only. A shared session refuses
+    // them so nothing bypasses its ordered command lane (drive it with TermCommand).
+    if terminals.mode(session) != Some(crate::term::SessionMode::Single) {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
+        return;
+    }
     let Ok(bytes) = STANDARD.decode(data_b64) else {
         tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
         return;
