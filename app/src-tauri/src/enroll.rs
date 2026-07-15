@@ -26,9 +26,11 @@ use tiny_http::{Method, Request, Response, Server};
 
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 use crate::lan_http::{
-    MAX_REQUEST_BODY_BYTES, html, is_hex, js, json, lan_ipv4, lan_server, random_token, read_json,
-    serve, status, token_matches,
+    html, is_hex, js, json, lan_ipv4, lan_server, random_token, read_json, serve, status,
+    token_matches,
 };
+#[cfg(test)]
+use crate::lan_http::MAX_REQUEST_BODY_BYTES;
 
 // ── session state ────────────────────────────────────────
 

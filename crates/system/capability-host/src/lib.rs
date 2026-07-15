@@ -78,6 +78,7 @@ const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PODMAN_RETRY_MIN: Duration = Duration::from_millis(250);
 const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
 const PODMAN_EMPTY_MIN_OBSERVATIONS: usize = 3;
+#[cfg(any(target_os = "linux", test))]
 const PODMAN_REAP_MAX: usize = 64;
 const PODMAN_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
 const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
@@ -1551,6 +1552,7 @@ impl PodmanOwner {
         })
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn from_inspect(output: &str) -> Option<Self> {
         let mut fields = output.trim().split('\t');
         let boot_id = fields.next()?.to_string();
@@ -1932,6 +1934,7 @@ fn valid_execution_node_id(id: &str) -> bool {
         && id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn valid_boot_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -1987,6 +1990,7 @@ fn parse_container_ids(output: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn podman_reap_query_argv(executing_node: &str) -> Vec<String> {
     vec![
         "ps".into(),
@@ -2000,6 +2004,7 @@ fn podman_reap_query_argv(executing_node: &str) -> Vec<String> {
     ]
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn podman_owner_inspect_argv(cid: &str) -> Vec<String> {
     vec![
         "inspect".into(),
@@ -2015,6 +2020,7 @@ fn podman_owner_inspect_argv(cid: &str) -> Vec<String> {
     ]
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerLiveness {
     Alive,
@@ -2022,6 +2028,7 @@ enum OwnerLiveness {
     Unknown,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn owner_liveness_with(
     owner: &PodmanOwner,
     current_boot_id: &str,
@@ -2040,6 +2047,7 @@ fn owner_liveness_with(
 /// Reap only a bounded set of containers whose Linux owner identity is proven
 /// dead. A same-node live owner, a missing label, failed inspect, or unreadable
 /// `/proc` record is preserved: node identity alone is never kill authority.
+#[cfg(any(target_os = "linux", test))]
 fn reap_podman_orphans_with(
     executing_node: &str,
     current_boot_id: &str,
@@ -2087,6 +2095,7 @@ fn reap_podman_orphans_with(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn run_podman_bounded(args: &[String]) -> Result<String, String> {
     run_command_bounded(Path::new("podman"), args, PODMAN_CONTROL_TIMEOUT)
 }

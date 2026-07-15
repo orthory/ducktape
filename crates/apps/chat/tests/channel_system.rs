@@ -814,7 +814,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
 #[test]
 fn messages_around_windows_the_history_at_one_sequence() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await
@@ -1943,7 +1943,7 @@ fn module_channels_must_use_the_modules_own_prefix() {
 #[test]
 fn rename_stamps_the_owner_at_create_and_gates_on_it() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         // a user-created channel is owned by its creator.
         module
             .execute(
@@ -2014,7 +2014,7 @@ fn rename_stamps_the_owner_at_create_and_gates_on_it() {
 #[test]
 fn archived_channels_reject_writes_until_unarchived() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         module
             .execute(
                 &mut TestCtx::with_origin(10, user(1)),
@@ -2093,7 +2093,7 @@ fn archived_channels_reject_writes_until_unarchived() {
 #[test]
 fn ownerless_channels_admit_any_user_for_rename_and_archive() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         // a system-minted channel has no owner — also the shape a legacy record
         // (created before the field existed) decodes to via serde defaults.
         module
@@ -2148,7 +2148,7 @@ fn ownerless_channels_admit_any_user_for_rename_and_archive() {
 #[test]
 fn users_cannot_archive_module_namespaced_channels() {
     deterministic::Runner::default().start(|context| async move {
-        let mut module = Chat::init(context, "chat").await;
+        let mut module = chat_on!(context, "chat");
         // a module-minted channel is unowned (owner = None), so `check_channel_admin`
         // alone would admit ANY user — the ':' namespace gate is what keeps them out.
         module
