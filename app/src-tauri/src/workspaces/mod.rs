@@ -46,9 +46,10 @@ use lifecycle::{node_uptime_secs, pidfile, read_pid, recorded_pid_alive, stop_wo
 use phase::{classify, parse_join_state, PhaseReport};
 use ports::{allocate_ports, reserved_ports};
 use registry::{
-    load_registry, save_registry, workspaces_dir, write_atomic, Ports, Registry, Selection,
-    Workspace,
+    load_registry, save_registry, workspaces_dir, write_atomic, Registry, Selection, Workspace,
 };
+#[cfg(test)]
+use registry::Ports;
 
 const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
 

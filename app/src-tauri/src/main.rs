@@ -258,7 +258,7 @@ fn main() {
             // to raise the native consent window when gateway content asks for
             // a device.
             permissions::attach(app.handle());
-            let main = tauri::Manager::get_webview_window(app, "main")
+            let _main = tauri::Manager::get_webview_window(app, "main")
                 .ok_or("main window missing (tauri.conf.json windows)")?;
             // macOS overlays its native traffic lights on the in-app title
             // bar (titleBarStyle Overlay). Other desktops get the same
@@ -268,7 +268,7 @@ fn main() {
             // ponytail: set at setup = one decorated first paint on launch;
             // move to per-platform tauri conf files if the flash matters.
             #[cfg(not(target_os = "macos"))]
-            main.set_decorations(false)?;
+            _main.set_decorations(false)?;
             Ok(())
         });
 

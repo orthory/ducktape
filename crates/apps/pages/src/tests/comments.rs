@@ -29,7 +29,7 @@ fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageM
 #[test]
 fn exact_comment_anchor_rebases_with_target_text() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         let mut anchored = add("t1", "m1", "b1", "on the selection");
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
@@ -114,7 +114,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
 #[test]
 fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await.with_tagging("tagging");
+        let mut p = pages_on!(context, "pages").with_tagging("tagging");
         apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("eddy")).await;
         let edit = PageMsg::EditComment {
             comment_id: "c1".into(),

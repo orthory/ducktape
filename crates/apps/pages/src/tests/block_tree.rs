@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn inline_marks_persist_and_rebase_in_utf16() {
     deterministic::Runner::default().start(|context| async move {
-        let mut p = Pages::init(context, "pages").await;
+        let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit(
             &mut p,
