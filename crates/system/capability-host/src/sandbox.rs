@@ -293,6 +293,10 @@ pub(crate) fn tart_plan(
     envs: &[(String, String)],
     ro_paths: &[PathBuf],
     rw_dirs: &[PathBuf],
+    // an interactive (pty) session `exec`s the TUI as the ssh session's
+    // foreground process and skips the batch tail (status capture +
+    // workspace rsync-back) — a terminal session produces no artifact to sync.
+    interactive: bool,
 ) -> Result<TartPlan, String> {
     let bin_dir = bin
         .parent()
@@ -432,17 +436,23 @@ pub(crate) fn tart_plan(
         "cd {}",
         shell_quote(&guest_workdir.display().to_string())
     ));
-    setup.push("set +e".into());
-    setup.push(command);
-    setup.push("status=$?".into());
-    // Tart virtiofs rejects mtime updates on the shared root (-O).
-    setup.push(format!(
-        "rsync -aO --delete {}/ {}/ >/dev/null 2>&1 || sync_status=$?",
-        shell_quote(&guest_workdir.display().to_string()),
-        shell_quote(&mounted_workdir.display().to_string())
-    ));
-    setup.push("if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi".into());
-    setup.push("exit ${sync_status:-0}".into());
+    if interactive {
+        // the TUI replaces the shell, so the pty carries it directly and its
+        // exit is the ssh session's. no status capture, no rsync-back.
+        setup.push(format!("exec {command}"));
+    } else {
+        setup.push("set +e".into());
+        setup.push(command);
+        setup.push("status=$?".into());
+        // Tart virtiofs rejects mtime updates on the shared root (-O).
+        setup.push(format!(
+            "rsync -aO --delete {}/ {}/ >/dev/null 2>&1 || sync_status=$?",
+            shell_quote(&guest_workdir.display().to_string()),
+            shell_quote(&mounted_workdir.display().to_string())
+        ));
+        setup.push("if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi".into());
+        setup.push("exit ${sync_status:-0}".into());
+    }
 
     Ok(TartPlan {
         vm: vm.to_string(),
@@ -451,12 +461,15 @@ pub(crate) fn tart_plan(
     })
 }
 
-pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str) -> Vec<String> {
+pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str, tty: bool) -> Vec<String> {
+    // -T for a headless run (no pty); -tt forces a remote pty for an interactive
+    // session, so the guest TUI sees a terminal and SIGWINCH/size relay works.
+    let pty_flag = if tty { "-tt" } else { "-T" };
     vec![
         "-p".into(),
         "admin".into(),
         "ssh".into(),
-        "-T".into(),
+        pty_flag.into(),
         "-o".into(),
         "StrictHostKeyChecking=no".into(),
         "-o".into(),
@@ -696,6 +709,7 @@ mod tests {
             ],
             std::slice::from_ref(&skills),
             std::slice::from_ref(&auth),
+            false,
         )
         .unwrap();
         let run = plan.run_argv.join(" ");
@@ -731,9 +745,12 @@ mod tests {
             "{script}"
         );
 
-        let ssh = tart_ssh_argv("192.0.2.10", script).join(" ");
+        let ssh = tart_ssh_argv("192.0.2.10", script, false).join(" ");
         assert!(ssh.starts_with("-p admin ssh -T"), "{ssh}");
         assert!(ssh.contains("admin@192.0.2.10 -- /bin/sh -lc"), "{ssh}");
+        // an interactive session forces a remote pty with -tt instead of -T.
+        let ssh_tty = tart_ssh_argv("192.0.2.10", script, true).join(" ");
+        assert!(ssh_tty.starts_with("-p admin ssh -tt"), "{ssh_tty}");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -747,6 +764,7 @@ mod tests {
             &[("HOME".into(), "/home/u".into())],
             &[],
             &[],
+            false,
         )
         .unwrap_err();
         assert!(err.contains("containing ':'"), "{err}");

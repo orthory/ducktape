@@ -700,6 +700,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
+        interactive: bool,
     ) -> Result<sandbox::TartPlan, String> {
         let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
         for dir in &rw_dirs {
@@ -732,6 +733,7 @@ impl CliProvider {
             &envs,
             &self.sandbox_ro_paths(ctx, workdir, auth)?,
             &rw_dirs,
+            interactive,
         )
     }
 
@@ -1120,7 +1122,7 @@ impl CliProvider {
         }
 
         for attempt in 0..30 {
-            let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true");
+            let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true", false);
             let status = guard
                 .setup_command(
                     "sshpass",
@@ -3047,7 +3049,7 @@ impl CliProvider {
         let tart_plan = matches!(self.backend, SandboxBackend::Tart { .. })
             .then(|| {
                 let args = self.broker_argv(args, workdir, auth);
-                self.tart_plan(&args, workdir, ctx, auth)
+                self.tart_plan(&args, workdir, ctx, auth, false)
             })
             .transpose()?;
         // Declared before the SSH child so VM stop/delete runs after the child
@@ -3055,7 +3057,7 @@ impl CliProvider {
         let tart_guard = self.tart_setup(tart_plan.as_ref(), ctx).await?;
         let (mut command, podman) = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
             let mut command = tokio::process::Command::new("sshpass");
-            command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script));
+            command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, false));
             (command, None)
         } else {
             let PreparedCommand { command, podman } =
@@ -4344,7 +4346,7 @@ format = "text"
             ..RunContext::default()
         };
         let plan = provider
-            .tart_plan(&["--go".into()], &workdir, &ctx, &RunAuth::default())
+            .tart_plan(&["--go".into()], &workdir, &ctx, &RunAuth::default(), false)
             .expect("Tart plan builds");
         assert!(plan.vm.starts_with("ducktape-"), "{}", plan.vm);
         assert_eq!(plan.run_argv.first().map(String::as_str), Some("run"));

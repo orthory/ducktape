@@ -30,9 +30,9 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 
 use crate::broker::RunBroker;
-use crate::sandbox::SandboxBackend;
+use crate::sandbox::{self, SandboxBackend};
 use crate::{
-    CliProvider, LiveChild, PodmanRun, RunAuth, RunContext, broker_provider_overrides,
+    CliProvider, LiveChild, PodmanRun, RunAuth, RunContext, TartGuard, broker_provider_overrides,
     canonical_mount_path, configure_process_group,
 };
 
@@ -48,6 +48,10 @@ pub struct InteractiveSession {
     /// the child + its Podman lifecycle, behind a lock so `close` can tear it
     /// down through `&self`. `kill_on_drop` is the final safety net.
     live: Mutex<LiveChild>,
+    /// the Tart VM guard, when the backend is Tart. Declared AFTER `live` so the
+    /// ssh child dies before this guard's Drop (synchronously) stops/deletes the
+    /// VM. `None` under Podman (where `live` carries the container lifecycle).
+    _tart: Option<TartGuard>,
     /// held for the session's lifetime: dropping the broker tears its loopback
     /// endpoint down, and the config home must outlive the child that reads it.
     _broker: Option<RunBroker>,
@@ -62,6 +66,7 @@ impl InteractiveSession {
     fn spawn_on_pty(
         mut command: tokio::process::Command,
         podman: Option<PodmanRun>,
+        tart: Option<TartGuard>,
         broker: Option<RunBroker>,
         config_home: Option<PathBuf>,
     ) -> Result<Self, String> {
@@ -88,6 +93,7 @@ impl InteractiveSession {
             reader,
             writer,
             live: Mutex::new(live),
+            _tart: tart,
             _broker: broker,
             _config_home: config_home,
         })
@@ -182,21 +188,25 @@ impl InteractiveSession {
 }
 
 impl CliProvider {
-    /// spawn this capability's interactive TUI on a pty. Refuses any backend but
-    /// Podman, and any spec without an `[interactive]` argv. The isolation is the
-    /// headless path's: a broker holding the credential, a fresh config home, the
-    /// container fence — only the argv and the stdio (pty, not pipes) differ.
+    /// spawn this capability's interactive TUI on a pty. Requires a SANDBOX
+    /// backend (Podman or Tart) — `Direct` has no mount namespace / fresh HOME
+    /// and is refused — and a spec with an `[interactive]` argv. The isolation is
+    /// the headless path's (a broker holding the credential, a fresh config home,
+    /// the container/VM fence); only the argv and the stdio (pty, not pipes)
+    /// differ. Podman keeps the container lifecycle on the pty child itself; Tart
+    /// spawns `sshpass ssh -tt` into a guest VM and the returned session holds
+    /// the [`TartGuard`] that stops/deletes it on drop.
     pub(crate) async fn spawn_interactive_session(
         &self,
         ctx: &RunContext,
     ) -> Result<InteractiveSession, String> {
-        let SandboxBackend::Podman { image } = &self.backend else {
+        if matches!(self.backend, SandboxBackend::Direct) {
             return Err(format!(
-                "{}: interactive sessions require the Podman backend (this node runs {:?})",
-                self.spec.tag, self.backend
+                "{}: interactive sessions require a sandbox backend (Podman or Tart); \
+                 this node runs Direct",
+                self.spec.tag
             ));
-        };
-        let image = image.clone();
+        }
         let Some(interactive) = self.spec.interactive.clone() else {
             return Err(format!(
                 "{}: this capability declares no [interactive] argv",
@@ -212,10 +222,32 @@ impl CliProvider {
             broker: broker.as_ref().map(|b| &b.endpoint),
         };
         let args = interactive_argv(&interactive.args, &auth, &workdir);
-        let (mut command, run) = self.podman_command(&image, &args, &workdir, ctx, &auth, true)?;
-        run.prepare_cidfile()?;
-        command.current_dir(&workdir);
-        InteractiveSession::spawn_on_pty(command, Some(run), broker, config_home)
+
+        match &self.backend {
+            SandboxBackend::Podman { image } => {
+                let (mut command, run) =
+                    self.podman_command(image, &args, &workdir, ctx, &auth, true)?;
+                run.prepare_cidfile()?;
+                command.current_dir(&workdir);
+                InteractiveSession::spawn_on_pty(command, Some(run), None, broker, config_home)
+            }
+            SandboxBackend::Tart { .. } => {
+                // build the interactive guest plan (its script `exec`s the TUI,
+                // no rsync-back), clone/boot the VM, then attach a pty to
+                // `sshpass ssh -tt` into it. the guard rides in the session so
+                // the VM is stopped/deleted when the session ends.
+                let plan = self.tart_plan(&args, &workdir, ctx, &auth, true)?;
+                let guard = self
+                    .tart_setup(Some(&plan), ctx)
+                    .await?
+                    .ok_or_else(|| format!("{}: Tart setup returned no VM guard", self.spec.tag))?;
+                let mut command = tokio::process::Command::new("sshpass");
+                command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, true));
+                command.current_dir(&workdir);
+                InteractiveSession::spawn_on_pty(command, None, Some(guard), broker, config_home)
+            }
+            SandboxBackend::Direct => unreachable!("Direct is refused above"),
+        }
     }
 }
 
@@ -295,8 +327,14 @@ mod tests {
     #[tokio::test]
     async fn pty_round_trips_bytes_through_a_child() {
         let session =
-            InteractiveSession::spawn_on_pty(tokio::process::Command::new("cat"), None, None, None)
-                .expect("spawn cat on a pty");
+            InteractiveSession::spawn_on_pty(
+                tokio::process::Command::new("cat"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn cat on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
 
         let mut seen = Vec::new();
@@ -329,6 +367,7 @@ mod tests {
     async fn resize_sets_the_window_size() {
         let session = InteractiveSession::spawn_on_pty(
             tokio::process::Command::new("cat"),
+            None,
             None,
             None,
             None,

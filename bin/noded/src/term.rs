@@ -58,11 +58,15 @@ const TERM_RING_MAX_SESSIONS: usize = 16;
 /// one pty read chunk. human typing + TUI redraws are modest; a chunk this size
 /// coalesces a redraw burst into few frames without a large per-session buffer.
 const TERM_READ_BUF: usize = 32 * 1024;
-/// the environment knob carrying the Podman image interactive sessions run in.
-/// mirrors `bin/node`'s `sandbox_image` (node.toml) but as a plain env var,
-/// since the daemon parses no toml — same `DUCKTAPE_*` precedent as
-/// `DUCKTAPE_AGENT_WORKSPACES` / `DUCKTAPE_PROVIDER_TIMEOUT_SECS`.
+/// the environment knob carrying the sandbox image interactive sessions run in
+/// (a container image for Podman, a VM image for Tart). mirrors `bin/node`'s
+/// `sandbox_image` (node.toml) but as a plain env var, since the daemon parses
+/// no toml — same `DUCKTAPE_*` precedent as `DUCKTAPE_AGENT_WORKSPACES` /
+/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS`.
 pub const SANDBOX_IMAGE_ENV: &str = "DUCKTAPE_SANDBOX_IMAGE";
+/// which sandbox backend hosts interactive sessions: `"podman"` (default, Linux)
+/// or `"tart"` (macOS guest VM). mirrors `bin/node`'s `sandbox` selector.
+pub const SANDBOX_BACKEND_ENV: &str = "DUCKTAPE_SANDBOX_BACKEND";
 
 /// the ws topic a session's output rides.
 pub fn topic(session_id: &str) -> String {
@@ -393,24 +397,29 @@ impl TerminalSessions {
     }
 }
 
-/// build the Podman-backed interactive provider set, if a sandbox image is
+/// build the sandbox-backed interactive provider set, if a sandbox image is
 /// configured. `None` (no `DUCKTAPE_SANDBOX_IMAGE`) leaves interactive disabled;
-/// a discovery error is logged and also disables it (no Direct fallback — the
-/// interactive path refuses Direct regardless).
+/// a discovery error, or an unknown backend, is logged and also disables it (no
+/// Direct fallback — the interactive path refuses Direct regardless).
 pub fn discover_interactive(node_identity: &[u8], dirs: AgentDirs) -> Option<ProviderSet> {
     let image = std::env::var(SANDBOX_IMAGE_ENV).ok()?;
-    let image = image.trim();
+    let image = image.trim().to_string();
     if image.is_empty() {
         return None;
     }
-    match capability_host::discover(
-        node_identity,
-        dirs,
-        None,
-        SandboxBackend::Podman {
-            image: image.to_string(),
-        },
-    ) {
+    let backend = match std::env::var(SANDBOX_BACKEND_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") | Some("podman") => SandboxBackend::Podman { image },
+        Some("tart") => SandboxBackend::Tart { image },
+        Some(other) => {
+            tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; interactive disabled");
+            return None;
+        }
+    };
+    match capability_host::discover(node_identity, dirs, None, backend) {
         Ok(set) => Some(set),
         Err(err) => {
             tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");

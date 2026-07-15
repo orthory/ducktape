@@ -166,10 +166,26 @@ not just terminals.
 - **PR 4 (optional): full-shell mode** (member gets bash, not just the CLI TUI) —
   a session-creation option; same isolation, strictly needs Phase 3 first.
 
+## Tart (macOS host) — added, UNVERIFIED
+
+Both sandbox backends host a session now (`Direct` is still refused — no fence).
+Tart reuses the headless VM lifecycle (`tart_setup` clone/boot/ip + `TartGuard`
+teardown) and the same broker (`start_for_tart` binds the host-gateway the guest
+reaches as `ducktape-host`); interactive differs only in the guest script
+(`exec`s the TUI, no rsync-back) and the ssh flag (`-tt` forces a remote pty vs
+headless `-T`). The session holds the `TartGuard`, so ending it stops/deletes the
+VM. noded selects the backend via `DUCKTAPE_SANDBOX_BACKEND` (`podman` default,
+`tart` on macOS) + `DUCKTAPE_SANDBOX_IMAGE`.
+
+**Status: compiles + lints clean + argv-asserted (`-tt`, interactive guest
+script), but NOT runtime-verified** — needs an Apple-Silicon Tart host (macmini-duke)
+with a **codex-in-guest** VM image. Caveats to validate there: a Tart interactive
+session holds a `tart_semaphore` permit (cap 2) for its whole lifetime, so it
+starves headless Tart runs; and `TartGuard::Drop` stops the VM synchronously on
+the thread that drops the last session `Arc`.
+
 ## Non-goals
 
-- macOS/Tart hosting of sessions (clients may still *attach*). Day-1 host =
-  Linux/podman.
 - Consensus-committing sessions, session persistence across node restart,
   multi-member shared sessions.
 
