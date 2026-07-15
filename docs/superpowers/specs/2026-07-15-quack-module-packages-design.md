@@ -305,12 +305,14 @@ manage pending state by hand.
 5. **Install/approval UI** in the iced shell — capability sheet, three-state source badge, audit
    report.
 
-Separate-repo question, answered now so it is not re-litigated: everything stays in this monorepo
-until the view-api is frozen at v1 **and** external authors actually exist. At that trigger, the
-author-facing SDK (widget WIT world, `quack` CLI, `guest-adapter`, sdk types) extracts to
-**`byeongsu-hong/quack`** (destination decided 2026-07-15); ViewHost, modreg, gateway, and the
-registration path cannot ever leave. Guest crates are already standalone workspaces inside the
-repo — technical isolation is solved at the workspace level, not the repo level.
+Separate-repo question, answered now so it is not re-litigated: the author-facing framework lives
+in **`byeongsu-hong/ducktape-quack`** (created 2026-07-15) — Anchor-style: the `quack` CLI, the
+scaffold conventions, the `.quack` envelope, and a hand-synced mirror of the `ducktape:module` WIT.
+Its v0 ships `new`/`build`/`verify` (scaffold is self-contained raw `wit-bindgen`, zero git deps);
+`dev`/`test`/`publish`/`rebuild`/`audit` are stubs blocked on the items above. This monorepo keeps
+everything consensus-side — ViewHost, modreg, gateway, the registration path, and (for now) the
+`sdk`/`guest-adapter` crates as single source of truth; the ergonomic authoring layer migrates to
+the framework repo as those ABIs freeze.
 
 ## Open items
 
