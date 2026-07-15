@@ -32,8 +32,8 @@ use tokio::sync::Mutex;
 use crate::broker::RunBroker;
 use crate::sandbox::{self, SandboxBackend};
 use crate::{
-    CliProvider, LiveChild, PodmanRun, RunAuth, RunContext, TartGuard, broker_provider_overrides,
-    canonical_mount_path, configure_process_group,
+    BrokerKind, CliProvider, LiveChild, PodmanRun, RunAuth, RunContext, TartGuard,
+    broker_provider_overrides, canonical_mount_path, configure_process_group,
 };
 
 /// a live interactive session: the child process on one end of a pty, the host
@@ -221,7 +221,12 @@ impl CliProvider {
             config_home: config_home.as_deref(),
             broker: broker.as_ref().map(|b| &b.endpoint),
         };
-        let args = interactive_argv(&interactive.args, &auth, &workdir);
+        let args = interactive_argv(
+            &interactive.args,
+            &auth,
+            &workdir,
+            self.spec.isolation.broker,
+        );
 
         match &self.backend {
             SandboxBackend::Podman { image } => {
@@ -251,12 +256,18 @@ impl CliProvider {
     }
 }
 
-/// the interactive TUI argv: the spec's `[interactive]` args with the broker's
-/// `-c` overrides PREPENDED (a TUI argv has no `exec` subcommand to splice them
-/// after, and codex reads `-c` as global config). No broker → the base argv,
-/// verbatim.
-fn interactive_argv(base: &[String], auth: &RunAuth<'_>, workdir: &Path) -> Vec<String> {
-    let Some(broker) = auth.broker else {
+/// the interactive TUI argv. For CODEX, the broker's `-c` overrides are
+/// PREPENDED (a TUI argv has no `exec` subcommand to splice them after, and
+/// codex reads `-c` as global config). For the Anthropic broker (claude) the
+/// aiming is entirely by ENV (see [`CliProvider::apply_auth_env`]), so the base
+/// argv passes through verbatim — as it does when there is no broker at all.
+fn interactive_argv(
+    base: &[String],
+    auth: &RunAuth<'_>,
+    workdir: &Path,
+    kind: Option<BrokerKind>,
+) -> Vec<String> {
+    let (Some(broker), Some(BrokerKind::CodexResponses)) = (auth.broker, kind) else {
         return base.to_vec();
     };
     let mut argv = broker_provider_overrides(broker, workdir);
@@ -378,16 +389,45 @@ mod tests {
         session.close().await;
     }
 
-    /// the broker overrides are PREPENDED for the interactive (TUI) argv, since
-    /// there is no `exec` selector to splice them after.
+    /// the broker overrides are PREPENDED for a CODEX interactive (TUI) argv
+    /// (no `exec` selector to splice after); every other case passes the base
+    /// argv through verbatim.
     #[test]
-    fn interactive_argv_prepends_broker_overrides_and_passes_base_through() {
+    fn interactive_argv_prepends_only_for_codex() {
         // no broker → base argv verbatim.
         let bare = interactive_argv(
             &["--foo".to_string()],
             &RunAuth::default(),
             Path::new("/w"),
+            None,
         );
         assert_eq!(bare, vec!["--foo".to_string()]);
+
+        let endpoint = crate::broker::BrokerEndpoint {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            run_bearer: "b".into(),
+        };
+        let auth = RunAuth {
+            config_home: None,
+            broker: Some(&endpoint),
+        };
+        // codex → overrides prepended.
+        let codex = interactive_argv(
+            &["--foo".to_string()],
+            &auth,
+            Path::new("/w"),
+            Some(BrokerKind::CodexResponses),
+        );
+        assert_eq!(codex.first().map(String::as_str), Some("-c"));
+        assert_eq!(codex.last().map(String::as_str), Some("--foo"));
+
+        // claude (Anthropic) → base argv verbatim, aiming is by ENV not argv.
+        let claude = interactive_argv(
+            &["--foo".to_string()],
+            &auth,
+            Path::new("/w"),
+            Some(BrokerKind::AnthropicMessages),
+        );
+        assert_eq!(claude, vec!["--foo".to_string()]);
     }
 }

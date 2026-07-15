@@ -105,10 +105,14 @@ const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 /// run. the spec's argv names it (`env_key` in the model-provider block).
 const BROKER_TOKEN_ENV: &str = "DUCKTAPE_MODEL_BROKER_TOKEN";
 
-/// the upstream credential env vars a broker takes over. the HOST reads these
-/// (see [`broker::UpstreamCredential::from_host`]); the child must not see them,
-/// or it would dial the provider directly and walk straight past the broker.
-const UPSTREAM_CREDENTIAL_ENV: [&str; 1] = ["OPENAI_API_KEY"];
+/// the upstream credential env vars a broker takes over. the HOST reads these;
+/// the child must not see them, or it would dial the provider directly and walk
+/// straight past the broker. Removed whenever ANY broker is active (removing an
+/// unrelated provider's key is harmless); covers both the OpenAI (codex) and
+/// Anthropic (claude) upstreams. `ANTHROPIC_AUTH_TOKEN` is NOT here: the broker
+/// sets it to the opaque run bearer, so it must survive into the child.
+const UPSTREAM_CREDENTIAL_ENV: [&str; 3] =
+    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
 
 /// the `-c` overrides that aim a codex invocation at this run's loopback broker:
 /// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
@@ -956,6 +960,21 @@ impl CliProvider {
             .join(runtime_slot(ctx, workdir))
             .join("provider-config");
         create_private_dir(&dir)?;
+        // Claude Code reads settings from `<CLAUDE_CONFIG_DIR>/settings.json`.
+        // `skipWebFetchPreflight` cannot be expressed as an env var, so it rides
+        // this file in the fresh config home: without it, WebFetch preflights
+        // api.anthropic.com DIRECTLY, bypassing the broker, and fails behind
+        // isolation. Written only for the Anthropic broker (codex ignores it).
+        if self.spec.isolation.broker == Some(BrokerKind::AnthropicMessages) {
+            let settings = dir.join("settings.json");
+            std::fs::write(&settings, r#"{"skipWebFetchPreflight":true}"#).map_err(|e| {
+                format!(
+                    "{}: write claude settings {}: {e}",
+                    self.spec.tag,
+                    settings.display()
+                )
+            })?;
+        }
         Ok(Some(dir))
     }
 
@@ -969,24 +988,38 @@ impl CliProvider {
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
+        let tart = matches!(self.backend, SandboxBackend::Tart { .. });
         match kind {
             BrokerKind::CodexResponses => {
-                if matches!(self.backend, SandboxBackend::Tart { .. }) {
+                if tart {
                     broker::RunBroker::start_for_tart().await.map(Some)
                 } else {
                     broker::RunBroker::start().await.map(Some)
+                }
+            }
+            BrokerKind::AnthropicMessages => {
+                if tart {
+                    broker::RunBroker::start_anthropic_for_tart().await.map(Some)
+                } else {
+                    broker::RunBroker::start_anthropic().await.map(Some)
                 }
             }
         }
     }
 
     /// the run's auth env, backend-independent: the fresh config home (so the
-    /// CLI cannot read the operator's real one) and the broker's opaque per-run
-    /// bearer. `set` is how the caller applies one binding — a `Command` env for
+    /// CLI cannot read the operator's real one) and the way the child reaches the
+    /// broker. `set` is how the caller applies one binding — a `Command` env for
     /// Direct, or the Podman process environment behind a value-free `-e K`.
     ///
     /// NOTE what is NOT here: the credential itself. that is the whole point —
     /// the host holds it and the broker spends it, so there is nothing to pass.
+    ///
+    /// The config-home binding is shared; the broker-reach bindings DIFFER by
+    /// kind. codex is aimed by ARGV (see [`Self::broker_argv`]) and only needs
+    /// the bearer here in [`BROKER_TOKEN_ENV`]; claude is aimed entirely by ENV —
+    /// base URL, bearer, and the fresh config home — plus the hardening vars that
+    /// keep Claude Code from dialing out around the broker.
     fn apply_auth_env(&self, auth: &RunAuth<'_>, mut set: impl FnMut(&str, String)) {
         if let (Some(name), Some(dir)) = (
             self.spec.isolation.config_home_env.as_deref(),
@@ -994,8 +1027,22 @@ impl CliProvider {
         ) {
             set(name, dir.display().to_string());
         }
-        if let Some(broker) = auth.broker {
-            set(BROKER_TOKEN_ENV, broker.run_bearer.clone());
+        let Some(broker) = auth.broker else {
+            return;
+        };
+        match self.spec.isolation.broker {
+            Some(BrokerKind::AnthropicMessages) => {
+                set("ANTHROPIC_BASE_URL", broker.base_url.clone());
+                set("ANTHROPIC_AUTH_TOKEN", broker.run_bearer.clone());
+                // hardening: scrub creds from subprocesses the CLI spawns, kill
+                // non-essential outbound traffic, and disable the auto-updater —
+                // all of which would otherwise dial Anthropic around the broker.
+                set("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1".into());
+                set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into());
+                set("DISABLE_AUTOUPDATER", "1".into());
+            }
+            // codex (and the defensive no-kind case): argv aims it, bearer only.
+            _ => set(BROKER_TOKEN_ENV, broker.run_bearer.clone()),
         }
     }
 
@@ -1003,12 +1050,19 @@ impl CliProvider {
     /// provider in after the subcommand selector (`args[0]`, e.g. `exec`) —
     /// where codex expects its `-c` overrides. a no-op without a broker.
     ///
+    /// ARGV aiming is CODEX-SPECIFIC. The Anthropic broker aims claude by ENV
+    /// (see [`Self::apply_auth_env`]) — a claude argv has no `-c model_providers`
+    /// splice — so for any non-codex broker the argv passes through unchanged.
+    ///
     /// the child is given a base URL and [`BROKER_TOKEN_ENV`], and neither can
     /// recover the operator's credential: the bearer is 32 random bytes minted
     /// for this run, and the endpoint dies with it. The interactive path
     /// ([`crate::interactive`]) shares [`broker_provider_overrides`] but PREPENDS
     /// them (a TUI argv has no `exec` selector to splice after).
     fn broker_argv(&self, args: &[String], workdir: &Path, auth: &RunAuth<'_>) -> Vec<String> {
+        if self.spec.isolation.broker != Some(BrokerKind::CodexResponses) {
+            return args.to_vec();
+        }
         let (Some(broker), Some(selector)) = (auth.broker, args.first()) else {
             return args.to_vec();
         };
@@ -4716,6 +4770,30 @@ broker = "codex-responses"
         .unwrap()
     }
 
+    fn anthropic_broker_spec(tag: &str) -> CapabilitySpec {
+        CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "{tag}"
+[detect]
+bin = "{tag}"
+[invoke]
+args = ["-p", "--output-format", "json"]
+prompt = "stdin"
+[output]
+format = "json-result"
+[isolation]
+config_home_env = "CLAUDE_CONFIG_DIR"
+broker = "anthropic-messages"
+"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
     fn argv_of(cmd: &tokio::process::Command) -> String {
         cmd.as_std()
             .get_args()
@@ -4831,6 +4909,69 @@ broker = "codex-responses"
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         assert!(envs.is_empty(), "no auth env overlay at all: {envs:?}");
+    }
+
+    #[test]
+    fn a_claude_broker_aims_the_child_by_env_not_argv() {
+        // the Anthropic broker's opposite of codex: the argv is UNTOUCHED (a
+        // claude argv has no `-c model_providers` splice), and the child is aimed
+        // entirely by env — base URL, opaque bearer, fresh config home, plus the
+        // hardening vars that keep Claude Code from dialing out around the broker.
+        let provider =
+            CliProvider::from_spec(anthropic_broker_spec("cl"), PathBuf::from("/usr/bin/cl"));
+        let endpoint = broker::BrokerEndpoint {
+            // NOTE: no `/v1` — ANTHROPIC_BASE_URL is the API root.
+            base_url: "http://127.0.0.1:54321".into(),
+            run_bearer: "opaque-run-bearer".into(),
+        };
+        let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
+        let auth = RunAuth {
+            config_home: Some(&config_home),
+            broker: Some(&endpoint),
+        };
+        let cmd = provider
+            .command(
+                &["-p".into(), "--output-format".into(), "json".into()],
+                Path::new("/tmp/wd"),
+                &RunContext::default(),
+                &auth,
+            )
+            .expect("command builds");
+
+        // argv verbatim — no codex-style splice for a claude broker.
+        assert_eq!(argv_of(&cmd), "-p --output-format json");
+
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let got = |k: &str| envs.get(k).cloned().flatten();
+        assert_eq!(got("ANTHROPIC_BASE_URL").as_deref(), Some("http://127.0.0.1:54321"));
+        assert_eq!(got("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("opaque-run-bearer"));
+        assert_eq!(
+            got("CLAUDE_CONFIG_DIR").as_deref(),
+            Some(config_home.to_str().unwrap()),
+            "the fresh config home blocks the ~/.claude fallback"
+        );
+        assert_eq!(got("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB").as_deref(), Some("1"));
+        assert_eq!(got("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(), Some("1"));
+        assert_eq!(got("DISABLE_AUTOUPDATER").as_deref(), Some("1"));
+        // the codex bearer var is NOT set for a claude broker.
+        assert_eq!(envs.get(BROKER_TOKEN_ENV), None);
+        // and the inherited Anthropic credential is REMOVED, not merely unset: a
+        // Direct child that still saw it would dial api.anthropic.com directly,
+        // straight past the broker holding the real credential.
+        assert_eq!(
+            envs.get("ANTHROPIC_API_KEY"),
+            Some(&None),
+            "the inherited upstream credential is explicitly removed: {envs:?}"
+        );
     }
 
     // ---- discovery ----------------------------------------------------------

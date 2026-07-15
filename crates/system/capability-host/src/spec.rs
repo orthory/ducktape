@@ -215,6 +215,10 @@ pub struct IsolationSpec {
 pub enum BrokerKind {
     /// the OpenAI Responses API, as `codex exec` speaks it (see [`crate::broker`]).
     CodexResponses,
+    /// the Anthropic Messages API (`POST /v1/messages`, SSE), as Claude Code
+    /// speaks it. the child is aimed by ENV (`ANTHROPIC_BASE_URL` +
+    /// `ANTHROPIC_AUTH_TOKEN`), not argv (see [`crate::broker`]).
+    AnthropicMessages,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -339,8 +343,10 @@ fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationS
         .broker
         .map(|broker| match broker.as_str() {
             "codex-responses" => Ok(BrokerKind::CodexResponses),
+            "anthropic-messages" => Ok(BrokerKind::AnthropicMessages),
             other => Err(format!(
-                "{origin}: isolation.broker {other:?} is unsupported (want codex-responses)"
+                "{origin}: isolation.broker {other:?} is unsupported \
+                 (want codex-responses | anthropic-messages)"
             )),
         })
         .transpose()?;
@@ -911,6 +917,17 @@ resume_args_append = ["--resume", "{{session_id}}"]
         let spec = CapabilitySpec::parse(&valid, "t").unwrap();
         assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(spec.isolation.broker, Some(BrokerKind::CodexResponses));
+
+        // the Anthropic broker is a distinct closed-set member (Claude Code).
+        let claude = valid
+            .replace("CODEX_HOME", "CLAUDE_CONFIG_DIR")
+            .replace("codex-responses", "anthropic-messages");
+        let spec = CapabilitySpec::parse(&claude, "t").unwrap();
+        assert_eq!(
+            spec.isolation.config_home_env.as_deref(),
+            Some("CLAUDE_CONFIG_DIR")
+        );
+        assert_eq!(spec.isolation.broker, Some(BrokerKind::AnthropicMessages));
 
         // a broker is host CODE: an unknown name must never degrade to "no
         // broker" (that would hand the child the operator's credential), and a

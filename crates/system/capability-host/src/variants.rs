@@ -527,12 +527,13 @@ resume_args = ["resume", "stale-id"]
             );
         }
 
-        // the shipped AUTH posture, per family, inherited by every variant: codex
-        // takes the strong path (broker + fresh CODEX_HOME, so the credential
-        // never enters the child, and therefore NO credential dir mounted);
-        // claude takes the weak one (no broker exists for it yet, so its auth dir
-        // is mounted into the sandbox instead). the parse-time invariant is what
-        // makes "both" unrepresentable — this pins which side each family is on.
+        // the shipped AUTH posture, per family, inherited by every variant: BOTH
+        // families now take the STRONG path (a host broker + fresh config home,
+        // so the credential never enters the child, and therefore NO credential
+        // dir mounted). They differ only in wire shape — codex speaks the OpenAI
+        // Responses API, claude the Anthropic Messages API. The parse-time
+        // invariant is what makes "broker + rw_dirs" unrepresentable; this pins
+        // which broker each family is on and that neither mounts a credential dir.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
             assert_eq!(
                 spec.isolation.broker,
@@ -548,11 +549,19 @@ resume_args = ["resume", "stale-id"]
             );
         }
         for spec in specs.iter().filter(|s| s.tag.starts_with("claude")) {
-            assert_eq!(spec.isolation.broker, None, "{}: no broker yet", spec.tag);
             assert_eq!(
-                spec.rw_dirs,
-                vec!["~/.claude", "~/.claude.json"],
-                "{}: claude reads its own dotfiles, so they cross the sandbox",
+                spec.isolation.broker,
+                Some(crate::spec::BrokerKind::AnthropicMessages),
+                "{}: claude authenticates through the host Anthropic broker",
+                spec.tag
+            );
+            assert_eq!(
+                spec.isolation.config_home_env.as_deref(),
+                Some("CLAUDE_CONFIG_DIR")
+            );
+            assert!(
+                spec.rw_dirs.is_empty(),
+                "{}: a broker-backed spec mounts no credential dir",
                 spec.tag
             );
         }
