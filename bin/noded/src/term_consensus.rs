@@ -33,6 +33,22 @@
 //! `validate_channel_namespace` is not consulted on `PostMessage`), and the app
 //! hides it via an `isModuleChannel` extension that also matches `term-<hex>`.
 //!
+//! ## Authorization posture (deferred ACL — read this before trusting it)
+//!
+//! `PostPolicy::Open` means ANY network member can post a command the projector
+//! feeds into the pty — NOT only the session's participants, and NOT only those
+//! "who know the id". The channel id is not a secret: `term-<id>` lands in
+//! committed chat state and is enumerable via `ChatQuery::Channels`; the
+//! `isModuleChannel` hide is UI-only. What contains the blast radius is the
+//! session posture, not the channel: a Shared session runs the RESTRICTED,
+//! read-only, non-prompting argv, the pty is Podman-sandboxed under the node
+//! identity, and the credential never enters the container — so an injected
+//! command can only spend tokens + inject conversation text, never write/exec.
+//! The NAMED next step is per-channel membership (`PostPolicy::MembersOnly`)
+//! once a shared session carries an on-chain participant set; per-member spend
+//! caps are the epic's finding #2. Until then, treat a shared session as
+//! open-to-the-network by construction.
+//!
 //! ## Why a projector, not a `host::worker::Worker`
 //!
 //! The obvious shape — a worker that decodes a committed `ChatEvent::MessagePosted`
