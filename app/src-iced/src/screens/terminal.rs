@@ -5,14 +5,11 @@
 
 use std::time::{Duration, Instant};
 
-use iced::advanced::clipboard;
 use iced::advanced::renderer::Renderer as _;
 use iced::advanced::text::Renderer as _;
 use iced::advanced::widget::Operation;
 use iced::advanced::widget::tree::{self, Tree};
-use iced::advanced::{
-    Clipboard, Layout, Shell, Text, Widget, input_method, layout, mouse, renderer,
-};
+use iced::advanced::{Layout, Shell, Text, Widget, input_method, layout, mouse, renderer};
 use iced::keyboard::{self, Key, Modifiers, key};
 use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{
@@ -97,7 +94,9 @@ pub enum Message {
     Output { generation: u64, bytes: Vec<u8> },
     Failed { generation: u64, detail: String },
     Input(Vec<u8>),
-    Paste(String),
+    Copy(String),
+    RequestPaste,
+    Paste { generation: u64, value: String },
     Resize { cols: u16, rows: u16 },
     Scroll(i32),
 }
@@ -113,6 +112,10 @@ pub enum Effect {
     Input {
         generation: u64,
         bytes: Vec<u8>,
+    },
+    Copy(String),
+    ReadClipboard {
+        generation: u64,
     },
     Resize {
         generation: u64,
@@ -175,7 +178,15 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
                 bytes,
             })
         }
-        Message::Paste(value) if state.status == Status::Live && !value.is_empty() => {
+        Message::Copy(value) if !value.is_empty() => Some(Effect::Copy(value)),
+        Message::RequestPaste if state.status == Status::Live => Some(Effect::ReadClipboard {
+            generation: state.generation,
+        }),
+        Message::Paste { generation, value }
+            if generation == state.generation
+                && state.status == Status::Live
+                && !value.is_empty() =>
+        {
             let bytes = paste_bytes(state.parser.screen().bracketed_paste(), &value)?;
             state.parser.screen_mut().set_scrollback(0);
             Some(Effect::Input {
@@ -471,7 +482,7 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
+        _clipboard: &mut dyn iced::advanced::Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
@@ -652,13 +663,11 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                     if let Some(value) =
                         selected_text(self.state.parser.screen(), state.selection.as_ref())
                     {
-                        clipboard.write(clipboard::Kind::Standard, value);
+                        shell.publish(Message::Copy(value));
                     }
                     shell.capture_event();
-                } else if is_paste_shortcut(key, *modifiers)
-                    && let Some(value) = clipboard.read(clipboard::Kind::Standard)
-                {
-                    shell.publish(Message::Paste(value));
+                } else if is_paste_shortcut(key, *modifiers) {
+                    shell.publish(Message::RequestPaste);
                     shell.capture_event();
                 } else if let Some(bytes) = key_bytes(
                     key,
@@ -989,6 +998,10 @@ fn paste_bytes(bracketed: bool, value: &str) -> Option<Vec<u8>> {
     if !bracketed {
         return Some(value.as_bytes().to_vec());
     }
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
     let mut bytes = Vec::with_capacity(value.len() + 12);
     bytes.extend_from_slice(b"\x1b[200~");
     bytes.extend_from_slice(value.as_bytes());
@@ -1336,6 +1349,10 @@ mod tests {
             paste_bytes(true, "duck").unwrap(),
             b"\x1b[200~duck\x1b[201~"
         );
+        assert_eq!(
+            paste_bytes(true, "safe\x1b[201~\nrm -rf ~").unwrap(),
+            b"\x1b[200~safe[201~\nrm -rf ~\x1b[201~"
+        );
         assert!(paste_bytes(false, &"x".repeat(MAX_PASTE_BYTES + 1)).is_none());
         assert_eq!(terminal_geometry(Size::new(800.0, 450.0)), Some((100, 25)));
         assert_eq!(terminal_geometry(Size::new(0.0, 450.0)), None);
@@ -1361,6 +1378,38 @@ mod tests {
 
         assert!(matches!(effect, Some(Effect::Input { .. })));
         assert_eq!(state.parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn clipboard_access_leaves_the_view_as_typed_effects() {
+        let mut state = State {
+            status: Status::Live,
+            generation: 7,
+            ..State::default()
+        };
+
+        assert_eq!(
+            update(&mut state, Message::Copy("duck".into())),
+            Some(Effect::Copy("duck".into()))
+        );
+        assert_eq!(
+            update(&mut state, Message::RequestPaste),
+            Some(Effect::ReadClipboard { generation: 7 })
+        );
+
+        assert_eq!(
+            update(
+                &mut state,
+                Message::Paste {
+                    generation: 6,
+                    value: "stale".into(),
+                },
+            ),
+            None
+        );
+
+        state.status = Status::Failed;
+        assert_eq!(update(&mut state, Message::RequestPaste), None);
     }
 
     #[test]

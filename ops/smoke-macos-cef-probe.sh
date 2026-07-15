@@ -91,6 +91,11 @@ APPLESCRIPT
       tail -60 "$tmp_home/probe.log" >&2 || true
       exit 1
     fi
+    if ! grep -q 'shutting down CEF' "$tmp_home/probe.log"; then
+      echo "[macos-cef-smoke] probe exited without orderly CEF shutdown" >&2
+      tail -60 "$tmp_home/probe.log" >&2 || true
+      exit 1
+    fi
     for _ in $(seq 1 40); do
       helpers_alive || break
       sleep 0.25

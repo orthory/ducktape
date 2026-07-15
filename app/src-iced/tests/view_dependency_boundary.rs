@@ -7,6 +7,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
     ("crate::transport", "node transport"),
     ("crate::browser", "CEF/browser host"),
     ("crate::desktop", "desktop host"),
+    ("crate::external_url", "system browser host"),
     ("crate::huddle_media", "native media host"),
     ("crate::huddle_session", "native session host"),
     ("crate::mac_tray", "platform tray host"),
@@ -48,6 +49,12 @@ fn views_do_not_import_host_capabilities() {
     let mut violations = Vec::new();
     for file in files {
         let source = fs::read_to_string(&file).unwrap();
+        if imports_iced_clipboard(&source) {
+            violations.push(format!(
+                "{} imports native clipboard access",
+                file.strip_prefix(&root).unwrap().display(),
+            ));
+        }
         for (index, line) in source.lines().enumerate() {
             let code = line.trim_start();
             if code.starts_with("//") {
@@ -70,6 +77,41 @@ fn views_do_not_import_host_capabilities() {
         "views must request host capabilities through typed effects:\n{}",
         violations.join("\n")
     );
+}
+
+fn imports_iced_clipboard(source: &str) -> bool {
+    let mut statement = String::new();
+    let mut collecting = false;
+    for line in source.lines().map(str::trim) {
+        if !collecting && line.starts_with("use ") {
+            collecting = true;
+        }
+        if !collecting {
+            continue;
+        }
+        statement.push_str(line);
+        if line.ends_with(';') {
+            if statement.contains("iced::advanced")
+                && (statement.contains("clipboard") || statement.contains("Clipboard"))
+            {
+                return true;
+            }
+            statement.clear();
+            collecting = false;
+        }
+    }
+    false
+}
+
+#[test]
+fn clipboard_imports_are_part_of_the_view_boundary() {
+    assert!(imports_iced_clipboard("use iced::advanced::clipboard;"));
+    assert!(imports_iced_clipboard(
+        "use iced::advanced::{\n    Clipboard, Layout, Widget,\n};"
+    ));
+    assert!(!imports_iced_clipboard(
+        "fn update(_clipboard: &mut dyn iced::advanced::Clipboard) {}"
+    ));
 }
 
 #[test]

@@ -75,13 +75,20 @@ objc2::define_class!(
     unsafe impl CefAppProtocol for DucktapeApplication {}
 );
 
-/// Register the principal class before Winit creates the shared application.
+/// Install the principal class before Winit creates the shared application.
 pub(super) fn register() {
-    assert!(
-        MainThreadMarker::new().is_some(),
-        "the macOS application must be registered on the main thread"
+    let _marker = MainThreadMarker::new()
+        .expect("the macOS application must be registered on the main thread");
+    let application: Retained<NSApplication> =
+        // SAFETY: `sharedApplication` is an AppKit class method. Sending it to
+        // our registered subclass before Winit asks NSApplication for NSApp
+        // makes the process-global instance implement CefAppProtocol.
+        unsafe { msg_send![DucktapeApplication::class(), sharedApplication] };
+    assert_eq!(
+        application.class(),
+        DucktapeApplication::class(),
+        "NSApp was created before DucktapeApplication was installed"
     );
-    let _ = DucktapeApplication::class();
 }
 
 pub(super) fn take_terminate_request() -> bool {

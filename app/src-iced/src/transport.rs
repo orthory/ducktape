@@ -614,6 +614,9 @@ impl NodeClient {
                 "DuckFS file exceeds the gateway file limit",
             ));
         }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
         let mut bytes = Vec::with_capacity(size as usize);
         let mut eof = false;
         while !eof && bytes.len() < size as usize {
@@ -1040,6 +1043,16 @@ mod tests {
         assert!(safe_file_path("shared/plan.md").is_err());
         assert!(safe_file_path("/shared/../secret").is_err());
         assert!(safe_file_path("/shared\nsecret").is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_read_accepts_an_empty_file_without_a_range_request() {
+        let client = NodeClient::new("http://127.0.0.1:1").unwrap();
+        let bytes = client
+            .files_read_exact("/shared/empty.html", &"a".repeat(64), 0)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
     }
 
     #[test]

@@ -27,6 +27,10 @@ if [ -n "$notary_profile" ] && [ "$profile" != release ]; then
   echo "[macos-app] notarization is only supported for release packages" >&2
   exit 2
 fi
+if [ "$profile" = release ] && [ -n "$sign_identity" ] && [ -z "$notary_profile" ]; then
+  echo "[macos-app] a Developer ID release requires DUCKTAPE_MACOS_NOTARY_PROFILE" >&2
+  exit 2
+fi
 
 cef_version="$(awk '
   $0 == "name = \"cef\"" { in_cef = 1; next }

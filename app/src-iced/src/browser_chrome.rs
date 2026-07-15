@@ -5,6 +5,10 @@ use iced::{Alignment, Background, Border, Element, Length};
 
 use crate::theme::{self, MONO, Mode, SANS};
 
+pub const IDLE_URL: &str = "about:blank";
+pub const TAB_BAR_HEIGHT: f32 = 36.0;
+pub const TOOLBAR_HEIGHT: f32 = 48.0;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     AddressChanged(String),
@@ -30,7 +34,7 @@ impl Default for Tab {
         Self {
             address: "net.duck".into(),
             current: "net.duck".into(),
-            history: vec!["duck://net.duck".into()],
+            history: Vec::new(),
             history_index: 0,
         }
     }
@@ -60,6 +64,36 @@ impl Default for State {
 }
 
 impl State {
+    pub fn is_idle(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_none_or(|tab| tab.history.is_empty())
+    }
+
+    pub fn runtime_url(&self) -> &str {
+        self.runtime_url_at(self.active_tab).unwrap_or(IDLE_URL)
+    }
+
+    pub fn runtime_url_at(&self, index: usize) -> Option<&str> {
+        let tab = self.tabs.get(index)?;
+        Some(
+            tab.history
+                .get(tab.history_index)
+                .map_or(IDLE_URL, String::as_str),
+        )
+    }
+
+    pub fn runtime_urls(&self) -> Vec<&str> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                tab.history
+                    .get(tab.history_index)
+                    .map_or(IDLE_URL, String::as_str)
+            })
+            .collect()
+    }
+
     pub fn url(&self) -> Result<String, String> {
         let address = self.address.trim();
         if address.is_empty()
@@ -82,24 +116,14 @@ impl State {
             .or_else(|| address.strip_prefix("DUCK://"))
             .unwrap_or(address);
         let host = address.split(['/', '?', '#']).next().unwrap_or_default();
-        let labels = host.split('.').collect::<Vec<_>>();
-        if !(labels.len() == 2 || labels.len() == 3)
-            || labels
-                .last()
-                .is_none_or(|label| !label.eq_ignore_ascii_case("duck"))
-            || labels.iter().any(|label| {
-                label.is_empty()
-                    || label.len() > 63
-                    || label.starts_with('-')
-                    || label.ends_with('-')
-                    || !label
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            })
-        {
-            return Err("Enter <account>.duck or <label>.<account>.duck.".into());
-        }
-        Ok(format!("duck://{address}"))
+        validate_duck_host(host)?;
+        let host = host.to_ascii_lowercase();
+        let suffix = &address[host.len()..];
+        Ok(if suffix.is_empty() {
+            format!("duck://{host}/")
+        } else {
+            format!("duck://{host}{suffix}")
+        })
     }
 
     fn save_active(&mut self) {
@@ -157,8 +181,57 @@ impl State {
     }
 }
 
+/// Validate the shared Browser authority contract. Reserved DuckDNS roots have
+/// no account gateway; only the exact network-owned `net.duck` origin exists.
+pub(crate) fn validate_duck_host(host: &str) -> Result<(), String> {
+    if host.contains(':') || !host.is_ascii() {
+        return Err("Enter <account>.duck or <label>.<account>.duck.".into());
+    }
+    let canonical = host.to_ascii_lowercase();
+    let labels = canonical.split('.').collect::<Vec<_>>();
+    if labels.last().is_none_or(|label| *label != "duck")
+        || !(labels.len() == 2 || labels.len() == 3)
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err("Enter <account>.duck or <label>.<account>.duck.".into());
+    }
+    if canonical == "net.duck" {
+        return Ok(());
+    }
+    let handle = labels[labels.len() - 2];
+    duckdns::validate_handle(handle)
+        .map_err(|_| format!("{handle}.duck is reserved or is not a valid account."))
+}
+
+pub fn is_network_url(raw: &str) -> bool {
+    reqwest::Url::parse(raw).is_ok_and(|url| {
+        url.scheme().eq_ignore_ascii_case("duck")
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("net.duck"))
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
 /// Reconcile a main-frame URL reported by one persistent CEF tab.
 pub fn commit_navigation(state: &mut State, tab_index: usize, url: &str) -> Result<(), String> {
+    if url == IDLE_URL {
+        return state
+            .tabs
+            .get(tab_index)
+            .map(|_| ())
+            .ok_or_else(|| "Browser tab no longer exists.".to_string());
+    }
     let address = url
         .get(7..)
         .filter(|_| {
@@ -204,6 +277,7 @@ pub fn update(state: &mut State, message: Message) -> Option<String> {
             None
         }
         action @ (Message::Open | Message::Reload) => match state.url() {
+            _ if matches!(action, Message::Reload) && state.is_idle() => None,
             Ok(url) => {
                 state.current.clone_from(&state.address);
                 state.loading = true;
@@ -227,8 +301,8 @@ pub fn update(state: &mut State, message: Message) -> Option<String> {
             state.tabs.push(Tab::default());
             state.active_tab = state.tabs.len() - 1;
             state.load_active();
-            state.loading = true;
-            Some("duck://net.duck".into())
+            state.loading = false;
+            Some(IDLE_URL.into())
         }
         Message::SelectTab(index) => {
             if index == state.active_tab || index >= state.tabs.len() {
@@ -237,11 +311,8 @@ pub fn update(state: &mut State, message: Message) -> Option<String> {
             state.save_active();
             state.active_tab = index;
             state.load_active();
-            state.loading = true;
-            state.tabs[index]
-                .history
-                .get(state.tabs[index].history_index)
-                .cloned()
+            state.loading = !state.is_idle();
+            Some(state.runtime_url().into())
         }
         Message::CloseTab(index) => {
             if index >= state.tabs.len() {
@@ -261,11 +332,8 @@ pub fn update(state: &mut State, message: Message) -> Option<String> {
                 state.active_tab = old_active;
             }
             state.load_active();
-            state.loading = true;
-            state.tabs[state.active_tab]
-                .history
-                .get(state.tabs[state.active_tab].history_index)
-                .cloned()
+            state.loading = !state.is_idle();
+            Some(state.runtime_url().into())
         }
     }
 }
@@ -304,7 +372,7 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
     }
     tab_items = tab_items.push(chrome_button("+", Some(Message::NewTab), p));
     let tabs = container(tab_items)
-        .height(36)
+        .height(TAB_BAR_HEIGHT)
         .padding(iced::Padding {
             top: 5.0,
             right: 10.0,
@@ -353,7 +421,7 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
                 .width(30)
                 .height(30)
                 .padding(8)
-                .on_press(Message::Reload)
+                .on_press_maybe((!state.is_idle()).then_some(Message::Reload))
                 .style(move |_, status| chrome_style(p, status)),
             container(
                 row![
@@ -381,13 +449,15 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
         .spacing(7)
         .align_y(Alignment::Center),
     )
-    .height(48)
+    .height(TOOLBAR_HEIGHT)
     .padding([0, 12])
     .align_y(Alignment::Center)
     .style(move |_| bottom_border(p.sidebar, p.border_soft));
 
     let pane_copy = if let Some(error) = &state.error {
         error.as_str()
+    } else if state.is_idle() {
+        "Enter net.duck, <account>.duck, or <label>.<account>.duck."
     } else if !cef_ready {
         "Starting the isolated browser…"
     } else if state.loading {
@@ -483,27 +553,16 @@ mod tests {
         state.address = "docs.demo.duck".into();
         assert_eq!(
             update(&mut state, Message::Open),
-            Some("duck://docs.demo.duck".into())
-        );
-        assert_eq!(
-            update(&mut state, Message::Back),
-            Some("duck://net.duck".into())
-        );
-        assert_eq!(
-            update(&mut state, Message::Forward),
-            Some("duck://docs.demo.duck".into())
+            Some("duck://docs.demo.duck/".into())
         );
 
-        assert_eq!(
-            update(&mut state, Message::NewTab),
-            Some("duck://net.duck".into())
-        );
+        assert_eq!(update(&mut state, Message::NewTab), Some(IDLE_URL.into()));
         assert_eq!(state.tabs.len(), 2);
         state.address = "chat.demo.duck".into();
         update(&mut state, Message::Open);
         assert_eq!(
             update(&mut state, Message::SelectTab(0)),
-            Some("duck://docs.demo.duck".into())
+            Some("duck://docs.demo.duck/".into())
         );
         assert_eq!(state.address, "docs.demo.duck");
 
@@ -517,16 +576,96 @@ mod tests {
     fn committed_page_navigation_updates_history_without_destroying_forward_history() {
         let mut state = State::default();
         commit_navigation(&mut state, 0, "duck://net.duck/docs").unwrap();
-        assert_eq!(state.address, "net.duck/docs");
+        commit_navigation(&mut state, 0, "duck://net.duck/reference").unwrap();
         assert_eq!(
             update(&mut state, Message::Back),
-            Some("duck://net.duck".into())
-        );
-        commit_navigation(&mut state, 0, "duck://net.duck").unwrap();
-        assert_eq!(
-            update(&mut state, Message::Forward),
             Some("duck://net.duck/docs".into())
         );
+        assert_eq!(state.address, "net.duck/docs");
+        commit_navigation(&mut state, 0, "duck://net.duck/docs").unwrap();
+        assert_eq!(
+            update(&mut state, Message::Forward),
+            Some("duck://net.duck/reference".into())
+        );
+    }
+
+    #[test]
+    fn fresh_tabs_stay_idle_until_the_user_opens_a_duck_route() {
+        let mut state = State::default();
+        assert!(state.is_idle());
+        assert_eq!(state.runtime_url(), IDLE_URL);
+        assert_eq!(update(&mut state, Message::Reload), None);
+
+        assert_eq!(update(&mut state, Message::NewTab), Some(IDLE_URL.into()));
+        assert!(state.is_idle());
+        let active_tab = state.active_tab;
+        commit_navigation(&mut state, active_tab, IDLE_URL).unwrap();
+        assert!(state.error.is_none());
+        assert!(state.tabs[state.active_tab].history.is_empty());
+
+        assert_eq!(
+            update(&mut state, Message::Open),
+            Some("duck://net.duck/".into())
+        );
+        assert!(!state.is_idle());
+        commit_navigation(&mut state, active_tab, IDLE_URL).unwrap();
+        assert_eq!(state.runtime_url(), "duck://net.duck/");
+    }
+
+    #[test]
+    fn runtime_urls_preserve_idle_tab_indices_before_first_cef_start() {
+        let mut state = State::default();
+        update(&mut state, Message::NewTab);
+        update(&mut state, Message::NewTab);
+        update(&mut state, Message::Open);
+
+        assert_eq!(
+            state.runtime_urls(),
+            vec![IDLE_URL, IDLE_URL, "duck://net.duck/"]
+        );
+        assert_eq!(state.active_tab, 2);
+    }
+
+    #[test]
+    fn network_urls_are_exactly_the_reserved_root() {
+        assert!(is_network_url("duck://net.duck"));
+        assert!(is_network_url("DUCK://NET.DUCK/docs.html"));
+        assert!(!is_network_url("duck://api.net.duck/index.html"));
+        assert!(!is_network_url("https://net.duck/index.html"));
+        assert!(!is_network_url("about:blank"));
+
+        assert!(State::default().url().is_ok());
+        let mut reserved = State::default();
+        reserved.address = "agents.duck".into();
+        assert!(reserved.url().is_err());
+        reserved.address = "api.net.duck".into();
+        assert!(reserved.url().is_err());
+    }
+
+    #[test]
+    fn network_root_commit_does_not_duplicate_history() {
+        let mut state = State::default();
+        update(&mut state, Message::Open);
+        commit_navigation(&mut state, 0, "duck://net.duck/").unwrap();
+
+        assert_eq!(state.tabs[0].history, vec!["duck://net.duck/"]);
+        assert!(!state.can_go_back());
+    }
+
+    #[test]
+    fn uppercase_host_commit_does_not_duplicate_history() {
+        let mut state = State {
+            address: "DUCK://NET.DUCK/Docs.HTML".into(),
+            ..State::default()
+        };
+        assert_eq!(
+            update(&mut state, Message::Open),
+            Some("duck://net.duck/Docs.HTML".into())
+        );
+        commit_navigation(&mut state, 0, "duck://net.duck/Docs.HTML").unwrap();
+
+        assert_eq!(state.tabs[0].history.len(), 1);
+        assert!(!state.can_go_back());
     }
 
     #[test]
@@ -542,7 +681,7 @@ mod tests {
         assert_eq!(state.active_tab, 2);
         assert_eq!(
             update(&mut state, Message::CloseTab(0)),
-            Some("duck://last.demo.duck".into())
+            Some("duck://last.demo.duck/".into())
         );
         assert_eq!(state.active_tab, 1);
         assert_eq!(state.address, "last.demo.duck");

@@ -37,9 +37,9 @@ Windows staging must run in an MSVC/Windows SDK environment where `mt.exe` is
 on `PATH`; the script embeds the `asInvoker` manifest in the bootstrap PE and
 reads it back before packaging.
 
-macOS local builds are ad-hoc signed and require macOS 14 or newer. For a
-direct-distribution release, provide a Developer ID Application identity and,
-optionally, a notarytool keychain profile:
+macOS local builds are ad-hoc signed and require macOS 14 or newer. A
+direct-distribution release requires both a Developer ID Application identity
+and a notarytool keychain profile:
 
 ```bash
 DUCKTAPE_MACOS_SIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
@@ -47,8 +47,20 @@ DUCKTAPE_MACOS_NOTARY_PROFILE=ducktape-notary make app
 ```
 
 The staging script signs nested Mach-O files inside-out with the hardened
-runtime, submits the release ZIP when a notary profile is set, staples the app,
-and repacks the stapled artifact. Credentials remain in the login keychain.
+runtime, submits the release ZIP, staples and Gatekeeper-checks the app, and
+repacks the stapled artifact. It refuses to create a Developer ID release
+without notarization. Credentials remain in the login keychain.
+
+Windows local packages are explicitly suffixed `-unsigned`. A distribution
+archive requires a code-signing certificate and RFC 3161 timestamp service;
+the staging script signs and Authenticode-verifies every app-owned PE after
+embedding the rootless manifest and before archiving:
+
+```powershell
+$env:DUCKTAPE_WINDOWS_SIGN_SHA1 = "CERTIFICATE_THUMBPRINT"
+$env:DUCKTAPE_WINDOWS_TIMESTAMP_URL = "http://timestamp.example"
+make app
+```
 
 ## Native verification
 

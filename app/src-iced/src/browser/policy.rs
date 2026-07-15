@@ -10,7 +10,10 @@ use cef::{
     PermissionRequestTypes,
 };
 
+use crate::browser_chrome::validate_duck_host;
+
 const MAX_URL_BYTES: usize = 2 * 1024 * 1024;
+const MAX_NET_DATA_IMAGE_URL_BYTES: usize = 64 * 1024 * 1024;
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runtime-neutral permissions the iced shell may show in native consent UI.
@@ -125,6 +128,7 @@ impl PermissionBroker {
                 callback,
                 requested,
             },
+            false,
         );
     }
 
@@ -133,12 +137,19 @@ impl PermissionBroker {
         origin: &str,
         requested: u32,
         callback: PermissionPromptCallback,
+        allow_minted_loopback: bool,
     ) {
         let Some(permissions) = prompt_permissions(requested) else {
             Completion::Prompt(callback).finish(false);
             return;
         };
-        self.request(origin, true, permissions, Completion::Prompt(callback));
+        self.request(
+            origin,
+            true,
+            permissions,
+            Completion::Prompt(callback),
+            allow_minted_loopback,
+        );
     }
 
     fn request(
@@ -147,6 +158,7 @@ impl PermissionBroker {
         is_main_frame: bool,
         permissions: Vec<BrowserPermission>,
         completion: Completion,
+        allow_minted_loopback: bool,
     ) {
         self.expire();
         let Some(origin) = normalize_duck_origin(raw_origin) else {
@@ -158,7 +170,11 @@ impl PermissionBroker {
             return;
         }
         if permissions.contains(&BrowserPermission::LocalNetwork) {
-            completion.finish(false);
+            completion.finish(
+                allow_minted_loopback
+                    && permissions.len() == 1
+                    && permissions[0] == BrowserPermission::LocalNetwork,
+            );
             return;
         }
 
@@ -365,6 +381,45 @@ impl NavigationPolicy {
             ),
         }
     }
+
+    pub(crate) fn allows_resource(&self, url: &str) -> bool {
+        self.allows(url)
+            || matches!(
+                self,
+                Self::Origin { authority, .. }
+                    if authority == "net.duck" && allowed_data_image(url)
+            )
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self, Self::Exact(url) if url.eq_ignore_ascii_case("about:blank"))
+    }
+}
+
+fn allowed_data_image(url: &str) -> bool {
+    if !net_data_image_size_is_allowed(url.len())
+        || url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+
+    [
+        "data:image/gif;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/png;base64,",
+        "data:image/webp;base64,",
+    ]
+    .iter()
+    .any(|prefix| {
+        url.get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+    })
+}
+
+const fn net_data_image_size_is_allowed(size: usize) -> bool {
+    size <= MAX_NET_DATA_IMAGE_URL_BYTES
 }
 
 enum Parsed {
@@ -405,7 +460,7 @@ fn parse(url: &str, initial: bool) -> Result<Parsed, String> {
         "about" if rest == "blank" => Ok(Parsed::Exact),
         "duck" => {
             let (authority, suffix) = authority(rest)?;
-            if initial && suffix.contains('#') {
+            if initial && suffix.contains('#') && !authority.eq_ignore_ascii_case("net.duck") {
                 return Err("initial duck URL must not contain a fragment".into());
             }
             validate_duck_host(authority)?;
@@ -436,32 +491,6 @@ fn authority(rest: &str) -> Result<(&str, &str), String> {
     Ok((authority, &rest[end..]))
 }
 
-pub(crate) fn validate_duck_host(host: &str) -> Result<(), String> {
-    if host.contains(':') || !host.is_ascii() {
-        return Err("duck host must be ASCII and must not contain a port".into());
-    }
-    let labels: Vec<_> = host.split('.').collect();
-    if labels
-        .last()
-        .is_none_or(|label| !label.eq_ignore_ascii_case("duck"))
-        || !(labels.len() == 2 || labels.len() == 3)
-        || labels.iter().any(|label| !valid_dns_label(label))
-    {
-        return Err("duck host must be <account>.duck or <label>.<account>.duck".into());
-    }
-    Ok(())
-}
-
-fn valid_dns_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 63
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +503,9 @@ mod tests {
         assert!(!policy.allows("duck://other.demo.duck/next"));
         assert!(!policy.allows("duck://user@app.demo.duck/next"));
         assert!(NavigationPolicy::new("duck://app.demo.duck/#secret").is_err());
+        assert!(NavigationPolicy::new("duck://net.duck/index.html#part").is_ok());
+        assert!(NavigationPolicy::new("duck://agents.duck/").is_err());
+        assert!(NavigationPolicy::new("duck://api.net.duck/").is_err());
         assert!(NavigationPolicy::new("duck://a.b.c.demo.duck/").is_err());
     }
 
@@ -494,6 +526,48 @@ mod tests {
         assert!(!policy.allows("data:text/html,%3Ch1%3Echanged%3C/h1%3E"));
         assert!(NavigationPolicy::new("data:text/plain,nope").is_err());
         assert!(NavigationPolicy::new("about:blank").is_ok());
+        assert!(NavigationPolicy::new("about:blank").unwrap().is_idle());
+        assert!(!NavigationPolicy::new(data).unwrap().is_idle());
+        assert!(!NavigationPolicy::new("duck://net.duck/").unwrap().is_idle());
+    }
+
+    #[test]
+    fn net_resources_allow_only_bounded_raster_data_images() {
+        let policy = NavigationPolicy::new("duck://net.duck/index.html").unwrap();
+        for image in [
+            "data:image/gif;base64,R0lGODlhAQABAAAAACw=",
+            "DATA:IMAGE/JPEG;BASE64,/9j/2Q==",
+            "data:image/png;base64,iVBORw0KGgo=",
+            "data:image/webp;base64,UklGRg==",
+        ] {
+            assert!(policy.allows_resource(image), "refused {image}");
+            assert!(!policy.allows(image), "data image became a navigation");
+        }
+
+        for rejected in [
+            "data:image/svg+xml;base64,PHN2Zz4=",
+            "data:text/plain;base64,bm9wZQ==",
+            "data:text/html;base64,PGgxPm5vcGU8L2gxPg==",
+            "javascript:alert(1)",
+        ] {
+            assert!(!policy.allows_resource(rejected), "allowed {rejected}");
+        }
+
+        let larger_than_navigation_limit =
+            format!("data:image/png;base64,{}", "A".repeat(MAX_URL_BYTES));
+        assert!(policy.allows_resource(&larger_than_navigation_limit));
+        assert!(net_data_image_size_is_allowed(MAX_NET_DATA_IMAGE_URL_BYTES));
+        assert!(!net_data_image_size_is_allowed(
+            MAX_NET_DATA_IMAGE_URL_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn account_resources_reject_data_and_cross_origin_urls() {
+        let policy = NavigationPolicy::new("duck://app.demo.duck/index.html").unwrap();
+        assert!(!policy.allows_resource("data:image/png;base64,iVBORw0KGgo="));
+        assert!(!policy.allows_resource("duck://other.demo.duck/image.png"));
+        assert!(policy.allows_resource("duck://app.demo.duck/image.png"));
     }
 
     #[test]
@@ -528,6 +602,7 @@ mod tests {
             true,
             camera.clone(),
             Completion::Test(first_tx),
+            false,
         );
         let first = broker.prompt().unwrap();
         broker.decide(first.id, true, true).unwrap();
@@ -539,6 +614,7 @@ mod tests {
             true,
             camera.clone(),
             Completion::Test(remembered_tx),
+            false,
         );
         assert!(remembered_rx.recv().unwrap());
         assert!(broker.prompt().is_none());
@@ -549,6 +625,7 @@ mod tests {
             true,
             camera.clone(),
             Completion::Test(other_tx),
+            false,
         );
         assert!(broker.prompt().is_some());
         broker.close();
@@ -560,12 +637,13 @@ mod tests {
             false,
             camera,
             Completion::Test(subframe_tx),
+            false,
         );
         assert!(!subframe_rx.recv().unwrap());
     }
 
     #[test]
-    fn local_network_is_always_denied() {
+    fn local_network_requires_an_exact_minted_loopback_capability() {
         let broker = PermissionBroker::default();
         let (local_tx, local_rx) = std::sync::mpsc::channel();
         broker.request(
@@ -573,8 +651,19 @@ mod tests {
             true,
             vec![BrowserPermission::LocalNetwork],
             Completion::Test(local_tx),
+            false,
         );
         assert!(!local_rx.recv().unwrap());
+
+        let (minted_tx, minted_rx) = std::sync::mpsc::channel();
+        broker.request(
+            "duck://app.demo.duck",
+            true,
+            vec![BrowserPermission::LocalNetwork],
+            Completion::Test(minted_tx),
+            true,
+        );
+        assert!(minted_rx.recv().unwrap());
 
         let (mixed_tx, mixed_rx) = std::sync::mpsc::channel();
         broker.request(
@@ -582,6 +671,7 @@ mod tests {
             true,
             vec![BrowserPermission::LocalNetwork, BrowserPermission::Camera],
             Completion::Test(mixed_tx),
+            true,
         );
         assert!(!mixed_rx.recv().unwrap());
     }

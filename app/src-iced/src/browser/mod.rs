@@ -139,7 +139,10 @@ cef::wrap_client! {
         }
 
         fn permission_handler(&self) -> Option<PermissionHandler> {
-            Some(GatewayPermissionHandler::new(self.permissions.clone()))
+            Some(GatewayPermissionHandler::new(
+                self.permissions.clone(),
+                self.gateway.clone(),
+            ))
         }
 
         fn download_handler(&self) -> Option<DownloadHandler> {
@@ -313,11 +316,15 @@ cef::wrap_resource_request_handler! {
                 return ReturnValue::CANCEL;
             };
             let url = CefString::from(&request.url()).to_string();
+            let method = CefString::from(&request.method()).to_string();
             if self
                 .navigation
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .allows(&url)
+                .allows_resource(&url)
+                || self
+                    .gateway
+                    .allows_websocket(&url, self.initiator.as_deref(), &method)
             {
                 ReturnValue::CONTINUE
             } else {
@@ -356,6 +363,7 @@ cef::wrap_resource_request_handler! {
 cef::wrap_permission_handler! {
     struct GatewayPermissionHandler {
         permissions: PermissionBroker,
+        gateway: GatewayProxy,
     }
 
     impl PermissionHandler {
@@ -386,10 +394,12 @@ cef::wrap_permission_handler! {
             callback: Option<&mut PermissionPromptCallback>,
         ) -> ::std::os::raw::c_int {
             let Some(callback) = callback else { return 0 };
+            let origin = requesting_origin.map(CefString::to_string).unwrap_or_default();
             self.permissions.request_prompt(
-                &requesting_origin.map(CefString::to_string).unwrap_or_default(),
+                &origin,
                 requested_permissions,
                 callback.clone(),
+                self.gateway.permits_loopback_for_origin(&origin),
             );
             1
         }
@@ -666,7 +676,7 @@ impl BrowserRuntime {
             let _ = std::fs::remove_dir_all(cache_path);
             return Err("CEF initialization failed".into());
         }
-        let mut cef = CefShutdown {
+        let cef = CefShutdown {
             armed: true,
             cache_path: Some(cache_path),
         };
@@ -695,10 +705,7 @@ impl BrowserRuntime {
         ) {
             Ok(browser) => browser,
             Err(error) => {
-                cef.armed = false;
-                return Err(format!(
-                    "{error}; shutdown skipped in case CEF created a live browser"
-                ));
+                return Err(error);
             }
         };
 
@@ -752,6 +759,17 @@ impl BrowserRuntime {
         self.surface()?.navigate(url)
     }
 
+    /// Install one inert `net.duck` document before navigating the active CEF
+    /// surface to its exact URL. Replacing it invalidates any in-flight read.
+    pub fn navigate_local_document(&self, url: &str, bytes: Arc<[u8]>) -> Result<(), String> {
+        self.gateway.install_local_document(url, bytes)?;
+        if let Err(error) = self.navigate(url) {
+            self.gateway.remove_local_document(url);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Atomically select or clear the dedicated browser gateway. Replacing it
     /// invalidates in-flight work from the previous workspace generation.
     pub fn set_gateway_base(&self, base: Option<String>) -> Result<(), String> {
@@ -760,6 +778,14 @@ impl BrowserRuntime {
 
     pub fn has_surface(&self) -> bool {
         !self.browsers.is_empty()
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.browsers.len()
+    }
+
+    pub fn active_tab_is_idle(&self) -> Result<bool, String> {
+        Ok(self.surface()?.is_idle())
     }
 
     pub fn take_events(&self) -> Vec<BrowserEvent> {
@@ -867,7 +893,7 @@ impl BrowserRuntime {
     /// runtime alive. The next workspace gets a fresh in-memory request
     /// context before any of its routes are loaded.
     pub fn reset_workspace(&mut self) -> Result<(), String> {
-        self.gateway.set_gateway_base(None)?;
+        self.gateway.retire_workspace()?;
         self.permissions.close();
         self.permissions = PermissionBroker::default();
         self.event_rx.try_iter().for_each(drop);
@@ -1059,7 +1085,13 @@ fn create_browser_surface(
     let host = browser
         .host()
         .ok_or_else(|| "CEF browser has no host".to_string())?;
-    let native = platform::NativeChild::new(&host)?;
+    let native = match platform::NativeChild::new(&host) {
+        Ok(native) => native,
+        Err(error) => {
+            close_partially_created_browser(&host, &closed)?;
+            return Err(error);
+        }
+    };
     Ok(BrowserSurface {
         browser,
         host,
@@ -1069,6 +1101,32 @@ fn create_browser_surface(
         bounds,
         visible: true,
     })
+}
+
+fn close_partially_created_browser(host: &BrowserHost, closed: &AtomicBool) -> Result<(), String> {
+    let mut close = CloseBrowserTask::new(host.clone());
+    if cef::post_task(ThreadId::UI, Some(&mut close)) != 1 {
+        // Synchronous browser creation runs on the process UI thread; this is
+        // the last-resort path when CEF refuses to enqueue its own close task.
+        host.close_browser(1);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !closed.load(Ordering::SeqCst) && Instant::now() < deadline {
+        cef::do_message_loop_work();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if !closed.load(Ordering::SeqCst) {
+        tracing::error!(
+            target: "ducktape::browser",
+            reason = "partial_browser_close_timeout",
+            "CEF partially created a browser that did not close"
+        );
+        // CEF forbids process shutdown with a live Browser. Continuing would
+        // orphan helpers with no runtime owner, so this startup failure is
+        // terminal for the desktop process.
+        std::process::exit(70);
+    }
+    Ok(())
 }
 
 fn cef_no_sandbox() -> bool {
@@ -1218,6 +1276,13 @@ struct BrowserSurface {
 }
 
 impl BrowserSurface {
+    fn is_idle(&self) -> bool {
+        self.navigation
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_idle()
+    }
+
     fn set_bounds(&mut self, bounds: Bounds) -> Result<(), String> {
         let bounds = bounds.validate()?;
         if bounds == self.bounds {

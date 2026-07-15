@@ -5,11 +5,12 @@
 //! trusted Duck authority, and streamed back through CEF with bounded
 //! backpressure.
 
+use std::collections::VecDeque;
 use std::io::Read as _;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use cef::*;
@@ -17,7 +18,7 @@ use reqwest::blocking::{Client, Response as UpstreamResponse};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
 
-use super::policy::validate_duck_host;
+use crate::browser_chrome::validate_duck_host;
 
 const CHANNEL_DEPTH: usize = 8;
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -25,6 +26,13 @@ const MAX_PATH_AND_QUERY_BYTES: usize = 2 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_REQUEST_HEADER_BYTES: usize = 32 * 1024;
 const READ_CHUNK_BYTES: usize = 32 * 1024;
+const MAX_LOCAL_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LOCAL_DOCUMENTS: usize = 16;
+const MAX_CONCURRENT_REQUESTS: usize = 32;
+const MAX_WEBSOCKET_CAPABILITIES: usize = 32;
+const WEBSOCKET_CAPABILITY_TTL: Duration = Duration::from_secs(30);
+
+const LOCAL_DOCUMENT_CSP: &str = "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src 'none'; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
 
 const FORWARDED_HEADERS: &[&str] = &[
     "content-type",
@@ -54,6 +62,29 @@ struct GatewayTarget {
 #[derive(Debug, Default)]
 struct GatewayState {
     active: Option<GatewayTarget>,
+    local_documents: LocalDocumentStore,
+    websocket_capabilities: VecDeque<WebSocketCapability>,
+}
+
+#[derive(Debug, Default)]
+struct LocalDocumentStore {
+    documents: VecDeque<LocalDocument>,
+    total_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LocalDocument {
+    url: String,
+    bytes: Arc<[u8]>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WebSocketCapability {
+    url: String,
+    origin: String,
+    generation: u64,
+    expires_at: std::time::Instant,
 }
 
 /// Cloneable process-local capability for the currently active workspace's
@@ -63,6 +94,7 @@ struct GatewayState {
 pub(crate) struct GatewayProxy {
     state: Arc<Mutex<GatewayState>>,
     next_generation: Arc<AtomicU64>,
+    active_requests: Arc<AtomicUsize>,
 }
 
 impl Default for GatewayProxy {
@@ -70,21 +102,121 @@ impl Default for GatewayProxy {
         Self {
             state: Arc::new(Mutex::new(GatewayState::default())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            active_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
+struct RequestPermit(Arc<AtomicUsize>);
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl GatewayProxy {
+    fn try_admit(&self) -> Option<RequestPermit> {
+        self.active_requests
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |active| {
+                (active < MAX_CONCURRENT_REQUESTS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| RequestPermit(self.active_requests.clone()))
+    }
+
+    /// Revoke every clone held by the retiring workspace, then give the
+    /// runtime an unrelated capability for the next workspace.
+    pub(crate) fn retire_workspace(&mut self) -> Result<(), String> {
+        self.set_gateway_base(None)?;
+        *self = Self::default();
+        Ok(())
+    }
+
     pub(crate) fn set_gateway_base(&self, base: Option<String>) -> Result<(), String> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let clear_local = base.is_none();
         let active = base
             .map(|base| validate_gateway_base(&base, generation))
             .transpose()?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.active = active;
+        state.websocket_capabilities.clear();
+        if clear_local {
+            state.local_documents = LocalDocumentStore::default();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_local_document(&self, url: &str, bytes: Arc<[u8]>) -> Result<(), String> {
+        if bytes.len() > MAX_LOCAL_DOCUMENT_BYTES {
+            return Err("local browser document exceeds the 64 MiB limit".into());
+        }
+        let url = canonical_local_document_url(url)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let store = &mut state.local_documents;
+        let replaced = store
+            .documents
+            .iter()
+            .position(|document| document.url == url);
+        let replaced_bytes = replaced
+            .and_then(|index| store.documents.get(index))
+            .map_or(0, |document| document.bytes.len());
+        if let Some(index) = replaced {
+            store.documents.remove(index);
+        }
+        store.total_bytes = store.total_bytes.saturating_sub(replaced_bytes);
+        while store.documents.len() >= MAX_LOCAL_DOCUMENTS
+            || store.total_bytes.saturating_add(bytes.len()) > MAX_LOCAL_DOCUMENT_BYTES
+        {
+            let evicted = store
+                .documents
+                .pop_front()
+                .expect("one bounded document can always fit an empty store");
+            store.total_bytes = store.total_bytes.saturating_sub(evicted.bytes.len());
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        store.total_bytes += bytes.len();
+        store.documents.push_back(LocalDocument {
+            url,
+            bytes,
+            generation,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn clear_local_documents(&self) {
+        self.next_generation.fetch_add(1, Ordering::Relaxed);
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .active = active;
-        Ok(())
+            .local_documents = LocalDocumentStore::default();
+    }
+
+    pub(crate) fn remove_local_document(&self, url: &str) {
+        let Ok(url) = canonical_local_document_url(url) else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let store = &mut state.local_documents;
+        if let Some(index) = store
+            .documents
+            .iter()
+            .position(|document| document.url == url)
+            && let Some(removed) = store.documents.remove(index)
+        {
+            store.total_bytes = store.total_bytes.saturating_sub(removed.bytes.len());
+            self.next_generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn snapshot(&self) -> Option<GatewayTarget> {
@@ -104,23 +236,172 @@ impl GatewayProxy {
             .is_some_and(|active| active.generation == target.generation)
     }
 
-    fn serve(&self, request: ProxyRequest, responder: StreamResponder) {
-        let Some(target) = self.snapshot() else {
-            return responder.fail(503, "duck: no active gateway — open a workspace first");
+    fn local_document(&self, url: &str) -> Option<LocalDocument> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .local_documents
+            .documents
+            .iter()
+            .find(|document| document.url == url)
+            .cloned()
+    }
+
+    fn is_local_document_current(&self, document: &LocalDocument) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .local_documents
+            .documents
+            .iter()
+            .any(|active| active.url == document.url && active.generation == document.generation)
+    }
+
+    fn remember_websocket(&self, target: &GatewayTarget, origin: &str, url: String) -> bool {
+        let now = std::time::Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state
+            .active
+            .as_ref()
+            .is_none_or(|active| active.generation != target.generation)
+        {
+            return false;
+        }
+        state
+            .websocket_capabilities
+            .retain(|capability| capability.expires_at > now);
+        while state.websocket_capabilities.len() >= MAX_WEBSOCKET_CAPABILITIES {
+            state.websocket_capabilities.pop_front();
+        }
+        state.websocket_capabilities.push_back(WebSocketCapability {
+            url,
+            origin: origin.to_string(),
+            generation: target.generation,
+            expires_at: now + WEBSOCKET_CAPABILITY_TTL,
+        });
+        true
+    }
+
+    pub(super) fn permits_loopback_for_origin(&self, raw_origin: &str) -> bool {
+        let Some(origin) = canonical_duck_origin(raw_origin) else {
+            return false;
         };
+        let now = std::time::Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let generation = state.active.as_ref().map(|active| active.generation);
+        state
+            .websocket_capabilities
+            .retain(|capability| capability.expires_at > now);
+        state.websocket_capabilities.iter().any(|capability| {
+            Some(capability.generation) == generation && capability.origin == origin
+        })
+    }
+
+    pub(super) fn allows_websocket(
+        &self,
+        raw_url: &str,
+        raw_origin: Option<&str>,
+        method: &str,
+    ) -> bool {
+        if method != "GET" {
+            return false;
+        }
+        let Some(origin) = raw_origin.and_then(canonical_duck_origin) else {
+            return false;
+        };
+        let Ok(url) = Url::parse(raw_url) else {
+            return false;
+        };
+        if url.scheme() != "ws"
+            || url.host_str() != Some("127.0.0.1")
+            || url.port().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return false;
+        }
+        let canonical_url = url.to_string();
+        let now = std::time::Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let generation = state.active.as_ref().map(|active| active.generation);
+        state
+            .websocket_capabilities
+            .retain(|capability| capability.expires_at > now);
+        state.websocket_capabilities.iter().any(|capability| {
+            Some(capability.generation) == generation
+                && capability.origin == origin
+                && capability.url == canonical_url
+        })
+    }
+
+    fn serve(&self, request: ProxyRequest, responder: StreamResponder) {
         let route = match classify_request(&request) {
             Ok(route) => route,
             Err(failure) => return responder.fail(failure.status, failure.message),
         };
 
         match route {
+            Route::LocalDocument { url, head } => self.serve_local_document(&url, head, responder),
             Route::WebSocketBootstrap { authority, origin } => {
+                let Some(target) = self.snapshot() else {
+                    return responder.fail(503, "duck: no active gateway — open a workspace first");
+                };
                 self.serve_ws_bootstrap(&target, &authority, &origin, responder)
             }
             Route::Proxy {
                 authority,
                 path_and_query,
-            } => self.serve_proxy(&target, &authority, &path_and_query, request, responder),
+            } => {
+                let Some(target) = self.snapshot() else {
+                    return responder.fail(503, "duck: no active gateway — open a workspace first");
+                };
+                self.serve_proxy(&target, &authority, &path_and_query, request, responder)
+            }
+        }
+    }
+
+    fn serve_local_document(&self, url: &str, head: bool, responder: StreamResponder) {
+        let Some(document) = self.local_document(url) else {
+            return responder.fail(404, "duck: local document is not installed");
+        };
+        if !self.is_local_document_current(&document) {
+            return responder.fail(409, "duck: local document changed");
+        }
+        let mut writer = responder.respond(ResponseHead {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), "text/html; charset=utf-8".into()),
+                ("content-security-policy".into(), LOCAL_DOCUMENT_CSP.into()),
+                ("cache-control".into(), "no-store".into()),
+                ("x-content-type-options".into(), "nosniff".into()),
+                ("referrer-policy".into(), "no-referrer".into()),
+                ("cross-origin-resource-policy".into(), "same-origin".into()),
+                ("cross-origin-opener-policy".into(), "same-origin".into()),
+                (
+                    "permissions-policy".into(),
+                    "camera=(), microphone=(), display-capture=(), geolocation=(), payment=(), usb=()"
+                        .into(),
+                ),
+            ],
+        });
+        if head {
+            return;
+        }
+        for chunk in document.bytes.chunks(READ_CHUNK_BYTES) {
+            if !self.is_local_document_current(&document) || writer.write(chunk.to_vec()).is_err() {
+                return;
+            }
         }
     }
 
@@ -228,10 +509,11 @@ impl GatewayProxy {
         if !self.is_current(target) {
             return responder.fail(409, "duck: active workspace changed");
         }
-        let payload = serde_json::json!({
-            "url": format!("ws://127.0.0.1:{}/.duck/ws/{token}", target.port)
-        })
-        .to_string();
+        let url = format!("ws://127.0.0.1:{}/.duck/ws/{token}", target.port);
+        if !self.remember_websocket(target, origin, url.clone()) {
+            return responder.fail(409, "duck: active workspace changed");
+        }
+        let payload = serde_json::json!({ "url": url }).to_string();
         let mut writer = responder.respond(ResponseHead {
             status: 200,
             headers: vec![
@@ -274,14 +556,37 @@ fn validate_gateway_base(raw: &str, generation: u64) -> Result<GatewayTarget, St
     })
 }
 
-fn http_client() -> Result<Client, ()> {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-        .map_err(|_| ())
+fn canonical_duck_origin(raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "duck"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    validate_duck_host(&host).ok()?;
+    Some(format!("duck://{host}"))
+}
+
+fn http_client() -> Result<&'static Client, ()> {
+    static CLIENT: OnceLock<Result<Client, ()>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|_| ())
+    }) {
+        Ok(client) => Ok(client),
+        Err(()) => Err(()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +611,10 @@ pub(super) fn request_provenance(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
+    LocalDocument {
+        url: String,
+        head: bool,
+    },
     Proxy {
         authority: String,
         path_and_query: String,
@@ -356,6 +665,40 @@ fn classify_request(request: &ProxyRequest) -> Result<Route, Failure> {
             message: "duck: invalid path",
         });
     }
+    if authority == "net.duck" {
+        if url.query().is_some() {
+            return Err(Failure {
+                status: 400,
+                message: "duck: net.duck does not accept query strings",
+            });
+        }
+        if !request.main_frame {
+            return Err(Failure {
+                status: 403,
+                message: "duck: net.duck is a main-frame document only",
+            });
+        }
+        if !request.body.is_empty() {
+            return Err(Failure {
+                status: 400,
+                message: "duck: net.duck request body is not allowed",
+            });
+        }
+        if !matches!(request.method.as_str(), "GET" | "HEAD") {
+            return Err(Failure {
+                status: 405,
+                message: "duck: net.duck permits only GET and HEAD",
+            });
+        }
+        let url = canonical_local_document_url(&request.url).map_err(|_| Failure {
+            status: 400,
+            message: "duck: net.duck path is not canonical HTML",
+        })?;
+        return Ok(Route::LocalDocument {
+            url,
+            head: request.method == "HEAD",
+        });
+    }
     if url.path() == "/.duck/ws" {
         let expected = format!("duck://{authority}");
         if request.initiator.as_deref() != Some(expected.as_str()) {
@@ -395,6 +738,71 @@ fn classify_request(request: &ProxyRequest) -> Result<Route, Failure> {
         authority,
         path_and_query,
     })
+}
+
+fn canonical_local_document_url(raw: &str) -> Result<String, String> {
+    if raw.is_empty()
+        || raw.len() > MAX_PATH_AND_QUERY_BYTES + 32
+        || raw
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("local document URL is empty, oversized, or malformed".into());
+    }
+    let url = Url::parse(raw).map_err(|_| "local document URL is malformed".to_string())?;
+    if url.scheme() != "duck"
+        || url.host_str() != Some("net.duck")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+    {
+        return Err("local document URL must be an exact net.duck origin".into());
+    }
+    // Inspect origin-form before `Url` can normalize dot segments away.
+    let (_, rest) = raw
+        .split_once("://")
+        .ok_or_else(|| "local document URL is malformed".to_string())?;
+    let origin_form = rest.split_once('#').map_or(rest, |(path, _)| path);
+    let raw_path = origin_form
+        .find('/')
+        .map_or("/", |index| &origin_form[index..]);
+    if raw_path.starts_with("//")
+        || raw_path.contains(['\\', '?', '#', '%'])
+        || raw_path
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err("local document path is not canonical".into());
+    }
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    if raw_path != path {
+        return Err("local document path is not canonical".into());
+    }
+    if path != "/" {
+        let relative = path
+            .strip_prefix('/')
+            .ok_or_else(|| "local document path is not origin-form".to_string())?;
+        if relative.len() > 512 || !relative.to_ascii_lowercase().ends_with(".html") {
+            return Err("local document path is not bounded HTML".into());
+        }
+        for segment in relative.split('/') {
+            if segment.is_empty()
+                || matches!(segment, "." | "..")
+                || segment.len() > 128
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err("local document path is not canonical".into());
+            }
+        }
+    }
+    Ok(format!("duck://net.duck{path}"))
 }
 
 fn valid_path_and_query(value: &str) -> bool {
@@ -712,6 +1120,14 @@ cef::wrap_resource_handler! {
         ) -> ::std::os::raw::c_int {
             let Some(request) = request else { return 0 };
             let Some(callback) = callback else { return 0 };
+            let Some(permit) = self.proxy.try_admit() else {
+                tracing::warn!(
+                    target: "ducktape::browser",
+                    reason = "gateway_request_limit",
+                    "browser gateway request refused at the concurrency limit"
+                );
+                return 0;
+            };
             let request = match read_cef_request(
                 request,
                 self.initiator.clone(),
@@ -725,7 +1141,16 @@ cef::wrap_resource_handler! {
                     }));
                     *self.stream.lock().unwrap_or_else(|poison| poison.into_inner()) =
                         Some(ResourceState { head, body });
-                    std::thread::spawn(move || responder.fail(failure.status, failure.message));
+                    let spawned = std::thread::Builder::new()
+                        .name("duck-browser-request".into())
+                        .spawn(move || {
+                            let _permit = permit;
+                            responder.fail(failure.status, failure.message);
+                        });
+                    if spawned.is_err() {
+                        *self.stream.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+                        return 0;
+                    }
                     return 1;
                 }
             };
@@ -736,7 +1161,16 @@ cef::wrap_resource_handler! {
             *self.stream.lock().unwrap_or_else(|poison| poison.into_inner()) =
                 Some(ResourceState { head, body });
             let proxy = self.proxy.clone();
-            std::thread::spawn(move || proxy.serve(request, responder));
+            let spawned = std::thread::Builder::new()
+                .name("duck-browser-request".into())
+                .spawn(move || {
+                    let _permit = permit;
+                    proxy.serve(request, responder);
+                });
+            if spawned.is_err() {
+                *self.stream.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+                return 0;
+            }
             1
         }
 
@@ -875,6 +1309,33 @@ mod tests {
         }
     }
 
+    fn local_request(url: &str, method: &str) -> ProxyRequest {
+        ProxyRequest {
+            url: url.into(),
+            method: method.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            initiator: None,
+            main_frame: true,
+        }
+    }
+
+    fn serve(proxy: &GatewayProxy, request: ProxyRequest) -> (ResponseHead, Vec<u8>) {
+        let (responder, head, mut stream) = make_stream(Box::new(|| {}));
+        proxy.serve(request, responder);
+        let head = head.lock().unwrap().clone().unwrap();
+        let mut body = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            match stream.read(&mut buffer, || {}) {
+                ReadOutcome::Copied(count) => body.extend_from_slice(&buffer[..count]),
+                ReadOutcome::Done => break,
+                ReadOutcome::Pending => panic!("synchronous local response must not pend"),
+            }
+        }
+        (head, body)
+    }
+
     #[test]
     fn gateway_base_is_literal_loopback_and_generation_scoped() {
         assert!(validate_gateway_base("http://127.0.0.1:49152", 1).is_ok());
@@ -898,6 +1359,197 @@ mod tests {
             .set_gateway_base(Some("http://127.0.0.1:49153".into()))
             .unwrap();
         assert!(!proxy.is_current(&old));
+    }
+
+    #[test]
+    fn retiring_workspace_rotates_the_shared_gateway_capability() {
+        let mut proxy = GatewayProxy::default();
+        proxy
+            .set_gateway_base(Some("http://127.0.0.1:49152".into()))
+            .unwrap();
+        let retired_surface = proxy.clone();
+
+        proxy.retire_workspace().unwrap();
+        proxy
+            .set_gateway_base(Some("http://127.0.0.1:49153".into()))
+            .unwrap();
+
+        assert!(retired_surface.snapshot().is_none());
+        assert_eq!(proxy.snapshot().unwrap().port, 49153);
+    }
+
+    #[test]
+    fn renderer_request_admission_is_bounded_and_released() {
+        let proxy = GatewayProxy::default();
+        let permits = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|_| proxy.try_admit().expect("request within the cap"))
+            .collect::<Vec<_>>();
+        assert!(proxy.try_admit().is_none());
+        drop(permits);
+        assert!(proxy.try_admit().is_some());
+    }
+
+    #[test]
+    fn minted_websocket_is_exact_origin_target_and_generation_scoped() {
+        let proxy = GatewayProxy::default();
+        proxy
+            .set_gateway_base(Some("http://127.0.0.1:49152".into()))
+            .unwrap();
+        let target = proxy.snapshot().unwrap();
+        let url = "ws://127.0.0.1:49152/.duck/ws/0123456789abcdef0123456789abcdef";
+        assert!(proxy.remember_websocket(&target, "duck://app.demo.duck", url.into()));
+
+        assert!(proxy.permits_loopback_for_origin("duck://app.demo.duck/"));
+        assert!(proxy.allows_websocket(url, Some("duck://app.demo.duck"), "GET"));
+        assert!(!proxy.allows_websocket(url, Some("duck://other.demo.duck"), "GET"));
+        assert!(!proxy.allows_websocket(
+            "ws://127.0.0.1:49152/.duck/ws/ffffffffffffffffffffffffffffffff",
+            Some("duck://app.demo.duck"),
+            "GET"
+        ));
+        assert!(!proxy.allows_websocket(url, Some("duck://app.demo.duck"), "POST"));
+
+        proxy
+            .set_gateway_base(Some("http://127.0.0.1:49153".into()))
+            .unwrap();
+        assert!(!proxy.permits_loopback_for_origin("duck://app.demo.duck"));
+        assert!(!proxy.allows_websocket(url, Some("duck://app.demo.duck"), "GET"));
+    }
+
+    #[test]
+    fn net_duck_is_an_exact_main_frame_get_or_head_route() {
+        assert_eq!(
+            classify_request(&local_request("duck://net.duck", "GET")).unwrap(),
+            Route::LocalDocument {
+                url: "duck://net.duck/".into(),
+                head: false,
+            }
+        );
+        assert_eq!(
+            classify_request(&local_request("duck://net.duck/docs/start.HTML", "HEAD")).unwrap(),
+            Route::LocalDocument {
+                url: "duck://net.duck/docs/start.HTML".into(),
+                head: true,
+            }
+        );
+        assert_eq!(
+            classify_request(&local_request(
+                "duck://net.duck/docs/start.html#part",
+                "GET"
+            ))
+            .unwrap(),
+            Route::LocalDocument {
+                url: "duck://net.duck/docs/start.html".into(),
+                head: false,
+            }
+        );
+
+        for rejected in [
+            "duck://net.duck/docs/../index.html",
+            "duck://net.duck/%2e%2e/secret.html",
+            "duck://net.duck/docs//index.html",
+            "duck://net.duck/index.html?x=1",
+            "duck://net.duck/app.js",
+        ] {
+            assert!(
+                classify_request(&local_request(rejected, "GET")).is_err(),
+                "accepted {rejected}"
+            );
+        }
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(
+                classify_request(&local_request("duck://net.duck", method)).is_err(),
+                "accepted {method}"
+            );
+        }
+        let mut body = local_request("duck://net.duck", "GET");
+        body.body.push(1);
+        assert!(classify_request(&body).is_err());
+        let mut subframe = local_request("duck://net.duck", "GET");
+        subframe.main_frame = false;
+        assert!(classify_request(&subframe).is_err());
+    }
+
+    #[test]
+    fn local_documents_are_url_keyed_inert_and_do_not_require_a_gateway() {
+        let proxy = GatewayProxy::default();
+        proxy
+            .install_local_document("duck://net.duck", Arc::from(&b"first"[..]))
+            .unwrap();
+        let first = proxy.local_document("duck://net.duck/").unwrap();
+        proxy
+            .install_local_document(
+                "duck://net.duck/docs/second.html",
+                Arc::from(&b"second"[..]),
+            )
+            .unwrap();
+
+        let (head, body) = serve(&proxy, local_request("duck://net.duck", "GET"));
+        assert_eq!(head.status, 200);
+        assert_eq!(body, b"first");
+        for required in [
+            "content-security-policy",
+            "cache-control",
+            "x-content-type-options",
+            "referrer-policy",
+            "cross-origin-resource-policy",
+            "cross-origin-opener-policy",
+            "permissions-policy",
+        ] {
+            assert!(head.headers.iter().any(|(name, _)| name == required));
+        }
+        assert!(head.headers.iter().any(|(name, value)| {
+            name == "content-security-policy" && value.contains("sandbox")
+        }));
+
+        let (_, head_body) = serve(&proxy, local_request("duck://net.duck", "HEAD"));
+        assert!(head_body.is_empty());
+        let (_, second) = serve(
+            &proxy,
+            local_request("duck://net.duck/docs/second.html", "GET"),
+        );
+        assert_eq!(second, b"second");
+        let (missing, _) = serve(
+            &proxy,
+            local_request("duck://net.duck/docs/missing.html", "GET"),
+        );
+        assert_eq!(missing.status, 404);
+
+        proxy
+            .install_local_document("duck://net.duck", Arc::from(&b"replacement"[..]))
+            .unwrap();
+        assert!(!proxy.is_local_document_current(&first));
+        assert!(
+            proxy
+                .local_document("duck://net.duck/docs/second.html")
+                .is_some()
+        );
+        proxy.clear_local_documents();
+        assert!(proxy.local_document("duck://net.duck/").is_none());
+        assert!(
+            proxy
+                .local_document("duck://net.duck/docs/second.html")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_document_store_evicts_oldest_url_at_its_count_bound() {
+        let proxy = GatewayProxy::default();
+        for index in 0..MAX_LOCAL_DOCUMENTS {
+            proxy
+                .install_local_document(&format!("duck://net.duck/{index}.html"), Arc::from([]))
+                .unwrap();
+        }
+        proxy
+            .install_local_document("duck://net.duck/overflow.html", Arc::from(&b"x"[..]))
+            .unwrap();
+        assert!(proxy.local_document("duck://net.duck/0.html").is_none());
+        assert!(
+            proxy
+                .local_document("duck://net.duck/overflow.html")
+                .is_some()
+        );
     }
 
     #[test]

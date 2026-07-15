@@ -128,9 +128,42 @@ foreach ($pair in @(
     }
 }
 
+$signThumbprint = $env:DUCKTAPE_WINDOWS_SIGN_SHA1
+$timestampUrl = $env:DUCKTAPE_WINDOWS_TIMESTAMP_URL
+$signed = -not [string]::IsNullOrWhiteSpace($signThumbprint)
+if ($signed) {
+    if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
+        throw "[windows-app] DUCKTAPE_WINDOWS_TIMESTAMP_URL is required for a signed package"
+    }
+    $signtool = Get-Command "signtool.exe" -ErrorAction SilentlyContinue
+    if ($null -eq $signtool) {
+        throw "[windows-app] signtool.exe is required for a signed package"
+    }
+    foreach ($file in @(
+        (Join-Path $stage "Ducktape.exe"),
+        (Join-Path $stage "Ducktape.dll"),
+        (Join-Path $stage "ducktape-node.exe")
+    )) {
+        & $signtool.Source sign /sha1 $signThumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $file
+        if ($LASTEXITCODE -ne 0) {
+            throw "[windows-app] Authenticode signing failed for $file"
+        }
+        & $signtool.Source verify /pa /all $file
+        if ($LASTEXITCODE -ne 0) {
+            throw "[windows-app] Authenticode verification failed for $file"
+        }
+    }
+    Write-Host "[windows-app] signed and verified app-owned PE files"
+} elseif (-not [string]::IsNullOrWhiteSpace($timestampUrl)) {
+    throw "[windows-app] DUCKTAPE_WINDOWS_SIGN_SHA1 is required when a timestamp URL is set"
+} else {
+    Write-Warning "[windows-app] local package is unsigned and is not a distribution artifact"
+}
+
 Write-Host "[windows-app] staged sandbox bootstrap + client DLL at $stage"
 if (-not $NoArchive) {
-    $zip = Join-Path $bundleRoot "Ducktape-windows-$env:PROCESSOR_ARCHITECTURE.zip"
+    $suffix = if ($signed) { "" } else { "-unsigned" }
+    $zip = Join-Path $bundleRoot "Ducktape-windows-$env:PROCESSOR_ARCHITECTURE$suffix.zip"
     if (Test-Path -LiteralPath $zip) {
         Remove-Item -LiteralPath $zip -Force
     }

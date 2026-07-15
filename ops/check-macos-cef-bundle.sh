@@ -149,6 +149,10 @@ else
     || fail "distribution signature does not enable the hardened runtime"
   grep -q '^Timestamp=' <<<"$signature" \
     || fail "distribution signature has no secure timestamp"
+  xcrun stapler validate "$app" >/dev/null 2>&1 \
+    || fail "Developer ID distribution is not stapled with a notarization ticket"
+  spctl --assess --type execute --verbose=2 "$app" >/dev/null 2>&1 \
+    || fail "Developer ID distribution is not accepted by Gatekeeper"
   signing_label="Developer ID"
 fi
 

@@ -95,13 +95,9 @@ wait_for_windows 0
 kill -0 "$pid"
 echo "[macos-smoke] close hid the main window without quitting"
 
-osascript <<APPLESCRIPT
-tell application "System Events"
-  set frontmost of first application process whose unix id is $pid to true
-end tell
-APPLESCRIPT
+open "$app"
 wait_for_windows 1
-echo "[macos-smoke] application activation restored the main window"
+echo "[macos-smoke] LaunchServices activation restored the main window"
 
 osascript <<APPLESCRIPT
 tell application "System Events"

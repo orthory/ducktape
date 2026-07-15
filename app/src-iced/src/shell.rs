@@ -12,9 +12,7 @@ use crate::backend::{
     PossessionRequest, Workspace, WorkspaceSnapshot, decode_link_challenge, encode_link_response,
 };
 #[cfg(feature = "cef-browser")]
-use crate::browser::{
-    Bounds as BrowserBounds, BrowserEvent, BrowserRuntime, ParentWindow, PermissionPrompt,
-};
+use crate::browser::{BrowserRuntime, ParentWindow, PermissionPrompt};
 use crate::browser_chrome;
 use crate::community_service;
 use crate::desktop;
@@ -23,6 +21,8 @@ use crate::huddle_ui;
 use crate::icons::{self, Icon};
 use crate::mac_tray;
 use crate::module_host;
+#[cfg(feature = "cef-browser")]
+use crate::network_content::LocalDocument;
 use crate::notifications;
 use crate::onboarding;
 use crate::operator_service::{self, DesktopPreferences, SettingsContext};
@@ -44,7 +44,14 @@ use crate::transport::{NodeClient, ServerFrame};
 use crate::view_api::{AppIntent, Route};
 use crate::workspace_service;
 
+mod browser_session;
 mod view;
+#[cfg(feature = "cef-browser")]
+use browser_session::bounds as browser_bounds;
+use browser_session::{
+    hide as hide_browser, reset_gateway as reset_browser_gateway,
+    sync_visibility as sync_browser_visibility,
+};
 #[cfg(test)]
 use view::{titlebar_connection, workspace_initials};
 
@@ -196,6 +203,7 @@ enum Message {
     },
     PagePresenceTick,
     ClipboardWritten,
+    ExternalUrlOpened(Result<(), String>),
     Settings(settings_screen::Message),
     Workspace(workspace_screens::Message),
     WorkspaceSnapshotLoaded(Result<WorkspaceSnapshot, String>),
@@ -226,6 +234,15 @@ enum Message {
         generation: u64,
         workspace_id: Option<String>,
         result: Result<String, String>,
+    },
+    #[cfg(feature = "cef-browser")]
+    BrowserLocalDocumentLoaded {
+        generation: u64,
+        request_generation: u64,
+        workspace_id: Option<String>,
+        tab_index: usize,
+        expected_url: String,
+        result: Result<LocalDocument, String>,
     },
     #[cfg(feature = "cef-browser")]
     BrowserParentReady(Result<ParentWindow, String>),
@@ -282,6 +299,10 @@ struct Shell {
     browser_gateway_loading: bool,
     #[cfg(feature = "cef-browser")]
     browser_gateway_generation: u64,
+    #[cfg(feature = "cef-browser")]
+    browser_local_pending: Option<browser_session::PendingLocalDocument>,
+    #[cfg(feature = "cef-browser")]
+    browser_local_generation: u64,
     #[cfg(feature = "cef-browser")]
     browser_permission: Option<PermissionPrompt>,
     pending_display_name: Option<String>,
@@ -342,6 +363,10 @@ impl Default for Shell {
             browser_gateway_loading: false,
             #[cfg(feature = "cef-browser")]
             browser_gateway_generation: 0,
+            #[cfg(feature = "cef-browser")]
+            browser_local_pending: None,
+            #[cfg(feature = "cef-browser")]
+            browser_local_generation: 0,
             #[cfg(feature = "cef-browser")]
             browser_permission: None,
             pending_display_name: None,
@@ -675,6 +700,14 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
         Message::NotificationStream(notifications::StreamEvent::Disconnected) => {}
         Message::NotificationResolved(Some(item)) => return present_notification(state, item),
         Message::NotificationResolved(None) => {}
+        Message::ExternalUrlOpened(Ok(())) => {}
+        Message::ExternalUrlOpened(Err(_)) => {
+            tracing::warn!(
+                target: "ducktape::desktop",
+                reason = "external_url_open_failed",
+                "could not open an external link in the system browser"
+            );
+        }
         Message::BackendLoaded(Ok((backend, snapshot))) => {
             state.stop_terminal();
             let close_huddle = reset_huddle(state);
@@ -1149,208 +1182,41 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             }
             return finish_workspace_connection(state);
         }
-        Message::Browser(message) => {
-            #[cfg(feature = "cef-browser")]
-            let chrome_before = state.browser_chrome.clone();
-            #[cfg(feature = "cef-browser")]
-            let action = message.clone();
-            if let Some(url) = browser_chrome::update(&mut state.browser_chrome, message) {
-                #[cfg(feature = "cef-browser")]
-                if let Some(browser) = &mut state.browser {
-                    let result = match &action {
-                        browser_chrome::Message::NewTab => browser.new_tab(&url),
-                        browser_chrome::Message::SelectTab(index) => browser.select_tab(*index),
-                        browser_chrome::Message::CloseTab(index) => {
-                            browser.close_tab(*index, state.browser_chrome.active_tab, &url)
-                        }
-                        _ => browser.navigate(&url),
-                    };
-                    match result {
-                        Ok(()) => {
-                            state.browser_chrome.loading = false;
-                            state.browser_error = None;
-                        }
-                        Err(error) => {
-                            if matches!(action, browser_chrome::Message::NewTab) {
-                                state.browser_chrome = chrome_before;
-                            }
-                            state.browser_chrome.loading = false;
-                            state.browser_chrome.error = Some(error.clone());
-                            state.browser_error = Some(error);
-                        }
-                    }
-                } else {
-                    return sync_browser_visibility(state);
-                }
-                #[cfg(not(feature = "cef-browser"))]
-                {
-                    let _ = url;
-                    state.browser_chrome.loading = false;
-                    state.browser_chrome.error =
-                        Some("This build does not include the embedded CEF browser.".into());
-                }
-            }
+        Message::Browser(message) => return browser_session::update_chrome(state, message),
+        #[cfg(feature = "cef-browser")]
+        Message::BrowserLocalDocumentLoaded {
+            generation,
+            request_generation,
+            workspace_id,
+            tab_index,
+            expected_url,
+            result,
+        } => {
+            return browser_session::local_document_loaded(
+                state,
+                generation,
+                request_generation,
+                workspace_id,
+                tab_index,
+                expected_url,
+                result,
+            );
         }
         #[cfg(feature = "cef-browser")]
         Message::BrowserGatewayLoaded {
             generation,
             workspace_id,
-            result: Ok(base),
-        } => {
-            if generation != state.browser_gateway_generation
-                || workspace_id != browser_gateway_workspace(state)
-            {
-                return Task::none();
-            }
-            state.browser_gateway_loading = false;
-            if let Err(error) = BrowserRuntime::validate_gateway_base(&base) {
-                state.browser_chrome.loading = false;
-                state.browser_chrome.error = Some(error.clone());
-                state.browser_error = Some(error);
-                return Task::none();
-            }
-            if let Some(browser) = &mut state.browser {
-                if let Err(error) = browser.set_gateway_base(Some(base.clone())) {
-                    state.browser_chrome.loading = false;
-                    state.browser_chrome.error = Some(error.clone());
-                    state.browser_error = Some(error);
-                    return Task::none();
-                }
-                if let Ok(url) = state.browser_chrome.url() {
-                    let result = if browser.has_surface() {
-                        browser.navigate(&url)
-                    } else {
-                        browser.reopen(&url)
-                    };
-                    if let Err(error) = result {
-                        state.browser_chrome.loading = false;
-                        state.browser_chrome.error = Some(error.clone());
-                        state.browser_error = Some(error);
-                        return Task::none();
-                    }
-                }
-                state.browser_gateway_base = Some(base);
-                state.browser_chrome.loading = false;
-                return sync_browser_visibility(state);
-            }
-            state.browser_gateway_base = Some(base);
-            return Task::done(Message::BrowserWindowReady(state.desktop.main));
-        }
+            result,
+        } => return browser_session::gateway_loaded(state, generation, workspace_id, result),
         #[cfg(feature = "cef-browser")]
-        Message::BrowserGatewayLoaded {
-            generation,
-            workspace_id,
-            result: Err(error),
-        } => {
-            if generation != state.browser_gateway_generation
-                || workspace_id != browser_gateway_workspace(state)
-            {
-                return Task::none();
-            }
-            state.browser_gateway_loading = false;
-            state.browser_chrome.loading = false;
-            state.browser_chrome.error = Some(error.clone());
-            state.browser_error = Some(error);
-        }
+        Message::BrowserWindowReady(id) => return browser_session::window_ready(state, id),
         #[cfg(feature = "cef-browser")]
-        Message::BrowserWindowReady(Some(id)) => {
-            return window::run(id, ParentWindow::from_iced).map(Message::BrowserParentReady);
-        }
+        Message::BrowserParentReady(result) => return browser_session::parent_ready(state, result),
         #[cfg(feature = "cef-browser")]
-        Message::BrowserWindowReady(None) => {
-            state.browser_error = Some("iced did not expose its native window".into());
-        }
-        #[cfg(feature = "cef-browser")]
-        Message::BrowserParentReady(Ok(parent)) => {
-            let url = state
-                .browser_chrome
-                .url()
-                .unwrap_or_else(|_| "duck://net.duck/".into());
-            match BrowserRuntime::create_with_gateway(
-                parent,
-                browser_bounds(state.window_size),
-                &url,
-                state.browser_gateway_base.clone(),
-            ) {
-                Ok(browser) => {
-                    state.browser = Some(browser);
-                    state.browser_chrome.loading = false;
-                    state.browser_error = None;
-                    return sync_browser_visibility(state);
-                }
-                Err(error) => {
-                    state.browser_chrome.loading = false;
-                    state.browser_chrome.error = Some(error.clone());
-                    state.browser_error = Some(error);
-                }
-            }
-        }
-        #[cfg(feature = "cef-browser")]
-        Message::BrowserParentReady(Err(error)) => {
-            state.browser_error = Some(error);
-        }
-        #[cfg(feature = "cef-browser")]
-        Message::BrowserPump => {
-            let page_visible =
-                state.screen() == Screen::Browser && !state.workspace_overlay && !state.search.open;
-            if let Some(browser) = &mut state.browser {
-                browser.pump();
-                if state.quitting
-                    && let Err(error) = browser.begin_shutdown()
-                {
-                    tracing::warn!(
-                        target: "ducktape::browser",
-                        reason = "close_request_failed",
-                        error = %error,
-                        "CEF browser close request was only partially applied"
-                    );
-                }
-                for event in browser.take_events() {
-                    match event {
-                        BrowserEvent::NavigationCommitted { browser_id, url } => {
-                            let Some(tab_index) = browser.tab_index(browser_id) else {
-                                continue;
-                            };
-                            if let Err(error) = browser_chrome::commit_navigation(
-                                &mut state.browser_chrome,
-                                tab_index,
-                                &url,
-                            ) {
-                                state.browser_chrome.error = Some(error);
-                            }
-                        }
-                    }
-                }
-                let prompt = browser.permission_prompt();
-                if prompt != state.browser_permission {
-                    state.browser_permission = prompt;
-                    let visible = state.browser_permission.is_none() && page_visible;
-                    if let Err(error) = browser.set_visible(visible) {
-                        state.browser_error = Some(error);
-                    }
-                }
-            }
-            if state.quitting {
-                return finish_quit(state);
-            }
-        }
+        Message::BrowserPump => return browser_session::pump(state),
         #[cfg(feature = "cef-browser")]
         Message::BrowserPermissionDecision { id, allow, session } => {
-            let page_visible =
-                state.screen() == Screen::Browser && !state.workspace_overlay && !state.search.open;
-            if state.browser_permission.as_ref().map(|prompt| prompt.id) == Some(id)
-                && let Some(browser) = &mut state.browser
-            {
-                match browser.decide_permission(id, allow, session) {
-                    Ok(()) => {
-                        state.browser_permission = None;
-                        if let Err(error) = browser.set_visible(page_visible) {
-                            state.browser_error = Some(error);
-                        }
-                    }
-                    Err(error) => state.browser_error = Some(error),
-                }
-            }
+            return browser_session::decide_permission(state, id, allow, session);
         }
         Message::Window(action) => {
             return Task::done(Message::WindowReady(action, state.desktop.main));
@@ -1897,99 +1763,6 @@ fn present_notification(state: &mut Shell, item: notifications::Item) -> Task<Me
         notifications::present(item),
         Message::NativeNotificationActivated,
     )
-}
-
-#[cfg(feature = "cef-browser")]
-fn sync_browser_visibility(state: &mut Shell) -> Task<Message> {
-    let visible = state.screen() == Screen::Browser
-        && !state.workspace_overlay
-        && !state.search.open
-        && state.browser_permission.is_none();
-    if state
-        .browser
-        .as_ref()
-        .is_some_and(BrowserRuntime::has_surface)
-    {
-        let browser = state.browser.as_mut().expect("browser presence checked");
-        if let Err(error) = browser.set_visible(visible) {
-            state.browser_error = Some(error);
-        }
-        Task::none()
-    } else if visible {
-        state.browser_chrome.loading = true;
-        if state.browser_gateway_base.is_some() {
-            if let Some(browser) = &mut state.browser {
-                let result = state
-                    .browser_chrome
-                    .url()
-                    .and_then(|url| browser.reopen(&url));
-                match result {
-                    Ok(()) => {
-                        state.browser_chrome.loading = false;
-                        if let Err(error) = browser.set_visible(true) {
-                            state.browser_error = Some(error);
-                        }
-                    }
-                    Err(error) => {
-                        state.browser_chrome.loading = false;
-                        state.browser_chrome.error = Some(error.clone());
-                        state.browser_error = Some(error);
-                    }
-                }
-                Task::none()
-            } else {
-                Task::done(Message::BrowserWindowReady(state.desktop.main))
-            }
-        } else if state.browser_gateway_loading {
-            Task::none()
-        } else if let Some(client) = state.node_client.clone() {
-            state.browser_gateway_loading = true;
-            let generation = state.browser_gateway_generation;
-            let workspace_id = browser_gateway_workspace(state);
-            Task::perform(
-                async move {
-                    client
-                        .gateway_browser_base()
-                        .await
-                        .map_err(|error| error.to_string())
-                },
-                move |result| Message::BrowserGatewayLoaded {
-                    generation,
-                    workspace_id,
-                    result,
-                },
-            )
-        } else {
-            state.browser_chrome.loading = false;
-            state.browser_chrome.error = Some("Connect a workspace to browse .duck routes.".into());
-            Task::none()
-        }
-    } else {
-        Task::none()
-    }
-}
-
-#[cfg(not(feature = "cef-browser"))]
-fn sync_browser_visibility(state: &mut Shell) -> Task<Message> {
-    if state.screen() == Screen::Browser && !state.workspace_overlay && !state.search.open {
-        state.browser_chrome.error =
-            Some("This build does not include the embedded CEF browser.".into());
-    }
-    Task::none()
-}
-
-#[cfg(feature = "cef-browser")]
-fn browser_bounds(size: Size) -> BrowserBounds {
-    BrowserBounds {
-        x: (NETWORK_RAIL_WIDTH + MODULE_RAIL_WIDTH) as i32,
-        y: (TITLEBAR_HEIGHT + 36.0 + 48.0) as i32,
-        width: (size.width - NETWORK_RAIL_WIDTH - MODULE_RAIL_WIDTH)
-            .max(1.0)
-            .round() as i32,
-        height: (size.height - TITLEBAR_HEIGHT - 36.0 - 48.0)
-            .max(1.0)
-            .round() as i32,
-    }
 }
 
 fn execute_onboarding(backend: Option<Backend>, command: onboarding::Command) -> Task<Message> {
@@ -2548,6 +2321,17 @@ fn execute_terminal(state: &mut Shell, effect: terminal_screen::Effect) -> Task<
                 terminal_failed(state, generation, "Terminal input queue is unavailable.");
             }
         }
+        terminal_screen::Effect::Copy(value) => {
+            return iced::clipboard::write(value).map(|()| Message::ClipboardWritten);
+        }
+        terminal_screen::Effect::ReadClipboard { generation } => {
+            return iced::clipboard::read().map(move |value| {
+                Message::Terminal(terminal_screen::Message::Paste {
+                    generation,
+                    value: value.unwrap_or_default(),
+                })
+            });
+        }
         terminal_screen::Effect::Resize {
             generation,
             cols,
@@ -2770,22 +2554,10 @@ fn open_app_intent(state: &mut Shell, intent: AppIntent) -> Task<Message> {
             );
             Task::none()
         }
-        AppIntent::OpenExternal(address) => {
-            state.navigate(Screen::Browser);
-            state.browser_chrome.address = address;
-            if let Some(_url) =
-                browser_chrome::update(&mut state.browser_chrome, browser_chrome::Message::Open)
-            {
-                #[cfg(feature = "cef-browser")]
-                if let Some(browser) = &state.browser
-                    && let Err(error) = browser.navigate(&_url)
-                {
-                    state.browser_chrome.loading = false;
-                    state.browser_chrome.error = Some(error);
-                }
-            }
-            sync_browser_visibility(state)
-        }
+        AppIntent::OpenExternal(address) => Task::perform(
+            crate::external_url::open(address),
+            Message::ExternalUrlOpened,
+        ),
         AppIntent::PopOutHuddle => Task::done(Message::Huddle(huddle_ui::Message::PopOut)),
     }
 }
@@ -3030,41 +2802,6 @@ fn workspace_for_screen(workspace: Workspace) -> workspace_screens::Workspace {
     }
 }
 
-#[cfg(feature = "cef-browser")]
-fn hide_browser(state: &mut Shell) {
-    if let Some(browser) = &mut state.browser {
-        let _ = browser.set_visible(false);
-    }
-}
-
-#[cfg(not(feature = "cef-browser"))]
-fn hide_browser(_state: &mut Shell) {}
-
-#[cfg(feature = "cef-browser")]
-fn reset_browser_gateway(state: &mut Shell) {
-    state.browser_gateway_generation = state.browser_gateway_generation.wrapping_add(1);
-    state.browser_gateway_base = None;
-    state.browser_gateway_loading = false;
-    state.browser_chrome = browser_chrome::State::default();
-    state.browser_permission = None;
-    if let Some(browser) = &mut state.browser
-        && let Err(error) = browser.reset_workspace()
-    {
-        state.browser_error = Some(error);
-    }
-}
-
-#[cfg(feature = "cef-browser")]
-fn browser_gateway_workspace(state: &Shell) -> Option<String> {
-    state
-        .active_workspace
-        .as_ref()
-        .map(|workspace| workspace.id.clone())
-}
-
-#[cfg(not(feature = "cef-browser"))]
-fn reset_browser_gateway(_state: &mut Shell) {}
-
 const fn user_screen(screen: Screen) -> Option<user_screens::Screen> {
     match screen {
         Screen::Home => Some(user_screens::Screen::Home),
@@ -3175,9 +2912,11 @@ mod tests {
     #[cfg(feature = "cef-browser")]
     #[test]
     fn stale_browser_gateway_result_is_ignored() {
-        let mut shell = Shell::default();
-        shell.browser_gateway_generation = 9;
-        shell.browser_gateway_loading = true;
+        let mut shell = Shell {
+            browser_gateway_generation: 9,
+            browser_gateway_loading: true,
+            ..Shell::default()
+        };
         drop(update(
             &mut shell,
             Message::BrowserGatewayLoaded {
@@ -3187,6 +2926,75 @@ mod tests {
             },
         ));
         assert!(shell.browser_gateway_loading);
+        assert!(shell.browser_gateway_base.is_none());
+    }
+
+    #[cfg(feature = "cef-browser")]
+    #[test]
+    fn stale_network_reload_result_is_ignored() {
+        let mut shell = Shell {
+            node_client: Some(NodeClient::new("https://node.example").unwrap()),
+            ..Shell::default()
+        };
+        drop(update(
+            &mut shell,
+            Message::Browser(browser_chrome::Message::Open),
+        ));
+        assert_eq!(shell.browser_local_generation, 1);
+        drop(update(
+            &mut shell,
+            Message::Browser(browser_chrome::Message::Reload),
+        ));
+        assert_eq!(shell.browser_local_generation, 2);
+
+        drop(update(
+            &mut shell,
+            Message::BrowserLocalDocumentLoaded {
+                generation: 0,
+                request_generation: 1,
+                workspace_id: None,
+                tab_index: 0,
+                expected_url: "duck://net.duck/".into(),
+                result: Ok(LocalDocument {
+                    url: "duck://net.duck/".into(),
+                    bytes: std::sync::Arc::from(b"old".as_slice()),
+                    snapshot: "old".into(),
+                    title: "net.duck".into(),
+                }),
+            },
+        ));
+
+        assert!(shell.browser_chrome.loading);
+        assert!(shell.browser_local_pending.is_none());
+        assert!(shell.browser.is_none());
+        assert!(shell.browser_chrome.error.is_none());
+    }
+
+    #[cfg(feature = "cef-browser")]
+    #[test]
+    fn fresh_tab_network_open_starts_local_load_without_gateway() {
+        let mut shell = Shell {
+            node_client: Some(NodeClient::new("https://node.example").unwrap()),
+            ..Shell::default()
+        };
+        shell.navigate(Screen::Browser);
+        drop(update(
+            &mut shell,
+            Message::Browser(browser_chrome::Message::NewTab),
+        ));
+        assert_eq!(shell.browser_chrome.active_tab, 1);
+        assert_eq!(shell.browser_chrome.runtime_url(), browser_chrome::IDLE_URL);
+
+        drop(update(
+            &mut shell,
+            Message::Browser(browser_chrome::Message::Open),
+        ));
+
+        assert_eq!(shell.browser_chrome.active_tab, 1);
+        assert_eq!(shell.browser_chrome.runtime_url(), "duck://net.duck/");
+        assert!(shell.browser_chrome.loading);
+        assert_eq!(shell.browser_local_generation, 1);
+        assert!(!shell.browser_gateway_loading);
         assert!(shell.browser_gateway_base.is_none());
     }
 
@@ -3204,6 +3012,7 @@ mod tests {
         reset_browser_gateway(&mut shell);
 
         assert_eq!(shell.browser_gateway_generation, 10);
+        assert_eq!(shell.browser_local_generation, 1);
         assert!(shell.browser_gateway_base.is_none());
         assert!(!shell.browser_gateway_loading);
         assert_eq!(shell.browser_chrome, browser_chrome::State::default());
@@ -3211,11 +3020,12 @@ mod tests {
 
     #[cfg(feature = "cef-browser")]
     #[test]
-    fn invalid_browser_gateway_is_not_persisted_before_cef_exists() {
+    fn gateway_result_is_discarded_after_switching_to_net_duck() {
         let mut shell = Shell {
             browser_gateway_loading: true,
             ..Shell::default()
         };
+        browser_chrome::update(&mut shell.browser_chrome, browser_chrome::Message::Open);
 
         drop(update(
             &mut shell,
@@ -3228,7 +3038,7 @@ mod tests {
 
         assert!(!shell.browser_gateway_loading);
         assert!(shell.browser_gateway_base.is_none());
-        assert!(shell.browser_chrome.error.is_some());
+        assert!(shell.browser_chrome.error.is_none());
     }
 
     #[test]
@@ -3236,6 +3046,50 @@ mod tests {
         assert_eq!(workspace_initials("Duck Tape"), "DT");
         assert_eq!(workspace_initials("forge"), "F");
         assert_eq!(workspace_initials(""), "?");
+    }
+
+    #[test]
+    fn idle_browser_does_not_start_gateway_or_replace_its_empty_state() {
+        let mut shell = Shell::default();
+        shell.navigate(Screen::Browser);
+
+        drop(sync_browser_visibility(&mut shell));
+
+        assert!(shell.browser_chrome.is_idle());
+        assert!(!shell.browser_chrome.loading);
+        assert!(shell.browser_chrome.error.is_none());
+        #[cfg(feature = "cef-browser")]
+        assert!(!shell.browser_gateway_loading);
+    }
+
+    #[test]
+    fn external_intents_do_not_enter_the_embedded_browser() {
+        let mut shell = Shell {
+            backend_error: Some("existing backend failure".into()),
+            ..Shell::default()
+        };
+        let chrome = shell.browser_chrome.clone();
+
+        drop(open_app_intent(
+            &mut shell,
+            AppIntent::OpenExternal("https://example.com/docs".into()),
+        ));
+
+        assert_eq!(shell.screen(), Screen::Chat);
+        assert_eq!(shell.browser_chrome, chrome);
+        assert_eq!(
+            shell.backend_error.as_deref(),
+            Some("existing backend failure")
+        );
+
+        drop(update(
+            &mut shell,
+            Message::ExternalUrlOpened(Err("opener unavailable".into())),
+        ));
+        assert_eq!(
+            shell.backend_error.as_deref(),
+            Some("existing backend failure")
+        );
     }
 
     #[test]

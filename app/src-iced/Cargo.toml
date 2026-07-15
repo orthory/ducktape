@@ -11,6 +11,9 @@ default = ["cef-browser"]
 cef-browser = ["dep:cef", "dep:cef-dll-sys", "dep:x11-dl"]
 
 [dependencies]
+ammonia = "4.1.3"
+html5ever = "0.39.0"
+markup5ever_rcdom = "0.39.0"
 cef = { version = "=148.0.0", features = ["build-util", "linux-x11", "sandbox"], optional = true }
 # cef's published manifest permits newer 148.x bindings, which are not wire-
 # compatible with its generated 148.0.0 wrapper. Pin both halves explicitly.
@@ -29,6 +32,8 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+gateway.workspace = true
+duckdns.workspace = true
 vt100 = "=0.16.2"
 tiny_http = "0.12"
 toml = "0.8"
