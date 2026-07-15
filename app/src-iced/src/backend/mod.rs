@@ -41,8 +41,7 @@ pub use link::{
 pub use sandbox::{ProbeResult, SandboxChoice};
 #[allow(unused_imports)]
 pub use signing::{
-    AddMemberRequest, AdminProofRequest, BindRequest, ContentTarget, PossessionRequest,
-    RemoveMemberRequest,
+    AddMemberRequest, BindRequest, ContentTarget, PossessionRequest, RemoveMemberRequest,
 };
 #[allow(unused_imports)]
 pub use workspace_service::{

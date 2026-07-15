@@ -232,17 +232,20 @@ async fn run(
                 }
             },
             outgoing = media.outgoing.recv() => {
-                if let Some(frame) = outgoing {
-                    let encoded = match encode_driver(frame) {
-                        Ok(encoded) => encoded,
-                        Err(error) => {
-                            tracing::debug!(target: "ducktape::huddle", event = "media_frame_dropped", reason = "invalid_driver_frame", detail = %error);
-                            continue;
-                        }
-                    };
-                    if sink.send(Message::Binary(encoded)).await.is_err() {
-                        break;
+                // The media worker's Sender is dropped when it exits (e.g. mic
+                // capture failed to start on a live call). Without this break
+                // the closed channel is instantly Ready every poll and select!
+                // busy-spins a full core. The sibling arms break on None too.
+                let Some(frame) = outgoing else { break };
+                let encoded = match encode_driver(frame) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        tracing::debug!(target: "ducktape::huddle", event = "media_frame_dropped", reason = "invalid_driver_frame", detail = %error);
+                        continue;
                     }
+                };
+                if sink.send(Message::Binary(encoded)).await.is_err() {
+                    break;
                 }
             },
             incoming = stream.next() => match incoming {

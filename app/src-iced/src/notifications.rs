@@ -368,7 +368,7 @@ impl OpRow {
 
 fn chat_message(message: &Value, row: &OpRow, config: &Config) -> Option<Matched> {
     let author = row.external_author()?;
-    if is_me(config, author) {
+    if is_me_user(config, author) {
         return None;
     }
     let channel = message.get("channel_id")?.as_str()?;
@@ -405,7 +405,7 @@ fn chat_message(message: &Value, row: &OpRow, config: &Config) -> Option<Matched
 
 fn pages(row: &OpRow, config: &Config) -> Option<Item> {
     let author = row.external_author()?;
-    if is_me(config, author) {
+    if is_me_user(config, author) {
         return None;
     }
     let payload = row.payload.as_ref()?;
@@ -523,6 +523,17 @@ fn is_me(config: &Config, key: &str) -> bool {
         .self_node_keys
         .iter()
         .any(|mine| mine.eq_ignore_ascii_case(key))
+}
+
+/// Chat/pages ops are account-signed, so their external author is the account
+/// (user) key, not a node key. Filtering these against `self_node_keys` never
+/// matches — use the account identity so you don't get notified about your own
+/// content.
+fn is_me_user(config: &Config, key: &str) -> bool {
+    config
+        .self_user_key
+        .as_deref()
+        .is_some_and(|me| me.eq_ignore_ascii_case(key))
 }
 
 fn display_name(config: &Config, key: &str) -> String {

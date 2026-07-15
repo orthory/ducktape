@@ -679,7 +679,23 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
         ServiceEvent::IdentityRestored(Ok(()))
         | ServiceEvent::IdentityUnlocked(Ok(()))
         | ServiceEvent::TouchIdUnlocked(Ok(())) => finish(state, Command::GateCompleted),
-        ServiceEvent::TouchIdEnrolled(_) => finish(state, Command::GateCompleted),
+        ServiceEvent::TouchIdEnrolled(Ok(())) => finish(state, Command::GateCompleted),
+        ServiceEvent::TouchIdEnrolled(Err(error)) => {
+            // Do NOT finish(): a swallowed enrollment failure would falsely
+            // report onboarding success while leaving the account with neither
+            // a working Touch ID credential nor a password. Stay on-screen with
+            // a visible error; the proceed button re-issues enrollment.
+            state.error = Some(
+                if error == "touchid-canceled" || error.starts_with("touchid-unavailable") {
+                    "Touch ID setup didn't finish. Your recovery phrase is your only way back \
+                     in — keep it safe, then retry Touch ID."
+                        .into()
+                } else {
+                    error
+                },
+            );
+            None
+        }
         ServiceEvent::LinkIdentityPrepared(Ok(())) => {
             state.password.zeroize();
             state.confirm_password.zeroize();

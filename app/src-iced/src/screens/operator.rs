@@ -743,15 +743,32 @@ fn short(value: &str, start: usize, end: usize) -> String {
     if value.is_empty() {
         return "—".into();
     }
-    if value.len() <= start + end + 1 {
+    // Node-status strings (peer keys, app_hash, module roots) come from the
+    // connected node, which is untrusted in Remote mode; slice on char
+    // boundaries so a multibyte value cannot panic the render loop.
+    let count = value.chars().count();
+    if count <= start + end + 1 {
         return value.into();
     }
-    format!("{}…{}", &value[..start], &value[value.len() - end..])
+    let head: String = value.chars().take(start).collect();
+    let tail: String = value.chars().skip(count - end).collect();
+    format!("{head}…{tail}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_never_panics_on_multibyte_node_values() {
+        // A multibyte codepoint straddling the byte offsets used to slice.
+        let value = "aaaaaaaaaaaa\u{1F600}bbbbbbbbbb";
+        let out = short(value, 12, 8);
+        assert!(out.contains('…'));
+        // Short and empty inputs are returned whole / dashed, not sliced.
+        assert_eq!(short("", 12, 8), "—");
+        assert_eq!(short("\u{20AC}\u{20AC}", 12, 8), "\u{20AC}\u{20AC}");
+    }
 
     #[test]
     fn every_operator_screen_loads_through_a_typed_command() {

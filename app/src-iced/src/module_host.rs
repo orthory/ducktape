@@ -436,7 +436,6 @@ fn is_chat_event(event: &user::ServiceEvent) -> bool {
             | user::ServiceEvent::ChannelLoaded(_)
             | user::ServiceEvent::MessageWindowLoaded { .. }
             | user::ServiceEvent::ThreadLoaded(_)
-            | user::ServiceEvent::ChannelMembersLoaded(_)
             | user::ServiceEvent::ChatTagsLoaded(_)
             | user::ServiceEvent::ChatHitsLoaded(_)
             | user::ServiceEvent::ChatAttachmentUploaded(_)

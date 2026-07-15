@@ -238,6 +238,12 @@ pub async fn load_files(client: Option<NodeClient>) -> Result<Vec<FileHit>, Stri
     };
     let mut files = Vec::new();
     let mut after: Option<String> = None;
+    // The entry cap alone cannot bound this loop: empty pages carrying a
+    // cycling `next` cursor (A,B,A,B,…) advance the cursor every iteration
+    // while `files` stays empty, so a buggy/malicious node could spin it
+    // forever. Cap the page count too — a full legitimate catalog needs at
+    // most FILE_CATALOG_CAP / FILE_PAGE_SIZE pages plus a little slack.
+    let mut pages_seen = 0usize;
     loop {
         let reply = client
             .query(
@@ -257,6 +263,10 @@ pub async fn load_files(client: Option<NodeClient>) -> Result<Vec<FileHit>, Stri
         files.extend(page.entries);
         if files.len() > FILE_CATALOG_CAP {
             return Err("file catalog exceeds the desktop search limit".into());
+        }
+        pages_seen += 1;
+        if pages_seen > FILE_CATALOG_CAP / FILE_PAGE_SIZE + 4 {
+            return Err("file catalog paginated past its limit".into());
         }
         match page.next {
             Some(next) if after.as_ref() != Some(&next) => after = Some(next),

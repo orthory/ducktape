@@ -323,7 +323,6 @@ pub enum ServiceEvent {
         result: Result<Vec<ChatMessage>, String>,
     },
     ThreadLoaded(Result<ChatThread, String>),
-    ChannelMembersLoaded(Result<Vec<String>, String>),
     ChatTagsLoaded(Result<Vec<ChatTag>, String>),
     ChatHitsLoaded(Result<Vec<ChatHit>, String>),
     ChatAttachmentUploaded(Result<String, String>),
@@ -652,14 +651,6 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
             Ok(thread) => {
                 if let Resource::Ready(data) = &mut state.chat.data {
                     data.thread = Some(thread);
-                }
-            }
-            Err(error) => state.chat.error = Some(error),
-        },
-        ServiceEvent::ChannelMembersLoaded(result) => match result {
-            Ok(members) => {
-                if let Resource::Ready(data) = &mut state.chat.data {
-                    data.members = members;
                 }
             }
             Err(error) => state.chat.error = Some(error),

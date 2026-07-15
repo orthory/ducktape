@@ -231,6 +231,10 @@ pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option
             state.reply_draft.clear();
             state.editing = None;
             state.edit_draft.clear();
+            // A pending delete confirmation is scoped to the channel it was
+            // opened in; switching channels must drop it or the confirm would
+            // delete that sequence in the newly-selected channel.
+            state.pending_delete = None;
             state.rename_draft = match &state.data {
                 Resource::Ready(data) => data
                     .channels
@@ -397,6 +401,7 @@ pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option
         ChatMessageEvent::OpenLink(ChatLink::Channel { id, sequence }) => {
             state.active_channel = Some(id.clone());
             state.tag_filter = None;
+            state.pending_delete = None;
             if let Resource::Ready(data) = &mut state.data {
                 data.thread = None;
                 data.hits.clear();
@@ -782,10 +787,15 @@ fn chat_empty_shell<'a>(
                     stream = stream.push(tags);
                 }
             }
+            let mut last_day: Option<&str> = None;
             for message in messages {
-                if let Some(day) = &message.day {
-                    stream = stream.push(day_divider(day, p));
+                let day = message.day.as_deref();
+                if let Some(label) = day {
+                    if day != last_day {
+                        stream = stream.push(day_divider(label, p));
+                    }
                 }
+                last_day = day;
                 stream = stream.push(message_row(
                     message,
                     channel.archived,

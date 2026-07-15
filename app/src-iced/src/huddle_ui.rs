@@ -461,6 +461,18 @@ fn tick(
             }
         }
     }
+    // A node can beacon an unbounded number of distinct peer keys over a long
+    // huddle; nothing else evicts them, so prune both maps down to the current
+    // membership. `channel()` borrows `chat`, not `runtime`, so there is no
+    // conflict with the mutable peer-map borrows.
+    if let Some(channel) = channel(chat, &runtime.channel) {
+        let members: std::collections::BTreeSet<&str> =
+            channel.huddle.iter().map(|member| member.node.as_str()).collect();
+        runtime.peers.retain(|key, _| members.contains(key.as_str()));
+        runtime
+            .peer_frames
+            .retain(|key, _| members.contains(key.as_str()));
+    }
     if let Some(error) = terminal {
         let now = std::time::Instant::now();
         let reconnect = error.is_none()

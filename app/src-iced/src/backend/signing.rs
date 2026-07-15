@@ -16,7 +16,6 @@ const MAX_LABEL_BYTES: usize = 64;
 const MAX_STATEMENT_BYTES: usize = 4 * 1024;
 const MAX_POSSESSION_BYTES: usize = 16 * 1024;
 const MAX_PAYLOAD_HEX_BYTES: usize = 47 * 1024;
-const MAX_ADMIN_PATH_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BindRequest {
@@ -49,24 +48,6 @@ pub struct RemoveMemberRequest {
     pub account_id: String,
     pub target_pubkey: String,
     pub nonce: u64,
-}
-
-#[derive(Clone)]
-pub struct AdminProofRequest {
-    pub method: String,
-    pub path: String,
-    pub node_pubkey: String,
-}
-
-impl std::fmt::Debug for AdminProofRequest {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AdminProofRequest")
-            .field("method", &self.method)
-            .field("path", &"[REDACTED]")
-            .field("node_pubkey", &self.node_pubkey)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,11 +216,6 @@ impl Backend {
             .await
     }
 
-    pub async fn sign_files_frame(&self, payload_hex: String) -> Result<String, String> {
-        self.sign_content_frame(ContentTarget::Files, payload_hex)
-            .await
-    }
-
     pub async fn sign_content_frame(
         &self,
         target: ContentTarget,
@@ -252,25 +228,6 @@ impl Backend {
             .await
     }
 
-    pub async fn sign_admin_proof(&self, request: AdminProofRequest) -> Result<String, String> {
-        let root = self.root.clone();
-        self.control
-            .run(move || {
-                validate_admin_method(&request.method)?;
-                validate_admin_path(&request.path)?;
-                validate_ed25519_key(&request.node_pubkey, "node public key")?;
-                run_sign_verb(
-                    &root,
-                    "user-sign-admin",
-                    &[
-                        ("--method", &request.method),
-                        ("--path", &request.path),
-                        ("--node-key", &request.node_pubkey),
-                    ],
-                )
-            })
-            .await
-    }
 }
 
 fn run_sign_verb(root: &Path, verb: &str, flags: &[(&str, &str)]) -> Result<String, String> {
@@ -389,26 +346,6 @@ fn validate_label(label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_admin_method(method: &str) -> Result<(), String> {
-    if matches!(method, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
-        Ok(())
-    } else {
-        Err("admin request method is not allowed".to_string())
-    }
-}
-
-fn validate_admin_path(path: &str) -> Result<(), String> {
-    if path.len() <= MAX_ADMIN_PATH_BYTES
-        && path.starts_with("/v1/admin/")
-        && !path.contains('#')
-        && !path.chars().any(char::is_control)
-    {
-        Ok(())
-    } else {
-        Err("admin request path is not a bounded /v1/admin path".to_string())
-    }
-}
-
 fn nonempty_output(stdout: &str, verb: &str) -> Result<String, String> {
     let output = last_line(stdout);
     if output.is_empty() {
@@ -463,15 +400,6 @@ mod tests {
         assert!(validate_member_key(&"11".repeat(32), MemberKeyKind::P256).is_err());
         assert!(validate_label(&"x".repeat(MAX_LABEL_BYTES)).is_ok());
         assert!(validate_label(&"x".repeat(MAX_LABEL_BYTES + 1)).is_err());
-    }
-
-    #[test]
-    fn admin_proofs_are_scoped_to_the_admin_surface() {
-        assert!(validate_admin_method("POST").is_ok());
-        assert!(validate_admin_method("CONNECT").is_err());
-        assert!(validate_admin_path("/v1/admin/shutdown").is_ok());
-        assert!(validate_admin_path("/v1/submit/frame").is_err());
-        assert!(validate_admin_path("https://example.test/v1/admin/x").is_err());
     }
 
     #[test]

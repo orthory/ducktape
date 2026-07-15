@@ -547,6 +547,27 @@ fn clock_time(timestamp: u64) -> String {
     format!("{:02}:{:02}", seconds / 3_600, seconds / 60 % 60)
 }
 
+/// A UTC calendar-date label ("Jul 16, 2026") for a unix-seconds timestamp,
+/// used to head each day's messages with a divider. Same UTC basis as
+/// `clock_time`. Uses Hinnant's exact days-from-civil algorithm — no date crate.
+fn day_label(timestamp: u64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (timestamp / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{} {}, {}", MONTHS[(month - 1) as usize], day, year)
+}
+
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if value.is_empty()
@@ -570,6 +591,15 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn day_label_is_exact_across_epoch_and_leap_day() {
+        assert_eq!(day_label(0), "Jan 1, 1970");
+        // 1972-02-29 is day 789 since the epoch; a naive year*365 would miss it.
+        assert_eq!(day_label(789 * 86_400), "Feb 29, 1972");
+        // Any within-day second maps to the same civil date.
+        assert_eq!(day_label(789 * 86_400 + 86_399), "Feb 29, 1972");
+    }
 
     #[test]
     fn page_comment_mentions_share_the_strict_chat_mention_grammar() {

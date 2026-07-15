@@ -1733,7 +1733,12 @@ fn short_key(value: &str) -> String {
     } else if value.len() <= 16 {
         value.into()
     } else {
-        format!("{}…{}", &value[..8], &value[value.len() - 8..])
+        // Char-based slicing: proposal ids arrive from the wire unvalidated for
+        // UTF-8 boundaries, so a byte slice at 8 would panic mid-codepoint.
+        let head: String = value.chars().take(8).collect();
+        let count = value.chars().count();
+        let tail: String = value.chars().skip(count.saturating_sub(8)).collect();
+        format!("{head}…{tail}")
     }
 }
 

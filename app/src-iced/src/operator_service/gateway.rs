@@ -403,7 +403,8 @@ fn gateway_audience(draft: &operator::GatewayDraft) -> Result<Value, String> {
         operator::RouteAudience::Accounts => {
             let mut accounts = draft
                 .audience_accounts
-                .iter()
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|token| !token.is_empty())
                 .map(|account| {
                     let bytes = decode_hex(account)?;
                     if !(1..=128).contains(&bytes.len()) {
@@ -1068,7 +1069,8 @@ fn gateway_draft(record: &Value, handle: Option<&str>) -> Result<operator::Gatew
                     }
                 })
             })
-            .collect::<Result<_, _>>()?,
+            .collect::<Result<Vec<String>, String>>()?
+            .join(" "),
         default_path: "index.html".into(),
         // The port is deliberately node-local and absent from the consensus record.
         port: "3000".into(),

@@ -1037,25 +1037,29 @@ impl StreamBody {
                     self.cursor = 0;
                 }
                 Err(TryRecvError::Empty) => {
-                    *self
+                    // Hold the wake-slot guard across the store, the re-check,
+                    // and the take-back. Otherwise the producer's wake() can
+                    // take-and-fire the just-stored closure in the gap while
+                    // this read also completes synchronously below — a double
+                    // completion that races the read buffer. No deadlock: this
+                    // never blocks while holding the guard (try_recv is
+                    // non-blocking), and wake() releases the slot before its
+                    // closure acquires the stream mutex.
+                    let mut slot = self
                         .wake
                         .lock()
-                        .unwrap_or_else(|poison| poison.into_inner()) = Some(Box::new(wake));
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    *slot = Some(Box::new(wake));
                     match self.body_rx.try_recv() {
                         Ok(chunk) => {
-                            self.wake
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .take();
+                            slot.take();
+                            drop(slot);
                             self.leftover = chunk;
                             self.cursor = 0;
                         }
                         Err(TryRecvError::Empty) => return ReadOutcome::Pending,
                         Err(TryRecvError::Disconnected) => {
-                            self.wake
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .take();
+                            slot.take();
                             return ReadOutcome::Done;
                         }
                     }

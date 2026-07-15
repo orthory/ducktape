@@ -15,6 +15,12 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: "./src/test-setup.ts",
+    // The jsdom UI suite runs many files across forks; on a loaded/oversubscribed
+    // runner a `waitFor` can jitter well past the 1s default and flake. Give it
+    // real headroom (asyncUtilTimeout is raised to 10s in test-setup.ts) while
+    // keeping testTimeout strictly above it, so a genuine hang still fails as a
+    // clean waitFor error rather than a bare test-timeout.
+    testTimeout: 15_000,
     // Node ≥22 ships its own global localStorage/sessionStorage; vitest's jsdom
     // env skips globals that already exist, so Node's non-functional stub (no
     // --localstorage-file) shadows jsdom's real Storage and every access throws.

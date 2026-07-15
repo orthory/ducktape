@@ -1,7 +1,15 @@
 import "@testing-library/jest-dom/vitest";
 
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
+
+// The jsdom UI suite runs many files in parallel forks; under CPU
+// oversubscription a `waitFor`/`findBy` occasionally exceeds its 1000ms default
+// and flakes (observed >10s under a 3-way build+test contended box). Give the
+// async utils real headroom, kept below the 15s testTimeout in vite.config.ts
+// so a genuine hang still surfaces as a clean waitFor failure, not a bare
+// test-timeout.
+configure({ asyncUtilTimeout: 10_000 });
 
 type NativeInvoke = (feature: string, args?: unknown) => unknown;
 type NativeEvents = {

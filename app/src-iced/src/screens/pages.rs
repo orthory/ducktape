@@ -977,8 +977,29 @@ fn apply_page_edit(state: &mut State, redo: bool) -> Option<Effect> {
         .blocks
         .iter()
         .position(|block| block.id == edit.block)?;
+    // Undo/redo replaces the block text; its inline marks and comment anchors
+    // must be rebased onto the restored text too, exactly as the forward
+    // `edit_block` path does. Otherwise a mark's UTF-16 range can exceed the
+    // reverted text length and the node silently rejects the commit.
+    let current = page_document(state)?.blocks.get(index)?.text.clone();
     set_editor_text(state, &edit.block, &value, true);
-    page_document_mut(state)?.blocks[index].text = value;
+    let marks = {
+        let block = page_document(state)?.blocks.get(index)?;
+        rebase_marks(&current, &value, &block.marks)
+    };
+    if let Some(block) = page_document_mut(state)?.blocks.get_mut(index) {
+        block.text.clone_from(&value);
+        block.marks = marks;
+    }
+    if let Some(document) = page_document_mut(state) {
+        for thread in &mut document.comment_threads {
+            if thread.target == edit.block {
+                thread.anchor = thread
+                    .anchor
+                    .map(|anchor| rebase_range(&current, &value, anchor));
+            }
+        }
+    }
     if redo {
         state.undo.push(edit);
     } else {

@@ -748,9 +748,18 @@ impl NodeClient {
                         "connecting to node stream"
                     );
                 }
-                let result = client.stream_once(&topics, &mut resume, &sender).await;
+                let mut connected = false;
+                let result = client
+                    .stream_once(&topics, &mut resume, &sender, &mut connected)
+                    .await;
                 if sender.is_closed() {
                     break;
+                }
+                // A session that reached Connected was healthy; a later drop
+                // should reconnect quickly, not inherit the escalated backoff
+                // from earlier failures (which would pin it at the 16s cap).
+                if connected {
+                    attempts = 0;
                 }
                 let reason = result
                     .err()
@@ -778,6 +787,7 @@ impl NodeClient {
         topics: &[String],
         resume: &mut BTreeMap<String, String>,
         sender: &mpsc::Sender<StreamEvent>,
+        connected: &mut bool,
     ) -> Result<(), NodeError> {
         let url = self.websocket_url()?;
         let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
@@ -795,6 +805,7 @@ impl NodeClient {
             .send(StreamEvent::Connected)
             .await
             .map_err(|_| NodeError::new(ErrorKind::Refused, "stream receiver closed"))?;
+        *connected = true;
 
         let mut watchdog = STREAM_WATCHDOG;
         loop {

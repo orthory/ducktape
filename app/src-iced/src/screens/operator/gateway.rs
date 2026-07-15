@@ -130,7 +130,9 @@ pub struct GatewayDraft {
     pub address: String,
     pub target: RouteTarget,
     pub audience: RouteAudience,
-    pub audience_accounts: Vec<String>,
+    /// Raw editor text for the Accounts audience: hex account ids separated by
+    /// commas or whitespace. Tokenized into ids at the save boundary.
+    pub audience_accounts: String,
     pub default_path: String,
     pub port: String,
     pub methods: Vec<RouteMethod>,
@@ -148,7 +150,7 @@ impl Default for GatewayDraft {
             address: "Account ID route".into(),
             target: RouteTarget::DuckFs,
             audience: RouteAudience::Network,
-            audience_accounts: Vec::new(),
+            audience_accounts: String::new(),
             default_path: "index.html".into(),
             port: "3000".into(),
             methods: vec![RouteMethod::Get, RouteMethod::Head],
@@ -187,6 +189,7 @@ pub enum GatewayMessage {
     LabelChanged(String),
     SetTarget(RouteTarget),
     SetAudience(RouteAudience),
+    AccountsChanged(String),
     DefaultPathChanged(String),
     PortChanged(String),
     ToggleMethod(RouteMethod),
@@ -226,6 +229,7 @@ pub(super) fn update(state: &mut GatewayState, message: GatewayMessage) -> Optio
             }
         }
         GatewayMessage::SetAudience(audience) => state.draft.audience = audience,
+        GatewayMessage::AccountsChanged(value) => state.draft.audience_accounts = value,
         GatewayMessage::DefaultPathChanged(value) => state.draft.default_path = value,
         GatewayMessage::PortChanged(value) => state.draft.port = value,
         GatewayMessage::ToggleMethod(method) => {
@@ -311,10 +315,18 @@ fn validate_gateway_draft(draft: &GatewayDraft) -> Result<(), String> {
             return Err("Choose at least one allowed method.".into());
         }
     }
-    if draft.audience == RouteAudience::Accounts && draft.audience_accounts.is_empty() {
+    if draft.audience == RouteAudience::Accounts && account_id_tokens(&draft.audience_accounts).next().is_none() {
         return Err("Choose at least one account for this audience.".into());
     }
     Ok(())
+}
+
+/// Split the Accounts-audience editor text into candidate hex account ids,
+/// separated by commas or whitespace. Shared by validation, the save encoder,
+/// and (indirectly) any UI that echoes the parsed list.
+pub(crate) fn account_id_tokens(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|token| !token.is_empty())
 }
 
 pub(super) fn view(state: &GatewayState, p: Palette) -> Element<'_, Message> {
@@ -535,6 +547,18 @@ fn gateway_editor(state: &GatewayState, can_mutate: bool, p: Palette) -> Element
                 .size(10.5)
                 .color(p.muted_3),
         );
+
+    if draft.audience == RouteAudience::Accounts {
+        // Without this input an Accounts-audience route can never satisfy the
+        // "choose at least one account" gate, making the policy uncreatable.
+        fields = fields.push(labeled_input(
+            "Account IDs · comma or space separated",
+            "acct1 acct2",
+            &draft.audience_accounts,
+            |value| Message::Gateway(GatewayMessage::AccountsChanged(value)),
+            p,
+        ));
+    }
 
     if draft.target == RouteTarget::DuckFs {
         fields = fields

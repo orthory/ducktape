@@ -240,6 +240,20 @@ impl MediaBackend for Backend {
                             ) {
                                 audio = Some(device);
                                 playback_tx = sender;
+                            } else {
+                                // Both the new device and the previous one are
+                                // gone: end the session deterministically
+                                // instead of degrading to a silent no-audio
+                                // call. Mirrors the macOS twin.
+                                emit(
+                                    &events,
+                                    Event::Failed {
+                                        kind: FailureKind::MicrophoneUnavailable,
+                                        detail: "the previous microphone could not be restored"
+                                            .into(),
+                                    },
+                                );
+                                running.store(false, Ordering::Release);
                             }
                         }
                     }
@@ -283,6 +297,19 @@ impl MediaBackend for Backend {
                             ) {
                                 audio = Some(device);
                                 playback_tx = sender;
+                            } else {
+                                // Restoring the previous speaker also failed:
+                                // end the session rather than continue with no
+                                // audio path. Mirrors the macOS twin.
+                                emit(
+                                    &events,
+                                    Event::Failed {
+                                        kind: FailureKind::MicrophoneUnavailable,
+                                        detail: "the previous speaker could not be restored"
+                                            .into(),
+                                    },
+                                );
+                                running.store(false, Ordering::Release);
                             }
                         }
                     }

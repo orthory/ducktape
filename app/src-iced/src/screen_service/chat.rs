@@ -685,7 +685,7 @@ pub(super) fn parse_message(
             blocks_text(head.get("blocks")?)
         },
         time: clock_time(created),
-        day: None,
+        day: Some(day_label(created)),
         replies: head
             .get("reply_count")
             .and_then(Value::as_u64)
