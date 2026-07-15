@@ -16,12 +16,15 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::terminal_contract::SessionMode;
 use crate::transport::NodeClient;
 
 const AGENT: &str = "codex";
 const COMMAND_QUEUE: usize = 64;
 const EVENT_QUEUE: usize = 256;
 const MAX_INPUT_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_ORIGIN_BYTES: usize = 512;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_JSON_BYTES: usize = 384 * 1024;
 const MAX_ID_BYTES: usize = 128;
@@ -34,20 +37,39 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Connected { generation: u64 },
-    Reconnecting { generation: u64, detail: String },
-    Output { generation: u64, bytes: Vec<u8> },
-    Failed { generation: u64, detail: String },
+    Connected {
+        generation: u64,
+    },
+    Reconnecting {
+        generation: u64,
+        detail: String,
+    },
+    Output {
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    CommandLogged {
+        generation: u64,
+        seq: u64,
+        origin: String,
+        text: String,
+    },
+    Failed {
+        generation: u64,
+        detail: String,
+    },
 }
 
 #[derive(Debug)]
 enum Command {
     Input(Vec<u8>),
+    Submit { text: String, origin: String },
     Resize { cols: u16, rows: u16 },
 }
 
 pub struct Handle {
     generation: u64,
+    mode: SessionMode,
     commands: mpsc::Sender<Command>,
     stop: watch::Sender<bool>,
     events: Receiver<Event>,
@@ -55,19 +77,21 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub fn start(client: NodeClient, generation: u64) -> Self {
+    pub fn start(client: NodeClient, generation: u64, mode: SessionMode) -> Self {
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE);
         let (events_tx, events) = sync_channel(EVENT_QUEUE);
         let (stop, stop_rx) = watch::channel(false);
         let worker = tokio::spawn(run(
             client.origin(),
             generation,
+            mode,
             command_rx,
             events_tx,
             stop_rx,
         ));
         Self {
             generation,
+            mode,
             commands,
             stop,
             events,
@@ -80,9 +104,21 @@ impl Handle {
     }
 
     pub fn send_input(&self, bytes: Vec<u8>) -> bool {
-        !bytes.is_empty()
+        self.mode == SessionMode::Single
+            && !bytes.is_empty()
             && bytes.len() <= MAX_INPUT_BYTES
             && self.commands.try_send(Command::Input(bytes)).is_ok()
+    }
+
+    pub fn send_command(&self, text: String, origin: String) -> bool {
+        self.mode == SessionMode::Shared
+            && !text.is_empty()
+            && text.len() <= MAX_COMMAND_BYTES
+            && origin.len() <= MAX_ORIGIN_BYTES
+            && self
+                .commands
+                .try_send(Command::Submit { text, origin })
+                .is_ok()
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> bool {
@@ -140,7 +176,7 @@ struct CreatedSession {
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum ClientFrame<'a> {
     Subscribe {
-        topics: [&'a str; 1],
+        topics: Vec<&'a str>,
         resume: std::collections::BTreeMap<&'a str, &'a str>,
     },
     TermInput {
@@ -152,12 +188,25 @@ enum ClientFrame<'a> {
         cols: u16,
         rows: u16,
     },
+    TermCommand {
+        session: &'a str,
+        text: &'a str,
+        origin: &'a str,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum WireEvent {
     Subscribed,
-    Output { cursor: String, bytes: Vec<u8> },
+    Output {
+        cursor: u64,
+        bytes: Vec<u8>,
+    },
+    CommandLog {
+        seq: u64,
+        origin: String,
+        text: String,
+    },
     Lagged,
     Refused(String),
     Ignore,
@@ -172,12 +221,13 @@ enum ConnectionEnd {
 async fn run(
     origin: String,
     generation: u64,
+    mode: SessionMode,
     mut commands: mpsc::Receiver<Command>,
     events: SyncSender<Event>,
     mut stop: watch::Receiver<bool>,
 ) {
     let http = Client::new();
-    let mut session = match create_session(&http, &origin, &mut stop).await {
+    let mut session = match create_session(&http, &origin, mode, &mut stop).await {
         Ok(Some(session)) => Some(session),
         Ok(None) => return,
         Err(detail) => {
@@ -185,7 +235,8 @@ async fn run(
             return;
         }
     };
-    let mut cursor = String::new();
+    let mut cursor = 0u64;
+    let mut command_cursor = 0u64;
     let mut size = None;
     let mut attempts = 0u32;
     let mut fatal = None;
@@ -198,7 +249,9 @@ async fn run(
             &origin,
             current,
             generation,
+            mode,
             &mut cursor,
+            &mut command_cursor,
             &mut size,
             &mut attempts,
             &mut commands,
@@ -255,7 +308,9 @@ async fn connect_once(
     origin: &str,
     session: &CreatedSession,
     generation: u64,
-    cursor: &mut String,
+    mode: SessionMode,
+    cursor: &mut u64,
+    command_cursor: &mut u64,
     size: &mut Option<(u16, u16)>,
     attempts: &mut u32,
     commands: &mut mpsc::Receiver<Command>,
@@ -280,12 +335,22 @@ async fn connect_once(
         }
     };
     let (mut sink, mut source) = socket.split();
+    let command_topic = format!("term-cmd:{}", session.session_id);
+    let cursor_text = cursor.to_string();
+    let command_cursor_text = command_cursor.to_string();
     let mut resume = std::collections::BTreeMap::new();
-    if !cursor.is_empty() {
-        resume.insert(session.topic.as_str(), cursor.as_str());
+    if *cursor > 0 {
+        resume.insert(session.topic.as_str(), cursor_text.as_str());
+    }
+    if mode == SessionMode::Shared && *command_cursor > 0 {
+        resume.insert(command_topic.as_str(), command_cursor_text.as_str());
     }
     let subscribe = ClientFrame::Subscribe {
-        topics: [session.topic.as_str()],
+        topics: if mode == SessionMode::Shared {
+            vec![session.topic.as_str(), command_topic.as_str()]
+        } else {
+            vec![session.topic.as_str()]
+        },
         resume,
     };
     if send_frame(&mut sink, &subscribe, stop).await.is_err() {
@@ -308,17 +373,34 @@ async fn connect_once(
                 let Some(command) = command else {
                     return ConnectionEnd::Stopped;
                 };
-                let frame = match command {
-                    Command::Input(bytes) => ClientFrame::TermInput {
-                        session: &session.session_id,
-                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                    },
+                let result = match command {
+                    Command::Input(bytes) if mode == SessionMode::Single => {
+                        let frame = ClientFrame::TermInput {
+                            session: &session.session_id,
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        };
+                        send_frame(&mut sink, &frame, stop).await
+                    }
+                    Command::Submit { text, origin } if mode == SessionMode::Shared => {
+                        let frame = ClientFrame::TermCommand {
+                            session: &session.session_id,
+                            text: &text,
+                            origin: &origin,
+                        };
+                        send_frame(&mut sink, &frame, stop).await
+                    }
                     Command::Resize { cols, rows } => {
                         *size = Some((cols, rows));
-                        ClientFrame::TermResize { session: &session.session_id, cols, rows }
+                        let frame = ClientFrame::TermResize {
+                            session: &session.session_id,
+                            cols,
+                            rows,
+                        };
+                        send_frame(&mut sink, &frame, stop).await
                     }
+                    Command::Input(_) | Command::Submit { .. } => Ok(()),
                 };
-                if send_frame(&mut sink, &frame, stop).await.is_err() {
+                if result.is_err() {
                     return ConnectionEnd::Reconnect("terminal stream write failed".into());
                 }
             }
@@ -340,7 +422,11 @@ async fn connect_once(
                 if text.len() > MAX_JSON_BYTES {
                     return ConnectionEnd::Fatal("terminal stream sent an oversized frame".into());
                 }
-                match parse_wire_event(&text, &session.topic) {
+                match parse_wire_event(
+                    &text,
+                    &session.topic,
+                    (mode == SessionMode::Shared).then_some(command_topic.as_str()),
+                ) {
                     Ok(WireEvent::Subscribed) if !subscribed => {
                         // Commands can arrive while DNS/connect/subscribe is
                         // pending. Discard their Input before declaring Live;
@@ -363,16 +449,49 @@ async fn connect_once(
                         }
                     }
                     Ok(WireEvent::Output { cursor: next, bytes }) if subscribed => {
+                        if next <= *cursor {
+                            continue;
+                        }
+                        if next != cursor.saturating_add(1) {
+                            return ConnectionEnd::Fatal(
+                                "Terminal output sequence is incomplete; restart the session.".into(),
+                            );
+                        }
                         if !send_event(events, stop, Event::Output { generation, bytes }).await {
                             return ConnectionEnd::Stopped;
                         }
                         *cursor = next;
                     }
+                    Ok(WireEvent::CommandLog { seq, origin, text }) if subscribed => {
+                        if seq <= *command_cursor {
+                            continue;
+                        }
+                        if seq != command_cursor.saturating_add(1) {
+                            return ConnectionEnd::Fatal(
+                                "Terminal command history is incomplete; restart the session.".into(),
+                            );
+                        }
+                        if !send_event(
+                            events,
+                            stop,
+                            Event::CommandLogged { generation, seq, origin, text },
+                        )
+                        .await
+                        {
+                            return ConnectionEnd::Stopped;
+                        }
+                        *command_cursor = seq;
+                    }
                     Ok(WireEvent::Lagged) => return ConnectionEnd::Fatal(
                         "Terminal output history expired; restart the session.".into(),
                     ),
                     Ok(WireEvent::Refused(detail)) => return ConnectionEnd::Fatal(detail),
-                    Ok(WireEvent::Subscribed | WireEvent::Output { .. } | WireEvent::Ignore) => {}
+                    Ok(
+                        WireEvent::Subscribed
+                        | WireEvent::Output { .. }
+                        | WireEvent::CommandLog { .. }
+                        | WireEvent::Ignore,
+                    ) => {}
                     Err(detail) => return ConnectionEnd::Fatal(detail),
                 }
             }
@@ -431,12 +550,17 @@ fn drain_disconnected_commands(
         if let Command::Resize { cols, rows } = command {
             *size = Some((cols, rows));
         }
-        // Input is deliberately discarded while disconnected. Replaying old
-        // keystrokes into a freshly redrawn TUI is more dangerous than loss.
+        // Input and commands are deliberately discarded while disconnected.
+        // Replaying stale interaction into a redrawn TUI is more dangerous
+        // than loss; only the newest geometry is safe to carry forward.
     }
 }
 
-fn parse_wire_event(text: &str, topic: &str) -> Result<WireEvent, String> {
+fn parse_wire_event(
+    text: &str,
+    topic: &str,
+    command_topic: Option<&str>,
+) -> Result<WireEvent, String> {
     let value: Value = serde_json::from_str(text)
         .map_err(|_| "terminal stream sent an invalid JSON frame".to_string())?;
     let Some(object) = value.as_object() else {
@@ -447,7 +571,10 @@ fn parse_wire_event(text: &str, topic: &str) -> Result<WireEvent, String> {
             let accepted = object
                 .get("topics")
                 .and_then(Value::as_object)
-                .is_some_and(|topics| topics.contains_key(topic));
+                .is_some_and(|topics| {
+                    topics.contains_key(topic)
+                        && command_topic.is_none_or(|topic| topics.contains_key(topic))
+                });
             if accepted {
                 Ok(WireEvent::Subscribed)
             } else {
@@ -463,6 +590,8 @@ fn parse_wire_event(text: &str, topic: &str) -> Result<WireEvent, String> {
                         && cursor.len() <= 32
                         && cursor.bytes().all(|byte| byte.is_ascii_digit())
                 })
+                .and_then(|cursor| cursor.parse::<u64>().ok())
+                .filter(|cursor| *cursor > 0)
                 .ok_or_else(|| "terminal stream sent an invalid cursor".to_string())?;
             let item = object
                 .get("item")
@@ -479,10 +608,47 @@ fn parse_wire_event(text: &str, topic: &str) -> Result<WireEvent, String> {
                 bytes,
             })
         }
-        Some("lagged") if object.get("topic").and_then(Value::as_str) == Some(topic) => {
+        Some("termCommandLog")
+            if command_topic.is_some()
+                && object.get("topic").and_then(Value::as_str) == command_topic =>
+        {
+            let seq = object
+                .get("seq")
+                .and_then(Value::as_u64)
+                .filter(|seq| *seq > 0)
+                .ok_or_else(|| "terminal stream sent an invalid command sequence".to_string())?;
+            let origin = object
+                .get("origin")
+                .and_then(Value::as_str)
+                .filter(|origin| origin.len() <= MAX_ORIGIN_BYTES)
+                .ok_or_else(|| "terminal stream sent invalid command attribution".to_string())?;
+            let text = object
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| text.len() <= MAX_COMMAND_BYTES)
+                .ok_or_else(|| "terminal stream sent an invalid command".to_string())?;
+            Ok(WireEvent::CommandLog {
+                seq,
+                origin: origin.to_owned(),
+                text: text.to_owned(),
+            })
+        }
+        Some("lagged")
+            if stream_topic_matches(
+                object.get("topic").and_then(Value::as_str),
+                topic,
+                command_topic,
+            ) =>
+        {
             Ok(WireEvent::Lagged)
         }
-        Some("error") if object.get("topic").and_then(Value::as_str) == Some(topic) => {
+        Some("error")
+            if stream_topic_matches(
+                object.get("topic").and_then(Value::as_str),
+                topic,
+                command_topic,
+            ) =>
+        {
             let detail = object
                 .get("detail")
                 .and_then(Value::as_str)
@@ -493,16 +659,26 @@ fn parse_wire_event(text: &str, topic: &str) -> Result<WireEvent, String> {
     }
 }
 
+fn stream_topic_matches(
+    frame_topic: Option<&str>,
+    topic: &str,
+    command_topic: Option<&str>,
+) -> bool {
+    frame_topic == Some(topic)
+        || command_topic.is_some_and(|command_topic| frame_topic == Some(command_topic))
+}
+
 async fn create_session(
     http: &Client,
     origin: &str,
+    mode: SessionMode,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<Option<CreatedSession>, String> {
     let url = endpoint(origin, "v1/term/sessions")?;
     let request = http
         .post(url)
         .timeout(HTTP_TIMEOUT)
-        .json(&serde_json::json!({ "agent": AGENT }));
+        .json(&serde_json::json!({ "agent": AGENT, "mode": mode.as_str() }));
     let response = tokio::select! {
         result = request.send() => result.map_err(|_| "could not create a terminal session".to_string())?,
         changed = stop.changed() => {
@@ -661,18 +837,23 @@ mod tests {
         let event = parse_wire_event(
             r#"{"type":"event","topic":"term:s1","cursor":"42","item":"7Jik66as"}"#,
             topic,
+            None,
         )
         .unwrap();
         assert_eq!(
             event,
             WireEvent::Output {
-                cursor: "42".into(),
+                cursor: 42,
                 bytes: "오리".as_bytes().to_vec(),
             }
         );
         assert!(
-            parse_wire_event(r#"{"type":"event","topic":"term:s1","item":"eA=="}"#, topic,)
-                .is_err()
+            parse_wire_event(
+                r#"{"type":"event","topic":"term:s1","item":"eA=="}"#,
+                topic,
+                None,
+            )
+            .is_err()
         );
     }
 
@@ -682,9 +863,83 @@ mod tests {
             parse_wire_event(
                 r#"{"type":"lagged","topic":"term:s1","cursor":"9"}"#,
                 "term:s1",
+                None,
             )
             .unwrap(),
             WireEvent::Lagged
+        );
+    }
+
+    #[test]
+    fn shared_subscription_requires_both_terminal_topics() {
+        assert_eq!(
+            parse_wire_event(
+                r#"{"type":"subscribed","topics":{"term:s1":"0","term-cmd:s1":"0"}}"#,
+                "term:s1",
+                Some("term-cmd:s1"),
+            )
+            .unwrap(),
+            WireEvent::Subscribed
+        );
+        assert!(
+            parse_wire_event(
+                r#"{"type":"subscribed","topics":{"term:s1":"0"}}"#,
+                "term:s1",
+                Some("term-cmd:s1"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attributed_command_log_is_bounded_and_topic_scoped() {
+        assert_eq!(
+            parse_wire_event(
+                r#"{"type":"termCommandLog","topic":"term-cmd:s1","seq":2,"origin":"Rae","text":"cargo test"}"#,
+                "term:s1",
+                Some("term-cmd:s1"),
+            )
+            .unwrap(),
+            WireEvent::CommandLog {
+                seq: 2,
+                origin: "Rae".into(),
+                text: "cargo test".into(),
+            }
+        );
+        assert_eq!(
+            parse_wire_event(
+                r#"{"type":"termCommandLog","topic":"term-cmd:other","seq":2,"origin":"Rae","text":"cargo test"}"#,
+                "term:s1",
+                Some("term-cmd:s1"),
+            )
+            .unwrap(),
+            WireEvent::Ignore
+        );
+        assert!(
+            parse_wire_event(
+                r#"{"type":"termCommandLog","topic":"term-cmd:s1","seq":0,"origin":"Rae","text":"cargo test"}"#,
+                "term:s1",
+                Some("term-cmd:s1"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_frame_uses_the_ordered_shared_lane() {
+        let frame = ClientFrame::TermCommand {
+            session: "s1",
+            text: "cargo test",
+            origin: "Rae",
+        };
+        assert_eq!(
+            serde_json::to_value(frame).unwrap(),
+            serde_json::json!({
+                "op": "termCommand",
+                "session": "s1",
+                "text": "cargo test",
+                "origin": "Rae",
+            })
         );
     }
 
@@ -702,9 +957,15 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_input_is_dropped_but_latest_resize_is_retained() {
-        let (sender, mut receiver) = mpsc::channel(3);
+    fn disconnected_interaction_is_dropped_but_latest_resize_is_retained() {
+        let (sender, mut receiver) = mpsc::channel(4);
         sender.try_send(Command::Input(b"stale".to_vec())).unwrap();
+        sender
+            .try_send(Command::Submit {
+                text: "stale command".into(),
+                origin: "Rae".into(),
+            })
+            .unwrap();
         sender
             .try_send(Command::Resize { cols: 80, rows: 24 })
             .unwrap();

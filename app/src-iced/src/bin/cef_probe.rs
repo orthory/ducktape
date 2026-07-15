@@ -1,5 +1,7 @@
 #[path = "../browser/mod.rs"]
 mod browser;
+#[path = "../duck_url.rs"]
+mod duck_url;
 
 use std::time::Duration;
 

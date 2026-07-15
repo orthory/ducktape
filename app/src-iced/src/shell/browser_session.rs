@@ -282,6 +282,9 @@ pub(super) fn parent_ready(
     state: &mut Shell,
     result: Result<ParentWindow, String>,
 ) -> Task<Message> {
+    if !parent_request_is_current(state.quitting, state.browser.is_some()) {
+        return Task::none();
+    }
     let parent = match result {
         Ok(parent) => parent,
         Err(error) => {
@@ -353,6 +356,11 @@ pub(super) fn parent_ready(
             Task::none()
         }
     }
+}
+
+#[cfg(feature = "cef-browser")]
+pub(super) const fn parent_request_is_current(quitting: bool, browser_present: bool) -> bool {
+    !quitting && !browser_present
 }
 
 #[cfg(feature = "cef-browser")]

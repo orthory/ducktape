@@ -12,6 +12,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
     ("crate::huddle_session", "native session host"),
     ("crate::mac_tray", "platform tray host"),
     ("crate::module_host", "host composition"),
+    ("module_view_host::", "packaged-view runtime host"),
     ("crate::notifications", "notification host"),
     ("crate::page_presence", "presence host"),
     ("crate::search", "search host"),

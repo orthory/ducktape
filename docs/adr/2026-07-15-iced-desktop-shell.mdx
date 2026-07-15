@@ -37,10 +37,12 @@ the application does not split views merely to meet a file-size target.
 ## Native Terminal
 
 The operator Terminal is an Iced view backed by a trusted Rust service. It is
-not a browser tab and never creates a CEF surface. The capability-free view
-owns terminal presentation, keyboard and IME input, selection, scrollback, and
-geometry. The trusted service owns the single node WebSocket used to create,
-subscribe to, write to, resize, and close the Codex terminal session.
+not a browser tab and never creates a CEF surface. A single-user session owns
+keyboard and IME input, selection, scrollback, and geometry. A shared session
+is read-only at the PTY surface: attributed commands enter only through the
+ordered command lane and its second topic. The trusted service owns the single
+node WebSocket used to create, subscribe to, write to, resize, and close either
+kind of Codex terminal session.
 
 Terminal output carries a monotonic cursor. A reconnect resumes after the last
 delivered cursor instead of replaying retained ANSI bytes into an already
@@ -95,4 +97,8 @@ the macOS 14 API. AppKit owns the application lifecycle and native traffic-light
 controls while Iced draws the full-size titlebar content underneath. CEF helper
 shutdown, close-to-menu-bar, Dock/Finder reopen, Cmd+Q, code signing, hardened
 runtime entitlements, notarization, stapling, and Gatekeeper assessment are
-release gates.
+release gates. The pinned Iced 0.14 stack does not currently expose an
+AccessKit-equivalent macOS semantic tree; tooltips preserve sighted
+discoverability but not VoiceOver parity. A production release therefore also
+requires an accessibility backend or an explicit product decision accepting
+that limitation. Linux CI cannot satisfy that gate.

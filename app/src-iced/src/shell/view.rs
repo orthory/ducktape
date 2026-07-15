@@ -1,5 +1,5 @@
 use super::*;
-use iced::widget::{column, row, stack};
+use iced::widget::{column, row, stack, tooltip};
 
 fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
     let p = theme::palette(state.mode);
@@ -299,23 +299,43 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
     let hairline = Color::from_rgba8(255, 255, 255, 0.12);
     let text_color = Color::from_rgba8(255, 255, 255, 0.94);
     let dim = Color::from_rgba8(255, 255, 255, 0.55);
-    let connected = state.node_client.is_some();
-    let workspace = state
-        .active_workspace
-        .as_ref()
-        .map(|workspace| workspace.name.as_str())
-        .unwrap_or("No network");
+    let connected = state.node_client.is_some() && state.node_stream_connected;
+    let local_managed = state.active_workspace.is_some();
+    let mut modules = column![].spacing(1);
+    for screen in Screen::USER {
+        modules = modules.push(tray_nav(
+            screen,
+            state.tray_selected == screen,
+            text_color,
+            dim,
+            state.accent,
+        ));
+    }
+    if local_managed {
+        for screen in Screen::OPERATOR {
+            if screen != Screen::Node {
+                modules = modules.push(tray_nav(
+                    screen,
+                    state.tray_selected == screen,
+                    text_color,
+                    dim,
+                    state.accent,
+                ));
+            }
+        }
+    }
     let rail = column![
-        tray_nav("Node", Icon::Node, Screen::Node, text_color, dim),
-        tray_nav("Chat", Icon::Chat, Screen::Chat, text_color, dim),
-        tray_nav("Pages", Icon::Pages, Screen::Pages, text_color, dim),
-        tray_nav("Files", Icon::Files, Screen::Files, text_color, dim),
-        tray_nav("Browser", Icon::Browser, Screen::Browser, text_color, dim),
-        tray_nav("Forge", Icon::Forge, Screen::Forge, text_color, dim),
-        tray_nav("Agents", Icon::Agent, Screen::Agents, text_color, dim),
-        tray_nav("Members", Icon::Members, Screen::Members, text_color, dim),
-        Space::new().height(Length::Fill),
         tray_nav(
+            Screen::Node,
+            state.tray_selected == Screen::Node,
+            text_color,
+            dim,
+            state.accent,
+        ),
+        tray_divider(hairline),
+        scrollable(modules).height(Length::Fill),
+        tray_divider(hairline),
+        tray_launch(
             "Settings",
             Icon::Settings,
             Screen::Settings,
@@ -332,45 +352,15 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
         )
         .width(Length::Fill)
         .padding([7, 10])
-        .style(move |_, status| tray_button_style(status, text_color))
+        .style(move |_, status| tray_button_style(status, text_color, false))
         .on_press(Message::Quit),
     ]
-    .spacing(2);
-    let detail = column![
-        text("Node").size(15).font(theme::SANS_SEMIBOLD),
-        tray_field("Network", workspace, text_color, dim),
-        tray_field(
-            "Status",
-            if connected { "Synced" } else { "Stopped" },
-            text_color,
-            dim,
-        ),
-        tray_field(
-            "Role",
-            state
-                .active_workspace
-                .as_ref()
-                .map_or("—", |workspace| if workspace.founder {
-                    "genesis · validator"
-                } else if workspace.member {
-                    "member · validator"
-                } else {
-                    "guest"
-                }),
-            text_color,
-            dim,
-        ),
-        Space::new().height(8),
-        text("SOFTWARE").size(10).color(dim),
-        tray_field("Version", env!("CARGO_PKG_VERSION"), text_color, dim),
-        Space::new().height(Length::Fill),
-        button(text("Open in console").size(11.5))
-            .width(Length::Fill)
-            .padding([7, 10])
-            .style(move |_, status| tray_button_style(status, text_color))
-            .on_press(Message::OpenMain(Some(Screen::Node))),
-    ]
-    .spacing(10);
+    .spacing(1);
+    let detail = if state.tray_selected == Screen::Node {
+        tray_node_detail(state, text_color, dim)
+    } else {
+        tray_module_detail(state.tray_selected, text_color, dim)
+    };
     let header = row![
         container(text("D").size(11).color(Color::WHITE))
             .center_x(24)
@@ -379,7 +369,9 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
         column![
             text("Ducktape").size(12.5).font(theme::SANS_SEMIBOLD),
             text(if connected {
-                "●  Synced"
+                "●  Connected"
+            } else if state.node_client.is_some() {
+                "●  Reconnecting"
             } else {
                 "●  Stopped"
             })
@@ -387,6 +379,8 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
             .font(theme::MONO)
             .color(if connected {
                 Color::from_rgb8(92, 180, 95)
+            } else if state.node_client.is_some() {
+                Color::from_rgb8(209, 162, 77)
             } else {
                 Color::from_rgb8(207, 106, 94)
             }),
@@ -424,6 +418,39 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
 }
 
 fn tray_nav(
+    screen: Screen,
+    selected: bool,
+    text_color: Color,
+    dim: Color,
+    accent: Color,
+) -> Element<'static, Message> {
+    button(
+        row![
+            container(Space::new().width(2).height(18)).style(move |_| {
+                container::Style::default().background(if selected {
+                    accent
+                } else {
+                    Color::TRANSPARENT
+                })
+            }),
+            icons::view(
+                screen.icon(),
+                15.0,
+                if selected { Color::WHITE } else { dim }
+            ),
+            text(screen.label()).size(11.5).color(text_color)
+        ]
+        .spacing(7)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([7, 10])
+    .style(move |_, status| tray_button_style(status, text_color, selected))
+    .on_press(Message::TraySelect(screen))
+    .into()
+}
+
+fn tray_launch(
     label: &'static str,
     icon: Icon,
     screen: Screen,
@@ -440,21 +467,170 @@ fn tray_nav(
     )
     .width(Length::Fill)
     .padding([7, 10])
-    .style(move |_, status| tray_button_style(status, text_color))
+    .style(move |_, status| tray_button_style(status, text_color, false))
     .on_press(Message::OpenMain(Some(screen)))
     .into()
 }
 
-fn tray_button_style(status: button::Status, text_color: Color) -> button::Style {
+fn tray_button_style(status: button::Status, text_color: Color, selected: bool) -> button::Style {
     button::Style {
-        background: matches!(status, button::Status::Hovered)
-            .then(|| Background::Color(Color::from_rgba8(255, 255, 255, 0.08))),
+        background: if selected {
+            Some(Background::Color(Color::from_rgba8(255, 255, 255, 0.13)))
+        } else {
+            matches!(status, button::Status::Hovered)
+                .then(|| Background::Color(Color::from_rgba8(255, 255, 255, 0.08)))
+        },
         text_color,
         border: Border {
             radius: 5.0.into(),
             ..Border::default()
         },
         ..button::Style::default()
+    }
+}
+
+fn tray_divider(color: Color) -> Element<'static, Message> {
+    container(Space::new())
+        .height(1)
+        .width(Length::Fill)
+        .style(move |_| container::Style::default().background(color))
+        .into()
+}
+
+fn tray_node_detail(state: &Shell, text_color: Color, dim: Color) -> Element<'_, Message> {
+    let connected = state.node_client.is_some() && state.node_stream_connected;
+    let snapshot = match &state.operator.node.data {
+        operator_screens::Resource::Ready(snapshot) => Some(snapshot),
+        _ => None,
+    };
+    let workspace = state
+        .active_workspace
+        .as_ref()
+        .map(|workspace| workspace.name.clone())
+        .or_else(|| snapshot.map(|snapshot| snapshot.workspace_name.clone()))
+        .unwrap_or_else(|| "No network".into());
+    let node_key = state
+        .active_workspace
+        .as_ref()
+        .map(|workspace| workspace.pubkey.as_str())
+        .or_else(|| snapshot.map(|snapshot| snapshot.peer.as_str()))
+        .map(short_tray_key)
+        .unwrap_or_else(|| "—".into());
+    let role = state.active_workspace.as_ref().map_or_else(
+        || snapshot.map_or("—", |snapshot| node_role_label(snapshot.role)),
+        |workspace| {
+            if workspace.founder {
+                "genesis · validator"
+            } else if workspace.member {
+                "member · validator"
+            } else {
+                "guest"
+            }
+        },
+    );
+    let status = if connected && snapshot.is_some_and(|snapshot| snapshot.connected) {
+        "Running"
+    } else if connected {
+        "Connected"
+    } else if state.node_client.is_some() {
+        "Reconnecting"
+    } else if state.active_workspace.is_some() {
+        "Stopped"
+    } else {
+        "Stopped"
+    };
+    let height = snapshot
+        .filter(|snapshot| connected && snapshot.connected)
+        .map(|snapshot| snapshot.height.to_string())
+        .unwrap_or_else(|| "—".into());
+    let members = match &state.members.data {
+        members_screen::Resource::Ready(data) => data.members.len().to_string(),
+        _ => "—".into(),
+    };
+    let modules = snapshot
+        .map(|snapshot| format!("{} installed", snapshot.modules.len()))
+        .unwrap_or_else(|| "—".into());
+    let mut detail = column![
+        text("Node").size(15).font(theme::SANS_SEMIBOLD),
+        tray_field("Network", &workspace, text_color, dim),
+        tray_field("Key", &node_key, text_color, dim),
+        tray_field("Role", role, text_color, dim),
+        tray_field("Status", status, text_color, dim),
+        tray_field("Height", &height, text_color, dim),
+        tray_field("Members", &members, text_color, dim),
+        tray_field("Modules", &modules, text_color, dim),
+        Space::new().height(8),
+        text("SOFTWARE").size(10).color(dim),
+        tray_field("Version", env!("CARGO_PKG_VERSION"), text_color, dim),
+        Space::new().height(Length::Fill),
+    ]
+    .spacing(8);
+    if state.active_workspace.is_some() {
+        detail = detail.push(tray_open_button(Screen::Node, text_color));
+    }
+    detail.into()
+}
+
+fn tray_module_detail(screen: Screen, text_color: Color, dim: Color) -> Element<'static, Message> {
+    column![
+        row![
+            container(icons::view(screen.icon(), 16.0, text_color))
+                .width(26)
+                .height(26)
+                .center_x(26)
+                .center_y(26)
+                .style(move |_| rounded(Color::from_rgba8(255, 255, 255, 0.10), 7.0)),
+            text(screen.label())
+                .size(13)
+                .font(theme::SANS_SEMIBOLD)
+                .color(text_color),
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+        text("Open this module in the main Ducktape window.")
+            .size(11)
+            .color(dim),
+        Space::new().height(Length::Fill),
+        tray_open_button(screen, text_color),
+    ]
+    .spacing(12)
+    .into()
+}
+
+fn tray_open_button(screen: Screen, text_color: Color) -> Element<'static, Message> {
+    button(container(text("Open in console").size(11.5)).center_x(Length::Fill))
+        .width(Length::Fill)
+        .padding([7, 10])
+        .style(move |_, status| tray_button_style(status, text_color, true))
+        .on_press(Message::OpenMain(Some(screen)))
+        .into()
+}
+
+const fn node_role_label(role: operator_screens::NodeRole) -> &'static str {
+    match role {
+        operator_screens::NodeRole::GenesisValidator => "genesis · validator",
+        operator_screens::NodeRole::MemberValidator => "member · validator",
+        operator_screens::NodeRole::RemoteUser => "user · node",
+        operator_screens::NodeRole::Guest => "guest",
+    }
+}
+
+fn short_tray_key(value: &str) -> String {
+    if value.is_empty() {
+        "—".into()
+    } else if value.chars().count() > 12 {
+        let start = value.chars().take(6).collect::<String>();
+        let end = value
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        format!("0x{start}…{end}")
+    } else {
+        format!("0x{value}")
     }
 }
 
@@ -605,14 +781,16 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
     let (connection_label, connection_color) = titlebar_connection(state, p);
     let back = icon_button(
         Icon::ChevronLeft,
+        "Back",
         Message::Back,
-        state.history_index > 0,
+        state.history_index > 0 && !state.workspace_overlay,
         state,
     );
     let forward = icon_button(
         Icon::ChevronRight,
+        "Forward",
         Message::Forward,
-        state.history_index + 1 < state.history.len(),
+        state.history_index + 1 < state.history.len() && !state.workspace_overlay,
         state,
     );
     let identity = mouse_area(
@@ -665,7 +843,7 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
     .padding([0, 12])
     .width(340)
     .height(28)
-    .on_press(Message::ToggleSearch)
+    .on_press_maybe((!state.workspace_overlay).then_some(Message::ToggleSearch))
     .style(move |_, status| button::Style {
         background: Some(Background::Color(
             if matches!(status, button::Status::Hovered) {
@@ -709,36 +887,45 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
             .style(move |_| rounded(state.accent, 8.0)),
         );
     }
-    let bell = button(bell_content)
-        .padding([3, 5])
-        .on_press(Message::ToggleNotifications)
-        .style(move |_, status| button::Style {
-            background: matches!(status, button::Status::Hovered)
-                .then_some(Background::Color(p.hover)),
-            text_color: p.ink,
-            border: Border {
-                radius: 5.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        });
+    let bell = tooltip(
+        button(bell_content)
+            .padding([3, 5])
+            .on_press(Message::ToggleNotifications)
+            .style(move |_, status| button::Style {
+                background: matches!(status, button::Status::Hovered)
+                    .then_some(Background::Color(p.hover)),
+                text_color: p.ink,
+                border: Border {
+                    radius: 5.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            }),
+        text("Notifications").size(11),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .padding(6);
     let mut controls = row![bell].spacing(1).align_y(Alignment::Center);
     if !cfg!(target_os = "macos") {
         controls = controls
             .push(icon_button(
                 Icon::Minimize,
+                "Minimize",
                 Message::Window(WindowAction::Minimize),
                 true,
                 state,
             ))
             .push(icon_button(
                 Icon::Maximize,
+                "Maximize",
                 Message::Window(WindowAction::Maximize),
                 true,
                 state,
             ))
             .push(icon_button(
                 Icon::Close,
+                "Close",
                 Message::Window(WindowAction::Close),
                 true,
                 state,
@@ -782,12 +969,14 @@ pub(super) fn titlebar_connection(state: &Shell, p: &theme::Palette) -> (String,
     } else {
         "REMOTE"
     };
+    if !state.node_stream_connected {
+        return (format!("{mode} · RECONNECTING"), p.amber);
+    }
     match &state.operator.node.data {
         operator_screens::Resource::Ready(snapshot) if snapshot.connected => {
             (format!("{mode} · #{}", snapshot.height), p.green)
         }
-        operator_screens::Resource::Error(_) => (format!("{mode} · RECONNECTING"), p.amber),
-        _ => (mode.into(), state.accent),
+        _ => (format!("{mode} · CONNECTED"), p.green),
     }
 }
 
@@ -885,6 +1074,10 @@ fn module_rail(state: &Shell) -> Element<'_, Message> {
                 Mode::Light => Icon::Sun,
                 Mode::Dark => Icon::Moon,
             },
+            match state.mode {
+                Mode::Light => "Use dark theme",
+                Mode::Dark => "Use light theme",
+            },
             Message::ToggleTheme,
             true,
             state,
@@ -897,9 +1090,8 @@ fn module_rail(state: &Shell) -> Element<'_, Message> {
 }
 
 fn screen_view(state: &Shell) -> Element<'_, Message> {
-    if let Some(screen) = user_screen(state.screen()) {
-        return user_screens::view(&state.user_screens, screen, state.mode)
-            .map(Message::UserScreen);
+    if let Some(view) = user_view(state.screen()) {
+        return module_host::view(&state.user_screens, view, state.mode).map(Message::UserView);
     }
     if state.screen() == Screen::Browser {
         #[cfg(feature = "cef-browser")]
@@ -974,12 +1166,13 @@ fn screen_view(state: &Shell) -> Element<'_, Message> {
 
 fn icon_button<'a>(
     icon: Icon,
+    label: &'static str,
     message: Message,
     enabled: bool,
     state: &Shell,
 ) -> Element<'a, Message> {
     let p = theme::palette(state.mode);
-    button(icons::view(
+    let control = button(icons::view(
         icon,
         15.0,
         if enabled { p.muted_3 } else { p.icon_idle },
@@ -988,8 +1181,11 @@ fn icon_button<'a>(
     .height(32)
     .padding(8)
     .on_press_maybe(enabled.then_some(message))
-    .style(move |_, status| transparent_button(p, status))
-    .into()
+    .style(move |_, status| transparent_button(p, status));
+    tooltip(control, text(label).size(11), tooltip::Position::Bottom)
+        .gap(6)
+        .padding(6)
+        .into()
 }
 
 fn section_button<'a>(

@@ -799,6 +799,7 @@ impl BrowserRuntime {
     }
 
     pub fn new_tab(&mut self, url: &str) -> Result<(), String> {
+        ensure_cef_reusable(self.cef.armed)?;
         let navigation = Arc::new(Mutex::new(NavigationPolicy::new(url)?));
         let request_context = self
             .request_context
@@ -907,9 +908,7 @@ impl BrowserRuntime {
         if !self.browsers.is_empty() {
             return self.navigate(url);
         }
-        if !self.cef.armed {
-            return Err("CEF runtime is not safe to reuse after a failed close".into());
-        }
+        ensure_cef_reusable(self.cef.armed)?;
         let navigation = Arc::new(Mutex::new(NavigationPolicy::new(url)?));
         let mut request_context = private_request_context()?;
         let surface = create_browser_surface(
@@ -1129,15 +1128,33 @@ fn close_partially_created_browser(host: &BrowserHost, closed: &AtomicBool) -> R
     Ok(())
 }
 
+fn ensure_cef_reusable(armed: bool) -> Result<(), String> {
+    armed.then_some(()).ok_or_else(|| {
+        "CEF runtime is not safe to reuse after a failed browser lifecycle operation".into()
+    })
+}
+
 fn cef_no_sandbox() -> bool {
-    #[cfg(target_os = "windows")]
+    #[cfg(debug_assertions)]
     {
+        let requested = std::env::var_os("DUCKTAPE_CEF_NO_SANDBOX");
+        cef_no_sandbox_policy(cfg!(target_os = "windows"), true, requested.as_deref())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        // A shipped app must never let ambient process state disable the CEF
+        // renderer sandbox. The override exists only for local diagnostics.
         false
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("DUCKTAPE_CEF_NO_SANDBOX").as_deref() == Ok("1")
-    }
+}
+
+#[cfg(any(debug_assertions, test))]
+fn cef_no_sandbox_policy(
+    windows: bool,
+    debug_build: bool,
+    requested: Option<&std::ffi::OsStr>,
+) -> bool {
+    !windows && debug_build && requested == Some(std::ffi::OsStr::new("1"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1557,8 +1574,10 @@ fn assert_pinned_libcef() {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MacBundlePaths, PumpSchedule, is_cef_helper_argument, macos_cef_framework_for_executable,
+        MacBundlePaths, PumpSchedule, cef_no_sandbox_policy, ensure_cef_reusable,
+        is_cef_helper_argument, macos_cef_framework_for_executable,
     };
+    use std::ffi::OsStr;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -1581,6 +1600,23 @@ mod tests {
         assert!(is_cef_helper_argument("--type=renderer"));
         assert!(!is_cef_helper_argument("--typewriter=renderer"));
         assert!(!is_cef_helper_argument("ducktape"));
+    }
+
+    #[test]
+    fn no_sandbox_override_is_debug_only_and_never_allowed_on_windows() {
+        let requested = Some(OsStr::new("1"));
+
+        assert!(cef_no_sandbox_policy(false, true, requested));
+        assert!(!cef_no_sandbox_policy(false, false, requested));
+        assert!(!cef_no_sandbox_policy(true, true, requested));
+        assert!(!cef_no_sandbox_policy(false, true, Some(OsStr::new("0"))));
+        assert!(!cef_no_sandbox_policy(false, true, None));
+    }
+
+    #[test]
+    fn disarmed_cef_runtime_cannot_be_reused() {
+        assert!(ensure_cef_reusable(true).is_ok());
+        assert!(ensure_cef_reusable(false).is_err());
     }
 
     #[test]

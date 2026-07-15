@@ -11,13 +11,14 @@ use iced::advanced::widget::Operation;
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{Layout, Shell, Text, Widget, input_method, layout, mouse, renderer};
 use iced::keyboard::{self, Key, Modifiers, key};
-use iced::widget::{Space, button, column, container, row, stack, text};
+use iced::widget::{Space, button, column, container, row, scrollable, stack, text, text_input};
 use iced::{
-    Alignment, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size, Theme,
-    window,
+    Alignment, Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle,
+    Size, Theme, window,
 };
 
 use crate::icons::{self, Icon};
+pub use crate::terminal_contract::SessionMode;
 use crate::theme::{self, MONO, SANS, SANS_SEMIBOLD};
 
 const INITIAL_ROWS: u16 = 24;
@@ -30,6 +31,15 @@ const CURSOR_BLINK: Duration = Duration::from_millis(500);
 const MAX_COLS: u16 = 500;
 const MAX_ROWS: u16 = 300;
 const MAX_PASTE_BYTES: usize = 60 * 1024;
+const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_ROWS: usize = 1_024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandRow {
+    seq: u64,
+    origin: String,
+    text: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -47,6 +57,9 @@ pub struct State {
     error: Option<String>,
     generation: u64,
     geometry: Option<(u16, u16)>,
+    session_mode: SessionMode,
+    commands: Vec<CommandRow>,
+    command_draft: String,
 }
 
 impl std::fmt::Debug for State {
@@ -57,6 +70,9 @@ impl std::fmt::Debug for State {
             .field("error", &self.error)
             .field("generation", &self.generation)
             .field("geometry", &self.geometry)
+            .field("session_mode", &self.session_mode)
+            .field("commands", &self.commands)
+            .field("command_draft", &self.command_draft)
             .finish_non_exhaustive()
     }
 }
@@ -70,6 +86,9 @@ impl Default for State {
             error: None,
             generation: 0,
             geometry: None,
+            session_mode: SessionMode::Single,
+            commands: Vec::new(),
+            command_draft: String::new(),
         }
     }
 }
@@ -82,6 +101,10 @@ impl State {
     pub const fn status(&self) -> Status {
         self.status
     }
+
+    pub const fn session_mode(&self) -> SessionMode {
+        self.session_mode
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,15 +112,41 @@ pub enum Message {
     Start,
     Retry,
     Stop,
-    Connected { generation: u64 },
-    Reconnecting { generation: u64, detail: String },
-    Output { generation: u64, bytes: Vec<u8> },
-    Failed { generation: u64, detail: String },
+    SetMode(SessionMode),
+    Connected {
+        generation: u64,
+    },
+    Reconnecting {
+        generation: u64,
+        detail: String,
+    },
+    Output {
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    CommandLogged {
+        generation: u64,
+        seq: u64,
+        origin: String,
+        text: String,
+    },
+    Failed {
+        generation: u64,
+        detail: String,
+    },
+    CommandDraftChanged(String),
+    SubmitCommand,
     Input(Vec<u8>),
     Copy(String),
     RequestPaste,
-    Paste { generation: u64, value: String },
-    Resize { cols: u16, rows: u16 },
+    Paste {
+        generation: u64,
+        value: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Scroll(i32),
 }
 
@@ -105,6 +154,7 @@ pub enum Message {
 pub enum Effect {
     Start {
         generation: u64,
+        mode: SessionMode,
     },
     Stop {
         generation: u64,
@@ -112,6 +162,10 @@ pub enum Effect {
     Input {
         generation: u64,
         bytes: Vec<u8>,
+    },
+    Command {
+        generation: u64,
+        text: String,
     },
     Copy(String),
     ReadClipboard {
@@ -126,18 +180,10 @@ pub enum Effect {
 
 pub fn update(state: &mut State, message: Message) -> Option<Effect> {
     match message {
-        Message::Start | Message::Retry => {
-            state.generation = state.generation.wrapping_add(1).max(1);
-            state.parser = vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, SCROLLBACK_ROWS);
-            state.modes = ModeTracker::default();
-            if let Some((cols, rows)) = state.geometry {
-                state.parser.screen_mut().set_size(rows, cols);
-            }
-            state.status = Status::Starting;
-            state.error = None;
-            Some(Effect::Start {
-                generation: state.generation,
-            })
+        Message::Start | Message::Retry => Some(reset_session(state)),
+        Message::SetMode(mode) if mode != state.session_mode => {
+            state.session_mode = mode;
+            Some(reset_session(state))
         }
         Message::Stop => {
             let generation = state.generation;
@@ -145,6 +191,8 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             state.modes = ModeTracker::default();
             state.status = Status::Idle;
             state.error = None;
+            state.commands.clear();
+            state.command_draft.clear();
             (generation != 0).then_some(Effect::Stop { generation })
         }
         Message::Connected { generation } if generation == state.generation => {
@@ -166,12 +214,48 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             state.parser.process(&bytes);
             None
         }
+        Message::CommandLogged {
+            generation,
+            seq,
+            origin,
+            text,
+        } if generation == state.generation
+            && state.session_mode == SessionMode::Shared
+            && seq > state.commands.last().map_or(0, |command| command.seq) =>
+        {
+            if state.commands.len() == MAX_COMMAND_ROWS {
+                state.commands.remove(0);
+            }
+            state.commands.push(CommandRow { seq, origin, text });
+            None
+        }
         Message::Failed { generation, detail } if generation == state.generation => {
             state.status = Status::Failed;
             state.error = Some(detail);
             None
         }
-        Message::Input(bytes) if state.status == Status::Live && !bytes.is_empty() => {
+        Message::CommandDraftChanged(value) if state.session_mode == SessionMode::Shared => {
+            state.command_draft = bounded_command(value);
+            None
+        }
+        Message::SubmitCommand
+            if state.session_mode == SessionMode::Shared && state.status == Status::Live =>
+        {
+            let text = state.command_draft.trim().to_owned();
+            if text.is_empty() {
+                return None;
+            }
+            state.command_draft.clear();
+            Some(Effect::Command {
+                generation: state.generation,
+                text,
+            })
+        }
+        Message::Input(bytes)
+            if state.session_mode == SessionMode::Single
+                && state.status == Status::Live
+                && !bytes.is_empty() =>
+        {
             state.parser.screen_mut().set_scrollback(0);
             Some(Effect::Input {
                 generation: state.generation,
@@ -179,11 +263,16 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             })
         }
         Message::Copy(value) if !value.is_empty() => Some(Effect::Copy(value)),
-        Message::RequestPaste if state.status == Status::Live => Some(Effect::ReadClipboard {
-            generation: state.generation,
-        }),
+        Message::RequestPaste
+            if state.session_mode == SessionMode::Single && state.status == Status::Live =>
+        {
+            Some(Effect::ReadClipboard {
+                generation: state.generation,
+            })
+        }
         Message::Paste { generation, value }
             if generation == state.generation
+                && state.session_mode == SessionMode::Single
                 && state.status == Status::Live
                 && !value.is_empty() =>
         {
@@ -221,8 +310,54 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
     }
 }
 
+fn reset_session(state: &mut State) -> Effect {
+    state.generation = state.generation.wrapping_add(1).max(1);
+    state.parser = vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, SCROLLBACK_ROWS);
+    state.modes = ModeTracker::default();
+    if let Some((cols, rows)) = state.geometry {
+        state.parser.screen_mut().set_size(rows, cols);
+    }
+    state.status = Status::Starting;
+    state.error = None;
+    state.commands.clear();
+    state.command_draft.clear();
+    Effect::Start {
+        generation: state.generation,
+        mode: state.session_mode,
+    }
+}
+
+fn bounded_command(mut value: String) -> String {
+    if value.len() <= MAX_COMMAND_BYTES {
+        return value;
+    }
+    let mut end = MAX_COMMAND_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
 pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     let p = theme::palette(mode);
+    let mode_switch = container(
+        row![
+            mode_button("Single", SessionMode::Single, state.session_mode, *p),
+            mode_button("Shared", SessionMode::Shared, state.session_mode, *p),
+        ]
+        .spacing(2),
+    )
+    .padding(2)
+    .style(move |_| {
+        container::Style::default()
+            .background(p.canvas)
+            .border(Border {
+                color: p.border_soft,
+                width: 1.0,
+                radius: 6.0.into(),
+            })
+    });
     let header = row![
         container(icons::view(Icon::Terminal, 16.0, p.on_filled))
             .width(30)
@@ -234,6 +369,8 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
                 .border(Border::default().rounded(6))),
         text("Terminal").size(18).font(SANS_SEMIBOLD).color(p.ink),
         text("codex").size(12).font(MONO).color(p.muted),
+        Space::new().width(Length::Fill),
+        mode_switch,
     ]
     .spacing(12)
     .align_y(Alignment::Center);
@@ -263,6 +400,21 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
         Status::Live => terminal,
     };
 
+    let terminal_area: Element<'_, Message> = container(body)
+        .padding(10)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style::default().background(Color::BLACK))
+        .into();
+    let content: Element<'_, Message> = if state.session_mode == SessionMode::Shared {
+        column![terminal_area, shared_command_panel(state, *p)]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        terminal_area
+    };
+
     column![
         column![
             container(header)
@@ -276,14 +428,136 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
                 .style(move |_| container::Style::default().background(p.border)),
         ]
         .height(56),
-        container(body)
-            .padding(10)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| container::Style::default().background(Color::BLACK)),
+        content,
     ]
     .width(Length::Fill)
     .height(Length::Fill)
+    .into()
+}
+
+fn mode_button(
+    label: &'static str,
+    mode: SessionMode,
+    active: SessionMode,
+    p: theme::Palette,
+) -> iced::widget::Button<'static, Message> {
+    let selected = mode == active;
+    button(text(label).size(12).font(SANS_SEMIBOLD))
+        .padding([5, 12])
+        .style(move |_, status| iced::widget::button::Style {
+            background: Some(Background::Color(if selected {
+                p.filled
+            } else if matches!(status, iced::widget::button::Status::Hovered) {
+                p.hover
+            } else {
+                p.canvas
+            })),
+            text_color: if selected { p.on_filled } else { p.muted_2 },
+            border: Border {
+                radius: 5.0.into(),
+                ..Border::default()
+            },
+            ..iced::widget::button::Style::default()
+        })
+        .on_press(Message::SetMode(mode))
+}
+
+fn shared_command_panel(state: &State, p: theme::Palette) -> Element<'_, Message> {
+    let mut rows = column![].spacing(4).width(Length::Fill);
+    if state.commands.is_empty() {
+        rows = rows.push(
+            text("No commands yet — the ordered log appears here.")
+                .size(12)
+                .font(MONO)
+                .color(p.muted_2),
+        );
+    } else {
+        for command in &state.commands {
+            rows = rows.push(
+                row![
+                    text(command.seq.to_string())
+                        .size(12)
+                        .font(MONO)
+                        .color(p.muted_2)
+                        .width(28),
+                    text(&command.origin).size(12).font(MONO).color(p.muted_2),
+                    text(&command.text)
+                        .size(12)
+                        .font(MONO)
+                        .color(p.ink)
+                        .width(Length::Fill),
+                ]
+                .spacing(10),
+            );
+        }
+    }
+
+    let ready = state.status == Status::Live;
+    let can_send = ready && !state.command_draft.trim().is_empty();
+    let input = text_input("Send a command…", &state.command_draft)
+        .on_input_maybe(ready.then_some(Message::CommandDraftChanged))
+        .on_submit_maybe(can_send.then_some(Message::SubmitCommand))
+        .padding([8, 10])
+        .size(13)
+        .font(MONO)
+        .width(Length::Fill)
+        .style(move |_, status| iced::widget::text_input::Style {
+            background: Background::Color(p.canvas),
+            border: Border {
+                color: if matches!(status, iced::widget::text_input::Status::Focused { .. }) {
+                    p.border_strong
+                } else {
+                    p.border_soft
+                },
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            icon: p.muted,
+            placeholder: p.muted_2,
+            value: p.ink,
+            selection: theme::ACCENTS[0],
+        });
+    let send = button(text("Send").size(13).font(SANS_SEMIBOLD))
+        .padding([8, 16])
+        .style(move |_, _| iced::widget::button::Style {
+            background: Some(Background::Color(if can_send {
+                p.filled
+            } else {
+                p.sunken
+            })),
+            text_color: if can_send { p.on_filled } else { p.muted_2 },
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..iced::widget::button::Style::default()
+        });
+    let send = if can_send {
+        send.on_press(Message::SubmitCommand)
+    } else {
+        send
+    };
+
+    container(column![
+        container(Space::new())
+            .height(1)
+            .width(Length::Fill)
+            .style(move |_| container::Style::default().background(p.border_soft)),
+        container(scrollable(rows).height(Length::Shrink))
+            .max_height(160)
+            .padding([8, 14])
+            .width(Length::Fill),
+        container(column![
+            container(Space::new())
+                .height(1)
+                .width(Length::Fill)
+                .style(move |_| container::Style::default().background(p.border_soft)),
+            row![input, send].spacing(8).padding([10, 14]),
+        ])
+        .width(Length::Fill),
+    ])
+    .width(Length::Fill)
+    .style(move |_| container::Style::default().background(p.paper))
     .into()
 }
 
@@ -487,6 +761,7 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<WidgetState>();
+        let accepts_stdin = self.state.session_mode == SessionMode::Single;
         let mouse_mode = self.state.parser.screen().mouse_protocol_mode();
         if state.mouse_mode != mouse_mode {
             state.mouse_mode = mouse_mode;
@@ -505,7 +780,9 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                     if let Some(position) = cursor.position() {
                         let cell = cell_at(position, layout.bounds(), self.state.parser.screen());
                         let screen = self.state.parser.screen();
-                        if mouse_reporting(screen.mouse_protocol_mode(), state.modifiers) {
+                        if accepts_stdin
+                            && mouse_reporting(screen.mouse_protocol_mode(), state.modifiers)
+                        {
                             if let Some(button) = mouse_button_code(*button) {
                                 if let Some(bytes) = mouse_bytes(
                                     screen.mouse_protocol_encoding(),
@@ -541,6 +818,7 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                 let screen = self.state.parser.screen();
                 let cell = cell_at(*position, layout.bounds(), screen);
                 if cursor.is_over(layout.bounds())
+                    && accepts_stdin
                     && mouse_reporting(screen.mouse_protocol_mode(), state.modifiers)
                     && mouse_motion_enabled(
                         screen.mouse_protocol_mode(),
@@ -574,7 +852,8 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                 if let Some(reported) = state.reported_button
                     && mouse_button_code(*button) == Some(reported)
                 {
-                    if mouse_reporting(screen.mouse_protocol_mode(), state.modifiers)
+                    if accepts_stdin
+                        && mouse_reporting(screen.mouse_protocol_mode(), state.modifiers)
                         && !matches!(
                             screen.mouse_protocol_mode(),
                             vt100::MouseProtocolMode::Press
@@ -603,7 +882,9 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                 let lines = scroll_lines(*delta, &mut state.scroll_remainder);
                 if lines != 0 {
                     let screen = self.state.parser.screen();
-                    if mouse_wheel_reporting(screen.mouse_protocol_mode(), state.modifiers) {
+                    if accepts_stdin
+                        && mouse_wheel_reporting(screen.mouse_protocol_mode(), state.modifiers)
+                    {
                         let button = if lines > 0 { 64 } else { 65 };
                         if let Some(position) = cursor.position() {
                             let cell = cell_at(position, layout.bounds(), screen);
@@ -620,7 +901,8 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                                 }
                             }
                         }
-                    } else if self.state.modes.alternate_scroll
+                    } else if accepts_stdin
+                        && self.state.modes.alternate_scroll
                         && screen.alternate_screen()
                         && matches!(screen.mouse_protocol_mode(), vt100::MouseProtocolMode::None)
                         && !state.modifiers.shift()
@@ -666,20 +948,22 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                         shell.publish(Message::Copy(value));
                     }
                     shell.capture_event();
-                } else if is_paste_shortcut(key, *modifiers) {
+                } else if accepts_stdin && is_paste_shortcut(key, *modifiers) {
                     shell.publish(Message::RequestPaste);
                     shell.capture_event();
-                } else if let Some(bytes) = key_bytes(
-                    key,
-                    text.as_deref(),
-                    *modifiers,
-                    self.state.parser.screen().application_cursor(),
-                ) {
+                } else if accepts_stdin
+                    && let Some(bytes) = key_bytes(
+                        key,
+                        text.as_deref(),
+                        *modifiers,
+                        self.state.parser.screen().application_cursor(),
+                    )
+                {
                     shell.publish(Message::Input(bytes));
                     shell.capture_event();
                 }
             }
-            Event::InputMethod(input_method::Event::Opened) => {
+            Event::InputMethod(input_method::Event::Opened) if accepts_stdin => {
                 state.preedit = Some(input_method::Preedit::new());
                 shell.request_redraw();
             }
@@ -688,7 +972,7 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                 shell.request_redraw();
             }
             Event::InputMethod(input_method::Event::Preedit(content, selection))
-                if state.focused =>
+                if accepts_stdin && state.focused =>
             {
                 state.preedit = Some(input_method::Preedit {
                     content: content.clone(),
@@ -697,7 +981,9 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                 });
                 shell.request_redraw();
             }
-            Event::InputMethod(input_method::Event::Commit(value)) if state.focused => {
+            Event::InputMethod(input_method::Event::Commit(value))
+                if accepts_stdin && state.focused =>
+            {
                 if !value.is_empty() {
                     shell.publish(Message::Input(value.as_bytes().to_vec()));
                     shell.capture_event();
@@ -724,7 +1010,7 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                         shell.publish(Message::Resize { cols, rows });
                     }
                 }
-                if state.focused && state.window_focused {
+                if accepts_stdin && state.focused && state.window_focused {
                     if now.duration_since(state.last_blink) >= CURSOR_BLINK {
                         state.cursor_on = !state.cursor_on;
                         state.last_blink = *now;
@@ -790,6 +1076,7 @@ impl Widget<Message, Theme, iced::Renderer> for Terminal<'_> {
                 self.state.parser.screen(),
                 tree.state.downcast_ref(),
                 bounds,
+                self.state.session_mode == SessionMode::Single,
             );
         });
     }
@@ -806,6 +1093,7 @@ fn draw_screen(
     screen: &vt100::Screen,
     widget: &WidgetState,
     bounds: Rectangle,
+    show_cursor: bool,
 ) {
     let (rows, cols) = screen.size();
     let clip = bounds;
@@ -881,7 +1169,8 @@ fn draw_screen(
             }
         }
     }
-    if widget.focused
+    if show_cursor
+        && widget.focused
         && widget.window_focused
         && widget.cursor_on
         && !screen.hide_cursor()
@@ -1532,7 +1821,7 @@ mod tests {
     #[test]
     fn stale_generations_cannot_mutate_the_screen() {
         let mut state = State::default();
-        let Some(Effect::Start { generation }) = update(&mut state, Message::Start) else {
+        let Some(Effect::Start { generation, .. }) = update(&mut state, Message::Start) else {
             panic!("start effect missing");
         };
         update(
@@ -1551,6 +1840,78 @@ mod tests {
             },
         );
         assert_eq!(state.parser.screen().contents(), "live");
+    }
+
+    #[test]
+    fn shared_mode_restarts_cleanly_and_refuses_raw_input() {
+        let mut state = State {
+            status: Status::Live,
+            generation: 4,
+            ..State::default()
+        };
+        state.parser.process(b"old session");
+
+        assert_eq!(
+            update(&mut state, Message::SetMode(SessionMode::Shared)),
+            Some(Effect::Start {
+                generation: 5,
+                mode: SessionMode::Shared,
+            })
+        );
+        assert!(state.parser.screen().contents().is_empty());
+        assert_eq!(update(&mut state, Message::Input(b"unsafe".to_vec())), None);
+        assert_eq!(update(&mut state, Message::RequestPaste), None);
+    }
+
+    #[test]
+    fn shared_commands_are_submitted_and_logged_in_monotonic_order() {
+        let mut state = State {
+            status: Status::Live,
+            generation: 7,
+            session_mode: SessionMode::Shared,
+            ..State::default()
+        };
+        update(
+            &mut state,
+            Message::CommandDraftChanged("  cargo test  ".into()),
+        );
+        assert_eq!(
+            update(&mut state, Message::SubmitCommand),
+            Some(Effect::Command {
+                generation: 7,
+                text: "cargo test".into(),
+            })
+        );
+        assert!(state.command_draft.is_empty());
+
+        for (seq, text) in [(1, "first"), (1, "duplicate"), (2, "second")] {
+            update(
+                &mut state,
+                Message::CommandLogged {
+                    generation: 7,
+                    seq,
+                    origin: "Rae".into(),
+                    text: text.into(),
+                },
+            );
+        }
+        update(
+            &mut state,
+            Message::CommandLogged {
+                generation: 6,
+                seq: 3,
+                origin: "stale".into(),
+                text: "ignored".into(),
+            },
+        );
+        assert_eq!(
+            state
+                .commands
+                .iter()
+                .map(|command| (command.seq, command.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "first"), (2, "second")]
+        );
     }
 
     #[test]

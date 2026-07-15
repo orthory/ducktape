@@ -10,7 +10,7 @@ use cef::{
     PermissionRequestTypes,
 };
 
-use crate::browser_chrome::validate_duck_host;
+use crate::duck_url::validate_duck_host;
 
 const MAX_URL_BYTES: usize = 2 * 1024 * 1024;
 const MAX_NET_DATA_IMAGE_URL_BYTES: usize = 64 * 1024 * 1024;

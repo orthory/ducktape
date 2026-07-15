@@ -182,6 +182,7 @@ enum Message {
     ToggleSearch,
     Search(search::Message),
     Onboarding(onboarding::Message),
+    UserView(module_host::Message),
     UserScreen(user_screens::Message),
     UserModule(module_host::Event),
     Forge(forge_screen::Message),
@@ -220,12 +221,16 @@ enum Message {
     TrayTick,
     Tray(mac_tray::Event),
     TrayPositioned(window::Id, f32, f64, f64),
+    TraySelect(Screen),
     ToggleNotifications,
     CloseNotifications,
     ToggleNotificationGroup(String),
     OpenNotification(usize),
     NativeNotificationActivated(Option<notifications::Target>),
-    NotificationStream(notifications::StreamEvent),
+    NotificationStream {
+        origin: String,
+        event: notifications::StreamEvent,
+    },
     NotificationResolved(Option<notifications::Item>),
     #[cfg(feature = "cef-browser")]
     BrowserWindowReady(Option<window::Id>),
@@ -265,6 +270,7 @@ struct Shell {
     backend: Option<Backend>,
     active_workspace: Option<Workspace>,
     node_client: Option<NodeClient>,
+    node_stream_connected: bool,
     backend_error: Option<String>,
     mode: Mode,
     accent: Color,
@@ -284,10 +290,11 @@ struct Shell {
     terminal_screen: terminal_screen::State,
     terminal: Option<terminal_service::Handle>,
     terminal_closing: Option<terminal_service::Handle>,
-    terminal_pending_start: Option<u64>,
+    terminal_pending_start: Option<(u64, terminal_screen::SessionMode)>,
     settings: settings_screen::State,
     workspace: workspace_screens::State,
     workspace_overlay: bool,
+    tray_selected: Screen,
     browser_chrome: browser_chrome::State,
     browser_error: Option<String>,
     window_size: Size,
@@ -329,6 +336,7 @@ impl Default for Shell {
             backend: None,
             active_workspace: None,
             node_client: None,
+            node_stream_connected: false,
             backend_error: None,
             mode: Mode::Light,
             accent: theme::ACCENTS[0],
@@ -352,6 +360,7 @@ impl Default for Shell {
             settings: settings_screen::State::default(),
             workspace: workspace_screens::State::default(),
             workspace_overlay: false,
+            tray_selected: Screen::Node,
             browser_chrome: browser_chrome::State::default(),
             browser_error: None,
             window_size: Size::new(1280.0, 800.0),
@@ -429,6 +438,17 @@ impl Shell {
         };
     }
 
+    fn replace_node_client(&mut self, client: Option<NodeClient>) {
+        self.node_client = client;
+        self.node_stream_connected = false;
+    }
+
+    fn normalize_tray_selection(&mut self) {
+        if !tray_screen_available(self.tray_selected, self.active_workspace.is_some()) {
+            self.tray_selected = Screen::Node;
+        }
+    }
+
     fn stop_terminal(&mut self) {
         let _ = terminal_screen::update(&mut self.terminal_screen, terminal_screen::Message::Stop);
         self.terminal_pending_start = None;
@@ -446,6 +466,12 @@ impl Shell {
         handle.request_stop();
         self.terminal_closing = Some(handle);
     }
+}
+
+fn tray_screen_available(screen: Screen, local_managed: bool) -> bool {
+    screen == Screen::Node
+        || Screen::USER.contains(&screen)
+        || local_managed && Screen::OPERATOR.contains(&screen)
 }
 
 pub fn run() -> iced::Result {
@@ -652,6 +678,12 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                 return Task::batch([window::move_to(id, point), window::gain_focus(id)]);
             }
         }
+        Message::TraySelect(screen)
+            if tray_screen_available(screen, state.active_workspace.is_some()) =>
+        {
+            state.tray_selected = screen;
+        }
+        Message::TraySelect(_) => {}
         Message::ToggleNotifications => {
             state.notifications.toggle();
             mac_tray::set_unread(state.notifications.unread);
@@ -672,32 +704,47 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             ]);
         }
         Message::NativeNotificationActivated(None) => {}
-        Message::NotificationStream(notifications::StreamEvent::Frame(frame)) => {
-            let governance = governance_stream_frame(state, &frame);
-            let config = notification_config(state);
-            match state.notification_matcher.handle(frame, &config) {
-                Some(notifications::Matched::Item(item)) => {
-                    return Task::batch([present_notification(state, item), governance]);
+        Message::NotificationStream { origin, event } => {
+            if state
+                .node_client
+                .as_ref()
+                .is_none_or(|client| client.origin() != origin)
+            {
+                return Task::none();
+            }
+            match event {
+                notifications::StreamEvent::Connected => {
+                    state.node_stream_connected = true;
+                    return governance_stream_reload(state);
                 }
-                Some(notifications::Matched::Reply(candidate)) => {
-                    let Some(client) = state.node_client.clone() else {
-                        return governance;
-                    };
-                    return Task::batch([
-                        Task::perform(
-                            notifications::resolve_reply(client, candidate),
-                            Message::NotificationResolved,
-                        ),
-                        governance,
-                    ]);
+                notifications::StreamEvent::Disconnected => {
+                    state.node_stream_connected = false;
                 }
-                None => return governance,
+                notifications::StreamEvent::Frame(frame) => {
+                    state.node_stream_connected = true;
+                    let governance = governance_stream_frame(state, &frame);
+                    let config = notification_config(state);
+                    match state.notification_matcher.handle(frame, &config) {
+                        Some(notifications::Matched::Item(item)) => {
+                            return Task::batch([present_notification(state, item), governance]);
+                        }
+                        Some(notifications::Matched::Reply(candidate)) => {
+                            let Some(client) = state.node_client.clone() else {
+                                return governance;
+                            };
+                            return Task::batch([
+                                Task::perform(
+                                    notifications::resolve_reply(client, candidate),
+                                    Message::NotificationResolved,
+                                ),
+                                governance,
+                            ]);
+                        }
+                        None => return governance,
+                    }
+                }
             }
         }
-        Message::NotificationStream(notifications::StreamEvent::Connected) => {
-            return governance_stream_reload(state);
-        }
-        Message::NotificationStream(notifications::StreamEvent::Disconnected) => {}
         Message::NotificationResolved(Some(item)) => return present_notification(state, item),
         Message::NotificationResolved(None) => {}
         Message::ExternalUrlOpened(Ok(())) => {}
@@ -711,7 +758,7 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
         Message::BackendLoaded(Ok((backend, snapshot))) => {
             state.stop_terminal();
             let close_huddle = reset_huddle(state);
-            state.node_client = None;
+            state.replace_node_client(None);
             state.workspace.workspaces = snapshot
                 .workspaces
                 .iter()
@@ -724,6 +771,7 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                 .as_ref()
                 .is_none_or(|workspace| !workspace.member);
             state.active_workspace = snapshot.active;
+            state.normalize_tray_selection();
             state.backend = Some(backend.clone());
             state.backend_error = None;
             return Task::batch([
@@ -753,25 +801,38 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                 "desktop preferences could not be loaded"
             );
         }
-        Message::Back if state.history_index > 0 => {
-            if state.history[state.history_index - 1] == Screen::Terminal
-                && !terminal_available(state)
-            {
+        Message::Back => {
+            let terminal_available = terminal_available(state);
+            let Some(index) = (0..state.history_index)
+                .rev()
+                .find(|index| state.history[*index] != Screen::Terminal || terminal_available)
+            else {
                 return Task::none();
-            }
+            };
             let previous = state.screen();
-            state.history_index -= 1;
+            state.history_index = index;
+            state.section = if Screen::OPERATOR.contains(&state.screen()) {
+                Section::Operator
+            } else {
+                Section::User
+            };
             let terminal = sync_terminal_navigation(state, previous);
             return Task::batch([sync_browser_visibility(state), terminal]);
         }
-        Message::Forward if state.history_index + 1 < state.history.len() => {
-            if state.history[state.history_index + 1] == Screen::Terminal
-                && !terminal_available(state)
-            {
+        Message::Forward => {
+            let terminal_available = terminal_available(state);
+            let Some(index) = (state.history_index + 1..state.history.len())
+                .find(|index| state.history[*index] != Screen::Terminal || terminal_available)
+            else {
                 return Task::none();
-            }
+            };
             let previous = state.screen();
-            state.history_index += 1;
+            state.history_index = index;
+            state.section = if Screen::OPERATOR.contains(&state.screen()) {
+                Section::Operator
+            } else {
+                Section::User
+            };
             let terminal = sync_terminal_navigation(state, previous);
             return Task::batch([sync_browser_visibility(state), terminal]);
         }
@@ -928,6 +989,9 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             if !was_ready && state.onboarding.is_ready() {
                 return after_gate_ready(state);
             }
+        }
+        Message::UserView(message) => {
+            return update_user_module(state, message);
         }
         Message::UserScreen(message) => {
             match message {
@@ -1139,10 +1203,13 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             let close_huddle = reset_huddle(state);
             state.notification_matcher = notifications::Matcher::default();
             state.active_workspace = snapshot.active.clone();
-            state.node_client = snapshot
-                .active
-                .as_ref()
-                .and_then(|workspace| NodeClient::local(workspace.ports.http).ok());
+            state.replace_node_client(
+                snapshot
+                    .active
+                    .as_ref()
+                    .and_then(|workspace| NodeClient::local(workspace.ports.http).ok()),
+            );
+            state.normalize_tray_selection();
             state.workspace.workspaces = snapshot
                 .workspaces
                 .into_iter()
@@ -1229,7 +1296,7 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                 WindowAction::Close => close_window(state, id),
             };
         }
-        Message::Back | Message::Forward | Message::WindowReady(_, None) => {}
+        Message::WindowReady(_, None) => {}
     }
     Task::none()
 }
@@ -1271,8 +1338,12 @@ fn subscription(state: &Shell) -> Subscription<Message> {
         );
     }
     if let Some(client) = &state.node_client {
-        subscriptions
-            .push(notifications::subscription(client.origin()).map(Message::NotificationStream));
+        let origin = client.origin();
+        subscriptions.push(
+            notifications::subscription(origin.clone())
+                .with(origin)
+                .map(notification_stream_message),
+        );
         let dispatches = agents_screen::expanded_run_dispatches(&state.agents);
         if !dispatches.is_empty() {
             subscriptions.push(
@@ -1300,6 +1371,10 @@ fn subscription(state: &Shell) -> Subscription<Message> {
         );
     }
     Subscription::batch(subscriptions)
+}
+
+fn notification_stream_message((origin, event): (String, notifications::StreamEvent)) -> Message {
+    Message::NotificationStream { origin, event }
 }
 
 fn sync_huddle_runtime(state: &mut Shell) -> Task<Message> {
@@ -2293,12 +2368,12 @@ fn sync_terminal_navigation(state: &mut Shell, previous: Screen) -> Task<Message
 
 fn execute_terminal(state: &mut Shell, effect: terminal_screen::Effect) -> Task<Message> {
     match effect {
-        terminal_screen::Effect::Start { generation } => {
-            state.terminal_pending_start = Some(generation);
+        terminal_screen::Effect::Start { generation, mode } => {
+            state.terminal_pending_start = Some((generation, mode));
             state.begin_terminal_close();
             if state.terminal_closing.is_none() {
                 state.terminal_pending_start = None;
-                begin_terminal(state, generation);
+                begin_terminal(state, generation, mode);
             }
         }
         terminal_screen::Effect::Stop { generation } => {
@@ -2319,6 +2394,17 @@ fn execute_terminal(state: &mut Shell, effect: terminal_screen::Effect) -> Task<
                 .is_some_and(|handle| handle.send_input(bytes));
             if !accepted {
                 terminal_failed(state, generation, "Terminal input queue is unavailable.");
+            }
+        }
+        terminal_screen::Effect::Command { generation, text } => {
+            let origin = terminal_author(state);
+            let accepted = state
+                .terminal
+                .as_ref()
+                .filter(|handle| handle.generation() == generation)
+                .is_some_and(|handle| handle.send_command(text, origin));
+            if !accepted {
+                terminal_failed(state, generation, "Terminal command queue is unavailable.");
             }
         }
         terminal_screen::Effect::Copy(value) => {
@@ -2350,8 +2436,11 @@ fn execute_terminal(state: &mut Shell, effect: terminal_screen::Effect) -> Task<
     Task::none()
 }
 
-fn begin_terminal(state: &mut Shell, generation: u64) {
-    if state.screen() != Screen::Terminal || state.terminal_screen.generation() != generation {
+fn begin_terminal(state: &mut Shell, generation: u64, mode: terminal_screen::SessionMode) {
+    if state.screen() != Screen::Terminal
+        || state.terminal_screen.generation() != generation
+        || state.terminal_screen.session_mode() != mode
+    {
         return;
     }
     let Some(client) = state
@@ -2366,7 +2455,20 @@ fn begin_terminal(state: &mut Shell, generation: u64) {
         );
         return;
     };
-    state.terminal = Some(terminal_service::Handle::start(client, generation));
+    state.terminal = Some(terminal_service::Handle::start(client, generation, mode));
+}
+
+fn terminal_author(state: &Shell) -> String {
+    match &state.user_screens.home.data {
+        user_screens::Resource::Ready(data) => data
+            .profile
+            .as_ref()
+            .map(|profile| profile.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("operator")
+            .to_owned(),
+        _ => "operator".into(),
+    }
 }
 
 fn terminal_failed(state: &mut Shell, generation: u64, detail: &str) {
@@ -2388,11 +2490,12 @@ fn poll_terminal(state: &mut Shell) -> Task<Message> {
         .is_some_and(terminal_service::Handle::is_stopped)
     {
         state.terminal_closing.take();
-        if let Some(generation) = state.terminal_pending_start.take()
+        if let Some((generation, mode)) = state.terminal_pending_start.take()
             && state.screen() == Screen::Terminal
             && state.terminal_screen.generation() == generation
+            && state.terminal_screen.session_mode() == mode
         {
-            begin_terminal(state, generation);
+            begin_terminal(state, generation, mode);
         }
     }
     let events = state
@@ -2412,6 +2515,17 @@ fn poll_terminal(state: &mut Shell) -> Task<Message> {
             terminal_service::Event::Output { generation, bytes } => {
                 terminal_screen::Message::Output { generation, bytes }
             }
+            terminal_service::Event::CommandLogged {
+                generation,
+                seq,
+                origin,
+                text,
+            } => terminal_screen::Message::CommandLogged {
+                generation,
+                seq,
+                origin,
+                text,
+            },
             terminal_service::Event::Failed { generation, detail } => {
                 terminal_screen::Message::Failed { generation, detail }
             }
@@ -2760,8 +2874,9 @@ fn execute_workspace(state: &mut Shell, command: workspace_screens::Command) -> 
                 state.navigate(Screen::Chat);
                 let close_huddle = reset_huddle(state);
                 state.section = Section::User;
-                state.node_client = NodeClient::new(&url).ok();
                 state.active_workspace = None;
+                state.replace_node_client(NodeClient::new(&url).ok());
+                state.normalize_tray_selection();
                 state.workspace_overlay = false;
                 reset_browser_gateway(state);
                 return Task::batch([close_huddle, load_current_user_screen(state)]);
@@ -2774,7 +2889,7 @@ fn execute_workspace(state: &mut Shell, command: workspace_screens::Command) -> 
         workspace_screens::Command::ActivateWorkspace { .. } => {
             state.stop_terminal();
             let close_huddle = reset_huddle(state);
-            state.node_client = None;
+            state.replace_node_client(None);
             reset_browser_gateway(state);
             return Task::batch([
                 close_huddle,
@@ -2808,6 +2923,16 @@ const fn user_screen(screen: Screen) -> Option<user_screens::Screen> {
         Screen::Chat => Some(user_screens::Screen::Chat),
         Screen::Pages => Some(user_screens::Screen::Pages),
         Screen::Files => Some(user_screens::Screen::Files),
+        _ => None,
+    }
+}
+
+const fn user_view(screen: Screen) -> Option<crate::view_api::ViewId> {
+    match screen {
+        Screen::Home => Some(crate::view_api::ViewId::Home),
+        Screen::Chat => Some(crate::view_api::ViewId::Chat),
+        Screen::Pages => Some(crate::view_api::ViewId::Pages),
+        Screen::Files => Some(crate::view_api::ViewId::Files),
         _ => None,
     }
 }
@@ -2873,6 +2998,45 @@ mod tests {
             vec![Screen::Chat, Screen::Pages, Screen::Forge]
         );
         assert_eq!(shell.screen(), Screen::Forge);
+    }
+
+    #[test]
+    fn history_navigation_keeps_the_module_section_in_sync() {
+        let mut shell = Shell::default();
+        shell.navigate(Screen::Node);
+        assert_eq!(shell.section, Section::Operator);
+
+        drop(update(&mut shell, Message::Back));
+        assert_eq!(shell.screen(), Screen::Chat);
+        assert_eq!(shell.section, Section::User);
+
+        drop(update(&mut shell, Message::Forward));
+        assert_eq!(shell.screen(), Screen::Node);
+        assert_eq!(shell.section, Section::Operator);
+    }
+
+    #[test]
+    fn history_navigation_skips_an_unavailable_terminal() {
+        let mut shell = Shell::default();
+        shell.history = vec![Screen::Chat, Screen::Terminal, Screen::Node];
+        shell.history_index = 2;
+        shell.section = Section::Operator;
+
+        drop(update(&mut shell, Message::Back));
+        assert_eq!(shell.screen(), Screen::Chat);
+        assert_eq!(shell.section, Section::User);
+
+        drop(update(&mut shell, Message::Forward));
+        assert_eq!(shell.screen(), Screen::Node);
+        assert_eq!(shell.section, Section::Operator);
+    }
+
+    #[cfg(feature = "cef-browser")]
+    #[test]
+    fn browser_parent_completion_is_ignored_after_start_or_quit() {
+        assert!(browser_session::parent_request_is_current(false, false));
+        assert!(!browser_session::parent_request_is_current(true, false));
+        assert!(!browser_session::parent_request_is_current(false, true));
     }
 
     #[test]
@@ -3097,8 +3261,76 @@ mod tests {
         let mut shell = Shell::default();
         let palette = theme::palette(shell.mode);
         assert_eq!(titlebar_connection(&shell, palette).0, "OFFLINE");
-        shell.node_client = Some(NodeClient::new("https://node.example").unwrap());
-        assert_eq!(titlebar_connection(&shell, palette).0, "REMOTE");
+        shell.replace_node_client(Some(NodeClient::new("https://node.example").unwrap()));
+        assert_eq!(
+            titlebar_connection(&shell, palette).0,
+            "REMOTE · RECONNECTING"
+        );
+        shell.node_stream_connected = true;
+        assert_eq!(titlebar_connection(&shell, palette).0, "REMOTE · CONNECTED");
+    }
+
+    #[test]
+    fn stale_stream_events_cannot_mark_the_current_client_connected() {
+        let mut shell = Shell::default();
+        shell.replace_node_client(Some(NodeClient::new("https://node.example").unwrap()));
+
+        drop(update(
+            &mut shell,
+            Message::NotificationStream {
+                origin: "https://old-node.example/".into(),
+                event: notifications::StreamEvent::Connected,
+            },
+        ));
+        assert!(!shell.node_stream_connected);
+
+        let origin = shell.node_client.as_ref().unwrap().origin();
+        drop(update(
+            &mut shell,
+            Message::NotificationStream {
+                origin: origin.clone(),
+                event: notifications::StreamEvent::Connected,
+            },
+        ));
+        assert!(shell.node_stream_connected);
+
+        drop(update(
+            &mut shell,
+            Message::NotificationStream {
+                origin,
+                event: notifications::StreamEvent::Disconnected,
+            },
+        ));
+        assert!(!shell.node_stream_connected);
+        assert_eq!(
+            titlebar_connection(&shell, theme::palette(shell.mode)).0,
+            "REMOTE · RECONNECTING"
+        );
+    }
+
+    #[test]
+    fn tray_keeps_module_selection_without_opening_the_main_window() {
+        let mut shell = Shell::default();
+        assert!(
+            Screen::USER
+                .into_iter()
+                .all(|screen| tray_screen_available(screen, false))
+        );
+        assert!(!tray_screen_available(Screen::Gateway, false));
+        assert!(
+            Screen::OPERATOR
+                .into_iter()
+                .all(|screen| tray_screen_available(screen, true))
+        );
+
+        drop(update(&mut shell, Message::TraySelect(Screen::Forge)));
+        assert_eq!(shell.tray_selected, Screen::Forge);
+        assert_eq!(shell.screen(), Screen::Chat);
+
+        shell.tray_selected = Screen::Gateway;
+        shell.active_workspace = None;
+        shell.normalize_tray_selection();
+        assert_eq!(shell.tray_selected, Screen::Node);
     }
 
     #[test]

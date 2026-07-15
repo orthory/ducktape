@@ -18,7 +18,7 @@ use reqwest::blocking::{Client, Response as UpstreamResponse};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
 
-use crate::browser_chrome::validate_duck_host;
+use crate::duck_url::validate_duck_host;
 
 const CHANNEL_DEPTH: usize = 8;
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;

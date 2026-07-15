@@ -4,11 +4,45 @@
 //! trait registry. Every effect and event retains its originating view until
 //! that view's reducer consumes it.
 
+use iced::Element;
+
 use crate::screens::user;
+use crate::theme;
 use crate::view_api::{AppIntent, Route, ViewId};
+
+/// Render a built-in native view through the same origin-tagged boundary used
+/// by its reducer. A future packaged-view runtime can replace this one host
+/// entry point without adding capabilities to the view modules themselves.
+pub fn view(state: &user::State, view: ViewId, mode: theme::Mode) -> Element<'_, Message> {
+    user::view(state, built_in_screen(view), mode)
+        .map(move |message| from_built_in_message(view, message))
+}
+
+const fn built_in_screen(view: ViewId) -> user::Screen {
+    match view {
+        ViewId::Home => user::Screen::Home,
+        ViewId::Chat => user::Screen::Chat,
+        ViewId::Pages => user::Screen::Pages,
+        ViewId::Files => user::Screen::Files,
+    }
+}
+
+fn from_built_in_message(view: ViewId, message: user::Message) -> Message {
+    match message {
+        user::Message::Load(_) => Message::Load(view),
+        user::Message::Home(message) => Message::Home(message),
+        user::Message::Chat(message) => Message::Chat(message),
+        user::Message::Pages(message) => Message::Pages(message),
+        user::Message::Files(message) => Message::Files(message),
+        user::Message::AccountTick | user::Message::Service(_) => {
+            unreachable!("a built-in view emitted a host-only message")
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
+    Load(ViewId),
     Home(user::HomeMessage),
     Chat(user::ChatMessageEvent),
     Pages(user::PagesMessage),
@@ -189,6 +223,17 @@ impl FilesEvent {
 
 pub fn update(state: &mut user::State, message: Message) -> Option<Effect> {
     match message {
+        Message::Load(view) => {
+            let command = user::update(state, user::Message::Load(built_in_screen(view)))?;
+            match view {
+                ViewId::Home => HomeEffect::new(command).map(Effect::Home),
+                ViewId::Chat => ChatCommand::new(command)
+                    .map(ChatEffect::Command)
+                    .map(Effect::Chat),
+                ViewId::Pages => PagesEffect::new(command).map(Effect::Pages),
+                ViewId::Files => FilesEffect::new(command).map(Effect::Files),
+            }
+        }
         Message::Home(message) => user::update(state, user::Message::Home(message))
             .and_then(HomeEffect::new)
             .map(Effect::Home),
@@ -438,6 +483,24 @@ fn invalid_service_event(screen: user::Screen) -> user::ServiceEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_static_views_render_through_the_native_boundary() {
+        let state = user::State::default();
+        for view_id in [ViewId::Home, ViewId::Chat, ViewId::Pages, ViewId::Files] {
+            drop(view(&state, view_id, theme::Mode::Light));
+        }
+    }
+
+    #[test]
+    fn retry_loads_keep_their_view_origin() {
+        for view_id in [ViewId::Home, ViewId::Chat, ViewId::Pages, ViewId::Files] {
+            assert_eq!(
+                from_built_in_message(view_id, user::Message::Load(user::Screen::Files)),
+                Message::Load(view_id)
+            );
+        }
+    }
 
     #[test]
     fn effects_keep_their_origin_and_reject_cross_view_commands() {
