@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 
-use agent::{AgentRecord, LoadMode, SKILL_LIBRARY_PREFIX, SkillRef};
+use agent::{AgentRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
 use chat::{AuthorRef, Block, MessageView};
 use duckfs_core::paths::canonical as canonical_duckfs_path;
 use serde::Serialize;
@@ -248,6 +248,16 @@ pub(crate) fn resolve_skills(
 /// pinned snapshot, no `always` — a requester offers a library skill on demand;
 /// only an owner's own record inlines a persona.
 pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> {
+    // the SAME ceiling the agent record's own curation carries — the resolved
+    // set is bounded there, and an unbounded request would otherwise commit a
+    // giant dispatch payload and force one duckfs checkout per name on the
+    // executing node for a run the assembler was always going to refuse.
+    if names.len() > MAX_SKILLS_PER_AGENT {
+        return Err(format!(
+            "a run may curate at most {MAX_SKILLS_PER_AGENT} skills, got {}",
+            names.len()
+        ));
+    }
     let mut seen = BTreeSet::new();
     let mut refs = Vec::with_capacity(names.len());
     for name in names {
@@ -729,6 +739,15 @@ mod tests {
         }
         // a name repeated in one request is refused (it would mount twice).
         assert!(library_skills(&["qa".into(), "qa".into()]).is_err());
+
+        // and the count is capped in consensus — the same ceiling the agent
+        // record carries — so a huge request cannot commit a giant payload or
+        // force a checkout per name for a doomed run.
+        let too_many: Vec<String> = (0..=agent::MAX_SKILLS_PER_AGENT)
+            .map(|i| format!("s{i}"))
+            .collect();
+        assert!(library_skills(&too_many).is_err());
+        assert!(library_skills(&too_many[..agent::MAX_SKILLS_PER_AGENT]).is_ok());
     }
 
     /// a tracking skill (no pin) still resolves to the committed head, and its
