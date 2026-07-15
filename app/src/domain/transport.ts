@@ -28,6 +28,7 @@ import {
   isSubscribedFrame,
   isTailFrame,
   isTermChunkFrame,
+  isTermCommandLogFrame,
 } from "./stream";
 
 export interface BlockEvent {
@@ -379,15 +380,22 @@ export interface NodeTransport {
   // http/ws surface simply omits them and the Terminal view stays inert.
 
   /** Create a node-hosted interactive terminal session for `agent` (e.g.
-   *  "codex"): POST /v1/term/sessions. The node enforces its own per-node
-   *  session cap and answers an error when over it — surfaced as a NodeError. */
-  createTermSession?(agent: string): Promise<TermSession>;
+   *  "codex"): POST /v1/term/sessions. `mode` picks the input discipline —
+   *  `"single"` (raw keystrokes → pty, the solo terminal) or `"shared"` (the
+   *  ordered, attributed `termCommand` lane). The node enforces its own
+   *  per-node session cap and answers an error when over it — a NodeError. */
+  createTermSession?(agent: string, mode: TermSessionMode): Promise<TermSession>;
   /** Close a session: POST /v1/term/sessions/<id>/close (idempotent). */
   closeTermSession?(sessionId: string): Promise<void>;
   /** Send one terminal op (input / resize) over the SAME ws the subscribe
    *  socket uses. A no-op if the socket is not currently open. */
   sendTerm?(msg: TermClientMsg): void;
 }
+
+/** How a terminal session takes input. `single`: raw keystrokes straight to the
+ *  pty (the solo terminal). `shared`: the ordered, attributed command lane —
+ *  raw input is refused, the only way in is `termCommand`. */
+export type TermSessionMode = "single" | "shared";
 
 /** A created terminal session: its id and the stream topic its output rides. */
 export interface TermSession {
@@ -402,6 +410,11 @@ export interface TopicHandlers {
    *  terminal bytes (see stream.ts TermChunkFrame). The ring replays on
    *  (re)subscribe, so these also carry catch-up. */
   onTermChunk?(item: string): void;
+  /** One row of a shared session's ordered command log, on a `term-cmd:` topic
+   *  (see stream.ts TermCommandLogFrame): the total-order `seq`, the author
+   *  `origin`, and the command `text`. The ring replays on (re)subscribe, so
+   *  these carry catch-up too — dedupe by `seq` on reconnect. */
+  onTermCommandLog?(seq: number, origin: string, text: string): void;
   onLagged?(topic: string, cursor: string): void;
   /** The node refused this topic (unknown on an older build, unavailable, …):
    *  no frames will arrive on it for the rest of this connection, so a
@@ -686,6 +699,14 @@ export const remoteTransport = (
     if (isEventFrame(frame)) {
       cursors.set(frame.topic, frame.cursor);
       topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onEvent?.(frame));
+      return;
+    }
+    if (isTermCommandLogFrame(frame)) {
+      // no cursor: the frame carries none, and the node replays the whole
+      // command ring on resubscribe (the view dedupes by seq).
+      topicSubs
+        .get(frame.topic)
+        ?.forEach((handlers) => handlers.onTermCommandLog?.(frame.seq, frame.origin, frame.text));
       return;
     }
     if (isTailFrame(frame)) {
@@ -1069,8 +1090,8 @@ export const remoteTransport = (
         closeIfIdle();
       };
     },
-    createTermSession: (agent) =>
-      postJson<TermSession>(`${base}/v1/term/sessions`, { agent }),
+    createTermSession: (agent, mode) =>
+      postJson<TermSession>(`${base}/v1/term/sessions`, { agent, mode }),
     closeTermSession: async (sessionId) => {
       // idempotent on the node; a non-2xx still surfaces its detail.
       const res = await fetchDeadline(

@@ -4,12 +4,17 @@
 // codex, its topic is subscribed, base64 output chunks decode onto the terminal,
 // and keystrokes encode back as termInput.
 
-import { act, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ConsoleContext } from "../../console/store/context";
 import type { ConsoleContextValue } from "../../console/store/context";
-import { decodeTermChunk, termInputMsg, termResizeMsg } from "../../domain/term-client";
+import {
+  decodeTermChunk,
+  termCommandMsg,
+  termInputMsg,
+  termResizeMsg,
+} from "../../domain/term-client";
 import type { TopicHandlers } from "../../domain/transport";
 import { makeTransportStub } from "../transport-stub";
 
@@ -35,7 +40,11 @@ vi.mock("@xterm/xterm", () => ({
     loadAddon() {}
     open() {}
     focus() {}
-    dispose() {}
+    dispose() {
+      // a disposed terminal has no data callback — lets a test observe that the
+      // raw keystroke path is left UNWIRED after a mode switch to shared.
+      xterm.dataCb = null;
+    }
   },
 }));
 vi.mock("@xterm/addon-fit", () => ({
@@ -66,6 +75,13 @@ describe("term-client wire helpers", () => {
       cols: 80,
       rows: 24,
     });
+    // a shared-session command carries plain text (not base64) + the author.
+    expect(termCommandMsg("s1", "ls -la", "ext:me")).toEqual({
+      op: "termCommand",
+      session: "s1",
+      text: "ls -la",
+      origin: "ext:me",
+    });
   });
 });
 
@@ -95,7 +111,7 @@ describe("terminal surface", () => {
       );
     });
 
-    await waitFor(() => expect(createTermSession).toHaveBeenCalledWith("codex"));
+    await waitFor(() => expect(createTermSession).toHaveBeenCalledWith("codex", "single"));
     await waitFor(() => expect(subscribe).toHaveBeenCalled());
     expect(subscribe.mock.calls[0][0]).toEqual(["term:s1"]);
     // an initial resize rides after fit(), at the terminal's geometry.
@@ -113,5 +129,68 @@ describe("terminal surface", () => {
       xterm.dataCb!("x");
     });
     expect(sendTerm).toHaveBeenCalledWith(termInputMsg("s1", "x"));
+  });
+
+  it("shared mode: command lane in, ordered log out, no raw input", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const subscribed: string[][] = [];
+    let handlers: TopicHandlers | null = null;
+    const subscribe = vi.fn((topics: string[], h: TopicHandlers) => {
+      subscribed.push(topics);
+      handlers = h;
+      return () => {};
+    });
+    const createTermSession = vi.fn().mockResolvedValue({ sessionId: "s1", topic: "term:s1" });
+    const sendTerm = vi.fn();
+    const transport = makeTransportStub({ subscribe, createTermSession, sendTerm });
+    const state = { author: "ext:me" };
+
+    render(
+      <ConsoleContext.Provider
+        value={{ transport, state } as unknown as ConsoleContextValue}
+      >
+        <TerminalView />
+      </ConsoleContext.Provider>,
+    );
+
+    // starts single (default); wait until the raw keystroke path is wired so the
+    // switch-to-shared genuinely tears it back down.
+    await waitFor(() => expect(createTermSession).toHaveBeenCalledWith("codex", "single"));
+    await waitFor(() => expect(xterm.dataCb).not.toBeNull());
+
+    // flip the header toggle to shared.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /shared/i }));
+    });
+    await waitFor(() => expect(createTermSession).toHaveBeenCalledWith("codex", "shared"));
+
+    // shared subscribes BOTH the output topic and the command-log topic.
+    await waitFor(() =>
+      expect(subscribed[subscribed.length - 1]).toEqual(["term:s1", "term-cmd:s1"]),
+    );
+    // and leaves raw keystrokes UNWIRED (node refuses raw_input_on_shared).
+    expect(xterm.dataCb).toBeNull();
+
+    // the command box sends a termCommand — plain text + the author origin.
+    const box = screen.getByRole("textbox", { name: /command/i });
+    await act(async () => {
+      fireEvent.change(box, { target: { value: "ls -la" } });
+      fireEvent.submit(box.closest("form")!);
+    });
+    expect(sendTerm).toHaveBeenCalledWith(termCommandMsg("s1", "ls -la", "ext:me"));
+
+    // the ordered command log renders seq · origin · text rows.
+    await act(async () => {
+      handlers!.onTermCommandLog!(1, "ext:alice", "whoami");
+    });
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("ext:alice")).toBeInTheDocument();
+    expect(screen.getByText("whoami")).toBeInTheDocument();
   });
 });
