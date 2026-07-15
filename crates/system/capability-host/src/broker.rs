@@ -120,6 +120,42 @@ pub(crate) struct BrokerEndpoint {
     pub(crate) run_bearer: String,
 }
 
+/// how the provider child reaches this run's broker — which drives BOTH the
+/// bind address and the `base_url` the child is handed.
+///
+/// `Loopback` is a same-netns child (Direct, or Podman under `--network=host`):
+/// bind `127.0.0.1`, hand it `http://127.0.0.1:<port>`.
+///
+/// `HostGateway(host)` is a child in a SEPARATE netns that reaches the host only
+/// through a gateway name in its `/etc/hosts` — a Tart VM guest (`ducktape-host`)
+/// or a private-netns Podman container (`host.containers.internal`). The broker
+/// binds a routable interface and the base_url names the gateway. The opaque
+/// per-run bearer still gates it; binding beyond loopback is the reachability
+/// cost of the stronger network isolation.
+#[derive(Clone, Copy)]
+pub(crate) enum Reachability {
+    Loopback,
+    HostGateway(&'static str),
+}
+
+impl Reachability {
+    fn bind(self) -> std::net::Ipv4Addr {
+        match self {
+            Self::Loopback => std::net::Ipv4Addr::LOCALHOST,
+            Self::HostGateway(_) => std::net::Ipv4Addr::UNSPECIFIED,
+        }
+    }
+
+    /// `suffix` is `/v1` for codex (base points at the provider root) and `""`
+    /// for Anthropic (Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`).
+    fn base_url(self, addr: std::net::SocketAddr, suffix: &str) -> String {
+        match self {
+            Self::Loopback => format!("http://{addr}{suffix}"),
+            Self::HostGateway(host) => format!("http://{host}:{}{suffix}", addr.port()),
+        }
+    }
+}
+
 pub(crate) struct RunBroker {
     pub(crate) endpoint: BrokerEndpoint,
     shutdown: Option<oneshot::Sender<()>>,
@@ -128,19 +164,29 @@ pub(crate) struct RunBroker {
 
 impl RunBroker {
     pub(crate) async fn start() -> Result<Self, String> {
-        Self::start_with(UpstreamCredential::from_host()?, false).await
+        Self::start_with(UpstreamCredential::from_host()?, Reachability::Loopback).await
     }
 
     pub(crate) async fn start_for_tart() -> Result<Self, String> {
-        Self::start_with(UpstreamCredential::from_host()?, true).await
+        Self::start_with(
+            UpstreamCredential::from_host()?,
+            Reachability::HostGateway("ducktape-host"),
+        )
+        .await
     }
 
-    async fn start_with(upstream: UpstreamCredential, tart_guest: bool) -> Result<Self, String> {
-        let bind = if tart_guest {
-            std::net::Ipv4Addr::UNSPECIFIED
-        } else {
-            std::net::Ipv4Addr::LOCALHOST
-        };
+    /// a private-netns Podman container reaches the loopback host only via the
+    /// `host.containers.internal` gateway podman adds to its `/etc/hosts`.
+    pub(crate) async fn start_for_podman_private() -> Result<Self, String> {
+        Self::start_with(
+            UpstreamCredential::from_host()?,
+            Reachability::HostGateway("host.containers.internal"),
+        )
+        .await
+    }
+
+    async fn start_with(upstream: UpstreamCredential, reach: Reachability) -> Result<Self, String> {
+        let bind = reach.bind();
         let listener = tokio::net::TcpListener::bind((bind, 0))
             .await
             .map_err(|e| format!("bind run-scoped provider broker: {e}"))?;
@@ -179,11 +225,7 @@ impl RunBroker {
         });
         Ok(Self {
             endpoint: BrokerEndpoint {
-                base_url: if tart_guest {
-                    format!("http://ducktape-host:{}/v1", addr.port())
-                } else {
-                    format!("http://{addr}/v1")
-                },
+                base_url: reach.base_url(addr, "/v1"),
                 run_bearer,
             },
             shutdown: Some(shutdown),
@@ -558,27 +600,41 @@ async fn oauth_refresh(
 impl RunBroker {
     /// start the Anthropic Messages broker for a Direct/Podman run (loopback).
     pub(crate) async fn start_anthropic() -> Result<Self, String> {
-        Self::start_anthropic_with(AnthropicAuth::from_host()?, false, ANTHROPIC_MESSAGES_URL.into())
-            .await
+        Self::start_anthropic_with(
+            AnthropicAuth::from_host()?,
+            Reachability::Loopback,
+            ANTHROPIC_MESSAGES_URL.into(),
+        )
+        .await
     }
 
     /// start it for a Tart guest — bind the host gateway the guest reaches as
     /// `ducktape-host`.
     pub(crate) async fn start_anthropic_for_tart() -> Result<Self, String> {
-        Self::start_anthropic_with(AnthropicAuth::from_host()?, true, ANTHROPIC_MESSAGES_URL.into())
-            .await
+        Self::start_anthropic_with(
+            AnthropicAuth::from_host()?,
+            Reachability::HostGateway("ducktape-host"),
+            ANTHROPIC_MESSAGES_URL.into(),
+        )
+        .await
+    }
+
+    /// start it for a private-netns Podman container (`host.containers.internal`).
+    pub(crate) async fn start_anthropic_for_podman_private() -> Result<Self, String> {
+        Self::start_anthropic_with(
+            AnthropicAuth::from_host()?,
+            Reachability::HostGateway("host.containers.internal"),
+            ANTHROPIC_MESSAGES_URL.into(),
+        )
+        .await
     }
 
     async fn start_anthropic_with(
         auth: AnthropicAuth,
-        tart_guest: bool,
+        reach: Reachability,
         messages_url: String,
     ) -> Result<Self, String> {
-        let bind = if tart_guest {
-            std::net::Ipv4Addr::UNSPECIFIED
-        } else {
-            std::net::Ipv4Addr::LOCALHOST
-        };
+        let bind = reach.bind();
         let listener = tokio::net::TcpListener::bind((bind, 0))
             .await
             .map_err(|e| format!("bind run-scoped anthropic broker: {e}"))?;
@@ -625,11 +681,7 @@ impl RunBroker {
                 // NO `/v1` suffix: ANTHROPIC_BASE_URL is the API ROOT and Claude
                 // Code appends `/v1/messages` itself (unlike codex, whose argv
                 // appends `/responses` to a `…/v1` base).
-                base_url: if tart_guest {
-                    format!("http://ducktape-host:{}", addr.port())
-                } else {
-                    format!("http://{addr}")
-                },
+                base_url: reach.base_url(addr, ""),
                 run_bearer,
             },
             shutdown: Some(shutdown),
@@ -774,7 +826,7 @@ mod tests {
                 account_id: None,
                 url: "http://127.0.0.1:1/responses".into(),
             },
-            true,
+            Reachability::HostGateway("ducktape-host"),
         )
         .await
         .unwrap();
@@ -810,7 +862,7 @@ mod tests {
                 account_id: Some("acct-1".into()),
                 url: format!("http://{addr}/responses"),
             },
-            false,
+            Reachability::Loopback,
         )
         .await
         .unwrap();
@@ -920,7 +972,7 @@ mod tests {
         auth: AnthropicAuth,
         url: String,
     ) -> RunBroker {
-        RunBroker::start_anthropic_with(auth, false, url)
+        RunBroker::start_anthropic_with(auth, Reachability::Loopback, url)
             .await
             .unwrap()
     }
@@ -1124,7 +1176,7 @@ mod tests {
     async fn anthropic_tart_broker_uses_the_guest_nat_hostname() {
         let broker = RunBroker::start_anthropic_with(
             AnthropicAuth::ApiKey("unused".into()),
-            true,
+            Reachability::HostGateway("ducktape-host"),
             "http://127.0.0.1:1/v1/messages".into(),
         )
         .await
@@ -1133,6 +1185,23 @@ mod tests {
         // Code appends /v1/messages to ANTHROPIC_BASE_URL itself).
         assert!(broker.endpoint.base_url.starts_with("http://ducktape-host:"));
         assert!(!broker.endpoint.base_url.ends_with("/v1"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_private_netns_podman_uses_host_containers_internal() {
+        let broker = RunBroker::start_anthropic_with(
+            AnthropicAuth::ApiKey("unused".into()),
+            Reachability::HostGateway("host.containers.internal"),
+            "http://127.0.0.1:1/v1/messages".into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            broker
+                .endpoint
+                .base_url
+                .starts_with("http://host.containers.internal:")
+        );
     }
 
     #[test]

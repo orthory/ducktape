@@ -64,7 +64,7 @@ pub fn wrap_podman(
     limits: &BTreeMap<String, u64>,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
-        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false,
+        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false, false,
     )
 }
 
@@ -84,6 +84,7 @@ pub(crate) fn wrap_podman_managed(
     cidfile: &Path,
     labels: &[String],
     tty: bool,
+    private_net: bool,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
         image,
@@ -96,6 +97,7 @@ pub(crate) fn wrap_podman_managed(
         limits,
         Some((cidfile, labels)),
         tty,
+        private_net,
     )
 }
 
@@ -111,16 +113,34 @@ fn wrap_podman_inner(
     limits: &BTreeMap<String, u64>,
     control: Option<(&Path, &[String])>,
     tty: bool,
+    private_net: bool,
 ) -> (PathBuf, Vec<String>) {
-    // -i keeps stdin open: the prompt is fed on the child's stdin. -t adds a
+    let mut argv: Vec<String> = vec!["run".into(), "--rm".into()];
+    if private_net {
+        // A PRIVATE netns (podman's default rootless net, pasta/slirp): the
+        // container gets its OWN loopback, so it can no longer scan the host's —
+        // the lateral reach `--network=host` gave, letting a member hit other
+        // runs' brokers / the node RPC. It reaches this run's broker (bound to a
+        // routable interface, base_url = host.containers.internal) only via the
+        // gateway podman adds to /etc/hosts.
+        //
+        // PENDING podman-host validation (this box has no podman): whether the
+        // gateway forwards to host-loopback services or the broker must bind the
+        // gateway address, and a full OUTBOUND egress allowlist (block the
+        // internet, allow only the broker + node RPC). Off by default — enabled
+        // per-node by DUCKTAPE_SANDBOX_PRIVATE_NET — so nothing regresses until
+        // it is validated and made default.
+        argv.push("--add-host=host.containers.internal:host-gateway".into());
+    } else {
+        // `--network=host`: the container shares the host netns, so the broker /
+        // MCP on 127.0.0.1 are reachable at the address the argv names. The
+        // historical default; kept until private_net is validated on a podman host.
+        argv.push("--network=host".into());
+    }
+    // -i keeps stdin open (the prompt is fed on the child's stdin). -t adds a
     // container-side pty for an interactive session — the host attaches podman's
     // stdio to a pty master and podman relays terminal size/SIGWINCH into it.
-    let mut argv: Vec<String> = vec![
-        "run".into(),
-        "--rm".into(),
-        "--network=host".into(),
-        "-i".into(),
-    ];
+    argv.push("-i".into());
     if tty {
         argv.push("-t".into());
     }
@@ -569,6 +589,7 @@ mod tests {
             cidfile,
             &labels,
             false,
+            false,
         );
         let s = argv.join(" ");
         assert!(
@@ -606,6 +627,7 @@ mod tests {
                 cidfile,
                 &labels,
                 tty,
+                false,
             )
             .1
             .join(" ")
@@ -623,6 +645,41 @@ mod tests {
         assert!(
             interactive.split(' ').any(|a| a == "-t"),
             "interactive adds -t: {interactive}"
+        );
+    }
+
+    #[test]
+    fn private_net_swaps_host_netns_for_a_gateway_mapped_private_one() {
+        let cidfile = Path::new("/host/x.cid");
+        let labels: Vec<String> = vec![];
+        let build = |private_net: bool| {
+            wrap_podman_managed(
+                "img",
+                Path::new("/bin/x"),
+                &[],
+                Path::new("/work"),
+                &[],
+                &[],
+                &[],
+                &BTreeMap::new(),
+                cidfile,
+                &labels,
+                false,
+                private_net,
+            )
+            .1
+            .join(" ")
+        };
+        let host = build(false);
+        let private = build(true);
+        // default: shared host netns, no gateway mapping.
+        assert!(host.contains("--network=host"), "host mode: {host}");
+        assert!(!host.contains("host.containers.internal"), "host mode: {host}");
+        // private: no --network=host, the gateway is mapped instead.
+        assert!(!private.contains("--network=host"), "private: {private}");
+        assert!(
+            private.contains("--add-host=host.containers.internal:host-gateway"),
+            "private: {private}"
         );
     }
 

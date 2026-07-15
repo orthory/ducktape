@@ -507,6 +507,13 @@ pub(crate) struct CliProvider {
     /// how the child is spawned: `Direct`, rootless `Podman`, or an ephemeral
     /// Tart VM. set once at discovery for the whole provider set.
     backend: SandboxBackend,
+    /// (Podman only) give the container a PRIVATE netns instead of `--network=host`,
+    /// so it cannot scan the host's loopback for other runs' brokers / the node
+    /// RPC. Off by default (`--network=host` unchanged); enabled per-node by
+    /// `DUCKTAPE_SANDBOX_PRIVATE_NET` while the gateway/egress specifics are
+    /// validated on a real podman host. When on, the broker is reachable via
+    /// `host.containers.internal` (see [`broker::Reachability`]).
+    private_net: bool,
 }
 
 impl CliProvider {
@@ -527,6 +534,7 @@ impl CliProvider {
             dirs: AgentDirs::default(),
             output_sink: None,
             backend: SandboxBackend::Direct,
+            private_net: false,
         }
     }
 
@@ -538,6 +546,12 @@ impl CliProvider {
 
     pub fn with_backend(mut self, backend: SandboxBackend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// (Podman only) opt into a private netns instead of `--network=host`.
+    pub fn with_private_net(mut self, private_net: bool) -> Self {
+        self.private_net = private_net;
         self
     }
 
@@ -687,6 +701,7 @@ impl CliProvider {
             &run.cidfile,
             &run.labels,
             tty,
+            self.private_net,
         );
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(argv)
@@ -989,10 +1004,16 @@ impl CliProvider {
             return Ok(None);
         };
         let tart = matches!(self.backend, SandboxBackend::Tart { .. });
+        // a private-netns Podman child can't reach a loopback-bound broker at
+        // 127.0.0.1; it dials `host.containers.internal` instead.
+        let podman_private =
+            self.private_net && matches!(self.backend, SandboxBackend::Podman { .. });
         match kind {
             BrokerKind::CodexResponses => {
                 if tart {
                     broker::RunBroker::start_for_tart().await.map(Some)
+                } else if podman_private {
+                    broker::RunBroker::start_for_podman_private().await.map(Some)
                 } else {
                     broker::RunBroker::start().await.map(Some)
                 }
@@ -1000,6 +1021,10 @@ impl CliProvider {
             BrokerKind::AnthropicMessages => {
                 if tart {
                     broker::RunBroker::start_anthropic_for_tart().await.map(Some)
+                } else if podman_private {
+                    broker::RunBroker::start_anthropic_for_podman_private()
+                        .await
+                        .map(Some)
                 } else {
                     broker::RunBroker::start_anthropic().await.map(Some)
                 }
@@ -3634,6 +3659,12 @@ pub fn discover(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
+    // opt-in per node: a private container netns instead of --network=host (see
+    // CliProvider::private_net). Off unless explicitly enabled while its podman
+    // networking specifics are validated on a real podman host.
+    let private_net = std::env::var("DUCKTAPE_SANDBOX_PRIVATE_NET")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     Ok(discover_with_sink(
         specs,
         std::env::var_os("PATH"),
@@ -3642,6 +3673,7 @@ pub fn discover(
         dirs.resolved(&|k| std::env::var_os(k)),
         output_sink,
         backend,
+        private_net,
     ))
 }
 
@@ -3681,9 +3713,11 @@ fn discover_with(
         dirs,
         None,
         SandboxBackend::Direct,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_with_sink(
     specs: SpecSet,
     path: Option<OsString>,
@@ -3692,6 +3726,7 @@ fn discover_with_sink(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
+    private_net: bool,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -3708,7 +3743,8 @@ fn discover_with_sink(
         for spec in group {
             let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone())
                 .with_agent_dirs(dirs.clone())
-                .with_backend(backend.clone());
+                .with_backend(backend.clone())
+                .with_private_net(private_net);
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }

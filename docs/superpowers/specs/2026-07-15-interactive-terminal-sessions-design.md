@@ -157,14 +157,22 @@ not just terminals.
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_AUTOUPDATER=1`, setting
   `skipWebFetchPreflight: true`. Upstream credential = the swappable knob. This is
   where the ToS decision bites, isolated to one module.
-- **PR 3: private netns + egress allowlist.** Replace `--network=host` with a
-  private network that reaches ONLY the broker + MCP endpoint. Note: rootless
-  podman `127.0.0.1` ≠ host → point argv at `host.containers.internal`; this
-  touches the **existing codex broker reachability** too, so it is its own PR.
-  Do **not** use the reference-devcontainer `NET_ADMIN` in-container firewall —
-  an adversarial container must not hold `NET_ADMIN`; enforce egress from outside.
-- **PR 4 (optional): full-shell mode** (member gets bash, not just the CLI TUI) —
-  a session-creation option; same isolation, strictly needs Phase 3 first.
+- **PR 3 (SHIPPED, safe part): opt-in private netns + host-gateway.** A private
+  container netns replaces `--network=host`, so the container gets its OWN
+  loopback and can no longer scan the host's for other runs' brokers / the node
+  RPC — the primary lateral-reach weakness. The broker becomes reachable via
+  `host.containers.internal` (a new `broker::Reachability::HostGateway`, shared
+  with Tart), and this touches the **existing codex broker reachability** too.
+  **Opt-in** via `DUCKTAPE_SANDBOX_PRIVATE_NET` (off by default → `--network=host`
+  unchanged, nothing regresses) precisely because the podman networking specifics
+  can't be validated without a podman host. **DEFERRED, needs a podman host:**
+  whether the gateway forwards to host-loopback services (pasta `--map-gw`) or the
+  broker must bind the gateway address; and a full OUTBOUND egress allowlist (block
+  the internet, allow only broker + node RPC). Do **not** use the
+  reference-devcontainer `NET_ADMIN` in-container firewall — an adversarial
+  container must not hold `NET_ADMIN`; enforce egress from outside.
+- **PR 4: full-shell mode — DROPPED** (user call: "full shell은 별로"). A member
+  drives the CLI TUI, not a bare shell.
 
 ## Tart (macOS host) — added, UNVERIFIED
 
