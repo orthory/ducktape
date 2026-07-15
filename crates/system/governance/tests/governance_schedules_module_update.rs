@@ -439,3 +439,147 @@ fn snapshot_install_round_trips_module_update_proposals() {
         }
     });
 }
+
+/// the module lookup, admission flavor: any id, absent allowed.
+async fn module_code(host: &Host, id: &str) -> Option<modreg::ModuleCode> {
+    let reply = host
+        .query("modreg", &modreg_query(&ModregQuery::Status))
+        .await
+        .expect("modreg status");
+    match modreg_decode(&reply).expect("decode") {
+        ModregReply::Status { modules } => modules.into_iter().find(|m| m.module_id == id),
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
+/// a passing RegisterModule ADMITS a brand-new module: the entry lands with an
+/// EMPTY active hash and the pending initial code — registered, not yet
+/// running, gated by the same readiness/height machinery as a swap.
+#[test]
+fn a_passing_register_module_admits_a_new_pending_entry() {
+    block_on(async {
+        let mut host = gov_host_with_modreg().await;
+        assert!(module_code(&host, "kanban").await.is_none());
+        pass(
+            &mut host,
+            1,
+            "adm-1",
+            GovAction::RegisterModule {
+                name: "kanban-v1".into(),
+                module_id: "kanban".into(),
+                activation_height: 500,
+                code_hash: hash(7),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            proposal_status(&host, "adm-1").await,
+            Some(ProposalStatus::Passed)
+        );
+        let code = module_code(&host, "kanban").await.expect("entry admitted");
+        assert!(code.active_code_hash.is_empty(), "no active code until H");
+        let pending = code.pending.expect("pending initial code landed");
+        assert_eq!(pending.name, "kanban-v1");
+        assert_eq!(pending.activation_height, 500);
+        assert_eq!(pending.code_hash, hash(7));
+    });
+}
+
+/// a passing CancelModuleUpdate on an ADMISSION removes the entry entirely —
+/// modreg never claims a module that has no code.
+#[test]
+fn a_passing_cancel_removes_an_admission_entry_entirely() {
+    block_on(async {
+        let mut host = gov_host_with_modreg().await;
+        pass(
+            &mut host,
+            1,
+            "adm-1",
+            GovAction::RegisterModule {
+                name: "kanban-v1".into(),
+                module_id: "kanban".into(),
+                activation_height: 500,
+                code_hash: hash(7),
+            },
+        )
+        .await;
+        assert!(module_code(&host, "kanban").await.is_some());
+
+        pass(
+            &mut host,
+            10,
+            "adm-cancel",
+            GovAction::CancelModuleUpdate {
+                name: "kanban-v1".into(),
+                module_id: "kanban".into(),
+            },
+        )
+        .await;
+        assert!(
+            module_code(&host, "kanban").await.is_none(),
+            "cancelled admission leaves no registry entry"
+        );
+    });
+}
+
+/// a RegisterModule of an id that already exists is refused by the registry,
+/// and the refusal fails the Execute op ATOMICALLY — the staged Passed
+/// transition rolls back, the proposal stays Open, hello is untouched (the
+/// exact contract `a_refused_schedule_fails_execute_atomically` pins for
+/// swaps).
+#[test]
+fn register_module_of_an_existing_id_fails_execute_atomically() {
+    block_on(async {
+        let mut host = gov_host_with_modreg().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "adm-dup".into(),
+                action: GovAction::RegisterModule {
+                    name: "hello-again".into(),
+                    module_id: "hello".into(),
+                    activation_height: 500,
+                    code_hash: hash(9),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose");
+        for (who, at) in [(&m1, 2u64), (&m2, 3u64)] {
+            submit_as(
+                &mut host,
+                who,
+                at,
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "adm-dup".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        let refused = submit_as(
+            &mut host,
+            &m2,
+            4,
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "adm-dup".into(),
+            }),
+        )
+        .await;
+        assert!(refused.is_err(), "registry refusal fails the Execute op");
+        assert_eq!(
+            proposal_status(&host, "adm-dup").await,
+            Some(ProposalStatus::Open),
+            "staged Passed transition rolled back"
+        );
+        let code = module_code(&host, "hello").await.expect("hello persists");
+        assert_eq!(code.active_code_hash, hash(1), "active code untouched");
+        assert!(code.pending.is_none(), "no pending landed");
+    });
+}
