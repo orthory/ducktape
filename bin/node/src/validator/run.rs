@@ -310,6 +310,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // the operator's `node.toml sandbox` choice: Direct (default) or a
         // Podman container that enforces this node's announced capacity.
         sandbox,
+        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+        false,
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let my_capabilities = providers.capabilities();

@@ -3655,6 +3655,12 @@ pub fn discover(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
+    // force a private container netns regardless of the env knob. The interactive
+    // terminal plane passes `true` — its containers are driven by ADVERSARIAL
+    // members, so they must NOT share the host netns (where they could reach the
+    // node's own loopback /v1 control plane + other runs' brokers). Headless runs
+    // pass `false` and honor `DUCKTAPE_SANDBOX_PRIVATE_NET`.
+    force_private_net: bool,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let executing_node = execution_node_id(node_identity);
@@ -3669,9 +3675,10 @@ pub fn discover(
     // opt-in per node: a private container netns instead of --network=host (see
     // CliProvider::private_net). Off unless explicitly enabled while its podman
     // networking specifics are validated on a real podman host.
-    let private_net = std::env::var("DUCKTAPE_SANDBOX_PRIVATE_NET")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let private_net = force_private_net
+        || std::env::var("DUCKTAPE_SANDBOX_PRIVATE_NET")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     Ok(discover_with_sink(
         specs,
         std::env::var_os("PATH"),

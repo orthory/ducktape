@@ -71,6 +71,8 @@ where
         // sandbox knobs, so `DispatchPool::new` below keeps the bare (empty
         // capacity) ledger — the sandbox/capacity plane is bin/node only.
         capability_host::SandboxBackend::Direct,
+        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+        false,
     )
     // BYO: run whatever executor CLIs the capability specs describe and
     // this host has installed — no credential handling here (see

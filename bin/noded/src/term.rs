@@ -474,7 +474,9 @@ pub fn discover_interactive(
     if matches!(backend, SandboxBackend::Direct) {
         return None;
     }
-    match capability_host::discover(node_identity, dirs, None, backend) {
+    // force_private_net = TRUE: terminal containers host adversarial members, so
+    // they must not share the host netns (see capability_host::discover).
+    match capability_host::discover(node_identity, dirs, None, backend, true) {
         Ok(set) => Some(set),
         Err(err) => {
             tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");

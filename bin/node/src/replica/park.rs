@@ -503,6 +503,8 @@ pub(super) async fn park(
         // the operator's `node.toml sandbox` choice (Direct or Podman), same
         // as the validator boot — a resident sandboxes its runs identically.
         sandbox,
+        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+        false,
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let resident_capabilities = resident_provider_set.capabilities();
