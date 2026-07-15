@@ -87,7 +87,6 @@ export function AgentView() {
   const [runFilter, setRunFilter] = useState<"all" | "mine">("all");
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
-  const [jobWorkerOn, setJobWorkerOn] = useState(false);
   // With nothing selected, the first agent is a fine default. But once a
   // selection is EXPLICIT — the roster, or a clicked @agent mention naming an
   // agent that has since been removed — falling back to the first agent would
@@ -102,12 +101,6 @@ export function AgentView() {
     selectedAgentId === null
       ? (state.agents[0] ?? null)
       : (state.agents.find((agent) => agent.agent_id === selectedAgentId) ?? null);
-
-  const toggleJobWorker = () => {
-    const next = !jobWorkerOn;
-    setJobWorkerOn(next);
-    actions.enableJobWorker(next);
-  };
 
   const startAdding = () => {
     setTab("agents");
@@ -246,6 +239,7 @@ export function AgentView() {
                   agent={selectedAgent}
                   capabilities={state.capabilities}
                   capabilitiesStatus={state.capabilitiesStatus}
+                  op={state.ops[opKey.agent(selectedAgent.agent_id)]}
                   onPause={actions.pauseAgent}
                   onResume={actions.resumeAgent}
                   onUpdate={actions.updateAgent}
@@ -275,9 +269,8 @@ export function AgentView() {
         <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 22 }}>
           <div data-agent-content="full-width" style={{ width: "100%" }}>
             <JobsWorkerRow
-              on={jobWorkerOn}
               op={state.ops[opKey.jobWorker()]}
-              onToggle={toggleJobWorker}
+              onToggle={actions.enableJobWorker}
             />
             <UsageCard refreshKey={state.pendingRuns.map((run) => run.run_id).join("\n")} />
             <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>

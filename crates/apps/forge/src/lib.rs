@@ -809,6 +809,74 @@ impl Module for Forge {
                     self.tracker.get(&name, number).map(Box::new),
                 )))
             }
+            ForgeQuery::PrDiff { repo, number } => {
+                let name = norm_repo(&repo)?;
+                let item = self.tracker.get(&name, number).ok_or_else(|| {
+                    Error::Module(format!("forge: no item #{number} in repo {name:?}"))
+                })?;
+                if item.summary.kind != ItemKind::Pr {
+                    return Err(Error::Module(format!(
+                        "forge: item #{number} is an issue, not a pull request"
+                    )));
+                }
+                let source_branch = item.source_branch.ok_or_else(|| {
+                    Error::Module(format!("forge: pull request #{number} has no source branch"))
+                })?;
+                let target_branch = item.target_branch.ok_or_else(|| {
+                    Error::Module(format!("forge: pull request #{number} has no target branch"))
+                })?;
+                let state = self.repos.get(&name).ok_or_else(|| {
+                    Error::Module(format!("forge: no repo {name:?}"))
+                })?;
+                let source = state.refs.get(&source_branch).copied().ok_or_else(|| {
+                    Error::Module(format!(
+                        "forge: pull request #{number} source branch {source_branch:?} is not materialized"
+                    ))
+                })?;
+                let target = state.refs.get(&target_branch).copied().ok_or_else(|| {
+                    Error::Module(format!(
+                        "forge: pull request #{number} target branch {target_branch:?} is not materialized"
+                    ))
+                })?;
+                let repo = git::open(&self.base.join(&name)).map_err(|e| {
+                    Error::Module(format!(
+                        "forge: repo {name:?} is not materialized (target {target}, source \
+                         {source}): {e}"
+                    ))
+                })?;
+                let (patch, truncated, files_changed, additions, deletions) =
+                    match git::bounded_diff(
+                        &repo,
+                        target,
+                        source,
+                        MAX_PR_DIFF_BYTES,
+                        MAX_PR_DIFF_FILES,
+                        MAX_PR_DIFF_BLOB_BYTES,
+                    ) {
+                        Ok(diff) => diff,
+                        Err(e @ git::BoundedDiffError::TooLarge { .. }) => {
+                            return Err(Error::Module(format!(
+                                "forge: pull request #{number} diff is too large to serve \
+                                 (target {target}, source {source}): {e}"
+                            )));
+                        }
+                        Err(git::BoundedDiffError::Git(e)) => {
+                            return Err(Error::Module(format!(
+                                "forge: objects for pull request #{number} are not fully \
+                                 materialized (target {target}, source {source}): {e}"
+                            )));
+                        }
+                    };
+                Ok(encode_reply(&ForgeReply::PrDiff(PrDiff {
+                    source_oid: source.to_string(),
+                    target_oid: target.to_string(),
+                    files_changed,
+                    additions,
+                    deletions,
+                    patch,
+                    truncated,
+                })))
+            }
         }
     }
 
@@ -936,6 +1004,487 @@ mod tests {
 
     fn oid(hexc: char) -> Oid {
         Oid::from_str(&hexc.to_string().repeat(40)).unwrap()
+    }
+
+    fn materialized_pr(base: &std::path::Path, content: &[u8]) -> (Forge, Oid, Oid) {
+        let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
+        commit(&mut forge, 1, "demo", "base.txt", "base\n", "base");
+        let repo = git::open(&base.join("demo")).unwrap();
+        let target = git_head_oid(base, "demo");
+        let target_commit = repo.find_commit(target).unwrap();
+        let target_tree = target_commit.tree().unwrap();
+        let blob = repo.blob(content).unwrap();
+        let source_tree_oid =
+            git::build_tree(&repo, Some(&target_tree), "feature.txt", blob).unwrap();
+        let source_tree = repo.find_tree(source_tree_oid).unwrap();
+        let source = git::commit(
+            &repo,
+            &source_tree,
+            Some(&target_commit),
+            "feature",
+            2,
+        )
+        .unwrap();
+        git::update_ref(&repo, "refs/heads/dev", target).unwrap();
+        git::update_ref(&repo, "refs/heads/feature", source).unwrap();
+        let state = forge.repos.get_mut("demo").unwrap();
+        state.refs.insert("dev".into(), target);
+        state.refs.insert("feature".into(), source);
+
+        let mut ctx = TestCtx::with_origin(3, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut ctx,
+            &ForgeMsg::OpenPr {
+                repo: "demo".into(),
+                title: "review me".into(),
+                body: String::new(),
+                source_branch: "feature".into(),
+                target_branch: "dev".into(),
+            },
+        );
+        (forge, source, target)
+    }
+
+    fn replace_pr_source_with_files(
+        forge: &mut Forge,
+        base: &std::path::Path,
+        target: Oid,
+        files: usize,
+        content: &[u8],
+    ) -> Oid {
+        let repo = git::open(&base.join("demo")).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let mut tree_oid = target_commit.tree_id();
+        let blob = repo.blob(content).unwrap();
+        for index in 0..files {
+            let tree = repo.find_tree(tree_oid).unwrap();
+            tree_oid = git::build_tree(
+                &repo,
+                Some(&tree),
+                &format!("feature-{index:04}.txt"),
+                blob,
+            )
+            .unwrap();
+        }
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let source = git::commit(&repo, &tree, Some(&target_commit), "feature", 2).unwrap();
+        git::update_ref(&repo, "refs/heads/feature", source).unwrap();
+        forge
+            .repos
+            .get_mut("demo")
+            .unwrap()
+            .refs
+            .insert("feature".into(), source);
+        source
+    }
+
+    #[test]
+    fn pr_diff_pins_oids_and_returns_a_reviewable_patch() {
+        let base = tmp_base("pr-diff");
+        let (forge, source, target) = materialized_pr(&base, b"reviewable\n");
+        let bytes = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap();
+        let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
+            panic!("wrong reply")
+        };
+        assert_eq!(diff.source_oid, source.to_string());
+        assert_eq!(diff.target_oid, target.to_string());
+        assert_eq!(diff.files_changed, 1);
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 0);
+        assert!(diff.patch.contains("+++ b/feature.txt"), "{}", diff.patch);
+        assert!(diff.patch.contains("+reviewable"), "{}", diff.patch);
+        assert!(!diff.truncated);
+        assert!(diff.patch.len() <= MAX_PR_DIFF_BYTES);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_caps_the_patch_and_reports_truncation() {
+        let base = tmp_base("pr-diff-cap");
+        let content = vec![b'x'; MAX_PR_DIFF_BYTES + 4096];
+        let (forge, _, _) = materialized_pr(&base, &content);
+        let bytes = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap();
+        let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
+            panic!("wrong reply")
+        };
+        assert!(diff.truncated);
+        assert_eq!(diff.patch.len(), MAX_PR_DIFF_BYTES);
+        assert_eq!(diff.files_changed, 1, "full stats survive truncation");
+        assert_eq!(diff.additions, 1, "full stats survive truncation");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_stops_patch_printing_at_the_response_cap() {
+        let base = tmp_base("pr-diff-callback-stop");
+        let (_, source, target) = materialized_pr(&base, &[b'x'; 4096]);
+        let repo = git::open(&base.join("demo")).unwrap();
+        let (patch, truncated, files_changed, additions, deletions) = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            64,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .expect("the deliberate libgit2 callback abort is truncation, not an error");
+        assert!(truncated);
+        assert_eq!(patch.len(), 64);
+        assert_eq!((files_changed, additions, deletions), (1, 1, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_returns_empty_when_trees_are_identical() {
+        let base = tmp_base("pr-diff-identical-trees");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let target = git::commit(&repo, &tree, None, "target", 1).unwrap();
+        let parent = repo.find_commit(target).unwrap();
+        let source = git::commit(&repo, &tree, Some(&parent), "source", 2).unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .unwrap();
+        assert_eq!(result, (String::new(), false, 0, 0, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_an_oversized_commit_before_identical_tree_materialization() {
+        let base = tmp_base("pr-diff-large-commit");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let target = git::commit(&repo, &tree, None, "target", 1).unwrap();
+        let mut raw = format!(
+            "tree {tree_oid}\nparent {target}\nauthor agent <agent@agents.duck> 2 +0000\ncommitter node <node@nodes.duck> 2 +0000\n\n"
+        )
+        .into_bytes();
+        raw.resize(raw.len() + MAX_PR_DIFF_COMMIT_BYTES + 1, b'x');
+        let source = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Commit, &raw)
+            .unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(git::BoundedDiffError::TooLarge { commit_bytes, .. })
+                    if commit_bytes > MAX_PR_DIFF_COMMIT_BYTES
+            ),
+            "commit headers must bound work before find_commit: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_handles_nested_add_delete_type_and_mode_changes() {
+        let base = tmp_base("pr-diff-tree-walk");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let old_blob = repo.blob(b"old\n").unwrap();
+        let new_blob = repo.blob(b"new\n").unwrap();
+
+        let mut old_nested = repo.treebuilder(None).unwrap();
+        old_nested.insert("one.txt", old_blob, 0o100644).unwrap();
+        old_nested.insert("two.txt", old_blob, 0o100644).unwrap();
+        let old_nested_oid = old_nested.write().unwrap();
+        let mut old_root = repo.treebuilder(None).unwrap();
+        old_root.insert("node", old_nested_oid, 0o040000).unwrap();
+        old_root.insert("mode.txt", old_blob, 0o100644).unwrap();
+        old_root.insert("removed.txt", old_blob, 0o100644).unwrap();
+        let old_tree = repo.find_tree(old_root.write().unwrap()).unwrap();
+        let target = git::commit(&repo, &old_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+
+        let mut new_root = repo.treebuilder(None).unwrap();
+        new_root.insert("node", new_blob, 0o100644).unwrap();
+        new_root.insert("mode.txt", old_blob, 0o100755).unwrap();
+        new_root.insert("added.txt", new_blob, 0o100644).unwrap();
+        let new_tree = repo.find_tree(new_root.write().unwrap()).unwrap();
+        let source =
+            git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
+
+        let (patch, truncated, files_changed, _, _) = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert_eq!(files_changed, 6);
+        for path in [
+            "added.txt",
+            "mode.txt",
+            "node",
+            "node/one.txt",
+            "node/two.txt",
+            "removed.txt",
+        ] {
+            assert!(patch.contains(path), "missing {path} from {patch}");
+        }
+        assert!(patch.contains("old mode 100644"), "{patch}");
+        assert!(patch.contains("new mode 100755"), "{patch}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_rejects_a_wide_mostly_unchanged_tree() {
+        let base = tmp_base("pr-diff-wide-tree");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let old_blob = repo.blob(b"old\n").unwrap();
+        let new_blob = repo.blob(b"new\n").unwrap();
+        let entries = MAX_PR_DIFF_TREE_ENTRIES / 2 + 1;
+        let mut old_builder = repo.treebuilder(None).unwrap();
+        for index in 0..entries {
+            old_builder
+                .insert(format!("entry-{index:05}.txt"), old_blob, 0o100644)
+                .unwrap();
+        }
+        let old_tree = repo.find_tree(old_builder.write().unwrap()).unwrap();
+        let target = git::commit(&repo, &old_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let mut new_builder = repo.treebuilder(Some(&old_tree)).unwrap();
+        new_builder
+            .insert("entry-00000.txt", new_blob, 0o100644)
+            .unwrap();
+        let new_tree = repo.find_tree(new_builder.write().unwrap()).unwrap();
+        let source =
+            git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(git::BoundedDiffError::TooLarge { tree_entries, .. })
+                    if tree_entries > MAX_PR_DIFF_TREE_ENTRIES
+            ),
+            "wide tree traversal must stop at its own work bound: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_rejects_excessive_tree_depth() {
+        let base = tmp_base("pr-diff-deep-tree");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let empty_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = repo.find_tree(empty_oid).unwrap();
+        let target = git::commit(&repo, &empty_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let blob = repo.blob(b"deep\n").unwrap();
+        let mut leaf_builder = repo.treebuilder(None).unwrap();
+        leaf_builder.insert("leaf.txt", blob, 0o100644).unwrap();
+        let mut tree_oid = leaf_builder.write().unwrap();
+        for _ in 0..=MAX_PR_DIFF_TREE_DEPTH {
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert("nested", tree_oid, 0o040000).unwrap();
+            tree_oid = builder.write().unwrap();
+        }
+        let source_tree = repo.find_tree(tree_oid).unwrap();
+        let source = git::commit(
+            &repo,
+            &source_tree,
+            Some(&target_commit),
+            "source",
+            2,
+        )
+        .unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(git::BoundedDiffError::TooLarge { tree_depth, .. })
+                    if tree_depth > MAX_PR_DIFF_TREE_DEPTH
+            ),
+            "deep tree traversal must stop before unbounded recursion: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_preflight_rejects_a_missing_changed_blob() {
+        let base = tmp_base("pr-diff-missing-blob");
+        let repo = git::init(&base.join("repo")).unwrap();
+        let empty_tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = repo.find_tree(empty_tree_oid).unwrap();
+        let target = git::commit(&repo, &empty_tree, None, "target", 1).unwrap();
+        let target_commit = repo.find_commit(target).unwrap();
+        let blob = repo.blob(b"will disappear\n").unwrap();
+        let mut source_builder = repo.treebuilder(None).unwrap();
+        source_builder.insert("missing.txt", blob, 0o100644).unwrap();
+        let source_tree = repo
+            .find_tree(source_builder.write().unwrap())
+            .unwrap();
+        let source =
+            git::commit(&repo, &source_tree, Some(&target_commit), "source", 2).unwrap();
+        let hex = blob.to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..]))
+            .unwrap();
+
+        let result = git::bounded_diff(
+            &repo,
+            target,
+            source,
+            MAX_PR_DIFF_BYTES,
+            MAX_PR_DIFF_FILES,
+            MAX_PR_DIFF_BLOB_BYTES,
+        );
+        assert!(
+            matches!(result, Err(git::BoundedDiffError::Git(_))),
+            "missing changed blob must fail as an unavailable git object"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_too_many_changed_files_before_patch_generation() {
+        let base = tmp_base("pr-diff-many-files");
+        let (mut forge, _, target) = materialized_pr(&base, b"initial\n");
+        let source = replace_pr_source_with_files(
+            &mut forge,
+            &base,
+            target,
+            MAX_PR_DIFF_FILES + 1,
+            b"x\n",
+        );
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("diff is too large to serve"), "{err}");
+        assert!(
+            err.contains(&format!("{} changed files", MAX_PR_DIFF_FILES + 1)),
+            "{err}"
+        );
+        assert!(err.contains(&source.to_string()), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_excessive_materialized_blob_bytes() {
+        let base = tmp_base("pr-diff-large-blob");
+        let content = vec![b'x'; MAX_PR_DIFF_BLOB_BYTES + 1];
+        let (forge, source, target) = materialized_pr(&base, &content);
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("diff is too large to serve"), "{err}");
+        assert!(
+            err.contains(&format!("{} materialized blob bytes", content.len())),
+            "{err}"
+        );
+        assert!(err.contains(&source.to_string()), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_fails_honestly_when_a_pinned_object_is_unavailable() {
+        let base = tmp_base("pr-diff-missing");
+        let (mut forge, _, target) = materialized_pr(&base, b"present\n");
+        let missing = oid('f');
+        forge
+            .repos
+            .get_mut("demo")
+            .unwrap()
+            .refs
+            .insert("feature".into(), missing);
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not fully materialized"), "{err}");
+        assert!(err.contains(&missing.to_string()), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pr_diff_rejects_an_issue_before_reading_git_objects() {
+        let base = tmp_base("issue-diff");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut ctx = TestCtx::with_origin(1, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut ctx,
+            &ForgeMsg::OpenIssue {
+                repo: "demo".into(),
+                title: "not a pr".into(),
+                body: String::new(),
+            },
+        );
+        let err = futures::executor::block_on(forge.query(&encode_query(
+            &ForgeQuery::PrDiff {
+                repo: "demo".into(),
+                number: 1,
+            },
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("issue, not a pull request"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn user_origin(b: u8) -> sdk::Origin {

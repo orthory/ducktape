@@ -53,7 +53,8 @@ pub enum SandboxBackend {
 // function (no context struct to build in tests); the alternative bundle would
 // exist only to appease the lint.
 #[allow(clippy::too_many_arguments)]
-pub fn wrap_podman(
+#[cfg(test)]
+fn wrap_podman(
     image: &str,
     bin: &Path,
     args: &[String],

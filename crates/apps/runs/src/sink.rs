@@ -164,7 +164,9 @@ impl RunsModule {
     /// target (the no-fail rule: an OpenPr for an unborn branch — either end —
     /// or with source == target would abort the block), and the duplicate-PR
     /// guard (an OPEN PR already sourcing this branch was UPDATED by the push
-    /// — skip with a breadcrumb). the OpenPr title comes from the verified
+    /// — skip with a breadcrumb). Both paths require a host-observed commit
+    /// pushed to this sink's source branch; prose and a stale ref are never a
+    /// publication signal. the OpenPr title comes from the verified
     /// bound Forge item; only an unavailable item falls back to `message`.
     /// The body carries the full rendered message facet and `receipt` — the
     /// wire sink's echoed empty title/body are IGNORED. `executing_node` is
@@ -238,6 +240,30 @@ impl RunsModule {
                     );
                     return None;
                 }
+                // The workspace receipt is the host-authored publication
+                // boundary. A requested PR sink, response prose, and even a
+                // pre-existing source ref do not prove this run moved the ref.
+                // Gate BEFORE the duplicate-PR probe so no-change/review-only
+                // runs cannot be misreported as having updated an existing PR.
+                let has_publishable_commit = matches!(
+                    (&receipt.branch, &receipt.output_commit),
+                    (Some(branch), Some(oid))
+                        if receipt.source_prefix == format!("forge:{repo}")
+                            && branch == source_branch
+                            && !receipt.no_changes
+                            && receipt.commit_error.is_none()
+                            && oid.len() == 40
+                            && oid.bytes().all(|b| b.is_ascii_hexdigit())
+                );
+                if !has_publishable_commit {
+                    self.note(
+                        ctx,
+                        format!(
+                            "run {run_id} pr sink skipped: no publishable workspace commit for source branch"
+                        ),
+                    );
+                    return None;
+                }
                 match self.forge_branch_born(&*ctx, &forge, repo, source_branch).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -252,28 +278,54 @@ impl RunsModule {
                         return None;
                     }
                 }
+                // A receipt can arrive after its anchor was closed or merged.
+                // Re-read committed tracker state at the publication boundary
+                // and keep that late result in chat/history only.
+                let item_title = match crate::forge_source::parse_forge_channel(&entry.channel_id) {
+                    Some(item_ref) if item_ref.repo == repo => {
+                        match self.forge_item(&*ctx, &forge, repo, item_ref.number).await {
+                            Ok(Some(item)) if item.state == ForgeItemState::Open => Some(item.title),
+                            Ok(Some(item)) => {
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "run {run_id} pr sink skipped: bound Forge item is {}",
+                                        item.state.as_str()
+                                    ),
+                                );
+                                return None;
+                            }
+                            Ok(None) => {
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "run {run_id} pr sink: bound Forge item unavailable; using response-title fallback"
+                                    ),
+                                );
+                                None
+                            }
+                            Err(why) => {
+                                self.note(
+                                    ctx,
+                                    format!(
+                                        "run {run_id} pr sink: bound Forge item unavailable ({why}); using response-title fallback"
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
                 // the duplicate-PR guard: an OPEN PR already sourcing this
                 // branch means the session's push WAS the feedback — never a
-                // second PR. worded honestly when this run pushed nothing.
+                // second PR.
                 let next_number = match self
                     .forge_pr_probe(&*ctx, &forge, repo, source_branch)
                     .await
                 {
                     Ok((Some(number), _)) => {
-                        let what = if receipt.output_commit.is_some() {
-                            format!("run {run_id} pr sink: updated PR #{number}")
-                        } else if receipt.no_changes {
-                            format!(
-                                "run {run_id} pr sink: PR #{number} already open, no changes pushed"
-                            )
-                        } else if receipt.commit_error.is_some() {
-                            format!(
-                                "run {run_id} pr sink: PR #{number} already open, nothing pushed (workspace commit failed)"
-                            )
-                        } else {
-                            format!("run {run_id} pr sink: PR #{number} already open, nothing new pushed")
-                        };
-                        self.note(ctx, what);
+                        self.note(ctx, format!("run {run_id} pr sink: updated PR #{number}"));
                         return Some(number);
                     }
                     Ok((None, next_number)) => next_number,
@@ -307,35 +359,6 @@ impl RunsModule {
                         return None;
                     }
                 }
-                // Re-read the bound item from committed tracker state at the
-                // publication boundary. A response receipt is never metadata
-                // and therefore cannot replace a title that Forge verifies.
-                let item_title = match crate::forge_source::parse_forge_channel(&entry.channel_id) {
-                    Some(item_ref) if item_ref.repo == repo => {
-                        match self.forge_item(&*ctx, &forge, repo, item_ref.number).await {
-                            Ok(Some(item)) => Some(item.title),
-                            Ok(None) => {
-                                self.note(
-                                    ctx,
-                                    format!(
-                                        "run {run_id} pr sink: bound Forge item unavailable; using response-title fallback"
-                                    ),
-                                );
-                                None
-                            }
-                            Err(why) => {
-                                self.note(
-                                    ctx,
-                                    format!(
-                                        "run {run_id} pr sink: bound Forge item unavailable ({why}); using response-title fallback"
-                                    ),
-                                );
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                };
                 let title = derive_pr_title(item_title.as_deref(), message, run_id);
                 let body = derive_pr_body(message, run_id, receipt, executing_node);
                 ctx.emit_msg(Msg {

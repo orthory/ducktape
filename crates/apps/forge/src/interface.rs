@@ -148,6 +148,10 @@ pub enum ForgeQuery {
     ListItems { repo: String },
     /// one item in full — body, branches, reviews, discussion channel id.
     GetItem { repo: String, number: u64 },
+    /// a pull request's current source-vs-target patch, pinned to the exact
+    /// committed branch heads. The node-local object store must contain both
+    /// commits and their trees; this query never fetches missing objects.
+    PrDiff { repo: String, number: u64 },
 }
 
 /// the git oid hex of a repo's HEAD (a 40-char sha1 oid), or `None` on an unborn
@@ -170,6 +174,43 @@ pub enum ForgeReply {
     /// one full item (the reply to [`ForgeQuery::GetItem`]). boxed: an
     /// ItemDetail dwarfs the other variants.
     Item(Option<Box<crate::tracker_iface::ItemDetail>>),
+    /// a bounded, reviewable pull-request patch (the reply to
+    /// [`ForgeQuery::PrDiff`]).
+    PrDiff(PrDiff),
+}
+
+/// Maximum UTF-8 bytes returned in [`PrDiff::patch`]. The limit is fixed by the
+/// server rather than caller-controlled so one tool call cannot consume an
+/// agent's context.
+pub const MAX_PR_DIFF_BYTES: usize = 48 * 1024;
+/// Maximum number of changed paths examined for one PR diff.
+pub const MAX_PR_DIFF_FILES: usize = 256;
+/// Maximum aggregate old-plus-new blob bytes examined for one PR diff.
+pub const MAX_PR_DIFF_BLOB_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum aggregate bytes of the two commit objects inspected for one PR
+/// diff. Headers are checked before libgit2 materializes either commit.
+pub const MAX_PR_DIFF_COMMIT_BYTES: usize = 256 * 1024;
+/// Maximum old-plus-new tree entries visited while preflighting one PR diff.
+pub const MAX_PR_DIFF_TREE_ENTRIES: usize = 4 * 1024;
+/// Maximum aggregate bytes of tree objects loaded while preflighting one PR
+/// diff. Tree headers are checked before libgit2 materializes the object.
+pub const MAX_PR_DIFF_TREE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum recursive tree depth visited while preflighting one PR diff.
+pub const MAX_PR_DIFF_TREE_DEPTH: usize = 64;
+
+/// An exact source/target comparison at the committed OIDs named here.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PrDiff {
+    pub source_oid: String,
+    pub target_oid: String,
+    pub files_changed: usize,
+    pub additions: usize,
+    pub deletions: usize,
+    pub patch: String,
+    /// True when `patch` is only a prefix of the full unified diff. Statistics
+    /// are still complete because over-limit file/blob inputs fail instead of
+    /// returning a partial reply.
+    pub truncated: bool,
 }
 
 /// one repo's committed head in a [`ForgeReply::Repos`] listing.

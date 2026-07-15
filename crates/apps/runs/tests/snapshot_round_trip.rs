@@ -253,6 +253,7 @@ fn source() -> RunsModule {
         channel_id: channel.into(),
         anchor_seq,
         demands: Default::default(),
+        skills: Vec::new(),
     };
     exec(
         &mut m,
@@ -481,6 +482,7 @@ fn minimal_snapshot() -> Vec<u8> {
             channel_id: "c".into(),
             anchor_seq: 1,
             demands: Default::default(),
+            skills: Vec::new(),
         },
     );
     commit(&mut m);

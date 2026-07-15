@@ -12,7 +12,7 @@ pub(crate) struct Surfaces {
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
-    pub(crate) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    pub(crate) agent_provisioner: dispatch_oracle::SharedProvisioner,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
 }
@@ -156,7 +156,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // unconditionally, so the runs composer emits v3 (the de-versioned
     // activation — no flag day, pre-production re-genesis). a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> = Some(std::sync::Arc::new(
+    let agent_provisioner: dispatch_oracle::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(storage)
@@ -183,7 +183,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_node_url(noded::agent_provision::node_http_base(
             http_listen.as_deref().filter(|_| !sync_only),
         )),
-    ));
+    );
     // the node-local, off-chain interactive terminal-session plane (lives on the
     // http handle like the stream hub — never consensus). Wired only where the
     // app surface is actually served for a real member: not sync-only, not a

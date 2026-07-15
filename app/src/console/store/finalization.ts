@@ -3,7 +3,8 @@
 //
 // Every consensus write begins an OpRecord under a stable ENTITY key (the row
 // the operation touches), applies its optimistic projection immediately, and
-// flips the record to finalized/failed when the node's submit receipt lands.
+// retains the pending record through the completion refresh, then flips it to
+// finalized/failed.
 // Views look their entity's record up to draw the inline mark: a single check
 // while in flight (sent + preconfirmed render), a double check once included
 // (clicking reveals the submit/confirm times, the inclusion height and the
@@ -21,9 +22,12 @@ export interface OpRecord {
   phase: OpPhase;
   /** Wall-clock ms at submit — lets the provider ignore stale pendings. */
   startedAt: number;
-  /** Wall-clock ms when the receipt (or rejection) landed — with `startedAt`,
-   *  the mark's stats popover derives the confirm time and latency. */
+  /** Wall-clock ms when the completion refresh settled — with `startedAt`, the
+   *  mark's stats popover derives the end-to-end confirmation latency. */
   settledAt?: number;
+  /** The submit settled and its completion/rollback refresh is in flight.
+   *  `phase` deliberately stays pending so controls remain locked. */
+  settling?: boolean;
   /** The op's inclusion height, once the receipt lands. */
   height?: number;
   /** The op's content address (64-hex sha256), when the node returns one. */
@@ -134,6 +138,7 @@ export const finalizeOp = (
     [key]: {
       ...prev,
       phase: "finalized",
+      settling: false,
       settledAt,
       height: receipt?.height,
       opHash: receipt?.opHash,
@@ -149,7 +154,29 @@ export const failOp = (
 ): OpLedger => {
   const prev = ops[key];
   if (!prev) return ops;
-  return { ...ops, [key]: { ...prev, phase: "failed", settledAt, error } };
+  return {
+    ...ops,
+    [key]: { ...prev, phase: "failed", settling: false, settledAt, error },
+  };
+};
+
+/** Keep the UI lock while the submit's completion/rollback refresh runs. A
+ *  successful receipt is retained now so the refresh keeps its height floor. */
+export const prepareOpSettlement = (
+  ops: OpLedger,
+  key: string,
+  receipt: { height: number; opHash?: string } | null = null,
+): OpLedger => {
+  const prev = ops[key];
+  if (!prev) return ops;
+  return {
+    ...ops,
+    [key]: {
+      ...prev,
+      settling: true,
+      ...(receipt ? { height: receipt.height, opHash: receipt.opHash } : {}),
+    },
+  };
 };
 
 /** Any op still in flight and younger than OP_STALE_MS? While true, the
@@ -161,18 +188,19 @@ export const hasFreshPending = (ops: OpLedger, now: number): boolean =>
     (op) => op.phase === "pending" && now - op.startedAt < OP_STALE_MS,
   );
 
-/** The read-your-writes floor: the highest inclusion height among finalized
- *  ops. A snapshot whose `status.height` sits below it predates a write this
- *  console already holds a receipt for — applying it would un-render the
- *  confirmed row until a later refresh (the "message disappears and
- *  reappears" bug on nodes whose local fold trails the receipt's validator).
+/** The read-your-writes floor: the highest inclusion height among ops with a
+ *  live receipt, including one whose completion refresh is still running. A
+ *  snapshot whose `status.height` sits below it predates a write this console
+ *  already holds a receipt for — applying it would un-render the confirmed
+ *  row until a later refresh (the "message disappears and reappears" bug on
+ *  nodes whose local fold trails the receipt's validator).
  *  Unbounded on purpose: on one honest node heights are monotonic, so the
  *  floor can never wedge hydration — and the ledger resets on node switches,
  *  which is what makes that safe across connections. */
 export const receiptFloor = (ops: OpLedger): number =>
   Object.values(ops).reduce(
     (max, op) =>
-      op.phase === "finalized" && op.height !== undefined
+      op.phase !== "failed" && op.height !== undefined
         ? Math.max(max, op.height)
         : max,
     0,
@@ -197,7 +225,7 @@ export const pageSnapshotSuperseded = (
   Object.entries(ops).some(([key, op]) => {
     if (!PAGE_KEY_PREFIXES.some((prefix) => key.startsWith(prefix))) return false;
     return op.phase === "pending"
-      ? now - op.startedAt < OP_STALE_MS
+      ? !op.settling && now - op.startedAt < OP_STALE_MS
       : op.startedAt >= fetchStartedAt;
   });
 

@@ -108,7 +108,7 @@ export function ConsoleShell() {
   }, [actions]);
 
   return (
-    <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative" }}>
+    <div style={{ display: "flex", flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
       <Sidebar />
       <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
         <div style={{ flex: 1, minWidth: 0, display: browserVisible ? "flex" : "none" }}>

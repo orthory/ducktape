@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::identity::Run;
 use crate::node::Result;
 
+mod control;
 mod read;
 mod write;
 
@@ -36,6 +37,7 @@ pub struct Tool {
 /// plane, then the write plane.
 pub fn all() -> Vec<Tool> {
     let mut tools = read::tools();
+    tools.extend(control::tools());
     tools.extend(write::tools());
     tools
 }

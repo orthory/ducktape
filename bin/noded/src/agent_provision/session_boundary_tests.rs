@@ -313,11 +313,11 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             // no announced capacity: this bed is about the session boundary, and
             // a bare node's ledger fits the demandless jobs it dispatches.
             Default::default(),
-        )
-        .with_provisioner(Arc::new(
-            NodedProvisioner::new(handle, &runs_root)
-                .with_node_url(Some("http://127.0.0.1:8844".into())),
-        ));
+            Arc::new(
+                NodedProvisioner::new(handle, &runs_root)
+                    .with_node_url(Some("http://127.0.0.1:8844".into())),
+            ),
+        );
 
         // the announcement is an OFFER: the pool claims it with Accept, and the
         // saga re-emits the request naming the winner. the lease this creates is

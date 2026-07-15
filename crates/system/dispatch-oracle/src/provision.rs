@@ -7,10 +7,8 @@
 //! kernel/system crate must never touch the OS-side checkout engine), so this
 //! module speaks only plain data: the concrete `checkout_with`/`commit` calls
 //! live in the node binary's provisioner impl. the pool brackets a run with
-//! provision → bind → run → commit → assemble → cleanup ONLY when a
-//! provisioner is wired; an embedder without one keeps the accept-only
-//! degrade (raw-text delivery, no workspace). this path is LIVE in both node
-//! binaries.
+//! provision → bind → run → commit → assemble → cleanup. Portable execution
+//! requires this provisioner; both node binaries wire the real implementation.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,8 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::workspace_source::WorkspaceSource;
 
 /// the pinned portable plan carried by [`crate::Prepared`]. the pool turns it
-/// into a [`WorkspaceSpec`] iff a provisioner is wired, else it is inert
-/// (dormant).
+/// into a [`WorkspaceSpec`] through its provisioner.
 ///
 /// carries NO `mount_path`: the composer emits SOURCE coordinates only (D7),
 /// and the provisioner mints its own writable host cwd. `skills` are the C4
@@ -207,8 +204,6 @@ impl WorkspaceReceipt {
 /// materialize a per-run workspace (rw source + ro mounts) at a WRITABLE path
 /// OUTSIDE `<storage>` (D7), with zero external network (W2). injected by the
 /// node binary, where duckfs-client + the actor lane are reachable. an
-/// embedder that never wires one keeps today's accept-only behavior.
-///
 /// Dispatch may keep awaiting a slow provision future after the attempt's step
 /// threshold or cancellation. It retains both this provisioner and the
 /// [`WorkspaceSpec`], then cleans a workspace that materializes late before
@@ -270,49 +265,11 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.context_doc = ws.context_doc();
 }
 
-// ---- faceted runner result (v1 wire) --------------------------------------------
-// the runner result grew from message-only to the six ADR facets — message
-// (`response_text`) / data / effects / artifact (`workspace_receipt`) / sink /
-// status. the extra five are ADDITIVE and skip-serialized when empty/default, so
-// a plain run still emits the minimal `{ducktape_runner_result, response_text,
-// workspace_receipt}` shape that `runs` decodes as a message-only result. the
-// single `runs` delivery path applies whatever facets are present. the
-// marker/version stay `ducktape_runner_result` / 1.
-
-/// the wire name a [`RunEffect`] carries for a task create.
-const EFFECT_TASKS_CREATE: &str = "tasks.create";
-/// the wire name a [`RunEffect`] carries for a task status move.
-const EFFECT_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
-/// the wire name a [`RunEffect`] carries for a page comment (M2).
-const EFFECT_PAGES_COMMENT: &str = "pages.comment";
-/// the wire name a [`RunEffect`] carries for a todo check flip (M2).
-const EFFECT_PAGES_SET_CHECKED: &str = "pages.set_checked";
-
-/// one declarative, host-assembled effect the model's answer requested. lifted
-/// out of `response_text` by [`effects_from_response_text`] so at v4 runs applies
-/// the HOST's observation (R1) rather than re-parsing prose. idempotent by
-/// run_id (applied once at the delivery boundary).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
-pub struct RunEffect {
-    pub kind: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub task_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub title: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub status: String,
-    /// `pages.comment` (M2): the page/block anchor and the comment text.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub target: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub body: String,
-    /// `pages.set_checked` (M2): the todo block and the desired state. a
-    /// skipped `checked` decodes false on the runs side — same value.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub block: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub checked: bool,
-}
+// ---- runner result (v1 wire) ----------------------------------------------------
+// Dispatch produces only the facets it owns: model prose, the workspace
+// receipt, requested sink, and the host-observed status. Runs owns strict
+// response parsing and retains decode compatibility for historical data and
+// effects facets.
 
 /// the O1/O2 output sink: `Chain` (default — the next run reads this run's
 /// output_ref) / `Pr` (open a forge PR). the concrete routing is runs'
@@ -345,18 +302,13 @@ impl Sink {
     }
 }
 
-/// the host's observation of the run's terminal state. `Ok` is the default; a
-/// `Failed` status makes runs fail the run even with a present message facet.
+/// the host's observation of the run's terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
     Ok,
     Degraded,
-    /// not constructed host-side today — kept so the wire vocabulary states
-    /// all three states runs decodes.
-    #[allow(dead_code)]
-    Failed,
 }
 
 impl Status {
@@ -365,17 +317,13 @@ impl Status {
     }
 }
 
-/// the serialized receipt shape. the three core fields lead (unchanged
-/// positions); the five facets follow and skip-serialize when empty/default.
+/// the serialized receipt shape. Runs retains decode-only compatibility for
+/// historical fields this producer no longer emits.
 #[derive(Serialize)]
 struct RunnerResultWire<'a> {
     ducktape_runner_result: u64,
     response_text: &'a str,
     workspace_receipt: &'a WorkspaceReceipt,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    effects: Vec<RunEffect>,
     #[serde(skip_serializing_if = "Sink::is_chain")]
     sink: Sink,
     #[serde(skip_serializing_if = "Status::is_ok")]
@@ -383,7 +331,7 @@ struct RunnerResultWire<'a> {
 }
 
 /// the winning attempt's delivered bytes for a portable run: the model prose,
-/// the host-assembled receipt, and the four other facets, under marker
+/// host-assembled receipt, requested sink, and status under marker
 /// `ducktape_runner_result` (R1, host-assembled). the version is
 /// [`crate::envelope::RUNNER_RESULT_VERSION`] — the SINGLE owner, never a second
 /// const; `runs` reads it back as `u32 == 1` and unwraps `response_text`
@@ -395,29 +343,24 @@ struct RunnerResultWire<'a> {
 /// attempt could then never land and the run would wedge until its deadline.
 /// so the assembly is capped HERE: an oversized result gets its PROSE
 /// truncated (char-boundary, with a note naming the original size) while the
-/// receipt/effects/sink survive; in the pathological case where even a
-/// note-only wrapper is over, the effects and data facets are dropped too.
+/// receipt and sink survive.
 pub fn assemble_runner_result(
     response_text: &str,
     receipt: &WorkspaceReceipt,
-    data: Option<String>,
-    effects: Vec<RunEffect>,
     sink: Sink,
     status: Status,
 ) -> Vec<u8> {
-    let encode = |text: &str, data: Option<String>, effects: Vec<RunEffect>| {
+    let encode = |text: &str| {
         serde_json::to_vec(&RunnerResultWire {
             ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
             response_text: text,
             workspace_receipt: receipt,
-            data,
-            effects,
             sink: sink.clone(),
             status,
         })
         .expect("runner result serializes")
     };
-    let full = encode(response_text, data.clone(), effects.clone());
+    let full = encode(response_text);
     if full.len() <= saga::MAX_RESULT_BYTES {
         return full;
     }
@@ -432,17 +375,11 @@ pub fn assemble_runner_result(
     while keep > 0 && !response_text.is_char_boundary(keep) {
         keep -= 1;
     }
-    let truncated = encode(
-        &format!("{}{note}", &response_text[..keep]),
-        data,
-        effects,
-    );
+    let truncated = encode(&format!("{}{note}", &response_text[..keep]));
     if truncated.len() <= saga::MAX_RESULT_BYTES {
         return truncated;
     }
-    // the non-prose facets alone exceed the cap (a pathological effects/data
-    // payload): drop them — a degraded-but-landing result beats a wedged saga.
-    let bare = encode(&note, None, Vec::new());
+    let bare = encode(&note);
     if bare.len() <= saga::MAX_RESULT_BYTES {
         return bare;
     }
@@ -464,8 +401,6 @@ pub fn assemble_runner_result(
         ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
         response_text: &note,
         workspace_receipt: &stub,
-        data: None,
-        effects: Vec::new(),
         sink: Sink::Chain,
         status,
     })
@@ -486,70 +421,6 @@ fn receipt_stub(r: &WorkspaceReceipt) -> WorkspaceReceipt {
         branch: None,
         output_commit: None,
     }
-}
-
-/// LIFT the model's `tasks.create` / `tasks.update_status` /
-/// `pages.comment` / `pages.set_checked` actions out of its
-/// strict-response prose into declarative [`RunEffect`]s (R1, activation
-/// correctness — critic #4). at v4 runs applies these host-assembled effects
-/// rather than re-parsing the prose; an empty result lets runs fall back to the
-/// response-parsed actions so nothing is silently dropped — which is also why
-/// EVERY known action kind must lift: a partial lift would make the effects
-/// facet override the prose actions and drop the unlifted ones. the parse
-/// mirrors `runs::parse_strict_response`: bare JSON, then a `` ```json ``
-/// fence, then the outermost `{…}` span. the action shape is `AgentAction`'s
-/// snake_case tags.
-pub fn effects_from_response_text(text: &str) -> Vec<RunEffect> {
-    let Some(value) = parse_response_value(text) else {
-        return Vec::new();
-    };
-    let Some(actions) = value.get("actions").and_then(|a| a.as_array()) else {
-        return Vec::new();
-    };
-    actions
-        .iter()
-        .filter_map(|action| {
-            let obj = action.as_object()?;
-            let str_field = |m: &serde_json::Map<String, serde_json::Value>, k: &str| {
-                m.get(k)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            if let Some(create) = obj.get("create_task").and_then(|v| v.as_object()) {
-                return Some(RunEffect {
-                    kind: EFFECT_TASKS_CREATE.to_string(),
-                    task_id: str_field(create, "task_id"),
-                    title: str_field(create, "title"),
-                    ..RunEffect::default()
-                });
-            }
-            if let Some(update) = obj.get("update_task_status").and_then(|v| v.as_object()) {
-                return Some(RunEffect {
-                    kind: EFFECT_TASKS_UPDATE_STATUS.to_string(),
-                    task_id: str_field(update, "task_id"),
-                    status: str_field(update, "status"),
-                    ..RunEffect::default()
-                });
-            }
-            if let Some(comment) = obj.get("add_page_comment").and_then(|v| v.as_object()) {
-                return Some(RunEffect {
-                    kind: EFFECT_PAGES_COMMENT.to_string(),
-                    target: str_field(comment, "target"),
-                    body: str_field(comment, "body"),
-                    ..RunEffect::default()
-                });
-            }
-            obj.get("set_page_checked")
-                .and_then(|v| v.as_object())
-                .map(|flip| RunEffect {
-                    kind: EFFECT_PAGES_SET_CHECKED.to_string(),
-                    block: str_field(flip, "block"),
-                    checked: flip.get("checked").and_then(|v| v.as_bool()).unwrap_or(false),
-                    ..RunEffect::default()
-                })
-        })
-        .collect()
 }
 
 /// Extract the optional Git message from the same tolerant strict-response
@@ -618,8 +489,6 @@ mod tests {
         let out = super::assemble_runner_result(
             "answer",
             &receipt,
-            None,
-            Vec::new(),
             super::Sink::Chain,
             super::Status::Ok,
         );
@@ -811,8 +680,7 @@ mod tests {
     #[test]
     fn assembled_runner_result_carries_marker_text_and_receipt() {
         let r = WorkspaceReceipt::committed(&spec(), "cc".repeat(32), 9, true);
-        let bytes =
-            assemble_runner_result("the answer", &r, None, Vec::new(), Sink::Chain, Status::Ok);
+        let bytes = assemble_runner_result("the answer", &r, Sink::Chain, Status::Ok);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ducktape_runner_result"], 1);
         assert_eq!(v["response_text"], "the answer");
@@ -822,85 +690,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_facets_skip_serialize_to_the_minimal_shape() {
-        // a plain run (no data/effects, chain sink, ok status) must emit ONLY the
-        // three core fields — the pre-v4 wrapper shape — so the untouched
-        // response_text extraction stays byte-compatible.
+    fn retired_facets_are_not_serialized() {
+        // Runs retains decode-only compatibility for historical data/effects;
+        // Dispatch must not produce either key.
         let r = WorkspaceReceipt::no_changes(&spec());
-        let bytes = assemble_runner_result("hi", &r, None, Vec::new(), Sink::Chain, Status::Ok);
+        let bytes = assemble_runner_result("hi", &r, Sink::Chain, Status::Ok);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let obj = v.as_object().unwrap();
         assert!(obj.contains_key("ducktape_runner_result"));
         assert!(obj.contains_key("response_text"));
         assert!(obj.contains_key("workspace_receipt"));
-        assert!(!obj.contains_key("data"), "empty data must skip-serialize");
-        assert!(
-            !obj.contains_key("effects"),
-            "empty effects must skip-serialize"
-        );
+        assert!(!obj.contains_key("data"));
+        assert!(!obj.contains_key("effects"));
         assert!(!obj.contains_key("sink"), "chain sink must skip-serialize");
         assert!(!obj.contains_key("status"), "ok status must skip-serialize");
     }
 
-    #[test]
-    fn effects_from_response_text_lifts_a_tasks_create() {
-        // the exact strict-response shape a model emits — AgentAction's
-        // snake_case tags, fenced like an agentic CLI reply.
-        let text = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"done\"}],\
-            \"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"ship it\"}},\
-            {\"update_task_status\":{\"task_id\":\"t1\",\"status\":\"done\"}}]}\n```";
-        let effects = effects_from_response_text(text);
-        assert_eq!(
-            effects,
-            vec![
-                RunEffect {
-                    kind: "tasks.create".into(),
-                    task_id: "t1".into(),
-                    title: "ship it".into(),
-                    ..RunEffect::default()
-                },
-                RunEffect {
-                    kind: "tasks.update_status".into(),
-                    task_id: "t1".into(),
-                    status: "done".into(),
-                    ..RunEffect::default()
-                },
-            ]
-        );
-        // prose with no actions lifts nothing (runs then falls back cleanly).
-        assert!(effects_from_response_text("just prose, no json").is_empty());
-        assert!(effects_from_response_text("").is_empty());
-    }
-
-    #[test]
-    fn effects_from_response_text_lifts_the_pages_actions() {
-        // M2: the pages verbs must lift alongside the task verbs — a partial
-        // lift would override the prose actions and silently drop these.
-        let text = "{\"actions\":[\
-            {\"add_page_comment\":{\"target\":\"b1\",\"body\":\"nice\"}},\
-            {\"set_page_checked\":{\"block\":\"b2\",\"checked\":true}}]}";
-        let effects = effects_from_response_text(text);
-        assert_eq!(
-            effects,
-            vec![
-                RunEffect {
-                    kind: "pages.comment".into(),
-                    target: "b1".into(),
-                    body: "nice".into(),
-                    ..RunEffect::default()
-                },
-                RunEffect {
-                    kind: "pages.set_checked".into(),
-                    block: "b2".into(),
-                    checked: true,
-                    ..RunEffect::default()
-                },
-            ]
-        );
-        // the wire keys skip-serialize: a set_checked carries no task keys.
-        let json = serde_json::to_value(&effects[1]).unwrap();
-        let obj = json.as_object().unwrap();
-        assert!(!obj.contains_key("task_id"));
-        assert!(!obj.contains_key("target"));
-    }
 }

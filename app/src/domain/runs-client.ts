@@ -15,6 +15,8 @@
 //
 // Everything is a pure function over an injected NodeTransport.
 
+import { sha256 } from "@noble/hashes/sha2.js";
+
 import type { SagaOrigin } from "./agent-client";
 import type { BlockEvent, NodeTransport } from "./transport";
 import { replyVariant } from "./wire";
@@ -82,6 +84,13 @@ export interface RunRecord {
   /** The forge PR this run opened or updated, when the PR sink applied. */
   pr_number: number | null;
 }
+
+/** Mirror `runs::dispatch_id_for`: output rings are keyed by the lowercase
+ * hex SHA-256 of the stable run id, including after the pending row is gone. */
+export const dispatchIdForRun = (runId: string): string =>
+  Array.from(sha256(new TextEncoder().encode(runId)), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 
 const TARGET = "runs";
 

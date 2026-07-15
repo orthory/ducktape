@@ -107,7 +107,7 @@ pub(crate) async fn run(
     metrics: noded::NodeMetrics,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
+    agent_provisioner: &dispatch_oracle::SharedProvisioner,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,

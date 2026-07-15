@@ -418,6 +418,8 @@ mod tests {
         let endpoint = crate::broker::BrokerEndpoint {
             base_url: "http://127.0.0.1:9/v1".into(),
             run_bearer: "b".into(),
+            control_url: String::new(),
+            control_token: String::new(),
         };
         let auth = RunAuth {
             config_home: None,

@@ -90,6 +90,7 @@ fn canned_response(run_id: &str) -> Vec<u8> {
             task_id: "task-1".into(),
             title: "follow up on the mention".into(),
         }],
+        delegations: Vec::new(),
         commit_message: None,
     })
 }
@@ -102,6 +103,7 @@ fn job_response(task_id: &str, title: &str) -> Vec<u8> {
             task_id: task_id.into(),
             title: title.into(),
         }],
+        delegations: Vec::new(),
         commit_message: None,
     })
 }

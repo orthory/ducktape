@@ -535,19 +535,6 @@ fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     )
 }
 
-pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
-    std::sync::Arc::new(move |ctx, line| {
-        let Some(run_key) = ctx.run_key.as_deref() else {
-            return;
-        };
-        let stream = match line.stream {
-            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
-            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
-        };
-        registry.append(run_key, stream, line.line);
-    })
-}
-
 /// the production module registry: ONE named field per module, so genesis,
 /// restore, and state sync compose the SAME set by construction — adding a
 /// module means adding a field here, and every lifecycle fails to compile

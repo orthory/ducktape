@@ -1263,7 +1263,7 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
             assert!(
                 spec.args.windows(2).any(|w| w == [
                     "-c",
-                    "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_SESSION_KEY\",\"DUCKTAPE_RUN_ID\"]"
+                    "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_SESSION_KEY\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]"
                 ]),
                 "{}: codex passes only the run env names to its MCP child: {:?}",
                 spec.tag,

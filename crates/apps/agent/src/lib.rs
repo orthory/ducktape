@@ -500,9 +500,8 @@ pub struct AgentModule {
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
     /// Recovery-only execution mode for the exact protocol-v1 native
-    /// registry. Its snapshot predates roles, so role mutations and
-    /// role-bearing snapshots must remain unavailable while that workspace
-    /// advertises the revision-1 fingerprint.
+    /// registry. Its snapshot predates roles, so role-bearing snapshots remain
+    /// unavailable while that workspace advertises the revision-1 fingerprint.
     legacy_v1: bool,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
@@ -848,22 +847,6 @@ impl AgentModule {
             }
             AgentMsg::PauseAgent { agent_id } => self.stage_active(ctx, agent_id, false, now),
             AgentMsg::ResumeAgent { agent_id } => self.stage_active(ctx, agent_id, true, now),
-            AgentMsg::SetAgentRole { agent_id, role } => {
-                if self.legacy_v1 {
-                    return Err(Error::Module(
-                        "agent roles are unavailable on the native-v1 state schema".into(),
-                    ));
-                }
-                let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
-                if state.role == role {
-                    return Ok(());
-                }
-                state.role = role;
-                state.updated_at = now;
-                Self::validate_record_size(&agent_id, &state)?;
-                self.pending_agents.insert(agent_id, state);
-                Ok(())
-            }
         }
     }
 
@@ -1083,6 +1066,7 @@ mod tests {
     fn agent_response_commit_message_is_optional_and_round_trips_exactly() {
         let legacy = decode_response(br#"{"reply_blocks":[],"actions":[]}"#).unwrap();
         assert_eq!(legacy.commit_message, None);
+        assert!(legacy.delegations.is_empty());
 
         let message = "fix: exact subject\n\nExact body.";
         let response = AgentResponse {
@@ -1907,53 +1891,113 @@ mod tests {
         assert!(!rec.permits(&CapRequest::Secret("t")));
         assert!(rec.permits(&CapRequest::SpawnSubagent));
 
+        let root = record_with_caps(ResourceCaps {
+            duckfs_read: vec!["/".into()],
+            ..Default::default()
+        });
+        assert!(root.permits(&CapRequest::DuckfsRead("/shared/child")));
+        assert!(!root.permits(&CapRequest::DuckfsRead("relative")));
+
         let empty = record_with_caps(ResourceCaps::default());
         assert!(!empty.permits(&CapRequest::SpawnSubagent));
         assert!(!empty.permits(&CapRequest::ForgeRead("r")));
     }
 
     #[test]
-    fn read_only_intersection_never_widens_authority() {
-        let parent = ResourceCaps {
+    fn delegation_requires_same_runtime_and_parent_authority() {
+        let mut parent = record_with_caps(ResourceCaps {
             forge_read: vec!["docs".into()],
-            forge_push: vec!["code".into()],
-            duckfs_read: vec!["/shared/project".into()],
-            duckfs_write: vec!["/shared/project/generated".into()],
-            tools: vec!["ducktape_ask_librarian".into()],
-            secrets: vec!["vault://parent".into()],
-            pages_write: vec!["plan".into()],
-            subagent_budget: 2,
-        };
-        let librarian = ResourceCaps {
-            forge_read: vec!["code".into(), "docs".into(), "foreign".into()],
-            duckfs_read: vec![
-                "/shared/project/reference".into(),
-                "/shared/project/generated/report".into(),
-                "/shared/unrelated".into(),
-            ],
-            duckfs_write: vec!["/shared/project/reference/drafts".into()],
+            forge_push: vec!["app".into()],
+            duckfs_read: vec!["/shared/read".into()],
+            duckfs_write: vec!["/shared/write".into()],
             tools: vec!["shell".into()],
-            secrets: vec!["vault://librarian".into()],
+            secrets: vec!["build-token".into()],
             pages_write: vec!["*".into()],
-            subagent_budget: 9,
+            subagent_budget: 2,
+        });
+        parent.allowed_actions = vec![ACTION_CHAT_POST.into(), ACTION_DUCKFS_WRITE_TEXT.into()];
+        let mut child = parent.clone();
+        child.agent_id = "child".into();
+        child.allowed_actions = vec![ACTION_CHAT_POST.into()];
+        child.skills = vec![SkillRef {
+            name: "specialist".into(),
+            source_prefix: "/shared/read/specialist".into(),
+            source_snapshot: None,
+            load: LoadMode::Always,
+        }];
+        child.caps = ResourceCaps {
+            forge_read: vec!["app".into()],
+            duckfs_read: vec!["/shared/write/child".into()],
+            duckfs_write: vec!["/shared/write/child".into()],
+            tools: vec!["shell".into()],
+            secrets: vec!["build-token".into()],
+            pages_write: vec!["one-page".into()],
+            subagent_budget: 0,
             ..Default::default()
         };
+        assert!(parent.can_delegate_to(&child));
 
-        assert_eq!(
-            parent.read_only_intersection(&librarian),
+        let mut root_parent = parent.clone();
+        root_parent.caps.duckfs_read = vec!["/".into()];
+        let mut root_skill_child = child.clone();
+        root_skill_child.skills[0].source_prefix = "/root-readable/specialist".into();
+        assert!(root_parent.can_delegate_to(&root_skill_child));
+
+        let mut escalated = child.clone();
+        escalated.owner = SagaOrigin::External(vec![8; 32]);
+        assert!(!parent.can_delegate_to(&escalated));
+        escalated = child.clone();
+        escalated.capability = "other-model".into();
+        assert!(!parent.can_delegate_to(&escalated));
+        escalated = child.clone();
+        escalated.skills[0].source_prefix = "/unreadable/specialist".into();
+        assert!(!parent.can_delegate_to(&escalated));
+        for caps in [
             ResourceCaps {
-                forge_read: vec!["code".into(), "docs".into()],
-                duckfs_read: vec![
-                    "/shared/project/generated/report".into(),
-                    "/shared/project/reference".into(),
-                ],
-                ..Default::default()
-            }
-        );
+                forge_read: vec!["outside".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                forge_push: vec!["docs".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                duckfs_read: vec!["/outside".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                duckfs_write: vec!["/shared/read".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                tools: vec!["other".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                secrets: vec!["other".into()],
+                ..child.caps.clone()
+            },
+            ResourceCaps {
+                subagent_budget: 3,
+                ..child.caps.clone()
+            },
+        ] {
+            escalated = child.clone();
+            escalated.caps = caps;
+            assert!(!parent.can_delegate_to(&escalated));
+        }
+        escalated = child.clone();
+        escalated.allowed_actions.push(ACTION_TASKS_CREATE.into());
+        assert!(!parent.can_delegate_to(&escalated));
+
+        parent.caps.pages_write = vec!["one-page".into()];
+        escalated = child;
+        escalated.caps.pages_write = vec!["other-page".into()];
+        assert!(!parent.can_delegate_to(&escalated));
     }
 
     #[test]
-    fn role_is_owner_assigned_committed_state_with_legacy_defaults() {
+    fn historical_role_tail_round_trips_with_legacy_defaults() {
         let legacy: AgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "bot",
             "owner": { "external": [9] },
@@ -1974,16 +2018,8 @@ mod tests {
         let mut m = module();
         let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
         exec(&mut m, &mut owner, &admin(&register("bot", &[]))).unwrap();
-        exec(
-            &mut m,
-            &mut owner,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::ProjectLibrarian,
-            }),
-        )
-        .unwrap();
         commit(&mut m);
+        m.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
         assert_eq!(
             get_agent(&m, "bot").unwrap().role,
             AgentRole::ProjectLibrarian
@@ -1997,27 +2033,10 @@ mod tests {
             get_agent(&joiner, "bot").unwrap().role,
             AgentRole::ProjectLibrarian
         );
-
-        let mut intruder = CaptureCtx::new().at(4).with_origin(user(8));
-        let err = exec(
-            &mut m,
-            &mut intruder,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::General,
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
-        abort(&mut m);
-        assert_eq!(
-            get_agent(&m, "bot").unwrap().role,
-            AgentRole::ProjectLibrarian
-        );
     }
 
     #[test]
-    fn native_v1_mode_keeps_revision_one_and_rejects_roles() {
+    fn native_v1_mode_keeps_revision_one_and_rejects_role_tails() {
         let mut legacy = module().with_legacy_v1_state();
         assert_eq!(Module::state_schema_revision(&legacy), 1);
         assert_eq!(Module::state_schema_revision(&module()), 2);
@@ -2032,21 +2051,6 @@ mod tests {
         commit(&mut legacy);
         let (legacy_bytes, legacy_root) = (legacy.snapshot(), legacy.root());
 
-        let err = exec(
-            &mut legacy,
-            &mut owner,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::ProjectLibrarian,
-            }),
-        )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unavailable on the native-v1 state schema"));
-        assert_eq!(legacy.snapshot(), legacy_bytes);
-        assert_eq!(legacy.root(), legacy_root);
-
         let mut current = module();
         exec(
             &mut current,
@@ -2054,16 +2058,8 @@ mod tests {
             &admin(&register("bot", &[])),
         )
         .unwrap();
-        exec(
-            &mut current,
-            &mut owner,
-            &admin(&AgentMsg::SetAgentRole {
-                agent_id: "bot".into(),
-                role: AgentRole::ProjectLibrarian,
-            }),
-        )
-        .unwrap();
         commit(&mut current);
+        current.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
         let err = legacy
             .install(&current.snapshot(), current.root())
             .unwrap_err();

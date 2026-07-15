@@ -418,8 +418,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
-    use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
+    use dispatch::{AdmissionPolicy, WORK_SPEC_KIND, WorkSpec, encode_work_spec};
+    use dispatch_oracle::{
+        DeliverFn, DispatchPool, ProvisionedWorkspace, SharedProvisioner, SpawnFn,
+        WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec,
+    };
     use futures::StreamExt as _;
 
     const ME: &[u8] = b"resident-key";
@@ -494,6 +497,49 @@ format = "text"
         .expect("mock spec parses")
     }
 
+    struct TestProvisioner;
+
+    #[async_trait::async_trait]
+    impl WorkspaceProvisioner for TestProvisioner {
+        async fn provision(
+            &self,
+            spec: &WorkspaceSpec,
+        ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+            Ok(Box::new(TestWorkspace(spec.clone())))
+        }
+    }
+
+    struct TestWorkspace(WorkspaceSpec);
+
+    #[async_trait::async_trait]
+    impl ProvisionedWorkspace for TestWorkspace {
+        fn workdir(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn env(&self) -> std::collections::BTreeMap<String, String> {
+            Default::default()
+        }
+
+        fn path_entries(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+
+        async fn commit(
+            &self,
+            _audit_message: &str,
+            _proposal: Option<&str>,
+        ) -> Result<WorkspaceReceipt, String> {
+            Ok(WorkspaceReceipt::no_changes(&self.0))
+        }
+
+        async fn cleanup(&self) {}
+    }
+
+    fn test_provisioner() -> SharedProvisioner {
+        Arc::new(TestProvisioner)
+    }
+
     /// a pump wired the way main.rs wires it: a DispatchPool spawning on
     /// tokio with a result lane the test forwards into `completed`. returns
     /// the pump, the lane, and the provider's execution counter. `installed`
@@ -542,8 +588,15 @@ format = "text"
                 let _ = tx.unbounded_send(msg);
             })
         });
-        let pool =
-            DispatchPool::with_limit(providers, ME.to_vec(), spawn, deliver, 4, Default::default());
+        let pool = DispatchPool::with_limit(
+            providers,
+            ME.to_vec(),
+            spawn,
+            deliver,
+            4,
+            Default::default(),
+            test_provisioner(),
+        );
         let control = pool.attempt_control();
         (
             ResidentDispatch::new(Box::new(pool), control, ME.to_vec()),
@@ -561,9 +614,8 @@ format = "text"
                 dispatch_id: "d1".into(),
                 capability: "alpha".into(),
                 // a minimal v3 run envelope: the oracle's prepare() rejects
-                // marker-less flat payloads post-flag-day. no provisioner is
-                // wired in these tests, so the provider sees the assembled
-                // "GENERIC\n\nCONTRACT\n\nCONVERSATION" input (dormant path).
+                // marker-less flat payloads post-flag-day. the test
+                // provisioner keeps the production-required workspace path.
                 payload: serde_json::json!({
                     "ducktape_run": 3,
                     "agent_id": "bot",
@@ -582,8 +634,7 @@ format = "text"
                 .to_string()
                 .into_bytes(),
                 demands: Default::default(),
-                // `Queue` — the legacy wait-for-capacity behavior these tests assume.
-                admission: Default::default(),
+                admission: AdmissionPolicy::Queue,
             }),
             deadline: None,
             assignee: Some(ME.to_vec()),
@@ -649,9 +700,10 @@ format = "text"
                 ..
             } => {
                 assert_eq!((saga_id, attempt), ("job".to_string(), 0));
+                let result: serde_json::Value = serde_json::from_slice(&outcome.unwrap()).unwrap();
                 assert_eq!(
-                    outcome.unwrap(),
-                    b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec()
+                    result["response_text"],
+                    "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION"
                 );
             }
             other => panic!("expected an OracleResult, got {other:?}"),

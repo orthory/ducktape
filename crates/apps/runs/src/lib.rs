@@ -119,9 +119,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use agent::{
     ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED,
     ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery,
-    AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
-    MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
-    decode_reply as agent_decode_reply, encode_query as agent_encode_query,
+    AgentRecord, AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
+    MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
+    MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock, SkillRef,
+    decode_event as agent_decode_event, decode_reply as agent_decode_reply,
+    encode_query as agent_encode_query,
 };
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
@@ -171,6 +173,13 @@ pub const RUN_LEASE_VIEWS: u64 = 1024;
 
 /// oracle attempts per run: one retry after an explicit provider failure.
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
+
+/// every delegated child requests this fixed sandbox profile. The owner's
+/// `subagent_budget` is therefore also the aggregate compute ceiling: budget N
+/// admits at most `min(N, 8)` children, `2*min(N, 8)` cores, and
+/// `4*min(N, 8)` GiB in one wave.
+pub const DELEGATED_CHILD_CORES: u64 = 2;
+pub const DELEGATED_CHILD_MEM_GB: u64 = 4;
 
 /// jobs-board claims created by the runs worker use a view-denominated lease.
 pub(crate) const JOB_RUN_LEASE_VIEWS: u64 = 1000;

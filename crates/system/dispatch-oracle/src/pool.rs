@@ -179,12 +179,9 @@ pub struct DispatchPool {
     /// been handed to the delivery lane.
     inflight: RunningAttempts,
     /// materializes/commits/cleans a per-run workspace — injected by the node
-    /// binary, where duckfs-client + the actor lane are reachable. `None`
-    /// (the default) keeps the accept-only degrade: the plan is surfaced but
-    /// never activated, so the run executes raw-text with no workspace. both
-    /// node binaries wire a real provisioner, so this is LIVE on every
-    /// production agent run.
-    provisioner: Option<SharedProvisioner>,
+    /// binary, where duckfs-client + the actor lane are reachable. Portable
+    /// execution fails loudly if a host has not wired it.
+    provisioner: SharedProvisioner,
     /// the host-local load ledger: announcements claim only current fit;
     /// assigned work that fits total capacity queues in `spawn_exec`, then
     /// reserves before the semaphore acquire. `Arc`-wrapped so the spawned
@@ -201,6 +198,7 @@ impl DispatchPool {
         node_key: Vec<u8>,
         spawn: SpawnFn,
         deliver: DeliverFn,
+        provisioner: SharedProvisioner,
     ) -> Self {
         Self::with_limit(
             providers,
@@ -209,6 +207,7 @@ impl DispatchPool {
             deliver,
             max_concurrent_runs_from_env(),
             Default::default(),
+            provisioner,
         )
     }
 
@@ -222,6 +221,7 @@ impl DispatchPool {
         deliver: DeliverFn,
         limit: usize,
         capacity: BTreeMap<String, u64>,
+        provisioner: SharedProvisioner,
     ) -> Self {
         let limit = limit.max(1);
         let owner_limit = limit.checked_mul(2).unwrap_or(limit);
@@ -233,20 +233,9 @@ impl DispatchPool {
             semaphore: Arc::new(Semaphore::new(limit)),
             owner_semaphore: Arc::new(Semaphore::new(owner_limit)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
-            provisioner: None,
+            provisioner,
             ledger: Arc::new(ResourceLedger::new(capacity)),
         }
-    }
-
-    /// wire the host-side workspace provisioner runs materialize through — a
-    /// builder (not a constructor arm) so embedders and tests keep compiling.
-    /// without it the pool takes the dormant branch: the provider's raw text is
-    /// delivered verbatim, no workspace exists — and, since the soul is
-    /// assembled from MATERIALIZED skill mounts, no context document either.
-    /// the production binaries always wire one.
-    pub fn with_provisioner(mut self, provisioner: SharedProvisioner) -> Self {
-        self.provisioner = Some(provisioner);
-        self
     }
 
     /// how many attempts are executing (or queued for the semaphore) right
@@ -410,7 +399,7 @@ impl DispatchPool {
                             } else {
                                 match providers.resolve(&job.capability) {
                                     Ok(provider) => {
-                                        match crate::envelope::prepare(&job.input).await {
+                                        match crate::envelope::prepare(&job.input) {
                                             Ok(mut prepared) => {
                                                 prepared.ctx.run_key =
                                                     Some(run_key_for(&job.saga_id));
@@ -422,7 +411,7 @@ impl DispatchPool {
                                                     &job,
                                                     prepared,
                                                     provider,
-                                                    provisioner.as_ref(),
+                                                    &provisioner,
                                                     &cancellation,
                                                     permit,
                                                 )
@@ -518,10 +507,8 @@ async fn settle_attempt(
 /// provision → bind → run → commit → assemble → cleanup, at the dispatch
 /// boundary on the spawned task.
 ///
-/// DORMANT without a wired provisioner: the run is plain
-/// `provider.run(&input, &ctx).await` with the raw text as the delivered
-/// bytes. on the provisioned path the winning attempt's bytes are the
-/// host-assembled `RunnerResult` (prose + receipt).
+/// Portable execution requires a wired provisioner. The winning attempt's
+/// bytes are the host-assembled `RunnerResult` (prose + receipt).
 /// commit runs ONLY after a successful provider run (provider failure yields a
 /// saga `Err` with no `output_ref`). Cleanup ownership is retained (W5), either
 /// synchronously, including after a late storage future settles. A
@@ -547,7 +534,7 @@ async fn execute(
     job: &ExecJob,
     prepared: crate::envelope::Prepared,
     provider: &dyn capability_host::Provider,
-    provisioner: Option<&SharedProvisioner>,
+    provisioner: &SharedProvisioner,
     cancellation: &RunCancellation,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<AttemptOutput, String> {
@@ -557,13 +544,6 @@ async fn execute(
         mut ctx,
         workspace: plan,
     } = prepared;
-    let Some(prov) = provisioner else {
-        // accept-only / legacy: unchanged behavior, raw text bytes.
-        let output = run_provider(provider, &input, &ctx, cancellation).await?;
-        drop(permit.take());
-        let bytes = output.text.as_bytes().to_vec();
-        return Ok(attempt_output(output, bytes));
-    };
     // the REQUESTED sink (Chain when the envelope carried none) — echoed on
     // the assembled RunnerResult below so runs' delivery can route it.
     let sink = plan.sink;
@@ -584,7 +564,7 @@ async fn execute(
     };
     // (a)+(b) materialize OUTSIDE storage. A late blocking result releases the
     // provider slot, but keeps this attempt's resource admission until cleanup.
-    let provisioner = Arc::clone(prov);
+    let provisioner = Arc::clone(provisioner);
     let provision_spec = spec.clone();
     let mut provision = Box::pin(async move { provisioner.provision(&provision_spec).await });
     let provision_timeout = tokio::time::sleep(workspace_step_timeout());
@@ -691,15 +671,9 @@ async fn execute(
                         )
                     }
                 };
-                // LIFT the model's task actions into the effects facet: runs
-                // applies the host-assembled effects; an empty result lets runs
-                // fall back to the response-parsed actions. the sink is the
-                // plan's REQUESTED sink (Chain unless the composer named one) —
-                // echoed so runs' delivery routes the output without re-deriving
-                // intent; the data facet stays host-observed later.
-                let effects = crate::provision::effects_from_response_text(&output.text);
-                let bytes =
-                    assemble_runner_result(&output.text, &receipt, None, effects, sink, status);
+                // Echo the plan's requested sink so Runs can route delivery;
+                // Runs remains the sole owner of strict response parsing.
+                let bytes = assemble_runner_result(&output.text, &receipt, sink, status);
                 Ok(attempt_output(output, bytes))
             }
             Err(e) => Err(e), // failed run: no commit, no output_ref
@@ -1051,8 +1025,23 @@ format = "text"
                 let _ = tx.unbounded_send(msg);
             })
         });
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned,
+            committed,
+            cleaned,
+            fail_commit: None,
+        });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit, capacity),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                limit,
+                capacity,
+                provisioner,
+            ),
             rx,
         )
     }
@@ -1132,9 +1121,12 @@ format = "text"
         }
     }
 
-    /// what an unprovisioned pool delivers for [`envelope_payload`]: the raw
-    /// provider text over the assembled input.
-    const PLAIN_ANSWER: &[u8] = b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION";
+    fn response_text(bytes: Vec<u8>) -> String {
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["response_text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
 
     #[test]
     fn run_key_for_dispatch_saga_uses_last_segment() {
@@ -1216,8 +1208,8 @@ format = "text"
             deliver,
             1,
             capacity.clone(),
-        )
-        .with_provisioner(provisioner);
+            provisioner,
+        );
         let occupied = pool
             .ledger
             .try_reserve("occupied", &capacity)
@@ -1278,7 +1270,10 @@ format = "text"
         );
         let (saga_id, attempt, outcome) = next_result(&mut rx).await;
         assert_eq!((saga_id.as_str(), attempt), ("nested", 0));
-        assert_eq!(outcome.unwrap(), PLAIN_ANSWER);
+        assert_eq!(
+            response_text(outcome.unwrap()),
+            "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION"
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             while pool.in_flight() != 0 {
                 tokio::task::yield_now().await;
@@ -1472,6 +1467,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("running", 0, Some(b"me")))
@@ -1523,8 +1519,8 @@ format = "text"
             deliver,
             1,
             Default::default(),
-        )
-        .with_provisioner(Arc::new(HungCommitProvisioner { cleaned }));
+            Arc::new(HungCommitProvisioner { cleaned }),
+        );
 
         pool.run(&effect_for("hung-commit-1", 0, Some(b"me")))
             .await
@@ -1593,6 +1589,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("blocked-delivery-1", 0, Some(b"me")))
@@ -1674,6 +1671,7 @@ format = "text"
             deliver,
             1,
             demands.clone(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_with_demands(
@@ -1749,6 +1747,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("discarded", 0, Some(b"me")))
@@ -1793,6 +1792,7 @@ format = "text"
             deliver,
             1,
             Default::default(),
+            mock_provisioner(),
         );
 
         pool.run(&effect_for("completed", 0, Some(b"me")))
@@ -1930,7 +1930,10 @@ format = "text"
 
         let (saga_id, attempt, outcome) = next_result(&mut rx).await;
         assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
-        assert_eq!(outcome.unwrap(), PLAIN_ANSWER.to_vec());
+        assert_eq!(
+            response_text(outcome.unwrap()),
+            "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION"
+        );
         assert_eq!(
             probes.executions.load(Ordering::SeqCst),
             1,
@@ -2017,8 +2020,8 @@ format = "text"
         pool.run(&eff).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
         assert_eq!(
-            outcome.unwrap(),
-            b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec(),
+            response_text(outcome.unwrap()),
+            "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION",
             "assembly order: prompt-or-instructions, contract, conversation"
         );
         let (input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
@@ -2040,7 +2043,10 @@ format = "text"
         pool.run(&eff).await.unwrap();
         let (result_saga_id, _, outcome) = next_result(&mut rx).await;
         assert_eq!(result_saga_id, saga_id);
-        assert_eq!(outcome.unwrap(), PLAIN_ANSWER.to_vec());
+        assert_eq!(
+            response_text(outcome.unwrap()),
+            "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION"
+        );
         let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
         assert_eq!(ctx.run_key.as_deref(), Some("d1"));
         let expected_node = capability_host::execution_node_id(b"me");
@@ -2276,6 +2282,16 @@ format = "text"
         )
     }
 
+    fn mock_provisioner() -> SharedProvisioner {
+        let (provisioned, committed, cleaned) = flags();
+        Arc::new(MockProvisioner {
+            provisioned,
+            committed,
+            cleaned,
+            fail_commit: None,
+        })
+    }
+
     fn pool_with_provisioner(
         providers: Arc<ProviderSet>,
         provisioner: SharedProvisioner,
@@ -2300,8 +2316,15 @@ format = "text"
             })
         });
         (
-            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, limit, capacity)
-                .with_provisioner(provisioner),
+            DispatchPool::with_limit(
+                providers,
+                b"me".to_vec(),
+                spawn,
+                deliver,
+                limit,
+                capacity,
+                provisioner,
+            ),
             rx,
         )
     }
@@ -3155,29 +3178,6 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_v3_run_without_a_provisioner_is_dormant_raw_text_no_wrapper() {
-        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
-        let (pool, mut rx) = pool_with(providers, 4); // NO provisioner
-
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
-        pool.run(&eff).await.unwrap();
-        let (_, _, outcome) = next_result(&mut rx).await;
-
-        // no wrapper: the raw provider text is delivered verbatim.
-        assert_eq!(
-            outcome.unwrap(),
-            b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec(),
-            "an unwired provisioner keeps the accept-only behavior (dormant)"
-        );
-        let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
-        assert!(
-            ctx.workdir_override.is_none(),
-            "no provisioner => no mount is bound, exactly the accept slice"
-        );
-        assert!(ctx.portable, "the run is still marked portable at accept");
-    }
-
-    #[tokio::test]
     async fn flat_and_v2_payloads_fail_the_saga_loudly() {
         // FLAG DAY: the flat-string passthrough and the v2 tolerance are gone
         // — both deliver a loud Err result (the saga settles a failed
@@ -3299,10 +3299,6 @@ format = "text"
             response_text: String,
             workspace_receipt: RunsWorkspaceReceipt,
             #[serde(default)]
-            data: Option<String>,
-            #[serde(default)]
-            effects: Vec<RunsEffect>,
-            #[serde(default)]
             sink: RunsSink,
             #[serde(default)]
             status: RunsStatus,
@@ -3316,16 +3312,6 @@ format = "text"
             no_changes: bool,
             #[serde(default)]
             commit_error: Option<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct RunsEffect {
-            kind: String,
-            #[serde(default)]
-            task_id: String,
-            #[serde(default)]
-            title: String,
-            #[serde(default)]
-            status: String,
         }
         #[derive(serde::Deserialize, Default, PartialEq, Debug)]
         #[serde(tag = "mode", rename_all = "snake_case")]
@@ -3361,15 +3347,13 @@ format = "text"
             output_commit: None,
         };
 
-        use crate::provision::{RunEffect, Sink, Status};
+        use crate::provision::{Sink, Status};
 
         // (1) the minimal shape (empty facets) still decodes and still yields
         //     response_text via the runs contract.
         let minimal = assemble_runner_result(
             "the answer",
             &receipt,
-            None,
-            Vec::new(),
             Sink::Chain,
             Status::Ok,
         );
@@ -3389,22 +3373,13 @@ format = "text"
         assert!(parsed.workspace_receipt.rebased);
         assert!(!parsed.workspace_receipt.no_changes);
         assert_eq!(parsed.workspace_receipt.commit_error, None);
-        assert!(parsed.effects.is_empty());
         assert_eq!(parsed.sink, RunsSink::Chain);
         assert_eq!(parsed.status, RunsStatus::Ok);
-        assert_eq!(parsed.data, None);
 
-        // (2) a fully faceted receipt round-trips field-for-field.
+        // (2) the facets Dispatch still owns round-trip field-for-field.
         let full = assemble_runner_result(
             "prose",
             &receipt,
-            Some("{\"k\":1}".into()),
-            vec![RunEffect {
-                kind: "tasks.create".into(),
-                task_id: "t1".into(),
-                title: "ship".into(),
-                ..RunEffect::default()
-            }],
             Sink::Pr {
                 repo: "app".into(),
                 source_branch: "agent/run".into(),
@@ -3416,12 +3391,6 @@ format = "text"
         );
         let parsed: RunsRunnerResult = serde_json::from_slice(&full)
             .expect("faceted bytes deserialize into the runs contract");
-        assert_eq!(parsed.data.as_deref(), Some("{\"k\":1}"));
-        assert_eq!(parsed.effects.len(), 1);
-        assert_eq!(parsed.effects[0].kind, "tasks.create");
-        assert_eq!(parsed.effects[0].task_id, "t1");
-        assert_eq!(parsed.effects[0].title, "ship");
-        assert_eq!(parsed.effects[0].status, "");
         assert_eq!(parsed.status, RunsStatus::Degraded);
         assert_eq!(
             parsed.sink,
@@ -3454,8 +3423,6 @@ format = "text"
         let echoed = assemble_runner_result(
             "prose",
             &forge_receipt,
-            None,
-            Vec::new(),
             Sink::Pr {
                 repo: "app".into(),
                 source_branch: "agent/item-7".into(),
@@ -3534,6 +3501,7 @@ format = "text"
             deliver,
             0,
             Default::default(),
+            mock_provisioner(),
         );
         // a zero cap would deadlock every run; the pool clamps to 1.
         assert_eq!(pool.semaphore.available_permits(), 1);

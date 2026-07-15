@@ -104,6 +104,10 @@ const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 /// authenticates the child to this host's loopback endpoint and dies with the
 /// run. the spec's argv names it (`env_key` in the model-provider block).
 const BROKER_TOKEN_ENV: &str = "DUCKTAPE_MODEL_BROKER_TOKEN";
+/// Separate run-local capability used only by the MCP control tool. These are
+/// reserved: inherited or RunContext-supplied lookalikes are always removed.
+const PROVIDER_CONTROL_URL_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
+const PROVIDER_CONTROL_TOKEN_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 
 /// the upstream credential env vars a broker takes over. the HOST reads these;
 /// the child must not see them, or it would dial the provider directly and walk
@@ -149,7 +153,7 @@ mod variants;
 mod workspace;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
-pub use sandbox::{SandboxBackend, TART_MIN_CORES, wrap_podman};
+pub use sandbox::{SandboxBackend, TART_MIN_CORES};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
@@ -468,8 +472,9 @@ type SandboxEnvRw = (Vec<(String, String)>, Vec<PathBuf>);
 /// operator's credential — both `None` for a plain BYO spec (no `[isolation]`),
 /// which is the historical posture and still the default.
 ///
-/// this is the whole of it: a directory and a bearer. the credential is not here
-/// and never will be — it stays in this process, behind the [`broker`].
+/// this is the whole of it: a directory and run-local broker capabilities. the
+/// upstream credential is not here and never will be — it stays in this process,
+/// behind the [`broker`].
 #[derive(Default)]
 struct RunAuth<'a> {
     /// this run's FRESH config home (materialized under [`RUN_RUNTIME_DIR`]),
@@ -647,6 +652,8 @@ impl CliProvider {
         let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.args(args.iter());
         cmd.envs(ctx.env.iter());
+        cmd.env_remove(PROVIDER_CONTROL_URL_ENV);
+        cmd.env_remove(PROVIDER_CONTROL_TOKEN_ENV);
         // the child INHERITS this process's environment here, so a broker-backed
         // run must actively remove the upstream credential vars — see
         // [`Self::apply_auth_env`], where that subtraction is the load-bearing
@@ -783,7 +790,10 @@ impl CliProvider {
             envs.push(("PATH".into(), path.to_string_lossy().into_owned()));
         }
         for (key, value) in &ctx.env {
-            if key == "HOME" {
+            if key == "HOME"
+                || key == PROVIDER_CONTROL_URL_ENV
+                || key == PROVIDER_CONTROL_TOKEN_ENV
+            {
                 continue;
             }
             let value = if key == SKILLS_ROOT_ENV {
@@ -1033,8 +1043,10 @@ impl CliProvider {
     }
 
     /// the run's auth env, backend-independent: the fresh config home (so the
-    /// CLI cannot read the operator's real one) and the way the child reaches the
-    /// broker. `set` is how the caller applies one binding — a `Command` env for
+    /// CLI cannot read the operator's real one), the way the child reaches the
+    /// broker (codex: an opaque model bearer + its separately-scoped
+    /// provider-control capability; claude: ANTHROPIC_BASE_URL + the opaque
+    /// bearer). `set` is how the caller applies one binding — a `Command` env for
     /// Direct, or the Podman process environment behind a value-free `-e K`.
     ///
     /// NOTE what is NOT here: the credential itself. that is the whole point —
@@ -1073,8 +1085,14 @@ impl CliProvider {
                 set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into());
                 set("DISABLE_AUTOUPDATER", "1".into());
             }
-            // codex (and the defensive no-kind case): argv aims it, bearer only.
-            _ => set(BROKER_TOKEN_ENV, broker.run_bearer.clone()),
+            // codex (and the defensive no-kind case): argv aims it; the child gets
+            // the opaque model bearer + its separately-scoped provider-control cap.
+            _ => {
+                set(BROKER_TOKEN_ENV, broker.run_bearer.clone());
+                set(PROVIDER_CONTROL_URL_ENV, broker.control_url.clone());
+                set(PROVIDER_CONTROL_TOKEN_ENV, broker.control_token.clone());
+            }
+
         }
     }
 
@@ -3114,6 +3132,17 @@ fn flush_pending_line(
     );
 }
 
+fn effective_provider_deadline(
+    last_activity: tokio::time::Instant,
+    idle: Duration,
+    explicit: Option<tokio::time::Instant>,
+    hard: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (last_activity + idle)
+        .max(explicit.unwrap_or(last_activity + idle))
+        .min(hard)
+}
+
 impl CliProvider {
     /// one child process, start to parsed answer, with an explicit argv and
     /// working directory — the shared engine under the cold and resume paths.
@@ -3123,7 +3152,8 @@ impl CliProvider {
         args: &[String],
         workdir: &Path,
         ctx: &RunContext,
-        auth: &RunAuth<'_>,
+        config_home: Option<&Path>,
+        broker: Option<&broker::RunBroker>,
     ) -> Result<Invocation, String> {
         if ctx
             .cancellation
@@ -3132,10 +3162,17 @@ impl CliProvider {
         {
             return Err(format!("{} cancelled before spawn", self.bin.display()));
         }
+        let broker_invocation = broker.map(broker::RunBroker::begin_invocation);
+        let auth = RunAuth {
+            config_home,
+            broker: broker_invocation
+                .as_ref()
+                .map(|invocation| &invocation.endpoint),
+        };
         let tart_plan = matches!(self.backend, SandboxBackend::Tart { .. })
             .then(|| {
-                let args = self.broker_argv(args, workdir, auth);
-                self.tart_plan(&args, workdir, ctx, auth, false)
+                let args = self.broker_argv(args, workdir, &auth);
+                self.tart_plan(&args, workdir, ctx, &auth, false)
             })
             .transpose()?;
         // Declared before the SSH child so VM stop/delete runs after the child
@@ -3147,7 +3184,7 @@ impl CliProvider {
             (command, None)
         } else {
             let PreparedCommand { command, podman } =
-                self.prepared_command(args, workdir, ctx, auth)?;
+                self.prepared_command(args, workdir, ctx, &auth)?;
             (command, podman)
         };
         if let Some(podman) = &podman {
@@ -3160,6 +3197,11 @@ impl CliProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         configure_process_group(&mut command);
+        let idle = self.timeout;
+        let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
+        if let Some(invocation) = &broker_invocation {
+            invocation.arm(hard);
+        }
         let child = command
             .spawn()
             .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
@@ -3206,8 +3248,9 @@ impl CliProvider {
         // ceiling ([`HARD_TIMEOUT_FACTOR`] × idle) guards this host's
         // resources against a chatty-forever child; the RUN's outcome is
         // bounded by the saga's consensus deadline regardless (ADR X3).
-        let idle = self.timeout;
-        let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
+        let mut explicit_deadline = broker_invocation
+            .as_ref()
+            .map(|invocation| invocation.idle_deadline.clone());
         let mut feed = std::pin::pin!(feed);
         let mut fed: Option<Result<(), std::io::Error>> = None;
         let mut out_bytes: Vec<u8> = Vec::new();
@@ -3217,7 +3260,10 @@ impl CliProvider {
         let mut ebuf = [0u8; 8192];
         let mut last_activity = tokio::time::Instant::now();
         while out_open || err_open {
-            let deadline = (last_activity + idle).min(hard);
+            let explicit = explicit_deadline
+                .as_ref()
+                .and_then(|deadline| *deadline.borrow());
+            let deadline = effective_provider_deadline(last_activity, idle, explicit, hard);
             tokio::select! {
                 r = &mut feed, if fed.is_none() => fed = Some(r),
                 r = stdout_pipe.read(&mut obuf), if out_open => match r {
@@ -3231,6 +3277,9 @@ impl CliProvider {
                         last_activity = tokio::time::Instant::now();
                     }
                     Err(e) => {
+                        if let Some(invocation) = &broker_invocation {
+                            invocation.revoke();
+                        }
                         live.terminate().await;
                         return Err(format!(
                             "reading {} stdout failed: {e}",
@@ -3249,6 +3298,9 @@ impl CliProvider {
                         last_activity = tokio::time::Instant::now();
                     }
                     Err(e) => {
+                        if let Some(invocation) = &broker_invocation {
+                            invocation.revoke();
+                        }
                         live.terminate().await;
                         return Err(format!(
                             "reading {} stderr failed: {e}",
@@ -3257,15 +3309,70 @@ impl CliProvider {
                     }
                 },
                 _ = cancellation_requested(ctx.cancellation.as_ref()) => {
+                    if let Some(invocation) = &broker_invocation {
+                        invocation.revoke();
+                    }
                     live.terminate().await;
                     return Err(format!(
                         "{} cancelled (child terminated)",
                         self.bin.display()
                     ));
                 },
+                changed = async {
+                    match explicit_deadline.as_mut() {
+                        Some(deadline) => deadline.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        explicit_deadline = None;
+                    }
+                },
                 _ = tokio::time::sleep_until(deadline) => {
+                    if ctx
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(RunCancellation::is_cancelled)
+                    {
+                        if let Some(invocation) = &broker_invocation {
+                            invocation.revoke();
+                        }
+                        live.terminate().await;
+                        return Err(format!(
+                            "{} cancelled (child terminated)",
+                            self.bin.display()
+                        ));
+                    }
+                    // A control grant and the old timer can become ready in
+                    // the same scheduler turn. The timer wake is provisional:
+                    // re-check under the controller's own mutex so either its
+                    // grant wins or this timeout revokes before it can grant.
+                    let now = tokio::time::Instant::now();
+                    let should_continue = broker_invocation.as_ref().map_or_else(
+                        || {
+                            now < effective_provider_deadline(
+                                last_activity,
+                                idle,
+                                explicit_deadline
+                                    .as_ref()
+                                    .and_then(|deadline| *deadline.borrow()),
+                                hard,
+                            )
+                        },
+                        |invocation| {
+                            invocation.continue_after_timeout_wake(
+                                last_activity,
+                                idle,
+                                hard,
+                                now,
+                            )
+                        },
+                    );
+                    if should_continue {
+                        continue;
+                    }
                     live.terminate().await;
-                    return Err(if deadline == hard {
+                    return Err(if now >= hard {
                         format!(
                             "{} timed out: still running at the hard cap of {:?} \
                              ({HARD_TIMEOUT_FACTOR}x the idle window; child killed)",
@@ -3285,6 +3392,9 @@ impl CliProvider {
         }
         // both streams closed: the child is done (or moments from it) — a
         // bounded wait, never indefinite.
+        if let Some(invocation) = &broker_invocation {
+            invocation.revoke();
+        }
         enum WaitOutcome {
             Exited(std::io::Result<std::process::ExitStatus>),
             Cancelled,
@@ -3300,6 +3410,9 @@ impl CliProvider {
         } {
             WaitOutcome::Exited(Ok(status)) => status,
             WaitOutcome::Exited(Err(error)) => {
+                if let Some(invocation) = &broker_invocation {
+                    invocation.revoke();
+                }
                 live.terminate().await;
                 return Err(format!(
                     "waiting on {} failed: {error}",
@@ -3307,6 +3420,9 @@ impl CliProvider {
                 ));
             }
             WaitOutcome::Cancelled => {
+                if let Some(invocation) = &broker_invocation {
+                    invocation.revoke();
+                }
                 live.terminate().await;
                 return Err(format!(
                     "{} cancelled (child terminated)",
@@ -3314,6 +3430,9 @@ impl CliProvider {
                 ));
             }
             WaitOutcome::TimedOut => {
+                if let Some(invocation) = &broker_invocation {
+                    invocation.revoke();
+                }
                 live.terminate().await;
                 return Err(format!(
                     "{} closed its output but did not exit within {idle:?} (child killed)",
@@ -3386,15 +3505,18 @@ impl CliProvider {
         let prompt_buf = self.prompt_with_context(prompt, ctx);
         let prompt = prompt_buf.as_str();
         let broker = self.start_broker().await?;
-        let auth = RunAuth {
-            config_home: config_home.as_deref(),
-            broker: broker.as_ref().map(|b| &b.endpoint),
-        };
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
             let run = self
-                .invoke(prompt, &self.spec.args, &workdir, ctx, &auth)
+                .invoke(
+                    prompt,
+                    &self.spec.args,
+                    &workdir,
+                    ctx,
+                    config_home.as_deref(),
+                    broker.as_ref(),
+                )
                 .await?;
             return Ok(ProviderOutput {
                 text: run.text,
@@ -3404,7 +3526,17 @@ impl CliProvider {
 
         if let Some(session_id) = store.load() {
             let argv = session::resume_argv(&self.spec.args, &session.resume, &session_id);
-            match self.invoke(prompt, &argv, &workdir, ctx, &auth).await {
+            match self
+                .invoke(
+                    prompt,
+                    &argv,
+                    &workdir,
+                    ctx,
+                    config_home.as_deref(),
+                    broker.as_ref(),
+                )
+                .await
+            {
                 Ok(run) => {
                     // re-capture on success: a CLI that rotates ids on
                     // resume stays resumable next time.
@@ -3436,7 +3568,14 @@ impl CliProvider {
             }
         }
         let run = self
-            .invoke(prompt, &self.spec.args, &workdir, ctx, &auth)
+            .invoke(
+                prompt,
+                &self.spec.args,
+                &workdir,
+                ctx,
+                config_home.as_deref(),
+                broker.as_ref(),
+            )
             .await?;
         store.store_captured(&session.capture, &run.stdout);
         Ok(ProviderOutput {
@@ -4886,6 +5025,8 @@ broker = "anthropic-messages"
         let endpoint = broker::BrokerEndpoint {
             base_url: "http://127.0.0.1:54321/v1".into(),
             run_bearer: "opaque-run-bearer".into(),
+            control_url: "http://127.0.0.1:54321/v1/control/provider-idle".into(),
+            control_token: "opaque-control-token".into(),
         };
         let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
         let auth = RunAuth {
@@ -4928,6 +5069,24 @@ broker = "anthropic-messages"
             envs.get(BROKER_TOKEN_ENV).cloned().flatten().as_deref(),
             Some("opaque-run-bearer")
         );
+        assert_eq!(
+            envs.get(PROVIDER_CONTROL_URL_ENV)
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("http://127.0.0.1:54321/v1/control/provider-idle")
+        );
+        assert_eq!(
+            envs.get(PROVIDER_CONTROL_TOKEN_ENV)
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("opaque-control-token")
+        );
+        assert!(
+            !joined.contains("opaque-control-token"),
+            "the control credential stays out of argv: {joined}"
+        );
         // and the upstream credential is REMOVED, not merely unset: a Direct child
         // inherits this process's env, and one that still saw OPENAI_API_KEY would
         // dial OpenAI directly, straight past the broker holding it.
@@ -4939,10 +5098,10 @@ broker = "anthropic-messages"
     }
 
     #[test]
-    fn without_a_broker_the_argv_and_env_are_untouched() {
-        // the BYO posture is the default and stays byte-for-byte what it was: no
-        // model-provider splice, no bearer, and nothing removed from the child's
-        // inherited environment.
+    fn without_a_broker_has_no_control_capability() {
+        // BYO providers get no model-provider splice or bearer. Reserved
+        // control lookalikes are actively removed from the inherited env so a
+        // stale operator value cannot turn into authority for another run.
         let provider = CliProvider::from_spec(sandbox_spec("plain"), PathBuf::from("/usr/bin/x"));
         let cmd = provider
             .command(
@@ -4953,12 +5112,39 @@ broker = "anthropic-messages"
             )
             .expect("command builds");
         assert_eq!(argv_of(&cmd), "run");
-        let envs: Vec<String> = cmd
+        let envs: BTreeMap<String, Option<String>> = cmd
             .as_std()
             .get_envs()
-            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
             .collect();
-        assert!(envs.is_empty(), "no auth env overlay at all: {envs:?}");
+        assert_eq!(
+            envs,
+            BTreeMap::from([
+                (PROVIDER_CONTROL_TOKEN_ENV.to_string(), None),
+                (PROVIDER_CONTROL_URL_ENV.to_string(), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn sandbox_context_cannot_supply_reserved_control_env() {
+        let provider = CliProvider::from_spec(sandbox_spec("plain"), PathBuf::from("/usr/bin/x"));
+        let mut ctx = RunContext::default();
+        ctx.env
+            .insert(PROVIDER_CONTROL_URL_ENV.into(), "http://foreign".into());
+        ctx.env
+            .insert(PROVIDER_CONTROL_TOKEN_ENV.into(), "foreign-token".into());
+        let (envs, _) = provider
+            .sandbox_env_and_rw(&ctx, &RunAuth::default())
+            .unwrap();
+        assert!(envs.iter().all(|(key, _)| {
+            key != PROVIDER_CONTROL_URL_ENV && key != PROVIDER_CONTROL_TOKEN_ENV
+        }));
     }
 
     #[test]
@@ -4973,6 +5159,8 @@ broker = "anthropic-messages"
             // NOTE: no `/v1` — ANTHROPIC_BASE_URL is the API root.
             base_url: "http://127.0.0.1:54321".into(),
             run_bearer: "opaque-run-bearer".into(),
+            control_url: String::new(),
+            control_token: String::new(),
         };
         let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
         let auth = RunAuth {
@@ -5439,6 +5627,109 @@ printf '{"type":"turn.completed"}\n'"#,
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
         assert!(err.contains("no output"), "names the idle window: {err}");
+    }
+
+    #[test]
+    fn an_accepted_extension_wins_when_the_old_timer_wakes() {
+        let start = tokio::time::Instant::now();
+        let idle = Duration::from_millis(200);
+        let old_timer = start + idle;
+        let hard = start + Duration::from_secs(2);
+        assert_eq!(
+            effective_provider_deadline(start, idle, None, hard),
+            old_timer
+        );
+
+        // Model the scheduler boundary directly: the old sleep is ready at
+        // old_timer while the watch already carries the synchronously granted
+        // later deadline. The timeout branch's mandatory re-read must continue.
+        let granted = old_timer + Duration::from_millis(500);
+        let refreshed = effective_provider_deadline(start, idle, Some(granted), hard);
+        assert_eq!(refreshed, granted);
+        assert!(refreshed > old_timer);
+        assert_eq!(
+            effective_provider_deadline(
+                start,
+                idle,
+                Some(hard + Duration::from_secs(1)),
+                hard,
+            ),
+            hard,
+            "the same re-read never outranks the hard cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_cli_can_extend_only_its_live_broker_invocation() {
+        let dir = scratch("idle-control");
+        let endpoint_file = dir.join("control-endpoint");
+        let bin = fake_cli(
+            &dir,
+            "controlled-sleeper",
+            &format!(
+                "cat > /dev/null\n\
+                 printf '%s\\n%s\\n' \"$DUCKTAPE_PROVIDER_CONTROL_URL\" \
+                   \"$DUCKTAPE_PROVIDER_CONTROL_TOKEN\" > {}\n\
+                 sleep 0.45\n\
+                 echo survived",
+                endpoint_file.display()
+            ),
+        );
+        let provider = sh_provider(
+            broker_spec("controlled-sleeper"),
+            bin,
+            "idle-control-wd",
+        )
+        .with_timeout(Duration::from_millis(200));
+        let broker = broker::RunBroker::start_for_test().await;
+        let args = provider.spec.args.clone();
+        let workdir = provider.workdir.clone();
+        let running = tokio::spawn(async move {
+            provider
+                .invoke(
+                    "x",
+                    &args,
+                    &workdir,
+                    &RunContext::default(),
+                    None,
+                    Some(&broker),
+                )
+                .await
+        });
+
+        let (url, token) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&endpoint_file) {
+                    let values: Vec<_> = contents.lines().collect();
+                    if values.len() == 2 && values.iter().all(|value| !value.is_empty()) {
+                        break (values[0].to_string(), values[1].to_string());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the provider receives its ambient control endpoint");
+        let reply: serde_json::Value = reqwest::Client::new()
+            .post(url)
+            .header("x-ducktape-provider-control", token)
+            .json(&serde_json::json!({
+                "request_id":"silent-phase",
+                "requested_secs":1,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reply["status"], "granted");
+        let invocation = tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("the extension is bounded")
+            .expect("provider task does not panic")
+            .unwrap();
+        assert_eq!(invocation.text, "survived");
     }
 
     #[cfg(unix)]
@@ -6105,10 +6396,12 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
 
         let mut env = BTreeMap::new();
         env.insert("AGENT_TOKEN".to_string(), "abc".to_string());
-        let expected: BTreeMap<String, Option<String>> = env
+        let mut expected: BTreeMap<String, Option<String>> = env
             .iter()
             .map(|(k, v)| (k.clone(), Some(v.clone())))
             .collect();
+        expected.insert(PROVIDER_CONTROL_URL_ENV.into(), None);
+        expected.insert(PROVIDER_CONTROL_TOKEN_ENV.into(), None);
 
         for portable in [true, false] {
             let ctx = RunContext {
@@ -6132,7 +6425,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
                 .collect();
             assert_eq!(
                 envs, expected,
-                "portable={portable}: env is the additive overlay (no env_clear, no HOME override)"
+                "portable={portable}: env is additive except reserved control capabilities"
             );
         }
     }

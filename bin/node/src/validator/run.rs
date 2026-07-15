@@ -16,7 +16,6 @@ use recovery::Manifest;
 use super::announce::{CapabilityAnnouncer, ReadinessSignaller};
 use crate::constants::{DRAIN_TICK, MAX_PROTOCOL_VERSION};
 use crate::host_reads::read_upgrade_version_fields;
-use crate::host_state::run_output_sink;
 use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
@@ -81,7 +80,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
-    pub(super) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    pub(super) agent_provisioner: dispatch_oracle::SharedProvisioner,
     pub(super) agent_dirs: capability_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status_public_key: String,
@@ -306,7 +305,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let providers = capability_host::discover(
         signer.public_key().as_ref(),
         agent_dirs.clone(),
-        Some(run_output_sink(stream_hub.run_output())),
+        Some(stream_hub.run_output().output_sink()),
         // the operator's `node.toml sandbox` choice: Direct (default) or a
         // Podman container that enforces this node's announced capacity.
         sandbox,

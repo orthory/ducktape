@@ -213,7 +213,12 @@ function BlockRowInner({
   } | null>(null);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
   const rowRef = useRef<HTMLDivElement | null>(null);
-  const localCaretRef = useRef<number | null>(null);
+  const localSelectionRef = useRef<{
+    start: number;
+    end: number;
+    direction: "forward" | "backward" | "none";
+  } | null>(null);
+  const codeTabEscapeArmedRef = useRef(false);
   // true from mousedown in the textarea until the pointer releases: the guide
   // menu appears when the drag comes OFF, not on every mid-drag selection
   // change (which would flicker a menu under the moving pointer).
@@ -247,10 +252,10 @@ function BlockRowInner({
   }, [caret, draft, block.text, block.id, handlers]);
 
   useLayoutEffect(() => {
-    const at = localCaretRef.current;
-    if (at == null) return;
-    areaRef.current?.setSelectionRange(at, at);
-    localCaretRef.current = null;
+    const selection = localSelectionRef.current;
+    if (selection == null) return;
+    areaRef.current?.setSelectionRange(selection.start, selection.end, selection.direction);
+    localSelectionRef.current = null;
   }, [draft]);
 
   // auto-grow: the textarea is exactly as tall as its content.
@@ -336,6 +341,7 @@ function BlockRowInner({
   };
 
   const onChange = (next: string) => {
+    codeTabEscapeArmedRef.current = false;
     setSelection(null);
     if (!next.startsWith("/")) setSlashDismissed(false);
     if (slashOpen || next.startsWith("/")) {
@@ -393,6 +399,22 @@ function BlockRowInner({
     // swallowed (released off-window, native text drag), unstick the flag or
     // keyboard selections never raise the menu again.
     pointerSelecting.current = false;
+
+    if (block.kind === "code") {
+      if (event.key === "Escape") {
+        codeTabEscapeArmedRef.current = true;
+      } else if (event.key === "Tab" && codeTabEscapeArmedRef.current) {
+        codeTabEscapeArmedRef.current = false;
+        return;
+      } else if (
+        event.key.length === 1 ||
+        event.key === "Backspace" ||
+        event.key === "Delete" ||
+        event.key === "Enter"
+      ) {
+        codeTabEscapeArmedRef.current = false;
+      }
+    }
 
     if (event.key === "Escape" && selection) {
       // this Escape spends itself on the guide menu — a docked comment card
@@ -482,8 +504,16 @@ function BlockRowInner({
       case "toggle-collapse":
         handlers.toggleCollapse(block.id);
         return;
-      case "insert-tab":
-        localCaretRef.current = intent.caret;
+      case "edit-code":
+        if (intent.value === draft) {
+          el.setSelectionRange(intent.selectionStart, intent.selectionEnd, el.selectionDirection);
+          return;
+        }
+        localSelectionRef.current = {
+          start: intent.selectionStart,
+          end: intent.selectionEnd,
+          direction: el.selectionDirection,
+        };
         setDraft(intent.value);
         return;
       case "indent":
@@ -515,6 +545,7 @@ function BlockRowInner({
 
   const todoDone = block.kind === "todo" && block.checked;
   const blockNumber = index + 1;
+  const codeTabHintId = `code-tab-hint-${block.id}`;
 
   const area = (
     <div style={{ position: "relative" }}>
@@ -533,6 +564,7 @@ function BlockRowInner({
           handlers.registerInput(block.id, el);
         }}
         aria-label={`Edit ${block.kind} block ${blockNumber}`}
+        aria-describedby={block.kind === "code" ? codeTabHintId : undefined}
         value={draft}
         rows={1}
         onChange={(event) => {
@@ -564,6 +596,7 @@ function BlockRowInner({
           publishCursor(event.currentTarget);
         }}
         onBlur={(event) => {
+          codeTabEscapeArmedRef.current = false;
           focusedRef.current = false;
           setFocused(false);
           // focus moved elsewhere: the guide menu must not linger over a
@@ -607,6 +640,7 @@ function BlockRowInner({
             visibleMarks.length > 0 || commentRanges.length > 0 ? "transparent" : undefined,
           textDecoration: todoDone ? "line-through" : "none",
           font: kindFont(block.kind),
+          tabSize: block.kind === "code" ? 2 : undefined,
         }}
         onClick={(event) => {
           const el = event.currentTarget;
@@ -621,6 +655,20 @@ function BlockRowInner({
           handlers.openComments(block.id, { x: rect.right, y: rect.top }, hit.anchor);
         }}
       />
+      {block.kind === "code" ? (
+        <span
+          id={codeTabHintId}
+          style={{
+            position: "absolute",
+            width: 1,
+            height: 1,
+            overflow: "hidden",
+            clipPath: "inset(50%)",
+          }}
+        >
+          Tab indents code. Press Escape, then Tab to move focus.
+        </span>
+      ) : null}
     </div>
   );
 
