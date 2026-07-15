@@ -144,6 +144,18 @@ pub(super) async fn park(
             planes.clone(),
             stream_hub.run_output(),
         );
+        // the terminal-session plane: forwards a session's output ring and
+        // ordered command log to peers, so a member on another node streams it.
+        crate::term_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(&tracked),
+            me,
+            bulk_pacer.clone(),
+            planes.clone(),
+            stream_hub.terminals(),
+            stream_hub.term_commands(),
+        );
         Some(tracked)
     } else {
         eprintln!(

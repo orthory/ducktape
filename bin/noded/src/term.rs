@@ -41,7 +41,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability_host::{AgentDirs, InteractiveSession, ProviderSet, RunContext, SandboxBackend};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::NodeHandle;
 
@@ -76,6 +76,11 @@ const TERM_CMD_RING_MAX_COMMANDS: usize = 1024;
 /// one pty read chunk. human typing + TUI redraws are modest; a chunk this size
 /// coalesces a redraw burst into few frames without a large per-session buffer.
 const TERM_READ_BUF: usize = 32 * 1024;
+/// the per-ring peer-forwarder broadcast buffer (the feed `bin/node`'s
+/// `term_plane` tails and fans out to peer nodes). A lagged subscriber — a slow
+/// or stalled peer stream — drops the overflow and continues: terminal output
+/// is observational, never consensus. Mirrors the run-output feed's buffer.
+const TERM_APPEND_BUFFER: usize = 2048;
 /// the environment knob carrying the sandbox image interactive sessions run in
 /// (a container image for Podman, a VM image for Tart). mirrors `bin/node`'s
 /// `sandbox_image` (node.toml) but as a plain env var, since the daemon parses
@@ -97,6 +102,35 @@ pub fn command_topic(session_id: &str) -> String {
     format!("term-cmd:{session_id}")
 }
 
+/// one raw output chunk of a session, as it entered this node's local ring —
+/// the wire grain `bin/node`'s `term_plane` forwards to peer nodes. A twin of
+/// [`crate::stream::RunOutputEvent`]: a peer ingests it via
+/// [`TermRing::append_remote`], which appends WITHOUT re-broadcasting (breaks
+/// the fan-out loop). `chunk_b64` is base64 of the pty bytes, never logged. No
+/// `seq`: the raw byte stream is opaque, so each node stamps its own local
+/// ring cursor — the reliable per-peer stream preserves arrival order.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TermChunkEvent {
+    pub session: String,
+    pub chunk_b64: String,
+}
+
+/// one entry of a session's ordered, attributed command log, as its serial
+/// consumer stamped it — the wire grain `term_plane` forwards to peer nodes.
+/// Unlike [`TermChunkEvent`] it carries `seq`: that is the AUTHORITATIVE total
+/// order the origin node's single consumer assigned, and a peer replays it
+/// verbatim via [`TermCommandRing::append_remote`] (which never re-stamps),
+/// so every node shows the same order. `text` can carry secrets — never logged.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TermCommandEvent {
+    pub session: String,
+    pub seq: u64,
+    pub origin: String,
+    pub text: String,
+}
+
 // ---------------------------------------------------------------------------
 // the per-session output ring (a focused twin of RunOutputRegistry)
 // ---------------------------------------------------------------------------
@@ -110,6 +144,11 @@ pub fn command_topic(session_id: &str) -> String {
 pub struct TermRing {
     inner: Arc<Mutex<TermRingInner>>,
     watch: watch::Sender<u64>,
+    /// the peer-forwarder feed: a LOCAL append (the pump) publishes here so
+    /// `bin/node`'s `term_plane` forwards it to peers; a `append_remote`
+    /// (a peer's chunk arriving) does NOT, which breaks the fan-out loop. Twin
+    /// of [`crate::stream::RunOutputRegistry`]'s `appends`.
+    appends: broadcast::Sender<TermChunkEvent>,
 }
 
 #[derive(Default)]
@@ -131,16 +170,32 @@ struct SessionRing {
 impl Default for TermRing {
     fn default() -> Self {
         let (watch, _) = watch::channel(0);
+        let (appends, _) = broadcast::channel(TERM_APPEND_BUFFER);
         Self {
             inner: Arc::new(Mutex::new(TermRingInner::default())),
             watch,
+            appends,
         }
     }
 }
 
 impl TermRing {
-    /// append one base64 output chunk to a session's ring and wake subscribers.
+    /// append one base64 output chunk from THIS node's pump: rings it, wakes the
+    /// node-local ws subscribers, AND publishes it on the forwarder feed so
+    /// `bin/node`'s `term_plane` fans it out to peer nodes.
     pub fn append(&self, session: &str, chunk_b64: String) {
+        self.push(session, chunk_b64, true);
+    }
+
+    /// append one chunk received FROM a peer node without re-broadcasting it —
+    /// the ring-only path that breaks the fan-out loop. Only bumps the ring's
+    /// `watch` version, which wakes this node's `term:<session>` ws subscribers;
+    /// the raw byte stream is opaque, so the local ring stamps its own cursor.
+    pub fn append_remote(&self, event: TermChunkEvent) {
+        self.push(&event.session, event.chunk_b64, false);
+    }
+
+    fn push(&self, session: &str, chunk_b64: String, publish: bool) {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
         inner.version += 1;
         inner.touch += 1;
@@ -151,6 +206,8 @@ impl TermRing {
         ring.next_seq += 1;
         let seq = ring.next_seq;
         ring.bytes += chunk_b64.len();
+        // keep a copy for the forwarder feed only when we will publish.
+        let forwarded = publish.then(|| chunk_b64.clone());
         ring.chunks.push_back((seq, chunk_b64));
         // evict oldest chunks until under the byte cap, always keeping the last.
         while ring.bytes > TERM_RING_MAX_BYTES && ring.chunks.len() > 1 {
@@ -174,6 +231,18 @@ impl TermRing {
         }
         drop(inner);
         let _ = self.watch.send(version);
+        if let Some(chunk_b64) = forwarded {
+            let _ = self.appends.send(TermChunkEvent {
+                session: session.to_string(),
+                chunk_b64,
+            });
+        }
+    }
+
+    /// subscribe the peer-forwarder feed: every LOCAL append (never a remote
+    /// one) arrives here, so `bin/node`'s `term_plane` can forward it to peers.
+    pub fn subscribe_appends(&self) -> broadcast::Receiver<TermChunkEvent> {
+        self.appends.subscribe()
     }
 
     /// chunks with `seq > after`, up to `budget`, plus the ring's floor seq (so
@@ -217,6 +286,10 @@ impl TermRing {
 pub struct TermCommandRing {
     inner: Arc<Mutex<TermCommandRingInner>>,
     watch: watch::Sender<u64>,
+    /// the peer-forwarder feed — twin of [`TermRing`]'s. A LOCAL append (the
+    /// serial consumer stamping a command) publishes here; a `append_remote`
+    /// (a peer's command arriving) does NOT, breaking the fan-out loop.
+    appends: broadcast::Sender<TermCommandEvent>,
 }
 
 #[derive(Default)]
@@ -237,20 +310,43 @@ struct CommandRing {
 impl Default for TermCommandRing {
     fn default() -> Self {
         let (watch, _) = watch::channel(0);
+        let (appends, _) = broadcast::channel(TERM_APPEND_BUFFER);
         Self {
             inner: Arc::new(Mutex::new(TermCommandRingInner::default())),
             watch,
+            appends,
         }
     }
 }
 
 impl TermCommandRing {
-    /// append one accepted command to a session's ordered log and wake
-    /// subscribers. Returns the assigned monotonic `seq` — the total order the
-    /// serial consumer stamps each command with (starting at 1). The single
-    /// per-session consumer is the only appender, so this ring's `next_seq` IS
-    /// that order.
+    /// append one accepted command from THIS node's serial consumer: rings it,
+    /// wakes the node-local ws subscribers, AND publishes it on the forwarder
+    /// feed so `term_plane` fans it out. Returns the assigned monotonic `seq` —
+    /// the total order (starting at 1). The single per-session consumer is the
+    /// only local appender, so this ring's `next_seq` IS that order.
     pub fn append(&self, session: &str, origin: &str, text: &str) -> u64 {
+        self.push(session, None, origin, text, true)
+    }
+
+    /// append one command received FROM a peer node without re-broadcasting it —
+    /// the ring-only path that breaks the fan-out loop. Preserves the origin
+    /// node's `seq` VERBATIM (never re-stamps): that node's serial consumer owns
+    /// the authoritative total order, so a peer replaying it must show the same
+    /// order. Off-consensus and observational, so this stays honest to the
+    /// origin's numbering rather than inventing a local one.
+    pub fn append_remote(&self, event: TermCommandEvent) {
+        self.push(&event.session, Some(event.seq), &event.origin, &event.text, false);
+    }
+
+    fn push(
+        &self,
+        session: &str,
+        seq_override: Option<u64>,
+        origin: &str,
+        text: &str,
+        publish: bool,
+    ) -> u64 {
         let mut inner = self.inner.lock().expect("term command ring lock poisoned");
         inner.version += 1;
         inner.touch += 1;
@@ -258,8 +354,19 @@ impl TermCommandRing {
         let touch = inner.touch;
         let ring = inner.sessions.entry(session.to_string()).or_default();
         ring.touched = touch;
-        ring.next_seq += 1;
-        let seq = ring.next_seq;
+        // a local append stamps the next serial seq; a remote one carries the
+        // origin's seq verbatim (bump `next_seq` past it only to keep the local
+        // cursor monotonic — a peer never appends locally, so it is bookkeeping).
+        let seq = match seq_override {
+            Some(seq) => {
+                ring.next_seq = ring.next_seq.max(seq);
+                seq
+            }
+            None => {
+                ring.next_seq += 1;
+                ring.next_seq
+            }
+        };
         ring.commands
             .push_back((seq, origin.to_string(), text.to_string()));
         // evict oldest commands until under the count cap, always keeping the last.
@@ -283,7 +390,21 @@ impl TermCommandRing {
         }
         drop(inner);
         let _ = self.watch.send(version);
+        if publish {
+            let _ = self.appends.send(TermCommandEvent {
+                session: session.to_string(),
+                seq,
+                origin: origin.to_string(),
+                text: text.to_string(),
+            });
+        }
         seq
+    }
+
+    /// subscribe the peer-forwarder feed: every LOCAL append (never a remote
+    /// one) arrives here for `term_plane` to forward to peers.
+    pub fn subscribe_appends(&self) -> broadcast::Receiver<TermCommandEvent> {
+        self.appends.subscribe()
     }
 
     /// commands with `seq > after`, up to `budget`, plus the ring's floor seq
@@ -923,6 +1044,67 @@ mod tests {
         assert_eq!(last.0, (TERM_CMD_RING_MAX_COMMANDS + 1) as u64);
         assert_eq!(last.1, "over");
         assert_eq!(last.2, "cmd-overflow");
+    }
+
+    // ----- the peer-forwarder feed: publish (local) vs append_remote -----
+
+    #[test]
+    fn output_ring_publishes_local_appends_but_stays_silent_on_remote() {
+        let ring = TermRing::default();
+        let mut appends = ring.subscribe_appends();
+        // a LOCAL append (the pump) publishes to the forwarder feed.
+        ring.append("00000000deadbeef", STANDARD.encode(b"hi"));
+        let event = appends.try_recv().expect("a local append publishes");
+        assert_eq!(event.session, "00000000deadbeef");
+        assert_eq!(STANDARD.decode(&event.chunk_b64).unwrap(), b"hi");
+        // a peer's chunk enters the ring WITHOUT re-publishing — breaks the loop.
+        ring.append_remote(TermChunkEvent {
+            session: "00000000deadbeef".into(),
+            chunk_b64: STANDARD.encode(b"yo"),
+        });
+        assert!(
+            matches!(
+                appends.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "append_remote must not re-broadcast"
+        );
+        // both chunks are readable locally (delivery to this node's ws is free).
+        let (rows, _) = ring.read_after("00000000deadbeef", 0, 8);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(STANDARD.decode(&rows[1].1).unwrap(), b"yo");
+    }
+
+    #[test]
+    fn command_ring_publishes_local_and_replays_remote_seq_verbatim() {
+        let ring = TermCommandRing::default();
+        let mut appends = ring.subscribe_appends();
+        // a LOCAL append stamps seq 1 and publishes the grain.
+        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), 1);
+        let event = appends.try_recv().expect("a local append publishes");
+        assert_eq!(
+            (event.seq, event.origin.as_str(), event.text.as_str()),
+            (1, "alice", "ls")
+        );
+        // a peer's command carries the ORIGIN's seq; append_remote preserves it
+        // verbatim (never renumbers to 2) and does not re-broadcast.
+        ring.append_remote(TermCommandEvent {
+            session: "00000000deadbeef".into(),
+            seq: 42,
+            origin: "bob".into(),
+            text: "pwd".into(),
+        });
+        assert!(matches!(
+            appends.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let (rows, _) = ring.read_after("00000000deadbeef", 0, 8);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1],
+            (42, "bob".to_string(), "pwd".to_string()),
+            "the origin's seq is replayed verbatim, not re-stamped"
+        );
     }
 
     #[test]

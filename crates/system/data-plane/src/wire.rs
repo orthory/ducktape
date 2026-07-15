@@ -206,6 +206,8 @@ mod tests {
             (Service::Video, 3u8),
             (Service::Gateway, 6u8),
             (Service::AgentTelemetry, 7u8),
+            (Service::ModuleCode, 8u8),
+            (Service::TermSession, 9u8),
         ] {
             assert_eq!(service as u8, id);
             assert_eq!(Service::try_from(id), Ok(service));
@@ -216,5 +218,7 @@ mod tests {
         assert_eq!(Service::Gateway.overlay_datagram_port(), 45906);
         assert_eq!(Service::AgentTelemetry.overlay_stream_port(), 45807);
         assert_eq!(Service::AgentTelemetry.overlay_datagram_port(), 45907);
+        assert_eq!(Service::TermSession.overlay_stream_port(), 45809);
+        assert_eq!(Service::TermSession.overlay_datagram_port(), 45909);
     }
 }

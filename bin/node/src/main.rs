@@ -55,6 +55,7 @@ mod agent_plane;
 mod blob_fetch;
 mod boot;
 mod code_plane;
+mod term_plane;
 mod cli;
 mod cli_flags;
 mod config;

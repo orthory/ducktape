@@ -75,7 +75,7 @@ pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStag
 // the node-local, off-chain interactive terminal-session plane. public so
 // `main.rs` can build the manager and wire it onto the handle.
 pub mod term;
-pub use term::{TermCommandRing, TermRing, TerminalSessions};
+pub use term::{TermChunkEvent, TermCommandEvent, TermCommandRing, TermRing, TerminalSessions};
 // the derived-index tier: store construction, rebuilds, /v1/index/* + /v1/blocks.
 mod index;
 pub use index::{

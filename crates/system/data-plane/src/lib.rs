@@ -82,6 +82,11 @@ pub enum Service {
     /// code-swap proposal and pulled on miss. Consensus pins the 32-byte
     /// hash; this plane only ever moves the self-verifying bytes.
     ModuleCode = 8,
+    /// Live interactive-terminal-session output between member nodes: the raw
+    /// output ring and the ordered command log, so a member on another node
+    /// streams the session. Observability only, like `AgentTelemetry` — the
+    /// session itself stays node-local and off consensus.
+    TermSession = 9,
 }
 
 impl Service {
@@ -99,6 +104,7 @@ impl Service {
             Service::Gateway => 45806,
             Service::AgentTelemetry => 45807,
             Service::ModuleCode => 45808,
+            Service::TermSession => 45809,
         }
     }
 
@@ -112,6 +118,7 @@ impl Service {
             Service::Gateway => 45906,
             Service::AgentTelemetry => 45907,
             Service::ModuleCode => 45908,
+            Service::TermSession => 45909,
         }
     }
 }
@@ -127,6 +134,7 @@ impl TryFrom<u8> for Service {
             6 => Ok(Service::Gateway),
             7 => Ok(Service::AgentTelemetry),
             8 => Ok(Service::ModuleCode),
+            9 => Ok(Service::TermSession),
             other => Err(other),
         }
     }
