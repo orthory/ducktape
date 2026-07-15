@@ -28,7 +28,6 @@ import type { Channel } from "../../domain/chat-client";
 import type { Workspace } from "../../domain/workspace-client";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 // ── Pure helpers ────────────────────────────────────────
 
@@ -161,8 +160,8 @@ const jsonResponse = (code: number, body: unknown): Response =>
     headers: { "content-type": "application/json" },
   });
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 const channel = (id: string): Channel => ({
@@ -244,7 +243,7 @@ function Probe() {
 }
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   invokeMock.mockReset();
@@ -258,7 +257,7 @@ afterEach(() => {
 
 const bootShell = async (fetchStub = nodeFetch()) => {
   const team = workspace({});
-  markTauri();
+  markNative();
   vi.stubGlobal("fetch", fetchStub);
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {
@@ -425,7 +424,7 @@ describe("browser back/forward (provider integration)", () => {
   });
 
   it("traversal is ignored while the account home owns the window", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "workspace_list":

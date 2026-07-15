@@ -6,13 +6,12 @@
 // encoded in the address: DuckFS and loopback HTTP use the same isolated,
 // route-scoped browser session.
 
-import { invoke } from "@tauri-apps/api/core";
 
 import * as duckdns from "./duckdns-client";
 import * as files from "./files-client";
 import * as gateway from "./gateway-client";
 import * as identity from "./identity-client";
-import { isTauri } from "./node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "./node-bootstrap";
 import type { FileEntry, NodeTransport } from "./transport";
 
 export const NETWORK_CONTENT_ROOT = "/shared/.duck/net";
@@ -295,7 +294,7 @@ const loadAccountRoute = async (
   transport: NodeTransport,
   address: DuckAddress,
 ): Promise<LoadedDuckPage> => {
-  if (!isTauri()) throw new Error("Account routes require the isolated desktop browser window.");
+  if (!hasNativeShell()) throw new Error("Account routes require the isolated desktop browser window.");
   if (!transport.gatewayBrowserBase)
     throw new Error("This node has no active gateway browser plane.");
   const resolved = await duckdns.resolve(transport, { handle: address.handle });

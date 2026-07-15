@@ -1,7 +1,7 @@
 // Lazy, WASM-free syntax highlighter for the forge file viewer.
 //
 // Uses shiki's JavaScript RegExp engine (no oniguruma WASM), so it works in the
-// offline Tauri webview with no extra asset, and only bundles the languages
+// offline desktop UI with no extra asset, and only bundles the languages
 // imported below. Returns per-line colored tokens that drop straight into the
 // viewer's line-number gutter.
 

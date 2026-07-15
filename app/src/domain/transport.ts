@@ -955,7 +955,7 @@ export const remoteTransport = (
         } catch (err) {
           // a locked identity falls back to the unsigned lane — the commit
           // still lands, with the daemon's status-quo authorship. anything
-          // else (a real signer or node failure) propagates. tauri invoke
+          // else (a real signer or node failure) propagates. Native calls
           // rejects with the raw string, not an Error — accept both shapes.
           const detail = err instanceof Error ? err.message : String(err);
           if (detail !== "identity-locked") throw err;

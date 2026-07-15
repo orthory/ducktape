@@ -4,9 +4,9 @@
 // store's people slice — the node→account→handle mapping the console projects.
 //
 // Why bare-wire seeding: the store's account WRITE paths (accountBindNode,
-// setDuckHandle landing) require a tauri shell to sign (`user_sign_bind`, gated
-// on isTauri()) AND a real self node key. The sim reports an empty publicKey and
-// the vitest env is not tauri, so those write paths short-circuit — their
+// setDuckHandle landing) require a native shell to sign (`user_sign_bind`, gated
+// on hasNativeShell()) AND a real self node key. The sim reports an empty publicKey and
+// the vitest env is not native, so those write paths short-circuit — their
 // outcome vocabulary (bound/already/locked/deferred/failed/skipped) is unit
 // territory (auto-bind.test.ts). What the scenario lane CAN prove end-to-end is
 // the ceremony over the wire + the store's READ projection of committed state,
@@ -238,7 +238,7 @@ describe.skipIf(!bin)("account scenarios against the sim node", () => {
 
       // accountBindNode's auto-bind vocabulary (bound/already/locked/deferred/
       // skipped) is NOT reachable in this provider-only lane: the action guards
-      // on a selected workspace (null here) before it ever reaches the tauri-
+      // on a selected workspace (null here) before it ever reaches the native-
       // signed bind. Pin the honest guard; the vocabulary lives in
       // auto-bind.test.ts (which drives a stub transport + a mocked shell).
       await expect(actions().accountBindNode()).rejects.toThrow(

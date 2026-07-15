@@ -80,8 +80,8 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
     "bin/mcp",
-    # app — the desktop shell of the react client (web twin ships from app/)
-    "app/src-tauri",
+    # app — native desktop shell (the React client remains the web twin)
+    "app/src-iced",
 ]
 
 [workspace.package]
@@ -231,9 +231,3 @@ overlay-net = { path = "crates/system/overlay-net" }
 # would be a different trait).
 governor = "0.10.2"
 rand_core = "0.6.4"
-
-# The desktop shell runs on the standalone tauri-runtime-cef crate
-# (github.com/byeongsu-hong/tauri-runtime-cef) against PUBLISHED tauri
-# crates — no tauri fork, no [patch.crates-io]. The dep lives in
-# app/src-tauri/Cargo.toml; the shell aliases the runtime generics itself
-# (app/src-tauri/src/rt.rs) since registry tauri only defaults them to wry.

@@ -4709,8 +4709,8 @@ printf 'sandbox-ok:%s' "$prompt""#,
     }
 
     /// Real Podman gate for macOS hardware. Kept ignored because it requires a
-    /// running Podman machine and a pulled image; ops/smoke-macos-sandbox.sh
-    /// owns those prerequisites and invokes this exact test.
+    /// running Podman machine and a pulled image. Run it explicitly with
+    /// `cargo test -p capability-host macos_podman_hardware_smoke -- --ignored`.
     #[tokio::test]
     #[ignore = "requires a live Podman machine"]
     async fn macos_podman_hardware_smoke() {

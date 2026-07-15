@@ -1,7 +1,5 @@
-// The app toolbar + content frame. On desktop the native title bar sits above
-// this and `data-tauri-drag-region` makes the toolbar draggable; on web the
-// attribute is inert. The status dot reflects the last node round-trip and the
-// height ticks with finalized blocks.
+// The static web twin's app toolbar + content frame. The status dot reflects
+// the last node round-trip and the height ticks with finalized blocks.
 
 import { useState } from "react";
 import type { ReactNode } from "react";
@@ -10,12 +8,10 @@ import { Icon } from "../components/Icon";
 import { accentVar, color, font, radius } from "../theme/tokens";
 import { hasNodeContext, isClientMode } from "../store/state";
 import { useDucktape } from "../store/use-ducktape";
-import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { NotificationsBell } from "./NotificationsBell";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { OwnerControlHint } from "./OwnerControlHint";
-import { ResizeEdges, WindowControls } from "./WindowChrome";
 
 // Left inset that clears the macOS traffic lights. Only the macOS desktop build
 // overlays them on the content (see isMacDesktop); on Linux/Windows desktop and
@@ -23,12 +19,12 @@ import { ResizeEdges, WindowControls } from "./WindowChrome";
 // status half. The platform is fixed for the process lifetime, so this is
 // resolved once at module load rather than per TitleBar render (which re-renders
 // on every finalized block).
-const TRAFFIC_LIGHT_INSET = isMacDesktop() ? 69 : 0;
+const TRAFFIC_LIGHT_INSET = 0;
 
 // The palette shortcut as the local platform types it (the handler accepts
 // both meta and ctrl — see ConsoleShell). Same module-load resolution as the
 // inset above.
-const SEARCH_KEY_LABEL = isMacDesktop() ? "⌘K" : "Ctrl K";
+const SEARCH_KEY_LABEL = "Ctrl K";
 
 // The centered search affordance in the title bar: a compact field that opens
 // the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
@@ -186,7 +182,6 @@ function TitleBar() {
 
   return (
     <div
-      data-tauri-drag-region
       style={{
         position: "relative",
         height: 44,
@@ -205,7 +200,6 @@ function TitleBar() {
       }}
     >
       <div
-        data-tauri-drag-region
         style={{
           display: "flex",
           alignItems: "center",
@@ -275,10 +269,9 @@ function TitleBar() {
 
       {/* an empty middle cell keeps the grid's two 1fr halves, and thus the
           bar's centering, intact while the palette affordance hides. */}
-      {gated ? <div data-tauri-drag-region /> : <SearchBar />}
+      {gated ? <div /> : <SearchBar />}
 
       <div
-        data-tauri-drag-region
         style={{
           display: "flex",
           alignItems: "center",
@@ -303,9 +296,6 @@ function TitleBar() {
           <span style={{ width: 6, height: 6, borderRadius: "50%", background: dot }} />
           {"h " + (state.status?.height ?? 0).toLocaleString()}
         </span>
-        {/* Undecorated Linux/Windows window controls; renders nothing on
-            macOS (native traffic lights) and on web. */}
-        <WindowControls />
       </div>
     </div>
   );
@@ -335,8 +325,6 @@ export function WindowFrame({ children }: { children: ReactNode }) {
           the content below, never the whole window (which had no boundary and
           went blank white on any render throw). */}
       <ErrorBoundary>{children}</ErrorBoundary>
-      {/* Edge resize handles for the undecorated non-mac desktop window. */}
-      <ResizeEdges />
     </div>
   );
 }

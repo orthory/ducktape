@@ -3,7 +3,6 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -63,7 +62,7 @@ const renderSettings = (patch: Partial<ConsoleState> = {}) => {
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 

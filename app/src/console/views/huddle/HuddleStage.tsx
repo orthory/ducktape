@@ -14,7 +14,7 @@ import type { CSSProperties } from "react";
 import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
 import { keyHex } from "../../../domain/chat-client";
 import { buildParticipants } from "../../store/huddle-roster";
-import { isTauri } from "../../../domain/node-bootstrap";
+import { hasNativeShell } from "../../../domain/node-bootstrap";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
@@ -48,7 +48,6 @@ function CollapseGlyph({ size = 15 }: { size?: number }) {
     </svg>
   );
 }
-
 // ── the stage ───────────────────────────────────────────
 
 export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
@@ -143,7 +142,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
             {mode === "gallery" ? <SpotlightGlyph /> : <GridGlyph />}
             {mode === "gallery" ? "Spotlight" : "Gallery"}
           </HoverButton>
-          {isTauri() && live && (
+          {hasNativeShell() && live && (
             <HoverButton onClick={() => actions.popOutHuddle()} title="Pop out to a window" style={barBtn(false)} hoverStyle={{ background: color.hover }}>
               Pop out
             </HoverButton>

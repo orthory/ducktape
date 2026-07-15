@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -88,15 +85,6 @@ const renderView = (transport: NodeTransport | null, patch: Partial<ConsoleState
     </ConsoleContext.Provider>,
   );
 };
-
-describe("Files desktop drag and drop wiring", () => {
-  it("lets the webview receive HTML5 drag/drop events", () => {
-    const config = JSON.parse(
-      readFileSync(join(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"),
-    );
-    expect(config.app.windows[0].dragDropEnabled).toBe(false);
-  });
-});
 
 describe("FilesView", () => {
   it("lists the current directory's folders and files", async () => {

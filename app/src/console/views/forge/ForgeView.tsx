@@ -1494,7 +1494,7 @@ function WebFallback({ head, op }: { head: string | null; op: OpRecord | undefin
           <div style={{ marginTop: 8, font: `600 15px ${font.sans}`, color: color.ink }}>Desktop app required</div>
           <div style={{ marginTop: 5, font: `400 12.5px ${font.sans}`, color: color.muted, lineHeight: 1.5 }}>
             This build can show the committed forge HEAD from the node, but the local git tree and file contents are
-            only available through the desktop Tauri reader.
+            only available through the native desktop reader.
           </div>
           <div style={{ marginTop: 13 }}>
             <HeadCard head={head} op={op} />

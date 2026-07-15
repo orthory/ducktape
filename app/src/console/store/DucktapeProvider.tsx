@@ -15,7 +15,8 @@ import type { ReactNode } from "react";
 
 import { forgeItemTarget } from "../../domain/forge-client";
 import {
-  isTauri,
+  hasNativeShell,
+  nativeCall,
   resolveNode,
 } from "../../domain/node-bootstrap";
 import * as notifyClient from "../../domain/notify-client";
@@ -87,24 +88,11 @@ export type { ConsoleContextValue } from "./context";
 /** How many recent non-empty blocks the explorer pulls per refresh. */
 const BLOCKS_KEEP = 200;
 
-// One shared dynamic import of the Tauri event API for every effect below.
-// Several effects need it on the same mount tick, and concurrent dynamic
-// imports of one specifier both waste work and race vitest's module mocker
-// (the loser of the race resolves the REAL module past the test's mock).
-let tauriEventModule: Promise<typeof import("@tauri-apps/api/event")> | null = null;
-const tauriEventApi = () => {
-  if (!tauriEventModule) {
-    tauriEventModule = import("@tauri-apps/api/event");
-    // Never cache a rejection: one failed load would otherwise leave the
-    // navigate listener and both huddle bridges dead for the whole session,
-    // with every consumer swallowing the same cached error silently.
-    tauriEventModule.catch((err) => {
-      tauriEventModule = null;
-      console.warn("[console] @tauri-apps/api/event failed to load; retrying on next use", err);
-    });
-  }
-  return tauriEventModule;
+type NativeEventApi = {
+  emit(event: string, payload?: unknown): Promise<void>;
+  listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void>;
 };
+const nativeEventApi = (): Promise<NativeEventApi> => nativeCall("native window events");
 
 /** The structured deep-link a desktop notification navigates with. A plain
  *  string payload remains the tray popover's bare screen switch. Mirrored by
@@ -701,7 +689,7 @@ export function DucktapeProvider({
     if (transport || bootStartedRef.current) return;
     bootStartedRef.current = true;
 
-    if (!isTauri()) {
+    if (!hasNativeShell()) {
       const resolution = resolveNode();
       dispatch({
         type: "patch",
@@ -977,7 +965,7 @@ export function DucktapeProvider({
   //     so there is no re-push tick here. Protocol: store/huddle-window.ts.
   const huddleCtxFp = useRef("");
   useEffect(() => {
-    if (!state.voice.popped || !isTauri()) return;
+    if (!state.voice.popped || !hasNativeShell()) return;
     const ctx = buildHuddleContext(
       state.voice,
       state.channels,
@@ -990,7 +978,7 @@ export function DucktapeProvider({
     const fp = JSON.stringify(ctx);
     if (fp === huddleCtxFp.current) return;
     huddleCtxFp.current = fp;
-    void tauriEventApi()
+    void nativeEventApi()
       .then(({ emit }) => emit(HUDDLE_CONTEXT_EVENT, ctx))
       // A dropped push must not strand the window on a stale roster (it has no
       // other source) — clear the fingerprint so the next render re-emits.
@@ -1005,7 +993,7 @@ export function DucktapeProvider({
   //     incl. the window closing itself on a media failure). The mount-time
   //     popInHuddle also re-takes any session left dangling by a reload.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!hasNativeShell()) return;
     actions.popInHuddle();
     const unlisteners: Array<() => void> = [];
     let cancelled = false;
@@ -1013,7 +1001,7 @@ export function DucktapeProvider({
       if (cancelled) un();
       else unlisteners.push(un);
     };
-    void tauriEventApi()
+    void nativeEventApi()
       .then(({ listen, emit }) =>
         Promise.all([
           listen(HUDDLE_CMD_EVENT, (event) => {
@@ -1038,7 +1026,7 @@ export function DucktapeProvider({
       )
       .then((uns) => uns.forEach(hold))
       .catch(() => {
-        // event API unavailable (non-tauri / test stub) — the bridge no-ops.
+        // native event API unavailable in the static web twin — the bridge no-ops.
       });
     return () => {
       cancelled = true;
@@ -1053,10 +1041,10 @@ export function DucktapeProvider({
   //     autoBindUserIdentity) deterministically short-circuits "locked"; this
   //     listener is what ever lands the bind for those users.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!hasNativeShell()) return;
     let unlisten: (() => void) | null = null;
     let cancelled = false;
-    void tauriEventApi()
+    void nativeEventApi()
       .then(({ listen }) =>
         listen(IDENTITY_UNLOCKED_EVENT, () => void actions.identityUnlocked()),
       )
@@ -1065,7 +1053,7 @@ export function DucktapeProvider({
         else unlisten = un;
       })
       .catch(() => {
-        // event API unavailable (non-tauri / test stub) — no retry hook, the
+        // native event API unavailable — no retry hook, the
         // next connect's own bind pass still runs.
       });
     return () => {
@@ -1115,10 +1103,10 @@ export function DucktapeProvider({
   //    — screen plus an optional channel/thread and forge repo/item. Inert on
   //    web, and a malformed object payload is ignored.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!hasNativeShell()) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    void tauriEventApi()
+    void nativeEventApi()
       .then(({ listen }) =>
         listen<string | NavigateTarget>("ducktape://navigate", (event) => {
           const payload = event.payload;
@@ -1179,7 +1167,7 @@ export function DucktapeProvider({
         else unlisten = un;
       })
       .catch(() => {
-        // event API unavailable (non-tauri / permission) — navigation just no-ops.
+        // native event API unavailable — navigation just no-ops.
       });
     return () => {
       cancelled = true;
@@ -1284,7 +1272,7 @@ export function DucktapeProvider({
   //    unchanged projections. Focus feeds ONLY the config (focus-suppression
   //    of the viewed channel) — seen-marking belongs to the bell dropdown.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!hasNativeShell()) return;
     const onFocus = () => {
       setWindowFocused(true);
     };
@@ -1298,7 +1286,7 @@ export function DucktapeProvider({
   }, []);
 
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!hasNativeShell()) return;
     // An empty publicKey (legacy daemon) reads as unknown, not as self "".
     const selfNodeKeyHex = state.status?.publicKey?.toLowerCase() || null;
     const selfUserKeyHex = selfNodeKeyHex

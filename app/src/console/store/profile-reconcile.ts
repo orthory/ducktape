@@ -27,7 +27,7 @@ import type { NodeTransport } from "../../domain/transport";
 import { base64ToBytes, uploadFile } from "../../domain/files-client";
 import { ATTACHMENTS_ROOT } from "../../domain/duck-uri";
 import { keyHex } from "../../domain/chat-client";
-import { isTauri } from "../../domain/node-bootstrap";
+import { hasNativeShell } from "../../domain/node-bootstrap";
 import { normalizeKey } from "../../domain/names";
 import { identityState } from "../../domain/user-identity-client";
 import { loadAccountProfile, saveAccountProfile } from "./account-profile";
@@ -40,13 +40,12 @@ import { loadAccountProfile, saveAccountProfile } from "./account-profile";
  *  (web build, locked key) counts as NOT ours — the next connect after unlock
  *  retries, exactly like auto-bind. */
 const isOwnAccount = async (account: AccountView): Promise<boolean> => {
-  if (!isTauri()) return false;
+  if (!hasNativeShell()) return false;
   const { state, pubkey } = await identityState();
   if ((state !== "unlocked" && state !== "plaintext") || !pubkey) return false;
   const mine = normalizeKey(pubkey);
   return account.member_keys.some((key) => keyHex(key.pubkey) === mine);
 };
-
 /** Raster image mimes accepted for avatars → their duckfs extension. Restricted
  *  to the set the attachment chip previews inline (svg is script-bearing and
  *  deliberately excluded). The panel validates against this before storing. */

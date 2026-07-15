@@ -1,4 +1,4 @@
 interface:
   display_name: "QA"
-  short_description: "Drive the fleet's real per-worktree Ducktape apps for agent QA."
-  default_prompt: "Use $qa to drive a fleet worktree's live Ducktape desktop instance over its tauri-plugin-mcp socket (/tmp/tauri-mcp-<id>.sock) — assert the DOM, drive the UI, seed node state — so an agent can QA that branch while it shows live in the fleet dashboard."
+  short_description: "Verify the real native Iced app, managed node, and CEF Browser pane."
+  default_prompt: "Use $qa to build and verify Ducktape's staged native Iced desktop app, including workspace/node lifecycle and the isolated CEF Browser pane. Report the platform, package path, exact checks, and any skipped native gate."

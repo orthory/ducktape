@@ -12,7 +12,7 @@ import * as files from "../../../domain/files-client";
 import * as gateway from "../../../domain/gateway-client";
 import * as identity from "../../../domain/identity-client";
 import { normalizeKey } from "../../../domain/names";
-import { isTauri } from "../../../domain/node-bootstrap";
+import { hasNativeShell } from "../../../domain/node-bootstrap";
 import * as workspaces from "../../../domain/workspace-client";
 import type { RouteMethod, RouteRecord, RouteStatement, RouteSummary } from "../../../domain/gateway-client";
 import { useDucktape } from "../../store/use-ducktape";
@@ -163,7 +163,7 @@ export function GatewayView() {
     const result = await Promise.all([
       gateway.getRoute(transport, accountBytes, name),
       gateway.listRoutes(transport, accountBytes),
-      workspaceId && isTauri()
+      workspaceId && hasNativeShell()
         ? workspaces.listGatewayRoutes(workspaceId)
         : Promise.resolve([]),
     ]).catch((error: unknown) => {
@@ -360,7 +360,7 @@ export function GatewayView() {
   };
 
   const canMutate = Boolean(
-    transport && isTauri() && workspaceId && accountId && publisherNode && chainId && !busy,
+    transport && hasNativeShell() && workspaceId && accountId && publisherNode && chainId && !busy,
   );
   const canPublish = canMutate && !labelError && (audience !== "accounts" || audienceAccounts.length > 0);
 
@@ -554,8 +554,8 @@ export function GatewayView() {
               <button disabled={!canMutate} onClick={() => run(unpublish)} style={{ ...buttonStyle(!canMutate), textAlign: "center", color: color.danger }}>Remove route</button>
             )}
           </div>
-          {!isTauri() && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Saving routes requires the desktop user-key signer.</p>}
-          {isTauri() && !accountId && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Bind this node to your Identity account before saving routes.</p>}
+          {!hasNativeShell() && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Saving routes requires the desktop user-key signer.</p>}
+          {hasNativeShell() && !accountId && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Bind this node to your Identity account before saving routes.</p>}
           {note && <div role="status" style={{ marginTop: 12, padding: 10, borderRadius: radius.sm, background: color.paper, border: `1px solid ${color.border}`, color: color.muted3, font: `500 10.5px/1.45 ${font.sans}` }}>{note}</div>}
         </div>
       </div>

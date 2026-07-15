@@ -1,18 +1,16 @@
 // Typed client for this machine's user identity (`~/.ducktape/user.key`) —
-// the TS mirror of app/src-tauri/src/user_identity.rs. Every call is a Tauri
-// `invoke`, so these ONLY work in the desktop build: the web build has no
+// the static web twin of the native identity service. Every mutator is a
+// native call, so these ONLY work in the desktop build: the web build has no
 // local user key file and no `user-key` verbs to shell out to. `identityState`
 // is the one exception — it resolves an inert "absent" shape on the web build
 // instead of rejecting, so the identity gate can call it unconditionally; every
 // mutator below rejects with a clear error there instead.
 //
 // Wire casing is the Rust commands' own (`#[serde(rename_all = "camelCase")]`
-// on every reply shape, and Tauri's own camelCase arg convention), so these TS
+// on every reply shape and the native bridge's camelCase arg convention), so these TS
 // shapes and call sites match verbatim — no remapping.
 
-import { invoke } from "@tauri-apps/api/core";
-
-import { isTauri } from "./node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "./node-bootstrap";
 
 // ── Wire types (verbatim from user_identity.rs) ─────────
 
@@ -75,7 +73,7 @@ const notDesktop = <T>(): Promise<T> =>
  *  build has no local user key at all — resolves the inert "absent" shape
  *  without invoking, so callers can gate on this everywhere unconditionally. */
 export const identityState = (): Promise<IdentityStateReport> => {
-  if (!isTauri()) {
+  if (!hasNativeShell()) {
     return Promise.resolve({ state: "absent", mnemonicConfirmed: true });
   }
   return invoke<IdentityStateReport>("user_identity_state");
@@ -87,7 +85,7 @@ export const identityState = (): Promise<IdentityStateReport> => {
  *  returning the pubkey and the mnemonic. Leaves mnemonic-confirmed false —
  *  the caller still owes the user the confirm-3-words step. */
 export const createIdentity = (password: string): Promise<IdentityCreated> =>
-  isTauri()
+  hasNativeShell()
     ? invoke<IdentityCreated>("user_identity_create", { password })
     : notDesktop();
 
@@ -98,7 +96,7 @@ export const restoreIdentity = (
   mnemonic: string,
   password: string,
 ): Promise<IdentityPubkey> =>
-  isTauri()
+  hasNativeShell()
     ? invoke<IdentityPubkey>("user_identity_restore", { mnemonic, password })
     : notDesktop();
 
@@ -106,7 +104,7 @@ export const restoreIdentity = (
  *  verification, nothing persists on disk; caches `password` in the shell's
  *  process memory for the rest of the app's run on success. */
 export const unlockIdentity = (password: string): Promise<IdentityPubkey> =>
-  isTauri()
+  hasNativeShell()
     ? invoke<IdentityPubkey>("user_identity_unlock", { password })
     : notDesktop();
 
@@ -116,13 +114,13 @@ export const unlockIdentity = (password: string): Promise<IdentityPubkey> =>
  *  (A successful reveal still STORES the just-verified password, so finishing
  *  the resume-create ceremony leaves the session unlocked.) */
 export const revealMnemonic = (password: string): Promise<IdentityMnemonic> =>
-  isTauri()
+  hasNativeShell()
     ? invoke<IdentityMnemonic>("user_identity_reveal", { password })
     : notDesktop();
 
 /** Migrate a legacy plaintext identity to encrypted (v2), in place. */
 export const encryptLegacy = (password: string): Promise<IdentityPubkey> =>
-  isTauri()
+  hasNativeShell()
     ? invoke<IdentityPubkey>("user_identity_encrypt", { password })
     : notDesktop();
 
@@ -130,10 +128,10 @@ export const encryptLegacy = (password: string): Promise<IdentityPubkey> =>
  *  Registry flag with no security weight (it only stops the identity gate
  *  from re-showing the confirmation step on future launches). */
 export const confirmMnemonic = (): Promise<void> =>
-  isTauri() ? invoke<void>("user_identity_confirm_mnemonic") : notDesktop();
+  hasNativeShell() ? invoke<void>("user_identity_confirm_mnemonic") : notDesktop();
 
 /** Drop the session-cached password (a Settings "lock" affordance). The next
  *  bind/unbind (or any signing call) on an encrypted key needs a fresh
  *  unlock, or fails with `"identity-locked"`. */
 export const lockIdentity = (): Promise<void> =>
-  isTauri() ? invoke<void>("user_identity_lock") : notDesktop();
+  hasNativeShell() ? invoke<void>("user_identity_lock") : notDesktop();

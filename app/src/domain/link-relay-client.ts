@@ -7,9 +7,9 @@
 // once it posts one; linkRelayCancel tears the server down. New-device half:
 // linkFetchChallenge/linkSendResponse run the exchange against a typed link
 // address (the shell does the HTTP — no webview cross-origin surface). All
-// desktop-only (Tauri invoke).
+// desktop-only native calls.
 
-import { invoke } from "@tauri-apps/api/core";
+import { nativeCall as invoke } from "./node-bootstrap";
 
 export interface LinkRelayStart {
   url: string;

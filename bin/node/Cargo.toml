@@ -132,7 +132,7 @@ libc = "0.2"
 # App Nap opt-out (see main.rs `hold_macos_activity`): a desktop-spawned node
 # lives in the GUI app's coalition and would otherwise be timer-coalesced the
 # moment the app hides to the menu bar. already in the workspace lockfile via
-# tauri — this adds no new supply chain.
+# another workspace dependency — this adds no new supply chain.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 

@@ -6,7 +6,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import type { AccountView } from "../../domain/identity-client";
 import { makeTransportStub } from "../transport-stub";
@@ -21,8 +20,8 @@ const NODE = "aa".repeat(32);
 const MY_KEY = "010203";
 
 /** Desktop shell with an unlocked user key = `pubkey` (default: OUR key). */
-const markTauri = (pubkey = MY_KEY) => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = (pubkey = MY_KEY) => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
   invokeMock.mockImplementation((cmd: string) =>
     cmd === "user_identity_state"
       ? Promise.resolve({ state: "plaintext", pubkey, mnemonicConfirmed: true })
@@ -31,7 +30,7 @@ const markTauri = (pubkey = MY_KEY) => {
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 
@@ -68,7 +67,7 @@ const PNG =
 
 beforeEach(() => {
   localStorage.clear();
-  markTauri();
+  markNative();
 });
 
 describe("reconcileProfile", () => {
@@ -91,7 +90,7 @@ describe("reconcileProfile", () => {
   });
 
   it("treats an unverifiable owner (web build, no user key) as foreign", async () => {
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
     saveAccountProfile({ name: "Kim" });
     const t = transportFor(account({ display_name: "Mallory" }));
     expect(await reconcileProfile(t, { nodePub: NODE })).toBe("foreign");

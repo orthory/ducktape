@@ -6,7 +6,6 @@ import { buildContentManifest, loadDuckPage, parseDuckAddress } from "./duck-bro
 import * as gateway from "./gateway-client";
 import * as nodeBootstrap from "./node-bootstrap";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const encoder = new TextEncoder();
 const b64 = (bytes: Uint8Array): string => {
@@ -133,7 +132,7 @@ describe("browser authority boundaries", () => {
   });
 
   it("verifies one signed route, mints a scoped origin, and closes the resolution race", async () => {
-    vi.spyOn(nodeBootstrap, "isTauri").mockReturnValue(true);
+    vi.spyOn(nodeBootstrap, "hasNativeShell").mockReturnValue(true);
     const secret = new Uint8Array(32).fill(5);
     const signer = ed25519.getPublicKey(secret);
     const publisher = new Array(32).fill(8);
@@ -180,6 +179,9 @@ describe("browser authority boundaries", () => {
     const gatewayBrowserBase = vi
       .fn()
       .mockResolvedValue({ base: "http://127.0.0.1:49152" });
+    (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = vi
+      .fn()
+      .mockResolvedValue(undefined);
     const page = await loadDuckPage(
       makeTransportStub({ query, gatewayBrowserBase }),
       "api.alice.duck/v1/health?q=1",

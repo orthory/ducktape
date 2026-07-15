@@ -7,7 +7,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import {
   confirmMnemonic,
@@ -20,12 +19,12 @@ import {
   unlockIdentity,
 } from "./user-identity-client";
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 
@@ -39,7 +38,7 @@ describe("identityState", () => {
   });
 
   it("invokes user_identity_state and returns its shape verbatim on desktop", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({
       state: "locked",
       pubkey: "cd34",
@@ -57,7 +56,7 @@ describe("identityState", () => {
 
 describe("createIdentity", () => {
   it("invokes user_identity_create with the password", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({ pubkey: "ab12", mnemonic: "one two three" });
 
     await expect(createIdentity("hunter2-plus")).resolves.toEqual({
@@ -77,7 +76,7 @@ describe("createIdentity", () => {
 
 describe("restoreIdentity", () => {
   it("invokes user_identity_restore with mnemonic + password", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({ pubkey: "ab12" });
 
     await expect(
@@ -97,7 +96,7 @@ describe("restoreIdentity", () => {
 
 describe("unlockIdentity", () => {
   it("invokes user_identity_unlock with the password", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({ pubkey: "ab12" });
 
     await expect(unlockIdentity("hunter2-plus")).resolves.toEqual({
@@ -116,7 +115,7 @@ describe("unlockIdentity", () => {
 
 describe("revealMnemonic", () => {
   it("invokes user_identity_reveal with the password", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({ mnemonic: "one two three" });
 
     await expect(revealMnemonic("hunter2-plus")).resolves.toEqual({
@@ -135,7 +134,7 @@ describe("revealMnemonic", () => {
 
 describe("encryptLegacy", () => {
   it("invokes user_identity_encrypt with the password", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({ pubkey: "ab12" });
 
     await expect(encryptLegacy("hunter2-plus")).resolves.toEqual({
@@ -154,7 +153,7 @@ describe("encryptLegacy", () => {
 
 describe("confirmMnemonic", () => {
   it("invokes user_identity_confirm_mnemonic with no args", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue(undefined);
 
     await expect(confirmMnemonic()).resolves.toBeUndefined();
@@ -169,7 +168,7 @@ describe("confirmMnemonic", () => {
 
 describe("lockIdentity", () => {
   it("invokes user_identity_lock with no args", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue(undefined);
 
     await expect(lockIdentity()).resolves.toBeUndefined();

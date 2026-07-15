@@ -131,7 +131,7 @@ fn install_panic_hook() {
             target: "ducktape::node",
             thread = std::thread::current().name().unwrap_or("?"),
             // the "panicked at" text is a marker the desktop shell greps for
-            // (app/src-tauri/src/workspaces/phase.rs) — keep it in the message.
+            // (app/src-iced/src/backend/workspace_service.rs) — keep it in the message.
             "panicked at: {info}"
         );
         default(info);

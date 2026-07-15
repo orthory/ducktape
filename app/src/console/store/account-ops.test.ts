@@ -2,10 +2,9 @@
 // the shell, refused on link-nonce drift — see account-ops.ts. The transport
 // stub mirrors auto-bind.test.ts's.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import {
   addMemberFromResponse,
@@ -21,7 +20,14 @@ import type { NodeTransport } from "../../domain/transport";
 import { encodeLinkResponse } from "../views/account/link-device";
 import type { LinkChallenge } from "../views/account/link-device";
 
-afterEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
+});
+
+afterEach(() => {
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
+  vi.clearAllMocks();
+});
 
 const wireAccount = (patch: Partial<AccountView> = {}): AccountView => ({
   account_id: [1, 2, 3],

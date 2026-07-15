@@ -1,6 +1,6 @@
 // The Account view's writes: mint a device-link challenge, approve a link
 // response (AddMemberKey), drop a member key, and unbind a node. All signing
-// happens in the tauri shell (`user_sign_*` verbs) over this machine's
+// happens in the native desktop app (`user_sign_*` verbs) over this machine's
 // account key — this module only assembles inputs from fresh account facts
 // read through the live transport, forwards the ready-to-submit msg JSON, and
 // maps the shell's `identity-locked` sentinel into an actionable error. Deps
@@ -13,11 +13,10 @@
 // drift (any account op landing in between invalidates the proof) instead of
 // submitting a doomed msg.
 
-import { invoke } from "@tauri-apps/api/core";
-
 import { keyHex } from "../../domain/chat-client";
 import { enrollStart } from "../../domain/enroll-client";
 import { accountOfNode, hexToBytes, submitRawMsg } from "../../domain/identity-client";
+import { nativeCall as invoke } from "../../domain/node-bootstrap";
 import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
 import { decodeLinkResponse } from "../views/account/link-device";

@@ -128,7 +128,7 @@ converged app-hashes agree across nodes:
 cargo test -p node-bin --test cluster_e2e
 ```
 
-## Step 2: Distribute To The Fleet
+## Step 2: Distribute To Validators
 
 Distribution mechanics (package channels, signatures, staging) are an ops
 concern, not a consensus concern — the mechanism only requires the correct
@@ -138,12 +138,14 @@ until you roll it in Step 4.
 
 - Production validators: copy the artifact and its checksum to each host, verify
   the checksum on arrival, stage it beside the running binary.
-- Local test net / worktree fleet: rebuild and redeploy per node.
+- Local test net: rebuild the node and run the process-level cluster gate before
+  deploying the binary independently to each test validator.
 
 ```bash
-# local multi-node test net driven by the fleet harness
-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js status
-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js up <revision…>
+cargo build --release -p node-bin
+cargo test -p node-bin --test cluster_e2e
+# Optional desktop package verification for the same sidecar revision:
+make app
 ```
 
 **Admission gate during an open window:** any validator admitted after a

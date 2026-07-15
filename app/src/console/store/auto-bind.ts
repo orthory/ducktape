@@ -1,6 +1,6 @@
 // Auto-bind: on a desktop connect, quietly offer this machine's user key to
 // bind the workspace's node — so a freshly-created or freshly-joined node
-// starts life owned by whoever's tauri shell is running it, with no manual
+// starts life owned by whoever's native desktop app is running it, with no manual
 // "bind" step. Fire-and-forget from the connect action (see actions.ts):
 // every step below is wrapped so a failure here NEVER surfaces as a connect
 // error — the identity module is best-effort convenience, not a gate, and the
@@ -8,14 +8,12 @@
 // binding concurrently resolves here too: one submit lands, the loser's
 // `submit` rejects and this resolves "failed" like any other hiccup.
 
-import { invoke } from "@tauri-apps/api/core";
-
 import {
   accountOfMember,
   accountOfNode,
   submitRawMsg,
 } from "../../domain/identity-client";
-import { isTauri } from "../../domain/node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import { identityState } from "../../domain/user-identity-client";
 import { clearLinkPending, loadLinkPending } from "./state";
@@ -37,7 +35,7 @@ export const autoBindUserIdentity = (
 ): Promise<AutoBindResult> => {
   // Web build (or any non-desktop shell): there is no machine user key to
   // offer and no `user_sign_bind` command to sign with.
-  if (!isTauri()) return Promise.resolve("skipped");
+  if (!hasNativeShell()) return Promise.resolve("skipped");
 
   return identityState()
     .then(({ state, pubkey: userKey }) => {

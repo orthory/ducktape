@@ -29,7 +29,7 @@ const nodeBootstrapMocks = vi.hoisted(() => ({
 }));
 
 // The desktop-only effects (notify config push, navigate deep-link) talk to
-// the Rust side through notify-client and the Tauri event plane — both mocked
+// the Rust side through notify-client and the native event plane — both mocked
 // so desktop-path tests can run in jsdom and observe/emit directly.
 const notifyMocks = vi.hoisted(() => ({
   configure: vi.fn(() => Promise.resolve()),
@@ -38,11 +38,11 @@ const notifyMocks = vi.hoisted(() => ({
 }));
 vi.mock("../../domain/notify-client", () => notifyMocks);
 
-const tauriEvent = vi.hoisted(() => {
+const nativeEvents = vi.hoisted(() => {
   const handlers = new Map<string, Set<(event: { payload: unknown }) => void>>();
   return {
     handlers,
-    /** Fire a Tauri event into every registered listener (the test's Rust). */
+    /** Fire a native event into every registered listener (the test's Rust). */
     emitTo(name: string, payload: unknown) {
       handlers.get(name)?.forEach((handler) => handler({ payload }));
     },
@@ -54,17 +54,6 @@ const tauriEvent = vi.hoisted(() => {
     emit: vi.fn(() => Promise.resolve()),
   };
 });
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: tauriEvent.listen,
-  emit: tauriEvent.emit,
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
-// Materialize the mocked module up front: the provider fires several
-// CONCURRENT dynamic imports of the event module on mount, and vitest's lazy
-// mock factory races them — the loser would fall through to the real module.
-import "@tauri-apps/api/event";
-import "@tauri-apps/api/core";
-
 // Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
 // so the switch lands on a benign, empty answering node with no real network —
 // enough to prove the previous node's projections are not carried across.
@@ -95,6 +84,21 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
   };
   return {
     ...actual,
+    hasNativeShell: () =>
+      typeof (globalThis as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ ===
+      "function",
+    nativeCall: <T,>(feature: string, args?: unknown): Promise<T> => {
+      const globals = globalThis as unknown as Record<string, unknown>;
+      if (feature === "native window events" && globals.__DUCKTAPE_TEST_NATIVE_EVENTS__) {
+        return Promise.resolve(globals.__DUCKTAPE_TEST_NATIVE_EVENTS__ as T);
+      }
+      const invoke = globals.__DUCKTAPE_TEST_NATIVE_INVOKE__ as
+        | ((feature: string, args?: unknown) => unknown)
+        | undefined;
+      return invoke
+        ? Promise.resolve((args === undefined ? invoke(feature) : invoke(feature, args)) as T)
+        : Promise.reject(new Error(`${feature} is available only in the native desktop app`));
+    },
     connectRemote: vi.fn((httpUrl: string) => ({
       transport:
         (nodeBootstrapMocks.remoteTransport as NodeTransport | null) ?? emptyNode,
@@ -2443,8 +2447,9 @@ const SELF_ACCOUNT: AccountView = {
 };
 const SELF_ACCOUNT_HEX = JESS_USER_KEY.map((b) => b.toString(16).padStart(2, "0")).join("");
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = vi.fn(() => Promise.resolve());
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_EVENTS__ = nativeEvents;
 };
 
 const lastConfig = () => {
@@ -2461,11 +2466,13 @@ describe("desktop notify config push", () => {
     notifyMocks.markSeen.mockClear();
   });
   afterEach(() => {
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-    tauriEvent.handlers.clear();
+    delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
+    delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_EVENTS__;
+    delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_EVENTS__;
+    nativeEvents.handlers.clear();
   });
 
-  it("stays silent on web — no Tauri, no push", async () => {
+  it("stays silent on web — no native, no push", async () => {
     const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
     await waitFor(() =>
@@ -2475,7 +2482,7 @@ describe("desktop notify config push", () => {
   });
 
   it("pushes a payload whose self identity derives from nodeUsers[..].accountId", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
 
@@ -2493,7 +2500,7 @@ describe("desktop notify config push", () => {
   });
 
   it("re-pushes on channel and screen switches with the new focusedChannel", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
     await waitFor(() =>
@@ -2515,7 +2522,7 @@ describe("desktop notify config push", () => {
   });
 
   it("dedupes identical payloads across a refresh's identity churn", async () => {
-    markTauri();
+    markNative();
     const { transport, emitOps } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
     await waitFor(() =>
@@ -2543,7 +2550,7 @@ describe("desktop notify config push", () => {
   });
 
   it("tracks window focus in the config without marking seen", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
     renderConsole(transport);
     await waitFor(() =>
@@ -2571,12 +2578,12 @@ describe("ducktape://navigate deep-link", () => {
     notifyMocks.configure.mockClear();
   });
   afterEach(() => {
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-    tauriEvent.handlers.clear();
+    delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
+    nativeEvents.handlers.clear();
   });
 
   it("keeps the plain-string screen switch byte-for-byte (tray popover)", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -2584,13 +2591,13 @@ describe("ducktape://navigate deep-link", () => {
     );
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", "members");
+      nativeEvents.emitTo("ducktape://navigate", "members");
     });
     expect(capturedState!.screen).toBe("members");
   });
 
   it("navigates a structured chat target: screen, channel, thread", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -2601,7 +2608,7 @@ describe("ducktape://navigate deep-link", () => {
     });
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", {
+      nativeEvents.emitTo("ducktape://navigate", {
         screen: "chat",
         channelId: "dev",
         threadRoot: 7,
@@ -2624,7 +2631,7 @@ describe("ducktape://navigate deep-link", () => {
   });
 
   it("opens a thread in the already-active channel without a channel switch", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -2632,7 +2639,7 @@ describe("ducktape://navigate deep-link", () => {
     );
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", { screen: "chat", threadRoot: 1 });
+      nativeEvents.emitTo("ducktape://navigate", { screen: "chat", threadRoot: 1 });
     });
 
     await waitFor(() =>
@@ -2647,7 +2654,7 @@ describe("ducktape://navigate deep-link", () => {
   });
 
   it("sets forgeFocus for a forge target and clears it on leaving the screen", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -2655,7 +2662,7 @@ describe("ducktape://navigate deep-link", () => {
     );
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", {
+      nativeEvents.emitTo("ducktape://navigate", {
         screen: "forge",
         repo: "default",
         number: 7,
@@ -2674,7 +2681,7 @@ describe("ducktape://navigate deep-link", () => {
     // the hand-off is one-shot: leaving the forge screen retires it, so a
     // later remount of the forge view can never replay the jump
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", "members");
+      nativeEvents.emitTo("ducktape://navigate", "members");
     });
     await waitFor(() => expect(capturedState!.forgeFocus).toBeNull());
   });
@@ -2683,7 +2690,7 @@ describe("ducktape://navigate deep-link", () => {
     // the run-finished deep-link for a forge-item mention targets screen
     // "chat" with the item's hidden `forge:<repo>:<n>` channel — unroutable
     // on the chat surface, so it must land on the item's forge view instead.
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -2691,7 +2698,7 @@ describe("ducktape://navigate deep-link", () => {
     );
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", {
+      nativeEvents.emitTo("ducktape://navigate", {
         screen: "chat",
         channelId: "forge:app:12",
         threadRoot: 7,
@@ -2710,7 +2717,7 @@ describe("ducktape://navigate deep-link", () => {
   });
 
   it("ignores malformed structured payloads", async () => {
-    markTauri();
+    markNative();
     const { transport } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
@@ -2719,10 +2726,10 @@ describe("ducktape://navigate deep-link", () => {
     const before = capturedState!.screen;
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://navigate", {});
-      tauriEvent.emitTo("ducktape://navigate", { channelId: "dev" });
-      tauriEvent.emitTo("ducktape://navigate", null);
-      tauriEvent.emitTo("ducktape://navigate", 42);
+      nativeEvents.emitTo("ducktape://navigate", {});
+      nativeEvents.emitTo("ducktape://navigate", { channelId: "dev" });
+      nativeEvents.emitTo("ducktape://navigate", null);
+      nativeEvents.emitTo("ducktape://navigate", 42);
     });
     expect(capturedState!.screen).toBe(before);
     expect(capturedState!.forgeFocus).toBeNull();

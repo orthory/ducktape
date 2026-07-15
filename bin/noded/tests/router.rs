@@ -802,9 +802,6 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
             "bodyB64": base64::engine::general_purpose::STANDARD.encode(request_body),
         }),
     );
-    request
-        .headers_mut()
-        .insert(header::ORIGIN, "tauri://localhost".parse().unwrap());
     let response = noded::router(handle.with_gateway(lane))
         .oneshot(request)
         .await

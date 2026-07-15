@@ -1,6 +1,6 @@
 // auto-bind contract: on a desktop connect, silently offer this machine's user
 // key to bind the workspace's node — see auto-bind.ts for the step-by-step.
-// Every failure mode (no tauri shell, no user key yet, a nonce race on
+// Every failure mode (no native shell, no user key yet, a nonce race on
 // submit) must resolve a status, never throw — the caller fires this without
 // awaiting. The nonce comes from the ACCOUNT the local key belongs to
 // (of_member), not a lookup by account id.
@@ -8,19 +8,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import { autoBindUserIdentity } from "./auto-bind";
 import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
 import { makeTransportStub } from "../../test/transport-stub";
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   localStorage.removeItem("ducktape.accountLinkPending");
   vi.clearAllMocks();
 });
@@ -57,7 +56,7 @@ const stubTransport = (
 const workspace = { chainId: "team#abcd", pubkey: "ab12" };
 
 describe("autoBindUserIdentity", () => {
-  it("skips on the web build (no tauri shell) without touching the node", async () => {
+  it("skips on the web build (no native shell) without touching the node", async () => {
     const transport = stubTransport(() => ({ account: null }));
 
     await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
@@ -68,7 +67,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("short-circuits to 'already' when the node is already bound, no sign/status invoke calls", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "plaintext", mnemonicConfirmed: true });
@@ -88,7 +87,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("returns 'locked' and makes no further calls when the identity is encrypted and locked", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({
@@ -112,7 +111,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("binds identity with nonce 0 without implicitly registering DuckDNS", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({
@@ -159,7 +158,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("signs with the existing account's nonce (3), not 0", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({
@@ -189,7 +188,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("resolves 'failed' (not a throw) when the node rejects the submit", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({
@@ -215,7 +214,7 @@ describe("autoBindUserIdentity", () => {
     // in the clear) — but if it ever did, there is nothing to sign a bind
     // with once we know the node isn't already bound, so this must resolve
     // 'failed' rather than throw, and never reach the sign/submit calls.
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "unlocked", mnemonicConfirmed: true });
@@ -238,7 +237,7 @@ describe("autoBindUserIdentity", () => {
     // The user chose "link this device to an existing account": until the
     // other device's AddMemberKey lands, this key has no membership — a bind
     // now would FOUND a fresh account, the exact split the link is avoiding.
-    markTauri();
+    markNative();
     localStorage.setItem("ducktape.accountLinkPending", "1");
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
@@ -266,7 +265,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("binds at the account's nonce and clears the pending-link flag once membership appears", async () => {
-    markTauri();
+    markNative();
     localStorage.setItem("ducktape.accountLinkPending", "1");
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
@@ -297,7 +296,7 @@ describe("autoBindUserIdentity", () => {
   });
 
   it("resolves 'failed' when identityState() rejects (e.g. the shell can't read the user key)", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockRejectedValue(new Error("no machine user key"));
     const transport = stubTransport(() => ({ account: null }));
 

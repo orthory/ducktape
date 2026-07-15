@@ -11,7 +11,7 @@ use sdk::StateRoot;
 ///
 /// the literal "FATAL" text stays in the message on purpose: the desktop shell
 /// greps `daemon.log` for it to classify a dead node
-/// (`app/src-tauri/src/workspaces/phase.rs`), and `bin/node`'s e2e suites assert
+/// (`app/src-iced/src/backend/workspace_service.rs`), and `bin/node`'s e2e suites assert
 /// on it.
 ///
 /// NOTE: `process::exit` runs no destructors, so the ring's ws subscribers may

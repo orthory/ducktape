@@ -1,6 +1,6 @@
 // The pure halves of the huddle pop-out bridge: the context the main window
 // pushes (so the popped window can run its own session + roster), and the
-// command→action mapping it applies. The Tauri emit/listen wiring itself needs
+// command→action mapping it applies. The native emit/listen wiring itself needs
 // real windows and is exercised at runtime.
 
 import { describe, expect, it, vi } from "vitest";

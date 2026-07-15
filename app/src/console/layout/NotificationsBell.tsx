@@ -13,7 +13,7 @@ import {
   useState,
 } from "react";
 
-import { isTauri } from "../../domain/node-bootstrap";
+import { hasNativeShell } from "../../domain/node-bootstrap";
 import * as notifyClient from "../../domain/notify-client";
 import type { NotifyItem } from "../../domain/notify-client";
 import { forgeItemTarget, parseItemChannelId } from "../../domain/forge-client";
@@ -58,7 +58,6 @@ interface Group {
   label: string;
   items: NotifyItem[];
 }
-
 const groupLabel = (item: NotifyItem, channelName: (id: string) => string): string => {
   if (!item.channelId) return CATEGORY_LABEL[item.category];
   const forgeItem = parseItemChannelId(item.channelId);
@@ -101,7 +100,7 @@ export function NotificationsBell() {
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!hasNativeShell()) return;
     let cancelled = false;
     let sawLiveUnread = false;
     const unlistens: Array<() => void> = [];
@@ -150,7 +149,7 @@ export function NotificationsBell() {
     };
   }, [open]);
 
-  if (!isTauri()) return null;
+  if (!hasNativeShell()) return null;
 
   const toggle = () => {
     const next = !open;
