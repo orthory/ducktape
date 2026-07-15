@@ -10,6 +10,7 @@ export type { ServerFrame, TailItem, RunStream, StreamErrorCode, StreamOpRow };
 
 export type SubscribedFrame = Extract<ServerFrame, { type: "subscribed" }>;
 export type EventFrame = Extract<ServerFrame, { type: "event" }>;
+export type TermCommandLogFrame = Extract<ServerFrame, { type: "termCommandLog" }>;
 export type TailFrame = Extract<ServerFrame, { type: "tail" }>;
 export type LaggedFrame = Extract<ServerFrame, { type: "lagged" }>;
 export type HeartbeatFrame = Extract<ServerFrame, { type: "heartbeat" }>;
@@ -39,11 +40,21 @@ export const TERM_TOPIC_PREFIX = "term:";
 export const termTopic = (sessionId: string): string =>
   `${TERM_TOPIC_PREFIX}${sessionId}`;
 
-/** The two app→node terminal ops, hand-authored to stay independent of
- *  stream.gen.ts regeneration. `data` is base64 of the keystroke bytes. */
+// A SHARED session's ordered command log rides a second topic, `term-cmd:<id>`,
+// carrying `TermCommandLog` frames (the total-order seq + attributed text). The
+// node replays the whole command ring on (re)subscribe, exactly like `term:`.
+export const TERM_CMD_TOPIC_PREFIX = "term-cmd:";
+export const commandTopic = (sessionId: string): string =>
+  `${TERM_CMD_TOPIC_PREFIX}${sessionId}`;
+
+/** The app→node terminal ops, hand-authored to stay independent of
+ *  stream.gen.ts regeneration. `data` is base64 of the keystroke bytes;
+ *  a `termCommand` carries plain command `text` + the author `origin` (the
+ *  shared-session lane — the node stores the text verbatim). */
 export type TermClientMsg =
   | { op: "termInput"; session: string; data: string }
-  | { op: "termResize"; session: string; cols: number; rows: number };
+  | { op: "termResize"; session: string; cols: number; rows: number }
+  | { op: "termCommand"; session: string; text: string; origin: string };
 
 /** A terminal output chunk: an event frame on a `term:` topic whose `item` is
  *  base64 of raw terminal bytes. Distinct from the op-carrying `EventFrame`
@@ -111,9 +122,18 @@ export const isTermChunkFrame = (value: unknown): value is TermChunkFrame =>
   (value.topic as string).startsWith(TERM_TOPIC_PREFIX) &&
   hasString(value, "item");
 
+export const isTermCommandLogFrame = (value: unknown): value is TermCommandLogFrame =>
+  isRecord(value) &&
+  value.type === "termCommandLog" &&
+  hasString(value, "topic") &&
+  hasNumber(value, "seq") &&
+  hasString(value, "origin") &&
+  hasString(value, "text");
+
 export const isServerFrame = (value: unknown): value is ServerFrame =>
   isSubscribedFrame(value) ||
   isEventFrame(value) ||
+  isTermCommandLogFrame(value) ||
   isTailFrame(value) ||
   isLaggedFrame(value) ||
   isHeartbeatFrame(value) ||

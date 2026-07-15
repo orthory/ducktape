@@ -7,10 +7,11 @@
 import { base64ToBytes, bytesToBase64 } from "./files-client";
 import type { TermClientMsg } from "./stream";
 
-// the precise variants (not the wide union) so callers keep `.data` etc; both
+// the precise variants (not the wide union) so callers keep `.data` etc; all
 // are still assignable to TermClientMsg for `sendTerm`.
 type TermInputMsg = Extract<TermClientMsg, { op: "termInput" }>;
 type TermResizeMsg = Extract<TermClientMsg, { op: "termResize" }>;
+type TermCommandMsg = Extract<TermClientMsg, { op: "termCommand" }>;
 
 const encoder = new TextEncoder();
 
@@ -28,6 +29,15 @@ export const termResizeMsg = (
   cols: number,
   rows: number,
 ): TermResizeMsg => ({ op: "termResize", session, cols, rows });
+
+/** A shared-session command line → a termCommand op. Unlike `termInput`, the
+ *  `text` is plain (not base64): the node's ordered lane stores it verbatim and
+ *  attributes it to `origin`. */
+export const termCommandMsg = (
+  session: string,
+  text: string,
+  origin: string,
+): TermCommandMsg => ({ op: "termCommand", session, text, origin });
 
 /** A term output chunk's base64 `item` → raw bytes for `Terminal.write`. */
 export const decodeTermChunk = (item: string): Uint8Array => base64ToBytes(item);
