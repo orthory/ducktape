@@ -5805,6 +5805,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "module-view-host"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,15 @@
+# module-view-host — the shell-side loader for packaged module views. Holds
+# the ONE state machine that makes view hot-swap correct: reload only when the
+# pinned manifest hash changes, verify bytes against the pin before
+# instantiating, and keep the previous view rendering on ANY failure — a
+# tampered or broken publish must never blank a running UI. The actual view
+# runtime (wasmtime + widget-tree ABI) plugs in behind `ViewRuntime`; this
+# crate deliberately has no wasm dependency so the swap logic lands and tests
+# first. Spec: docs/superpowers/specs/2026-07-15-quack-module-packages-design.md §6.
+[package]
+name = "module-view-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
