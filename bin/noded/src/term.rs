@@ -41,7 +41,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability_host::{AgentDirs, InteractiveSession, ProviderSet, RunContext, SandboxBackend};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::NodeHandle;
 
@@ -64,8 +64,15 @@ const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(4 * 60 * 60);
 /// redraw pattern proves it too small.
 const TERM_RING_MAX_BYTES: usize = 256 * 1024;
 /// how many session rings the shared ring retains before evicting the
-/// least-recently-touched — closed sessions age out here.
+/// least-recently-touched — closed sessions age out here. Shared by the output
+/// ring and the command-log ring.
 const TERM_RING_MAX_SESSIONS: usize = 16;
+/// how many commands each session's ordered command log retains for catch-up.
+/// A command is a submitted line (a prompt), so the count — not a byte cap — is
+/// the natural bound; past it the oldest ages out and a resuming reader lags.
+/// `ponytail:` fixed per-session cap; make it a config knob only if a real
+/// long-running session proves it too small.
+const TERM_CMD_RING_MAX_COMMANDS: usize = 1024;
 /// one pty read chunk. human typing + TUI redraws are modest; a chunk this size
 /// coalesces a redraw burst into few frames without a large per-session buffer.
 const TERM_READ_BUF: usize = 32 * 1024;
@@ -82,6 +89,12 @@ pub const SANDBOX_BACKEND_ENV: &str = "DUCKTAPE_SANDBOX_BACKEND";
 /// the ws topic a session's output rides.
 pub fn topic(session_id: &str) -> String {
     format!("term:{session_id}")
+}
+
+/// the ws topic a session's ordered, attributed command log rides — the
+/// shared-conversation-object view, distinct from the raw-output `term:<id>`.
+pub fn command_topic(session_id: &str) -> String {
+    format!("term-cmd:{session_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +203,122 @@ impl TermRing {
 }
 
 // ---------------------------------------------------------------------------
+// the per-session ordered command log ring (a focused twin of TermRing)
+// ---------------------------------------------------------------------------
+
+/// the per-session ordered, origin-attributed command log with catch-up on
+/// (re)subscribe — the shared-conversation-object seed. A focused twin of
+/// [`TermRing`]: the same monotonic-`seq` cursor, per-session count bound,
+/// LRU-across-sessions eviction, and `watch` wakeups; it stores `(seq, origin,
+/// text)` command grains instead of base64 output chunks. Owned by the
+/// [`crate::stream::StreamHub`] so the ws `term-cmd:<session>` catch-up reads
+/// the same ring the session's serial command consumer appends to.
+#[derive(Clone)]
+pub struct TermCommandRing {
+    inner: Arc<Mutex<TermCommandRingInner>>,
+    watch: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct TermCommandRingInner {
+    version: u64,
+    touch: u64,
+    sessions: BTreeMap<String, CommandRing>,
+}
+
+#[derive(Default)]
+struct CommandRing {
+    next_seq: u64,
+    floor_seq: u64,
+    touched: u64,
+    commands: VecDeque<(u64, String, String)>,
+}
+
+impl Default for TermCommandRing {
+    fn default() -> Self {
+        let (watch, _) = watch::channel(0);
+        Self {
+            inner: Arc::new(Mutex::new(TermCommandRingInner::default())),
+            watch,
+        }
+    }
+}
+
+impl TermCommandRing {
+    /// append one accepted command to a session's ordered log and wake
+    /// subscribers. Returns the assigned monotonic `seq` — the total order the
+    /// serial consumer stamps each command with (starting at 1). The single
+    /// per-session consumer is the only appender, so this ring's `next_seq` IS
+    /// that order.
+    pub fn append(&self, session: &str, origin: &str, text: &str) -> u64 {
+        let mut inner = self.inner.lock().expect("term command ring lock poisoned");
+        inner.version += 1;
+        inner.touch += 1;
+        let version = inner.version;
+        let touch = inner.touch;
+        let ring = inner.sessions.entry(session.to_string()).or_default();
+        ring.touched = touch;
+        ring.next_seq += 1;
+        let seq = ring.next_seq;
+        ring.commands
+            .push_back((seq, origin.to_string(), text.to_string()));
+        // evict oldest commands until under the count cap, always keeping the last.
+        while ring.commands.len() > TERM_CMD_RING_MAX_COMMANDS && ring.commands.len() > 1 {
+            if let Some((evicted, _, _)) = ring.commands.pop_front() {
+                ring.floor_seq = evicted;
+            }
+        }
+        // evict least-recently-touched WHOLE sessions (closed ones age out).
+        while inner.sessions.len() > TERM_RING_MAX_SESSIONS {
+            let Some(victim) = inner
+                .sessions
+                .iter()
+                .filter(|(id, _)| *id != session)
+                .min_by_key(|(_, ring)| ring.touched)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            inner.sessions.remove(&victim);
+        }
+        drop(inner);
+        let _ = self.watch.send(version);
+        seq
+    }
+
+    /// commands with `seq > after`, up to `budget`, plus the ring's floor seq
+    /// (so a reader that fell behind an eviction learns it lagged). Empty for an
+    /// unknown/evicted session, never a panic — exactly like [`TermRing`].
+    pub fn read_after(
+        &self,
+        session: &str,
+        after: u64,
+        budget: usize,
+    ) -> (Vec<(u64, String, String)>, u64) {
+        let mut inner = self.inner.lock().expect("term command ring lock poisoned");
+        inner.touch += 1;
+        let touch = inner.touch;
+        let Some(ring) = inner.sessions.get_mut(session) else {
+            return (Vec::new(), 0);
+        };
+        ring.touched = touch;
+        let rows = ring
+            .commands
+            .iter()
+            .filter(|(seq, _, _)| *seq > after)
+            .take(budget)
+            .cloned()
+            .collect();
+        (rows, ring.floor_seq)
+    }
+
+    /// wake on any append (the version counter), like the output ring's watch.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.watch.subscribe()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the session manager
 // ---------------------------------------------------------------------------
 
@@ -199,13 +328,42 @@ impl TermRing {
 #[derive(Clone)]
 pub struct TerminalSessions(Arc<Inner>);
 
-/// a live session plus the drop-guard that cancels its wall-clock reaper. When
-/// the entry leaves the map (`finish`), dropping `_reaper_cancel` resolves the
-/// reaper's cancel receiver, so its timer exits WITHOUT firing — an early end
-/// (pump EOF or explicit close) can never leave a stale timer around to reap a
-/// later session that happened to reuse this id.
+/// one ordered command bound for a session's pty: the "command grain" — a
+/// submitted line (a prompt), attributed to `origin`. The ws (`TermCommand`)
+/// enqueues these today; consensus (PR 2) will, with `origin` becoming the
+/// signed member. The per-session serial consumer drains them FIFO.
+pub struct Command {
+    pub origin: String,
+    pub text: String,
+}
+
+/// a live session plus the ordered-command lane feeding it and the drop-guard
+/// that cancels its wall-clock reaper. When the entry leaves the map (`finish`),
+/// dropping `_reaper_cancel` resolves the reaper's cancel receiver, so its timer
+/// exits WITHOUT firing — an early end (pump EOF or explicit close) can never
+/// leave a stale timer around to reap a later session that reused this id.
+/// Dropping the entry also drops `cmd_tx`, the lane's only long-lived sender, so
+/// the serial consumer's `recv()` returns `None` and it exits — the same
+/// drop-driven teardown the pump takes on EOF, no separate cancel needed.
+/// how a session is driven — chosen at create, enforced for its whole life.
+///
+/// `Single` (the default): ONE member, RAW keystrokes straight to the pty — the
+/// solo terminal. `Shared`: ordered, attributed `TermCommand`s through the lane
+/// (the consensus-ready path). The two are MUTUALLY EXCLUSIVE per session: a
+/// shared session refuses raw input (else a keystroke would bypass the total
+/// order), and a single session refuses commands (it has no lane/consumer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    #[default]
+    Single,
+    Shared,
+}
+
 struct Live {
     session: Arc<InteractiveSession>,
+    mode: SessionMode,
+    cmd_tx: mpsc::UnboundedSender<Command>,
     _reaper_cancel: oneshot::Sender<()>,
 }
 
@@ -223,6 +381,10 @@ struct Inner {
     /// the shared scrollback ring (owned by the StreamHub, cloned in here so
     /// the pump can append to the same ring the ws catch-up reads).
     ring: TermRing,
+    /// the shared ordered command-log ring (owned by the StreamHub, cloned in
+    /// here so each session's serial consumer appends to the same ring the ws
+    /// `term-cmd:<session>` catch-up reads).
+    cmd_ring: TermCommandRing,
     /// live sessions. `std::sync::Mutex`: every critical section clones an
     /// `Arc` out and drops the guard before any `.await`, so it never crosses
     /// an await point.
@@ -273,18 +435,21 @@ impl TermError {
 
 impl TerminalSessions {
     /// build a manager. `providers` is `None` when interactive is disabled (no
-    /// sandbox image); `ring` is the StreamHub's shared [`TermRing`].
+    /// sandbox image); `ring` is the StreamHub's shared [`TermRing`] and
+    /// `cmd_ring` its shared [`TermCommandRing`].
     pub fn new(
         providers: Option<ProviderSet>,
         executing_node: String,
         workdir_root: PathBuf,
         ring: TermRing,
+        cmd_ring: TermCommandRing,
     ) -> Self {
         Self(Arc::new(Inner {
             providers,
             executing_node,
             workdir_root,
             ring,
+            cmd_ring,
             sessions: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
         }))
@@ -293,7 +458,11 @@ impl TerminalSessions {
     /// create a session for `agent`, spawning its interactive TUI on a pty.
     /// Reserves a slot against the cap BEFORE the spawn await so concurrent
     /// creates can't both slip past a stale count.
-    pub async fn create(&self, agent: &str) -> Result<CreatedSession, TermError> {
+    pub async fn create(
+        &self,
+        agent: &str,
+        mode: SessionMode,
+    ) -> Result<CreatedSession, TermError> {
         let inner = &self.0;
         let Some(providers) = inner.providers.as_ref() else {
             tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "session create refused");
@@ -305,7 +474,7 @@ impl TerminalSessions {
             tracing::warn!(target: "ducktape::term", reason = "at_capacity", cap = MAX_TERM_SESSIONS, "session create refused");
             return Err(TermError::AtCapacity);
         }
-        match self.spawn(providers, agent).await {
+        match self.spawn(providers, agent, mode).await {
             Ok(created) => Ok(created),
             Err(err) => {
                 inner.active.fetch_sub(1, Ordering::SeqCst);
@@ -316,7 +485,12 @@ impl TerminalSessions {
 
     /// resolve the provider, build the run context, spawn the pty session, and
     /// register it + its pump. The reservation is held by the caller.
-    async fn spawn(&self, providers: &ProviderSet, agent: &str) -> Result<CreatedSession, TermError> {
+    async fn spawn(
+        &self,
+        providers: &ProviderSet,
+        agent: &str,
+        mode: SessionMode,
+    ) -> Result<CreatedSession, TermError> {
         let provider = providers.resolve(agent).map_err(|detail| {
             tracing::warn!(target: "ducktape::term", reason = "unknown_agent", agent, "session create refused");
             TermError::Resolve(detail)
@@ -334,14 +508,23 @@ impl TerminalSessions {
             portable: true,
             ..Default::default()
         };
-        let session = provider.spawn_interactive(&ctx).await.map_err(|detail| {
-            tracing::warn!(target: "ducktape::term", reason = "spawn_failed", agent, "interactive spawn failed");
-            TermError::Spawn(detail)
-        })?;
+        // a Shared session runs the restricted (read-only, non-prompting) argv;
+        // a Single session runs the full solo TUI.
+        let restricted = mode == SessionMode::Shared;
+        let session = provider
+            .spawn_interactive(&ctx, restricted)
+            .await
+            .map_err(|detail| {
+                tracing::warn!(target: "ducktape::term", reason = "spawn_failed", agent, mode = ?mode, "interactive spawn failed");
+                TermError::Spawn(detail)
+            })?;
         let session = Arc::new(session);
         // dropping `cancel_tx` (when the entry leaves the map) cancels the
         // reaper; holding it in the map keeps the ceiling armed for the session.
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        // the ordered command lane. `cmd_tx` lives in the map entry (its only
+        // long-lived sender), so `finish` dropping the entry ends the consumer.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         self.0
             .sessions
             .lock()
@@ -350,12 +533,19 @@ impl TerminalSessions {
                 id.clone(),
                 Live {
                     session: session.clone(),
+                    mode,
+                    cmd_tx,
                     _reaper_cancel: cancel_tx,
                 },
             );
-        self.spawn_pump(id.clone(), session);
+        self.spawn_pump(id.clone(), session.clone());
+        // the ordered command lane exists only for a Shared session; a Single
+        // session drives the pty with raw keystrokes (no lane, no consumer).
+        if mode == SessionMode::Shared {
+            self.spawn_command_consumer(id.clone(), session, cmd_rx);
+        }
         self.spawn_reaper(id.clone(), cancel_rx);
-        tracing::info!(target: "ducktape::term", session = %id, agent, "session_created");
+        tracing::info!(target: "ducktape::term", session = %id, agent, mode = ?mode, "session_created");
         Ok(CreatedSession {
             topic: topic(&id),
             session_id: id,
@@ -393,6 +583,41 @@ impl TerminalSessions {
         });
     }
 
+    /// the serial command consumer: the total order. One task per session,
+    /// spawned at create alongside the pump. It drains the session's ordered
+    /// command lane FIFO, stamps each command with a monotonic per-session `seq`
+    /// (via the shared command-log ring, starting at 1), records `(seq, origin,
+    /// text)` to that ring — which wakes `term-cmd:<id>` subscribers — THEN
+    /// feeds the command grain (`text` + `\r`, a submitted line) to the pty.
+    /// Serial processing IS the total order; one host feeds the pty. Exits the
+    /// moment every sender drops (the `Live` entry left the map via `finish`),
+    /// the same drop-driven teardown the pump takes on EOF — so it can never
+    /// outlive a reused id and never leaks.
+    fn spawn_command_consumer(
+        &self,
+        id: String,
+        session: Arc<InteractiveSession>,
+        mut rx: mpsc::UnboundedReceiver<Command>,
+    ) {
+        let cmd_ring = self.0.cmd_ring.clone();
+        tokio::spawn(async move {
+            while let Some(Command { origin, text }) = rx.recv().await {
+                // record + wake subscribers BEFORE the pty write: the ordered,
+                // attributed log is the shared object; the pty write is its
+                // effect. Never log the command text — it can carry secrets.
+                let seq = cmd_ring.append(&id, &origin, &text);
+                tracing::debug!(target: "ducktape::term", session = %id, seq, %origin, "term_command");
+                if let Err(err) = session.write_all(text.as_bytes()).await {
+                    tracing::warn!(target: "ducktape::term", session = %id, reason = "write_failed", error = %err, "term command dropped");
+                    continue;
+                }
+                if let Err(err) = session.write_all(b"\r").await {
+                    tracing::warn!(target: "ducktape::term", session = %id, reason = "write_failed", error = %err, "term command dropped");
+                }
+            }
+        });
+    }
+
     /// arm the hard wall-clock ceiling: after [`MAX_SESSION_LIFETIME`] the
     /// session is force-closed through `finish()` — the SAME teardown path pump
     /// EOF and explicit close take, so the slot still releases exactly once and
@@ -420,6 +645,47 @@ impl TerminalSessions {
             session.close().await;
             tracing::info!(target: "ducktape::term", session = %id, "session_ended");
         }
+    }
+
+    /// the `CommandSource` entry point: enqueue an ordered, origin-attributed
+    /// command for `session`. The ws calls this now (from `TermCommand`);
+    /// consensus (PR 2) will. The per-session serial consumer assigns the total
+    /// order and feeds the pty — this only appends to the FIFO lane. An unknown
+    /// session id is a no-op + `warn` (`unknown_session`), exactly like the
+    /// input/resize handlers; never a panic. Never logs the command text.
+    pub fn enqueue_command(&self, session: &str, origin: String, text: String) {
+        // read the mode + sender under the lock, drop the guard before sending
+        // (send is sync and non-blocking, but this keeps the manager's
+        // no-work-under-lock discipline uniform).
+        let found = self
+            .0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .get(session)
+            .map(|live| (live.mode, live.cmd_tx.clone()));
+        let Some((mode, tx)) = found else {
+            tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term command dropped");
+            return;
+        };
+        // commands are the SHARED-session path; a Single session has no lane.
+        if mode != SessionMode::Shared {
+            tracing::warn!(target: "ducktape::term", session = %session, reason = "command_on_single", "term command dropped");
+            return;
+        }
+        // a send failure means the consumer already exited (a teardown race with
+        // finish()); the session is ending, so the drop is benign.
+        let _ = tx.send(Command { origin, text });
+    }
+
+    /// the mode a session was created with (for the ws input gates), if live.
+    pub fn mode(&self, id: &str) -> Option<SessionMode> {
+        self.0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .get(id)
+            .map(|live| live.mode)
     }
 
     /// the live session for `id`, if any (for `TermInput`/`TermResize`).
@@ -531,6 +797,10 @@ pub fn backend_from_env() -> SandboxBackend {
 #[derive(Deserialize)]
 pub struct CreateSessionBody {
     pub agent: String,
+    /// `"single"` (default, back-compat) = raw-keystroke solo terminal;
+    /// `"shared"` = ordered `TermCommand` lane.
+    #[serde(default)]
+    pub mode: SessionMode,
 }
 
 /// POST /v1/term/sessions — create an interactive session and return its id +
@@ -547,7 +817,7 @@ pub async fn create_session(
         )
             .into_response();
     };
-    match terminals.create(&body.agent).await {
+    match terminals.create(&body.agent, body.mode).await {
         Ok(created) => (StatusCode::OK, Json(created)).into_response(),
         Err(err) => err.response(),
     }
@@ -608,6 +878,83 @@ mod tests {
             .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
             .0
             .is_empty());
+    }
+
+    // ----- the ordered command-log ring (a focused twin of TermRing) -----
+
+    #[test]
+    fn command_ring_assigns_monotonic_seq_and_catches_up() {
+        let ring = TermCommandRing::default();
+        // the consumer's seq is the ring's next_seq — monotonic, starting at 1.
+        assert_eq!(ring.append("s", "alice", "hello"), 1);
+        assert_eq!(ring.append("s", "bob", "world"), 2);
+        // a fresh subscriber (cursor 0) replays both commands in order.
+        let (rows, floor) = ring.read_after("s", 0, 64);
+        assert_eq!(floor, 0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (1, "alice".to_string(), "hello".to_string()));
+        assert_eq!(rows[1], (2, "bob".to_string(), "world".to_string()));
+        // a caught-up reader sees nothing new.
+        assert!(ring.read_after("s", 2, 64).0.is_empty());
+        // an unknown session is empty, never a panic.
+        assert!(ring.read_after("nope", 0, 64).0.is_empty());
+    }
+
+    #[test]
+    fn command_ring_records_origin_and_text_in_order_then_lags_on_eviction() {
+        let ring = TermCommandRing::default();
+        // the ordered, attributed log preserves each (seq, origin, text) grain.
+        for i in 0..TERM_CMD_RING_MAX_COMMANDS {
+            assert_eq!(
+                ring.append("s", &format!("m{i}"), &format!("cmd-{i}")),
+                (i + 1) as u64
+            );
+        }
+        ring.append("s", "over", "cmd-overflow"); // forces eviction of the first
+        let (rows, floor) = ring.read_after("s", 0, TERM_CMD_RING_MAX_COMMANDS + 8);
+        assert_eq!(floor, 1, "the evicted command's seq is the reported floor");
+        assert_eq!(rows.len(), TERM_CMD_RING_MAX_COMMANDS);
+        assert_eq!(
+            rows[0],
+            (2, "m1".to_string(), "cmd-1".to_string()),
+            "the oldest survivor after eviction, attribution intact"
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last.0, (TERM_CMD_RING_MAX_COMMANDS + 1) as u64);
+        assert_eq!(last.1, "over");
+        assert_eq!(last.2, "cmd-overflow");
+    }
+
+    #[test]
+    fn command_ring_evicts_least_recently_touched_sessions() {
+        let ring = TermCommandRing::default();
+        for i in 0..=TERM_RING_MAX_SESSIONS {
+            ring.append(&format!("s{i}"), "m", "x");
+        }
+        // the first-touched session aged out; the newest survives.
+        assert!(ring.read_after("s0", 0, 8).0.is_empty());
+        assert!(!ring
+            .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn enqueue_command_on_an_unknown_session_is_a_no_op() {
+        // no sandbox providers → no live session can exist; enqueue must warn +
+        // no-op, never panic (mirrors the input/resize unknown-session
+        // discipline) and record nothing. The live enqueue→consumer→pty path
+        // needs a real InteractiveSession (private ctor, real pty) and is
+        // exercised by the parent's live podman check.
+        let terminals = TerminalSessions::new(
+            None,
+            "node".into(),
+            PathBuf::from("term-sessions"),
+            TermRing::default(),
+            TermCommandRing::default(),
+        );
+        terminals.enqueue_command("nope", "alice".into(), "ls".into());
+        assert!(terminals.0.cmd_ring.read_after("nope", 0, 8).0.is_empty());
     }
 
     // The reaper drives `finish()` (the exactly-once slot release) once its

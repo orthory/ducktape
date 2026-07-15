@@ -199,6 +199,7 @@ impl CliProvider {
     pub(crate) async fn spawn_interactive_session(
         &self,
         ctx: &RunContext,
+        restricted: bool,
     ) -> Result<InteractiveSession, String> {
         if matches!(self.backend, SandboxBackend::Direct) {
             return Err(format!(
@@ -213,6 +214,23 @@ impl CliProvider {
                 self.spec.tag
             ));
         };
+        // a restricted (shared/command-lane) session runs the read-only,
+        // non-prompting argv; a capability that declares none does not support
+        // shared mode, and we refuse rather than run it unrestricted.
+        let base = if restricted {
+            match interactive.restricted_args.as_deref() {
+                Some(a) => a,
+                None => {
+                    return Err(format!(
+                        "{}: this capability declares no restricted [interactive] argv \
+                         (shared/command-lane session unsupported)",
+                        self.spec.tag
+                    ));
+                }
+            }
+        } else {
+            &interactive.args
+        };
         let workdir = self.ensure_writable_workdir(ctx)?;
         let workdir = canonical_mount_path(&workdir, "sandbox workdir")?;
         let config_home = self.prepare_config_home(&workdir, ctx)?;
@@ -221,12 +239,7 @@ impl CliProvider {
             config_home: config_home.as_deref(),
             broker: broker.as_ref().map(|b| &b.endpoint),
         };
-        let args = interactive_argv(
-            &interactive.args,
-            &auth,
-            &workdir,
-            self.spec.isolation.broker,
-        );
+        let args = interactive_argv(base, &auth, &workdir, self.spec.isolation.broker);
 
         match &self.backend {
             SandboxBackend::Podman { image } => {
@@ -536,7 +549,7 @@ mod tests {
             env: std::iter::once(("TERM".to_string(), "xterm-256color".to_string())).collect(),
             ..Default::default()
         };
-        let session = match provider.spawn_interactive(&ctx).await {
+        let session = match provider.spawn_interactive(&ctx, false).await {
             Ok(s) => s,
             Err(e) => panic!("spawn_interactive(codex) failed: {e}"),
         };
@@ -717,7 +730,7 @@ mod tests {
         let Some(set) = live_podman_set() else { return };
         let provider = set.resolve("codex").expect("codex provider");
         let session = provider
-            .spawn_interactive(&live_ctx("verify-codex-tui"))
+            .spawn_interactive(&live_ctx("verify-codex-tui"), false)
             .await
             .expect("spawn codex TUI");
         let raw = drive_tui(&session, TURN_PROMPT).await;
@@ -736,7 +749,7 @@ mod tests {
         let Some(set) = live_podman_set() else { return };
         let provider = set.resolve("claude").expect("claude provider");
         let session = provider
-            .spawn_interactive(&live_ctx("verify-claude-tui"))
+            .spawn_interactive(&live_ctx("verify-claude-tui"), false)
             .await
             .expect("spawn claude TUI");
         let raw = drive_tui(&session, TURN_PROMPT).await;
@@ -745,6 +758,28 @@ mod tests {
         assert!(
             letters_contains(&raw, TURN_REPLY),
             "claude TUI never rendered the model reply ({TURN_REPLY})"
+        );
+    }
+
+    /// LIVE: a SHARED (restricted) codex session spawns under the read-only,
+    /// never-ask argv and STILL renders a plain model reply — proving the
+    /// restricted argv is accepted by the real binary and that read-only does
+    /// not gag ordinary conversation (only writes/exec). `#[ignore]` — quota.
+    #[tokio::test]
+    #[ignore = "live interactive turn: spends codex quota"]
+    async fn codex_shared_restricted_model_turn() {
+        let Some(set) = live_podman_set() else { return };
+        let provider = set.resolve("codex").expect("codex provider");
+        let session = provider
+            .spawn_interactive(&live_ctx("verify-codex-shared"), true)
+            .await
+            .expect("spawn restricted codex TUI");
+        let raw = drive_tui(&session, TURN_PROMPT).await;
+        session.close().await;
+        eprintln!("=== codex RESTRICTED TUI transcript (deansi) ===\n{}\n=== end ===", deansi(&raw));
+        assert!(
+            letters_contains(&raw, TURN_REPLY),
+            "restricted codex TUI never rendered the model reply ({TURN_REPLY})"
         );
     }
 

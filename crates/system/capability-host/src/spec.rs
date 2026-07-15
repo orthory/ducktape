@@ -161,6 +161,15 @@ pub struct CapabilitySpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveSpec {
     pub args: Vec<String>,
+    /// argv for a RESTRICTED interactive session (a SHARED, command-lane
+    /// session): read-only + non-prompting, because no single member can answer
+    /// a TUI approval prompt when the session is command-driven, so the CLI must
+    /// never stop to ask AND must be unable to do damage while not asking (codex
+    /// `--sandbox read-only --ask-for-approval never`, claude
+    /// `--permission-mode plan`). `None` = this capability supports only the
+    /// unrestricted (solo) interactive mode; a restricted spawn is then refused
+    /// rather than silently running unrestricted.
+    pub restricted_args: Option<Vec<String>>,
 }
 
 /// where an executor auto-loads its ambient instructions from — a CLOSED set of
@@ -463,6 +472,9 @@ struct RawTools {
 struct RawInteractive {
     #[serde(default)]
     args: Vec<String>,
+    /// argv for the restricted (shared, command-lane) mode; absent = solo-only.
+    #[serde(default)]
+    restricted_args: Option<Vec<String>>,
 }
 
 /// splice `[tools].args` into every argv this spec can produce, ONCE, at load
@@ -634,7 +646,10 @@ impl CapabilitySpec {
                 rw_dirs,
                 isolation,
                 context,
-                interactive: raw.interactive.map(|i| InteractiveSpec { args: i.args }),
+                interactive: raw.interactive.map(|i| InteractiveSpec {
+                    args: i.args,
+                    restricted_args: i.restricted_args,
+                }),
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),
@@ -765,6 +780,27 @@ format = "text"
         let tags: std::collections::BTreeSet<&str> =
             specs.iter().map(|s| s.tag.as_str()).collect();
         assert_eq!(tags.len(), specs.len(), "embedded tags are unique");
+    }
+
+    #[test]
+    fn interactive_restricted_args_round_trip_and_default_to_none() {
+        // guards the serde key: a typo (`restricted-args`) would silently leave
+        // it None, making every SHARED session spawn error "unsupported" — a
+        // vacuous pass. A plain [interactive] (no restricted key) is solo-only.
+        let solo = spec_toml("solo") + "\n[interactive]\nargs = []\n";
+        let spec = CapabilitySpec::parse(&solo, "t").expect("solo interactive parses");
+        let i = spec.interactive.expect("[interactive] present");
+        assert_eq!(i.args, Vec::<String>::new());
+        assert_eq!(i.restricted_args, None, "no key ⇒ solo-only");
+
+        let shared = spec_toml("shared")
+            + "\n[interactive]\nargs = []\nrestricted_args = [\"-s\", \"read-only\"]\n";
+        let spec = CapabilitySpec::parse(&shared, "t").expect("shared interactive parses");
+        let i = spec.interactive.expect("[interactive] present");
+        assert_eq!(
+            i.restricted_args.as_deref(),
+            Some(["-s".to_string(), "read-only".to_string()].as_slice()),
+        );
     }
 
     #[test]

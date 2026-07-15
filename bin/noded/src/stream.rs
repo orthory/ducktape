@@ -62,6 +62,20 @@ pub enum ClientMsg {
         #[cfg_attr(test, ts(type = "number"))]
         rows: u16,
     },
+    /// a submitted COMMAND for an interactive session — the ordered "command
+    /// grain" (a prompt / line), not raw keystrokes. `origin` is the
+    /// caller-supplied attribution (the app passes a member label), stored
+    /// verbatim and UNTRUSTED until consensus signs it (PR 2). Gated exactly
+    /// like [`Self::TermInput`] (the
+    /// connection must be subscribed to the session's `term:<id>` topic); the
+    /// session's serial consumer assigns the total order and feeds `text` +
+    /// Enter to the pty. This is the `CommandSource` seam consensus (PR 2) will
+    /// drive; `TermInput` stays for the solo raw-keystroke case.
+    TermCommand {
+        session: String,
+        text: String,
+        origin: String,
+    },
 }
 
 // Serialize-only: the node SENDS frames and never parses its own, so there is
@@ -98,6 +112,19 @@ pub enum ServerFrame {
     TermChunk {
         topic: String,
         item: String,
+    },
+    /// one entry of an interactive session's ordered, attributed command log on
+    /// a `term-cmd:<session>` topic: the total-order `seq`, the command's
+    /// `origin` (attribution), and its `text` (the submitted line). Distinct
+    /// from the raw-output [`Self::TermChunk`] — this is the
+    /// shared-conversation-object view. Delivered + caught up like a run-output
+    /// tail: a `seq` cursor, replayed on (re)subscribe.
+    TermCommandLog {
+        topic: String,
+        #[cfg_attr(test, ts(type = "number"))]
+        seq: u64,
+        origin: String,
+        text: String,
     },
     Tail {
         topic: String,
@@ -227,6 +254,10 @@ pub struct StreamHub {
     /// same way `run_output` is: the terminal manager appends to it and the ws
     /// catch-up path replays it for `term:<session>` subscribers.
     terminals: crate::term::TermRing,
+    /// per-session ordered command log — a focused twin of `terminals`: the
+    /// session's serial command consumer appends `(seq, origin, text)` and the
+    /// ws catch-up path replays it for `term-cmd:<session>` subscribers.
+    term_commands: crate::term::TermCommandRing,
 }
 
 impl StreamHub {
@@ -243,6 +274,7 @@ impl StreamHub {
             logs,
             run_output: RunOutputRegistry::default(),
             terminals: crate::term::TermRing::default(),
+            term_commands: crate::term::TermCommandRing::default(),
         }
     }
 
@@ -268,6 +300,14 @@ impl StreamHub {
     /// ring the ws catch-up replays.
     pub fn terminals(&self) -> crate::term::TermRing {
         self.terminals.clone()
+    }
+
+    /// the interactive-terminal ordered command-log ring. The daemon hands this
+    /// to the [`crate::term::TerminalSessions`] manager so each session's serial
+    /// command consumer appends to the same ring the ws `term-cmd:<session>`
+    /// catch-up replays.
+    pub fn term_commands(&self) -> crate::term::TermCommandRing {
+        self.term_commands.clone()
     }
 
     pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<()> {
@@ -557,6 +597,13 @@ enum TopicState {
         session: String,
         seq: u64,
     },
+    /// an interactive session's ordered command log (`term-cmd:<session>`).
+    /// `seq` is the last emitted command — the same seq-cursor model as `Term`,
+    /// against the command-log ring instead of the output ring.
+    TermCommand {
+        session: String,
+        seq: u64,
+    },
     /// a SNAPSHOT topic: each wakeup re-samples the whole exposition, so the
     /// cursor (the last sample's `time_ms`) is bookkeeping, never a resume
     /// point — there is no backlog to replay and the topic never lags.
@@ -569,9 +616,10 @@ impl TopicState {
     fn cursor(&self) -> String {
         match self {
             Self::Module { cursor, .. } | Self::FilesWatch { cursor } => cursor.clone(),
-            Self::Logs { seq } | Self::RunOutput { seq, .. } | Self::Term { seq, .. } => {
-                seq.to_string()
-            }
+            Self::Logs { seq }
+            | Self::RunOutput { seq, .. }
+            | Self::Term { seq, .. }
+            | Self::TermCommand { seq, .. } => seq.to_string(),
             Self::Metrics { sampled_ms } => sampled_ms.to_string(),
         }
     }
@@ -610,6 +658,7 @@ enum Wake {
     Logs,
     RunOutput,
     Term,
+    TermCommand,
     Tick,
     All,
 }
@@ -622,6 +671,7 @@ impl TopicState {
             Wake::Logs => matches!(self, Self::Logs { .. }),
             Wake::RunOutput => matches!(self, Self::RunOutput { .. }),
             Wake::Term => matches!(self, Self::Term { .. }),
+            Wake::TermCommand => matches!(self, Self::TermCommand { .. }),
             Wake::Tick => matches!(self, Self::Metrics { .. }),
         }
     }
@@ -633,6 +683,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
     let mut log_rx = hub.log_ring().subscribe();
     let mut run_rx = hub.run_output().subscribe();
     let mut term_rx = hub.terminals().subscribe();
+    let mut term_cmd_rx = hub.term_commands().subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
     let mut topics = BTreeMap::new();
 
@@ -652,6 +703,9 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             }
                             Ok(ClientMsg::TermResize { session, cols, rows }) => {
                                 handle_term_resize(&handle, &topics, &session, cols, rows);
+                            }
+                            Ok(ClientMsg::TermCommand { session, text, origin }) => {
+                                handle_term_command(&handle, &topics, &session, origin, text);
                             }
                             Ok(msg) => {
                                 let frames = handle_client_msg(&handle, &mut topics, msg);
@@ -724,6 +778,14 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                     return;
                 }
             }
+            changed = term_cmd_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::TermCommand).await {
+                    return;
+                }
+            }
         }
     }
 }
@@ -744,9 +806,12 @@ fn handle_client_msg(
             }
             Vec::new()
         }
-        // handled inline in `stream_session` (async, and off the topic set), so
-        // they never reach here — but the match stays exhaustive.
-        ClientMsg::TermInput { .. } | ClientMsg::TermResize { .. } => Vec::new(),
+        // handled inline in `stream_session` (they act on the session manager,
+        // off this connection's topic set), so they never reach here — but the
+        // match stays exhaustive.
+        ClientMsg::TermInput { .. }
+        | ClientMsg::TermResize { .. }
+        | ClientMsg::TermCommand { .. } => Vec::new(),
     }
 }
 
@@ -785,6 +850,12 @@ async fn handle_term_input(
         tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
         return;
     };
+    // raw keystrokes are the SINGLE-session path only. A shared session refuses
+    // them so nothing bypasses its ordered command lane (drive it with TermCommand).
+    if terminals.mode(session) != Some(crate::term::SessionMode::Single) {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
+        return;
+    }
     let Ok(bytes) = STANDARD.decode(data_b64) else {
         tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
         return;
@@ -818,6 +889,31 @@ fn handle_term_resize(
     if let Err(err) = live.resize(cols, rows) {
         tracing::warn!(target: "ducktape::term", session = %session, reason = "resize_failed", error = %err, "term resize dropped");
     }
+}
+
+/// enqueue a submitted COMMAND onto a session's ordered command lane (the
+/// `CommandSource` seam). Gated exactly like [`handle_term_input`]: the
+/// connection must be subscribed to the session's `term:<id>` output topic
+/// (`term_entitled`, M6). Refused (no-op + `warn`) when unentitled or the
+/// terminal plane is absent; an unknown session id is warned inside
+/// `enqueue_command`. Never logs the command text (it can carry secrets); the
+/// serial consumer assigns the total order and feeds the pty.
+fn handle_term_command(
+    handle: &NodeHandle,
+    topics: &BTreeMap<String, TopicState>,
+    session: &str,
+    origin: String,
+    text: String,
+) {
+    if !term_entitled(topics, session) {
+        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term command dropped");
+        return;
+    }
+    let Some(terminals) = handle.terminals() else {
+        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term command dropped");
+        return;
+    };
+    terminals.enqueue_command(session, origin, text);
 }
 
 fn subscribe_topics(
@@ -897,6 +993,22 @@ fn prepare_topic(
         return Ok((
             TopicState::RunOutput {
                 id: id.to_string(),
+                seq,
+            },
+            None,
+        ));
+    }
+    if let Some(session) = topic.strip_prefix("term-cmd:") {
+        // the ordered command log — like `term:`, any session id subscribes
+        // (unknown/evicted → empty catch-up, never an error). Checked before
+        // `term:` (non-colliding prefixes, but clearer this way).
+        let seq = match resume {
+            Some(cursor) => parse_seq_cursor(topic, cursor)?,
+            None => 0,
+        };
+        return Ok((
+            TopicState::TermCommand {
+                session: session.to_string(),
                 seq,
             },
             None,
@@ -1017,6 +1129,9 @@ fn catch_up_topic(
         TopicState::Logs { seq } => catch_up_logs(topic, seq, &hub.log_ring()),
         TopicState::RunOutput { id, seq } => catch_up_run_output(topic, id, seq, &hub.run_output()),
         TopicState::Term { session, seq } => catch_up_term(topic, session, seq, &hub.terminals()),
+        TopicState::TermCommand { session, seq } => {
+            catch_up_term_command(topic, session, seq, &hub.term_commands())
+        }
         // routed to catch_up_metrics by the caller (it needs the actor lane,
         // an await this sync path cannot make) — nothing owed here.
         TopicState::Metrics { .. } => CatchUpResult::keep(Vec::new()),
@@ -1276,6 +1391,48 @@ fn catch_up_term(topic: &str, session: &str, seq: &mut u64, ring: &crate::term::
             frames.push(ServerFrame::TermChunk {
                 topic: topic.to_string(),
                 item,
+            });
+        }
+        if row_count < STREAM_CATCHUP_BUDGET {
+            break;
+        }
+    }
+    CatchUpResult::keep(frames)
+}
+
+/// replay a session's ordered command log the way `catch_up_term` replays its
+/// output ring: a `Lagged` frame if the reader fell behind an eviction, then
+/// every buffered command after the cursor as a `TermCommandLog` frame — the
+/// ordered, attributed view of the shared session. Emits nothing for an
+/// unknown/evicted session (the ring read returns empty) — never an error.
+fn catch_up_term_command(
+    topic: &str,
+    session: &str,
+    seq: &mut u64,
+    ring: &crate::term::TermCommandRing,
+) -> CatchUpResult {
+    let mut frames = Vec::new();
+    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
+    if *seq < floor {
+        *seq = floor;
+        frames.push(ServerFrame::Lagged {
+            topic: topic.to_string(),
+            cursor: floor.to_string(),
+        });
+    }
+    loop {
+        let (rows, _) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
+        if rows.is_empty() {
+            break;
+        }
+        let row_count = rows.len();
+        for (cmd_seq, origin, text) in rows {
+            *seq = cmd_seq;
+            frames.push(ServerFrame::TermCommandLog {
+                topic: topic.to_string(),
+                seq: cmd_seq,
+                origin,
+                text,
             });
         }
         if row_count < STREAM_CATCHUP_BUDGET {
@@ -1696,6 +1853,37 @@ mod tests {
     }
 
     #[test]
+    fn term_command_topic_subscribes_and_replays_the_ordered_attributed_log() {
+        // any session id subscribes to its command log (like `term:`); a fresh
+        // subscribe starts at cursor 0 and needs no index store.
+        let (state, lagged) =
+            prepare_topic("term-cmd:abc", None, None).expect("term-cmd topic subscribes");
+        assert!(lagged.is_none());
+        assert_eq!(state.cursor(), "0");
+        assert!(matches!(state, TopicState::TermCommand { .. }));
+
+        let ring = crate::term::TermCommandRing::default();
+        ring.append("s", "alice", "list files");
+        ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
+        let mut seq = 0u64;
+        let result = catch_up_term_command("term-cmd:s", "s", &mut seq, &ring);
+        assert!(!result.drop_topic);
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(seq, 2, "the cursor advances past the replayed commands");
+        // ordered + attributed: seq 1 first, carrying its origin + text.
+        let json = serde_json::to_value(&result.frames[0]).expect("frame json");
+        assert_eq!(json["type"], "termCommandLog");
+        assert_eq!(json["topic"], "term-cmd:s");
+        assert_eq!(json["seq"], 1);
+        assert_eq!(json["origin"], "alice");
+        assert_eq!(json["text"], "list files");
+        // a caught-up reader sees nothing new.
+        assert!(catch_up_term_command("term-cmd:s", "s", &mut seq, &ring)
+            .frames
+            .is_empty());
+    }
+
+    #[test]
     fn term_input_requires_a_subscription_to_the_session_topic() {
         let mut topics: BTreeMap<String, TopicState> = BTreeMap::new();
         // a connection that never subscribed is not entitled to drive a session.
@@ -1769,15 +1957,28 @@ mod tests {
             seq: 0,
         };
         let metrics = TopicState::Metrics { sampled_ms: 0 };
+        let term = TopicState::Term {
+            session: "s".into(),
+            seq: 0,
+        };
+        let term_cmd = TopicState::TermCommand {
+            session: "s".into(),
+            seq: 0,
+        };
         assert!(module.wakes_on(Wake::Block) && files.wakes_on(Wake::Block));
         assert!(!logs.wakes_on(Wake::Block) && !run.wakes_on(Wake::Block));
         assert!(logs.wakes_on(Wake::Logs) && !module.wakes_on(Wake::Logs));
         assert!(run.wakes_on(Wake::RunOutput) && !files.wakes_on(Wake::RunOutput));
+        // the two terminal planes are distinct wake sources: an output append
+        // never re-scans the command log and vice versa.
+        assert!(term.wakes_on(Wake::Term) && !term.wakes_on(Wake::TermCommand));
+        assert!(term_cmd.wakes_on(Wake::TermCommand) && !term_cmd.wakes_on(Wake::Term));
+        assert!(!run.wakes_on(Wake::Term) && !run.wakes_on(Wake::TermCommand));
         // metrics is time-driven ONLY: a block/log/run wakeup never re-samples
         // it, and no other topic class re-scans on the heartbeat tick.
         assert!(metrics.wakes_on(Wake::Tick) && !metrics.wakes_on(Wake::Block));
         assert!(!metrics.wakes_on(Wake::Logs) && !metrics.wakes_on(Wake::RunOutput));
-        for state in [&module, &files, &logs, &run] {
+        for state in [&module, &files, &logs, &run, &term, &term_cmd] {
             assert!(state.wakes_on(Wake::All));
             assert!(!state.wakes_on(Wake::Tick));
         }

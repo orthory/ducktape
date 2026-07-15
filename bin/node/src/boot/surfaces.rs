@@ -213,6 +213,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             capability_host::execution_node_id(&node_key),
             storage.join("term-sessions"),
             stream_hub.terminals(),
+            stream_hub.term_commands(),
         ))
     } else {
         http_handle
