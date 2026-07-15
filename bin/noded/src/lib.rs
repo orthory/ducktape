@@ -72,6 +72,10 @@ pub use handle::{NodeCommand, NodeHandle};
 
 mod module_code;
 pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
+// the node-local, off-chain interactive terminal-session plane. public so
+// `main.rs` can build the manager and wire it onto the handle.
+pub mod term;
+pub use term::{TermRing, TerminalSessions};
 // the derived-index tier: store construction, rebuilds, /v1/index/* + /v1/blocks.
 mod index;
 pub use index::{
@@ -597,6 +601,15 @@ pub fn router(handle: NodeHandle) -> Router {
         // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
         // managed checkouts under the injected root: create, commit (409 on a
         // structured conflict), delete. `None` root → 503.
+        // ---- interactive terminal sessions (node-local, off-chain) ----
+        // create returns {sessionId, topic}; output rides the ws `term:<id>`
+        // topic. same trusted-local gate as the other mutating /v1 routes (see
+        // term.rs). close is idempotent.
+        .route("/v1/term/sessions", post(term::create_session))
+        .route(
+            "/v1/term/sessions/{id}/close",
+            post(term::close_session),
+        )
         .route("/v1/fs/workspaces", post(workspaces::create_workspace))
         .route(
             "/v1/fs/workspaces/{id}/commit",

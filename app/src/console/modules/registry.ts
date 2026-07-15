@@ -15,6 +15,7 @@ import { PagesView } from "../views/pages/PagesView";
 import { MetricsView } from "../views/metrics/MetricsView";
 import { SandboxView } from "../views/sandbox/SandboxView";
 import { StatusView } from "../views/status/StatusView";
+import { TerminalView } from "../views/terminal/TerminalView";
 import type { AppModule, ModuleFilter, NavSection } from "./module-def";
 import { isClientMode, nodeControlAvailable } from "../store/state";
 import type { ConsoleState } from "../store/state";
@@ -44,7 +45,8 @@ export const MODULES: AppModule[] = [
   { id: "gateway", nav: { icon: "link", label: "Gateway", order: 1, section: "operator" }, Screen: GatewayView },
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 2, section: "operator" }, Screen: ModulesView },
   { id: "sandbox", nav: { icon: "sandbox", label: "Sandbox", order: 3, section: "operator" }, Screen: SandboxView },
-  { id: "metrics", nav: { icon: "metrics", label: "Metrics", order: 4, section: "operator" }, Screen: MetricsView },
+  { id: "terminal", nav: { icon: "code", label: "Terminal", order: 4, section: "operator" }, Screen: TerminalView },
+  { id: "metrics", nav: { icon: "metrics", label: "Metrics", order: 5, section: "operator" }, Screen: MetricsView },
 ];
 
 export const moduleById = (id: string): AppModule | undefined =>

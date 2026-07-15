@@ -65,7 +65,7 @@ fn wrap_podman(
     limits: &BTreeMap<String, u64>,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
-        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None,
+        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false, false,
     )
 }
 
@@ -84,6 +84,8 @@ pub(crate) fn wrap_podman_managed(
     limits: &BTreeMap<String, u64>,
     cidfile: &Path,
     labels: &[String],
+    tty: bool,
+    private_net: bool,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
         image,
@@ -95,6 +97,8 @@ pub(crate) fn wrap_podman_managed(
         rw_dirs,
         limits,
         Some((cidfile, labels)),
+        tty,
+        private_net,
     )
 }
 
@@ -109,14 +113,41 @@ fn wrap_podman_inner(
     rw_dirs: &[PathBuf],
     limits: &BTreeMap<String, u64>,
     control: Option<(&Path, &[String])>,
+    tty: bool,
+    private_net: bool,
 ) -> (PathBuf, Vec<String>) {
-    // -i keeps stdin open: the prompt is fed on the child's stdin.
-    let mut argv: Vec<String> = vec![
-        "run".into(),
-        "--rm".into(),
-        "--network=host".into(),
-        "-i".into(),
-    ];
+    let mut argv: Vec<String> = vec!["run".into(), "--rm".into()];
+    if private_net {
+        // A PRIVATE netns via slirp4netns: the container gets its OWN loopback,
+        // so it can no longer scan the host's — the lateral reach `--network=host`
+        // gave, letting a member hit other runs' brokers / the node RPC. slirp4netns
+        // auto-adds `host.containers.internal` (→ the host's routable IP), which is
+        // how the child reaches this run's broker (bound to a routable interface;
+        // base_url = host.containers.internal — see `broker::Reachability`).
+        //
+        // slirp4netns is named EXPLICITLY, not left to podman's default: the
+        // default is pasta, which a host may not have installed (verified: a box
+        // with only slirp4netns fails `podman run` with the default). slirp4netns
+        // is the widely-available backend and reachability is verified with it.
+        //
+        // STILL DEFERRED (needs more podman-host work): a full OUTBOUND egress
+        // allowlist (block the internet, allow only the broker + node RPC) — a
+        // private netns alone still NATs outbound. Off by default (enabled per node
+        // by DUCKTAPE_SANDBOX_PRIVATE_NET) so nothing regresses meanwhile.
+        argv.push("--network=slirp4netns".into());
+    } else {
+        // `--network=host`: the container shares the host netns, so the broker /
+        // MCP on 127.0.0.1 are reachable at the address the argv names. The
+        // historical default; kept until private_net is validated on a podman host.
+        argv.push("--network=host".into());
+    }
+    // -i keeps stdin open (the prompt is fed on the child's stdin). -t adds a
+    // container-side pty for an interactive session — the host attaches podman's
+    // stdio to a pty master and podman relays terminal size/SIGWINCH into it.
+    argv.push("-i".into());
+    if tty {
+        argv.push("-t".into());
+    }
     if let Some((cidfile, labels)) = control {
         argv.extend(["--cidfile".into(), cidfile.display().to_string()]);
         for label in labels {
@@ -286,6 +317,10 @@ pub(crate) fn tart_plan(
     envs: &[(String, String)],
     ro_paths: &[PathBuf],
     rw_dirs: &[PathBuf],
+    // an interactive (pty) session `exec`s the TUI as the ssh session's
+    // foreground process and skips the batch tail (status capture +
+    // workspace rsync-back) — a terminal session produces no artifact to sync.
+    interactive: bool,
 ) -> Result<TartPlan, String> {
     let bin_dir = bin
         .parent()
@@ -425,17 +460,23 @@ pub(crate) fn tart_plan(
         "cd {}",
         shell_quote(&guest_workdir.display().to_string())
     ));
-    setup.push("set +e".into());
-    setup.push(command);
-    setup.push("status=$?".into());
-    // Tart virtiofs rejects mtime updates on the shared root (-O).
-    setup.push(format!(
-        "rsync -aO --delete {}/ {}/ >/dev/null 2>&1 || sync_status=$?",
-        shell_quote(&guest_workdir.display().to_string()),
-        shell_quote(&mounted_workdir.display().to_string())
-    ));
-    setup.push("if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi".into());
-    setup.push("exit ${sync_status:-0}".into());
+    if interactive {
+        // the TUI replaces the shell, so the pty carries it directly and its
+        // exit is the ssh session's. no status capture, no rsync-back.
+        setup.push(format!("exec {command}"));
+    } else {
+        setup.push("set +e".into());
+        setup.push(command);
+        setup.push("status=$?".into());
+        // Tart virtiofs rejects mtime updates on the shared root (-O).
+        setup.push(format!(
+            "rsync -aO --delete {}/ {}/ >/dev/null 2>&1 || sync_status=$?",
+            shell_quote(&guest_workdir.display().to_string()),
+            shell_quote(&mounted_workdir.display().to_string())
+        ));
+        setup.push("if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi".into());
+        setup.push("exit ${sync_status:-0}".into());
+    }
 
     Ok(TartPlan {
         vm: vm.to_string(),
@@ -444,12 +485,15 @@ pub(crate) fn tart_plan(
     })
 }
 
-pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str) -> Vec<String> {
+pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str, tty: bool) -> Vec<String> {
+    // -T for a headless run (no pty); -tt forces a remote pty for an interactive
+    // session, so the guest TUI sees a terminal and SIGWINCH/size relay works.
+    let pty_flag = if tty { "-tt" } else { "-T" };
     vec![
         "-p".into(),
         "admin".into(),
         "ssh".into(),
-        "-T".into(),
+        pty_flag.into(),
         "-o".into(),
         "StrictHostKeyChecking=no".into(),
         "-o".into(),
@@ -548,6 +592,8 @@ mod tests {
             &BTreeMap::new(),
             cidfile,
             &labels,
+            false,
+            false,
         );
         let s = argv.join(" ");
         assert!(
@@ -565,6 +611,79 @@ mod tests {
                 && !s.contains("-e /host/ducktape")
                 && !s.contains("/host/ducktape/provider-runs/7.cid:"),
             "cidfile must never be mounted or exported: {s}"
+        );
+    }
+
+    #[test]
+    fn tty_flag_is_added_only_for_interactive_sessions() {
+        let cidfile = Path::new("/host/x.cid");
+        let labels: Vec<String> = vec![];
+        let build = |tty: bool| {
+            wrap_podman_managed(
+                "img",
+                Path::new("/bin/x"),
+                &[],
+                Path::new("/work"),
+                &[],
+                &[],
+                &[],
+                &BTreeMap::new(),
+                cidfile,
+                &labels,
+                tty,
+                false,
+            )
+            .1
+            .join(" ")
+        };
+        let headless = build(false);
+        let interactive = build(true);
+        assert!(
+            headless.split(' ').any(|a| a == "-i"),
+            "headless keeps -i: {headless}"
+        );
+        assert!(
+            !headless.split(' ').any(|a| a == "-t"),
+            "headless has no -t: {headless}"
+        );
+        assert!(
+            interactive.split(' ').any(|a| a == "-t"),
+            "interactive adds -t: {interactive}"
+        );
+    }
+
+    #[test]
+    fn private_net_swaps_host_netns_for_a_gateway_mapped_private_one() {
+        let cidfile = Path::new("/host/x.cid");
+        let labels: Vec<String> = vec![];
+        let build = |private_net: bool| {
+            wrap_podman_managed(
+                "img",
+                Path::new("/bin/x"),
+                &[],
+                Path::new("/work"),
+                &[],
+                &[],
+                &[],
+                &BTreeMap::new(),
+                cidfile,
+                &labels,
+                false,
+                private_net,
+            )
+            .1
+            .join(" ")
+        };
+        let host = build(false);
+        let private = build(true);
+        // default: shared host netns.
+        assert!(host.contains("--network=host"), "host mode: {host}");
+        // private: a slirp4netns netns instead (verified reachable via
+        // host.containers.internal), never the host netns.
+        assert!(!private.contains("--network=host"), "private: {private}");
+        assert!(
+            private.contains("--network=slirp4netns"),
+            "private: {private}"
         );
     }
 
@@ -651,6 +770,7 @@ mod tests {
             ],
             std::slice::from_ref(&skills),
             std::slice::from_ref(&auth),
+            false,
         )
         .unwrap();
         let run = plan.run_argv.join(" ");
@@ -686,9 +806,12 @@ mod tests {
             "{script}"
         );
 
-        let ssh = tart_ssh_argv("192.0.2.10", script).join(" ");
+        let ssh = tart_ssh_argv("192.0.2.10", script, false).join(" ");
         assert!(ssh.starts_with("-p admin ssh -T"), "{ssh}");
         assert!(ssh.contains("admin@192.0.2.10 -- /bin/sh -lc"), "{ssh}");
+        // an interactive session forces a remote pty with -tt instead of -T.
+        let ssh_tty = tart_ssh_argv("192.0.2.10", script, true).join(" ");
+        assert!(ssh_tty.starts_with("-p admin ssh -tt"), "{ssh_tty}");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -702,6 +825,7 @@ mod tests {
             &[("HOME".into(), "/home/u".into())],
             &[],
             &[],
+            false,
         )
         .unwrap_err();
         assert!(err.contains("containing ':'"), "{err}");

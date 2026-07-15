@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use duckfs_core::{Change, FilesMsg};
 use futures::StreamExt as _;
 use futures::channel::oneshot;
@@ -44,9 +46,28 @@ pub enum ClientMsg {
     Unsubscribe {
         topics: Vec<String>,
     },
+    /// keystrokes for an interactive terminal session (see `crate::term`).
+    /// `data` is base64 of the raw bytes to write to the session's pty. An
+    /// unknown/unentitled session id is dropped with a `warn`, never a panic.
+    TermInput {
+        session: String,
+        data: String,
+    },
+    /// a terminal resize for an interactive session: set the pty window size so
+    /// the CLI's TUI reflows.
+    TermResize {
+        session: String,
+        #[cfg_attr(test, ts(type = "number"))]
+        cols: u16,
+        #[cfg_attr(test, ts(type = "number"))]
+        rows: u16,
+    },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+// Serialize-only: the node SENDS frames and never parses its own, so there is
+// no `Deserialize` to conflict when [`Self::TermChunk`] shares the `event` tag
+// with [`Self::Event`] (a derived deserializer's tag match would be ambiguous).
+#[derive(Clone, Debug, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(
     tag = "type",
@@ -61,6 +82,22 @@ pub enum ServerFrame {
         topic: String,
         cursor: String,
         op: StreamOpRow,
+    },
+    /// one raw chunk of interactive-terminal output on a `term:<session>`
+    /// topic: `item` is base64 of the pty bytes. It rides the SAME `type:
+    /// "event"` tag the client keys on, but carries a bare-string `item` and
+    /// NO `op`/`cursor` — the client routes it by the `term:` topic prefix +
+    /// string `item` (its `isTermChunkFrame`), distinct from the op-carrying
+    /// module [`Self::Event`]. `ts(skip)`: the client hand-authors this frame
+    /// type (a second `type:"event"` arm would widen the generated `EventFrame`
+    /// and is intentionally kept out of `stream.gen.ts`). ServerFrame is
+    /// serialize-only at runtime (the node sends, never parses its own frames),
+    /// so sharing the `event` tag is safe.
+    #[serde(rename = "event")]
+    #[cfg_attr(test, ts(skip))]
+    TermChunk {
+        topic: String,
+        item: String,
     },
     Tail {
         topic: String,
@@ -186,6 +223,10 @@ pub struct StreamHub {
     tip: Arc<RwLock<Option<(u64, String)>>>,
     logs: LogRing,
     run_output: RunOutputRegistry,
+    /// per-session interactive-terminal scrollback. Always present (cheap), the
+    /// same way `run_output` is: the terminal manager appends to it and the ws
+    /// catch-up path replays it for `term:<session>` subscribers.
+    terminals: crate::term::TermRing,
 }
 
 impl StreamHub {
@@ -201,6 +242,7 @@ impl StreamHub {
             tip: Arc::new(RwLock::new(None)),
             logs,
             run_output: RunOutputRegistry::default(),
+            terminals: crate::term::TermRing::default(),
         }
     }
 
@@ -219,6 +261,13 @@ impl StreamHub {
 
     pub fn run_output(&self) -> RunOutputRegistry {
         self.run_output.clone()
+    }
+
+    /// the interactive-terminal scrollback ring. The daemon hands this to the
+    /// [`crate::term::TerminalSessions`] manager so its pump appends to the same
+    /// ring the ws catch-up replays.
+    pub fn terminals(&self) -> crate::term::TermRing {
+        self.terminals.clone()
     }
 
     pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<()> {
@@ -501,6 +550,13 @@ enum TopicState {
         id: String,
         seq: u64,
     },
+    /// an interactive terminal session's output stream (`term:<session>`).
+    /// `seq` is the last emitted ring chunk — the same seq-cursor model as
+    /// `RunOutput`.
+    Term {
+        session: String,
+        seq: u64,
+    },
     /// a SNAPSHOT topic: each wakeup re-samples the whole exposition, so the
     /// cursor (the last sample's `time_ms`) is bookkeeping, never a resume
     /// point — there is no backlog to replay and the topic never lags.
@@ -513,7 +569,9 @@ impl TopicState {
     fn cursor(&self) -> String {
         match self {
             Self::Module { cursor, .. } | Self::FilesWatch { cursor } => cursor.clone(),
-            Self::Logs { seq } | Self::RunOutput { seq, .. } => seq.to_string(),
+            Self::Logs { seq } | Self::RunOutput { seq, .. } | Self::Term { seq, .. } => {
+                seq.to_string()
+            }
             Self::Metrics { sampled_ms } => sampled_ms.to_string(),
         }
     }
@@ -551,6 +609,7 @@ enum Wake {
     Block,
     Logs,
     RunOutput,
+    Term,
     Tick,
     All,
 }
@@ -562,6 +621,7 @@ impl TopicState {
             Wake::Block => matches!(self, Self::Module { .. } | Self::FilesWatch { .. }),
             Wake::Logs => matches!(self, Self::Logs { .. }),
             Wake::RunOutput => matches!(self, Self::RunOutput { .. }),
+            Wake::Term => matches!(self, Self::Term { .. }),
             Wake::Tick => matches!(self, Self::Metrics { .. }),
         }
     }
@@ -572,6 +632,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
     let mut block_rx = hub.subscribe_blocks();
     let mut log_rx = hub.log_ring().subscribe();
     let mut run_rx = hub.run_output().subscribe();
+    let mut term_rx = hub.terminals().subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
     let mut topics = BTreeMap::new();
 
@@ -582,6 +643,16 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                 match frame {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<ClientMsg>(text.as_str()) {
+                            // terminal input/resize act on the session manager,
+                            // not on this connection's topic set — and the write
+                            // is async — so they're handled here, before the
+                            // sync topic path.
+                            Ok(ClientMsg::TermInput { session, data }) => {
+                                handle_term_input(&handle, &topics, &session, &data).await;
+                            }
+                            Ok(ClientMsg::TermResize { session, cols, rows }) => {
+                                handle_term_resize(&handle, &topics, &session, cols, rows);
+                            }
                             Ok(msg) => {
                                 let frames = handle_client_msg(&handle, &mut topics, msg);
                                 if !send_frames(&mut socket, frames).await {
@@ -645,6 +716,14 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                     return;
                 }
             }
+            changed = term_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::Term).await {
+                    return;
+                }
+            }
         }
     }
 }
@@ -665,6 +744,79 @@ fn handle_client_msg(
             }
             Vec::new()
         }
+        // handled inline in `stream_session` (async, and off the topic set), so
+        // they never reach here — but the match stays exhaustive.
+        ClientMsg::TermInput { .. } | ClientMsg::TermResize { .. } => Vec::new(),
+    }
+}
+
+/// a ws connection may drive a terminal session only if it has SUBSCRIBED to
+/// that session's `term:<id>` output topic. Subscribing is the connection's
+/// proof it legitimately holds the id: create is HTTP-gated (`origin_guard`),
+/// and this gate stops a trusted-local client that merely knows or guesses an id
+/// from driving another member's session. The app subscribes to the topic
+/// before it ever sends input (see `TerminalView`, and the ws frames are ordered
+/// on one socket), so this never breaks its flow.
+fn term_entitled(topics: &BTreeMap<String, TopicState>, session: &str) -> bool {
+    topics.contains_key(&crate::term::topic(session))
+}
+
+/// write base64-decoded keystrokes to a session's pty. Refused (no-op + `warn`)
+/// when the connection isn't subscribed to the session (`unentitled_session`),
+/// the terminal plane is absent, the session is unknown, or the base64 is bad —
+/// never a panic. Never logs the bytes; the unentitled refusal logs no id (an
+/// id the caller isn't entitled to is not the node's to echo into the
+/// webview-streamed log ring).
+async fn handle_term_input(
+    handle: &NodeHandle,
+    topics: &BTreeMap<String, TopicState>,
+    session: &str,
+    data_b64: &str,
+) {
+    if !term_entitled(topics, session) {
+        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term input dropped");
+        return;
+    }
+    let Some(terminals) = handle.terminals() else {
+        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
+        return;
+    };
+    let Some(live) = terminals.session(session) else {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
+        return;
+    };
+    let Ok(bytes) = STANDARD.decode(data_b64) else {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
+        return;
+    };
+    if let Err(err) = live.write_all(&bytes).await {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "write_failed", error = %err, "term input dropped");
+    }
+}
+
+/// resize a session's pty. Same entitlement gate + no-op-on-unknown discipline
+/// as input.
+fn handle_term_resize(
+    handle: &NodeHandle,
+    topics: &BTreeMap<String, TopicState>,
+    session: &str,
+    cols: u16,
+    rows: u16,
+) {
+    if !term_entitled(topics, session) {
+        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term resize dropped");
+        return;
+    }
+    let Some(terminals) = handle.terminals() else {
+        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
+        return;
+    };
+    let Some(live) = terminals.session(session) else {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term resize dropped");
+        return;
+    };
+    if let Err(err) = live.resize(cols, rows) {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "resize_failed", error = %err, "term resize dropped");
     }
 }
 
@@ -745,6 +897,21 @@ fn prepare_topic(
         return Ok((
             TopicState::RunOutput {
                 id: id.to_string(),
+                seq,
+            },
+            None,
+        ));
+    }
+    if let Some(session) = topic.strip_prefix("term:") {
+        // like run-output, any session id subscribes (unknown/evicted → empty
+        // catch-up, never an error); the manager gates who may CREATE one.
+        let seq = match resume {
+            Some(cursor) => parse_seq_cursor(topic, cursor)?,
+            None => 0,
+        };
+        return Ok((
+            TopicState::Term {
+                session: session.to_string(),
                 seq,
             },
             None,
@@ -849,6 +1016,7 @@ fn catch_up_topic(
         }
         TopicState::Logs { seq } => catch_up_logs(topic, seq, &hub.log_ring()),
         TopicState::RunOutput { id, seq } => catch_up_run_output(topic, id, seq, &hub.run_output()),
+        TopicState::Term { session, seq } => catch_up_term(topic, session, seq, &hub.terminals()),
         // routed to catch_up_metrics by the caller (it needs the actor lane,
         // an await this sync path cannot make) — nothing owed here.
         TopicState::Metrics { .. } => CatchUpResult::keep(Vec::new()),
@@ -1074,6 +1242,40 @@ fn catch_up_run_output(
                 topic: topic.to_string(),
                 cursor: line_seq.to_string(),
                 item: TailItem::RunOutput { stream, line },
+            });
+        }
+        if row_count < STREAM_CATCHUP_BUDGET {
+            break;
+        }
+    }
+    CatchUpResult::keep(frames)
+}
+
+/// replay a terminal session's ring the way `catch_up_run_output` replays a
+/// run's: a `Lagged` frame if the reader fell behind an eviction, then every
+/// buffered chunk after the cursor as a `Term` tail item. Emits nothing for an
+/// unknown/evicted session (the ring read returns empty) — never an error.
+fn catch_up_term(topic: &str, session: &str, seq: &mut u64, ring: &crate::term::TermRing) -> CatchUpResult {
+    let mut frames = Vec::new();
+    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
+    if *seq < floor {
+        *seq = floor;
+        frames.push(ServerFrame::Lagged {
+            topic: topic.to_string(),
+            cursor: floor.to_string(),
+        });
+    }
+    loop {
+        let (rows, _) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
+        if rows.is_empty() {
+            break;
+        }
+        let row_count = rows.len();
+        for (chunk_seq, item) in rows {
+            *seq = chunk_seq;
+            frames.push(ServerFrame::TermChunk {
+                topic: topic.to_string(),
+                item,
             });
         }
         if row_count < STREAM_CATCHUP_BUDGET {
@@ -1463,6 +1665,55 @@ mod tests {
             }
             other => panic!("expected heartbeat, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn term_topic_subscribes_and_replays_as_event_tagged_chunks() {
+        // any session id subscribes (the manager gates who may CREATE one);
+        // a fresh subscribe starts at cursor 0 and needs no index store.
+        let (state, lagged) = prepare_topic("term:abc", None, None).expect("term topic subscribes");
+        assert!(lagged.is_none());
+        assert_eq!(state.cursor(), "0");
+
+        let ring = crate::term::TermRing::default();
+        ring.append("s", "aGk=".to_string()); // base64("hi")
+        ring.append("s", "eW8=".to_string()); // base64("yo")
+        let mut seq = 0u64;
+        let result = catch_up_term("term:s", "s", &mut seq, &ring);
+        assert!(!result.drop_topic);
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(seq, 2, "the cursor advances past the replayed chunks");
+        // the LOAD-BEARING wire shape the app's `isTermChunkFrame` keys on: a
+        // `type:"event"` frame with a bare-string `item` and NO `op`/`cursor`.
+        let json = serde_json::to_value(&result.frames[0]).expect("frame json");
+        assert_eq!(json["type"], "event");
+        assert_eq!(json["topic"], "term:s");
+        assert_eq!(json["item"], "aGk=");
+        assert!(json.get("op").is_none(), "a term chunk carries no op");
+        assert!(json.get("cursor").is_none(), "a term chunk carries no cursor");
+        // a caught-up reader sees nothing new.
+        assert!(catch_up_term("term:s", "s", &mut seq, &ring).frames.is_empty());
+    }
+
+    #[test]
+    fn term_input_requires_a_subscription_to_the_session_topic() {
+        let mut topics: BTreeMap<String, TopicState> = BTreeMap::new();
+        // a connection that never subscribed is not entitled to drive a session.
+        assert!(!term_entitled(&topics, "sess1"));
+        // subscribing to a session's OWN output topic entitles input to it — and
+        // only it: holding one session's topic doesn't entitle another's.
+        topics.insert(
+            crate::term::topic("sess1"),
+            TopicState::Term {
+                session: "sess1".into(),
+                seq: 0,
+            },
+        );
+        assert!(term_entitled(&topics, "sess1"));
+        assert!(!term_entitled(&topics, "sess2"));
+        // a non-terminal subscription never entitles terminal input.
+        topics.insert("logs".into(), TopicState::Logs { seq: 0 });
+        assert!(!term_entitled(&topics, "logs"));
     }
 
     #[test]

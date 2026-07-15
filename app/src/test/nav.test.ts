@@ -72,6 +72,7 @@ describe("module availability (ADR A6)", () => {
       "gateway",
       "modules",
       "sandbox",
+      "terminal",
       "metrics",
     ]);
     expect(modulesInSection("operator", client)).toEqual([]);

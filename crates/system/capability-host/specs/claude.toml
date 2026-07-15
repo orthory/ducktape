@@ -25,7 +25,7 @@ spec = 1
 
 [capability]
 tag = "claude"
-description = "Claude Code CLI, non-interactive print mode (BYO auth: the CLI manages its own login)"
+description = "Claude Code CLI, print mode (auth via the host-owned Anthropic broker; the credential never enters the child)"
 
 [detect]
 bin = "claude"
@@ -65,25 +65,39 @@ mode = "persistent"
 capture = "json-result-field:session_id"
 resume_args_append = ["--resume", "{session_id}"]
 
-[sandbox]
-# THE WEAK AUTH PATH, and it is weak on purpose: there is no Anthropic-side
-# broker yet, so claude authenticates the only way it knows — by reading its own
-# dotfiles. That means the credential DOES enter the child.
+[interactive]
+# The pty-backed TUI argv, for interactive sessions (a member drives the claude
+# TUI directly), as opposed to the headless [invoke] print mode above. Empty
+# args = a bare `claude` launch, which opens the interactive TUI. Unlike codex,
+# NOTHING is spliced into this argv: the [isolation] broker below aims claude
+# entirely by ENV (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN), so the same
+# isolation applies — the credential stays in the host broker, the child gets
+# only the opaque bearer + loopback base URL, and the fresh CLAUDE_CONFIG_DIR
+# blocks any ~/.claude fallback. Pending live validation against the real claude
+# binary on a podman host (see the design spec).
+args = []
+
+[isolation]
+# THE STRONG AUTH PATH: the operator's credential never enters the claude
+# process. The HOST reads it (ANTHROPIC_API_KEY, else CLAUDE_CODE_OAUTH_TOKEN,
+# else ~/.claude/.credentials.json — the subscription path is the operator's
+# flagged choice, isolated to one broker knob) and holds it in the node; a
+# per-run loopback Anthropic Messages broker serves POST /v1/messages with SSE
+# passthrough, and claude gets only an opaque random bearer plus a base URL,
+# both of which die with the run. Neither can recover the credential.
 #
-# Under the Podman sandbox backend, HOME is set but NOT mounted — only these
-# home-relative auth/state dirs cross the boundary read-write, so the CLI can
-# authenticate while the node's data dir and user key stay outside (D7).
-# ~/.claude holds the login/session state; ~/.claude.json holds config. Inert
-# under the Direct backend (the child inherits HOME whole). Home-relative
-# ONLY: absolute paths and ".." are rejected at load. Inherited by every
-# [[variants]] tag below.
+# config_home_env is what MAKES that true. Pointed at a fresh, EMPTY
+# CLAUDE_CONFIG_DIR under the run's workdir, claude cannot read the operator's
+# ~/.claude/.credentials.json and must use ANTHROPIC_AUTH_TOKEN toward the broker
+# the ANTHROPIC_BASE_URL names. Without it the broker would be decorative.
 #
-# THIS SECTION DIES THE MOMENT AN ANTHROPIC BROKER LANDS. When one exists, this
-# spec grows an [isolation] block naming it (like codex.toml) and DELETES these
-# rw_dirs in the same edit — declaring both is a hard load error precisely so
-# that swap cannot be half-done, leaving the credential in the child while the
-# spec claims a broker.
-rw_dirs = ["~/.claude", "~/.claude.json"]
+# Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
+# to have both): mounting ~/.claude would put the credential back in the child
+# and quietly undo all of the above — the exact regression this replaces.
+# Applies under the Direct AND Podman backends; Tart binds the host gateway the
+# guest reaches as ducktape-host. Inherited by every [[variants]] tag below.
+config_home_env = "CLAUDE_CONFIG_DIR"
+broker = "anthropic-messages"
 
 [context]
 # WHERE THE AGENT'S SOUL LANDS. The host assembles the agent's curated skills

@@ -108,6 +108,11 @@ pub struct NodeHandle {
     /// A2/A5). the default (`Loopback`, no node key) is the embedded daemon's
     /// loopback-trust surface; the full node overrides it via [`Self::with_admin`].
     pub(crate) admin: crate::admin::AdminConfig,
+    /// the node-local interactive terminal-session manager. `None` on a handle
+    /// that never wires one (router tests, an embedder that omits it) — the
+    /// `/v1/term/*` routes answer 503 there and ws `TermInput`/`TermResize` are
+    /// no-ops. off-chain, node-local: never consensus state.
+    pub(crate) terminals: Option<crate::term::TerminalSessions>,
 }
 
 impl NodeHandle {
@@ -137,6 +142,7 @@ impl NodeHandle {
             duckfs_workspaces: None,
             code_stage: None,
             admin: crate::admin::AdminConfig::default(),
+            terminals: None,
         };
         (handle, cmd_rx, hub)
     }
@@ -193,6 +199,20 @@ impl NodeHandle {
     pub fn with_admin(mut self, admin: crate::admin::AdminConfig) -> Self {
         self.admin = admin;
         self
+    }
+
+    /// wire the node-local interactive terminal-session manager so the
+    /// `/v1/term/*` routes and the ws `TermInput`/`TermResize` handlers can
+    /// reach it. only the daemon wires one; a handle without it 503s the
+    /// routes.
+    pub fn with_terminals(mut self, terminals: crate::term::TerminalSessions) -> Self {
+        self.terminals = Some(terminals);
+        self
+    }
+
+    /// the terminal-session manager, if one is wired.
+    pub(crate) fn terminals(&self) -> Option<&crate::term::TerminalSessions> {
+        self.terminals.as_ref()
     }
 
     /// Point gateway requests at the full node's authenticated overlay

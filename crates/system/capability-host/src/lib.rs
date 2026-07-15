@@ -109,17 +109,50 @@ const BROKER_TOKEN_ENV: &str = "DUCKTAPE_MODEL_BROKER_TOKEN";
 const PROVIDER_CONTROL_URL_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
 const PROVIDER_CONTROL_TOKEN_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 
-/// the upstream credential env vars a broker takes over. the HOST reads these
-/// (see [`broker::UpstreamCredential::from_host`]); the child must not see them,
-/// or it would dial the provider directly and walk straight past the broker.
-const UPSTREAM_CREDENTIAL_ENV: [&str; 1] = ["OPENAI_API_KEY"];
+/// the upstream credential env vars a broker takes over. the HOST reads these;
+/// the child must not see them, or it would dial the provider directly and walk
+/// straight past the broker. Removed whenever ANY broker is active (removing an
+/// unrelated provider's key is harmless); covers both the OpenAI (codex) and
+/// Anthropic (claude) upstreams. `ANTHROPIC_AUTH_TOKEN` is NOT here: the broker
+/// sets it to the opaque run bearer, so it must survive into the child.
+const UPSTREAM_CREDENTIAL_ENV: [&str; 3] =
+    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/// the `-c` overrides that aim a codex invocation at this run's loopback broker:
+/// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
+/// off), the provider selector, and a workspace trust level. shared by the
+/// headless [`CliProvider::broker_argv`] (spliced after the subcommand) and the
+/// interactive path (prepended — a TUI argv has no subcommand). the child gets a
+/// base URL and an opaque bearer; neither recovers the operator's credential.
+fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) -> Vec<String> {
+    // the workdir is a path, and codex keys `projects.<key>` by TOML string —
+    // so it must be QUOTED as one (a bare path breaks the `-c` parse).
+    let project_key = toml::Value::String(workdir.to_string_lossy().into_owned()).to_string();
+    vec![
+        "-c".into(),
+        format!(
+            "model_providers.ducktape={{ name=\"Ducktape run broker\", base_url=\"{}\", wire_api=\"responses\", env_key=\"{BROKER_TOKEN_ENV}\", request_max_retries=0, stream_max_retries=0 }}",
+            broker.base_url
+        ),
+        "-c".into(),
+        "model_provider=\"ducktape\"".into(),
+        "-c".into(),
+        format!("projects.{project_key}.trust_level=\"untrusted\""),
+    ]
+}
 
 mod broker;
+// interactive (pty) sessions are unix-only: they use libc pty primitives, which
+// are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
+#[cfg(unix)]
+mod interactive;
 mod sandbox;
 mod session;
 mod spec;
 mod variants;
 mod workspace;
+#[cfg(unix)]
+pub use interactive::InteractiveSession;
 pub use sandbox::{SandboxBackend, TART_MIN_CORES};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
@@ -316,6 +349,21 @@ pub trait Provider: Send + Sync {
             .await
             .map(|text| ProviderOutput { text, usage: None })
     }
+    /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
+    /// [`crate::interactive`]). The default refuses — only a spec with an
+    /// `[interactive]` argv on a Podman backend supports it; everything else
+    /// keeps the historical headless-only surface.
+    #[cfg(unix)]
+    async fn spawn_interactive(
+        &self,
+        ctx: &RunContext,
+    ) -> Result<InteractiveSession, String> {
+        let _ = ctx;
+        Err(format!(
+            "{}: this capability has no interactive session support",
+            self.capability()
+        ))
+    }
 }
 
 /// the host's provider surface: every LOADED spec (for routing — an
@@ -464,6 +512,13 @@ pub(crate) struct CliProvider {
     /// how the child is spawned: `Direct`, rootless `Podman`, or an ephemeral
     /// Tart VM. set once at discovery for the whole provider set.
     backend: SandboxBackend,
+    /// (Podman only) give the container a PRIVATE netns instead of `--network=host`,
+    /// so it cannot scan the host's loopback for other runs' brokers / the node
+    /// RPC. Off by default (`--network=host` unchanged); enabled per-node by
+    /// `DUCKTAPE_SANDBOX_PRIVATE_NET` while the gateway/egress specifics are
+    /// validated on a real podman host. When on, the broker is reachable via
+    /// `host.containers.internal` (see [`broker::Reachability`]).
+    private_net: bool,
 }
 
 impl CliProvider {
@@ -484,6 +539,7 @@ impl CliProvider {
             dirs: AgentDirs::default(),
             output_sink: None,
             backend: SandboxBackend::Direct,
+            private_net: false,
         }
     }
 
@@ -495,6 +551,12 @@ impl CliProvider {
 
     pub fn with_backend(mut self, backend: SandboxBackend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// (Podman only) opt into a private netns instead of `--network=host`.
+    pub fn with_private_net(mut self, private_net: bool) -> Self {
+        self.private_net = private_net;
         self
     }
 
@@ -544,7 +606,7 @@ impl CliProvider {
             SandboxBackend::Direct => (self.direct_command(&args, ctx, auth)?, None),
             SandboxBackend::Podman { image } => {
                 let (command, run) =
-                    self.podman_command(image, &args, workdir, ctx, auth)?;
+                    self.podman_command(image, &args, workdir, ctx, auth, false)?;
                 (command, Some(run))
             }
             // Tart has a multi-process lifecycle (clone/set/boot, then SSH), so
@@ -627,6 +689,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
+        tty: bool,
     ) -> Result<(tokio::process::Command, PodmanRun), String> {
         let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
         let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
@@ -644,6 +707,8 @@ impl CliProvider {
             &ctx.limits,
             &run.cidfile,
             &run.labels,
+            tty,
+            self.private_net,
         );
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(argv)
@@ -661,6 +726,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
+        interactive: bool,
     ) -> Result<sandbox::TartPlan, String> {
         let (envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
         for dir in &rw_dirs {
@@ -693,6 +759,7 @@ impl CliProvider {
             &envs,
             &self.sandbox_ro_paths(ctx, workdir, auth)?,
             &rw_dirs,
+            interactive,
         )
     }
 
@@ -918,6 +985,21 @@ impl CliProvider {
             .join(runtime_slot(ctx, workdir))
             .join("provider-config");
         create_private_dir(&dir)?;
+        // Claude Code reads settings from `<CLAUDE_CONFIG_DIR>/settings.json`.
+        // `skipWebFetchPreflight` cannot be expressed as an env var, so it rides
+        // this file in the fresh config home: without it, WebFetch preflights
+        // api.anthropic.com DIRECTLY, bypassing the broker, and fails behind
+        // isolation. Written only for the Anthropic broker (codex ignores it).
+        if self.spec.isolation.broker == Some(BrokerKind::AnthropicMessages) {
+            let settings = dir.join("settings.json");
+            std::fs::write(&settings, r#"{"skipWebFetchPreflight":true}"#).map_err(|e| {
+                format!(
+                    "{}: write claude settings {}: {e}",
+                    self.spec.tag,
+                    settings.display()
+                )
+            })?;
+        }
         Ok(Some(dir))
     }
 
@@ -931,25 +1013,50 @@ impl CliProvider {
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
+        let tart = matches!(self.backend, SandboxBackend::Tart { .. });
+        // a private-netns Podman child can't reach a loopback-bound broker at
+        // 127.0.0.1; it dials `host.containers.internal` instead.
+        let podman_private =
+            self.private_net && matches!(self.backend, SandboxBackend::Podman { .. });
         match kind {
             BrokerKind::CodexResponses => {
-                if matches!(self.backend, SandboxBackend::Tart { .. }) {
+                if tart {
                     broker::RunBroker::start_for_tart().await.map(Some)
+                } else if podman_private {
+                    broker::RunBroker::start_for_podman_private().await.map(Some)
                 } else {
                     broker::RunBroker::start().await.map(Some)
+                }
+            }
+            BrokerKind::AnthropicMessages => {
+                if tart {
+                    broker::RunBroker::start_anthropic_for_tart().await.map(Some)
+                } else if podman_private {
+                    broker::RunBroker::start_anthropic_for_podman_private()
+                        .await
+                        .map(Some)
+                } else {
+                    broker::RunBroker::start_anthropic().await.map(Some)
                 }
             }
         }
     }
 
     /// the run's auth env, backend-independent: the fresh config home (so the
-    /// CLI cannot read the operator's real one), the broker's model bearer, and
-    /// its separately-scoped provider-control capability. `set` is how the
-    /// caller applies one binding — a `Command` env for Direct, or the Podman
-    /// process environment behind a value-free `-e K`.
+    /// CLI cannot read the operator's real one), the way the child reaches the
+    /// broker (codex: an opaque model bearer + its separately-scoped
+    /// provider-control capability; claude: ANTHROPIC_BASE_URL + the opaque
+    /// bearer). `set` is how the caller applies one binding — a `Command` env for
+    /// Direct, or the Podman process environment behind a value-free `-e K`.
     ///
     /// NOTE what is NOT here: the credential itself. that is the whole point —
     /// the host holds it and the broker spends it, so there is nothing to pass.
+    ///
+    /// The config-home binding is shared; the broker-reach bindings DIFFER by
+    /// kind. codex is aimed by ARGV (see [`Self::broker_argv`]) and only needs
+    /// the bearer here in [`BROKER_TOKEN_ENV`]; claude is aimed entirely by ENV —
+    /// base URL, bearer, and the fresh config home — plus the hardening vars that
+    /// keep Claude Code from dialing out around the broker.
     fn apply_auth_env(&self, auth: &RunAuth<'_>, mut set: impl FnMut(&str, String)) {
         if let (Some(name), Some(dir)) = (
             self.spec.isolation.config_home_env.as_deref(),
@@ -957,13 +1064,35 @@ impl CliProvider {
         ) {
             set(name, dir.display().to_string());
         }
-        if let Some(broker) = auth.broker {
-            set(BROKER_TOKEN_ENV, broker.run_bearer.clone());
-            set(PROVIDER_CONTROL_URL_ENV, broker.control_url.clone());
-            set(
-                PROVIDER_CONTROL_TOKEN_ENV,
-                broker.control_token.clone(),
-            );
+        let Some(broker) = auth.broker else {
+            return;
+        };
+        match self.spec.isolation.broker {
+            Some(BrokerKind::AnthropicMessages) => {
+                set("ANTHROPIC_BASE_URL", broker.base_url.clone());
+                set("ANTHROPIC_AUTH_TOKEN", broker.run_bearer.clone());
+                // hardening: kill non-essential outbound traffic + the auto-updater
+                // so the CLI never dials Anthropic around the broker.
+                //
+                // NOTE: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is deliberately NOT set.
+                // It scrubs ANTHROPIC_* from the CLI's subprocesses, but our only
+                // ANTHROPIC_* var is the OPAQUE run bearer (not a real credential —
+                // it authenticates to the loopback broker and dies with the run), so
+                // scrubbing it protects nothing. And live-verified it actively breaks
+                // the CLI: headless `claude -p` refuses to run with the scrub set
+                // unless allowedTools is declared ("Permission mode forced to
+                // default"). The real credential never enters the container at all.
+                set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into());
+                set("DISABLE_AUTOUPDATER", "1".into());
+            }
+            // codex (and the defensive no-kind case): argv aims it; the child gets
+            // the opaque model bearer + its separately-scoped provider-control cap.
+            _ => {
+                set(BROKER_TOKEN_ENV, broker.run_bearer.clone());
+                set(PROVIDER_CONTROL_URL_ENV, broker.control_url.clone());
+                set(PROVIDER_CONTROL_TOKEN_ENV, broker.control_token.clone());
+            }
+
         }
     }
 
@@ -971,28 +1100,24 @@ impl CliProvider {
     /// provider in after the subcommand selector (`args[0]`, e.g. `exec`) —
     /// where codex expects its `-c` overrides. a no-op without a broker.
     ///
+    /// ARGV aiming is CODEX-SPECIFIC. The Anthropic broker aims claude by ENV
+    /// (see [`Self::apply_auth_env`]) — a claude argv has no `-c model_providers`
+    /// splice — so for any non-codex broker the argv passes through unchanged.
+    ///
     /// the child is given a base URL and [`BROKER_TOKEN_ENV`], and neither can
     /// recover the operator's credential: the bearer is 32 random bytes minted
-    /// for this run, and the endpoint dies with it.
+    /// for this run, and the endpoint dies with it. The interactive path
+    /// ([`crate::interactive`]) shares [`broker_provider_overrides`] but PREPENDS
+    /// them (a TUI argv has no `exec` selector to splice after).
     fn broker_argv(&self, args: &[String], workdir: &Path, auth: &RunAuth<'_>) -> Vec<String> {
+        if self.spec.isolation.broker != Some(BrokerKind::CodexResponses) {
+            return args.to_vec();
+        }
         let (Some(broker), Some(selector)) = (auth.broker, args.first()) else {
             return args.to_vec();
         };
-        // the workdir is a path, and codex keys `projects.<key>` by TOML string —
-        // so it must be QUOTED as one (a bare path breaks the `-c` parse).
-        let project_key = toml::Value::String(workdir.to_string_lossy().into_owned()).to_string();
-        let mut argv = vec![
-            selector.clone(),
-            "-c".into(),
-            format!(
-                "model_providers.ducktape={{ name=\"Ducktape run broker\", base_url=\"{}\", wire_api=\"responses\", env_key=\"{BROKER_TOKEN_ENV}\", request_max_retries=0, stream_max_retries=0 }}",
-                broker.base_url
-            ),
-            "-c".into(),
-            "model_provider=\"ducktape\"".into(),
-            "-c".into(),
-            format!("projects.{project_key}.trust_level=\"untrusted\""),
-        ];
+        let mut argv = vec![selector.clone()];
+        argv.extend(broker_provider_overrides(broker, workdir));
         argv.extend(args.iter().skip(1).cloned());
         argv
     }
@@ -1101,7 +1226,7 @@ impl CliProvider {
         }
 
         for attempt in 0..30 {
-            let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true");
+            let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true", false);
             let status = guard
                 .setup_command(
                     "sshpass",
@@ -3047,7 +3172,7 @@ impl CliProvider {
         let tart_plan = matches!(self.backend, SandboxBackend::Tart { .. })
             .then(|| {
                 let args = self.broker_argv(args, workdir, &auth);
-                self.tart_plan(&args, workdir, ctx, &auth)
+                self.tart_plan(&args, workdir, ctx, &auth, false)
             })
             .transpose()?;
         // Declared before the SSH child so VM stop/delete runs after the child
@@ -3055,7 +3180,7 @@ impl CliProvider {
         let tart_guard = self.tart_setup(tart_plan.as_ref(), ctx).await?;
         let (mut command, podman) = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
             let mut command = tokio::process::Command::new("sshpass");
-            command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script));
+            command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, false));
             (command, None)
         } else {
             let PreparedCommand { command, podman } =
@@ -3477,6 +3602,14 @@ impl Provider for CliProvider {
     ) -> Result<ProviderOutput, String> {
         self.run_output(prompt, ctx).await
     }
+
+    #[cfg(unix)]
+    async fn spawn_interactive(
+        &self,
+        ctx: &RunContext,
+    ) -> Result<InteractiveSession, String> {
+        self.spawn_interactive_session(ctx).await
+    }
 }
 
 /// the JSON objects of a JSONL-ish stream: trimmed lines that parse; non-json
@@ -3661,6 +3794,12 @@ pub fn discover(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
+    // force a private container netns regardless of the env knob. The interactive
+    // terminal plane passes `true` — its containers are driven by ADVERSARIAL
+    // members, so they must NOT share the host netns (where they could reach the
+    // node's own loopback /v1 control plane + other runs' brokers). Headless runs
+    // pass `false` and honor `DUCKTAPE_SANDBOX_PRIVATE_NET`.
+    force_private_net: bool,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let executing_node = execution_node_id(node_identity);
@@ -3672,6 +3811,13 @@ pub fn discover(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
+    // opt-in per node: a private container netns instead of --network=host (see
+    // CliProvider::private_net). Off unless explicitly enabled while its podman
+    // networking specifics are validated on a real podman host.
+    let private_net = force_private_net
+        || std::env::var("DUCKTAPE_SANDBOX_PRIVATE_NET")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     Ok(discover_with_sink(
         specs,
         std::env::var_os("PATH"),
@@ -3680,6 +3826,7 @@ pub fn discover(
         dirs.resolved(&|k| std::env::var_os(k)),
         output_sink,
         backend,
+        private_net,
     ))
 }
 
@@ -3719,9 +3866,11 @@ fn discover_with(
         dirs,
         None,
         SandboxBackend::Direct,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_with_sink(
     specs: SpecSet,
     path: Option<OsString>,
@@ -3730,6 +3879,7 @@ fn discover_with_sink(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
+    private_net: bool,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -3746,7 +3896,8 @@ fn discover_with_sink(
         for spec in group {
             let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone())
                 .with_agent_dirs(dirs.clone())
-                .with_backend(backend.clone());
+                .with_backend(backend.clone())
+                .with_private_net(private_net);
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }
@@ -4438,7 +4589,7 @@ format = "text"
             ..RunContext::default()
         };
         let plan = provider
-            .tart_plan(&["--go".into()], &workdir, &ctx, &RunAuth::default())
+            .tart_plan(&["--go".into()], &workdir, &ctx, &RunAuth::default(), false)
             .expect("Tart plan builds");
         assert!(plan.vm.starts_with("ducktape-"), "{}", plan.vm);
         assert_eq!(plan.run_argv.first().map(String::as_str), Some("run"));
@@ -4808,6 +4959,30 @@ broker = "codex-responses"
         .unwrap()
     }
 
+    fn anthropic_broker_spec(tag: &str) -> CapabilitySpec {
+        CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "{tag}"
+[detect]
+bin = "{tag}"
+[invoke]
+args = ["-p", "--output-format", "json"]
+prompt = "stdin"
+[output]
+format = "json-result"
+[isolation]
+config_home_env = "CLAUDE_CONFIG_DIR"
+broker = "anthropic-messages"
+"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
     fn argv_of(cmd: &tokio::process::Command) -> String {
         cmd.as_std()
             .get_args()
@@ -4970,6 +5145,74 @@ broker = "codex-responses"
         assert!(envs.iter().all(|(key, _)| {
             key != PROVIDER_CONTROL_URL_ENV && key != PROVIDER_CONTROL_TOKEN_ENV
         }));
+    }
+
+    #[test]
+    fn a_claude_broker_aims_the_child_by_env_not_argv() {
+        // the Anthropic broker's opposite of codex: the argv is UNTOUCHED (a
+        // claude argv has no `-c model_providers` splice), and the child is aimed
+        // entirely by env — base URL, opaque bearer, fresh config home, plus the
+        // hardening vars that keep Claude Code from dialing out around the broker.
+        let provider =
+            CliProvider::from_spec(anthropic_broker_spec("cl"), PathBuf::from("/usr/bin/cl"));
+        let endpoint = broker::BrokerEndpoint {
+            // NOTE: no `/v1` — ANTHROPIC_BASE_URL is the API root.
+            base_url: "http://127.0.0.1:54321".into(),
+            run_bearer: "opaque-run-bearer".into(),
+            control_url: String::new(),
+            control_token: String::new(),
+        };
+        let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
+        let auth = RunAuth {
+            config_home: Some(&config_home),
+            broker: Some(&endpoint),
+        };
+        let cmd = provider
+            .command(
+                &["-p".into(), "--output-format".into(), "json".into()],
+                Path::new("/tmp/wd"),
+                &RunContext::default(),
+                &auth,
+            )
+            .expect("command builds");
+
+        // argv verbatim — no codex-style splice for a claude broker.
+        assert_eq!(argv_of(&cmd), "-p --output-format json");
+
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let got = |k: &str| envs.get(k).cloned().flatten();
+        assert_eq!(got("ANTHROPIC_BASE_URL").as_deref(), Some("http://127.0.0.1:54321"));
+        assert_eq!(got("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("opaque-run-bearer"));
+        assert_eq!(
+            got("CLAUDE_CONFIG_DIR").as_deref(),
+            Some(config_home.to_str().unwrap()),
+            "the fresh config home blocks the ~/.claude fallback"
+        );
+        // SUBPROCESS_ENV_SCRUB is deliberately NOT set — it breaks headless
+        // `claude -p` and protects nothing here (the only ANTHROPIC_* var is the
+        // opaque run bearer). See apply_auth_env.
+        assert_eq!(got("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"), None);
+        assert_eq!(got("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(), Some("1"));
+        assert_eq!(got("DISABLE_AUTOUPDATER").as_deref(), Some("1"));
+        // the codex bearer var is NOT set for a claude broker.
+        assert_eq!(envs.get(BROKER_TOKEN_ENV), None);
+        // and the inherited Anthropic credential is REMOVED, not merely unset: a
+        // Direct child that still saw it would dial api.anthropic.com directly,
+        // straight past the broker holding the real credential.
+        assert_eq!(
+            envs.get("ANTHROPIC_API_KEY"),
+            Some(&None),
+            "the inherited upstream credential is explicitly removed: {envs:?}"
+        );
     }
 
     // ---- discovery ----------------------------------------------------------

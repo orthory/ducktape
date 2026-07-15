@@ -92,6 +92,20 @@ resume_args = [
     "-",
 ]
 
+[interactive]
+# The pty-backed TUI argv, for interactive sessions (a member drives the codex
+# TUI directly), as opposed to the headless [invoke] `exec --json` above. Empty
+# args = a bare `codex` launch, which opens the TUI. The broker's `-c` overrides
+# (model_providers.ducktape + model_provider + workspace trust) are PREPENDED
+# host-side — codex reads `-c` as global config — so the SAME isolation applies:
+# the credential stays in the host broker, the child gets only the opaque bearer
+# and loopback base URL, and the fresh CODEX_HOME below blocks any dotfile
+# fallback. NOTE (PR1 scope): interactive sessions do NOT wire the [tools] MCP
+# plane — a human at the TUI needs no autonomous session-key tool door. The
+# exact TUI invocation is pending live validation against the real codex binary
+# on a podman host (see the design spec).
+args = []
+
 [isolation]
 # THE STRONG AUTH PATH: the operator's credential never enters the codex
 # process. The HOST reads it (OPENAI_API_KEY, else ~/.codex/auth.json) and holds

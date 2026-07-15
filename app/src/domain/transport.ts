@@ -17,6 +17,7 @@ import type {
   EventFrame,
   HeartbeatFrame,
   TailFrame,
+  TermClientMsg,
 } from "./stream";
 import {
   isErrorFrame,
@@ -26,6 +27,7 @@ import {
   isServerFrame,
   isSubscribedFrame,
   isTailFrame,
+  isTermChunkFrame,
 } from "./stream";
 
 export interface BlockEvent {
@@ -371,11 +373,35 @@ export interface NodeTransport {
   ): () => void;
   /** Subscribe to stream connection/liveness signals. Returns the unsubscribe. */
   onStream(listener: (signal: StreamSignal) => void): () => void;
+
+  // ── Interactive terminal sessions ──
+  // Optional (like gatewayProxy): a transport that does not expose the node's
+  // http/ws surface simply omits them and the Terminal view stays inert.
+
+  /** Create a node-hosted interactive terminal session for `agent` (e.g.
+   *  "codex"): POST /v1/term/sessions. The node enforces its own per-node
+   *  session cap and answers an error when over it — surfaced as a NodeError. */
+  createTermSession?(agent: string): Promise<TermSession>;
+  /** Close a session: POST /v1/term/sessions/<id>/close (idempotent). */
+  closeTermSession?(sessionId: string): Promise<void>;
+  /** Send one terminal op (input / resize) over the SAME ws the subscribe
+   *  socket uses. A no-op if the socket is not currently open. */
+  sendTerm?(msg: TermClientMsg): void;
+}
+
+/** A created terminal session: its id and the stream topic its output rides. */
+export interface TermSession {
+  sessionId: string;
+  topic: string;
 }
 
 export interface TopicHandlers {
   onEvent?(frame: EventFrame): void;
   onTail?(frame: TailFrame): void;
+  /** A terminal output chunk on a `term:` topic — `item` is base64 of raw
+   *  terminal bytes (see stream.ts TermChunkFrame). The ring replays on
+   *  (re)subscribe, so these also carry catch-up. */
+  onTermChunk?(item: string): void;
   onLagged?(topic: string, cursor: string): void;
   /** The node refused this topic (unknown on an older build, unavailable, …):
    *  no frames will arrive on it for the rest of this connection, so a
@@ -726,6 +752,14 @@ export const remoteTransport = (
       } catch {
         return; // a malformed / non-json frame is a no-op, not an uncaught throw
       }
+      // A term chunk is an event frame carrying `item` on a `term:` topic; it
+      // has no `op`/`cursor`, so it fails the strict isServerFrame guard —
+      // route it here before that gate. No cursor tracking: the node replays
+      // the whole ring on resubscribe and xterm reconstructs from raw bytes.
+      if (isTermChunkFrame(frame)) {
+        topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onTermChunk?.(frame.item));
+        return;
+      }
       if (isServerFrame(frame)) dispatchFrame(frame);
     };
     ws.onclose = () => {
@@ -1035,5 +1069,24 @@ export const remoteTransport = (
         closeIfIdle();
       };
     },
+    createTermSession: (agent) =>
+      postJson<TermSession>(`${base}/v1/term/sessions`, { agent }),
+    closeTermSession: async (sessionId) => {
+      // idempotent on the node; a non-2xx still surfaces its detail.
+      const res = await fetchDeadline(
+        `${base}/v1/term/sessions/${encodeURIComponent(sessionId)}/close`,
+        { method: "POST" },
+      );
+      if (!res.ok) {
+        throw new NodeError(
+          "httpError",
+          (await errorDetail(res)) || `node replied ${res.status}`,
+          res.status,
+        );
+      }
+    },
+    // TermClientMsg's two ops aren't in the generated ClientMsg yet (added to
+    // noded's enum in parallel); cast until stream.gen.ts regenerates.
+    sendTerm: (msg) => sendFrame(msg as unknown as ClientMsg),
   };
 };

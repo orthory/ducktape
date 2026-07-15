@@ -315,6 +315,7 @@ fn run_node(
         gateway_commands,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
+        joiner,
         label: &label,
         storage: &storage,
         rpc_listen,
@@ -330,6 +331,11 @@ fn run_node(
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
+        // the resolved node.toml sandbox backend: the interactive terminal plane
+        // uses the SAME backend + identity as this node's real agent runs, so a
+        // Direct node has no terminal plane and Podman reaping stays consistent.
+        // cloned — the validator/resident arms below consume the original.
+        sandbox: sandbox.clone(),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.

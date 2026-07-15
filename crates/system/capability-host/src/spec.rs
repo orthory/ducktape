@@ -144,6 +144,23 @@ pub struct CapabilitySpec {
     /// absent = the doc rides the stdin prompt instead; a raw provider needs no
     /// convention.
     pub context: Option<ContextLocation>,
+    /// optional `[interactive]` — the argv for an INTERACTIVE (pty-backed) TUI
+    /// session, as opposed to the headless `[invoke]` argv. absent means this
+    /// executor cannot be driven interactively (the historical posture); present
+    /// makes it eligible for [`crate::interactive`]. the broker/config-home
+    /// isolation is shared with the headless path — only the argv differs.
+    pub interactive: Option<InteractiveSpec>,
+}
+
+/// the argv for an interactive, pty-backed TUI session. deliberately its own
+/// section, not a flag on `[invoke]`: the headless argv (`codex exec --json …`)
+/// is the wrong shape for a human-driven TUI, and mixing them invites a spec
+/// that half-declares one. an empty `args` is legal and meaningful — `codex`
+/// with no subcommand launches its TUI; the broker's `-c` overrides are spliced
+/// in host-side (see [`crate::interactive`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveSpec {
+    pub args: Vec<String>,
 }
 
 /// where an executor auto-loads its ambient instructions from — a CLOSED set of
@@ -198,6 +215,10 @@ pub struct IsolationSpec {
 pub enum BrokerKind {
     /// the OpenAI Responses API, as `codex exec` speaks it (see [`crate::broker`]).
     CodexResponses,
+    /// the Anthropic Messages API (`POST /v1/messages`, SSE), as Claude Code
+    /// speaks it. the child is aimed by ENV (`ANTHROPIC_BASE_URL` +
+    /// `ANTHROPIC_AUTH_TOKEN`), not argv (see [`crate::broker`]).
+    AnthropicMessages,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -243,6 +264,9 @@ struct RawSpec {
     /// optional `[context]` — the executor's native ambient-instructions file.
     #[serde(default)]
     context: Option<RawContext>,
+    /// optional `[interactive]` — the pty-backed TUI argv.
+    #[serde(default)]
+    interactive: Option<RawInteractive>,
     /// optional `[tools]` — argv injected into EVERY argv this file produces
     /// (see [`inject_tool_args`]).
     #[serde(default)]
@@ -319,8 +343,10 @@ fn parse_isolation(raw: Option<RawIsolation>, origin: &str) -> Result<IsolationS
         .broker
         .map(|broker| match broker.as_str() {
             "codex-responses" => Ok(BrokerKind::CodexResponses),
+            "anthropic-messages" => Ok(BrokerKind::AnthropicMessages),
             other => Err(format!(
-                "{origin}: isolation.broker {other:?} is unsupported (want codex-responses)"
+                "{origin}: isolation.broker {other:?} is unsupported \
+                 (want codex-responses | anthropic-messages)"
             )),
         })
         .transpose()?;
@@ -427,6 +453,15 @@ struct RawOutput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTools {
+    args: Vec<String>,
+}
+
+/// the on-disk `[interactive]` shape — a dumb serde mirror. `args` defaults to
+/// empty (a bare TUI launch); unknown fields fail loud like the rest.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInteractive {
+    #[serde(default)]
     args: Vec<String>,
 }
 
@@ -599,6 +634,7 @@ impl CapabilitySpec {
                 rw_dirs,
                 isolation,
                 context,
+                interactive: raw.interactive.map(|i| InteractiveSpec { args: i.args }),
             },
             raw.variants,
             raw.tools.map(|t| t.args).unwrap_or_default(),
@@ -881,6 +917,17 @@ resume_args_append = ["--resume", "{{session_id}}"]
         let spec = CapabilitySpec::parse(&valid, "t").unwrap();
         assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(spec.isolation.broker, Some(BrokerKind::CodexResponses));
+
+        // the Anthropic broker is a distinct closed-set member (Claude Code).
+        let claude = valid
+            .replace("CODEX_HOME", "CLAUDE_CONFIG_DIR")
+            .replace("codex-responses", "anthropic-messages");
+        let spec = CapabilitySpec::parse(&claude, "t").unwrap();
+        assert_eq!(
+            spec.isolation.config_home_env.as_deref(),
+            Some("CLAUDE_CONFIG_DIR")
+        );
+        assert_eq!(spec.isolation.broker, Some(BrokerKind::AnthropicMessages));
 
         // a broker is host CODE: an unknown name must never degrade to "no
         // broker" (that would hand the child the operator's credential), and a

@@ -11,6 +11,9 @@ version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 axum = "0.8"
+# StreamExt for the Anthropic broker's SSE passthrough (reqwest bytes_stream →
+# axum Body::from_stream, never buffered) — see src/broker.rs.
+futures = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
@@ -24,7 +27,9 @@ sha2 = { workspace = true }
 # the capability spec format: executors are described by TOML files (embedded
 # defaults + operator dir), not Rust — see src/spec.rs and docs/records/specs/capability-spec.md.
 toml = "0.8"
-tokio = { workspace = true, features = ["process", "io-util"] }
+# "net" pulls in tokio::io::unix::AsyncFd — the async wrapper around the
+# interactive session's pty master (see src/interactive.rs).
+tokio = { workspace = true, features = ["process", "io-util", "net"] }
 tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
