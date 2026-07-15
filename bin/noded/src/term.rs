@@ -195,6 +195,15 @@ impl TermRing {
         self.push(&event.session, event.chunk_b64, false);
     }
 
+    /// append a chunk from THIS node's pump WITHOUT forwarding it to peers — the
+    /// SINGLE-session path. A single session is the solo, node-local terminal:
+    /// its output rings + wakes local ws subscribers exactly like `append`, but
+    /// is never fanned out, so a private terminal's bytes never leave the host.
+    /// Only a Shared session (the huddle-style path) forwards.
+    pub fn append_local_only(&self, session: &str, chunk_b64: String) {
+        self.push(session, chunk_b64, false);
+    }
+
     fn push(&self, session: &str, chunk_b64: String, publish: bool) {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
         inner.version += 1;
@@ -659,7 +668,7 @@ impl TerminalSessions {
                     _reaper_cancel: cancel_tx,
                 },
             );
-        self.spawn_pump(id.clone(), session.clone());
+        self.spawn_pump(id.clone(), session.clone(), mode);
         // the ordered command lane exists only for a Shared session; a Single
         // session drives the pty with raw keystrokes (no lane, no consumer).
         if mode == SessionMode::Shared {
@@ -675,9 +684,12 @@ impl TerminalSessions {
 
     /// the pump: copy pty output into the ring + broadcast until EOF, then
     /// clean the session up. One task per session.
-    fn spawn_pump(&self, id: String, session: Arc<InteractiveSession>) {
+    fn spawn_pump(&self, id: String, session: Arc<InteractiveSession>, mode: SessionMode) {
         let manager = self.clone();
         let ring = self.0.ring.clone();
+        // only a Shared session fans its output out to peers; a Single session
+        // stays node-local (rings + local ws only).
+        let forward = mode == SessionMode::Shared;
         tokio::spawn(async move {
             let mut buf = vec![0u8; TERM_READ_BUF];
             loop {
@@ -686,7 +698,12 @@ impl TerminalSessions {
                     Ok(0) => break,
                     Ok(n) => {
                         // never log the bytes — only their count.
-                        ring.append(&id, STANDARD.encode(&buf[..n]));
+                        let chunk = STANDARD.encode(&buf[..n]);
+                        if forward {
+                            ring.append(&id, chunk);
+                        } else {
+                            ring.append_local_only(&id, chunk);
+                        }
                         tracing::trace!(target: "ducktape::term", session = %id, bytes = n, "term_output");
                     }
                     Err(err) => {
@@ -1073,6 +1090,18 @@ mod tests {
         let (rows, _) = ring.read_after("00000000deadbeef", 0, 8);
         assert_eq!(rows.len(), 2);
         assert_eq!(STANDARD.decode(&rows[1].1).unwrap(), b"yo");
+        // a SINGLE session's pump append rings + wakes local ws but does NOT
+        // publish — a solo terminal's bytes never leave the host node.
+        ring.append_local_only("00000000deadbeef", STANDARD.encode(b"solo"));
+        assert!(
+            matches!(
+                appends.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "append_local_only must not publish to peers"
+        );
+        let (rows, _) = ring.read_after("00000000deadbeef", 0, 8);
+        assert_eq!(rows.len(), 3, "the solo chunk still rings locally");
     }
 
     #[test]
