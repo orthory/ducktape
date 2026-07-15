@@ -4,7 +4,7 @@
 // codex, its topic is subscribed, base64 output chunks decode onto the terminal,
 // and keystrokes encode back as termInput.
 
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ConsoleContext } from "../../console/store/context";
@@ -21,6 +21,7 @@ import { makeTransportStub } from "../transport-stub";
 const xterm = vi.hoisted(() => ({
   writes: [] as (Uint8Array | string)[],
   dataCb: null as null | ((d: string) => void),
+  disposes: 0,
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -44,6 +45,7 @@ vi.mock("@xterm/xterm", () => ({
       // a disposed terminal has no data callback — lets a test observe that the
       // raw keystroke path is left UNWIRED after a mode switch to shared.
       xterm.dataCb = null;
+      xterm.disposes += 1;
     }
   },
 }));
@@ -58,8 +60,10 @@ vi.mock("@xterm/addon-fit", () => ({
 import { TerminalView } from "../../console/views/terminal/TerminalView";
 
 afterEach(() => {
+  cleanup();
   xterm.writes.length = 0;
   xterm.dataCb = null;
+  xterm.disposes = 0;
   vi.restoreAllMocks();
 });
 
@@ -119,7 +123,12 @@ describe("terminal surface", () => {
 
     // server output: a base64 chunk decodes onto the terminal.
     await act(async () => {
-      handlers!.onTermChunk!(btoa("hi"));
+      handlers!.onTermChunk!({
+        type: "event",
+        topic: "term:s1",
+        cursor: "1",
+        item: btoa("hi"),
+      });
     });
     const lastWrite = xterm.writes[xterm.writes.length - 1] as Uint8Array;
     expect(new TextDecoder().decode(lastWrite)).toBe("hi");
@@ -192,5 +201,49 @@ describe("terminal surface", () => {
     expect(screen.getByText("1")).toBeInTheDocument();
     expect(screen.getByText("ext:alice")).toBeInTheDocument();
     expect(screen.getByText("whoami")).toBeInTheDocument();
+  });
+
+  it("closes instead of rendering an unreconstructable lagged tail", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    let handlers: TopicHandlers | null = null;
+    const unsubscribe = vi.fn();
+    const subscribe = vi.fn((_topics: string[], next: TopicHandlers) => {
+      handlers = next;
+      return unsubscribe;
+    });
+    const closeTermSession = vi.fn().mockResolvedValue(undefined);
+    const transport = makeTransportStub({
+      subscribe,
+      createTermSession: vi
+        .fn()
+        .mockResolvedValue({ sessionId: "s1", topic: "term:s1" }),
+      closeTermSession,
+      sendTerm: vi.fn(),
+    });
+
+    await act(async () => {
+      render(
+        <ConsoleContext.Provider value={{ transport } as unknown as ConsoleContextValue}>
+          <TerminalView />
+        </ConsoleContext.Provider>,
+      );
+    });
+    await waitFor(() => expect(subscribe).toHaveBeenCalled());
+
+    await act(async () => handlers!.onLagged!("term:s1", "9"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Terminal output history expired",
+    );
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(closeTermSession).toHaveBeenCalledTimes(1);
+    expect(closeTermSession).toHaveBeenCalledWith("s1");
+    expect(xterm.disposes).toBe(1);
   });
 });

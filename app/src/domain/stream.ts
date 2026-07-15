@@ -57,11 +57,13 @@ export type TermClientMsg =
   | { op: "termCommand"; session: string; text: string; origin: string };
 
 /** A terminal output chunk: an event frame on a `term:` topic whose `item` is
- *  base64 of raw terminal bytes. Distinct from the op-carrying `EventFrame`
- *  (no `op`), so the transport routes it separately. */
+ *  base64 of raw terminal bytes and whose `cursor` resumes the byte ring
+ *  without replay. Distinct from the op-carrying `EventFrame` (no `op`), so
+ *  the transport routes it separately. */
 export interface TermChunkFrame {
   type: "event";
   topic: string;
+  cursor: string;
   item: string;
 }
 
@@ -120,6 +122,7 @@ export const isTermChunkFrame = (value: unknown): value is TermChunkFrame =>
   value.type === "event" &&
   hasString(value, "topic") &&
   (value.topic as string).startsWith(TERM_TOPIC_PREFIX) &&
+  hasString(value, "cursor") &&
   hasString(value, "item");
 
 export const isTermCommandLogFrame = (value: unknown): value is TermCommandLogFrame =>
