@@ -289,8 +289,8 @@ fn interactive_argv(
 }
 
 /// allocate a pseudo-terminal via the POSIX path (`posix_openpt` + `grantpt` +
-/// `unlockpt` + `ptsname_r` + `open`), so this needs no `libutil` link the way
-/// `openpty` would. Returns `(master, slave)`.
+/// `unlockpt` + a platform slave-name lookup + `open`), so this needs no
+/// `libutil` link the way `openpty` would. Returns `(master, slave)`.
 fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
     // SAFETY: posix_openpt allocates a master pty; O_NOCTTY keeps it from
     // becoming this process's controlling terminal.
@@ -309,12 +309,8 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
         return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
     }
     let mut name = [0 as libc::c_char; 256];
-    // SAFETY: `name` is a 256-byte buffer; ptsname_r writes the NUL-terminated
-    // slave path into it.
-    if unsafe { libc::ptsname_r(mfd, name.as_mut_ptr(), name.len()) } != 0 {
-        return Err(format!("ptsname_r: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: `name` is NUL-terminated by ptsname_r.
+    pty_slave_name(mfd, &mut name)?;
+    // SAFETY: `name` is NUL-terminated by the platform slave-name lookup.
     let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
     if slave < 0 {
         return Err(format!("open pty slave: {}", std::io::Error::last_os_error()));
@@ -334,6 +330,31 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
     // SAFETY: mfd is a live master pty; &ws is a valid winsize.
     unsafe { libc::ioctl(mfd, libc::TIOCSWINSZ, &ws) };
     Ok((master, slave))
+}
+
+#[cfg(target_os = "macos")]
+fn pty_slave_name(mfd: libc::c_int, name: &mut [libc::c_char]) -> Result<(), String> {
+    // macOS has no ptsname_r. TIOCPTYGNAME is its thread-safe kernel interface
+    // for copying the slave path into a caller-owned MAXPATHLEN-sized buffer.
+    // SAFETY: mfd is a live master pty and `name` provides 256 writable bytes,
+    // the buffer size encoded by TIOCPTYGNAME.
+    if unsafe { libc::ioctl(mfd, libc::TIOCPTYGNAME.into(), name.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "ioctl TIOCPTYGNAME: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pty_slave_name(mfd: libc::c_int, name: &mut [libc::c_char]) -> Result<(), String> {
+    // SAFETY: `name` is a writable buffer; ptsname_r writes the NUL-terminated
+    // slave path into it.
+    if unsafe { libc::ptsname_r(mfd, name.as_mut_ptr(), name.len()) } != 0 {
+        return Err(format!("ptsname_r: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// mark `fd` non-blocking (`O_NONBLOCK` on the open file description, which its
