@@ -5,13 +5,31 @@ set -euo pipefail
 
 app="${1:?usage: check-macos-cef-bundle.sh /path/to/Ducktape.app}"
 contents="$app/Contents"
-framework="$contents/Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework"
-resources="$contents/Frameworks/Chromium Embedded Framework.framework/Resources"
-sandbox="$contents/Frameworks/Chromium Embedded Framework.framework/Libraries/libcef_sandbox.dylib"
+framework_root="$contents/Frameworks/Chromium Embedded Framework.framework"
+framework="$framework_root/Chromium Embedded Framework"
+resources="$framework_root/Resources"
+libraries="$framework_root/Libraries"
 
 fail() {
   echo "[cef-bundle] invalid $app: $*" >&2
   exit 1
+}
+
+require_exact_files() {
+  local directory="$1" label="$2"
+  shift 2
+  local expected actual path
+  expected="$(printf '%s\n' "$@" | LC_ALL=C sort)"
+  actual="$(
+    for path in "$directory"/*; do
+      [ -f "$path" ] && basename "$path"
+    done | LC_ALL=C sort
+  )"
+  [ "$actual" = "$expected" ] \
+    || fail "$label files differ from the pinned CEF M147 distribution"
+  for path in "$@"; do
+    [ -s "$directory/$path" ] || fail "$label/$path is empty"
+  done
 }
 
 version_not_newer_than() {
@@ -47,8 +65,27 @@ check_macos_minimum() {
 [ -x "$contents/MacOS/ducktape-node" ] || fail "missing node sidecar"
 [ -f "$contents/Resources/ducktape.icns" ] || fail "missing application icon"
 [ -f "$framework" ] || fail "missing Chromium Embedded Framework"
-[ -f "$sandbox" ] || fail "missing CEF macOS sandbox library"
-[ -f "$resources/icudtl.dat" ] || fail "missing CEF ICU resource icudtl.dat"
+case "$(uname -m)" in
+  arm64) v8_snapshot="v8_context_snapshot.arm64.bin" ;;
+  x86_64) v8_snapshot="v8_context_snapshot.x86_64.bin" ;;
+  *) fail "unsupported host architecture $(uname -m)" ;;
+esac
+require_exact_files "$libraries" "CEF Libraries" \
+  libEGL.dylib \
+  libGLESv2.dylib \
+  libcef_sandbox.dylib \
+  libvk_swiftshader.dylib \
+  vk_swiftshader_icd.json
+require_exact_files "$resources" "CEF top-level Resources" \
+  Info.plist \
+  chrome_100_percent.pak \
+  chrome_200_percent.pak \
+  gpu_shader_cache.bin \
+  icudtl.dat \
+  resources.pak \
+  "$v8_snapshot"
+[ -s "$resources/en.lproj/locale.pak" ] || fail "missing or empty CEF English locale resource"
+plutil -lint "$resources/Info.plist" >/dev/null || fail "invalid CEF framework Info.plist"
 
 macho_count=0
 while IFS= read -r -d '' candidate; do
@@ -115,7 +152,7 @@ for suffix in "" " (Alerts)" " (GPU)" " (Plugin)" " (Renderer)"; do
     plutil -extract "$key" raw "$helper_contents/Info.plist" >/dev/null \
       || fail "$helper.app is missing $key"
   done
-  helper_entitlements="$(codesign -d --entitlements :- "$helper_contents" 2>/dev/null || true)"
+  helper_entitlements="$(codesign -d --entitlements :- "$helper_exe" 2>/dev/null || true)"
   grep -q 'com.apple.security.device.camera' <<<"$helper_entitlements" \
     || fail "$helper.app is missing its camera entitlement"
   grep -q 'com.apple.security.device.audio-input' <<<"$helper_entitlements" \

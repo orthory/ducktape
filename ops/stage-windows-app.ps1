@@ -1,5 +1,5 @@
 # Stage CEF's sandbox-owning bootstrap, the iced client DLL, node sidecar, and
-# the exact CEF runtime copied beside them by cef-dll-sys. The result is a
+# the exact Cargo.lock-pinned CEF runtime. The result is a
 # relocatable directory plus a portable zip; -Install also installs it for the
 # current user and refreshes the Start-menu shortcut.
 [CmdletBinding()]
@@ -17,23 +17,134 @@ Set-Location $repo
 $targetDir = Join-Path $repo "target\$Configuration"
 $bundleRoot = Join-Path $targetDir "bundle\windows"
 $stage = Join-Path $bundleRoot "Ducktape"
-$bootstrapSource = Join-Path $targetDir "bootstrap.exe"
 $clientSource = Join-Path $targetDir "ducktape_iced.dll"
 $nodeSource = Join-Path $targetDir "ducktape-node.exe"
 $manifestSource = Join-Path $repo "app\src-iced\assets\windows\Ducktape.exe.manifest"
 $iconSource = Join-Path $repo "app\src-iced\assets\icons\icon.ico"
 
+$lock = Get-Content -LiteralPath (Join-Path $repo "Cargo.lock") -Raw
+$cefLockMatch = [regex]::Match(
+    $lock,
+    '(?ms)^\[\[package\]\]\r?\nname = "cef"\r?\nversion = "([^"]+)"'
+)
+if (-not $cefLockMatch.Success) {
+    throw "[windows-app] could not resolve the cef package from Cargo.lock"
+}
+$cefPackageVersion = $cefLockMatch.Groups[1].Value
+$cefDistributions = @{
+    # Keep this identity in lockstep with cef-dll-sys' generated CEF_VERSION.
+    "148.0.0+147.0.10" = "147.0.10+gd58e84d+chromium-147.0.7727.118"
+}
+$cefDistribution = $cefDistributions[$cefPackageVersion]
+if ([string]::IsNullOrWhiteSpace($cefDistribution)) {
+    throw "[windows-app] Cargo.lock pins unsupported cef $cefPackageVersion; audit and allowlist its exact distribution"
+}
+$cefVersion = ($cefPackageVersion -split '\+', 2)[1]
+
+$nativeArchitecture = if (-not [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
+    $env:PROCESSOR_ARCHITEW6432
+} else {
+    $env:PROCESSOR_ARCHITECTURE
+}
+switch ($nativeArchitecture.ToUpperInvariant()) {
+    "AMD64" {
+        $cefArchitecture = "x86_64"
+        $archivePlatform = "windows64"
+        $archiveSha1 = "af0bd26423b06c5f3f172c66bfef466f035ea3e1"
+    }
+    "ARM64" {
+        $cefArchitecture = "aarch64"
+        $archivePlatform = "windowsarm64"
+        $archiveSha1 = "497c116d8347729cb0499abf941b7178fc254023"
+    }
+    "X86" {
+        $cefArchitecture = "x86"
+        $archivePlatform = "windows32"
+        $archiveSha1 = "0efda7a995f22c90147bf3ed0ad0ab0968c0e721"
+    }
+    default { throw "[windows-app] unsupported native architecture $nativeArchitecture" }
+}
+
+$cefPath = if ([string]::IsNullOrWhiteSpace($env:CEF_PATH)) {
+    Join-Path $HOME ".local\share\cef"
+} else {
+    $env:CEF_PATH
+}
+$cefSource = Join-Path (Join-Path $cefPath $cefVersion) "cef_windows_$cefArchitecture"
+$archiveMetadata = Join-Path $cefSource "archive.json"
+if (-not (Test-Path -LiteralPath $archiveMetadata -PathType Leaf)) {
+    throw "[windows-app] exact CEF distribution metadata is missing: $archiveMetadata"
+}
+$archive = Get-Content -LiteralPath $archiveMetadata -Raw | ConvertFrom-Json
+$expectedArchive = "cef_binary_${cefDistribution}_${archivePlatform}_minimal.tar.bz2"
+if ($archive.type -ne "minimal" -or $archive.name -ne $expectedArchive -or $archive.sha1 -ne $archiveSha1) {
+    throw "[windows-app] $cefSource is not the exact Cargo.lock-pinned CEF distribution ($expectedArchive)"
+}
+
+$bootstrapSource = Join-Path $cefSource "bootstrap.exe"
+$cefRuntimeFiles = @(
+    "chrome_elf.dll",
+    "d3dcompiler_47.dll",
+    "libcef.dll",
+    "libEGL.dll",
+    "libGLESv2.dll",
+    "v8_context_snapshot.bin",
+    "vk_swiftshader.dll",
+    "vk_swiftshader_icd.json",
+    "vulkan-1.dll"
+)
+if ($cefArchitecture -ne "x86") {
+    $cefRuntimeFiles += @("dxil.dll", "dxcompiler.dll")
+}
+$cefResourceFiles = @(
+    "chrome_100_percent.pak",
+    "chrome_200_percent.pak",
+    "resources.pak",
+    "icudtl.dat"
+)
+$localesSource = Join-Path $cefSource "locales"
+$cefLocaleBases = @(
+    "af", "am", "ar", "bg", "bn", "ca", "cs", "da", "de", "el",
+    "en-GB", "en-US", "es-419", "es", "et", "fa", "fi", "fil", "fr", "gu",
+    "he", "hi", "hr", "hu", "id", "it", "ja", "kn", "ko", "lt", "lv",
+    "ml", "mr", "ms", "nb", "nl", "pl", "pt-BR", "pt-PT", "ro", "ru",
+    "sk", "sl", "sr", "sv", "sw", "ta", "te", "th", "tr", "uk", "ur",
+    "vi", "zh-CN", "zh-TW"
+)
+$cefLocaleFiles = @(
+    foreach ($base in $cefLocaleBases) {
+        "$base.pak"
+        "${base}_FEMININE.pak"
+        "${base}_MASCULINE.pak"
+        "${base}_NEUTER.pak"
+    }
+)
+$cefLocaleFiles = @($cefLocaleFiles | Sort-Object -Unique)
+
 if ($Install -and $Configuration -ne "release") {
     throw "[windows-app] refusing to install a non-release build"
 }
 
-foreach ($required in @($bootstrapSource, $clientSource, $nodeSource, $manifestSource, $iconSource)) {
+foreach ($required in @($bootstrapSource, $clientSource, $nodeSource, $manifestSource, $iconSource) +
+    ($cefRuntimeFiles | ForEach-Object { Join-Path $cefSource $_ }) +
+    ($cefResourceFiles | ForEach-Object { Join-Path $cefSource $_ })) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "[windows-app] missing $required; build the iced --lib and node targets first"
     }
     if ((Get-Item -LiteralPath $required).Length -eq 0) {
         throw "[windows-app] refusing empty artifact $required"
     }
+}
+if (-not (Test-Path -LiteralPath $localesSource -PathType Container) -or
+    -not (Test-Path -LiteralPath (Join-Path $localesSource "en-US.pak") -PathType Leaf)) {
+    throw "[windows-app] exact CEF locale set is missing from $localesSource"
+}
+$sourceLocaleDirectories = @(Get-ChildItem -LiteralPath $localesSource -Directory)
+$sourceLocales = @(Get-ChildItem -LiteralPath $localesSource -File)
+$sourceLocaleFiles = @($sourceLocales | ForEach-Object { $_.Name } | Sort-Object -Unique)
+$localeDifferences = @(Compare-Object $cefLocaleFiles $sourceLocaleFiles)
+if ($sourceLocaleDirectories.Count -ne 0 -or $localeDifferences.Count -ne 0) {
+    throw "[windows-app] CEF locales differ from the exact M147 allowlist: $($localeDifferences | Out-String)"
 }
 
 $manifest = Get-Content -LiteralPath $manifestSource -Raw
@@ -55,6 +166,10 @@ Copy-Item -LiteralPath $clientSource -Destination (Join-Path $stage "Ducktape.dl
 Copy-Item -LiteralPath $nodeSource -Destination (Join-Path $stage "ducktape-node.exe")
 Copy-Item -LiteralPath $manifestSource -Destination (Join-Path $stage "Ducktape.exe.manifest")
 Copy-Item -LiteralPath $iconSource -Destination (Join-Path $stage "Ducktape.ico")
+foreach ($runtime in $cefRuntimeFiles + $cefResourceFiles) {
+    Copy-Item -LiteralPath (Join-Path $cefSource $runtime) -Destination $stage
+}
+Copy-Item -LiteralPath $localesSource -Destination $stage -Recurse
 
 $stagedExe = Join-Path $stage "Ducktape.exe"
 & $mt.Source "-nologo" "-manifest" $manifestSource "-outputresource:$stagedExe;#1"
@@ -73,58 +188,59 @@ if ($effective -notmatch 'requestedExecutionLevel\s+level="asInvoker"' -or
     throw "[windows-app] Ducktape.exe's effective manifest is not rootless"
 }
 
-# cef-dll-sys copies the target-specific distribution to the Cargo target. Copy
-# runtime-shaped files rather than a version-specific list: CEF occasionally
-# adds a graphics DLL, while build metadata and SDK sources must never ship.
-$runtimePatterns = @("*.dll", "*.bin", "*.dat", "*.pak")
-foreach ($pattern in $runtimePatterns) {
-    Get-ChildItem -LiteralPath $targetDir -Filter $pattern -File | ForEach-Object {
-        # The Rust cdylib must only appear under the bootstrap's matching name.
-        if ($_.Name -ne "ducktape_iced.dll") {
-            Copy-Item -LiteralPath $_.FullName -Destination $stage
-        }
-    }
-}
-foreach ($runtimeJson in @("vk_swiftshader_icd.json")) {
-    $source = Join-Path $targetDir $runtimeJson
-    if (Test-Path -LiteralPath $source -PathType Leaf) {
-        Copy-Item -LiteralPath $source -Destination $stage
-    }
-}
-
-$locales = Join-Path $targetDir "locales"
-if (-not (Test-Path -LiteralPath $locales -PathType Container)) {
-    throw "[windows-app] CEF locales are missing from $targetDir"
-}
-Copy-Item -LiteralPath $locales -Destination $stage -Recurse
-
-foreach ($required in @(
+$appFiles = @(
     "Ducktape.exe",
     "Ducktape.dll",
+    "ducktape-node.exe",
     "Ducktape.exe.manifest",
-    "Ducktape.ico",
-    "libcef.dll",
-    "chrome_elf.dll",
-    "icudtl.dat",
-    "resources.pak",
-    "v8_context_snapshot.bin",
-    "locales\en-US.pak"
-)) {
+    "Ducktape.ico"
+)
+$expectedTopLevelFiles = @($appFiles + $cefRuntimeFiles + $cefResourceFiles)
+$expectedTopLevelFiles = @($expectedTopLevelFiles | Sort-Object -Unique)
+foreach ($required in $expectedTopLevelFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $stage $required) -PathType Leaf)) {
-        throw "[windows-app] required CEF runtime file is missing: $required"
+        throw "[windows-app] required staged file is missing: $required"
     }
 }
-
-if (Test-Path -LiteralPath (Join-Path $stage "ducktape_iced.dll") -PathType Leaf) {
-    throw "[windows-app] unrenamed Rust client DLL escaped into the package"
+$actualTopLevelFiles = @(Get-ChildItem -LiteralPath $stage -File | ForEach-Object { $_.Name } | Sort-Object -Unique)
+$unexpectedFiles = @(Compare-Object $expectedTopLevelFiles $actualTopLevelFiles)
+if ($unexpectedFiles.Count -ne 0) {
+    throw "[windows-app] staged top-level files differ from the M147 allowlist: $($unexpectedFiles | Out-String)"
+}
+$actualTopLevelDirectories = @(Get-ChildItem -LiteralPath $stage -Directory | ForEach-Object { $_.Name })
+if ($actualTopLevelDirectories.Count -ne 1 -or $actualTopLevelDirectories[0] -ne "locales") {
+    throw "[windows-app] staged top-level directories differ from the allowlist (locales only)"
 }
 
 foreach ($pair in @(
-    [PSCustomObject]@{ Source = $clientSource; Staged = (Join-Path $stage "Ducktape.dll") }
+    [PSCustomObject]@{ Source = $clientSource; Staged = (Join-Path $stage "Ducktape.dll") },
+    [PSCustomObject]@{ Source = $nodeSource; Staged = (Join-Path $stage "ducktape-node.exe") }
 )) {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $pair.Source).Hash -ne
         (Get-FileHash -Algorithm SHA256 -LiteralPath $pair.Staged).Hash) {
-        throw "[windows-app] staged bootstrap/client identity check failed"
+        throw "[windows-app] staged app artifact identity check failed"
+    }
+}
+foreach ($runtime in $cefRuntimeFiles + $cefResourceFiles) {
+    $source = Join-Path $cefSource $runtime
+    $staged = Join-Path $stage $runtime
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -ne
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash) {
+        throw "[windows-app] staged CEF identity check failed: $runtime"
+    }
+}
+$stagedLocalesRoot = Join-Path $stage "locales"
+$stagedLocales = @(Get-ChildItem -LiteralPath $stagedLocalesRoot -File -Recurse)
+if ($sourceLocales.Count -ne $stagedLocales.Count) {
+    throw "[windows-app] staged locale count differs from the exact CEF distribution"
+}
+foreach ($sourceLocale in $sourceLocales) {
+    $relative = $sourceLocale.FullName.Substring($localesSource.Length).TrimStart([char[]]'\/')
+    $stagedLocale = Join-Path $stagedLocalesRoot $relative
+    if (-not (Test-Path -LiteralPath $stagedLocale -PathType Leaf) -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceLocale.FullName).Hash -ne
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedLocale).Hash) {
+        throw "[windows-app] staged CEF locale identity check failed: $relative"
     }
 }
 
@@ -161,12 +277,20 @@ if ($signed) {
 }
 
 Write-Host "[windows-app] staged sandbox bootstrap + client DLL at $stage"
+$archiveBase = "Ducktape-windows-$nativeArchitecture"
+foreach ($staleBase in @($archiveBase, "Ducktape-windows-$env:PROCESSOR_ARCHITECTURE") | Sort-Object -Unique) {
+    foreach ($staleZip in @(
+        (Join-Path $bundleRoot "$staleBase.zip"),
+        (Join-Path $bundleRoot "$staleBase-unsigned.zip")
+    )) {
+        if (Test-Path -LiteralPath $staleZip) {
+            Remove-Item -LiteralPath $staleZip -Force
+        }
+    }
+}
 if (-not $NoArchive) {
     $suffix = if ($signed) { "" } else { "-unsigned" }
-    $zip = Join-Path $bundleRoot "Ducktape-windows-$env:PROCESSOR_ARCHITECTURE$suffix.zip"
-    if (Test-Path -LiteralPath $zip) {
-        Remove-Item -LiteralPath $zip -Force
-    }
+    $zip = Join-Path $bundleRoot "$archiveBase$suffix.zip"
     Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
     Write-Host "[windows-app] packed $zip"
 }

@@ -162,8 +162,13 @@ done
 codesign "${sign_args[@]}" --entitlements "$entitlements" "$app"
 echo "[macos-app] staged $app ($signing_label signature)"
 if [ "$profile" = release ]; then
-  archive="$build_dir/bundle/macos/Ducktape-macos-$(uname -m).zip"
-  rm -f "$archive"
+  archive_base="$build_dir/bundle/macos/Ducktape-macos-$(uname -m)"
+  if [ -n "$sign_identity" ]; then
+    archive="$archive_base.zip"
+  else
+    archive="$archive_base-unsigned.zip"
+  fi
+  rm -f "$archive_base.zip" "$archive_base-unsigned.zip"
   ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
   if [ -n "$notary_profile" ]; then
     xcrun notarytool submit "$archive" --keychain-profile "$notary_profile" --wait

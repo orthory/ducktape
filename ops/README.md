@@ -33,13 +33,13 @@ CEF payload. Platform staging lives in `stage-macos-iced-app.sh`,
 executable: its sibling sidecar and CEF resources are part of the package
 contract.
 
-Windows staging must run in an MSVC/Windows SDK environment where `mt.exe` is
-on `PATH`; the script embeds the `asInvoker` manifest in the bootstrap PE and
-reads it back before packaging.
+Windows staging must run in an MSVC/Windows SDK environment with CMake, Ninja,
+and `mt.exe` on `PATH`; the script embeds the `asInvoker` manifest in the
+bootstrap PE and reads it back before packaging.
 
-macOS local builds are ad-hoc signed and require macOS 14 or newer. A
-direct-distribution release requires both a Developer ID Application identity
-and a notarytool keychain profile:
+macOS local builds are ad-hoc signed, use an explicitly `-unsigned` release ZIP,
+and require macOS 14 or newer. A direct-distribution release requires both a
+Developer ID Application identity and a notarytool keychain profile:
 
 ```bash
 DUCKTAPE_MACOS_SIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \

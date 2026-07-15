@@ -36,8 +36,48 @@ cleanup() {
 }
 trap cleanup EXIT
 
-HOME="$tmp_home" "$binary" >"$tmp_home/app.log" 2>&1 &
-pid=$!
+bundle_pid() {
+  osascript <<'APPLESCRIPT'
+tell application "System Events"
+  set matches to every application process whose bundle identifier is "com.ducktape.app"
+  if (count of matches) is 0 then return ""
+  if (count of matches) is greater than 1 then error "multiple Ducktape application processes"
+  return unix id of item 1 of matches
+end tell
+APPLESCRIPT
+}
+
+if ! existing_pid="$(bundle_pid 2>"$tmp_home/osascript.log")"; then
+  echo "[macos-smoke] System Events could not inspect running apps; grant Accessibility permission to this terminal" >&2
+  cat "$tmp_home/osascript.log" >&2
+  exit 1
+fi
+if [ -n "$existing_pid" ]; then
+  echo "[macos-smoke] close the existing Ducktape instance (pid $existing_pid) before the cold-launch smoke" >&2
+  exit 1
+fi
+
+if ! open -n --env "HOME=$tmp_home" "$app" >"$tmp_home/open.log" 2>&1; then
+  echo "[macos-smoke] LaunchServices rejected the cold bundle launch" >&2
+  cat "$tmp_home/open.log" >&2
+  exit 1
+fi
+launch_deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$launch_deadline" ]; do
+  if ! pid="$(bundle_pid 2>"$tmp_home/osascript.log")"; then
+    echo "[macos-smoke] System Events could not identify the launched app" >&2
+    cat "$tmp_home/osascript.log" >&2
+    exit 1
+  fi
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && break
+  pid=""
+  sleep 0.25
+done
+if [ -z "$pid" ]; then
+  echo "[macos-smoke] LaunchServices did not produce a live Ducktape process" >&2
+  cat "$tmp_home/open.log" >&2
+  exit 1
+fi
 
 window_count() {
   osascript <<APPLESCRIPT
@@ -53,7 +93,7 @@ wait_for_windows() {
   local wanted="$1" deadline=$((SECONDS + 30)) count
   while [ "$SECONDS" -lt "$deadline" ]; do
     kill -0 "$pid" 2>/dev/null \
-      || { echo "[macos-smoke] app exited early" >&2; tail -40 "$tmp_home/app.log" >&2; return 1; }
+      || { echo "[macos-smoke] app exited early" >&2; cat "$tmp_home/open.log" >&2; return 1; }
     if ! count="$(window_count 2>"$tmp_home/osascript.log")"; then
       echo "[macos-smoke] System Events could not inspect the app; grant Accessibility permission to this terminal" >&2
       cat "$tmp_home/osascript.log" >&2
@@ -63,7 +103,7 @@ wait_for_windows() {
     sleep 0.25
   done
   echo "[macos-smoke] expected $wanted window(s), got ${count:-unknown}" >&2
-  tail -40 "$tmp_home/app.log" >&2 || true
+  cat "$tmp_home/open.log" >&2 || true
   return 1
 }
 
