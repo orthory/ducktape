@@ -331,10 +331,12 @@ fn validate_decoded_delegations(
                 return Err("snapshot callee run points at a different delegation".into());
             }
         }
-        *roots.entry(&view.root_run_id).or_default() += 1;
+        if view.status == DelegationStatus::Pending {
+            *roots.entry(&view.root_run_id).or_default() += 1;
+        }
     }
     if roots.values().any(|count| *count > MAX_DELEGATIONS_PER_RUN) {
-        return Err("snapshot delegation tree exceeds its hard budget".into());
+        return Err("snapshot delegation tree exceeds its concurrency limit".into());
     }
     for pending_run in pending.values() {
         let Some(id) = pending_run.delegation_id.as_deref() else {

@@ -175,9 +175,9 @@ pub const RUN_LEASE_VIEWS: u64 = 1024;
 pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
 /// every peer-call callee requests this fixed sandbox profile. One root call
-/// tree admits at most `min(root_budget, 8)` callees in total, so the same cap
-/// bounds recursive delegated compute at `2*min(root_budget, 8)` cores and
-/// `4*min(root_budget, 8)` GiB.
+/// tree runs at most `min(root_budget, 8)` callees concurrently, so the same cap
+/// bounds live delegated compute at `2*min(root_budget, 8)` cores and
+/// `4*min(root_budget, 8)` GiB. completed calls release their slot.
 pub const DELEGATED_CHILD_CORES: u64 = 2;
 pub const DELEGATED_CHILD_MEM_GB: u64 = 4;
 

@@ -122,7 +122,7 @@ export function ResourceCapsFields({
           );
         })}
         <div>
-          <FieldLabel htmlFor={`${idPrefix}-subagentBudget`}>Peer-call budget</FieldLabel>
+          <FieldLabel htmlFor={`${idPrefix}-subagentBudget`}>Concurrent peer calls</FieldLabel>
           <input
             id={`${idPrefix}-subagentBudget`}
             type="number"
@@ -134,8 +134,8 @@ export function ResourceCapsFields({
             style={monoInputStyle}
           />
           <div style={{ marginTop: 5, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-            Total peer calls across the whole recursive call tree; 0 disables calls and the
-            runtime hard cap is 8.
+            Maximum live calls across the recursive call tree; completed calls release their slot.
+            0 disables calls and the runtime hard cap is 8.
           </div>
         </div>
       </div>

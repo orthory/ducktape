@@ -251,8 +251,9 @@ pub enum RunsMsg {
     /// become a second, wider permission vocabulary.
     AgentAction { run_id: String, action: AgentAction },
     /// Start one peer agent call while the caller is still running. The bound
-    /// session key authorizes the request; `subagent_budget` bounds the whole
-    /// root call tree, and the callee executes with caller ∩ callee authority.
+    /// session key authorizes the request; `subagent_budget` bounds concurrent
+    /// live calls across the root tree, and the callee executes with caller ∩
+    /// callee authority.
     DelegateRun {
         run_id: String,
         request_id: String,
@@ -265,7 +266,7 @@ pub enum RunsMsg {
 /// required byte length of a session key (an ed25519 public key).
 pub const SESSION_KEY_LEN: usize = 32;
 
-/// hard cap on the actions ONE session may apply — the mid-run peer of
+/// hard cap on writes and peer calls ONE session may apply — the mid-run peer of
 /// [`agent::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
 /// its budget can still RETURN a response; it just cannot keep writing.
 pub const MAX_ACTIONS_PER_SESSION: u32 = 32;

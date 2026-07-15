@@ -133,7 +133,7 @@ export function AgentDetail({
     ...(caps.tools ?? []).map((value) => `Tool: ${value}`),
     ...(caps.secrets ?? []).map((value) => `Secret: ${value}`),
     ...(caps.pages_write ?? []).map((value) => `Page write: ${value}`),
-    `Peer calls: ${caps.subagent_budget ?? 0}`,
+    `Concurrent peer calls: ${caps.subagent_budget ?? 0}`,
   ];
   return (
     <section aria-label="Agent detail" style={{ minWidth: 0 }}>

@@ -419,7 +419,7 @@ fn describe(cap: &CapRequest) -> String {
         CapRequest::Tool(t) => format!("invoking tool {t:?} (caps.tools)"),
         CapRequest::Secret(s) => format!("resolving secret {s:?} (caps.secrets)"),
         CapRequest::PagesWrite(p) => format!("writing page {p:?} (caps.pages_write)"),
-        CapRequest::SpawnSubagent => "spawning a sub-agent (caps.subagent_budget)".into(),
+        CapRequest::SpawnSubagent => "calling a peer agent (caps.subagent_budget)".into(),
     }
 }
 

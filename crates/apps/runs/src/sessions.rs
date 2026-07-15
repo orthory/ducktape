@@ -302,6 +302,11 @@ impl RunsModule {
                 ))
             };
         }
+        if session.actions >= MAX_ACTIONS_PER_SESSION {
+            return Err(Error::Module(format!(
+                "session for run {run_id} has spent its budget of {MAX_ACTIONS_PER_SESSION} actions"
+            )));
+        }
 
         if request.agent_id == entry.agent_id {
             return Err(Error::Module("an agent cannot call itself".into()));
@@ -365,14 +370,17 @@ impl RunsModule {
             .delegation_ids()
             .into_iter()
             .filter_map(|id| self.delegation(&id))
-            .filter(|state| state.view.root_run_id == root_run_id)
+            .filter(|state| {
+                state.view.root_run_id == root_run_id
+                    && state.view.status == DelegationStatus::Pending
+            })
             .count();
         let limit = usize::try_from(root.caps.subagent_budget)
             .unwrap_or(usize::MAX)
             .min(MAX_DELEGATIONS_PER_RUN);
         if spent >= limit {
             return Err(Error::Module(format!(
-                "delegation tree has spent its budget of {limit} calls"
+                "delegation tree has reached its concurrency limit of {limit} calls"
             )));
         }
 
@@ -432,7 +440,7 @@ impl RunsModule {
                 view: DelegationView {
                     delegation_id: delegation_id.clone(),
                     request_id,
-                    caller_run_id: run_id,
+                    caller_run_id: run_id.clone(),
                     root_run_id,
                     callee_run_id: callee_run_id.clone(),
                     callee_agent_id: callee.agent_id.clone(),
@@ -459,6 +467,13 @@ impl RunsModule {
             ]),
             Some(RunAuthority::from_record(&scoped_callee)),
             Some(delegation_id),
+        );
+        self.pending_sessions.insert(
+            run_id,
+            Some(AgentSession {
+                actions: session.actions + 1,
+                ..session
+            }),
         );
         Ok(())
     }

@@ -42,8 +42,8 @@ pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
 pub const MAX_DELEGATION_INSTRUCTION_BYTES: usize = 4 * 1024;
 
 /// hard cap on the serialized delegation batch. `subagent_budget` plus the
-/// fixed fan-out cap bound compute; this independently bounds replicated input
-/// bytes.
+/// fixed concurrent-call cap bound compute; this independently bounds
+/// replicated input bytes.
 pub const MAX_DELEGATIONS_BYTES: usize = 8 * 1024;
 
 /// hard cap on the children one final response may fan out to, independent of
@@ -183,8 +183,8 @@ pub struct ResourceCaps {
     /// literal entry `"*"` granting every page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages_write: Vec<String>,
-    /// the D3 sub-agent spawn ceiling; 0 = none. consumption is the runtime's
-    /// concern; the record only states the ceiling.
+    /// concurrent peer-call ceiling; 0 = none. completed calls release their
+    /// slot, and the runtime applies a smaller hard cap.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub subagent_budget: u32,
 }

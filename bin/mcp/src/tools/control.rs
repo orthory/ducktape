@@ -31,7 +31,7 @@ pub(super) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "ducktape_delegate",
-            description: "Call another registered agent while this run remains live. Agents stay peers; the callee receives caller ∩ callee authority. request_id is idempotent and the root agent's subagent_budget bounds the whole call tree.",
+            description: "Call another registered agent while this run remains live. Agents stay peers; the callee receives caller ∩ callee authority. request_id is idempotent and the root agent's subagent_budget bounds concurrent live calls across the whole call tree.",
             schema: || {
                 json!({
                     "type": "object",

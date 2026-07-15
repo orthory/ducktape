@@ -185,7 +185,7 @@ describe("AgentView", () => {
     expect(within(detail).getByText("Reply in chat")).toBeInTheDocument();
     expect(within(detail).getByText("Create tasks")).toBeInTheDocument();
     expect(within(detail).getByText("Forge read: ducktape")).toBeInTheDocument();
-    expect(within(detail).getByText("Peer calls: 2")).toBeInTheDocument();
+    expect(within(detail).getByText("Concurrent peer calls: 2")).toBeInTheDocument();
 
     fireEvent.click(within(detail).getByRole("button", { name: /pause agent/i }));
     expect(spies.pauseAgent).toHaveBeenCalledWith("summarizer");
@@ -529,7 +529,7 @@ describe("AgentView", () => {
       ["Allowed tool IDs", "browser.search"],
       ["Secret references", "vault/github"],
       ["Page write access", "page-1 *"],
-      ["Peer-call budget", "3"],
+      ["Concurrent peer calls", "3"],
     ]) {
       fireEvent.change(screen.getByLabelText(label), { target: { value } });
     }

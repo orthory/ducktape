@@ -204,7 +204,7 @@ fn a_live_session_calls_a_peer_and_collects_its_result_without_a_parent_record()
 }
 
 #[test]
-fn call_ids_are_idempotent_and_the_root_budget_is_global() {
+fn call_ids_are_idempotent_and_completed_calls_release_the_root_slot() {
     let (mut m, registry, caller_run) = with_open_delegating_session(1);
     let call = delegate(&caller_run, "one", "worker", "work");
     let mut first = session_ctx(
@@ -214,6 +214,7 @@ fn call_ids_are_idempotent_and_the_root_budget_is_global() {
     );
     exec(&mut m, &mut first, &call).unwrap();
     commit(&mut m);
+    assert_eq!(sessions(&m)[0].actions, 1);
 
     let mut replay = session_ctx(
         &registry,
@@ -222,6 +223,7 @@ fn call_ids_are_idempotent_and_the_root_budget_is_global() {
     );
     exec(&mut m, &mut replay, &call).unwrap();
     assert!(replay.dispatch_msgs().is_empty(), "same request is a no-op");
+    assert_eq!(sessions(&m)[0].actions, 1, "a replay spends nothing");
 
     let err = exec(
         &mut m,
@@ -230,9 +232,59 @@ fn call_ids_are_idempotent_and_the_root_budget_is_global() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, Error::Module(ref reason) if reason.contains("spent its budget")),
+        matches!(err, Error::Module(ref reason) if reason.contains("concurrency limit")),
         "{err:?}"
     );
+
+    // More than the concurrent hard cap may be admitted sequentially, and the
+    // completed result history must still round-trip while the root is live.
+    for index in 1..=MAX_DELEGATIONS_PER_RUN {
+        let callee_run = delegations(&m, &caller_run)
+            .into_iter()
+            .find(|call| call.status == DelegationStatus::Pending)
+            .unwrap()
+            .callee_run_id;
+        let mut result_ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut result_ctx,
+            &result_event(
+                &callee_run,
+                Ok(runner_wrapper("done", serde_json::json!({}))),
+            ),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let mut next = session_ctx(
+            &registry,
+            &caller_run,
+            Origin::External(SESSION_KEY.to_vec()),
+        );
+        exec(
+            &mut m,
+            &mut next,
+            &delegate(
+                &caller_run,
+                &format!("next-{index}"),
+                "worker",
+                "work",
+            ),
+        )
+        .unwrap();
+        assert_eq!(next.dispatch_msgs().len(), 1);
+        commit(&mut m);
+    }
+    assert_eq!(
+        sessions(&m)[0].actions,
+        (MAX_DELEGATIONS_PER_RUN + 1) as u32
+    );
+    let mut joiner = module();
+    joiner.install(&m.snapshot(), m.root()).unwrap();
 }
 
 #[test]

@@ -722,7 +722,7 @@ impl RunsModule {
             let mut scoped_child = parent.scoped_for_call(&child);
             // Legacy terminal delegation has no call edge with which to count a
             // recursive tree. Keep that compatibility lane to one final wave;
-            // live recursive calls use DelegateRun and its root-wide budget.
+            // live recursive calls use DelegateRun and its root-wide live-call cap.
             scoped_child.caps.subagent_budget = 0;
             // the parent CURATES library skills for this child, on top of the
             // child's own — confined to the library by construction (names, not
