@@ -122,7 +122,41 @@ keystroke sharing is chaos). Raw-keystroke `TermInput` stays for the SOLO case.
   drives an actual CLI end-to-end (as the shipped model-turn tests already do,
   now via the command lane).
 
+## Review findings (fold in as sharing lands)
+
+These surfaced re-reviewing the spec. #1/#2/#5 are real defects that become
+reachable once sessions are actually SHARED (PR 2/3), so PR 1 flags them and the
+implementation lands with the sharing:
+
+1. **Raw `TermInput` bypasses the ordered lane.** A command-lane session must
+   REJECT raw keystroke input — otherwise it hits the pty without a `seq`, log,
+   or attribution and the total-order guarantee is false. Raw input and the
+   command lane are **mutually exclusive per session** (raw = solo only).
+2. **The command lane needs a bound / backpressure.** An unbounded lane lets any
+   subscribed member flood commands, each burning model tokens — a spend +
+   memory DoS in a shared session. Bound it (+ per-member rate) when sharing
+   lands; the broker's coarse lifetime cap is only a backstop.
+5. **PR 1 `origin` is caller-supplied = SPOOFABLE.** The command log's
+   attribution is untrusted until PR 2 signs it via consensus. Nothing may trust
+   PR 1 origins.
+
+Framing (honesty, not defects):
+- The command-log ring in PR 1 is an in-memory, bounded, VOLATILE broadcast ring
+  — the durable shared-conversation object is the PR 2 on-chain log, not this.
+- Consensus here is an **ordering + attribution + durability** service, NOT
+  state replication: the execution and conversation state stay on the host node,
+  non-deterministically. Validators agree on the *asks*, never the *answers*.
+- **Command grain is clean for prompt-submit only.** A rich TUI (approval
+  dialogs, modes, multi-line) does not cleanly decompose into "a command";
+  `text + \r` submits a line. That is a known rough edge, not a general remote
+  terminal.
+
 ## Non-goals (PR 1)
 
 - Consensus (PR 2), data-plane fan-out (PR 3), host failover, spend accounting,
   session ACL. Raw-keystroke `TermInput` stays unchanged for the solo case.
+- **PR 1 ships no user-visible shared session** — it is the command-lane SEAM
+  (a new op + `term-cmd:` topic + ordered consumer). Without data-plane fan-out
+  (PR 3) other-node members can't join; without consensus (PR 2) the order is
+  node-local arrival order, not trustless. It is an architectural linchpin, and
+  the app is not yet wired to use `TermCommand` — latent until PR 2/3.

@@ -158,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // <storage>). The manager shares the StreamHub's terminal ring so its pump
     // appends where the ws catch-up reads.
     let term_ring = handle.stream_hub().terminals();
+    let term_cmd_ring = handle.stream_hub().term_commands();
     let interactive = noded::term::discover_interactive(
         ORACLE_ORIGIN,
         capability_host::AgentDirs::under(&storage),
@@ -173,6 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         capability_host::execution_node_id(ORACLE_ORIGIN),
         storage.join("term-sessions"),
         term_ring,
+        term_cmd_ring,
     ));
     std::thread::Builder::new()
         .name("node-actor".into())
