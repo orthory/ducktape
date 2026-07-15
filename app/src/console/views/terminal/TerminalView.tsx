@@ -78,6 +78,11 @@ export function TerminalView() {
     let observer: ResizeObserver | null = null;
     let sessionId: string | null = null;
 
+    // each (re)created session is a fresh command log; clear any prior session's
+    // rows so a new session's seq (which restarts at 1) is not swallowed by the
+    // monotonic-seq dedupe below.
+    setCommands([]);
+
     create(AGENT, mode)
       .then((session) => {
         if (disposed) {
