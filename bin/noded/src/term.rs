@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -40,7 +41,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability_host::{AgentDirs, InteractiveSession, ProviderSet, RunContext, SandboxBackend};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::NodeHandle;
 
@@ -48,6 +49,16 @@ use crate::NodeHandle;
 /// on the operator's node burning the operator's subscription, so the ceiling
 /// is deliberately small; over it, create refuses rather than spawning.
 pub const MAX_TERM_SESSIONS: usize = 4;
+/// the hard wall-clock ceiling on any single session. A session is a human
+/// driving a CLI TUI, so 4h is a generous single working session; past it the
+/// session is force-closed no matter what. This is the backstop that makes a
+/// session non-immortal: the primary teardown is still explicit close on
+/// unmount, but if the app tab is killed (its `close` never runs) or an idle TUI
+/// is just left open, this timer guarantees the container + its slot are
+/// reclaimed instead of pinned forever. There is deliberately NO idle-timeout —
+/// a terminal is legitimately idle while a human reads (see the design's
+/// "no idle-timeout kill"); silence is not death, the wall clock is the bound.
+const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(4 * 60 * 60);
 /// how many bytes of (base64) scrollback each session keeps for catch-up.
 /// `ponytail:` fixed per-session cap; make it a config knob only if a real TUI
 /// redraw pattern proves it too small.
@@ -188,6 +199,16 @@ impl TermRing {
 #[derive(Clone)]
 pub struct TerminalSessions(Arc<Inner>);
 
+/// a live session plus the drop-guard that cancels its wall-clock reaper. When
+/// the entry leaves the map (`finish`), dropping `_reaper_cancel` resolves the
+/// reaper's cancel receiver, so its timer exits WITHOUT firing — an early end
+/// (pump EOF or explicit close) can never leave a stale timer around to reap a
+/// later session that happened to reuse this id.
+struct Live {
+    session: Arc<InteractiveSession>,
+    _reaper_cancel: oneshot::Sender<()>,
+}
+
 struct Inner {
     /// the Podman-backed provider set. `None` when no sandbox image is
     /// configured — create then refuses with a clear error, never a Direct
@@ -205,7 +226,7 @@ struct Inner {
     /// live sessions. `std::sync::Mutex`: every critical section clones an
     /// `Arc` out and drops the guard before any `.await`, so it never crosses
     /// an await point.
-    sessions: Mutex<HashMap<String, Arc<InteractiveSession>>>,
+    sessions: Mutex<HashMap<String, Live>>,
     /// reserved-or-live session count, the atomic backing the concurrency cap.
     /// reserved at create (before the spawn await), released exactly once when
     /// the session leaves the map (close or pump EOF).
@@ -318,12 +339,22 @@ impl TerminalSessions {
             TermError::Spawn(detail)
         })?;
         let session = Arc::new(session);
+        // dropping `cancel_tx` (when the entry leaves the map) cancels the
+        // reaper; holding it in the map keeps the ceiling armed for the session.
+        let (cancel_tx, cancel_rx) = oneshot::channel();
         self.0
             .sessions
             .lock()
             .expect("term sessions lock poisoned")
-            .insert(id.clone(), session.clone());
+            .insert(
+                id.clone(),
+                Live {
+                    session: session.clone(),
+                    _reaper_cancel: cancel_tx,
+                },
+            );
         self.spawn_pump(id.clone(), session);
+        self.spawn_reaper(id.clone(), cancel_rx);
         tracing::info!(target: "ducktape::term", session = %id, agent, "session_created");
         Ok(CreatedSession {
             topic: topic(&id),
@@ -362,6 +393,26 @@ impl TerminalSessions {
         });
     }
 
+    /// arm the hard wall-clock ceiling: after [`MAX_SESSION_LIFETIME`] the
+    /// session is force-closed through `finish()` — the SAME teardown path pump
+    /// EOF and explicit close take, so the slot still releases exactly once and
+    /// this can't double-release or race those paths. Cancelled cleanly the
+    /// moment the session ends earlier: `finish()` drops the entry (and with it
+    /// `cancel`'s sender), the select below takes the cancel arm, and the timer
+    /// never fires — so it can't reap a later session that reused this id.
+    fn spawn_reaper(&self, id: String, cancel: oneshot::Receiver<()>) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            if !reaper_fires(MAX_SESSION_LIFETIME, cancel).await {
+                return; // the session ended before the ceiling — nothing to reap.
+            }
+            if let Some(session) = manager.finish(&id) {
+                session.close().await;
+                tracing::info!(target: "ducktape::term", session = %id, reason = "lifetime_ceiling", "session_ended");
+            }
+        });
+    }
+
     /// close a session (idempotent): terminate the child + drop it from the
     /// manager. Unknown / already-closed id → a no-op.
     pub async fn close(&self, id: &str) {
@@ -378,11 +429,13 @@ impl TerminalSessions {
             .lock()
             .expect("term sessions lock poisoned")
             .get(id)
-            .cloned()
+            .map(|live| live.session.clone())
     }
 
     /// remove a session from the map, releasing its cap slot exactly once.
-    /// Returns the removed handle so the caller can tear it down.
+    /// Returns the removed handle so the caller can tear it down. Dropping the
+    /// removed [`Live`] also drops its reaper-cancel sender, so an early end
+    /// disarms the wall-clock timer here (after the lock is released).
     fn finish(&self, id: &str) -> Option<Arc<InteractiveSession>> {
         let removed = self
             .0
@@ -393,21 +446,57 @@ impl TerminalSessions {
         if removed.is_some() {
             self.0.active.fetch_sub(1, Ordering::SeqCst);
         }
-        removed
+        removed.map(|live| live.session)
     }
 }
 
-/// build the sandbox-backed interactive provider set, if a sandbox image is
-/// configured. `None` (no `DUCKTAPE_SANDBOX_IMAGE`) leaves interactive disabled;
-/// a discovery error, or an unknown backend, is logged and also disables it (no
-/// Direct fallback — the interactive path refuses Direct regardless).
-pub fn discover_interactive(node_identity: &[u8], dirs: AgentDirs) -> Option<ProviderSet> {
-    let image = std::env::var(SANDBOX_IMAGE_ENV).ok()?;
-    let image = image.trim().to_string();
-    if image.is_empty() {
+/// resolve to `true` iff `lifetime` elapses before the session is cancelled
+/// (its reaper-cancel sender dropped). Split out of `spawn_reaper` so the
+/// ceiling-vs-cancel race is unit-testable under paused time without a live pty
+/// session.
+async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(lifetime) => true,
+        _ = cancel => false,
+    }
+}
+
+/// build the sandbox-backed interactive provider set for `backend`. `None` for
+/// `Direct` (interactive requires Podman/Tart — a Direct node simply has no
+/// terminal plane, no fallback); a discovery error is logged and also disables
+/// it. The caller owns backend selection: `bin/node` passes its resolved
+/// `node.toml` backend, `bin/noded` passes [`backend_from_env`].
+pub fn discover_interactive(
+    node_identity: &[u8],
+    dirs: AgentDirs,
+    backend: SandboxBackend,
+) -> Option<ProviderSet> {
+    if matches!(backend, SandboxBackend::Direct) {
         return None;
     }
-    let backend = match std::env::var(SANDBOX_BACKEND_ENV)
+    match capability_host::discover(node_identity, dirs, None, backend) {
+        Ok(set) => Some(set),
+        Err(err) => {
+            tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");
+            None
+        }
+    }
+}
+
+/// derive the interactive sandbox backend from the daemon's env vars
+/// (`DUCKTAPE_SANDBOX_IMAGE` / `DUCKTAPE_SANDBOX_BACKEND`). `Direct` (no
+/// terminal plane) when no image is configured, or the backend name is unknown.
+/// `bin/noded` uses this because it parses no toml; `bin/node` resolves its
+/// backend from `node.toml` instead and passes it to [`discover_interactive`].
+pub fn backend_from_env() -> SandboxBackend {
+    let Ok(image) = std::env::var(SANDBOX_IMAGE_ENV) else {
+        return SandboxBackend::Direct;
+    };
+    let image = image.trim().to_string();
+    if image.is_empty() {
+        return SandboxBackend::Direct;
+    }
+    match std::env::var(SANDBOX_BACKEND_ENV)
         .ok()
         .as_deref()
         .map(str::trim)
@@ -416,14 +505,7 @@ pub fn discover_interactive(node_identity: &[u8], dirs: AgentDirs) -> Option<Pro
         Some("tart") => SandboxBackend::Tart { image },
         Some(other) => {
             tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; interactive disabled");
-            return None;
-        }
-    };
-    match capability_host::discover(node_identity, dirs, None, backend) {
-        Ok(set) => Some(set),
-        Err(err) => {
-            tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");
-            None
+            SandboxBackend::Direct
         }
     }
 }
@@ -524,5 +606,37 @@ mod tests {
             .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
             .0
             .is_empty());
+    }
+
+    // The reaper drives `finish()` (the exactly-once slot release) once its
+    // ceiling elapses; a live `InteractiveSession` can't be built in a unit test
+    // (private ctor, real pty), so the two tests below pin the ceiling-vs-cancel
+    // decision that gates that call. The reap-exactly-once itself is structural:
+    // pump EOF, explicit close, and the reaper all funnel through the single
+    // `remove().is_some()`-guarded `finish()`, covered live by fleet QA.
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_fires_once_past_the_lifetime_ceiling() {
+        // the sender is held (session still live), so only the sleep can win.
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let reaper = tokio::spawn(reaper_fires(Duration::from_secs(10), cancel_rx));
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(
+            reaper.await.unwrap(),
+            "past the ceiling with no earlier end, the reaper fires"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_is_cancelled_when_the_session_ends_early() {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let reaper = tokio::spawn(reaper_fires(Duration::from_secs(10), cancel_rx));
+        // the session ended (finish() dropped the entry, and with it the sender)
+        // before the ceiling — the timer must NOT fire, so a reused id is safe.
+        drop(cancel_tx);
+        assert!(
+            !reaper.await.unwrap(),
+            "an early end cancels the timer; it never fires on a reused id"
+        );
     }
 }

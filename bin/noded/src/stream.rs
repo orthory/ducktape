@@ -634,10 +634,10 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             // is async — so they're handled here, before the
                             // sync topic path.
                             Ok(ClientMsg::TermInput { session, data }) => {
-                                handle_term_input(&handle, &session, &data).await;
+                                handle_term_input(&handle, &topics, &session, &data).await;
                             }
                             Ok(ClientMsg::TermResize { session, cols, rows }) => {
-                                handle_term_resize(&handle, &session, cols, rows);
+                                handle_term_resize(&handle, &topics, &session, cols, rows);
                             }
                             Ok(msg) => {
                                 let frames = handle_client_msg(&handle, &mut topics, msg);
@@ -736,12 +736,33 @@ fn handle_client_msg(
     }
 }
 
-/// write base64-decoded keystrokes to a session's pty. A missing terminal
-/// plane, an unknown session id, or bad base64 is a `warn` + no-op — never a
-/// panic (the ws surface is trusted-local; who may CREATE a session is gated at
-/// the HTTP layer, and input to a session that doesn't exist is simply dropped).
-/// Never logs the bytes.
-async fn handle_term_input(handle: &NodeHandle, session: &str, data_b64: &str) {
+/// a ws connection may drive a terminal session only if it has SUBSCRIBED to
+/// that session's `term:<id>` output topic. Subscribing is the connection's
+/// proof it legitimately holds the id: create is HTTP-gated (`origin_guard`),
+/// and this gate stops a trusted-local client that merely knows or guesses an id
+/// from driving another member's session. The app subscribes to the topic
+/// before it ever sends input (see `TerminalView`, and the ws frames are ordered
+/// on one socket), so this never breaks its flow.
+fn term_entitled(topics: &BTreeMap<String, TopicState>, session: &str) -> bool {
+    topics.contains_key(&crate::term::topic(session))
+}
+
+/// write base64-decoded keystrokes to a session's pty. Refused (no-op + `warn`)
+/// when the connection isn't subscribed to the session (`unentitled_session`),
+/// the terminal plane is absent, the session is unknown, or the base64 is bad —
+/// never a panic. Never logs the bytes; the unentitled refusal logs no id (an
+/// id the caller isn't entitled to is not the node's to echo into the
+/// webview-streamed log ring).
+async fn handle_term_input(
+    handle: &NodeHandle,
+    topics: &BTreeMap<String, TopicState>,
+    session: &str,
+    data_b64: &str,
+) {
+    if !term_entitled(topics, session) {
+        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term input dropped");
+        return;
+    }
     let Some(terminals) = handle.terminals() else {
         tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
         return;
@@ -759,8 +780,19 @@ async fn handle_term_input(handle: &NodeHandle, session: &str, data_b64: &str) {
     }
 }
 
-/// resize a session's pty. Same no-op-on-unknown discipline as input.
-fn handle_term_resize(handle: &NodeHandle, session: &str, cols: u16, rows: u16) {
+/// resize a session's pty. Same entitlement gate + no-op-on-unknown discipline
+/// as input.
+fn handle_term_resize(
+    handle: &NodeHandle,
+    topics: &BTreeMap<String, TopicState>,
+    session: &str,
+    cols: u16,
+    rows: u16,
+) {
+    if !term_entitled(topics, session) {
+        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term resize dropped");
+        return;
+    }
     let Some(terminals) = handle.terminals() else {
         tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
         return;
@@ -1647,6 +1679,27 @@ mod tests {
         assert!(json.get("cursor").is_none(), "a term chunk carries no cursor");
         // a caught-up reader sees nothing new.
         assert!(catch_up_term("term:s", "s", &mut seq, &ring).frames.is_empty());
+    }
+
+    #[test]
+    fn term_input_requires_a_subscription_to_the_session_topic() {
+        let mut topics: BTreeMap<String, TopicState> = BTreeMap::new();
+        // a connection that never subscribed is not entitled to drive a session.
+        assert!(!term_entitled(&topics, "sess1"));
+        // subscribing to a session's OWN output topic entitles input to it — and
+        // only it: holding one session's topic doesn't entitle another's.
+        topics.insert(
+            crate::term::topic("sess1"),
+            TopicState::Term {
+                session: "sess1".into(),
+                seq: 0,
+            },
+        );
+        assert!(term_entitled(&topics, "sess1"));
+        assert!(!term_entitled(&topics, "sess2"));
+        // a non-terminal subscription never entitles terminal input.
+        topics.insert("logs".into(), TopicState::Logs { seq: 0 });
+        assert!(!term_entitled(&topics, "logs"));
     }
 
     #[test]

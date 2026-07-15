@@ -158,8 +158,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // <storage>). The manager shares the StreamHub's terminal ring so its pump
     // appends where the ws catch-up reads.
     let term_ring = handle.stream_hub().terminals();
-    let interactive =
-        noded::term::discover_interactive(ORACLE_ORIGIN, capability_host::AgentDirs::under(&storage));
+    let interactive = noded::term::discover_interactive(
+        ORACLE_ORIGIN,
+        capability_host::AgentDirs::under(&storage),
+        noded::term::backend_from_env(),
+    );
     tracing::info!(
         target: "ducktape::term",
         enabled = interactive.is_some(),

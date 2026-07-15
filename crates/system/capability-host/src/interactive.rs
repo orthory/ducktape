@@ -308,6 +308,18 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
     }
     // SAFETY: `slave` is a fresh fd we now own.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    // Give the pty a sane INITIAL size (80x24). A pty is created at 0x0; a TUI
+    // handed 0x0 (podman -t relays it into the container tty) renders blank until
+    // the first resize — and the app's first resize can be dropped while its ws
+    // is still connecting. The real client geometry replaces this via `resize`.
+    let ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: mfd is a live master pty; &ws is a valid winsize.
+    unsafe { libc::ioctl(mfd, libc::TIOCSWINSZ, &ws) };
     Ok((master, slave))
 }
 

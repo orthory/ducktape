@@ -27,8 +27,15 @@ use tokio::sync::{Semaphore, oneshot};
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_REQUESTS: u32 = 64;
+// Lifetime spend guards for ONE broker. A headless run makes a handful of
+// requests, but an INTERACTIVE session is long-lived — every user turn is 1+
+// requests (plus tool sub-requests, title/compaction calls) — so these must
+// bound a whole work session, not a one-shot: at 64 requests an interactive
+// session would silently 429 (model access dies) after ~an hour of use. Sized
+// for a long session while still capping a runaway that burns the operator's
+// subscription; the per-request/-response byte caps + concurrency still hold.
+const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_REQUESTS: u32 = 4096;
 /// Anthropic-broker concurrency. Codex serialises to 1; Claude Code fans out
 /// (parallel tool sub-requests, a haiku title generator), and with a STREAMING
 /// response a permit is held for the whole stream — so 1 would deadlock a
@@ -524,22 +531,27 @@ struct AnthropicBrokerState {
 }
 
 impl AnthropicBrokerState {
-    /// subscription-only: refresh an expired access token before proxying. A
-    /// no-op for the API-key path, for an unexpired token, or when no refresh
-    /// token is held (then the stale token proxies and upstream 401s).
-    async fn refresh_if_needed(&self) -> Result<(), String> {
+    /// subscription-only: BEST-EFFORT refresh of an expired access token before
+    /// proxying. A no-op for the API-key path, for an unexpired token, or when no
+    /// refresh token is held. A refresh FAILURE is swallowed on purpose: the
+    /// OAuth endpoint/client-id are PENDING live validation, and 502-ing here
+    /// would also break the existing HEADLESS claude path the moment a token
+    /// expires. Instead the stale token proxies and the upstream 401 surfaces to
+    /// the client, which re-authenticates.
+    async fn refresh_if_needed(&self) {
         let mut auth = self.auth.lock().await;
         let AnthropicAuth::Oauth(tokens) = &mut *auth else {
-            return Ok(());
+            return;
         };
         if !tokens.is_expired() {
-            return Ok(());
+            return;
         }
         let Some(refresh_token) = tokens.refresh_token.clone() else {
-            return Ok(());
+            return;
         };
-        *tokens = oauth_refresh(&self.client, &refresh_token).await?;
-        Ok(())
+        if let Ok(fresh) = oauth_refresh(&self.client, &refresh_token).await {
+            *tokens = fresh;
+        }
     }
 }
 
@@ -728,12 +740,9 @@ async fn forward_messages(
         );
     };
 
-    if let Err(e) = state.refresh_if_needed().await {
-        return response(
-            StatusCode::BAD_GATEWAY,
-            &format!("anthropic token refresh failed: {e}"),
-        );
-    }
+    // best-effort refresh; a failure proxies the stale token (see the fn doc) —
+    // never 502s the session.
+    state.refresh_if_needed().await;
 
     let mut request = state.client.post(&state.messages_url).body(body);
     // Forward request headers VERBATIM — including `anthropic-version` and

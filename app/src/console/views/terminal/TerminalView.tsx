@@ -72,8 +72,21 @@ export function TerminalView() {
         t.focus();
 
         // output: base64 chunk (incl. ring catch-up on subscribe) → raw bytes.
+        // On the FIRST chunk the ws is provably open (it just delivered), so
+        // re-fit + send the real geometry then — the initial resize below can be
+        // dropped while the socket is still CONNECTING, and on a static layout
+        // no later resize event would ever correct it. (The pty also has a sane
+        // 80x24 default server-side, so nothing renders at 0x0 meanwhile.)
+        let sized = false;
         unsubscribe = subscribe([session.topic], {
-          onTermChunk: (item) => t.write(decodeTermChunk(item)),
+          onTermChunk: (item) => {
+            t.write(decodeTermChunk(item));
+            if (!sized) {
+              sized = true;
+              fit.fit();
+              send(termResizeMsg(session.sessionId, t.cols, t.rows));
+            }
+          },
         });
         // input: keystrokes → termInput; size: xterm's resize event + an
         // initial one after fit() so the pty starts at the real geometry.

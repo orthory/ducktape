@@ -19,6 +19,9 @@ pub(crate) struct Surfaces {
 
 pub(crate) struct BindConfig<'a> {
     pub(crate) sync_only: bool,
+    /// a not-yet-admitted joiner: it binds and serves http reads-only while
+    /// parked, but must NOT host the interactive terminal plane (no standing).
+    pub(crate) joiner: bool,
     pub(crate) label: &'a str,
     pub(crate) storage: &'a std::path::Path,
     pub(crate) rpc_listen: Option<String>,
@@ -34,11 +37,16 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) node_key: Vec<u8>,
     /// how the owner-gated admin namespace is exposed (ADR A2/A4).
     pub(crate) admin_exposure: noded::AdminExposure,
+    /// how provider runs are spawned (`node.toml sandbox`): Direct, or a
+    /// Podman/Tart image. The interactive terminal plane requires Podman/Tart,
+    /// so a Direct node hosts no terminal plane.
+    pub(crate) sandbox: capability_host::SandboxBackend,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
     let BindConfig {
         sync_only,
+        joiner,
         label,
         storage,
         rpc_listen,
@@ -49,6 +57,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         forge_committer,
         node_key,
         admin_exposure,
+        sandbox,
     } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
@@ -123,7 +132,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // live here, off the unauthenticated public surface.
         .with_admin(noded::AdminConfig {
             exposure: admin_exposure,
-            node_key: Some(node_key),
+            node_key: Some(node_key.clone()),
             ..Default::default()
         });
     let http_handle = if gateway_enabled {
@@ -175,6 +184,39 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             http_listen.as_deref().filter(|_| !sync_only),
         )),
     ));
+    // the node-local, off-chain interactive terminal-session plane (lives on the
+    // http handle like the stream hub — never consensus). Wired only where the
+    // app surface is actually served for a real member: not sync-only, not a
+    // parked joiner, and only when an http address was configured. Sourced from
+    // the node's OWN config — the resolved `node.toml sandbox` backend and this
+    // node's signer identity (`node_key`) — so `discover_interactive` refuses
+    // the Direct backend (no terminal plane) and Podman container reaping scopes
+    // to the SAME execution id as the node's real agent runs (validator/run.rs
+    // discovers its provider set under the same identity). Mirrors bin/noded's
+    // wiring; a Podman node's create returns a session (or a clear spawn error),
+    // a Direct node's a "requires a configured podman sandbox image" 503 — never
+    // the "terminal sessions are not enabled" 503 that meant the plane was
+    // missing entirely (this bug).
+    let http_handle = if !sync_only && !joiner && http_listen.is_some() {
+        let interactive = noded::term::discover_interactive(
+            &node_key,
+            capability_host::AgentDirs::under(storage),
+            sandbox,
+        );
+        tracing::info!(
+            target: "ducktape::term",
+            enabled = interactive.is_some(),
+            "terminal_plane_ready"
+        );
+        http_handle.with_terminals(noded::TerminalSessions::new(
+            interactive,
+            capability_host::execution_node_id(&node_key),
+            storage.join("term-sessions"),
+            stream_hub.terminals(),
+        ))
+    } else {
+        http_handle
+    };
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
