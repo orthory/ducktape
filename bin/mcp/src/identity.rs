@@ -298,7 +298,10 @@ fn action_url_allowed(value: &str) -> bool {
         return false;
     };
     url.scheme() == "http"
-        && matches!(url.host_str(), Some("127.0.0.1" | "ducktape-host"))
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "ducktape-host" | "host.containers.internal")
+        )
         && url.port().is_some()
         && url.path() == "/v1/run-action"
         && url.username().is_empty()
@@ -365,7 +368,10 @@ fn provider_control_url_allowed(value: &str) -> bool {
         return false;
     };
     url.scheme() == "http"
-        && matches!(url.host_str(), Some("127.0.0.1" | "ducktape-host"))
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "ducktape-host" | "host.containers.internal")
+        )
         && url.port().is_some()
         && url.path() == "/v1/control/provider-idle"
         && url.username().is_empty()
@@ -392,6 +398,9 @@ mod provider_control_tests {
         ));
         assert!(provider_control_url_allowed(
             "http://ducktape-host:41043/v1/control/provider-idle"
+        ));
+        assert!(provider_control_url_allowed(
+            "http://host.containers.internal:41043/v1/control/provider-idle"
         ));
         for rejected in [
             "https://127.0.0.1:41043/v1/control/provider-idle",
@@ -432,6 +441,9 @@ mod tests {
         assert!(action_url_allowed("http://127.0.0.1:41043/v1/run-action"));
         assert!(action_url_allowed(
             "http://ducktape-host:41043/v1/run-action"
+        ));
+        assert!(action_url_allowed(
+            "http://host.containers.internal:41043/v1/run-action"
         ));
         for rejected in [
             "https://127.0.0.1:41043/v1/run-action",
