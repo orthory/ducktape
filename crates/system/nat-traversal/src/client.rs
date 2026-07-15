@@ -65,9 +65,10 @@ impl NatSocket {
         match self {
             Self::Owned(sock) => sock.send_to(buf, dst).await,
             Self::Shared { socket, local, .. } => {
-                // the shared underlay binds dual-stack `[::]` — a V4
-                // destination (a v4 coordinator, a v4 reflexive) must ride
-                // it as v4-MAPPED v6, or the send is EINVAL on macOS (and
+                // keyed on the socket's OWN family: production binds a real
+                // IPv4 `UnderlaySocket`, so a V4 destination is sent directly;
+                // only a V6-bound socket must ride a V4 destination as
+                // v4-MAPPED v6 (a plain V4 dst is EINVAL on macOS, and
                 // family-mismatched everywhere).
                 let dst = match (local, dst) {
                     (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
@@ -1642,13 +1643,15 @@ mod tests {
         );
     }
 
-    /// the PRODUCTION underlay shape: socket mode binds dual-stack `[::]`
-    /// (`overlay_net::userspace::UnderlaySocket`), while coordinators and
-    /// punched reflexives are V4. Sends must ride the v6 socket as v4-MAPPED
-    /// v6 (a plain V4 destination is EINVAL on macOS) and received sources
-    /// must canonicalize `::ffff:a.b.c.d` back to V4, or reply/punch source
-    /// validation never matches. The v4-loopback test above cannot catch
-    /// this — its underlay is a V4 socket.
+    /// the DEFENSIVE V6-bound shared transport — no longer the production
+    /// shape (socket mode now binds a real IPv4 `overlay_net::userspace::`
+    /// `UnderlaySocket`), but `NatSocket::Shared` still handles it: if a
+    /// caller ever hands it a dual-stack `[::]` socket, coordinators and
+    /// punched reflexives are V4, so sends must ride the v6 socket as
+    /// v4-MAPPED v6 (a plain V4 destination is EINVAL on macOS) and received
+    /// sources must canonicalize `::ffff:a.b.c.d` back to V4, or reply/punch
+    /// source validation never matches. The v4-loopback test above cannot
+    /// catch this — its underlay is a V4 socket.
     #[tokio::test]
     async fn dual_stack_shared_transport_reaches_a_v4_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1658,8 +1661,8 @@ mod tests {
             crate::auth::AuthPolicy::Open { require_pop: false },
         ));
 
-        // bind exactly like the production underlay: a std dual-stack
-        // `[::]:0` socket handed to tokio.
+        // bind the defensive dual-stack `[::]:0` shape (a std socket handed
+        // to tokio) that this test guards — production binds V4 instead.
         let std_sock = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).unwrap();
         std_sock.set_nonblocking(true).unwrap();
         let underlay = std::sync::Arc::new(UdpSocket::from_std(std_sock).unwrap());

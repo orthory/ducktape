@@ -230,9 +230,10 @@ fn build_backend(
     parsed: &ParsedConfig,
     shared_underlay: Option<&Arc<UnderlaySocket>>,
 ) -> Result<Backend, UserspaceEffectError> {
-    // one process-owned underlay socket per node: the WG listen endpoint,
-    // dual-stack so a peer endpoint of either family reaches it — the
-    // node-owned shared socket (which the NAT punch also rides) when
+    // one process-owned underlay socket per node: the WG listen endpoint, a
+    // real IPv4 socket so its datagrams (and the NAT punch that rides it)
+    // take the same translation a true AF_INET socket does on macOS CLAT46 —
+    // the node-owned shared socket (which the NAT punch also rides) when
     // injected, a fresh bind per backend in the standalone posture.
     let underlay = match shared_underlay {
         Some(underlay) => underlay.clone(),
