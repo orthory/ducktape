@@ -264,7 +264,8 @@ impl NodeHandle {
     }
 
     /// Publish a durable shutdown state to every current and future surface.
-    pub(crate) fn request_shutdown(&self) {
+    /// Request graceful shutdown; embedders (simnode lib) call this for teardown.
+    pub fn request_shutdown(&self) {
         self.shutdown.send_replace(true);
     }
 
