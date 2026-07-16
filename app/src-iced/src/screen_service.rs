@@ -190,9 +190,9 @@ pub async fn execute(
             Screen::Chat,
             set_huddle(backend.as_ref(), client.as_ref(), channel, joined).await,
         ),
-        Command::CreatePage { parent } => action(
+        Command::CreatePage { id, parent } => action(
             Screen::Pages,
-            create_page(backend.as_ref(), client.as_ref(), parent).await,
+            create_page(backend.as_ref(), client.as_ref(), id, parent).await,
         ),
         Command::RenamePage { page, title } => action(
             Screen::Pages,

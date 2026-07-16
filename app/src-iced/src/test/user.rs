@@ -62,3 +62,42 @@ fn home_success_clears_error_without_reloading() {
     assert!(command.is_none(), "a successful home action does not reload");
     assert!(state.home.error.is_none(), "success clears the home error slot");
 }
+
+// The create-and-open contract: a pending page create activates only on Ok
+// (reload targets the new page); on Err it clears without a phantom.
+#[test]
+fn pending_page_create_activates_on_ok_and_clears_on_err() {
+    use crate::screens::user::Command;
+
+    let mut state = State::default();
+    state.pages.pending_create = Some("page-1".into());
+    let command = update(
+        &mut state,
+        Message::Service(ServiceEvent::ActionFinished {
+            screen: Screen::Pages,
+            result: Ok(()),
+        }),
+    );
+    match command {
+        Some(Command::LoadPages { active, open_tabs }) => {
+            assert_eq!(active.as_deref(), Some("page-1"), "commit opens the created page");
+            assert_eq!(open_tabs, vec!["page-1".to_string()]);
+        }
+        other => panic!("expected a pages reload, got {other:?}"),
+    }
+    assert!(state.pages.pending_create.is_none());
+
+    let mut state = State::default();
+    state.pages.pending_create = Some("page-2".into());
+    let command = update(
+        &mut state,
+        Message::Service(ServiceEvent::ActionFinished {
+            screen: Screen::Pages,
+            result: Err("op rejected: Module(denied)".into()),
+        }),
+    );
+    assert!(command.is_none(), "a failed create chains no reload");
+    assert!(state.pages.pending_create.is_none(), "no phantom selection survives");
+    assert!(state.pages.document().is_none(), "no phantom document");
+    assert_eq!(state.pages.error.as_deref(), Some("op rejected: Module(denied)"));
+}

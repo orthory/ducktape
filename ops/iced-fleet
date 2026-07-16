@@ -109,14 +109,18 @@ down_one() { # down_one <id>
   [ -f "$dir/xvfb.pid" ] && verified_kill "$(cat "$dir/xvfb.pid")" "Xvfb"
   sleep 1
   # A ui-live instance's app-managed workspace node inherits the app's cwd,
-  # not the instance dir — identify it by exe + a --config path inside this
-  # instance's HOME (worktree-clean.sh's identity rule; never a name pattern).
-  local pid args
+  # not the instance dir — identify it by the daemon's EXACT argv shape:
+  # exe basename ducktape-node AND argv == [exe, --config, <path under this
+  # instance>]. A one-shot CLI (`ducktape-node <subcommand> --config …`) has
+  # the subcommand at argv[1] and never matches; no substring sweeps.
+  local pid exe a0 a1 a2
   for pid in $(pgrep -x ducktape-node 2>/dev/null || true); do
-    args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-    case "$args" in
-      *"--config $dir/"*) verified_kill "$pid" "ducktape-node" ;;
-    esac
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    [ "$(basename "${exe% (deleted)}")" = "ducktape-node" ] || continue
+    { IFS= read -r -d '' a0 && IFS= read -r -d '' a1 && IFS= read -r -d '' a2; } \
+      < "/proc/$pid/cmdline" 2>/dev/null || continue
+    case "$a1" in --config) ;; *) continue ;; esac
+    case "$a2" in "$dir/"*) kill "$pid" 2>/dev/null || true ;; esac
   done
   rm -rf "$dir"
 }

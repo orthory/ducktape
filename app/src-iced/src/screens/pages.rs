@@ -205,6 +205,9 @@ pub struct State {
     pub drag_hover: Option<usize>,
     pub pending_block_delete: Option<String>,
     pub pending_page_delete: bool,
+    /// A create in flight: the minted page id, activated only after the
+    /// commit succeeds. A failed create must leave no phantom document.
+    pub pending_create: Option<String>,
     // Which block the cursor is over (reveals its hover gutter) and which
     // block's actions menu is open. Both are id-keyed, so a stale id after a
     // reorder simply matches nothing.
@@ -235,6 +238,7 @@ impl Default for State {
             drag_hover: None,
             pending_block_delete: None,
             pending_page_delete: false,
+            pending_create: None,
             hovered_block: None,
             menu_open_block: None,
             editors: Vec::new(),
@@ -317,6 +321,7 @@ pub enum BlockMove {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     CreatePage {
+        id: String,
         parent: Option<String>,
     },
     LoadPages {
@@ -1533,35 +1538,11 @@ fn location(state: &State) -> (Option<String>, Vec<String>) {
 
 fn begin_page_create(state: &mut State, parent: Option<String>) -> Effect {
     let id = fresh_id("page");
-    let document = PageDocument {
-        id: id.clone(),
-        title: "Untitled".into(),
-        ancestry: Vec::new(),
-        blocks: Vec::new(),
-        page_comments: 0,
-        comment_threads: Vec::new(),
-        presence: Vec::new(),
-        self_key: None,
-    };
     reset_page_transients(state);
-    match &mut state.data {
-        Resource::Ready(data) => {
-            data.open_tabs.push(id.clone());
-            data.document = Some(document);
-        }
-        _ => {
-            state.data = Resource::Ready(PagesData {
-                pages: Vec::new(),
-                open_tabs: vec![id.clone()],
-                document: Some(document),
-            });
-        }
-    }
-    // ponytail: reuse the forwarded Command slot; give CreatePage typed fields
-    // when the screen/command boundary can change together.
-    Effect::CreatePage {
-        parent: Some(format!("{id}\0{}", parent.unwrap_or_default())),
-    }
+    // No optimistic document: the id stays pending and is activated by the
+    // post-commit reload; a failed create leaves the surface untouched.
+    state.pending_create = Some(id.clone());
+    Effect::CreatePage { id, parent }
 }
 
 fn reset_page_transients(state: &mut State) {

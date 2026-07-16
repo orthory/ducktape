@@ -170,19 +170,19 @@ fn rail_header_new_and_refresh_are_ghost_buttons() {
     assert!(emitted(ui, &Message::NewPage));
 }
 
+// A create must NOT open anything optimistically: the minted id stays pending
+// until the commit succeeds, so a failed create leaves no phantom document.
 #[test]
-fn new_page_opens_pending_document() {
+fn new_page_defers_open_until_commit() {
     let mut state = rail_state(vec![meta("doc", "Notes", None)]);
-    let Some(Effect::CreatePage {
-        parent: Some(request),
-    }) = pages::update(&mut state, Message::NewPage)
+    let Some(Effect::CreatePage { id, parent: None }) =
+        pages::update(&mut state, Message::NewPage)
     else {
         panic!("expected page create");
     };
-    let document = state.document().expect("new page is active");
-    assert_eq!(document.title, "Untitled");
-    assert_eq!(tabs(&state), vec![document.id.clone()]);
-    assert_eq!(request, format!("{}\0", document.id));
+    assert!(state.document().is_none(), "no optimistic document");
+    assert!(tabs(&state).is_empty(), "no optimistic tab");
+    assert_eq!(state.pending_create.as_deref(), Some(id.as_str()));
 }
 
 // The "cannot create any document" incident: a failed create lands in a state

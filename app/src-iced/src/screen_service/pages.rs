@@ -148,13 +148,9 @@ pub(super) fn page_ancestry(pages: &[PageMeta], page: &str) -> Vec<PageMeta> {
 pub(super) async fn create_page(
     backend: Option<&Backend>,
     client: Option<&NodeClient>,
-    request: Option<String>,
+    page_id: String,
+    parent: Option<String>,
 ) -> Result<(), String> {
-    let request = request.ok_or_else(|| "page create request is missing".to_string())?;
-    let (page_id, parent) = request
-        .split_once('\0')
-        .ok_or_else(|| "page create request is invalid".to_string())?;
-    let parent = (!parent.is_empty()).then(|| parent.to_string());
     pages_write(
         backend,
         client,
