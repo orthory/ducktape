@@ -31,6 +31,9 @@ mod test;
 mod terminal_service;
 mod theme;
 mod transport;
+// Public: the vendored ducktape-ui toolkit is a library surface; components
+// land here before every screen consumes them, and unused ones must not lint.
+pub mod ui;
 mod user_content_service;
 mod view_api;
 mod workspace_service;

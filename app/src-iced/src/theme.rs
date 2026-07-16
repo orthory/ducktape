@@ -170,6 +170,16 @@ pub const fn palette(mode: Mode) -> &'static Palette {
     }
 }
 
+/// The ducktape-ui token set for the current mode and runtime accent.
+/// Toolkit components (`crate::ui::*`) take this; app chrome keeps `Palette`.
+pub const fn ui(mode: Mode, accent: Color) -> crate::ui::theme::Theme {
+    match mode {
+        Mode::Light => crate::ui::theme::LIGHT,
+        Mode::Dark => crate::ui::theme::DARK,
+    }
+    .with_accent(accent)
+}
+
 pub fn iced_theme(mode: Mode, accent: Color) -> Theme {
     let p = palette(mode);
     Theme::custom(
