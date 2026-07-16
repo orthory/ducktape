@@ -129,6 +129,36 @@ pub(super) fn view(state: &ModulesState, p: Palette) -> Element<'_, Message> {
 
 fn module_card(module: &ModuleRoot, copied: bool, p: Palette) -> Element<'static, Message> {
     let (label, detail) = module_info(&module.id);
+    let copy_btn = button(
+        text(if copied {
+            "copied".into()
+        } else {
+            short(&module.root, 10, 8)
+        })
+        .font(MONO)
+        .size(11),
+    )
+    .padding([4, 8])
+    .style(move |_, _| iced::widget::button::Style {
+        background: Some(Background::Color(if copied {
+            p.danger_soft
+        } else {
+            p.sunken
+        })),
+        text_color: if copied { p.green } else { p.muted_3 },
+        border: Border {
+            color: p.border_soft,
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
+        ..Default::default()
+    })
+    .on_press(Message::CopyModule {
+        id: module.id.clone(),
+        root: module.root.clone(),
+    });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let copy_btn = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Copy root", copy_btn);
     card(
         row![
             container(
@@ -156,34 +186,7 @@ fn module_card(module: &ModuleRoot, copied: bool, p: Palette) -> Element<'static
                 ]
                 .spacing(7),
                 text(detail).font(SANS).size(12).color(p.muted),
-                button(
-                    text(if copied {
-                        "copied".into()
-                    } else {
-                        short(&module.root, 10, 8)
-                    })
-                    .font(MONO)
-                    .size(11)
-                )
-                .padding([4, 8])
-                .style(move |_, _| iced::widget::button::Style {
-                    background: Some(Background::Color(if copied {
-                        p.danger_soft
-                    } else {
-                        p.sunken
-                    })),
-                    text_color: if copied { p.green } else { p.muted_3 },
-                    border: Border {
-                        color: p.border_soft,
-                        width: 1.0,
-                        radius: RADIUS_SM.into()
-                    },
-                    ..Default::default()
-                })
-                .on_press(Message::CopyModule {
-                    id: module.id.clone(),
-                    root: module.root.clone()
-                }),
+                copy_btn,
             ]
             .spacing(5),
         ]

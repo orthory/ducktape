@@ -620,6 +620,16 @@ pub fn dock_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a, 
     let runtime = state.runtime.as_ref().expect("dock requires a huddle");
     let (status, status_color) = status_label(runtime, p);
     let count = member_count(context.chat, &runtime.channel);
+    let expand = button(text("Expand").size(10))
+        .on_press(Message::Expand)
+        .padding([4, 7]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let expand = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Expand", expand);
+    let pop_out = button(text("Pop out").size(10))
+        .on_press(Message::PopOut)
+        .padding([4, 7]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let pop_out = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Pop out", pop_out);
     let header = row![
         container(Space::new())
             .width(8)
@@ -635,12 +645,8 @@ pub fn dock_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a, 
         ]
         .spacing(1)
         .width(Length::Fill),
-        button(text("Expand").size(10))
-            .on_press(Message::Expand)
-            .padding([4, 7]),
-        button(text("Pop out").size(10))
-            .on_press(Message::PopOut)
-            .padding([4, 7]),
+        expand,
+        pop_out,
     ]
     .spacing(7)
     .align_y(Alignment::Center);
@@ -677,6 +683,36 @@ pub fn stage_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a,
     let runtime = state.runtime.as_ref().expect("stage requires a huddle");
     let (status, status_color) = status_label(runtime, p);
     let count = member_count(context.chat, &runtime.channel);
+    let layout_toggle = button(
+        text(if state.spotlight {
+            "Gallery"
+        } else {
+            "Spotlight"
+        })
+        .size(11),
+    )
+    .on_press(Message::ToggleLayout)
+    .padding([7, 11]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let layout_toggle = iced_agent_plugin::sem(
+        iced_agent_plugin::Role::Button,
+        if state.spotlight {
+            "Gallery"
+        } else {
+            "Spotlight"
+        },
+        layout_toggle,
+    );
+    let pop_out = button(text("Pop out").size(11))
+        .on_press(Message::PopOut)
+        .padding([7, 11]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let pop_out = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Pop out", pop_out);
+    let collapse = button(text("Collapse").size(11))
+        .on_press(Message::Collapse)
+        .padding([7, 11]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let collapse = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Collapse", collapse);
     let header = row![
         container(Space::new())
             .width(9)
@@ -689,22 +725,9 @@ pub fn stage_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a,
             .size(11)
             .color(p.muted),
         Space::new().width(Length::Fill),
-        button(
-            text(if state.spotlight {
-                "Gallery"
-            } else {
-                "Spotlight"
-            })
-            .size(11)
-        )
-        .on_press(Message::ToggleLayout)
-        .padding([7, 11]),
-        button(text("Pop out").size(11))
-            .on_press(Message::PopOut)
-            .padding([7, 11]),
-        button(text("Collapse").size(11))
-            .on_press(Message::Collapse)
-            .padding([7, 11]),
+        layout_toggle,
+        pop_out,
+        collapse,
     ]
     .spacing(9)
     .align_y(Alignment::Center);
@@ -763,6 +786,16 @@ pub fn window_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a
     };
     let (status, status_color) = status_label(runtime, p);
     let count = member_count(context.chat, &runtime.channel);
+    let open_chat = button(text("Chat").size(10))
+        .on_press(Message::OpenChat)
+        .padding([4, 7]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let open_chat = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Chat", open_chat);
+    let pop_in = button(text("Pop in").size(10))
+        .on_press(Message::PopIn)
+        .padding([4, 7]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let pop_in = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Pop in", pop_in);
     let header = row![
         container(Space::new())
             .width(8)
@@ -778,12 +811,8 @@ pub fn window_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a
         ]
         .spacing(1)
         .width(Length::Fill),
-        button(text("Chat").size(10))
-            .on_press(Message::OpenChat)
-            .padding([4, 7]),
-        button(text("Pop in").size(10))
-            .on_press(Message::PopIn)
-            .padding([4, 7]),
+        open_chat,
+        pop_in,
     ]
     .spacing(7)
     .align_y(Alignment::Center);
@@ -899,15 +928,18 @@ fn devices_view<'a>(runtime: &'a Runtime, p: &'a theme::Palette) -> Element<'a, 
     let microphones = device_labels(&runtime.devices.microphones);
     let cameras = device_labels(&runtime.devices.cameras);
     let speakers = device_labels(&runtime.devices.speakers);
+    let close = button(text("Close").size(9.5))
+        .on_press(Message::ToggleDevices)
+        .padding([3, 6]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let close = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Close", close);
     let mut devices = column![
         row![
             text("Devices")
                 .size(11)
                 .font(theme::SANS_SEMIBOLD)
                 .width(Length::Fill),
-            button(text("Close").size(9.5))
-                .on_press(Message::ToggleDevices)
-                .padding([3, 6]),
+            close,
         ]
         .align_y(Alignment::Center),
         text("Microphone").size(9.5).color(p.muted),
@@ -1064,7 +1096,9 @@ fn control_button<'a>(
     padding: [u16; 2],
     p: &'a theme::Palette,
 ) -> Element<'a, Message> {
-    button(text(label).size(10.5))
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let enabled = message.is_some();
+    let btn = button(text(label).size(10.5))
         .on_press_maybe(message)
         .padding(padding)
         .style(move |_, status| button::Style {
@@ -1090,8 +1124,13 @@ fn control_button<'a>(
                 radius: 6.0.into(),
             },
             ..button::Style::default()
-        })
-        .into()
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn self_check<'a>(
@@ -1114,12 +1153,19 @@ fn self_check<'a>(
             runtime.sharing,
         )
     } else {
+        let turn_on_camera = button(text("Turn on camera").size(11))
+            .on_press_maybe((runtime.status == Status::Live).then_some(Message::Camera))
+            .padding([7, 11]);
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let turn_on_camera = iced_agent_plugin::sem(
+            iced_agent_plugin::Role::Button,
+            "Turn on camera",
+            turn_on_camera,
+        );
         container(
             column![
                 text("Camera is off").size(14).font(theme::SANS_SEMIBOLD),
-                button(text("Turn on camera").size(11))
-                    .on_press_maybe((runtime.status == Status::Live).then_some(Message::Camera))
-                    .padding([7, 11]),
+                turn_on_camera,
             ]
             .spacing(9)
             .align_x(Alignment::Center),
