@@ -249,6 +249,7 @@ impl Default for State {
 pub enum Message {
     QueryChanged(String),
     NewPage,
+    DismissError,
     Refresh,
     OpenPage(String),
     OpenPageAt { page: String, block: String },
@@ -513,6 +514,10 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             None
         }
         Message::NewPage => Some(Effect::CreatePage { parent: None }),
+        Message::DismissError => {
+            state.error = None;
+            None
+        }
         Message::Refresh => {
             let (active, open_tabs) = location(state);
             Some(Effect::LoadPages { active, open_tabs })

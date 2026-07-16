@@ -2,8 +2,8 @@
 
 use super::harness::*;
 use crate::screens::governance::{
-    self, Action, FormSlot, GovernanceData, Message, OperationPhase, Proposal, ProposalStatus,
-    Resource, Shares, State, UpgradeStatus, VoterKind, VotingRule,
+    self, Action, Ballot, Filter, FormSlot, GovernanceData, Message, OperationPhase, Proposal,
+    ProposalStatus, Resource, Shares, State, UpgradeStatus, VoterKind, VotingRule,
 };
 use crate::theme;
 
@@ -151,4 +151,169 @@ fn an_invalid_share_change_lands_inline_not_in_the_bottom_banner() {
     );
     // The view still renders with the inline error present.
     let _ = sim(governance::view(&state, theme::Mode::Light));
+}
+
+fn settled(id: &str, status: ProposalStatus) -> Proposal {
+    Proposal {
+        status,
+        ..open_proposal(id)
+    }
+}
+
+#[test]
+fn loading_hides_retry() {
+    let state = State {
+        data: Resource::Loading,
+        ..State::default()
+    };
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    assert!(ui.find("Loading governance").is_ok());
+    assert!(
+        !has(&mut ui, Role::Button, "Retry"),
+        "an in-progress load is not retryable"
+    );
+}
+
+#[test]
+fn empty_offers_retry() {
+    let state = State {
+        data: Resource::Empty,
+        ..State::default()
+    };
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    assert!(ui.find("Governance unavailable").is_ok());
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("the empty state offers a retry");
+    assert!(ui.into_messages().any(|m| matches!(m, Message::Load)));
+}
+
+#[test]
+fn error_surfaces_reason_and_retry() {
+    // The error render variant plus its recovery affordance — the class of gap
+    // that let the pages regression hide.
+    let state = State {
+        data: Resource::Error("node offline".into()),
+        ..State::default()
+    };
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find("node offline").is_ok(),
+        "the load-failure reason is shown, not swallowed"
+    );
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("the error state offers a retry");
+    assert!(ui.into_messages().any(|m| matches!(m, Message::Load)));
+}
+
+#[test]
+fn filter_segment_emits_set_filter() {
+    let state = ready(vec![open_proposal("signal:1")], no_shares());
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Open"))
+        .expect("a filter segment is clickable");
+    assert!(
+        ui.into_messages()
+            .any(|m| matches!(m, Message::SetFilter(Filter::Open)))
+    );
+}
+
+#[test]
+fn proposal_list_shows_filtered_empty_states() {
+    let empty = ready(Vec::new(), no_shares());
+    let mut ui = sim(governance::view(&empty, theme::Mode::Light));
+    assert!(ui.find("No proposals to show.").is_ok());
+
+    // An open proposal hidden by the Settled filter → the settled-empty copy.
+    let mut hidden = ready(vec![open_proposal("signal:1")], no_shares());
+    hidden.filter = Filter::Settled;
+    let mut ui = sim(governance::view(&hidden, theme::Mode::Light));
+    assert!(ui.find("No settled proposals to show.").is_ok());
+}
+
+#[test]
+fn open_proposal_renders_detail_and_vote_controls() {
+    let state = ready(vec![open_proposal("signal:1")], no_shares());
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    assert!(ui.find("Ship it").is_ok(), "the action detail renders");
+    assert!(ui.find("open").is_ok(), "the open status pill renders");
+    assert!(has(&mut ui, Role::Button, "✓  Approve"));
+    assert!(has(&mut ui, Role::Button, "×  Reject"));
+    assert!(has(&mut ui, Role::Button, "Settle"));
+}
+
+#[test]
+fn settled_proposal_hides_the_vote_row() {
+    let state = ready(
+        vec![settled("signal:1", ProposalStatus::Passed)],
+        no_shares(),
+    );
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    assert!(ui.find("passed").is_ok(), "the settled status pill renders");
+    assert!(
+        !has(&mut ui, Role::Button, "✓  Approve"),
+        "a settled proposal exposes no vote row"
+    );
+    assert!(!has(&mut ui, Role::Button, "Settle"));
+}
+
+#[test]
+fn approve_click_emits_a_yes_vote() {
+    let state = ready(vec![open_proposal("signal:1")], no_shares());
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "✓  Approve"))
+        .expect("an eligible voter can approve");
+    assert!(
+        ui.into_messages().any(
+            |m| matches!(m, Message::Vote { proposal_id, approve: true } if proposal_id == "signal:1")
+        ),
+        "clicking Approve emits a yes vote for the proposal"
+    );
+}
+
+#[test]
+fn a_cast_yes_vote_locks_approve_but_frees_reject() {
+    // The Approve button is the toggled/active state once the local node has
+    // voted yes: re-clicking it must not re-emit, while Reject stays live to flip
+    // the ballot.
+    let mut proposal = open_proposal("signal:1");
+    proposal.votes = vec![Ballot {
+        principal: "aa".repeat(32),
+        approve: true,
+    }];
+    let state = ready(vec![proposal], no_shares());
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "✓  Approve"))
+        .expect("the toggled Approve button is still present");
+    ui.click(by::role(Role::Button, "×  Reject"))
+        .expect("reject stays live");
+    let messages: Vec<Message> = ui.into_messages().collect();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| matches!(m, Message::Vote { approve: true, .. })),
+        "re-approving an already-approved proposal emits nothing"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, Message::Vote { approve: false, .. })),
+        "reject remains actionable to change the ballot"
+    );
+}
+
+#[test]
+fn reload_error_surfaces_over_a_populated_view() {
+    // A background-refresh failure keeps the last-good proposals but surfaces the
+    // reason inline instead of blanking the surface (Ready-view error path).
+    let mut state = ready(vec![open_proposal("signal:1")], no_shares());
+    state.reload_error = Some("node offline".into());
+    let mut ui = sim(governance::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find("Live refresh unavailable: node offline").is_ok(),
+        "the reload error is shown without discarding the proposals"
+    );
+    assert!(
+        ui.find("Ship it").is_ok(),
+        "the last-good proposals remain rendered"
+    );
 }

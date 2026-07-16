@@ -8,6 +8,10 @@ mod signing;
 
 // The proof scenarios — chat round-trip + duplicate-channel rejection.
 mod chat;
+mod files;
+mod governance;
+mod members;
+mod pages;
 
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};

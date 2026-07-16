@@ -122,3 +122,73 @@ fn busy_create_is_disabled() {
         "busy label renders instead"
     );
 }
+
+#[test]
+fn load_error_offers_retry() {
+    let mut state = at(Stage::LoadError);
+    state.error = Some("account key sealed".into());
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find("account key sealed").is_ok(),
+        "the load failure is surfaced, not swallowed"
+    );
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("a load error offers a retry");
+    assert!(emitted(ui, &Message::Retry));
+}
+
+#[test]
+fn secure_legacy_gate_offers_both_choices() {
+    // The plaintext-account gate: set a password now, or defer. "Not now" must
+    // still let the user through (Skip), not dead-end the onboarding flow.
+    let state = at(Stage::SecureLegacy);
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Set a password"))
+        .expect("the gate offers to secure now");
+    assert!(emitted(ui, &Message::SecureLegacy));
+
+    let state = at(Stage::SecureLegacy);
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Link, "Not now"))
+        .expect("and to defer without blocking entry");
+    assert!(emitted(ui, &Message::Skip));
+}
+
+#[test]
+fn unlock_offers_touch_id_and_skip() {
+    let mut state = at(Stage::Unlock);
+    state.touch_id_available = true;
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Unlock with Touch ID"))
+        .expect("touch id unlock is offered when available");
+    assert!(emitted(ui, &Message::UseTouchId));
+
+    let mut state = at(Stage::Unlock);
+    state.touch_id_available = true;
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Link, "Skip for now"))
+        .expect("unlock can be deferred");
+    assert!(emitted(ui, &Message::Skip));
+}
+
+#[test]
+fn recovery_phrase_offers_copy_and_continue() {
+    let words = "alpha bravo charlie delta echo foxtrot";
+    let mut state = at(Stage::RecoveryPhrase);
+    state.mnemonic = words.into();
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find("alpha").is_ok(),
+        "the phrase words are shown for the user to write down"
+    );
+    ui.click(by::role(Role::Button, "Copy to clipboard"))
+        .expect("the phrase is copyable");
+    assert!(emitted(ui, &Message::CopyRecovery));
+
+    let mut state = at(Stage::RecoveryPhrase);
+    state.mnemonic = words.into();
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "I've saved it — continue"))
+        .expect("continuing proceeds to confirmation");
+    assert!(emitted(ui, &Message::ContinueRecovery));
+}
