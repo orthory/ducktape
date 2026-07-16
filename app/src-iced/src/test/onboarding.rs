@@ -38,6 +38,30 @@ fn create_submit_emits() {
 }
 
 #[test]
+fn reveal_legacy_requires_a_password() {
+    let state = at(Stage::RevealLegacy);
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    assert!(
+        has(&mut ui, Role::Button, "View recovery phrase"),
+        "the reveal form renders its submit"
+    );
+
+    // Submitting with no password is refused with an error, not sent to the
+    // backend as an empty secret that can never succeed.
+    let mut blank = at(Stage::RevealLegacy);
+    assert!(onboarding::update(&mut blank, Message::Submit).is_none());
+    assert!(blank.error.is_some(), "empty password is flagged");
+
+    // A typed password drives the reveal.
+    let mut ready = at(Stage::RevealLegacy);
+    ready.password = "correct horse battery".into();
+    assert!(
+        onboarding::update(&mut ready, Message::Submit).is_some(),
+        "a password lets the reveal proceed"
+    );
+}
+
+#[test]
 fn busy_create_is_disabled() {
     let mut state = at(Stage::Create);
     state.password = "correct horse battery".into();

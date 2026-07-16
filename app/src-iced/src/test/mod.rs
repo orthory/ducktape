@@ -17,6 +17,9 @@
 //! Transaction round-trips against a deterministic embedded node belong in
 //! the sim lane (`src/shell/sim/`, `cargo test -p ducktape-iced shell::sim`).
 
+mod chat;
 mod harness;
 mod onboarding;
 mod settings;
+mod terminal;
+mod workspace;

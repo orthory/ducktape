@@ -1,7 +1,7 @@
 //! Channel, message, thread, huddle, and composer surface.
 
 use iced::widget::{
-    Space, button, column, container, rich_text, row, scrollable, span, text,
+    Space, button, column, container, rich_text, row, scrollable, span, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, font};
 
@@ -220,6 +220,7 @@ pub enum ChatMessageEvent {
     JoinHuddle,
     LeaveHuddle,
     PopOutHuddle,
+    DismissError,
 }
 
 pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option<Command> {
@@ -462,6 +463,9 @@ pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option
             joined: false,
         }),
         ChatMessageEvent::PopOutHuddle => None,
+        // The leading `state.error = None` already cleared the banner; this
+        // arm just gives the dismiss control a message to emit.
+        ChatMessageEvent::DismissError => None,
     }
 }
 
@@ -500,7 +504,7 @@ fn destructive_confirmation(
     .into()
 }
 
-pub(super) fn view<'a>(
+pub(crate) fn view<'a>(
     state: &'a ChatState,
     pages: &'a [PageMeta],
     p: Palette,
@@ -888,13 +892,54 @@ fn chat_empty_shell<'a>(
             .align_y(Alignment::Center)
             .into()
     };
-    row![
+    let board = row![
         rail,
         container(lane)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(move |_| surface(p.paper))
-    ]
+    ];
+    match &state.error {
+        Some(error) => column![chat_error_banner(error, p), board].into(),
+        None => board.into(),
+    }
+}
+
+/// Dismissible inline banner for a chat write failure. The error text sits in a
+/// read-only `text_input` so it stays selectable/copyable (the `selectable_error`
+/// idiom from `screens/workspace.rs`).
+fn chat_error_banner<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
+    container(
+        row![
+            text_input("", message)
+                .font(MONO)
+                .size(11.5)
+                .padding(0)
+                .style(move |_, _| iced::widget::text_input::Style {
+                    background: Background::Color(Color::TRANSPARENT),
+                    border: Border::default(),
+                    icon: p.danger,
+                    placeholder: p.danger,
+                    value: p.danger,
+                    selection: theme::ACCENTS[0],
+                }),
+            Space::new().width(Length::Fill),
+            outline("Dismiss", Message::Chat(ChatMessageEvent::DismissError), p),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([8, 14])
+    .style(move |_| iced::widget::container::Style {
+        background: Some(Background::Color(p.danger_soft)),
+        border: Border {
+            color: p.danger_border,
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
+        ..Default::default()
+    })
     .into()
 }
 

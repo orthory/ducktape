@@ -167,6 +167,7 @@ pub enum Message {
     CancelForget,
     ConfirmForget,
     Cancel,
+    CreateFresh,
     Retry,
     ToggleLog,
     Service(ServiceEvent),
@@ -334,6 +335,18 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             })
         }
         Message::Cancel => cancel(state),
+        Message::CreateFresh => {
+            // The incompatible-workspace screen offers a fresh start; route the
+            // operator to the Create tab of the connect modal rather than just
+            // dismissing the failure.
+            state.stage = Stage::Connect;
+            state.mode = ConnectMode::Create;
+            state.boot_error = None;
+            state.show_log = false;
+            state.busy = false;
+            state.error = None;
+            None
+        }
         Message::Retry => retry(state),
         Message::ToggleLog => {
             state.show_log = !state.show_log;
@@ -882,22 +895,34 @@ fn networks(state: &State, p: Palette) -> Element<'_, Message> {
             .size(10.5)
             .color(p.muted_2),
     );
+    let active_id = state.workspace.as_ref().map(|workspace| workspace.id.as_str());
     for workspace in &state.workspaces {
+        let connecting = state.busy && active_id == Some(workspace.id.as_str());
+        let trailing = if connecting {
+            text("Connecting…")
+                .font(SANS_MEDIUM)
+                .size(10)
+                .color(theme::ACCENTS[0])
+        } else {
+            text(workspace.chain_id.clone())
+                .font(MONO)
+                .size(10)
+                .color(p.muted_2)
+        };
         let select = button(
             row![
                 text(workspace.name.clone()).font(SANS_SEMIBOLD).size(12),
                 Space::new().width(Length::Fill),
-                text(workspace.chain_id.clone())
-                    .font(MONO)
-                    .size(10)
-                    .color(p.muted_2),
+                trailing,
             ]
             .spacing(10)
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
         .padding([9, 11])
-        .on_press(Message::SelectWorkspace(workspace.id.clone()))
+        // While a workspace is activating, freeze the list so a second click
+        // can't kick off a competing ActivateWorkspace.
+        .on_press_maybe((!state.busy).then(|| Message::SelectWorkspace(workspace.id.clone())))
         .style(move |_, status| outline_style(p, true, status));
         #[cfg(all(feature = "agent", debug_assertions))]
         let select = iced_agent_plugin::sem(
@@ -1198,7 +1223,11 @@ fn node_failed(state: &State, p: Palette) -> Element<'_, Message> {
 
     let mut actions = row![].spacing(8).align_y(Alignment::Center);
     if incompatible {
-        actions = actions.push(danger_primary("Create fresh workspace", Message::Cancel, p));
+        actions = actions.push(danger_primary(
+            "Create fresh workspace",
+            Message::CreateFresh,
+            p,
+        ));
     } else {
         actions = actions
             .push(danger_primary("Retry", Message::Retry, p))

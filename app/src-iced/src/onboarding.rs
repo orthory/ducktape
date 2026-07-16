@@ -631,6 +631,10 @@ fn submit(state: &mut State) -> Option<Command> {
             Some(command)
         }
         Stage::RevealLegacy => {
+            if state.password.is_empty() {
+                state.error = Some("enter your password".into());
+                return None;
+            }
             state.busy = true;
             state.recovery_purpose = RecoveryPurpose::Legacy;
             Some(Command::RevealMnemonic {
@@ -1278,9 +1282,16 @@ fn reveal_legacy_view(state: &State, p: Palette) -> Element<'_, Message> {
     gate_card(
         "View your recovery phrase",
         Some(
-            "You can write down your 24-word recovery phrase now, or do this later from the Account view.",
+            "Enter your password to view your 24-word recovery phrase, or do this later from the Account view.",
         ),
         column![
+            field(
+                "Password",
+                &state.password,
+                Message::PasswordChanged,
+                true,
+                p
+            ),
             error_line(state, p),
             primary(
                 if state.busy {
