@@ -60,11 +60,12 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
 /// a far-future expiry for tokens whose test is not about expiry.
 const FAR_FUTURE: u64 = 4_102_444_800; // 2100-01-01
 
-/// mint an invite token locked to `target`: the issuer's signature over
-/// `binding ‖ nonce ‖ target ‖ role ‖ expiry` in the grant namespace —
-/// minting IS the admission decision FOR THAT KEY. the preimage is
-/// deliberately RE-STATED here rather than calling into governance: if the
-/// signed shape ever drifts, this suite fails instead of following along.
+/// mint an invite token locked to `target`: the issuer's signature over the
+/// v2 grant preimage `binding ‖ nonce ‖ kind[‖ target] ‖ role ‖ expiry`
+/// (kind 1 = targeted) in the grant namespace — minting IS the admission
+/// decision FOR THAT KEY. the preimage is deliberately RE-STATED here rather
+/// than calling into governance: if the signed shape ever drifts, this suite
+/// fails instead of following along.
 fn mint_as(
     issuer: &Ed,
     binding: &[u8],
@@ -77,6 +78,7 @@ fn mint_as(
     let msg = [
         binding,
         nonce.as_slice(),
+        &[1u8],
         target.as_ref(),
         &[role.as_u8()],
         &expires_unix_secs.to_le_bytes(),
@@ -85,7 +87,36 @@ fn mint_as(
     InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        target,
+        target: Some(target),
+        role,
+        expires_unix_secs,
+        sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
+    }
+}
+
+/// mint a BEARER token: v2 preimage kind 0x00, NO target bytes — the first
+/// valid join proof takes the grant. role is the caller's so the
+/// client-only rule can be pinned from the outside. re-stated on purpose,
+/// like `mint_as`.
+fn mint_bearer(
+    issuer: &Ed,
+    binding: &[u8],
+    nonce: [u8; INVITE_NONCE_LEN],
+    role: InviteRole,
+    expires_unix_secs: u64,
+) -> InviteToken {
+    let msg = [
+        binding,
+        nonce.as_slice(),
+        &[0u8],
+        &[role.as_u8()],
+        &expires_unix_secs.to_le_bytes(),
+    ]
+    .concat();
+    InviteToken {
+        issuer: issuer.public_key(),
+        nonce,
+        target: None,
         role,
         expires_unix_secs,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
@@ -97,7 +128,8 @@ fn mint(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN], target: &Ed)
     mint_as(issuer, binding, nonce, target, InviteRole::Resident, FAR_FUTURE)
 }
 
-/// the `GovMsg::Redeem` wire op — all raw bytes, mirroring the lobby announce.
+/// the `GovMsg::Redeem` wire op — all raw bytes, mirroring the lobby
+/// announce. empty target bytes = bearer, the wire-wide rule.
 fn redeem(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value {
     json!({ "redeem": {
         "issuer": token.issuer.as_ref().to_vec(),
@@ -105,7 +137,11 @@ fn redeem(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value {
         "token_sig": token.sig.as_ref().to_vec(),
         "joiner": joiner,
         "proof": proof,
-        "target": token.target.as_ref().to_vec(),
+        "target": token
+            .target
+            .as_ref()
+            .map(|t| t.as_ref().to_vec())
+            .unwrap_or_default(),
         "role": token.role.as_u8(),
         "expires_unix_secs": token.expires_unix_secs,
     }})
@@ -489,6 +525,115 @@ fn consensus_admits_a_wall_clock_expired_token_expiry_lives_at_the_doorbells() {
     assert!(
         has_key(&residents["residents"], joiner.public_key().as_ref()),
         "consensus admitted the expired token — the doorbells own expiry: {residents}"
+    );
+}
+
+// ── B5e: a BEARER Client invite — first valid proof wins, exactly once ──
+
+#[test]
+fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, validators) = governed(storage.path());
+    let issuer = &validators[0];
+
+    // bearer: NO target lock — the token names no key at mint time.
+    let token = mint_bearer(
+        issuer,
+        BINDING,
+        [10u8; INVITE_NONCE_LEN],
+        InviteRole::Client,
+        FAR_FUTURE,
+    );
+
+    // key A — any key at all — takes the grant with its own proof.
+    let a = Ed::from_seed(70);
+    let a_proof = sign_join_proof(&a, BINDING, &token);
+    sim.submit_ok(
+        "governance",
+        redeem(
+            &token,
+            a.public_key().as_ref().to_vec(),
+            a_proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+    let clients = sim.query("clients", json!("clients"));
+    assert!(
+        has_key(&clients["clients"], a.public_key().as_ref()),
+        "first redeemer holds client standing: {clients}"
+    );
+    // …and ONLY client standing — bearer never reaches the resident plane.
+    let residents = sim.query("valset", json!("residents"));
+    assert!(
+        !has_key(&residents["residents"], a.public_key().as_ref()),
+        "a bearer redeem grants NO resident standing: {residents}"
+    );
+
+    // key B presents the SAME blob with its OWN valid proof: the nonce is
+    // spent — single-use first-wins is the bearer containment story.
+    let b = Ed::from_seed(71);
+    let b_proof = sign_join_proof(&b, BINDING, &token);
+    let error = sim.submit_rejected(
+        "governance",
+        redeem(
+            &token,
+            b.public_key().as_ref().to_vec(),
+            b_proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+    assert!(
+        error.contains("already redeemed"),
+        "single-use first-wins: {error}"
+    );
+    let clients = sim.query("clients", json!("clients"));
+    assert!(
+        !has_key(&clients["clients"], b.public_key().as_ref()),
+        "the loser gained nothing: {clients}"
+    );
+}
+
+// ── B5f: bearer is CLIENT-ONLY — no bearer path onto the resident plane ──
+
+#[test]
+fn a_bearer_resident_invite_is_rejected_as_client_only() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, validators) = governed(storage.path());
+    let issuer = &validators[0];
+
+    // a WELL-FORMED bearer Resident token (valid sig over the v2 preimage):
+    // the rule is semantic, not cryptographic — pin the exact reject.
+    let token = mint_bearer(
+        issuer,
+        BINDING,
+        [11u8; INVITE_NONCE_LEN],
+        InviteRole::Resident,
+        FAR_FUTURE,
+    );
+    let joiner = Ed::from_seed(72);
+    let proof = sign_join_proof(&joiner, BINDING, &token);
+    let error = sim.submit_rejected(
+        "governance",
+        redeem(
+            &token,
+            joiner.public_key().as_ref().to_vec(),
+            proof.as_ref().to_vec(),
+        ),
+        Some("relay"),
+    );
+    assert!(
+        error.contains("bearer invites are client-only"),
+        "client-only rule: {error}"
+    );
+    let residents = sim.query("valset", json!("residents"));
+    assert!(
+        !has_key(&residents["residents"], joiner.public_key().as_ref()),
+        "no resident standing granted: {residents}"
+    );
+    let clients = sim.query("clients", json!("clients"));
+    assert!(
+        !has_key(&clients["clients"], joiner.public_key().as_ref()),
+        "no client standing granted: {clients}"
     );
 }
 
