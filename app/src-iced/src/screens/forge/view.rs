@@ -10,6 +10,7 @@ use crate::theme::{
     self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM,
     SANS, SANS_SEMIBOLD, TITLE,
 };
+use crate::ui;
 
 use super::*;
 
@@ -910,17 +911,12 @@ fn new_item_form<'a>(
         .push(sem_input(
             "Title",
             &state.new_item.title,
-            text_input("Title", &state.new_item.title)
-                .font(SANS)
-                .size(BODY)
-                .on_input(Message::NewTitleChanged),
+            text_field("Title", &state.new_item.title, p).on_input(Message::NewTitleChanged),
         ))
         .push(sem_input(
             "Description (markdown)",
             &state.new_item.body,
-            text_input("Description (markdown)", &state.new_item.body)
-                .font(SANS)
-                .size(BODY)
+            text_field("Description (markdown)", &state.new_item.body, p)
                 .on_input(Message::NewBodyChanged),
         ))
         .push(
@@ -1066,17 +1062,13 @@ fn item_detail(state: &State, p: Palette) -> Element<'_, Message> {
                         sem_input(
                             "Title",
                             &state.edit_title,
-                            text_input("Title", &state.edit_title)
-                                .font(SANS)
-                                .size(BODY)
+                            text_field("Title", &state.edit_title, p)
                                 .on_input(Message::EditTitleChanged),
                         ),
                         sem_input(
                             "Description (markdown)",
                             &state.edit_body,
-                            text_input("Description (markdown)", &state.edit_body)
-                                .font(SANS)
-                                .size(BODY)
+                            text_field("Description (markdown)", &state.edit_body, p)
                                 .on_input(Message::EditBodyChanged),
                         ),
                         row![
@@ -1377,9 +1369,7 @@ fn review_controls<'a>(
             sem_input(
                 "Leave a review summary",
                 &state.review_body,
-                text_input("Leave a review summary", &state.review_body)
-                    .font(SANS)
-                    .size(BODY)
+                text_field("Leave a review summary", &state.review_body, p)
                     .on_input(Message::ReviewBodyChanged),
             ),
             text(format!(
@@ -1796,18 +1786,15 @@ fn line_comment_composer<'a>(state: &'a State, p: Palette) -> Element<'a, Messag
             sem_input(
                 "Line",
                 &state.review_comment_line,
-                text_input("Line", &state.review_comment_line)
+                text_field("Line", &state.review_comment_line, p)
                     .font(MONO)
-                    .size(BODY)
                     .width(72)
                     .on_input(Message::ReviewCommentLineChanged),
             ),
             sem_input(
                 "Inline comment",
                 &state.review_comment_body,
-                text_input("Inline comment", &state.review_comment_body)
-                    .font(SANS)
-                    .size(BODY)
+                text_field("Inline comment", &state.review_comment_body, p)
                     .on_input(Message::ReviewCommentBodyChanged)
                     .on_submit(Message::QueueReviewComment),
             ),
@@ -2191,44 +2178,31 @@ fn section_label(label: &str, p: Palette) -> Element<'static, Message> {
 }
 
 fn center_note<'a>(title: &str, detail: Option<&str>, p: Palette) -> Element<'a, Message> {
-    let mut content = column![
-        text(title.to_owned())
-            .font(SANS_SEMIBOLD)
-            .size(BODY)
-            .color(p.muted_2)
-    ]
-    .spacing(5)
-    .align_x(Alignment::Center);
-    if let Some(detail) = detail {
-        content = content.push(
-            text(detail.to_owned())
-                .font(SANS)
-                .size(LABEL)
-                .color(p.muted_2),
-        );
-    }
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(24)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .into()
+    ui::empty_state::empty_state(
+        None,
+        title.to_owned(),
+        detail.unwrap_or_default().to_owned(),
+        &theme::ui_for(&p),
+    )
+    .height(Length::Fill)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// A tinted error box whose message is selectable so the user can copy it.
 fn error_banner<'a>(error: &'a str, p: Palette) -> Element<'a, Message> {
-    container(selectable(error, SANS, LABEL, p.red, p))
-        .width(Length::Fill)
-        .padding([7, 9])
-        .style(move |_| tinted_box(p.red, p))
-        .into()
+    ui::alert::alert(
+        selectable(error, SANS, LABEL, p.red, p),
+        ui::alert::AlertVariant::Destructive,
+        &theme::ui_for(&p),
+    )
+    .into()
 }
 
 /// B3: an error box that also offers a Retry re-firing the producer message —
 /// forge fires each fetch once, so without this a transient error is terminal.
 fn retry_banner<'a>(error: &'a str, on_retry: Message, p: Palette) -> Element<'a, Message> {
-    container(
+    ui::alert::alert(
         column![
             selectable(error, SANS, LABEL, p.red, p),
             row![
@@ -2237,10 +2211,9 @@ fn retry_banner<'a>(error: &'a str, on_retry: Message, p: Palette) -> Element<'a
             ]
         ]
         .spacing(8),
+        ui::alert::AlertVariant::Destructive,
+        &theme::ui_for(&p),
     )
-    .width(Length::Fill)
-    .padding([9, 11])
-    .style(move |_| tinted_box(p.red, p))
     .into()
 }
 
@@ -2269,19 +2242,19 @@ fn selectable<'a>(
         .into()
 }
 
+/// A bordered toolkit text input for the forge forms. Chain `.on_input`,
+/// `.on_submit`, `.width`, etc. as before.
+fn text_field<'a>(
+    placeholder: &str,
+    value: &str,
+    p: Palette,
+) -> iced::widget::TextInput<'a, Message> {
+    ui::input::input(placeholder, value, &theme::ui_for(&p))
+}
+
 fn card<'a>(content: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
-    container(content)
+    ui::surface::surface(content, ui::surface::SurfaceVariant::Card, &theme::ui_for(&p))
         .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(p.paper)),
-            border: Border {
-                color: p.border,
-                width: 1.0,
-                radius: RADIUS_LG.into(),
-            },
-            shadow: card_shadow(p),
-            ..Default::default()
-        })
         .into()
 }
 
@@ -2376,26 +2349,16 @@ fn secondary_button(
     message: Option<Message>,
     p: Palette,
 ) -> Element<'static, Message> {
+    let t = theme::ui_for(&p);
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([6, 10])
-        .style(move |_, status| {
-            if enabled {
-                outlined_button(status, p)
-            } else {
-                // Disabled controls must look disabled: dim ink, no border.
-                button::Style {
-                    background: Some(Background::Color(p.sunken)),
-                    text_color: p.muted_2,
-                    border: Border {
-                        radius: RADIUS_SM.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            }
-        })
-        .on_press_maybe(message);
+    let mut builder = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled);
+    if let Some(message) = message {
+        builder = builder.on_press(message);
+    }
+    let btn = builder.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -2409,19 +2372,15 @@ fn primary_button(
     message: Option<Message>,
     p: Palette,
 ) -> Element<'static, Message> {
+    let t = theme::ui_for(&p);
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([6, 10])
-        .style(move |_, _| button::Style {
-            background: Some(Background::Color(if enabled { p.filled } else { p.chip })),
-            text_color: if enabled { p.on_filled } else { p.muted_2 },
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .on_press_maybe(message);
+    let mut builder = ui::button::button(label, &t)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled);
+    if let Some(message) = message {
+        builder = builder.on_press(message);
+    }
+    let btn = builder.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -2450,14 +2409,7 @@ fn outlined_button(status: button::Status, p: Palette) -> button::Style {
 }
 
 fn horizontal_divider(p: Palette) -> Element<'static, Message> {
-    container(Space::new())
-        .height(1)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(p.border_soft)),
-            ..Default::default()
-        })
-        .into()
+    ui::separator::horizontal(&theme::ui_for(&p)).into()
 }
 
 fn short_hash(value: Option<&str>) -> String {
