@@ -941,28 +941,53 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
         100.. => "99+ new notifications".to_string(),
         n => format!("{n} new notifications"),
     };
-    let bell = tooltip(
-        button(bell_content)
-            .padding([3, 8])
-            .on_press(Message::ToggleNotifications)
-            .style(move |_, status| button::Style {
-                background: matches!(status, button::Status::Hovered)
-                    .then_some(Background::Color(p.hover)),
-                text_color: p.ink,
-                border: Border {
-                    radius: 5.0.into(),
-                    ..Border::default()
-                },
-                ..button::Style::default()
-            }),
-        container(text(tip).size(11).color(p.ink))
-            .padding([4, 8])
-            .style(move |_| bordered(p.paper, p.border, 6.0)),
-        tooltip::Position::Bottom,
-    )
-    .gap(6)
-    .padding(6);
-    let mut controls = row![bell].spacing(1).align_y(Alignment::Center);
+    let bell_button = button(bell_content)
+        .padding([3, 8])
+        .on_press(Message::ToggleNotifications)
+        .style(move |_, status| button::Style {
+            background: matches!(status, button::Status::Hovered)
+                .then_some(Background::Color(p.hover)),
+            text_color: p.ink,
+            border: Border {
+                radius: 5.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        });
+    // Iced tooltips draw as a top-layer overlay, so while the dropdown is open a
+    // hover would paint the "Notifications" bubble over the panel. Suppress the
+    // tip whenever the dropdown owns the surface; the native title carries it in
+    // the original.
+    let bell: Element<'_, Message> = if state.notifications.open {
+        bell_button.into()
+    } else {
+        tooltip(
+            bell_button,
+            container(text(tip).size(theme::CAPTION).color(p.ink))
+                .padding([4, 8])
+                .style(move |_| bordered(p.paper, p.border, 6.0)),
+            tooltip::Position::Bottom,
+        )
+        .gap(6)
+        .padding(6)
+        .into()
+    };
+    // Block-height indicator to the right of the bell: a liveness dot + mono
+    // height, mirroring the original's status cell.
+    let (dot_color, height_label) = titlebar_status(state, p);
+    let height_indicator = row![
+        container(Space::new().width(6).height(6)).style(move |_| rounded(dot_color, 3.0)),
+        text(height_label)
+            .size(theme::CAPTION)
+            .font(theme::MONO)
+            .color(p.muted_2),
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center);
+    let status = row![bell, height_indicator]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    let mut controls = row![status].spacing(4).align_y(Alignment::Center);
     if !cfg!(target_os = "macos") {
         controls = controls
             .push(icon_button(
@@ -1034,6 +1059,39 @@ pub(super) fn titlebar_connection(state: &Shell, p: &theme::Palette) -> (String,
         }
         _ => (format!("{mode} · CONNECTED"), p.green),
     }
+}
+
+/// Right-of-bell status cell: liveness dot color + grouped block height.
+/// Green when the node stream is live and the snapshot reports connected, red
+/// when a client exists but is not connected, muted when there is no node.
+fn titlebar_status(state: &Shell, p: &theme::Palette) -> (Color, String) {
+    let snapshot = match &state.operator.node.data {
+        operator_screens::Resource::Ready(snapshot) => Some(snapshot),
+        _ => None,
+    };
+    let connected = state.node_stream_connected && snapshot.is_some_and(|snapshot| snapshot.connected);
+    let dot = if connected {
+        p.green
+    } else if state.node_client.is_some() {
+        p.red
+    } else {
+        p.muted_2
+    };
+    let height = snapshot.map_or(0, |snapshot| snapshot.height);
+    (dot, format!("h {}", group_thousands(height)))
+}
+
+fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 && (bytes.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*byte as char);
+    }
+    out
 }
 
 fn app_frame(state: &Shell) -> Element<'_, Message> {
@@ -1436,5 +1494,26 @@ mod tests {
                 .is_ok(),
             "search must show once a workspace is entered"
         );
+    }
+
+    #[test]
+    fn titlebar_renders_the_block_height_indicator() {
+        // No node snapshot yet: the height cell still renders (as "h 0"), it is
+        // never absent, and it lives on the right beside the bell.
+        let shell = ready_shell();
+        assert!(
+            iced_test::simulator(titlebar(&shell)).find("h 0").is_ok(),
+            "block-height indicator must render right of the bell"
+        );
+    }
+
+    #[test]
+    fn group_thousands_matches_locale_grouping() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(42), "42");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_234), "1,234");
+        assert_eq!(group_thousands(12_345), "12,345");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
 }
