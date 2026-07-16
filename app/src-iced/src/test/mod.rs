@@ -21,6 +21,7 @@ mod browser;
 mod agents;
 mod chat;
 mod files;
+mod forge;
 mod harness;
 mod onboarding;
 mod pages;
