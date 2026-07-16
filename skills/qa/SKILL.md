@@ -131,6 +131,10 @@ match a body — assert the body via the render model
 (`shell().user_screens.chat.data`) and confirm the row materialized with a
 `sees_text` on its plain-text author label.
 
+**Deep reference for writing sim-lane tests** — harness API, Simulator traps,
+chat wire shapes/ordering guarantees, and embedding `simnode::boot` in any
+crate's `#[test]` — lives in `skills/sim-lane`.
+
 ## Headless bring-up (Linux)
 
 ```bash
