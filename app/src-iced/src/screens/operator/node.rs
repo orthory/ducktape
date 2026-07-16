@@ -409,13 +409,15 @@ fn logs_view<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let filter = state.log_filter.to_ascii_lowercase();
-    let mut lines = column![
+    let mut lines = column![sem_input(
+        "Filter logs",
+        &state.log_filter,
         text_input("Filter logs", &state.log_filter)
             .on_input(|value| Message::Node(NodeMessage::LogFilterChanged(value)))
             .padding([8, 10])
             .font(MONO)
             .size(11.5)
-    ]
+    )]
     .spacing(8);
     let mut count = 0;
     for line in &snapshot.logs {

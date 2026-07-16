@@ -3,7 +3,7 @@
 //! This module owns presentation state only. [`update`] emits typed [`Command`]s;
 //! the host performs node I/O and returns a [`ServiceEvent`].
 
-use iced::widget::{Button, Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
 
 use crate::icons::{self, Icon};
@@ -482,7 +482,9 @@ fn copy_value(
     key: &str,
     p: Palette,
 ) -> Element<'static, Message> {
-    button(
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let name = label.to_string();
+    let btn = button(
         row![
             text(label.to_string())
                 .font(MONO)
@@ -521,8 +523,11 @@ fn copy_value(
     .on_press(Message::Node(NodeMessage::Copy {
         key: key.to_string(),
         value: value.to_string(),
-    }))
-    .into()
+    }));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, name, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn segment_button<'a>(
@@ -530,8 +535,8 @@ fn segment_button<'a>(
     active: bool,
     message: Message,
     p: Palette,
-) -> Button<'a, Message> {
-    button(text(label).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let btn = button(text(label).font(SANS).size(11.5))
         .padding([6, 17])
         .style(move |_, _| iced::widget::button::Style {
             background: active.then_some(Background::Color(p.paper)),
@@ -547,7 +552,11 @@ fn segment_button<'a>(
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn outline_button<'a>(
@@ -555,8 +564,9 @@ fn outline_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(11.5))
         .padding([7, 13])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -578,11 +588,17 @@ fn outline_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn filled_button<'a>(
@@ -590,8 +606,9 @@ fn filled_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(11.5))
         .width(Length::Fill)
         .padding([8, 14])
         .style(move |_, _| iced::widget::button::Style {
@@ -607,11 +624,17 @@ fn filled_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn danger_button<'a>(
@@ -619,8 +642,9 @@ fn danger_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(11.5))
         .width(Length::Fill)
         .padding([8, 14])
         .style(move |_, _| iced::widget::button::Style {
@@ -636,11 +660,17 @@ fn danger_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn toggle_button<'a>(
@@ -649,8 +679,9 @@ fn toggle_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(10.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(10.5))
         .padding([6, 10])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.filled } else { p.paper })),
@@ -668,11 +699,17 @@ fn toggle_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn labeled_input<'a>(
@@ -684,14 +721,39 @@ fn labeled_input<'a>(
 ) -> Element<'a, Message> {
     column![
         text(label).font(SANS).size(10).color(p.muted_3),
-        text_input(placeholder, value)
-            .on_input(on_input)
-            .padding([7, 8])
-            .font(MONO)
-            .size(11)
+        sem_input(
+            label,
+            value,
+            text_input(placeholder, value)
+                .on_input(on_input)
+                .padding([7, 8])
+                .font(MONO)
+                .size(11)
+        )
     ]
     .spacing(5)
     .into()
+}
+
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
 }
 
 fn confirm_card(

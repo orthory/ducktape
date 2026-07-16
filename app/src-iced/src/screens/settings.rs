@@ -630,14 +630,17 @@ fn resource_view<'a>(resource: &'a Resource<SettingsData>, p: Palette) -> Elemen
 // --- Settings widget vocabulary ----------------------------------------
 
 fn section_label(label: &'static str, danger: bool, p: Palette) -> Element<'static, Message> {
-    container(
+    let heading = container(
         text(label)
             .font(MONO)
             .size(9)
             .color(if danger { p.danger } else { p.muted_2 }),
     )
-    .padding([11, 0])
-    .into()
+    .padding([11, 0]);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Heading, label, heading);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    heading.into()
 }
 
 fn group_card<'a>(content: Column<'a, Message>, p: Palette) -> Element<'a, Message> {
@@ -722,7 +725,7 @@ fn switch_button<'a>(
     enabled: bool,
     accent: Color,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let button = button(
         row![
             container(Space::new().width(12).height(12)).style(move |_| {
@@ -751,11 +754,21 @@ fn switch_button<'a>(
         },
         ..Default::default()
     });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(
+        iced_agent_plugin::Role::Button,
+        if checked { "ON" } else { "OFF" },
+        button,
+    )
+    .disabled(!enabled)
+    .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn accent_button<'a>(
@@ -784,8 +797,9 @@ fn outline_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(11.5))
         .padding([7, 13])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -807,11 +821,17 @@ fn outline_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn danger_button<'a>(
@@ -819,8 +839,9 @@ fn danger_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(11.5))
         .padding([8, 15])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if enabled {
@@ -835,11 +856,17 @@ fn danger_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn error_banner<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {

@@ -82,6 +82,7 @@ members = [
     "bin/mcp",
     # app — native desktop shell (the React client remains the web twin)
     "app/src-iced",
+    "app/iced-agent-plugin",
 ]
 
 [workspace.package]
@@ -231,3 +232,9 @@ overlay-net = { path = "crates/system/overlay-net" }
 # would be a different trait).
 governor = "0.10.2"
 rand_core = "0.6.4"
+
+# The agent fork of iced_winit: crates.io 0.14.0 + `// AGENT SEAM` blocks
+# (AccessKit adapter, tree push, synthetic event injection), dev-only via the
+# `agent` feature. See third_party/iced-winit/AGENT-FORK.md.
+[patch.crates-io]
+iced_winit = { path = "third_party/iced-winit" }

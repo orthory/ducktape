@@ -321,12 +321,17 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
             .padding([0, 8])
             .on_press(Message::SelectTab(index))
             .style(move |_, status| tab_style(p, active, status));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let select =
+            iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, tab.current.clone(), select);
         let close = button(text("×").font(SANS).size(12))
             .width(24)
             .height(28)
             .padding(0)
             .on_press(Message::CloseTab(index))
             .style(move |_, status| tab_style(p, active, status));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let close = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Close tab", close);
         tab_items = tab_items.push(
             container(row![select, close].spacing(0).align_y(Alignment::Center))
                 .width(180)
@@ -384,17 +389,21 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
                 selection: p.chip,
             }
         });
+    let address = sem_input("Address", &state.address, address);
+    let reload = button(text("↻").font(SANS).size(14).color(p.muted_3))
+        .width(30)
+        .height(30)
+        .padding(8)
+        .on_press_maybe((!state.is_idle()).then_some(Message::Reload))
+        .style(move |_, status| chrome_style(p, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let reload = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Reload", reload);
     let toolbar = container(
         row![
             text("Browser").font(SANS).size(14).color(p.filled),
             chrome_button("‹", state.can_go_back().then_some(Message::Back), p,),
             chrome_button("›", state.can_go_forward().then_some(Message::Forward), p,),
-            button(text("↻").font(SANS).size(14).color(p.muted_3))
-                .width(30)
-                .height(30)
-                .padding(8)
-                .on_press_maybe((!state.is_idle()).then_some(Message::Reload))
-                .style(move |_, status| chrome_style(p, status)),
+            reload,
             container(
                 row![
                     text(
@@ -443,6 +452,8 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .style(move |_| container::Style::default().background(p.canvas));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let pane = iced_agent_plugin::sem(iced_agent_plugin::Role::Region, "browser", pane);
     column![tabs, toolbar, pane].spacing(0).into()
 }
 
@@ -450,13 +461,42 @@ fn chrome_button<'a>(
     label: &'a str,
     message: Option<Message>,
     p: &'a theme::Palette,
-) -> iced::widget::Button<'a, Message> {
-    button(text(label).font(SANS).size(13))
+) -> Element<'a, Message> {
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let enabled = message.is_some();
+    let btn = button(text(label).font(SANS).size(13))
         .width(30)
         .height(30)
         .padding(0)
         .on_press_maybe(message)
-        .style(move |_, status| chrome_style(p, status))
+        .style(move |_, status| chrome_style(p, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
 }
 
 fn chrome_style(p: &theme::Palette, status: button::Status) -> button::Style {

@@ -376,6 +376,9 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     .align_y(Alignment::Center);
 
     let terminal: Element<'_, Message> = Terminal::new(state).into();
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let terminal: Element<'_, Message> =
+        iced_agent_plugin::sem(iced_agent_plugin::Role::Region, "terminal", terminal);
     let body: Element<'_, Message> = match state.status {
         Status::Idle | Status::Starting => stack![
             terminal,
@@ -440,9 +443,9 @@ fn mode_button(
     mode: SessionMode,
     active: SessionMode,
     p: theme::Palette,
-) -> iced::widget::Button<'static, Message> {
+) -> Element<'static, Message> {
     let selected = mode == active;
-    button(text(label).size(12).font(SANS_SEMIBOLD))
+    let btn = button(text(label).size(12).font(SANS_SEMIBOLD))
         .padding([5, 12])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(if selected {
@@ -459,7 +462,32 @@ fn mode_button(
             },
             ..iced::widget::button::Style::default()
         })
-        .on_press(Message::SetMode(mode))
+        .on_press(Message::SetMode(mode));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
 }
 
 fn shared_command_panel(state: &State, p: theme::Palette) -> Element<'_, Message> {
@@ -537,6 +565,9 @@ fn shared_command_panel(state: &State, p: theme::Palette) -> Element<'_, Message
     } else {
         send
     };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let send = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Send", send);
+    let input = sem_input("Command", &state.command_draft, input);
 
     container(column![
         container(Space::new())
@@ -571,11 +602,12 @@ fn terminal_notice<'a>(
         .spacing(12)
         .align_x(Alignment::Center);
     if let Some(message) = retry {
-        content = content.push(
-            button(text("Retry").size(12))
-                .on_press(message)
-                .padding([7, 14]),
-        );
+        let retry_btn = button(text("Retry").size(12))
+            .on_press(message)
+            .padding([7, 14]);
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let retry_btn = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Retry", retry_btn);
+        content = content.push(retry_btn);
     }
     container(content)
         .width(Length::Fill)

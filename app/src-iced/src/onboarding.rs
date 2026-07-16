@@ -5,7 +5,7 @@
 //! a [`ServiceEvent`]. This keeps account custody and transport outside the UI.
 
 use iced::widget::{
-    Button, Column, Space, TextInput, button, column, container, row, text, text_input,
+    Column, Space, TextInput, button, column, container, row, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 use zeroize::Zeroize as _;
@@ -1463,7 +1463,7 @@ fn field<'a>(
         })
 }
 
-fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Button<'a, Message> {
+fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let enabled = message.is_some();
     let button = button(
         container(text(label).font(SANS_SEMIBOLD).size(12.5))
@@ -1487,13 +1487,19 @@ fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Button<'
         },
         ..Default::default()
     });
-    match message {
+    let button = match message {
         Some(message) => button.on_press(message),
         None => button,
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
-fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Button<'a, Message> {
+fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let button = button(
         container(text(label).font(SANS_SEMIBOLD).size(12))
             .width(Length::Fill)
@@ -1517,10 +1523,17 @@ fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Button
         },
         ..Default::default()
     });
-    match message {
+    let enabled = message.is_some();
+    let button = match message {
         Some(message) => button.on_press(message),
         None => button,
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn tab(
@@ -1528,8 +1541,8 @@ fn tab(
     active: bool,
     message: Message,
     p: Palette,
-) -> Button<'static, Message> {
-    button(
+) -> Element<'static, Message> {
+    let tab = button(
         container(text(label).font(SANS_SEMIBOLD).size(12))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -1558,11 +1571,15 @@ fn tab(
         },
         ..Default::default()
     })
-    .on_press(message)
+    .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, tab);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    tab.into()
 }
 
-fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Button<'a, Message> {
-    button(
+fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
+    let link = button(
         container(text(label).font(SANS_SEMIBOLD).size(11).color(p.muted))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -1570,7 +1587,11 @@ fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Button<'a, M
     .width(Length::Fill)
     .padding(4)
     .style(|_, _| iced::widget::button::Style::default())
-    .on_press(message)
+    .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Link, label, link);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    link.into()
 }
 
 fn error_line<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {

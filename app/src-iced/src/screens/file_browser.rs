@@ -4,7 +4,7 @@
 //! the host. This module only owns view state and emits typed effects.
 
 use iced::widget::{
-    Button, Space, button, column, container, image, row, scrollable, stack, text, text_input,
+    Space, button, column, container, image, row, scrollable, stack, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 
@@ -528,11 +528,15 @@ fn browser<'a>(state: &'a State, listing: &'a FileListing, p: Palette) -> Elemen
         body = body.push(
             container(
                 row![
-                    field(
+                    sem_input(
                         "Folder name",
                         &state.new_folder_name,
-                        Message::NewFolderNameChanged,
-                        p
+                        field(
+                            "Folder name",
+                            &state.new_folder_name,
+                            Message::NewFolderNameChanged,
+                            p
+                        ),
                     ),
                     filled(
                         "Create folder",
@@ -681,7 +685,14 @@ fn entry_row(
         },
         ..Default::default()
     })
-    .on_press(Message::OpenEntry(entry.path.clone(), entry.kind));
+    .on_press(Message::OpenEntry(entry.path.clone(), entry.kind))
+    .width(Length::Fill);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let open = iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        entry.name.clone(),
+        open,
+    );
     let actions: Element<'static, Message> = if is_dir {
         outline_enabled(
             "Delete",
@@ -689,7 +700,6 @@ fn entry_row(
             !read_only,
             p,
         )
-        .into()
     } else {
         row![
             outline(
@@ -707,7 +717,7 @@ fn entry_row(
         .spacing(5)
         .into()
     };
-    row![open.width(Length::Fill), actions]
+    row![open, actions]
         .spacing(5)
         .align_y(Alignment::Center)
         .into()
@@ -1122,7 +1132,28 @@ fn field<'a>(
         })
 }
 
-fn outline<'a>(label: impl ToString, message: Message, p: Palette) -> Button<'a, Message> {
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
+fn outline<'a>(label: impl ToString, message: Message, p: Palette) -> Element<'a, Message> {
     outline_enabled(label, message, true, p)
 }
 
@@ -1131,8 +1162,9 @@ fn outline_enabled<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(12))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(12))
         .padding([7, 10])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -1154,11 +1186,17 @@ fn outline_enabled<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn filled<'a>(
@@ -1166,8 +1204,9 @@ fn filled<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(12.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(12.5))
         .padding([8, 13])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(if enabled {
@@ -1186,11 +1225,17 @@ fn filled<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn card_style(p: Palette) -> iced::widget::container::Style {

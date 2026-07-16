@@ -7,10 +7,17 @@ version.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["cef-browser"]
+default = ["cef-browser", "agent"]
 cef-browser = ["dep:cef", "dep:cef-dll-sys", "dep:x11-dl"]
+# Dev-only agent driver seams in the iced_winit fork; every use site is
+# additionally gated on debug_assertions, so release builds compile none of it.
+agent = ["iced_winit/agent", "dep:iced-agent-plugin"]
 
 [dependencies]
+# Direct dep so the app can name the fork's `agent` feature and call its API.
+# [patch.crates-io] resolves this to third_party/iced-winit.
+iced_winit = { version = "=0.14.0", default-features = false }
+iced-agent-plugin = { path = "../iced-agent-plugin", optional = true }
 ammonia = "4.1.3"
 html5ever = "0.39.0"
 markup5ever_rcdom = "0.39.0"

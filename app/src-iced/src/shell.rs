@@ -44,6 +44,8 @@ use crate::transport::{NodeClient, ServerFrame};
 use crate::view_api::{AppIntent, Route};
 use crate::workspace_service;
 
+#[cfg(all(feature = "agent", debug_assertions))]
+pub(crate) mod agent_wire;
 mod browser_session;
 mod view;
 #[cfg(feature = "cef-browser")]
@@ -261,6 +263,8 @@ enum Message {
     },
     Window(WindowAction),
     WindowReady(WindowAction, Option<window::Id>),
+    #[cfg(all(feature = "agent", debug_assertions))]
+    AgentTick,
 }
 
 struct Shell {
@@ -319,6 +323,8 @@ struct Shell {
     quit_services_ready: bool,
     quit_exit_ready: bool,
     quit_window_closing: bool,
+    #[cfg(all(feature = "agent", debug_assertions))]
+    agent: Option<agent_wire::Runtime>,
 }
 
 struct PagePresenceRuntime {
@@ -385,6 +391,8 @@ impl Default for Shell {
             quit_services_ready: false,
             quit_exit_ready: false,
             quit_window_closing: false,
+            #[cfg(all(feature = "agent", debug_assertions))]
+            agent: None,
         }
     }
 }
@@ -394,6 +402,10 @@ impl Shell {
         let (main, open_main) = window::open(desktop::main_settings());
         let mut state = Self::default();
         state.desktop.main = Some(main);
+        #[cfg(all(feature = "agent", debug_assertions))]
+        {
+            state.agent = Some(agent_wire::boot());
+        }
         (
             state,
             Task::batch([
@@ -498,6 +510,8 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
         Message::MainOpened(id) => {
             state.desktop.main = Some(id);
             state.window_size = desktop::MAIN_SIZE;
+            #[cfg(all(feature = "agent", debug_assertions))]
+            agent_wire::window_opened(state, "main", id);
             if let Err(error) = mac_tray::init() {
                 tracing::warn!(
                     target: "ducktape::shell",
@@ -534,6 +548,8 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             return Task::batch([open.map(Message::MainOpened), terminal]);
         }
         Message::Quit => return quit(state),
+        #[cfg(all(feature = "agent", debug_assertions))]
+        Message::AgentTick => return agent_wire::tick(state),
         Message::QuitReady => {
             state.quit_services_ready = true;
             return finish_quit(state);
@@ -570,6 +586,8 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
         }
         Message::HuddleOpened(id) => {
             state.desktop.huddle = Some(id);
+            #[cfg(all(feature = "agent", debug_assertions))]
+            agent_wire::window_opened(state, "huddle", id);
         }
         Message::WindowEvent(id, event) => match event {
             window::Event::FileHovered(_)
@@ -658,6 +676,8 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
                         (y + 6.0) as f32,
                     )));
                     state.desktop.tray = Some(id);
+                    #[cfg(all(feature = "agent", debug_assertions))]
+                    agent_wire::window_opened(state, "tray", id);
                     return Task::batch([
                         open.discard(),
                         window::scale_factor(id)
@@ -1309,6 +1329,10 @@ fn subscription(state: &Shell) -> Subscription<Message> {
         window::events().map(|(id, event)| Message::WindowEvent(id, event)),
         iced::event::listen_with(global_shortcut),
     ];
+    #[cfg(all(feature = "agent", debug_assertions))]
+    subscriptions.push(
+        iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::AgentTick),
+    );
     if state.screen() == Screen::Metrics && !state.operator.metrics.paused {
         subscriptions.push(
             iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::MetricsTick),

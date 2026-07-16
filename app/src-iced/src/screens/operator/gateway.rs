@@ -347,8 +347,7 @@ pub(super) fn view(state: &GatewayState, p: Palette) -> Element<'_, Message> {
     }
     for route in &data.routes {
         let selected = state.selected.as_deref() == Some(route.key.as_str());
-        route_rows = route_rows.push(
-            button(row![
+        let entry = button(row![
                 column![
                     text(&route.address).font(MONO).size(10.5).color(p.ink),
                     text(if selected {
@@ -401,8 +400,11 @@ pub(super) fn view(state: &GatewayState, p: Palette) -> Element<'_, Message> {
             })
             .on_press(Message::Gateway(GatewayMessage::SelectRoute(
                 route.key.clone(),
-            ))),
-        );
+            )));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let entry =
+            iced_agent_plugin::sem(iced_agent_plugin::Role::Button, route.address.clone(), entry);
+        route_rows = route_rows.push(entry);
     }
 
     let can_mutate =

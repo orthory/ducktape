@@ -1,5 +1,5 @@
 use iced::widget::{
-    Button, Column, Space, button, column, container, row, scrollable, text, text_input,
+    Column, Space, button, column, container, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
 
@@ -105,7 +105,7 @@ fn repo_card(repo: &Repository, p: Palette) -> Element<'static, Message> {
     ]
     .spacing(14)
     .align_y(Alignment::Center);
-    button(
+    let card = button(
         column![
             row![
                 icons::view(Icon::Forge, 14.0, p.muted),
@@ -147,8 +147,11 @@ fn repo_card(repo: &Repository, p: Palette) -> Element<'static, Message> {
         },
         ..Default::default()
     })
-    .on_press(Message::SelectRepository(id))
-    .into()
+    .on_press(Message::SelectRepository(id));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, repo.name.clone(), card);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    card.into()
 }
 
 fn listing<'a>(state: &'a State, repo: &'a Repository, p: Palette) -> Element<'a, Message> {
@@ -191,6 +194,9 @@ fn listing<'a>(state: &'a State, repo: &'a Repository, p: Palette) -> Element<'a
     .padding(0)
     .style(|_, _| button::Style::default())
     .on_press(Message::ToggleRepositoryMenu);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let repo_button =
+        iced_agent_plugin::sem(iced_agent_plugin::Role::Button, repo.name.clone(), repo_button);
     let branch_button = button(
         row![
             status_dot(p.green),
@@ -203,6 +209,9 @@ fn listing<'a>(state: &'a State, repo: &'a Repository, p: Palette) -> Element<'a
     .padding([3, 8])
     .style(move |_, status| outlined_button(status, p))
     .on_press(Message::ToggleBranchMenu);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let branch_button =
+        iced_agent_plugin::sem(iced_agent_plugin::Role::Button, branch.to_owned(), branch_button);
     let heading = row![
         icon_tile(Icon::Forge, 28.0, p),
         text_button("ducktape", Message::BackToRepositories, p),
@@ -676,15 +685,23 @@ fn new_item_form<'a>(
         form = form.push(
             row![
                 text("Merge").font(SANS_SEMIBOLD).size(11).color(p.muted_3),
-                text_input("Source branch", &state.new_item.source_branch)
-                    .font(MONO)
-                    .size(12)
-                    .on_input(Message::SourceBranchChanged),
+                sem_input(
+                    "Source branch",
+                    &state.new_item.source_branch,
+                    text_input("Source branch", &state.new_item.source_branch)
+                        .font(MONO)
+                        .size(12)
+                        .on_input(Message::SourceBranchChanged),
+                ),
                 text("into").font(SANS_SEMIBOLD).size(11).color(p.muted_3),
-                text_input("Target", &state.new_item.target_branch)
-                    .font(MONO)
-                    .size(12)
-                    .on_input(Message::TargetBranchChanged)
+                sem_input(
+                    "Target",
+                    &state.new_item.target_branch,
+                    text_input("Target", &state.new_item.target_branch)
+                        .font(MONO)
+                        .size(12)
+                        .on_input(Message::TargetBranchChanged),
+                )
             ]
             .spacing(9)
             .align_y(Alignment::Center),
@@ -699,18 +716,22 @@ fn new_item_form<'a>(
         }
     }
     form = form
-        .push(
+        .push(sem_input(
+            "Title",
+            &state.new_item.title,
             text_input("Title", &state.new_item.title)
                 .font(SANS)
                 .size(12.5)
                 .on_input(Message::NewTitleChanged),
-        )
-        .push(
+        ))
+        .push(sem_input(
+            "Description (markdown)",
+            &state.new_item.body,
             text_input("Description (markdown)", &state.new_item.body)
                 .font(SANS)
                 .size(12.5)
                 .on_input(Message::NewBodyChanged),
-        )
+        ))
         .push(
             row![
                 Space::new().width(Length::Fill),
@@ -747,7 +768,7 @@ fn new_item_form<'a>(
 
 fn item_row(item: &ForgeItem, p: Palette) -> Element<'static, Message> {
     let number = item.number;
-    button(
+    let open = button(
         row![
             status_dot(match item.state {
                 ItemState::Open => p.green,
@@ -786,8 +807,11 @@ fn item_row(item: &ForgeItem, p: Palette) -> Element<'static, Message> {
         },
         ..Default::default()
     })
-    .on_press(Message::OpenItem(number))
-    .into()
+    .on_press(Message::OpenItem(number));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, item.title.clone(), open);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    open.into()
 }
 
 fn item_detail(state: &State, p: Palette) -> Element<'_, Message> {
@@ -828,14 +852,22 @@ fn item_detail(state: &State, p: Palette) -> Element<'_, Message> {
             if state.editing_item {
                 body = body.push(card(
                     column![
-                        text_input("Title", &state.edit_title)
-                            .font(SANS)
-                            .size(13)
-                            .on_input(Message::EditTitleChanged),
-                        text_input("Description (markdown)", &state.edit_body)
-                            .font(SANS)
-                            .size(12.5)
-                            .on_input(Message::EditBodyChanged),
+                        sem_input(
+                            "Title",
+                            &state.edit_title,
+                            text_input("Title", &state.edit_title)
+                                .font(SANS)
+                                .size(13)
+                                .on_input(Message::EditTitleChanged),
+                        ),
+                        sem_input(
+                            "Description (markdown)",
+                            &state.edit_body,
+                            text_input("Description (markdown)", &state.edit_body)
+                                .font(SANS)
+                                .size(12.5)
+                                .on_input(Message::EditBodyChanged),
+                        ),
                         row![
                             Space::new().width(Length::Fill),
                             secondary_button(
@@ -987,10 +1019,14 @@ fn item_detail(state: &State, p: Palette) -> Element<'_, Message> {
                     }
                     body = body.push(
                         row![
-                            text_input("Leave a comment", &state.comment_draft)
-                                .font(SANS)
-                                .size(12.5)
-                                .on_input(Message::CommentChanged),
+                            sem_input(
+                                "Leave a comment",
+                                &state.comment_draft,
+                                text_input("Leave a comment", &state.comment_draft)
+                                    .font(SANS)
+                                    .size(12.5)
+                                    .on_input(Message::CommentChanged),
+                            ),
                             primary_button(
                                 if state.busy { "Posting..." } else { "Comment" },
                                 (!state.busy && !state.comment_draft.trim().is_empty())
@@ -1082,10 +1118,14 @@ fn review_controls<'a>(
                 review_verdict_button(ReviewVerdict::Comment, state.review_verdict, p),
             ]
             .spacing(7),
-            text_input("Leave a review summary", &state.review_body)
-                .font(SANS)
-                .size(12.5)
-                .on_input(Message::ReviewBodyChanged),
+            sem_input(
+                "Leave a review summary",
+                &state.review_body,
+                text_input("Leave a review summary", &state.review_body)
+                    .font(SANS)
+                    .size(12.5)
+                    .on_input(Message::ReviewBodyChanged),
+            ),
             text(format!(
                 "{} new-side inline comment{} queued",
                 state.review_comments.len(),
@@ -1133,8 +1173,8 @@ fn review_verdict_button(
     verdict: ReviewVerdict,
     active: ReviewVerdict,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(verdict.label()).font(SANS_SEMIBOLD).size(10.5))
+) -> Element<'static, Message> {
+    let btn = button(text(verdict.label()).font(SANS_SEMIBOLD).size(10.5))
         .padding([5, 9])
         .style(move |_, _| button::Style {
             background: (verdict == active).then_some(Background::Color(p.filled)),
@@ -1150,7 +1190,11 @@ fn review_verdict_button(
             },
             ..Default::default()
         })
-        .on_press(Message::ReviewVerdictChanged(verdict))
+        .on_press(Message::ReviewVerdictChanged(verdict));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, verdict.label(), btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn review_card(review: &Review, p: Palette) -> Element<'static, Message> {
@@ -1295,16 +1339,24 @@ fn changed_file<'a>(file: &'a ChangedFile, state: &'a State, p: Palette) -> Elem
             column![
                 section_label("COMMENT ON NEW VERSION", p),
                 row![
-                    text_input("Line", &state.review_comment_line)
-                        .font(MONO)
-                        .size(11.5)
-                        .width(72)
-                        .on_input(Message::ReviewCommentLineChanged),
-                    text_input("Inline comment", &state.review_comment_body)
-                        .font(SANS)
-                        .size(11.5)
-                        .on_input(Message::ReviewCommentBodyChanged)
-                        .on_submit(Message::QueueReviewComment),
+                    sem_input(
+                        "Line",
+                        &state.review_comment_line,
+                        text_input("Line", &state.review_comment_line)
+                            .font(MONO)
+                            .size(11.5)
+                            .width(72)
+                            .on_input(Message::ReviewCommentLineChanged),
+                    ),
+                    sem_input(
+                        "Inline comment",
+                        &state.review_comment_body,
+                        text_input("Inline comment", &state.review_comment_body)
+                            .font(SANS)
+                            .size(11.5)
+                            .on_input(Message::ReviewCommentBodyChanged)
+                            .on_submit(Message::QueueReviewComment),
+                    ),
                 ]
                 .spacing(8),
                 row![
@@ -1364,36 +1416,38 @@ fn repo_menu(state: &State, p: Palette) -> Element<'_, Message> {
     .spacing(3)
     .padding(6);
     for repo in repositories(state) {
-        menu = menu.push(
-            button(
-                row![
-                    status_dot(if repo.browsable { p.green } else { p.amber }),
-                    text(repo.name.clone())
-                        .font(SANS_SEMIBOLD)
-                        .size(12.5)
-                        .width(Length::Fill),
-                    text(repo.default_branch.clone())
-                        .font(MONO)
-                        .size(10)
-                        .color(p.muted_2)
-                ]
-                .spacing(9)
-                .align_y(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .padding([8, 9])
-            .style(move |_, status| button::Style {
-                background: matches!(status, button::Status::Hovered)
-                    .then_some(Background::Color(p.panel)),
-                text_color: p.ink,
-                border: Border {
-                    radius: RADIUS_SM.into(),
-                    ..Default::default()
-                },
+        let item = button(
+            row![
+                status_dot(if repo.browsable { p.green } else { p.amber }),
+                text(repo.name.clone())
+                    .font(SANS_SEMIBOLD)
+                    .size(12.5)
+                    .width(Length::Fill),
+                text(repo.default_branch.clone())
+                    .font(MONO)
+                    .size(10)
+                    .color(p.muted_2)
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([8, 9])
+        .style(move |_, status| button::Style {
+            background: matches!(status, button::Status::Hovered)
+                .then_some(Background::Color(p.panel)),
+            text_color: p.ink,
+            border: Border {
+                radius: RADIUS_SM.into(),
                 ..Default::default()
-            })
-            .on_press(Message::SelectRepository(repo.id.clone())),
-        );
+            },
+            ..Default::default()
+        })
+        .on_press(Message::SelectRepository(repo.id.clone()));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let item =
+            iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, repo.name.clone(), item);
+        menu = menu.push(item);
     }
     floating_menu(menu, p)
 }
@@ -1412,36 +1466,38 @@ fn branch_menu(state: &State, p: Palette) -> Element<'_, Message> {
         );
     }
     for branch in branches {
-        menu = menu.push(
-            button(
-                row![
-                    status_dot(p.green),
-                    text(branch.name.clone())
-                        .font(SANS_SEMIBOLD)
-                        .size(12.5)
-                        .width(Length::Fill),
-                    text(short_hash(Some(&branch.head)))
-                        .font(MONO)
-                        .size(10)
-                        .color(p.muted_2)
-                ]
-                .spacing(9)
-                .align_y(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .padding([8, 9])
-            .style(move |_, status| button::Style {
-                background: matches!(status, button::Status::Hovered)
-                    .then_some(Background::Color(p.panel)),
-                text_color: p.ink,
-                border: Border {
-                    radius: RADIUS_SM.into(),
-                    ..Default::default()
-                },
+        let item = button(
+            row![
+                status_dot(p.green),
+                text(branch.name.clone())
+                    .font(SANS_SEMIBOLD)
+                    .size(12.5)
+                    .width(Length::Fill),
+                text(short_hash(Some(&branch.head)))
+                    .font(MONO)
+                    .size(10)
+                    .color(p.muted_2)
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([8, 9])
+        .style(move |_, status| button::Style {
+            background: matches!(status, button::Status::Hovered)
+                .then_some(Background::Color(p.panel)),
+            text_color: p.ink,
+            border: Border {
+                radius: RADIUS_SM.into(),
                 ..Default::default()
-            })
-            .on_press(Message::SelectBranch(branch.name.clone())),
-        );
+            },
+            ..Default::default()
+        })
+        .on_press(Message::SelectBranch(branch.name.clone()));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let item =
+            iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, branch.name.clone(), item);
+        menu = menu.push(item);
     }
     floating_menu(menu, p)
 }
@@ -1467,7 +1523,7 @@ fn floating_menu<'a>(content: Column<'a, Message>, p: Palette) -> Element<'a, Me
         .into()
 }
 
-fn tab_button(tab: Tab, active: Tab, badge: Option<usize>, p: Palette) -> Button<'static, Message> {
+fn tab_button(tab: Tab, active: Tab, badge: Option<usize>, p: Palette) -> Element<'static, Message> {
     let mut content = row![text(tab.label()).font(SANS_SEMIBOLD).size(13)].spacing(7);
     if let Some(badge) = badge {
         content = content.push(
@@ -1483,7 +1539,7 @@ fn tab_button(tab: Tab, active: Tab, badge: Option<usize>, p: Palette) -> Button
                 }),
         );
     }
-    button(content.align_y(Alignment::Center))
+    let btn = button(content.align_y(Alignment::Center))
         .padding([10, 0])
         .style(move |_, _| button::Style {
             text_color: if tab == active { p.ink } else { p.muted_2 },
@@ -1498,7 +1554,11 @@ fn tab_button(tab: Tab, active: Tab, badge: Option<usize>, p: Palette) -> Button
             },
             ..Default::default()
         })
-        .on_press(Message::SelectTab(tab))
+        .on_press(Message::SelectTab(tab));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, tab.label(), btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn filter_button(
@@ -1507,8 +1567,8 @@ fn filter_button(
     filter: ItemFilter,
     active: ItemFilter,
     p: Palette,
-) -> Button<'static, Message> {
-    button(
+) -> Element<'static, Message> {
+    let btn = button(
         text(format!("{label} {count}"))
             .font(SANS_SEMIBOLD)
             .size(11.5),
@@ -1528,7 +1588,11 @@ fn filter_button(
         },
         ..Default::default()
     })
-    .on_press(Message::SetItemFilter(filter))
+    .on_press(Message::SetItemFilter(filter));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn pull_tab_button(
@@ -1536,8 +1600,8 @@ fn pull_tab_button(
     tab: PullTab,
     active: PullTab,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(11))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
         .padding([5, 10])
         .style(move |_, _| button::Style {
             background: (tab == active).then_some(Background::Color(p.filled)),
@@ -1553,7 +1617,11 @@ fn pull_tab_button(
             },
             ..Default::default()
         })
-        .on_press(Message::SelectPullTab(tab))
+        .on_press(Message::SelectPullTab(tab));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn icon_tile(icon: Icon, size: f32, p: Palette) -> Element<'static, Message> {
@@ -1669,8 +1737,29 @@ fn card<'a>(content: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a,
         .into()
 }
 
-fn text_button(label: &'static str, message: Message, p: Palette) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(15))
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
+fn text_button(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(15))
         .padding(0)
         .style(move |_, status| button::Style {
             text_color: if matches!(status, button::Status::Hovered) {
@@ -1680,27 +1769,38 @@ fn text_button(label: &'static str, message: Message, p: Palette) -> Button<'sta
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn secondary_button(
     label: &'static str,
     message: Option<Message>,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(11))
+) -> Element<'static, Message> {
+    let _disabled = message.is_none();
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
         .padding([6, 10])
         .style(move |_, status| outlined_button(status, p))
-        .on_press_maybe(message)
+        .on_press_maybe(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(_disabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn primary_button(
     label: &'static str,
     message: Option<Message>,
     p: Palette,
-) -> Button<'static, Message> {
+) -> Element<'static, Message> {
     let enabled = message.is_some();
-    button(text(label).font(SANS_SEMIBOLD).size(11))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
         .padding([6, 10])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if enabled { p.filled } else { p.chip })),
@@ -1711,7 +1811,13 @@ fn primary_button(
             },
             ..Default::default()
         })
-        .on_press_maybe(message)
+        .on_press_maybe(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn outlined_button(status: button::Status, p: Palette) -> button::Style {

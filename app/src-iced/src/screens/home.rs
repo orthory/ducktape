@@ -1303,7 +1303,9 @@ fn device_item_row<'a>(
     if active {
         if editing {
             value = value
-                .push(
+                .push(sem_input(
+                    "Node label",
+                    &state.node_label_draft,
                     plain_input(
                         "e.g. Kim's laptop",
                         &state.node_label_draft,
@@ -1311,7 +1313,7 @@ fn device_item_row<'a>(
                         p,
                     )
                     .on_submit(Message::Home(HomeMessage::CommitNodeLabel)),
-                )
+                ))
                 .push(outline(
                     "Save",
                     Message::Home(HomeMessage::CommitNodeLabel),
@@ -1807,8 +1809,29 @@ fn table_header<const N: usize>(
         .style(move |_| bottom_border(Color::TRANSPARENT, p.border_soft))
         .into()
 }
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn workspace_row(workspace: &WorkspaceRow, p: Palette) -> Element<'static, Message> {
-    button(
+    let btn = button(
         row![
             text(workspace.name.clone())
                 .font(SANS)
@@ -1853,8 +1876,15 @@ fn workspace_row(workspace: &WorkspaceRow, p: Palette) -> Element<'static, Messa
     })
     .on_press(Message::Home(HomeMessage::SwitchWorkspace(
         workspace.id.clone(),
-    )))
-    .into()
+    )));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        workspace.name.clone(),
+        btn,
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn short(value: &str) -> String {
