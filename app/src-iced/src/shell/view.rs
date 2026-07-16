@@ -1120,9 +1120,22 @@ fn network_rail(state: &Shell) -> Element<'_, Message> {
             .on_press(message)
             .style(move |_, status| rail_circle(p, state.accent, active, status))
     };
+    // The top chip is the account "me" avatar — the user's initials, not a
+    // generic house glyph — active while parked on Home; falls back to the house
+    // until a profile name is known.
+    let me_glyph = match &state.user_screens.home.data {
+        user_screens::Resource::Ready(data) => data
+            .profile
+            .as_ref()
+            .map(|profile| profile.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .map(workspace_initials),
+        _ => None,
+    }
+    .unwrap_or_else(|| "⌂".into());
     let mut networks = column![
         item(
-            "⌂".into(),
+            me_glyph,
             state.screen() == Screen::Home,
             Message::Navigate(Screen::Home),
         ),
@@ -1145,7 +1158,13 @@ fn network_rail(state: &Shell) -> Element<'_, Message> {
         ));
     }
     if state.active_workspace.is_none() && state.node_client.is_some() {
-        networks = networks.push(item("R".into(), true, Message::Navigate(Screen::Home)));
+        // Active only while viewing the node's content (off Home), never
+        // unconditionally — the me-chip owns Home.
+        networks = networks.push(item(
+            "R".into(),
+            state.screen() != Screen::Home,
+            Message::Navigate(Screen::Home),
+        ));
     }
     networks = networks
         .push(item(
@@ -1175,39 +1194,46 @@ fn module_rail(state: &Shell) -> Element<'_, Message> {
     } else {
         &Screen::USER[..]
     };
-    let mut modules = column![mode_segments(state, show_operator)]
+    // Brand-D chip crowns the rail (30×30 filled square), matching the original.
+    let brand = container(
+        text("D")
+            .size(theme::BODY_LG)
+            .font(theme::MONO)
+            .color(p.on_filled),
+    )
+    .center_x(30)
+    .center_y(30)
+    .style(move |_| rounded(p.filled, theme::RADIUS_MD));
+    let mut modules = column![brand, mode_segments(state, show_operator)]
         .spacing(4)
         .align_x(Alignment::Center);
     modules = modules.push(Space::new().height(4));
     for &screen in screens {
         modules = modules.push(module_button(screen, state));
     }
+    let theme_icon = match state.mode {
+        Mode::Light => Icon::Sun,
+        Mode::Dark => Icon::Moon,
+    };
+    // Settings and Theme sit at the bottom as compact icon-only 34×34 buttons —
+    // node/app chrome, not labelled module tiles.
     modules = modules
         .push(Space::new().height(Length::Fill))
-        .push(module_button(Screen::Settings, state))
-        .push(
-            button(
-                column![
-                    icons::view(
-                        match state.mode {
-                            Mode::Light => Icon::Sun,
-                            Mode::Dark => Icon::Moon,
-                        },
-                        18.0,
-                        p.icon_idle,
-                    ),
-                    text("Theme").size(theme::CAPTION).color(p.muted),
-                ]
-                .spacing(5)
-                .align_x(Alignment::Center)
-                .width(Length::Fill),
-            )
-            .width(66)
-            .height(54)
-            .padding([7, 2])
-            .on_press(Message::ToggleTheme)
-            .style(move |_, s| tab_style(p, false, s)),
-        );
+        .push(chrome_icon_button(
+            Icon::Settings,
+            "Settings",
+            state.screen() == Screen::Settings,
+            Message::Navigate(Screen::Settings),
+            state,
+        ))
+        .push(Space::new().height(2))
+        .push(chrome_icon_button(
+            theme_icon,
+            "Theme",
+            false,
+            Message::ToggleTheme,
+            state,
+        ));
     container(modules.padding([8, 4]))
         .width(MODULE_RAIL_WIDTH)
         .height(Length::Fill)
@@ -1416,6 +1442,34 @@ fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, screen.label(), nav);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
     nav.into()
+}
+
+/// Compact 34×34 icon-only chrome button (Settings, Theme) at the rail foot.
+fn chrome_icon_button<'a>(
+    icon: Icon,
+    label: &'static str,
+    active: bool,
+    message: Message,
+    state: &Shell,
+) -> Element<'a, Message> {
+    let p = theme::palette(state.mode);
+    let btn = button(
+        container(icons::view(icon, 18.0, if active { p.ink } else { p.icon_idle }))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(34)
+    .height(34)
+    .padding(0)
+    .on_press(message)
+    .style(move |_, status| tab_style(p, active, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    {
+        let _ = label;
+        btn.into()
+    }
 }
 
 fn rounded(background: Color, radius: f32) -> container::Style {
