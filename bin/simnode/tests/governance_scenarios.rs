@@ -61,7 +61,7 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
 const FAR_FUTURE: u64 = 4_102_444_800; // 2100-01-01
 
 /// mint an invite token locked to `target`: the issuer's signature over the
-/// v2 grant preimage `binding ‖ nonce ‖ kind[‖ target] ‖ role ‖ expiry`
+/// grant preimage `binding ‖ nonce ‖ kind[‖ target] ‖ role ‖ expiry`
 /// (kind 1 = targeted) in the grant namespace — minting IS the admission
 /// decision FOR THAT KEY. the preimage is deliberately RE-STATED here rather
 /// than calling into governance: if the signed shape ever drifts, this suite
@@ -94,7 +94,7 @@ fn mint_as(
     }
 }
 
-/// mint a BEARER token: v2 preimage kind 0x00, NO target bytes — the first
+/// mint a BEARER token: preimage kind 0x00, NO target bytes — the first
 /// valid join proof takes the grant. role is the caller's so the
 /// client-only rule can be pinned from the outside. re-stated on purpose,
 /// like `mint_as`.
@@ -601,7 +601,7 @@ fn a_bearer_resident_invite_is_rejected_as_client_only() {
     let (sim, validators) = governed(storage.path());
     let issuer = &validators[0];
 
-    // a WELL-FORMED bearer Resident token (valid sig over the v2 preimage):
+    // a WELL-FORMED bearer Resident token (valid sig over the current preimage):
     // the rule is semantic, not cryptographic — pin the exact reject.
     let token = mint_bearer(
         issuer,

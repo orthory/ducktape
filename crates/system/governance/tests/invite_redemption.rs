@@ -42,7 +42,7 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 
 /// re-state the invite-grant preimage here rather than reach into
 /// `governance::invite` (private): a preimage drift in the crate then FAILS
-/// these tests loudly instead of silently signing a stale shape. v2: a kind
+/// these tests loudly instead of silently signing a stale shape. a kind
 /// byte (`1` ‖ target for targeted, `0` for bearer) precedes the role.
 fn grant_preimage_for_tests(
     binding: &[u8],

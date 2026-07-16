@@ -166,7 +166,7 @@ fn execute(id: &str) -> Msg {
 /// proof-of-possession) into the Redeem op — deterministic: the nonce is
 /// caller-chosen and ed25519 signing is deterministic.
 fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &Ed) -> Msg {
-    // target-locked, Resident-role, far-future expiry — the v2 grant
+    // target-locked, Resident-role, far-future expiry — the current grant
     // preimage (binding || nonce || kind[|| target] || role || expires_le;
     // kind 1 = targeted).
     let expires: u64 = 4_102_444_800; // 2100-01-01 — far future, wall-clock-shaped

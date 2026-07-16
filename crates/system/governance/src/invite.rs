@@ -80,7 +80,7 @@ pub struct InviteToken {
     pub sig: ed25519::Signature,
 }
 
-/// the signed preimage of an invite grant, v2: `binding ‖ nonce ‖ kind[‖
+/// the signed preimage of an invite grant: `binding ‖ nonce ‖ kind[‖
 /// target] ‖ role ‖ expiry`, where the kind byte distinguishes targeted
 /// (`0x01 ‖ target`) from bearer (`0x00`, no target bytes) so neither form
 /// can be replayed as the other. every covered field is authenticated —
@@ -107,7 +107,7 @@ fn grant_preimage(
     out
 }
 
-/// verify a token: issuer signature over the v2 grant preimage. pure
+/// verify a token: issuer signature over the grant preimage. pure
 /// signature math — the bearer-is-client-only invariant is enforced where
 /// admission is decided (redeem, the doors), not here.
 pub fn verify_invite_token(token: &InviteToken, binding: &[u8]) -> bool {

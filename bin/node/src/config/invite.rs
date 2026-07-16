@@ -65,7 +65,7 @@ pub fn mint_bearer_client_token(
     mint_token(signer, binding, None, InviteRole::Client, expires_unix_secs)
 }
 
-/// the shared mint core — re-states the v2 grant preimage (`binding ‖ nonce ‖
+/// the shared mint core — re-states the grant preimage (`binding ‖ nonce ‖
 /// kind[‖ target] ‖ role ‖ expires_le`) because `grant_preimage` is private
 /// to the governance crate; a drift fails the crypto tests loudly.
 fn mint_token(
@@ -100,7 +100,7 @@ fn mint_token(
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
-/// packed token v2: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32) if
+/// packed token: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32) if
 /// kind==1] ‖ role(1) ‖ expires_le(8) ‖ sig(64)` — 154 bytes targeted, 122
 /// bearer.
 const INVITE_TOKEN_TARGETED_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 32 + 1 + 8 + 64;
@@ -147,18 +147,18 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
         0 => (None, INVITE_TOKEN_BEARER_LEN),
         other => return Err(format!("unknown invite token kind {other}")),
     };
+    if bytes.len() != expect_len {
+        return Err(format!(
+            "invite token must be {expect_len} bytes for its kind, got {}",
+            bytes.len()
+        ));
+    }
     // the semantic rule rides the decoder so EVERY consumer inherits it: a
     // bearer token is Client-role-only (mint cannot produce the combination;
     // a self-signed blob can claim it, and consensus would reject it — but
     // no decoder should hand it onward as a valid token either).
     if target.is_none() && bytes[pos] != InviteRole::Client.as_u8() {
         return Err("bearer invite tokens are client-only".into());
-    }
-    if bytes.len() != expect_len {
-        return Err(format!(
-            "invite token must be {expect_len} bytes for its kind, got {}",
-            bytes.len()
-        ));
     }
     let role = InviteRole::from_u8(bytes[pos])?;
     pos += 1;
@@ -617,7 +617,7 @@ fn pack_invite(
 
     // the token now carries its OWN expiry (no separate blob-level field) —
     // decode enforces it from `token.expires_unix_secs`.
-    // length-prefixed: the v2 token is variable-width (bearer carries no
+    // length-prefixed: the token is variable-width (bearer carries no
     // target bytes), so the reader learns how much to take.
     let tok = pack_invite_token(token);
     out.push(u8::try_from(tok.len()).expect("a packed token fits u8"));

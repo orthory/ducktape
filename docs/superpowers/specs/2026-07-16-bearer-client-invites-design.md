@@ -57,7 +57,7 @@ HTTP response. The serving node needs no new code path at all.
 `governance::invite::InviteToken.target: ed25519::PublicKey` becomes
 `Option<ed25519::PublicKey>`. `None` = bearer.
 
-**Signed preimage v2** (in-place, no compat — standing mandate):
+**The signed preimage** (changed IN PLACE — no dual-decode, no version tags, per the no-backcompat mandate; exactly ONE format exists and old invites simply fail to decode):
 
 ```
 binding ‖ nonce ‖ kind ‖ [target] ‖ role ‖ expires_le
@@ -91,7 +91,7 @@ In `crates/system/governance/src/lib.rs handle_redeem`:
 - bearer: no target lock — the join proof (`binding ‖ nonce ‖ joiner`,
   `INVITE_JOIN_NAMESPACE`) binds the redemption to whichever key redeems
   first; the shared nonce set makes that exactly-once.
-- everything else identical: token signature (over preimage v2), issuer
+- everything else identical: token signature (over the new preimage), issuer
   still in members, role-specific grant (`ClientsMsg::Grant`), no expiry in
   consensus (block-height clock; joiner decode + serving-member wall clock
   remain the expiry authorities, single-use bounds the residual window).
@@ -153,7 +153,7 @@ session, no quorum, no gateway control. Revocation = `ClientsMsg::Revoke`
 ## 6. Testing
 
 - **governance unit** (native, runs pre-wasm): bearer mint/verify roundtrip;
-  preimage-v2 pins (kind byte covered by sig — mutate target/kind ⇒ verify
+  new-preimage pins (kind byte covered by sig — mutate target/kind ⇒ verify
   fails); bearer+Resident refused at mint, verify, and redeem; bearer redeem
   grants client standing; targeted lock still enforced; **the bearer race
   pin**: two keys, one nonce — first commit wins, second deterministically

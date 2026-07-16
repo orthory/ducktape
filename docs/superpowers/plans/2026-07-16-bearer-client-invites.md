@@ -4,7 +4,7 @@
 
 **Goal:** Single-use bearer invites, Client role only, redeemed over the existing `/v1/submit` lane by a new `user-redeem-invite` CLI verb.
 
-**Architecture:** `InviteToken.target` becomes `Option<PublicKey>` with a signature-covered kind byte (preimage v2, in-place flag day). Consensus (`handle_redeem`) treats an empty `target` as bearer, requires `role == Client` for it, and skips the target lock — nonce exactly-once already gives single-use first-wins. No new gate, no new route: the resident lobby gate stays Resident-only, and a thin client POSTs its own `GovMsg::Redeem` to a member node's frameless `/v1/submit` (bin/node stamps its node key as the external origin; the token, not the submitter, authorizes admission).
+**Architecture:** `InviteToken.target` becomes `Option<PublicKey>` with a signature-covered kind byte (one in-place format change, flag day). Consensus (`handle_redeem`) treats an empty `target` as bearer, requires `role == Client` for it, and skips the target lock — nonce exactly-once already gives single-use first-wins. No new gate, no new route: the resident lobby gate stays Resident-only, and a thin client POSTs its own `GovMsg::Redeem` to a member node's frameless `/v1/submit` (bin/node stamps its node key as the external origin; the token, not the submitter, authorizes admission).
 
 **Tech Stack:** Rust (workspace), governance wasm module (adapter build via `make wasm-modules`), reqwest blocking (already a workspace dep with `blocking` feature).
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Worktree: `/home/eddy/dev/ducktape/.worktree/bearer-client-invites` (branch `feat/bearer-client-invites`, forked from origin/dev `538fa38e8b`). ALL commands below run from this directory.
-- NO backward compatibility (standing mandate): preimage v2 replaces v1 in place — no dual-decode, no version tags. All outstanding invites die; that is accepted.
+- NO backward compatibility (standing mandate): the preimage changes in place — no dual-decode, no version tags; one format exists. All outstanding invites die; that is accepted.
 - Bearer ⇒ `role == Client`, enforced at mint (by construction), at redeem (consensus), and at node-join paste time. NEVER grant resident standing from a bearer token.
 - Single-use stays the law: one invite = one redemption (operator directive). No multi-use anywhere.
 - Lint gate per touched crate: `cargo clippy -p <crate> --tests --no-deps`. Exception (pre-existing): `-p nat-traversal` needs `--features simnat` — not touched here.
@@ -26,14 +26,14 @@
 
 ---
 
-### Task 1: governance — `InviteToken.target: Option`, preimage v2
+### Task 1: governance — `InviteToken.target: Option`, the new preimage
 
 **Files:**
 - Modify: `crates/system/governance/src/invite.rs`
 
 **Interfaces:**
 - Produces: `pub struct InviteToken { target: Option<ed25519::PublicKey>, ... }` (other fields unchanged); `grant_preimage(binding, nonce, target: Option<&ed25519::PublicKey>, role, expires) -> Vec<u8>` stays private; `verify_invite_token(&InviteToken, binding) -> bool` signature unchanged; `sign_join_proof`/`verify_join_proof` unchanged (they never touch target).
-- Preimage v2 (every later task that re-states it MUST match byte-for-byte):
+- The preimage (every later task that re-states it MUST match byte-for-byte):
   `binding ‖ nonce ‖ 0x01 ‖ target(32) ‖ role ‖ expires_le` (targeted)
   `binding ‖ nonce ‖ 0x00 ‖ role ‖ expires_le` (bearer)
 
@@ -56,7 +56,7 @@ pub struct InviteToken {
     pub sig: ed25519::Signature,
 }
 
-/// the signed preimage of an invite grant, v2: a kind byte distinguishes
+/// the signed preimage of an invite grant: a kind byte distinguishes
 /// targeted (0x01 ‖ target) from bearer (0x00, no target bytes) so neither
 /// form can be replayed as the other. every covered field is authenticated.
 fn grant_preimage(
@@ -84,9 +84,9 @@ fn grant_preimage(
 
 Update `verify_invite_token` to pass `token.target.as_ref()`. Update the module doc header: replace "`target` is the ONE key the invite admits (no bearer invites)" with the bearer-is-client-only rule. Do NOT add a role invariant inside `verify_invite_token` — it stays pure signature math; the invariant is enforced at mint (by construction, Task 4), at redeem (Task 2), and at the admission doors (already role-gated).
 
-- [ ] **Step 2: fix the in-file tests to v2 and add bearer coverage**
+- [ ] **Step 2: fix the in-file tests to the new preimage and add bearer coverage**
 
-The `mint` helper and `a_client_role_invite...` test construct preimages inline — update both to the v2 shape (kind byte `1` + target). Add:
+The `mint` helper and `a_client_role_invite...` test construct preimages inline — update both to the new shape (kind byte `1` + target). Add:
 
 ```rust
 #[test]
@@ -124,7 +124,7 @@ Expected: PASS. (`cargo test -p governance` full will fail until Task 2 fixes li
 
 ```bash
 git add crates/system/governance/src/invite.rs
-git commit -m "governance: bearer invite tokens — optional target, preimage v2"
+git commit -m "governance: bearer invite tokens — optional target, kind-byte preimage"
 ```
 
 ---
@@ -142,11 +142,11 @@ git commit -m "governance: bearer invite tokens — optional target, preimage v2
 
 - [ ] **Step 1: write the failing native tests**
 
-In `crates/system/governance/tests/invite_redemption.rs`, the existing helpers mint targeted tokens with an inline preimage — update them to v2 (kind byte, like Task 1's test helper). Add a bearer mint helper and three tests (adapt `Ctx`/module setup from the file's existing tests — reuse whatever fixture the sibling tests use verbatim):
+In `crates/system/governance/tests/invite_redemption.rs`, the existing helpers mint targeted tokens with an inline preimage — update them to the new shape (kind byte, like Task 1's test helper). Add a bearer mint helper and three tests (adapt `Ctx`/module setup from the file's existing tests — reuse whatever fixture the sibling tests use verbatim):
 
 ```rust
 fn mint_bearer(issuer: &ed25519::PrivateKey, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN], role: InviteRole) -> InviteToken {
-    // re-states preimage v2 deliberately: drift fails this suite.
+    // re-states the preimage deliberately: drift fails this suite.
     let mut msg = Vec::new();
     msg.extend_from_slice(binding);
     msg.extend_from_slice(&nonce);
@@ -159,7 +159,7 @@ fn mint_bearer(issuer: &ed25519::PrivateKey, binding: &[u8], nonce: [u8; INVITE_
 ```
 
 1. `a_bearer_client_redeem_grants_client_standing_first_wins`: mint bearer Client; key A redeems (empty `target` bytes in the op) → Ok, clients set contains A, valset residents does NOT; key B redeems the SAME token with B's own valid proof → deterministic reject containing `"already redeemed"`.
-2. `a_bearer_resident_token_is_rejected_as_client_only`: mint bearer with `InviteRole::Resident` (valid sig over v2 preimage) → reject containing `"bearer invites are client-only"`; joiner gains no standing of any tier.
+2. `a_bearer_resident_token_is_rejected_as_client_only`: mint bearer with `InviteRole::Resident` (valid sig over new preimage) → reject containing `"bearer invites are client-only"`; joiner gains no standing of any tier.
 3. `a_targeted_token_still_locks_to_its_target`: existing lock test keeps passing after the preimage update (adjust, don't delete).
 
 - [ ] **Step 2: run to verify the new tests fail**
@@ -240,7 +240,7 @@ git commit -m "governance-wasm: regenerate component for bearer invite redemptio
 
 ---
 
-### Task 4: bin/node — token/blob codec v2, mint helpers, lobby Option handling
+### Task 4: bin/node — token/blob codec, mint helpers, lobby Option handling
 
 **Files:**
 - Modify: `bin/node/src/config/invite.rs` (mint at ~46, pack/unpack token at 76–118, blob write at 556, blob read at 664, `DEFAULT_INVITE_TTL_DAYS` block at ~315)
@@ -252,7 +252,7 @@ git commit -m "governance-wasm: regenerate component for bearer invite redemptio
   - `pub fn mint_invite_token(signer, binding, target: &ed25519::PublicKey, role, expires) -> InviteToken` — signature UNCHANGED (wraps `Some(target)`); zero caller churn.
   - `pub fn mint_bearer_client_token(signer: &ed25519::PrivateKey, binding: &[u8], expires_unix_secs: u64) -> InviteToken` — the ONLY bearer constructor (Client role by construction).
   - `pub const DEFAULT_BEARER_INVITE_TTL_DAYS: u64 = 1;`
-  - Packed token v2: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32) if kind==1] ‖ role(1) ‖ expires_le(8) ‖ sig(64)` → 122 bytes bearer / 154 targeted. Blob embeds it length-prefixed: `u8 len ‖ token bytes`.
+  - Packed token: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32) if kind==1] ‖ role(1) ‖ expires_le(8) ‖ sig(64)` → 122 bytes bearer / 154 targeted. Blob embeds it length-prefixed: `u8 len ‖ token bytes`.
   - Wire (`GateMsg`/`IntroRequest` field shapes untouched): `target: Vec<u8>` empty = bearer.
 
 - [ ] **Step 1: codec + mint in config/invite.rs**
@@ -313,7 +313,7 @@ fn mint_token(
 Pack/unpack:
 
 ```rust
-/// packed token v2: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32)] ‖
+/// packed token: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32)] ‖
 /// role(1) ‖ expires_le(8) ‖ sig(64)` — 154 targeted / 122 bearer.
 const INVITE_TOKEN_TARGETED_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 32 + 1 + 8 + 64;
 const INVITE_TOKEN_BEARER_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 1 + 8 + 64;
@@ -456,7 +456,7 @@ Expected: lib tests PASS (bins/e2e still broken until Task 5 — acceptable mid-
 
 ```bash
 git add bin/node/src/config/invite.rs bin/node/src/lobby.rs
-git commit -m "node: bearer token codec v2 + lobby optional-target handling"
+git commit -m "node: bearer token codec + lobby optional-target handling"
 ```
 
 ---
@@ -656,14 +656,14 @@ git commit -m "cli: user-redeem-invite — redeem a client invite over /v1/submi
 **Interfaces:**
 - Consumes: wire shapes only (the suite deliberately re-states the preimage).
 
-- [ ] **Step 1: update the re-stated preimage to v2 and add the bearer helpers**
+- [ ] **Step 1: update the re-stated preimage (kind byte) and add the bearer helpers**
 
 `mint_as`: insert the kind byte —
 ```rust
 let msg = [
     binding,
     nonce.as_slice(),
-    &[1u8],                    // targeted kind (preimage v2)
+    &[1u8],                    // targeted kind (the new preimage)
     target.as_ref(),
     &[role.as_u8()],
     &expires_unix_secs.to_le_bytes(),
@@ -673,7 +673,7 @@ let msg = [
 
 Add:
 ```rust
-/// bearer mint — preimage v2 kind 0x00, NO target bytes. re-stated on purpose.
+/// bearer mint — the new preimage kind 0x00, NO target bytes. re-stated on purpose.
 fn mint_bearer(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN], role: InviteRole) -> InviteToken { ... }
 
 /// the bearer redeem op: target = EMPTY bytes.
@@ -687,7 +687,7 @@ fn redeem_bearer(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value 
 
 - **B5e** `a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only`: bearer Client mint; key A `submit_ok` → clients set has A, residents/validators don't; key B same-nonce redeem with B's own proof → `submit_rejected` contains `"already redeemed"`; clients set does NOT contain B.
 - **B5f** `a_bearer_resident_invite_is_rejected_as_client_only`: bearer Resident (valid sig) → `submit_rejected` contains `"bearer invites are client-only"`; no standing of any tier.
-- **B5g** existing B5b/B5c/B5d still pass with the v2 helper (run, don't rewrite).
+- **B5g** existing B5b/B5c/B5d still pass with the updated helper (run, don't rewrite).
 
 - [ ] **Step 3: run the standing gate**
 
@@ -698,7 +698,7 @@ Expected: PASS (the suite exercises the WASM governance component — this is al
 
 ```bash
 git add bin/simnode/tests/governance_scenarios.rs
-git commit -m "simnode: preimage-v2 mint helpers + bearer client invite pins"
+git commit -m "simnode: new-preimage mint helpers + bearer client invite pins"
 ```
 
 ---
@@ -833,7 +833,7 @@ git diff --stat  # confirm no unrelated reformat
 
 ```bash
 git push -u origin feat/bearer-client-invites
-gh pr create --base dev --title "Bearer client invites: single-use, /v1/submit redemption" --body "<summary: spec link, wire flag day (preimage v2 + blob codec), wasm regen, what's out of scope (PR9/PR10 app UX), gates run + the pre-existing live_quorum skip>
+gh pr create --base dev --title "Bearer client invites: single-use, /v1/submit redemption" --body "<summary: spec link, wire flag day (the new preimage + blob codec), wasm regen, what's out of scope (PR9/PR10 app UX), gates run + the pre-existing live_quorum skip>
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 ```
@@ -848,4 +848,4 @@ Dispatch a fresh-context review of the PR diff (scope creep, missing verificatio
 
 - Spec coverage: §1 tokens → Task 1/4; §2 consensus + wasm → Tasks 2/3; §3 mint/guards → Tasks 4/5; §4 client verb → Task 6; §6 testing → Tasks 1,2,4,6,7,8; §7 out-of-scope honored (no app changes, no lobby gate change).
 - Wire strings are contracts: `"bearer invites are client-only"`, `"already redeemed"`, `"already holds client standing"`, `"invite is locked to another key"` — Tasks 2/6/7/8 all match on them; do not rephrase one without the others.
-- Preimage v2 is re-stated in four places BY DESIGN (governance/invite.rs authoritative; bin/node mint; simnode helper; governance native-test helper) — drift anywhere fails a suite.
+- the new preimage is re-stated in four places BY DESIGN (governance/invite.rs authoritative; bin/node mint; simnode helper; governance native-test helper) — drift anywhere fails a suite.
