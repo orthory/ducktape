@@ -493,18 +493,43 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
     .align_y(Alignment::Center)
     .style(move |_| section_bg(p.sidebar));
 
-    let pane_copy = if let Some(error) = &state.error {
-        error.as_str()
-    } else if state.is_idle() {
-        "Press Enter for net.duck, or type <account>.duck or <label>.<account>.duck."
-    } else if !cef_ready {
-        "Starting the isolated browser…"
-    } else if state.loading {
-        "Resolving route…"
+    // Refused route → a real alert card the user reads; other states → a hint.
+    let pane_body: Element<'_, Message> = if let Some(error) = &state.error {
+        container(
+            column![
+                text("Route refused")
+                    .font(SANS_SEMIBOLD)
+                    .size(TITLE)
+                    .color(p.filled),
+                selectable_error(error, p),
+            ]
+            .spacing(7),
+        )
+        .max_width(480)
+        .padding(18)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(p.paper)),
+            border: Border {
+                color: p.danger_border,
+                width: 1.0,
+                radius: theme::RADIUS_LG.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
     } else {
-        ""
+        let hint = if state.is_idle() {
+            "Press Enter for net.duck, or type <account>.duck or <label>.<account>.duck."
+        } else if !cef_ready {
+            "Starting the isolated browser…"
+        } else if state.loading {
+            "Resolving route…"
+        } else {
+            ""
+        };
+        text(hint).font(SANS).size(BODY).color(p.muted).into()
     };
-    let pane = container(text(pane_copy).font(SANS).size(BODY).color(p.muted))
+    let pane = container(pane_body)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(24)
@@ -555,6 +580,24 @@ fn icon_button<'a>(
         let _ = (enabled, name);
         btn.into()
     }
+}
+
+/// Selectable, read-only error text (the `workspace.rs::selectable_error`
+/// idiom, module-local) so a refused-route message can be copied.
+fn selectable_error<'a>(message: &'a str, p: &'a theme::Palette) -> Element<'a, Message> {
+    text_input("", message)
+        .font(SANS)
+        .size(LABEL)
+        .padding(0)
+        .style(move |_, _| text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.muted_3,
+            placeholder: p.muted_3,
+            value: p.muted_3,
+            selection: p.chip,
+        })
+        .into()
 }
 
 /// A 1px filled hairline between chrome sections (mandate #6: the card owns the
