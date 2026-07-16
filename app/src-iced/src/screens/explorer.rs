@@ -82,6 +82,20 @@ pub enum Message {
     Refresh,
     Open(u64),
     Back,
+    /// Deep-link entry point: open the explorer already scrolled to block #N,
+    /// waiting for the ring to load if needed (see [`consume_focus`]). The
+    /// consume side is complete and mirrors `members::Message::FocusAccount`,
+    /// but there is no producer yet. Wiring one is a cross-module change that
+    /// must end in `shell.rs`, which a parallel agent owns, so it is deferred:
+    //  TODO(EX-2.2): wire a block-ref producer for `Focus`. The chain is
+    //  `duck://block/{height}` → `classify_chat_ref` (`screen_service/chat.rs`,
+    //  add `ChatLink::Block { height }`) → `chat_intent` (`module_host.rs`) →
+    //  `Route::Block { height }` (`view_api.rs`) → the `AppIntent::Navigate`
+    //  arm in `shell.rs` (navigate to `Screen::Explorer` then
+    //  `explorer::update(&mut state.explorer, Message::Focus(height))`, exactly
+    //  as `Route::Member` does with `FocusAccount`). Only that last hop can emit
+    //  `Focus`; `shell.rs` is off-limits to this agent, so it is left for a
+    //  follow-up once the shell agent lands.
     #[allow(dead_code)]
     Focus(u64),
     Service(ServiceEvent),
