@@ -35,16 +35,27 @@ fn ready_renders_account_controls() {
     let state = ready();
     let mut ui = sim(settings::view(&state));
     assert!(ui.find("Settings").is_ok(), "title renders");
-    assert!(has(&mut ui, Role::Button, "Open Account"));
+    assert!(has(&mut ui, Role::Button, "Open account"));
 }
 
 #[test]
 fn open_account_emits() {
     let state = ready();
     let mut ui = sim(settings::view(&state));
-    ui.click(by::role(Role::Button, "Open Account"))
+    ui.click(by::role(Role::Button, "Open account"))
         .expect("account button is clickable");
     assert!(emitted(ui, &Message::OpenAccount));
+}
+
+#[test]
+fn section_titles_render() {
+    // The redesign groups preferences under clearly-titled sections; lock the
+    // group headings so a future refactor can't silently flatten them.
+    let state = ready();
+    let mut ui = sim(settings::view(&state));
+    for title in ["ACCOUNT", "PREFERENCES", "NOTIFICATIONS", "NETWORK"] {
+        assert!(ui.find(title).is_ok(), "section heading {title} renders");
+    }
 }
 
 #[test]
