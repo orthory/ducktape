@@ -79,37 +79,28 @@ pub(super) fn view(state: &MetricsState, p: Palette) -> Element<'_, Message> {
             p,
         );
     };
-    let header = container(
-        row![
-            column![
-                text("Metrics").font(SANS).size(20).color(p.ink),
-                text(format!(
-                    "Live node telemetry · sampled {}",
-                    snapshot.sampled_at
-                ))
-                .font(SANS)
-                .size(11.5)
-                .color(p.muted_2),
-            ]
-            .spacing(5),
-            Space::new().width(Length::Fill),
-            outline_button(
-                if state.paused { "Resume" } else { "Pause" },
-                Message::ToggleMetricsPause,
-                true,
-                p
-            ),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .padding(Padding {
-        top: 20.0,
-        right: 22.0,
-        bottom: 16.0,
-        left: 22.0,
-    })
-    .style(move |_| bottom_border(p.canvas, p.border_soft));
+    let actions = row![
+        text(if state.paused { "Paused" } else { "Live" })
+            .font(MONO)
+            .size(CAPTION)
+            .color(if state.paused { p.muted_2 } else { p.green }),
+        outline_button(
+            if state.paused { "Resume" } else { "Pause" },
+            Message::ToggleMetricsPause,
+            true,
+            p
+        ),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let header = section_header("Metrics", None, Some(actions.into()), p);
+    let intro = text(format!(
+        "Live node telemetry · sampled {}",
+        snapshot.sampled_at
+    ))
+    .font(SANS)
+    .size(BODY)
+    .color(p.muted_2);
     let summary = row![
         stat_card(
             "BLOCK HEIGHT",
@@ -168,32 +159,33 @@ pub(super) fn view(state: &MetricsState, p: Palette) -> Element<'_, Message> {
         sync = sync.push(metric_sync_row(peer, p));
     }
     let body = column![
+        intro,
         summary,
         card(
             row![
                 column![
-                    text("ACCEPTED").font(MONO).size(9).color(p.muted_2),
+                    text("ACCEPTED").font(MONO).size(CAPTION).color(p.muted_2),
                     text(snapshot.accepted.to_string())
                         .font(MONO)
-                        .size(18)
+                        .size(HEADING)
                         .color(p.green)
                 ]
                 .spacing(4),
                 Space::new().width(Length::Fill),
                 column![
-                    text("REJECTED").font(MONO).size(9).color(p.muted_2),
+                    text("REJECTED").font(MONO).size(CAPTION).color(p.muted_2),
                     text(snapshot.rejected.to_string())
                         .font(MONO)
-                        .size(18)
+                        .size(HEADING)
                         .color(p.red)
                 ]
                 .spacing(4),
                 Space::new().width(Length::Fill),
                 column![
-                    text("APPLY P50").font(MONO).size(9).color(p.muted_2),
+                    text("APPLY P50").font(MONO).size(CAPTION).color(p.muted_2),
                     text(format!("{:.1} ms", snapshot.apply_p50_ms))
                         .font(MONO)
-                        .size(18)
+                        .size(HEADING)
                         .color(p.ink)
                 ]
                 .spacing(4),
@@ -224,11 +216,11 @@ fn metric_plane_row(plane: &DataPlaneMetric, p: Palette) -> Element<'_, Message>
                     plane.service.clone()
                 })
                 .font(MONO)
-                .size(12)
+                .size(LABEL)
                 .color(if plane.halted { p.red } else { p.ink }),
-                text(format!("by {} · open {}", plane.owner, plane.age))
+                text(format!("by {} · open {}", short(&plane.owner, 10, 6), plane.age))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.muted_2),
             ]
             .spacing(2)
@@ -237,11 +229,11 @@ fn metric_plane_row(plane: &DataPlaneMetric, p: Palette) -> Element<'_, Message>
             column![
                 text(format!("↑ {}", format_rate(plane.tx_bytes_per_second)))
                     .font(MONO)
-                    .size(11)
+                    .size(CAPTION)
                     .color(p.ink),
                 text(format!("↓ {}", format_rate(plane.rx_bytes_per_second)))
                     .font(MONO)
-                    .size(11)
+                    .size(CAPTION)
                     .color(p.ink),
             ]
             .spacing(2)
@@ -249,11 +241,11 @@ fn metric_plane_row(plane: &DataPlaneMetric, p: Palette) -> Element<'_, Message>
             column![
                 text(format!("{} total", format_bytes(plane.total_bytes)))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.muted),
                 text(format!("{} dropped", plane.dropped))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(if plane.dropped > 0 {
                         p.amber
                     } else {
@@ -291,18 +283,18 @@ fn metric_sync_row(peer: &SyncPeerMetric, p: Palette) -> Element<'_, Message> {
             column![
                 text(short(&peer.peer, 12, 8))
                     .font(MONO)
-                    .size(12)
+                    .size(LABEL)
                     .color(p.ink),
                 text(format!("{} · {}", peer.phase, peer.age))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.muted_2),
             ]
             .spacing(2)
             .width(170),
             column![
-                text(progress).font(MONO).size(11).color(p.ink),
-                text(left).font(MONO).size(10.5).color(p.muted),
+                text(progress).font(MONO).size(CAPTION).color(p.ink),
+                text(left).font(MONO).size(CAPTION).color(p.muted),
             ]
             .spacing(2)
             .width(150),
@@ -310,7 +302,7 @@ fn metric_sync_row(peer: &SyncPeerMetric, p: Palette) -> Element<'_, Message> {
             column![
                 text(format!("↑ {}", format_rate(peer.tx_bytes_per_second)))
                     .font(MONO)
-                    .size(11)
+                    .size(CAPTION)
                     .color(p.ink),
                 text(format!(
                     "{} · {} frames",
@@ -318,7 +310,7 @@ fn metric_sync_row(peer: &SyncPeerMetric, p: Palette) -> Element<'_, Message> {
                     peer.frames
                 ))
                 .font(MONO)
-                .size(10.5)
+                .size(CAPTION)
                 .color(p.muted),
             ]
             .spacing(2)

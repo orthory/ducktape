@@ -31,7 +31,7 @@ pub async fn execute_operator(
     workspace: Option<Workspace>,
     command: operator::Command,
 ) -> operator::ServiceEvent {
-    use operator::{Command, Screen, ServiceEvent};
+    use operator::{Command, GatewayAction, Screen, ServiceEvent};
 
     match command {
         Command::LoadNode => ServiceEvent::NodeLoaded(
@@ -72,13 +72,13 @@ pub async fn execute_operator(
             screen: Screen::Sandbox,
             result: sandbox::start_setup(node.as_ref(), workspace.as_ref(), &check, &agent).await,
         },
-        Command::SaveGatewayRoute(draft) => ServiceEvent::ActionFinished {
-            screen: Screen::Gateway,
+        Command::SaveGatewayRoute(draft) => ServiceEvent::GatewayActionFinished {
+            kind: GatewayAction::Saved,
             result: gateway::save_route(backend.as_ref(), node.as_ref(), workspace.as_ref(), draft)
                 .await,
         },
-        Command::RemoveGatewayRoute(key) => ServiceEvent::ActionFinished {
-            screen: Screen::Gateway,
+        Command::RemoveGatewayRoute(key) => ServiceEvent::GatewayActionFinished {
+            kind: GatewayAction::Removed,
             result: gateway::remove_route(
                 backend.as_ref(),
                 node.as_ref(),
@@ -87,8 +87,8 @@ pub async fn execute_operator(
             )
             .await,
         },
-        Command::CreateGatewayStarter(draft) => ServiceEvent::ActionFinished {
-            screen: Screen::Gateway,
+        Command::CreateGatewayStarter(draft) => ServiceEvent::GatewayActionFinished {
+            kind: GatewayAction::StarterCreated,
             result: gateway::create_starter(
                 backend.as_ref(),
                 node.as_ref(),
