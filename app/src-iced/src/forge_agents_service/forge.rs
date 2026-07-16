@@ -160,6 +160,23 @@ pub async fn execute_forge(
             )
             .await,
         ),
+        Command::LoadCommitDiff {
+            repository_id,
+            commit_id,
+        } => {
+            let event_commit = commit_id.clone();
+            ServiceEvent::CommitDiffLoaded {
+                commit_id: event_commit,
+                result: load_commit_diff(
+                    backend.as_ref(),
+                    workspace.as_ref(),
+                    node.as_ref(),
+                    repository_id,
+                    commit_id,
+                )
+                .await,
+            }
+        }
         Command::OpenIssue {
             repository_id,
             title,
@@ -390,6 +407,7 @@ async fn load_repository(
         commits: commits.into_iter().map(commit_view).collect(),
         commits_have_more,
         items,
+        remote: location.remote_origin.is_some(),
     })
 }
 
@@ -470,6 +488,33 @@ async fn load_more_commits(
     let more = commits.len() > COMMIT_PAGE;
     commits.truncate(COMMIT_PAGE);
     Ok((commits.into_iter().map(commit_view).collect(), more))
+}
+
+async fn load_commit_diff(
+    backend: Option<&Backend>,
+    workspace: Option<&Workspace>,
+    node: Option<&NodeClient>,
+    repository: String,
+    commit_id: String,
+) -> Result<Vec<forge::ChangedFile>, String> {
+    clean_repo_name(&repository)?;
+    validate_oid(&commit_id, "commit id")?;
+    let location = forge_location(backend, workspace, node)?;
+    prepare_remote(&location, &repository).await?;
+    blocking(move || {
+        let repo = require_named_repo(&location, &repository)?;
+        let oid = Oid::from_str(&commit_id).map_err(git_error)?;
+        let commit = repo.find_commit(oid).map_err(git_error)?;
+        let head_tree = commit.tree().map_err(git_error)?;
+        // A root commit has no parent; diff it against the empty tree.
+        let base_tree = match commit.parent(0) {
+            Ok(parent) => Some(parent.tree().map_err(git_error)?),
+            Err(error) if error.code() == ErrorCode::NotFound => None,
+            Err(error) => return Err(git_error(error)),
+        };
+        diff_changed_files(&repo, base_tree.as_ref(), &head_tree)
+    })
+    .await
 }
 
 async fn load_forge_items(
@@ -1575,47 +1620,38 @@ fn utf8_text_page(content: &[u8], offset: usize, limit: usize) -> Result<FilePag
     })
 }
 
-fn compare(repo: &GitRepository, base: &str, head: &str) -> Result<CompareInfo, String> {
-    let base_oid = require_ref_spec(repo, base)?;
-    let head_oid = require_ref_spec(repo, head)?;
-    let merge_base = repo
-        .merge_base(base_oid, head_oid)
-        .map_err(|error| format!("no merge base between {base:?} and {head:?}: {error}"))?;
-    let base_tree = repo
-        .find_commit(merge_base)
-        .and_then(|commit| commit.tree())
-        .map_err(git_error)?;
-    let head_tree = repo
-        .find_commit(head_oid)
-        .and_then(|commit| commit.tree())
-        .map_err(git_error)?;
+/// Build the per-file unified diff between two trees, honoring the same
+/// changed-file / patch-size limits as a pull-request compare. `base_tree` is
+/// `None` for a root commit (diff against the empty tree).
+fn diff_changed_files(
+    repo: &GitRepository,
+    base_tree: Option<&GitTree<'_>>,
+    head_tree: &GitTree<'_>,
+) -> Result<Vec<forge::ChangedFile>, String> {
     let mut options = DiffOptions::new();
     options.context_lines(3).interhunk_lines(0);
     let mut diff = repo
-        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut options))
+        .diff_tree_to_tree(base_tree, Some(head_tree), Some(&mut options))
         .map_err(git_error)?;
     diff.find_similar(None).map_err(git_error)?;
     if diff.deltas().len() > MAX_CHANGED_FILES {
-        return Err("pull request changed-file count exceeds the desktop limit".into());
+        return Err("changed-file count exceeds the desktop limit".into());
     }
     let mut files = Vec::new();
     let mut total_patch_bytes = 0usize;
     for (index, delta) in diff.deltas().enumerate() {
         let path = delta_path(&delta);
-        let (additions, deletions, patch) = match Patch::from_diff(&diff, index)
-            .map_err(git_error)?
+        let (additions, deletions, patch) = match Patch::from_diff(&diff, index).map_err(git_error)?
         {
             Some(mut patch) => {
                 let (_context, additions, deletions) = patch.line_stats().map_err(git_error)?;
                 let patch = patch.to_buf().map_err(git_error)?;
                 if patch.len() > MAX_PATCH_BYTES {
-                    return Err(format!(
-                        "diff for {path:?} exceeds the desktop display limit"
-                    ));
+                    return Err(format!("diff for {path:?} exceeds the desktop display limit"));
                 }
                 total_patch_bytes = total_patch_bytes.saturating_add(patch.len());
                 if total_patch_bytes > MAX_TOTAL_PATCH_BYTES {
-                    return Err("pull request patch text exceeds the desktop display limit".into());
+                    return Err("patch text exceeds the desktop display limit".into());
                 }
                 (
                     additions as u64,
@@ -1632,6 +1668,24 @@ fn compare(repo: &GitRepository, base: &str, head: &str) -> Result<CompareInfo, 
             patch,
         });
     }
+    Ok(files)
+}
+
+fn compare(repo: &GitRepository, base: &str, head: &str) -> Result<CompareInfo, String> {
+    let base_oid = require_ref_spec(repo, base)?;
+    let head_oid = require_ref_spec(repo, head)?;
+    let merge_base = repo
+        .merge_base(base_oid, head_oid)
+        .map_err(|error| format!("no merge base between {base:?} and {head:?}: {error}"))?;
+    let base_tree = repo
+        .find_commit(merge_base)
+        .and_then(|commit| commit.tree())
+        .map_err(git_error)?;
+    let head_tree = repo
+        .find_commit(head_oid)
+        .and_then(|commit| commit.tree())
+        .map_err(git_error)?;
+    let files = diff_changed_files(repo, Some(&base_tree), &head_tree)?;
     let mut walk = repo.revwalk().map_err(git_error)?;
     walk.push(head_oid).map_err(git_error)?;
     walk.hide(base_oid).map_err(git_error)?;
