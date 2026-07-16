@@ -111,6 +111,12 @@ pub enum Message {
     FilesLoaded(Result<Vec<FileHit>, String>),
     MembersLoaded(Vec<MemberHit>),
     Select(Target),
+    /// Move the keyboard selection by a signed step (Down = +1, Up = -1).
+    /// A no-op while the palette is closed, so it is safe to route arrow keys
+    /// unconditionally from the stateless global shortcut handler.
+    MoveSelection(i32),
+    /// Activate the current keyboard selection (Enter). No-op while closed.
+    ActivateSelection,
     Ignore,
 }
 
@@ -129,6 +135,8 @@ pub struct State {
     pub results: Results,
     pub searching: bool,
     pub error: Option<String>,
+    /// Keyboard-selected result row, indexing `ordered_targets`.
+    pub selected: usize,
     generation: u64,
 }
 
@@ -141,6 +149,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             state.results = Results::default();
             state.searching = false;
             state.error = None;
+            state.selected = 0;
             state.generation = state.generation.wrapping_add(1);
             Some(Command::Focus)
         }
@@ -157,6 +166,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             state.query = value;
             state.results = Results::default();
             state.error = None;
+            state.selected = 0;
             state.generation = state.generation.wrapping_add(1);
             let query = state.query.trim().to_owned();
             state.searching = !query.is_empty();
@@ -167,6 +177,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         }
         Message::SearchFinished { generation, result } if generation == state.generation => {
             state.searching = false;
+            state.selected = 0;
             match result {
                 Ok(results) => state.results = results,
                 Err(error) => state.error = Some(error),
@@ -176,6 +187,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         Message::SearchFinished { .. } => None,
         Message::FilesLoaded(Ok(files)) => {
             state.catalog.files = files;
+            state.selected = 0;
             None
         }
         Message::FilesLoaded(Err(error)) => {
@@ -184,13 +196,100 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         }
         Message::MembersLoaded(members) => {
             state.catalog.members = members;
+            state.selected = 0;
             None
         }
         Message::Select(target) => {
             state.open = false;
             Some(Command::Selected(target))
         }
+        Message::MoveSelection(delta) => {
+            if !state.open {
+                return None;
+            }
+            let count = state.ordered_targets().len();
+            state.selected = if count == 0 {
+                0
+            } else {
+                (state.selected as i32 + delta).rem_euclid(count as i32) as usize
+            };
+            None
+        }
+        Message::ActivateSelection => {
+            if !state.open {
+                return None;
+            }
+            let target = state.ordered_targets().into_iter().nth(state.selected);
+            target.map(|target| {
+                state.open = false;
+                Command::Selected(target)
+            })
+        }
         Message::Ignore => None,
+    }
+}
+
+impl State {
+    /// Members matching the current query — the single filter both the view
+    /// and keyboard selection read, so ordering never drifts between them.
+    fn filtered_members(&self) -> Vec<&MemberHit> {
+        let query = self.query.trim().to_ascii_lowercase();
+        if query.is_empty() || self.catalog.client_mode {
+            return Vec::new();
+        }
+        self.catalog
+            .members
+            .iter()
+            .filter(|member| {
+                member.name.to_ascii_lowercase().contains(&query)
+                    || member.key.to_ascii_lowercase().contains(&query)
+            })
+            .take(RESULT_CAP)
+            .collect()
+    }
+
+    fn filtered_files(&self) -> Vec<&FileHit> {
+        let query = self.query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        self.catalog
+            .files
+            .iter()
+            .filter(|file| file.path.to_ascii_lowercase().contains(&query))
+            .take(RESULT_CAP)
+            .collect()
+    }
+
+    /// Every result row's target, in the exact render order (chat, pages,
+    /// members, files) — the index space keyboard selection walks.
+    fn ordered_targets(&self) -> Vec<Target> {
+        let mut targets = Vec::new();
+        for hit in &self.results.chat {
+            targets.push(Target::Chat {
+                channel_id: hit.channel_id.clone(),
+                sequence: hit.seq,
+            });
+        }
+        for hit in &self.results.pages {
+            targets.push(Target::Page {
+                page_id: hit.page_id.clone(),
+                block_id: hit.block_id.clone(),
+            });
+        }
+        for member in self.filtered_members() {
+            targets.push(Target::Member {
+                account_id: member.account_id.clone(),
+                key: member.key.clone(),
+            });
+        }
+        for file in self.filtered_files() {
+            targets.push(Target::File {
+                path: file.path.clone(),
+                directory: file.directory,
+            });
+        }
+        targets
     }
 }
 
@@ -359,32 +458,14 @@ fn decode_hits<T: for<'de> Deserialize<'de>>(reply: &Value) -> Result<Vec<T>, St
 
 pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, Message> {
     let p = *theme::palette(mode);
-    let query = state.query.trim().to_ascii_lowercase();
-    let members = (!query.is_empty() && !state.catalog.client_mode)
-        .then(|| {
-            state
-                .catalog
-                .members
-                .iter()
-                .filter(|member| {
-                    member.name.to_ascii_lowercase().contains(&query)
-                        || member.key.to_ascii_lowercase().contains(&query)
-                })
-                .take(RESULT_CAP)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let files = (!query.is_empty())
-        .then(|| {
-            state
-                .catalog
-                .files
-                .iter()
-                .filter(|file| file.path.to_ascii_lowercase().contains(&query))
-                .take(RESULT_CAP)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let members = state.filtered_members();
+    let files = state.filtered_files();
+    // Base index of each group in the flat `ordered_targets` space, so a row's
+    // keyboard-selected highlight matches `state.selected`.
+    let chat_base = 0;
+    let pages_base = chat_base + state.results.chat.len();
+    let members_base = pages_base + state.results.pages.len();
+    let files_base = members_base + members.len();
 
     let mut groups = column![].spacing(14);
     if state.query.trim().is_empty() {
@@ -400,7 +481,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
     } else {
         if !state.results.chat.is_empty() {
             let mut group = result_group("Chat", state.results.chat.len(), p);
-            for hit in &state.results.chat {
+            for (i, hit) in state.results.chat.iter().enumerate() {
                 let edited = if hit.edited { " · edited" } else { "" };
                 group = group.push(hit_button(
                     format!("#{} · {}{edited}", hit.channel_id, hit.author),
@@ -409,6 +490,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
                         channel_id: hit.channel_id.clone(),
                         sequence: hit.seq,
                     },
+                    state.selected == chat_base + i,
                     p,
                 ));
             }
@@ -416,7 +498,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
         }
         if !state.results.pages.is_empty() {
             let mut group = result_group("Pages", state.results.pages.len(), p);
-            for hit in &state.results.pages {
+            for (i, hit) in state.results.pages.iter().enumerate() {
                 group = group.push(hit_button(
                     format!("{} · {}", hit.page_id, hit.kind),
                     hit.text.clone(),
@@ -424,6 +506,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
                         page_id: hit.page_id.clone(),
                         block_id: hit.block_id.clone(),
                     },
+                    state.selected == pages_base + i,
                     p,
                 ));
             }
@@ -431,7 +514,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
         }
         if !members.is_empty() {
             let mut group = result_group("Members", members.len(), p);
-            for hit in &members {
+            for (i, hit) in members.iter().enumerate() {
                 group = group.push(hit_button(
                     short_key(&hit.key),
                     hit.name.clone(),
@@ -439,6 +522,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
                         account_id: hit.account_id.clone(),
                         key: hit.key.clone(),
                     },
+                    state.selected == members_base + i,
                     p,
                 ));
             }
@@ -446,7 +530,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
         }
         if !files.is_empty() {
             let mut group = result_group("Files", files.len(), p);
-            for hit in &files {
+            for (i, hit) in files.iter().enumerate() {
                 group = group.push(hit_button(
                     hit.path.clone(),
                     hit.name.clone(),
@@ -454,6 +538,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
                         path: hit.path.clone(),
                         directory: hit.directory,
                     },
+                    state.selected == files_base + i,
                     p,
                 ));
             }
@@ -484,6 +569,7 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
     )
     .id(Id::new(INPUT_ID))
     .on_input(Message::QueryChanged)
+    .on_submit(Message::ActivateSelection)
     .padding(0)
     .size(15)
     .style(move |_, status| text_input::Style {
@@ -612,6 +698,7 @@ fn hit_button(
     meta: String,
     body: String,
     target: Target,
+    selected: bool,
     p: theme::Palette,
 ) -> Element<'static, Message> {
     let btn = button(
@@ -625,7 +712,7 @@ fn hit_button(
     .width(Length::Fill)
     .on_press(Message::Select(target))
     .style(move |_, status| button::Style {
-        background: matches!(status, button::Status::Hovered)
+        background: (selected || matches!(status, button::Status::Hovered))
             .then_some(Background::Color(p.sunken)),
         text_color: p.ink,
         border: Border {
@@ -792,5 +879,51 @@ mod tests {
             thread: None,
             tags: vec![],
         }
+    }
+
+    #[test]
+    fn keyboard_selection_walks_results_and_activates() {
+        let mut state = State::default();
+        update(&mut state, Message::Open(Catalog::default()));
+        // Two chat rows + one page row = 3 targets in render order.
+        state.query = "x".into();
+        state.results = Results {
+            chat: vec![chat_hit("a"), chat_hit("b")],
+            pages: vec![PageHit {
+                block_id: "blk".into(),
+                page_id: "pg".into(),
+                parent: None,
+                kind: "text".into(),
+                text: "c".into(),
+                height: 1,
+                time: 1,
+            }],
+        };
+        assert_eq!(state.ordered_targets().len(), 3);
+        assert_eq!(state.selected, 0);
+
+        update(&mut state, Message::MoveSelection(1));
+        assert_eq!(state.selected, 1);
+        update(&mut state, Message::MembersLoaded(vec![]));
+        assert_eq!(state.selected, 0);
+        // Up from the top wraps to the last row.
+        update(&mut state, Message::MoveSelection(-1));
+        assert_eq!(state.selected, 2, "Up wraps to the last result");
+
+        // Enter activates the selected row's target.
+        let command = update(&mut state, Message::ActivateSelection);
+        assert!(
+            matches!(command, Some(Command::Selected(Target::Page { .. }))),
+            "activating row 2 opens the page target"
+        );
+        assert!(!state.open, "activation closes the palette");
+    }
+
+    #[test]
+    fn keyboard_nav_is_inert_while_closed() {
+        let mut state = State::default();
+        assert!(update(&mut state, Message::MoveSelection(1)).is_none());
+        assert!(update(&mut state, Message::ActivateSelection).is_none());
+        assert_eq!(state.selected, 0);
     }
 }
