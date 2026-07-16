@@ -1,10 +1,11 @@
 //! Multiline, IME-aware Chat composer presentation state.
 
 use iced::keyboard;
-use iced::widget::{button, column, container, row, text, text_editor};
+use iced::widget::{column, container, row, text_editor};
 use iced::{Alignment, Background, Border, Element};
 
-use crate::theme::{self, BODY, LABEL, Palette, RADIUS_SM, SANS};
+use crate::theme::{self, BODY, Palette, RADIUS_SM, SANS};
+use crate::ui;
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -239,34 +240,14 @@ fn outline_enabled<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(LABEL))
-        .padding([7, 10])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if enabled && matches!(status, iced::widget::button::Status::Hovered) {
-                    p.hover
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: if enabled { p.ink_soft } else { p.muted_2 },
-            border: Border {
-                color: if enabled {
-                    p.border_strong
-                } else {
-                    p.border_soft
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let button = if enabled {
-        button.on_press(message)
-    } else {
-        button
-    };
+    let button = ui::button::button(label.clone(), &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
         .disabled(!enabled)

@@ -7,9 +7,10 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, font};
 
 use crate::icons::Icon;
 use crate::theme::{
-    self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS,
-    SANS_SEMIBOLD, TITLE,
+    self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_SM, SANS, SANS_SEMIBOLD,
+    TITLE,
 };
+use crate::ui;
 use crate::view_api::Resource;
 
 use super::chat_composer;
@@ -514,7 +515,8 @@ fn destructive_confirmation(
     cancel: Message,
     p: Palette,
 ) -> Element<'static, Message> {
-    container(
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
         column![
             text("Confirm deletion")
                 .font(SANS_SEMIBOLD)
@@ -528,18 +530,9 @@ fn destructive_confirmation(
             .spacing(8),
         ]
         .spacing(7),
+        ui::alert::AlertVariant::Destructive,
+        &t,
     )
-    .width(Length::Fill)
-    .padding([11, 13])
-    .style(move |_| iced::widget::container::Style {
-        background: Some(Background::Color(p.danger_soft)),
-        border: Border {
-            color: p.danger_border,
-            width: 1.0,
-            radius: RADIUS_MD.into(),
-        },
-        ..Default::default()
-    })
     .into()
 }
 
@@ -950,7 +943,8 @@ fn chat_empty_shell<'a>(
 /// read-only `text_input` so it stays selectable/copyable (the `selectable_error`
 /// idiom from `screens/workspace.rs`).
 fn chat_error_banner<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
-    container(
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
         row![
             text_input("", message)
                 .font(MONO)
@@ -969,18 +963,9 @@ fn chat_error_banner<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
         ]
         .spacing(10)
         .align_y(Alignment::Center),
+        ui::alert::AlertVariant::Destructive,
+        &t,
     )
-    .width(Length::Fill)
-    .padding([8, 14])
-    .style(move |_| iced::widget::container::Style {
-        background: Some(Background::Color(p.danger_soft)),
-        border: Border {
-            color: p.danger_border,
-            width: 1.0,
-            radius: RADIUS_SM.into(),
-        },
-        ..Default::default()
-    })
     .into()
 }
 
