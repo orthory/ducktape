@@ -34,11 +34,11 @@ make app   # release package in target/release/bundle (agent bridge compiled out
 
 | Piece | Where |
 |---|---|
-| Fork seams (AccessKit adapter, tree push, event injection) | `third_party/iced-agent-browser/iced-winit` (submodule, `[patch.crates-io]`), feature `agent`, marked `// AGENT SEAM` |
-| Semantic layer + bridge + tools | `third_party/iced-agent-browser/plugin` (`sem()` tags, Operation collector, loopback JSON-lines server) |
+| Fork seams (AccessKit adapter, tree push, event injection) | [byeongsu-hong/iced-agent-browser](https://github.com/byeongsu-hong/iced-agent-browser) `iced-winit/` (git dep via `[patch.crates-io]`, rev pinned by Cargo.lock), feature `agent`, marked `// AGENT SEAM` |
+| Semantic layer + bridge + tools | iced-agent-browser `plugin/` (`sem()` tags, Operation collector, loopback JSON-lines server) |
 | App wiring (150 ms snapshot loop, intents, a11y-action routing) | `app/src-iced/src/shell/agent_wire.rs` |
-| CLI | `ops/iced-agent <cmd>` (bun shim) |
-| MCP | `.mcp.json` server `iced-agent`, tools `iced_*` |
+| CLI | `ops/iced-agent <cmd>` (bun shim over a cached clone in `~/.cache/iced-agent-browser`) |
+| MCP | `.mcp.json` server `iced-agent` via `ops/iced-agent-mcp`, tools `iced_*` |
 | Discovery | `${XDG_RUNTIME_DIR|TMPDIR|/tmp}/iced-agent/com.ducktape.app/endpoint.json` (`cdp` field = Browser-pane CDP URL in dev) |
 
 Everything is dev-only: the seams and wiring compile under

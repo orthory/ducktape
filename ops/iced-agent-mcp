@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stdio MCP server twin of ops/iced-agent — same cached clone, mcp entrypoint.
+set -euo pipefail
+CACHE="${ICED_AGENT_BROWSER_DIR:-$HOME/.cache/iced-agent-browser}"
+if [ ! -d "$CACHE/.git" ]; then
+  git clone -q https://github.com/byeongsu-hong/iced-agent-browser "$CACHE"
+fi
+exec bun "$CACHE/plugin/bin/iced-agent-mcp.ts" "$@"
