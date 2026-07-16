@@ -23,6 +23,12 @@ const MAX_WORKSPACE_NAME_BYTES: usize = 128;
 const MAX_INVITE_BLOB_BYTES: usize = 256 * 1024;
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(6);
+/// Startup is not shutdown: a fresh founder node compiles and instantiates
+/// every wasm module before its HTTP surface answers, measured at ~27 s cold
+/// (~17 s warm) for a debug build and ~4 s warm for release on the dev box.
+/// Waiting with the 6 s stop grace killed the node mid-genesis on every
+/// attempt, so entering a new workspace could never succeed on a dev build.
+pub(super) const START_GRACE: Duration = Duration::from_secs(120);
 const NODE_STATUS_BYTES: u64 = 64 * 1024;
 const NODE_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
@@ -542,11 +548,15 @@ fn existing_node_action(
     listen: bool,
     http: bool,
 ) -> Result<ExistingNodeAction, &'static str> {
+    // The mesh `listen` port lives inside the userspace overlay since the
+    // overlay-net cutover: the node never binds an OS socket there, so a
+    // loopback probe on it is false for a fully serving node. HTTP is the
+    // only OS-probeable surface an app-managed node has.
     match (verified_pids, listen, http) {
         ([], false, false) => Ok(ExistingNodeAction::Spawn),
-        ([pid], true, true) => Ok(ExistingNodeAction::Adopt(*pid)),
+        ([pid], _, true) => Ok(ExistingNodeAction::Adopt(*pid)),
         ([], _, _) => Err("configured ports are held by an unverified process"),
-        ([_], _, _) => Err("the verified node is not serving both configured ports"),
+        ([_], _, _) => Err("the verified node is not serving its HTTP surface yet"),
         _ => Err("more than one verified node uses this workspace config"),
     }
 }
@@ -607,7 +617,7 @@ pub(super) fn start_node(root: &Path, workspace: &Workspace) -> Result<(), Strin
 }
 
 pub(super) fn wait_node_ready(root: &Path, workspace: &Workspace) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + STOP_GRACE;
+    let deadline = std::time::Instant::now() + START_GRACE;
     loop {
         let status = node_status(root, workspace)?;
         if status.ready {
@@ -738,10 +748,11 @@ fn node_status(root: &Path, workspace: &Workspace) -> Result<WorkspaceNodeStatus
     #[cfg(not(unix))]
     let pid = read_pid(&dir);
     let alive = pid.map(|_| true).or_else(|| read_pid(&dir).map(|_| false));
-    let listen = workspaces::port_listening(workspace.ports.listen);
     let http = workspaces::port_listening(workspace.ports.http);
+    // Readiness must not probe the mesh `listen` port: it lives inside the
+    // userspace overlay (no OS socket), so requiring it held `ready` false
+    // forever and the startup wait killed every healthy node at its deadline.
     let ready = alive == Some(true)
-        && listen
         && http
         && node_identity_ready(workspace.ports.http, &workspace.pubkey).is_ok();
     let log = dir.join("daemon.log");
@@ -1626,7 +1637,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn adoption_requires_one_verified_process_and_both_ports() {
+    fn adoption_requires_one_verified_process_and_http() {
         assert_eq!(
             existing_node_action(&[], false, false),
             Ok(ExistingNodeAction::Spawn)
@@ -1635,12 +1646,17 @@ mod tests {
             existing_node_action(&[7], true, true),
             Ok(ExistingNodeAction::Adopt(7))
         );
+        // the mesh listener has no OS socket — http alone must carry adoption
+        assert_eq!(
+            existing_node_action(&[7], false, true),
+            Ok(ExistingNodeAction::Adopt(7))
+        );
         for (pids, listen, http) in [
             (Vec::new(), true, false),
             (Vec::new(), false, true),
             (Vec::new(), true, true),
             (vec![7], true, false),
-            (vec![7], false, true),
+            (vec![7], false, false),
             (vec![7, 8], true, true),
         ] {
             assert!(
