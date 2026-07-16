@@ -85,8 +85,7 @@ The terminal running `macos-smoke` needs Accessibility permission. On Linux
 and Windows, launch the staged package from `target/release/bundle`, complete
 onboarding in an isolated user profile, enter a workspace, and open Browser.
 Verify that `ducktape-node` belongs to that workspace and that the CEF child
-exits with the app. Use the `qa` and `tauri-debug` compatibility-named skills
-for the exact checklist.
+exits with the app. Use the `qa` skill for the exact checklist.
 
 ## Worktree cleanup
 
