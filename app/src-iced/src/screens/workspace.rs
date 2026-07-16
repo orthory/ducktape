@@ -4,7 +4,7 @@
 //! host performs backend/transport work and returns a [`ServiceEvent`].
 
 use iced::widget::{
-    Button, Column, Space, button, column, container, row, scrollable, text, text_input,
+    Column, Space, button, column, container, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 
@@ -775,36 +775,40 @@ fn connect_view(state: &State, p: Palette) -> Element<'_, Message> {
     .style(move |_| rounded(p.panel, RADIUS_MD));
 
     let fields: Element<'_, Message> = match state.mode {
-        ConnectMode::Remote => container(
-            field(
+        ConnectMode::Remote => {
+            let input = field(
                 "http://192.168.1.50:8844",
                 &state.remote_url,
                 Message::RemoteUrlChanged,
                 MONO,
                 p,
             )
-            .on_submit(Message::Submit),
-        )
-        .into(),
-        ConnectMode::Create => container(
-            field("Network name", &state.name, Message::NameChanged, SANS, p)
-                .on_submit(Message::Submit),
-        )
-        .into(),
-        ConnectMode::Join => column![
-            field("Network name", &state.name, Message::NameChanged, SANS, p,),
-            join_code_card(state, p),
-            field(
+            .on_submit(Message::Submit);
+            container(sem_input("Node address", &state.remote_url, input)).into()
+        }
+        ConnectMode::Create => {
+            let input = field("Network name", &state.name, Message::NameChanged, SANS, p)
+                .on_submit(Message::Submit);
+            container(sem_input("Network name", &state.name, input)).into()
+        }
+        ConnectMode::Join => {
+            let invite = field(
                 "Paste invite blob (🦆…)",
                 &state.invite,
                 Message::InviteChanged,
                 MONO,
                 p,
             )
-            .padding([18, 10]),
-        ]
-        .spacing(10)
-        .into(),
+            .padding([18, 10]);
+            let name = field("Network name", &state.name, Message::NameChanged, SANS, p);
+            column![
+                sem_input("Network name", &state.name, name),
+                join_code_card(state, p),
+                sem_input("Invite blob", &state.invite, invite),
+            ]
+            .spacing(10)
+            .into()
+        }
     };
     let mut content = column![header, tabs, fields].spacing(16);
 
@@ -891,6 +895,12 @@ fn networks(state: &State, p: Palette) -> Element<'_, Message> {
         .padding([9, 11])
         .on_press(Message::SelectWorkspace(workspace.id.clone()))
         .style(move |_, status| outline_style(p, true, status));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let select = iced_agent_plugin::sem(
+            iced_agent_plugin::Role::ListItem,
+            workspace.name.clone(),
+            select,
+        );
         let force = state.delete_needs_force.as_deref() == Some(&workspace.id);
         let label = if force { "Force delete" } else { "Delete" };
         let remove = danger_button(
@@ -1117,7 +1127,7 @@ fn node_key(pubkey: String, copied: bool, p: Palette) -> Element<'static, Messag
     } else {
         pubkey
     };
-    button(
+    let btn = button(
         row![
             text(label)
                 .font(MONO)
@@ -1144,8 +1154,13 @@ fn node_key(pubkey: String, copied: bool, p: Palette) -> Element<'static, Messag
             radius: RADIUS_MD.into(),
         },
         ..Default::default()
-    })
-    .into()
+    });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, "Copy node key", btn)
+        .disabled(empty)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn fatal_line(copy: String, p: Palette) -> Element<'static, Message> {
@@ -1291,8 +1306,8 @@ fn forget_confirmation(state: &State, p: Palette) -> Element<'_, Message> {
     modal_root(confirmation, p)
 }
 
-fn icon_close(p: Palette) -> Button<'static, Message> {
-    button(text("✕").font(SANS_MEDIUM).size(16))
+fn icon_close(p: Palette) -> Element<'static, Message> {
+    let btn = button(text("✕").font(SANS_MEDIUM).size(16))
         .width(26)
         .height(26)
         .padding(0)
@@ -1306,7 +1321,11 @@ fn icon_close(p: Palette) -> Button<'static, Message> {
                 ..Default::default()
             },
             ..Default::default()
-        })
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Close", btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn field<'a>(
@@ -1339,13 +1358,34 @@ fn field<'a>(
         })
 }
 
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn tab(
     label: &'static str,
     active: bool,
     mode: ConnectMode,
     p: Palette,
-) -> Button<'static, Message> {
-    button(
+) -> Element<'static, Message> {
+    let btn = button(
         container(text(label).font(SANS_SEMIBOLD).size(12))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -1374,12 +1414,16 @@ fn tab(
             Shadow::default()
         },
         ..Default::default()
-    })
+    });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
-fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Button<'a, Message> {
+fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let enabled = message.is_some();
-    button(
+    let btn = button(
         container(text(label).font(SANS_SEMIBOLD).size(12.5))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -1401,7 +1445,13 @@ fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Button<'
             ..Default::default()
         },
         ..Default::default()
-    })
+    });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn outline_enabled(
@@ -1409,18 +1459,28 @@ fn outline_enabled(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(10.5))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(10.5))
         .padding([5, 10])
         .on_press_maybe(enabled.then_some(message))
-        .style(move |_, status| outline_style(p, enabled, status))
+        .style(move |_, status| outline_style(p, enabled, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
-fn ghost(label: &'static str, message: Message, p: Palette) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(11))
+fn ghost(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
         .padding([6, 12])
         .on_press(message)
-        .style(move |_, status| outline_style(p, true, status))
+        .style(move |_, status| outline_style(p, true, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn danger_button(
@@ -1428,8 +1488,8 @@ fn danger_button(
     message: Message,
     filled: bool,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(10.5))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(10.5))
         .padding([8, 10])
         .on_press(message)
         .style(move |_, status| iced::widget::button::Style {
@@ -1447,11 +1507,15 @@ fn danger_button(
                 radius: RADIUS_SM.into(),
             },
             ..Default::default()
-        })
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
-fn danger_primary(label: &'static str, message: Message, p: Palette) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(11))
+fn danger_primary(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
         .padding([7, 14])
         .on_press(message)
         .style(move |_, status| iced::widget::button::Style {
@@ -1468,7 +1532,11 @@ fn danger_primary(label: &'static str, message: Message, p: Palette) -> Button<'
                 ..Default::default()
             },
             ..Default::default()
-        })
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn dialog_button(
@@ -1476,8 +1544,8 @@ fn dialog_button(
     message: Message,
     danger: bool,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(12))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
         .height(32)
         .padding([0, 12])
         .on_press(message)
@@ -1496,11 +1564,15 @@ fn dialog_button(
                 radius: RADIUS_SM.into(),
             },
             ..Default::default()
-        })
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
-fn link_button(label: &'static str, message: Message, p: Palette) -> Button<'static, Message> {
-    button(
+fn link_button(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
+    let btn = button(
         container(text(label).font(SANS_SEMIBOLD).size(11).color(p.muted))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -1508,7 +1580,11 @@ fn link_button(label: &'static str, message: Message, p: Palette) -> Button<'sta
     .width(Length::Fill)
     .padding(4)
     .on_press(message)
-    .style(|_, _| iced::widget::button::Style::default())
+    .style(|_, _| iced::widget::button::Style::default());
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Link, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn step_rail(p: Palette) -> Element<'static, Message> {

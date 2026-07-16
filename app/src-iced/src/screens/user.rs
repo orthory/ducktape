@@ -3,7 +3,7 @@
 //! Views are intentionally transport-free. [`update`] emits a typed
 //! [`Command`]; the host performs it and returns a [`ServiceEvent`].
 
-use iced::widget::{Button, Space, button, column, container, row, text, text_input};
+use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 
 use crate::icons::{self, Icon};
@@ -830,8 +830,9 @@ pub(super) fn danger_outline<'a>(
     label: impl ToString,
     message: Message,
     p: Palette,
-) -> Button<'a, Message> {
-    button(text(label.to_string()).font(SANS).size(12))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let btn = button(text(label.clone()).font(SANS).size(12))
         .padding([7, 10])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -849,7 +850,11 @@ pub(super) fn danger_outline<'a>(
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn pages_view(state: &PagesState, p: Palette) -> Element<'_, Message> {
@@ -1042,7 +1047,7 @@ pub(super) fn outline<'a>(
     label: impl ToString,
     message: Message,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     outline_enabled(label, message, true, p)
 }
 pub(super) fn outline_enabled<'a>(
@@ -1050,8 +1055,9 @@ pub(super) fn outline_enabled<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(12))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(12))
         .padding([7, 10])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -1073,11 +1079,17 @@ pub(super) fn outline_enabled<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 pub(super) fn filled<'a>(
@@ -1085,8 +1097,9 @@ pub(super) fn filled<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(12.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(12.5))
         .width(Length::Fill)
         .padding([8, 13])
         .style(move |_, status| iced::widget::button::Style {
@@ -1106,14 +1119,27 @@ pub(super) fn filled<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 pub(super) fn section_label(label: &'static str, p: Palette) -> Element<'static, Message> {
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::Heading,
+        label,
+        text(label).font(MONO).size(9).color(p.muted_2),
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
     text(label).font(MONO).size(9).color(p.muted_2).into()
 }
 pub(super) fn section_header(
