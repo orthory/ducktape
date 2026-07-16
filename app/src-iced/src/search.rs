@@ -474,32 +474,40 @@ pub fn view(state: &State, mode: Mode) -> Element<'_, Message> {
         }
     }
 
+    let query_field = text_input(
+        if state.catalog.client_mode {
+            "Search chat, pages, files…"
+        } else {
+            "Search chat, pages, members, files…"
+        },
+        &state.query,
+    )
+    .id(Id::new(INPUT_ID))
+    .on_input(Message::QueryChanged)
+    .padding(0)
+    .size(15)
+    .style(move |_, status| text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        icon: p.muted_2,
+        placeholder: p.muted_2,
+        value: p.ink,
+        selection: if matches!(status, text_input::Status::Focused { .. }) {
+            p.hover
+        } else {
+            p.hover
+        },
+    });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let query_field = iced_agent_plugin::Sem::new(
+        iced_agent_plugin::Role::TextInput,
+        "Search",
+        query_field,
+    )
+    .value(state.query.clone());
     let input = row![
         icons::view(Icon::Search, 18.0, p.muted_2),
-        text_input(
-            if state.catalog.client_mode {
-                "Search chat, pages, files…"
-            } else {
-                "Search chat, pages, members, files…"
-            },
-            &state.query,
-        )
-        .id(Id::new(INPUT_ID))
-        .on_input(Message::QueryChanged)
-        .padding(0)
-        .size(15)
-        .style(move |_, status| text_input::Style {
-            background: Background::Color(Color::TRANSPARENT),
-            border: Border::default(),
-            icon: p.muted_2,
-            placeholder: p.muted_2,
-            value: p.ink,
-            selection: if matches!(status, text_input::Status::Focused { .. }) {
-                p.hover
-            } else {
-                p.hover
-            },
-        }),
+        query_field,
         container(text("ESC").size(10).font(theme::MONO).color(p.muted_2))
             .padding([2, 6])
             .style(move |_| bordered(p.paper, p.border_soft, 4.0)),
@@ -600,10 +608,10 @@ fn hit_button(
     target: Target,
     p: theme::Palette,
 ) -> Element<'static, Message> {
-    button(
+    let btn = button(
         column![
             text(meta).size(10.5).color(p.muted_2),
-            text(body).size(13).color(p.ink),
+            text(body.clone()).size(13).color(p.ink),
         ]
         .spacing(2),
     )
@@ -619,8 +627,11 @@ fn hit_button(
             ..Border::default()
         },
         ..button::Style::default()
-    })
-    .into()
+    });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, body, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn hint(label: String, p: theme::Palette) -> Element<'static, Message> {

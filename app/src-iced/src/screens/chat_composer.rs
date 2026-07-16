@@ -1,7 +1,7 @@
 //! Multiline, IME-aware Chat composer presentation state.
 
 use iced::keyboard;
-use iced::widget::{Button, button, column, container, row, text, text_editor};
+use iced::widget::{button, column, container, row, text, text_editor};
 use iced::{Alignment, Background, Border, Element};
 
 use crate::theme::{self, Palette, RADIUS_SM, SANS};
@@ -173,6 +173,13 @@ pub fn view<'a>(
             value: p.ink,
             selection: theme::ACCENTS[0],
         });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let editor = iced_agent_plugin::Sem::new(
+        iced_agent_plugin::Role::TextInput,
+        "Message composer",
+        editor,
+    )
+    .value(state.text());
     let mut content = column![
         row![
             outline_enabled(
@@ -231,8 +238,9 @@ fn outline_enabled<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(12))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(12))
         .padding([7, 10])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -254,11 +262,17 @@ fn outline_enabled<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 #[cfg(test)]

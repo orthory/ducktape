@@ -1,7 +1,7 @@
 //! Channel, message, thread, huddle, and composer surface.
 
 use iced::widget::{
-    Button, Space, button, column, container, rich_text, row, scrollable, span, text,
+    Space, button, column, container, rich_text, row, scrollable, span, text,
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, font};
 
@@ -911,8 +911,8 @@ fn policy_button(
     policy: PostPolicy,
     active: PostPolicy,
     p: Palette,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS).size(11))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS).size(11))
         .width(Length::FillPortion(1))
         .padding([4, 8])
         .style(move |_, _| iced::widget::button::Style {
@@ -924,10 +924,14 @@ fn policy_button(
             },
             ..Default::default()
         })
-        .on_press(Message::Chat(ChatMessageEvent::SetPolicy(policy)))
+        .on_press(Message::Chat(ChatMessageEvent::SetPolicy(policy)));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 fn channel_button(channel: &Channel, active: bool, p: Palette) -> Element<'static, Message> {
-    button(
+    let btn = button(
         row![
             text("#").font(SANS).size(13).color(p.muted_2),
             text(channel.name.clone())
@@ -957,8 +961,15 @@ fn channel_button(channel: &Channel, active: bool, p: Palette) -> Element<'stati
     })
     .on_press(Message::Chat(ChatMessageEvent::SelectChannel(
         channel.id.clone(),
-    )))
-    .into()
+    )));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        channel.name.clone(),
+        btn,
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 fn channel_intro<'a>(name: &'a str, empty: bool, p: Palette) -> Element<'a, Message> {
     column![
