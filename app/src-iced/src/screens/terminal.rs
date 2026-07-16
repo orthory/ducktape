@@ -20,6 +20,7 @@ use iced::{
 use crate::icons::{self, Icon};
 pub use crate::terminal_contract::SessionMode;
 use crate::theme::{self, MONO, SANS, SANS_SEMIBOLD};
+use crate::ui;
 
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
@@ -567,26 +568,12 @@ fn shared_command_panel(state: &State, p: theme::Palette) -> Element<'_, Message
             value: p.ink,
             selection: theme::ACCENTS[0],
         });
-    let send = button(text("Send").size(13).font(SANS_SEMIBOLD))
-        .padding([8, 16])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(if can_send {
-                p.filled
-            } else {
-                p.sunken
-            })),
-            text_color: if can_send { p.on_filled } else { p.muted_2 },
-            border: Border {
-                radius: 6.0.into(),
-                ..Border::default()
-            },
-            ..iced::widget::button::Style::default()
-        });
-    let send = if can_send {
-        send.on_press(Message::SubmitCommand)
-    } else {
-        send
-    };
+    let t = theme::ui_for(&p);
+    let send = ui::button::button("Send", &t)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!can_send)
+        .on_press(Message::SubmitCommand)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let send = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Send", send);
     let input = sem_input("Command", &state.command_draft, input);
@@ -624,9 +611,11 @@ fn terminal_notice<'a>(
         .spacing(12)
         .align_x(Alignment::Center);
     if let Some((action_label, message)) = action {
-        let action_btn = button(text(action_label).size(12))
+        let t = theme::ui_for(p);
+        let action_btn = ui::button::button(action_label, &t)
+            .size(ui::button::ButtonSize::Small)
             .on_press(message)
-            .padding([7, 14]);
+            .into_widget();
         #[cfg(all(feature = "agent", debug_assertions))]
         let action_btn =
             iced_agent_plugin::sem(iced_agent_plugin::Role::Button, action_label, action_btn);

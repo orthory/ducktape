@@ -15,6 +15,7 @@ use crate::theme::{
     self, BODY, CAPTION, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM,
     SANS_SEMIBOLD, TITLE,
 };
+use crate::ui;
 
 const CARD_WIDTH: f32 = 440.0;
 const MIN_PASSWORD_LEN: usize = 8;
@@ -1528,28 +1529,10 @@ fn field<'a>(
     secure: bool,
     p: Palette,
 ) -> TextInput<'a, Message> {
-    text_input(placeholder, value)
+    let t = theme::ui_for(&p);
+    ui::input::input(placeholder, value, &t)
         .on_input(on_input)
         .secure(secure)
-        .padding([9, 11])
-        .size(BODY)
-        .font(SANS_MEDIUM)
-        .style(move |_, status| iced::widget::text_input::Style {
-            background: Background::Color(p.sunken),
-            border: Border {
-                color: if matches!(status, iced::widget::text_input::Status::Focused { .. }) {
-                    theme::ACCENTS[0]
-                } else {
-                    p.border_strong
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            icon: p.muted,
-            placeholder: p.muted,
-            value: p.ink,
-            selection: theme::ACCENTS[0],
-        })
 }
 
 /// Dev-only text-input tagging: wraps a non-secret input in a `TextInput`
@@ -1594,33 +1577,15 @@ fn sem_secret<'a>(
 }
 
 fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let enabled = message.is_some();
-    let button = button(
-        container(text(label).font(SANS_SEMIBOLD).size(BODY))
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding([10, 0])
-    .style(move |_, status| iced::widget::button::Style {
-        background: Some(Background::Color(if !enabled {
-            p.chip
-        } else if matches!(status, iced::widget::button::Status::Hovered) {
-            p.ink_soft
-        } else {
-            p.filled
-        })),
-        text_color: if !enabled { p.muted_3 } else { p.on_filled },
-        border: Border {
-            radius: RADIUS_MD.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    });
-    let button = match message {
-        Some(message) => button.on_press(message),
-        None => button,
-    };
+    let mut button = ui::button::button(label, &t)
+        .width(Length::Fill)
+        .disabled(!enabled);
+    if let Some(message) = message {
+        button = button.on_press(message);
+    }
+    let button = button.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
         .disabled(!enabled)
@@ -1630,34 +1595,16 @@ fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<
 }
 
 fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
-    let button = button(
-        container(text(label).font(SANS_SEMIBOLD).size(LABEL))
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding([9, 0])
-    .style(move |_, status| iced::widget::button::Style {
-        background: Some(Background::Color(
-            if matches!(status, iced::widget::button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            },
-        )),
-        text_color: p.ink,
-        border: Border {
-            color: p.border,
-            width: 1.0,
-            radius: RADIUS_MD.into(),
-        },
-        ..Default::default()
-    });
+    let t = theme::ui_for(&p);
     let enabled = message.is_some();
-    let button = match message {
-        Some(message) => button.on_press(message),
-        None => button,
-    };
+    let mut button = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .width(Length::Fill)
+        .disabled(!enabled);
+    if let Some(message) = message {
+        button = button.on_press(message);
+    }
+    let button = button.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
         .disabled(!enabled)
@@ -1716,15 +1663,12 @@ fn tab(
 }
 
 fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
-    let link = button(
-        container(text(label).font(SANS_SEMIBOLD).size(LABEL).color(p.muted))
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding(4)
-    .style(|_, _| iced::widget::button::Style::default())
-    .on_press(message);
+    let t = theme::ui_for(&p);
+    let link = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Link)
+        .width(Length::Fill)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Link, label, link);
     #[cfg(not(all(feature = "agent", debug_assertions)))]

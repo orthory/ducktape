@@ -482,11 +482,9 @@ fn logs_view<'a>(
     let mut lines = column![sem_input(
         "Filter logs",
         &state.log_filter,
-        text_input("Filter logs", &state.log_filter)
+        crate::ui::input::input("Filter logs", &state.log_filter, &crate::theme::ui_for(&p))
             .on_input(|value| Message::Node(NodeMessage::LogFilterChanged(value)))
-            .padding([8, 10])
             .font(MONO)
-            .size(LABEL)
     )]
     .spacing(8);
     let mut list = column![].spacing(0);

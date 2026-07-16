@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use iced::widget::{
-    Space, button, column, container, image, pick_list, progress_bar, row, scrollable, stack, text,
+    Space, column, container, image, pick_list, row, scrollable, stack, text,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
@@ -16,6 +16,7 @@ use crate::screens::members as members_screen;
 use crate::screens::user as user_screens;
 use crate::theme::{self, Mode};
 use crate::transport::NodeClient;
+use crate::ui;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -617,17 +618,22 @@ fn selected_device(options: &[String], selection: Option<usize>) -> Option<Strin
 
 pub fn dock_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a, Message> {
     let p = theme::palette(context.mode);
+    let t = theme::ui_for(p);
     let runtime = state.runtime.as_ref().expect("dock requires a huddle");
     let (status, status_color) = status_label(runtime, p);
     let count = member_count(context.chat, &runtime.channel);
-    let expand = button(text("Expand").size(10))
+    let expand = ui::button::button("Expand", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
+        .size(ui::button::ButtonSize::Small)
         .on_press(Message::Expand)
-        .padding([4, 7]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let expand = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Expand", expand);
-    let pop_out = button(text("Pop out").size(10))
+    let pop_out = ui::button::button("Pop out", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
+        .size(ui::button::ButtonSize::Small)
         .on_press(Message::PopOut)
-        .padding([4, 7]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let pop_out = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Pop out", pop_out);
     let header = row![
@@ -653,12 +659,11 @@ pub fn dock_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a, 
 
     let mut body = column![header].spacing(8);
     if let Some(error) = &runtime.error {
-        body = body.push(
-            container(text(error).size(10).color(p.danger))
-                .width(Length::Fill)
-                .padding([6, 8])
-                .style(move |_| bordered(p.danger_soft, p.danger_border, 5.0)),
-        );
+        body = body.push(ui::alert::alert(
+            text(error).size(10).color(p.danger),
+            ui::alert::AlertVariant::Destructive,
+            &t,
+        ));
     }
     body = body.push(compact_body(state, context, p));
     if runtime.devices_open {
@@ -680,37 +685,32 @@ pub fn dock_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a, 
 
 pub fn stage_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a, Message> {
     let p = theme::palette(context.mode);
+    let t = theme::ui_for(p);
     let runtime = state.runtime.as_ref().expect("stage requires a huddle");
     let (status, status_color) = status_label(runtime, p);
     let count = member_count(context.chat, &runtime.channel);
-    let layout_toggle = button(
-        text(if state.spotlight {
-            "Gallery"
-        } else {
-            "Spotlight"
-        })
-        .size(11),
-    )
-    .on_press(Message::ToggleLayout)
-    .padding([7, 11]);
+    let layout_label = if state.spotlight {
+        "Gallery"
+    } else {
+        "Spotlight"
+    };
+    let layout_toggle = ui::button::button(layout_label, &t)
+        .variant(ui::button::ButtonVariant::Secondary)
+        .on_press(Message::ToggleLayout)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
-    let layout_toggle = iced_agent_plugin::sem(
-        iced_agent_plugin::Role::Button,
-        if state.spotlight {
-            "Gallery"
-        } else {
-            "Spotlight"
-        },
-        layout_toggle,
-    );
-    let pop_out = button(text("Pop out").size(11))
+    let layout_toggle =
+        iced_agent_plugin::sem(iced_agent_plugin::Role::Button, layout_label, layout_toggle);
+    let pop_out = ui::button::button("Pop out", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
         .on_press(Message::PopOut)
-        .padding([7, 11]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let pop_out = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Pop out", pop_out);
-    let collapse = button(text("Collapse").size(11))
+    let collapse = ui::button::button("Collapse", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
         .on_press(Message::Collapse)
-        .padding([7, 11]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let collapse = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Collapse", collapse);
     let header = row![
@@ -784,16 +784,21 @@ pub fn window_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a
             })
             .into();
     };
+    let t = theme::ui_for(p);
     let (status, status_color) = status_label(runtime, p);
     let count = member_count(context.chat, &runtime.channel);
-    let open_chat = button(text("Chat").size(10))
+    let open_chat = ui::button::button("Chat", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
+        .size(ui::button::ButtonSize::Small)
         .on_press(Message::OpenChat)
-        .padding([4, 7]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let open_chat = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Chat", open_chat);
-    let pop_in = button(text("Pop in").size(10))
+    let pop_in = ui::button::button("Pop in", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
+        .size(ui::button::ButtonSize::Small)
         .on_press(Message::PopIn)
-        .padding([4, 7]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let pop_in = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Pop in", pop_in);
     let header = row![
@@ -830,7 +835,11 @@ pub fn window_view<'a>(state: &'a State, context: ViewContext<'a>) -> Element<'a
             })
             .size(9.5)
             .width(75),
-            progress_bar(0.0..=100.0, f32::from(runtime.level)),
+            ui::progress::progress(
+                f32::from(runtime.level),
+                ui::progress::ProgressVariant::Default,
+                &t,
+            ),
         ]
         .spacing(7)
         .align_y(Alignment::Center),
@@ -925,12 +934,15 @@ fn compact_body<'a>(
 }
 
 fn devices_view<'a>(runtime: &'a Runtime, p: &'a theme::Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(p);
     let microphones = device_labels(&runtime.devices.microphones);
     let cameras = device_labels(&runtime.devices.cameras);
     let speakers = device_labels(&runtime.devices.speakers);
-    let close = button(text("Close").size(9.5))
+    let close = ui::button::button("Close", &t)
+        .variant(ui::button::ButtonVariant::Secondary)
+        .size(ui::button::ButtonSize::Small)
         .on_press(Message::ToggleDevices)
-        .padding([3, 6]);
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let close = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Close", close);
     let mut devices = column![
@@ -1015,7 +1027,11 @@ fn controls_view<'a>(
     let runtime = state.runtime.as_ref().expect("controls require a huddle");
     let live = runtime.status == Status::Live;
     let video_allowed = live && member_count(context.chat, &runtime.channel) <= 8;
-    let padding = if comfortable { [7, 12] } else { [5, 7] };
+    let size = if comfortable {
+        ui::button::ButtonSize::Default
+    } else {
+        ui::button::ButtonSize::Small
+    };
     let mut controls = row![]
         .spacing(if comfortable { 8 } else { 4 })
         .align_y(Alignment::Center);
@@ -1030,7 +1046,7 @@ fn controls_view<'a>(
         live.then_some(Message::Mute),
         runtime.muted,
         false,
-        padding,
+        size,
         p,
     ));
     controls = controls.push(control_button(
@@ -1044,7 +1060,7 @@ fn controls_view<'a>(
         video_allowed.then_some(Message::Camera),
         runtime.camera_on,
         false,
-        padding,
+        size,
         p,
     ));
     controls = controls.push(control_button(
@@ -1056,7 +1072,7 @@ fn controls_view<'a>(
         video_allowed.then_some(Message::Share),
         runtime.sharing,
         false,
-        padding,
+        size,
         p,
     ));
     controls = controls.push(control_button(
@@ -1064,7 +1080,7 @@ fn controls_view<'a>(
         Some(Message::ToggleDevices),
         runtime.devices_open,
         false,
-        padding,
+        size,
         p,
     ));
     if runtime.status == Status::Unavailable {
@@ -1073,7 +1089,7 @@ fn controls_view<'a>(
             Some(Message::Retry),
             false,
             false,
-            padding,
+            size,
             p,
         ));
     }
@@ -1082,7 +1098,7 @@ fn controls_view<'a>(
         Some(Message::Leave),
         false,
         true,
-        padding,
+        size,
         p,
     ));
     controls.into()
@@ -1093,38 +1109,26 @@ fn control_button<'a>(
     message: Option<Message>,
     active: bool,
     danger: bool,
-    padding: [u16; 2],
+    size: ui::button::ButtonSize,
     p: &'a theme::Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(p);
+    // danger = destructive action (Leave); active = toggled-on control (filled);
+    // otherwise a neutral outlined control.
+    let variant = if danger {
+        ui::button::ButtonVariant::DestructiveOutline
+    } else if active {
+        ui::button::ButtonVariant::Default
+    } else {
+        ui::button::ButtonVariant::Outline
+    };
     #[cfg(all(feature = "agent", debug_assertions))]
     let enabled = message.is_some();
-    let btn = button(text(label).size(10.5))
-        .on_press_maybe(message)
-        .padding(padding)
-        .style(move |_, status| button::Style {
-            background: Some(Background::Color(if danger {
-                p.danger_soft
-            } else if active {
-                p.filled
-            } else if matches!(status, button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            })),
-            text_color: if danger {
-                p.danger
-            } else if active {
-                p.on_filled
-            } else {
-                p.ink
-            },
-            border: Border {
-                color: if danger { p.danger_border } else { p.border },
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..button::Style::default()
-        });
+    let mut builder = ui::button::button(label, &t).variant(variant).size(size);
+    if let Some(message) = message {
+        builder = builder.on_press(message);
+    }
+    let btn = builder.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -1142,6 +1146,7 @@ fn self_check<'a>(
         .runtime
         .as_ref()
         .expect("self-check requires a huddle");
+    let t = theme::ui_for(p);
     let is_speaking = speaking(runtime);
     let preview: Element<'a, Message> = if let Some(handle) = &runtime.local_frame {
         video_tile_sized(
@@ -1153,9 +1158,10 @@ fn self_check<'a>(
             runtime.sharing,
         )
     } else {
-        let turn_on_camera = button(text("Turn on camera").size(11))
-            .on_press_maybe((runtime.status == Status::Live).then_some(Message::Camera))
-            .padding([7, 11]);
+        let turn_on_camera = ui::button::button("Turn on camera", &t)
+            .disabled(runtime.status != Status::Live)
+            .on_press(Message::Camera)
+            .into_widget();
         #[cfg(all(feature = "agent", debug_assertions))]
         let turn_on_camera = iced_agent_plugin::sem(
             iced_agent_plugin::Role::Button,
@@ -1194,7 +1200,11 @@ fn self_check<'a>(
                 })
                 .size(10)
                 .width(82),
-                progress_bar(0.0..=100.0, f32::from(runtime.level)),
+                ui::progress::progress(
+                    f32::from(runtime.level),
+                    ui::progress::ProgressVariant::Default,
+                    &t,
+                ),
                 text(format!("{}%", runtime.level)).size(9.5).color(p.muted),
             ]
             .spacing(8)
@@ -1444,18 +1454,14 @@ fn gallery<'a>(
 }
 
 fn empty_stage(p: &theme::Palette) -> Element<'_, Message> {
-    container(
-        column![
-            text("Waiting for video")
-                .size(15)
-                .font(theme::SANS_SEMIBOLD),
-            text("Participant video and screen shares appear here.")
-                .size(10.5)
-                .color(p.muted),
-        ]
-        .spacing(6)
-        .align_x(Alignment::Center),
-    )
+    let t = theme::ui_for(p);
+    let leading: Option<Element<'_, Message>> = None;
+    container(ui::empty_state::empty_state(
+        leading,
+        "Waiting for video",
+        "Participant video and screen shares appear here.",
+        &t,
+    ))
     .width(Length::Fill)
     .height(Length::Fill)
     .center_x(Length::Fill)

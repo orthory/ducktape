@@ -3,7 +3,7 @@
 use std::ops::Deref;
 
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+    Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
 
@@ -12,6 +12,7 @@ use crate::theme::{
     self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM,
     SANS, SANS_SEMIBOLD, TITLE,
 };
+use crate::ui;
 
 use super::run_log::{SemanticLogKind, semantic_log_rows};
 use super::*;
@@ -31,6 +32,12 @@ impl Deref for Colors {
     fn deref(&self) -> &Self::Target {
         &self.palette
     }
+}
+
+/// ducktape-ui tokens for this screen's `Colors`, preserving the runtime accent
+/// on the focus ring (`theme::ui_for` alone falls back to `ACCENTS[0]`).
+fn tokens(p: Colors) -> crate::ui::theme::Theme {
+    theme::ui_for(&p.palette).with_accent(p.accent)
 }
 
 const ACTIONS: [(&str, &str); 7] = [
@@ -261,6 +268,7 @@ fn detail_pane<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<
 
 fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'a, Message> {
     let draft = &state.register;
+    let t = tokens(p);
     let ready = draft.ready(data) && !state.busy;
     let mut form = column![
         section_label("REGISTER AGENT", p),
@@ -304,11 +312,12 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
                 skill_editor(state, p),
                 permission_grid(&draft.allowed_actions, false, p),
                 section_label("RESOURCE CAPS", p),
-                checkbox(draft.library_read)
-                    .label("Can search the global skill library")
-                    .on_toggle(Message::RegisterLibraryChanged)
-                    .size(15)
-                    .text_size(BODY),
+                ui::checkbox::checkbox(
+                    "Can search the global skill library",
+                    draft.library_read,
+                    &t,
+                )
+                .on_toggle(Message::RegisterLibraryChanged),
                 row![
                     labeled_mono_input(
                         "FORGE READ REPOSITORIES",
@@ -422,6 +431,7 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
 
 fn skill_editor(state: &State, p: Colors) -> Element<'_, Message> {
     let draft = &state.register;
+    let t = tokens(p);
     let mut skills = column![section_label("CURATED SKILLS", p)].spacing(7);
     for (index, skill) in draft.skills.iter().enumerate() {
         skills = skills.push(
@@ -460,17 +470,14 @@ fn skill_editor(state: &State, p: Colors) -> Element<'_, Message> {
             sem_input(
                 "Skill name",
                 &draft.skill_name,
-                text_input("Skill name", &draft.skill_name)
-                    .font(SANS)
-                    .size(BODY)
+                ui::input::input("Skill name", &draft.skill_name, &t)
                     .on_input(Message::SkillNameChanged),
             ),
             sem_input(
                 "Skill prefix",
                 &draft.skill_prefix,
-                text_input("/skills/name", &draft.skill_prefix)
+                ui::input::input("/skills/name", &draft.skill_prefix, &t)
                     .font(MONO)
-                    .size(BODY)
                     .on_input(Message::SkillPrefixChanged),
             ),
             secondary_button(
@@ -668,6 +675,7 @@ fn edit_form<'a>(
     edit: &'a EditDraft,
     p: Colors,
 ) -> Element<'a, Message> {
+    let t = tokens(p);
     let valid = !edit.display_name.trim().is_empty()
         && data.capabilities.contains(&edit.capability)
         && !edit.allowed_actions.is_empty()
@@ -691,11 +699,12 @@ fn edit_form<'a>(
         ),
         permission_grid(&edit.allowed_actions, true, p),
         section_label("RESOURCE CAPS", p),
-        checkbox(edit.library_read)
-            .label("Can search the global skill library")
-            .on_toggle(Message::EditLibraryChanged)
-            .size(15)
-            .text_size(BODY),
+        ui::checkbox::checkbox(
+            "Can search the global skill library",
+            edit.library_read,
+            &t,
+        )
+        .on_toggle(Message::EditLibraryChanged),
         row![
             labeled_mono_input(
                 "FORGE READ REPOSITORIES",
@@ -789,22 +798,19 @@ fn edit_form<'a>(
 }
 
 fn permission_grid<'a>(selected: &'a [String], editing: bool, p: Colors) -> Element<'a, Message> {
+    let t = tokens(p);
     let mut grid = column![section_label("PERMISSIONS", p)].spacing(7);
     for (action, label) in ACTIONS {
         let action_owned = action.to_owned();
         let checked = selected.iter().any(|value| value == action);
         grid = grid.push(
-            checkbox(checked)
-                .label(label)
-                .on_toggle(move |_| {
-                    if editing {
-                        Message::ToggleEditAction(action_owned.clone())
-                    } else {
-                        Message::ToggleRegisterAction(action_owned.clone())
-                    }
-                })
-                .size(15)
-                .text_size(BODY),
+            ui::checkbox::checkbox(label, checked, &t).on_toggle(move |_| {
+                if editing {
+                    Message::ToggleEditAction(action_owned.clone())
+                } else {
+                    Message::ToggleRegisterAction(action_owned.clone())
+                }
+            }),
         );
     }
     grid.into()
@@ -2069,10 +2075,7 @@ fn labeled_input<'a>(
         sem_input(
             label,
             value,
-            text_input(placeholder, value)
-                .font(SANS)
-                .size(BODY)
-                .on_input(on_input),
+            ui::input::input(placeholder, value, &tokens(p)).on_input(on_input),
         )
     ]
     .spacing(5)
@@ -2092,9 +2095,8 @@ fn labeled_mono_input<'a>(
         sem_input(
             label,
             value,
-            text_input(placeholder, value)
+            ui::input::input(placeholder, value, &tokens(p))
                 .font(MONO)
-                .size(BODY)
                 .on_input(on_input),
         )
     ]
@@ -2214,9 +2216,9 @@ fn on_dark_pill(label: &str, tone: Color, p: Colors) -> Element<'static, Message
 }
 
 fn card<'a>(content: impl Into<Element<'a, Message>>, p: Colors) -> Element<'a, Message> {
-    container(content)
+    // Callers pad their own content, so keep the toolkit Card surface padding-less.
+    ui::surface::surface(content, ui::surface::SurfaceVariant::Card, &tokens(p))
         .width(Length::Fill)
-        .style(move |_| card_style(p))
         .into()
 }
 
@@ -2238,20 +2240,12 @@ fn card_style(p: Colors) -> container::Style {
 }
 
 fn empty_state(title: &str, detail: &str, p: Colors) -> Element<'static, Message> {
-    column![
-        icon_tile(Icon::Agent, 36.0, p),
-        text(title.to_owned())
-            .font(SANS_SEMIBOLD)
-            .size(BODY_LG)
-            .color(p.muted_3),
-        text(detail.to_owned())
-            .font(SANS)
-            .size(BODY)
-            .color(p.muted_2)
-    ]
-    .spacing(8)
-    .padding([30, 18])
-    .align_x(Alignment::Center)
+    ui::empty_state::empty_state(
+        Some(icon_tile(Icon::Agent, 36.0, p)),
+        title.to_owned(),
+        detail.to_owned(),
+        &tokens(p),
+    )
     .into()
 }
 
@@ -2285,17 +2279,13 @@ fn center_state<'a>(
 }
 
 fn error_banner<'a>(error: &'a str, p: Colors) -> Element<'a, Message> {
-    container(selectable_line(error, p.red, p))
-        .width(Length::Fill)
-        .padding([7, 9])
-        .style(move |_| {
-            rounded_surface(
-                mix(p.paper, p.red, 0.09),
-                mix(p.paper, p.red, 0.25),
-                RADIUS_SM,
-            )
-        })
-        .into()
+    // Keep the selectable inner line: an operator copies error/hash text out of it.
+    ui::alert::alert(
+        selectable_line(error, p.red, p),
+        ui::alert::AlertVariant::Destructive,
+        &tokens(p),
+    )
+    .into()
 }
 
 /// A read-only, selectable line — an error/hash/id/address the operator can
@@ -2340,25 +2330,14 @@ fn secondary_button(
     p: Colors,
 ) -> Element<'static, Message> {
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(BODY))
-        .padding([7, 12])
-        .style(move |_, status| button::Style {
-            background: Some(Background::Color(
-                if matches!(status, button::Status::Hovered) && enabled {
-                    p.sunken
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: if enabled { p.ink_soft } else { p.muted_2 },
-            border: Border {
-                color: if enabled { p.border_strong } else { p.border },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        })
-        .on_press_maybe(message);
+    let mut builder = ui::button::button(label, &tokens(p))
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled);
+    if let Some(message) = message {
+        builder = builder.on_press(message);
+    }
+    let btn = builder.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -2405,28 +2384,11 @@ fn primary_button(
     p: Colors,
 ) -> Element<'static, Message> {
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(BODY))
-        .padding([7, 12])
-        .style(move |_, _| button::Style {
-            background: Some(Background::Color(if enabled { p.accent } else { p.chip })),
-            text_color: if enabled { Color::WHITE } else { p.muted_2 },
-            border: Border {
-                color: if enabled { p.accent } else { p.chip },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            shadow: if enabled {
-                Shadow {
-                    color: Color { a: 0.3, ..p.shadow },
-                    offset: Vector::new(0.0, 1.0),
-                    blur_radius: 2.0,
-                }
-            } else {
-                Shadow::default()
-            },
-            ..Default::default()
-        })
-        .on_press_maybe(message);
+    let mut builder = ui::button::button(label, &tokens(p)).disabled(!enabled);
+    if let Some(message) = message {
+        builder = builder.on_press(message);
+    }
+    let btn = builder.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -2498,10 +2460,7 @@ fn bottom_rule(background: Color, border: Color) -> container::Style {
 }
 
 fn horizontal_divider(p: Colors) -> Element<'static, Message> {
-    container(Space::new())
-        .height(1)
-        .style(move |_| surface(p.border_soft))
-        .into()
+    ui::separator::horizontal(&tokens(p)).into()
 }
 
 fn initials(name: &str) -> String {

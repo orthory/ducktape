@@ -6,6 +6,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::icons::{self, Icon};
 use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS, SANS_SEMIBOLD};
+use crate::ui;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource<T> {
@@ -568,31 +569,17 @@ fn selectable_text<'a>(
 }
 
 fn state_view(title: &'static str, detail: &'static str, p: Palette) -> Element<'static, Message> {
+    let t = theme::ui_for(&p);
     let badge = container(icons::view(Icon::Explorer, 23.0, p.ink_soft))
         .width(42)
         .height(42)
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_| rounded_surface(p.hover, p.border_soft, RADIUS_SM));
-    container(
-        column![
-            badge,
-            text(title)
-                .font(SANS_SEMIBOLD)
-                .size(theme::BODY_LG)
-                .color(p.muted_3),
-            text(detail).font(SANS).size(theme::BODY).color(p.muted_2),
-        ]
-        .spacing(9)
-        .align_x(Alignment::Center)
-        .max_width(420),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .align_x(Alignment::Center)
-    .align_y(Alignment::Center)
-    .padding(24)
-    .into()
+    ui::empty_state::empty_state(Some(badge.into()), title, detail, &t)
+        .height(Length::Fill)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 fn header_cell(label: &'static str, width: f32, p: Palette) -> Element<'static, Message> {
@@ -637,23 +624,20 @@ fn fill_cell(value: String, color: iced::Color, mono: bool) -> Element<'static, 
 }
 
 fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
-    container(body)
+    let t = theme::ui_for(&p);
+    ui::surface::surface(body, ui::surface::SurfaceVariant::Card, &t)
         .width(Length::Fill)
         .padding([11, 13])
-        .style(move |_| rounded_surface(p.paper, p.border, RADIUS_MD))
         .into()
 }
 
 fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
-    let btn = button(
-        text(label)
-            .font(SANS)
-            .size(theme::LABEL)
-            .color(p.muted_3),
-    )
-    .padding([2, 0])
-    .style(|_, _| iced::widget::button::Style::default())
-    .on_press(message);
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Ghost)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -661,19 +645,12 @@ fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, 
 }
 
 fn outline_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(theme::LABEL))
-        .padding([7, 12])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(p.paper)),
-            text_color: p.ink_soft,
-            border: Border {
-                color: p.border_strong,
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        })
-        .on_press(message);
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]

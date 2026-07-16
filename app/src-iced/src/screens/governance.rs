@@ -15,6 +15,7 @@ use crate::theme::{
     self, BODY, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_SM, SANS, SANS_SEMIBOLD,
     TITLE,
 };
+use crate::ui;
 use crate::view_api::SubmitReceipt;
 
 const MAX_SHARE_ACCOUNTS: usize = 256;
@@ -1017,6 +1018,7 @@ fn shares_panel<'a>(
     data: &'a GovernanceData,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let can = can_propose(state) && !state.busy;
     let mode = if data.shares.active {
         format!("{} account shares", data.shares.total)
@@ -1092,21 +1094,17 @@ fn shares_panel<'a>(
                     sem_input(
                         "Account hex",
                         &state.share_account,
-                        text_input("Account hex", &state.share_account)
+                        ui::input::input("Account hex", &state.share_account, &t)
                             .on_input(Message::ShareAccountChanged)
                             .font(MONO)
-                            .size(LABEL)
-                            .padding([7, 8])
                             .width(Length::Fill),
                     ),
                     sem_input(
                         "Shares (0 removes)",
                         &state.share_value,
-                        text_input("Shares (0 removes)", &state.share_value)
+                        ui::input::input("Shares (0 removes)", &state.share_value, &t)
                             .on_input(Message::ShareValueChanged)
                             .font(MONO)
-                            .size(LABEL)
-                            .padding([7, 8])
                             .width(145),
                     ),
                     filled_button("Propose change", Message::ProposeSetShares, can, p),
@@ -1156,6 +1154,7 @@ fn proposal_form<'a>(
     data: &'a GovernanceData,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let can = can_propose(state) && !state.busy;
     let body = if can_propose(state) {
         card(
@@ -1175,12 +1174,9 @@ fn proposal_form<'a>(
                     sem_input(
                         "Signal",
                         &state.signal_text,
-                        text_input("Describe what the set should signal…", &state.signal_text)
+                        ui::input::input("Describe what the set should signal…", &state.signal_text, &t)
                             .on_input(Message::SignalChanged)
                             .on_submit(Message::ProposeSignal)
-                            .font(SANS)
-                            .size(BODY)
-                            .padding([8, 9])
                             .width(Length::Fill),
                     ),
                     filled_button("Propose", Message::ProposeSignal, can, p),
@@ -1219,6 +1215,7 @@ fn upgrade_panel<'a>(
     data: &'a GovernanceData,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let mut body = column![
         row![
             icons::view(Icon::Governance, 13.0, p.muted_2),
@@ -1319,37 +1316,35 @@ fn upgrade_panel<'a>(
                         sem_input(
                             "Upgrade name",
                             &state.upgrade_name,
-                            text_input("Upgrade name", &state.upgrade_name)
+                            ui::input::input("Upgrade name", &state.upgrade_name, &t)
                                 .on_input(Message::UpgradeNameChanged)
-                                .font(SANS)
-                                .size(BODY)
-                                .padding([8, 9])
                                 .width(Length::Fill),
                         ),
                         sem_input(
                             "Target version",
                             &state.upgrade_version,
-                            text_input(
+                            ui::input::input(
                                 &format!("Target version (> {})", upgrade.current_version),
                                 &state.upgrade_version,
+                                &t,
                             )
                             .on_input(Message::UpgradeVersionChanged)
                             .font(MONO)
-                            .size(LABEL)
-                            .padding([8, 9])
                             .width(165),
                         ),
                         sem_input(
                             "Activation height",
                             &state.upgrade_height,
-                            text_input(
-                                &format!("Activation height (> {})", group_digits(data.current_height)),
+                            ui::input::input(
+                                &format!(
+                                    "Activation height (> {})",
+                                    group_digits(data.current_height)
+                                ),
                                 &state.upgrade_height,
+                                &t,
                             )
                             .on_input(Message::UpgradeHeightChanged)
                             .font(MONO)
-                            .size(LABEL)
-                            .padding([8, 9])
                             .width(185),
                         ),
                         filled_button(
@@ -1397,28 +1392,19 @@ fn proposal_list<'a>(
             .then_with(|| left.id.cmp(&right.id))
     });
     if proposals.is_empty() {
-        return container(
-            column![
-                icons::view(Icon::Governance, 26.0, p.icon_idle),
-                text(match state.filter {
-                    Filter::All => "No proposals to show.",
-                    Filter::Open => "No open proposals to show.",
-                    Filter::Settled => "No settled proposals to show.",
-                })
-                .font(SANS)
-                .size(TITLE)
-                .color(p.muted_2),
-                text("Proposals appear here once an eligible voter opens one.")
-                    .font(SANS)
-                    .size(LABEL)
-                    .color(p.muted_2),
-            ]
-            .spacing(6)
-            .align_x(Alignment::Center),
+        let t = theme::ui_for(&p);
+        return ui::empty_state::empty_state(
+            Some(icons::view(Icon::Governance, 26.0, p.icon_idle).into()),
+            match state.filter {
+                Filter::All => "No proposals to show.",
+                Filter::Open => "No open proposals to show.",
+                Filter::Settled => "No settled proposals to show.",
+            },
+            "Proposals appear here once an eligible voter opens one.",
+            &t,
         )
-        .width(Length::Fill)
         .height(Length::Fill)
-        .center(Length::Fill)
+        .align_y(Alignment::Center)
         .into();
     }
     let mut list = column![].spacing(10);
@@ -1669,10 +1655,10 @@ fn section<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a,
 }
 
 fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
-    container(body)
+    let t = theme::ui_for(&p);
+    ui::surface::surface(body, ui::surface::SurfaceVariant::Card, &t)
         .width(Length::Fill)
         .padding([12, 13])
-        .style(move |_| rounded_surface(p.paper, p.border, RADIUS_LG))
         .into()
 }
 
@@ -1733,17 +1719,12 @@ fn muted(copy: &str, p: Palette) -> Element<'static, Message> {
 }
 
 fn notice(copy: &'static str, p: Palette) -> Element<'static, Message> {
-    container(
-        row![
-            icons::view(Icon::Node, 15.0, p.amber),
-            text(copy).font(SANS).size(BODY).color(p.amber),
-        ]
-        .spacing(9)
-        .align_y(Alignment::Center),
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy).size(t.typography.sm),
+        ui::alert::AlertVariant::Warning,
+        &t,
     )
-    .width(Length::Fill)
-    .padding([11, 13])
-    .style(move |_| rounded_surface(p.sunken, p.amber, RADIUS_LG))
     .into()
 }
 
@@ -1805,29 +1786,13 @@ fn outline_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(BODY))
-        .padding([7, 12])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if enabled && matches!(status, iced::widget::button::Status::Hovered) {
-                    p.titlebar
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: if enabled { p.ink_soft } else { p.muted_2 },
-            border: Border {
-                color: if enabled { p.border_strong } else { p.border_soft },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let control = if enabled {
-        control.on_press(message)
-    } else {
-        control
-    };
+    let t = theme::ui_for(&p);
+    let control = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
         .disabled(!enabled)
@@ -1842,23 +1807,12 @@ fn filled_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(BODY))
-        .padding([7, 12])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(if enabled { p.filled } else { p.sunken })),
-            text_color: if enabled { p.on_filled } else { p.muted_2 },
-            border: Border {
-                color: if enabled { p.filled } else { p.border_soft },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let control = if enabled {
-        control.on_press(message)
-    } else {
-        control
-    };
+    let t = theme::ui_for(&p);
+    let control = ui::button::button(label, &t)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
         .disabled(!enabled)
