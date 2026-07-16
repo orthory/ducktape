@@ -1,7 +1,12 @@
 # iced-agent-plugin — agent driver for the native iced shell
 
-**Status:** approved design (user-selected substrate: own the event loop — forked
-`iced_winit` — with real OS AccessKit).
+**Status:** BUILT on `feat/iced-agent-plugin` (2026-07-16). P0 proven live
+(AT-SPI serves the pushed tree; injected input flows the real event path);
+bridge e2e 10/10. Deltas from design: `press` also accepts single-character
+chords; the snapshot loop publishes on the next 150 ms beat instead of task
+chaining; `iced_state` serves a small curated projection (screen/section/
+history_len/has_workspace/unread/search_open/quitting) to be grown as QA
+needs it.
 
 ## Goal
 
