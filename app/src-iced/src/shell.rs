@@ -1115,15 +1115,19 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             }
         }
         Message::PageShortcut(shortcut) => {
+            // Tab reaches here on EVERY screen (the key mapper is stateless).
+            // Outside a pages block edit it is focus navigation, not block
+            // indent — swallowing it left the whole app without keyboard
+            // focus traversal.
             if state.screen() != Screen::Pages {
-                return Task::none();
+                return tab_focus_fallback(&shortcut);
             }
             if matches!(
                 shortcut,
                 PageShortcut::Move(_) | PageShortcut::RemoveEmpty | PageShortcut::Activate
             ) {
                 let Some(block) = state.user_screens.pages.focused_block.clone() else {
-                    return Task::none();
+                    return tab_focus_fallback(&shortcut);
                 };
                 let id = iced::widget::Id::from(user_screens::page_block_input_id(&block));
                 return iced::widget::operation::is_focused(id).map(move |is_focused| {
@@ -1147,6 +1151,9 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             {
                 return apply_page_shortcut(state, shortcut);
             }
+            // The nominally-focused block isn't actually being edited: Tab is
+            // ordinary focus traversal, not indent.
+            return tab_focus_fallback(&shortcut);
         }
         Message::PagePresenceTick => poll_page_presence(state),
         Message::Forge(message) => {
@@ -1584,6 +1591,20 @@ fn poll_page_presence(state: &mut Shell) {
             .values()
             .map(|(peer, _)| peer.clone())
             .collect();
+    }
+}
+
+/// Outside a live pages-block edit, the Tab mapping (`Move`) means keyboard
+/// focus traversal; every other pages shortcut stays pages-only and dies.
+fn tab_focus_fallback(shortcut: &PageShortcut) -> Task<Message> {
+    match shortcut {
+        PageShortcut::Move(user_screens::BlockMove::Indent) => {
+            iced::widget::operation::focus_next()
+        }
+        PageShortcut::Move(user_screens::BlockMove::Outdent) => {
+            iced::widget::operation::focus_previous()
+        }
+        _ => Task::none(),
     }
 }
 
