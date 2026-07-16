@@ -119,26 +119,6 @@ describe("MembersView", () => {
     expect(screen.queryByRole("button", { name: /admit joiner/i })).not.toBeInTheDocument();
   });
 
-  it("shows the short invite link first, with the full blob behind a details toggle", () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
-    renderMembers({ inviteShort: "🦆://demo/QUJDREVGR0hJSktMTU5P" });
-
-    // the short link is the primary field + copy button.
-    expect(screen.getByLabelText("Workspace invite link")).toHaveValue(
-      "🦆://demo/QUJDREVGR0hJSktMTU5P",
-    );
-    fireEvent.click(screen.getByRole("button", { name: /copy invite link/i }));
-    expect(writeText).toHaveBeenCalledWith("🦆://demo/QUJDREVGR0hJSktMTU5P");
-
-    // the full blob is still available (the coordinator-free fallback).
-    fireEvent.click(screen.getByRole("button", { name: /copy full invite/i }));
-    expect(writeText).toHaveBeenCalledWith("ducktape-invite-blob");
-  });
-
   it("offers an in-app confirmed removal per row but never for this node itself", () => {
     const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderMembers();

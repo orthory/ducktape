@@ -9,17 +9,8 @@ use tokio::sync::{Mutex, mpsc};
 use crate::AuthRequest;
 use crate::auth::{AuthPolicy, CoordCap, now_secs, sign_authenticator};
 use crate::coordinator::{AuthVerifier, VerifiedRequest};
-use crate::wire::INVITE_ID_LEN;
 use crate::{Coordinator, Msg, NodeKey};
 use commonware_cryptography::ed25519;
-
-/// per-attempt wait for a one-shot invite RPC (`invite_put`/`invite_fetch`).
-const INVITE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-/// resends per invite RPC before giving up (a coordinator UDP datagram can be
-/// dropped; the put is idempotent and the get is read-only, so resends are safe).
-const INVITE_RPC_ATTEMPTS: usize = 3;
-/// receive buffer for invite replies — the largest is an `InviteChunk` (≤1023 B).
-const INVITE_REPLY_BUF: usize = 2048;
 
 /// where a [`NatClient`]'s datagrams ride.
 ///
@@ -378,133 +369,6 @@ impl NatClient {
             .send_to(&Msg::Punch { from: self.key }.encode(), peer)
             .await?;
         Ok(())
-    }
-
-    /// Publish an invite blob to the coordinator's shelf under its content
-    /// `id`. `Ok(true)` = shelved (Stored or Replaced), `Ok(false)` = refused
-    /// (quota/size). The signed datagram is resent up to
-    /// [`INVITE_RPC_ATTEMPTS`] times if no ack lands within the per-attempt
-    /// window; a put is idempotent, so a resend is harmless.
-    pub async fn invite_put(
-        &self,
-        id: [u8; INVITE_ID_LEN],
-        expires_unix_secs: u64,
-        blob: Vec<u8>,
-    ) -> std::io::Result<bool> {
-        let req = self.authed(Msg::InvitePut {
-            key: self.key,
-            id,
-            expires_unix_secs,
-            blob,
-        });
-        for _ in 0..INVITE_RPC_ATTEMPTS {
-            self.sock.send_to(&req, self.coord).await?;
-            match tokio::time::timeout(INVITE_RPC_TIMEOUT, self.await_put_ack(id)).await {
-                Ok(result) => return result,
-                Err(_) => continue, // no ack in the window — resend
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "coordinator did not ack the invite put",
-        ))
-    }
-
-    async fn await_put_ack(&self, id: [u8; INVITE_ID_LEN]) -> std::io::Result<bool> {
-        let mut buf = [0u8; INVITE_REPLY_BUF];
-        loop {
-            let (n, from) = self.sock.recv_from(&mut buf).await?;
-            if from != self.coord {
-                continue;
-            }
-            if let Ok(Msg::InvitePutAck { id: got, ok }) = Msg::decode(&buf[..n])
-                && got == id
-            {
-                return Ok(ok);
-            }
-        }
-    }
-
-    /// Fetch and reassemble a shelved blob. `Ok(None)` = the coordinator
-    /// answered "unknown id" (the link is dead — expired, evicted, or a
-    /// coordinator restart). The id is a random lookup key, not a content hash,
-    /// so there is nothing to check the bytes against here — integrity rests on
-    /// the blob's envelope signature, which the caller verifies by running
-    /// `decode_invite` on the reassembled bytes.
-    pub async fn invite_fetch(&self, id: [u8; INVITE_ID_LEN]) -> std::io::Result<Option<Vec<u8>>> {
-        // chunk 0 first: it carries the real `total` (0 means unknown id).
-        let (first, total) = self.fetch_chunk(id, 0).await?;
-        if total == 0 {
-            return Ok(None);
-        }
-        // `total` is coordinator-claimed: cap it at the largest chunk count a
-        // legal blob can need, so a malicious shelf cannot drive this loop
-        // through 65k round-trips buffering megabytes before the hash check.
-        let max_total = crate::wire::INVITE_BLOB_MAX.div_ceil(crate::wire::INVITE_CHUNK_BYTES) as u16;
-        if total > max_total {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "coordinator claimed an impossible chunk count for this short invite",
-            ));
-        }
-        let mut whole = first;
-        for chunk in 1..total {
-            let (bytes, _) = self.fetch_chunk(id, chunk).await?;
-            whole.extend_from_slice(&bytes);
-        }
-        Ok(Some(whole))
-    }
-
-    /// One padded, PoP-authenticated `InviteGet`, resent up to
-    /// [`INVITE_RPC_ATTEMPTS`] times. Returns the chunk bytes and the blob's
-    /// total chunk count.
-    async fn fetch_chunk(
-        &self,
-        id: [u8; INVITE_ID_LEN],
-        chunk: u16,
-    ) -> std::io::Result<(Vec<u8>, u16)> {
-        let get = self.authed(Msg::InviteGet {
-            key: self.key,
-            id,
-            chunk,
-            pad: crate::wire::INVITE_GET_PAD,
-        });
-        for _ in 0..INVITE_RPC_ATTEMPTS {
-            self.sock.send_to(&get, self.coord).await?;
-            match tokio::time::timeout(INVITE_RPC_TIMEOUT, self.await_chunk(id, chunk)).await {
-                Ok(result) => return result,
-                Err(_) => continue, // no reply in the window — resend
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "coordinator did not answer the invite fetch",
-        ))
-    }
-
-    async fn await_chunk(
-        &self,
-        id: [u8; INVITE_ID_LEN],
-        chunk: u16,
-    ) -> std::io::Result<(Vec<u8>, u16)> {
-        let mut buf = [0u8; INVITE_REPLY_BUF];
-        loop {
-            let (n, from) = self.sock.recv_from(&mut buf).await?;
-            if from != self.coord {
-                continue;
-            }
-            if let Ok(Msg::InviteChunk {
-                id: got,
-                chunk: got_chunk,
-                total,
-                bytes,
-            }) = Msg::decode(&buf[..n])
-                && got == id
-                && got_chunk == chunk
-            {
-                return Ok((bytes, total));
-            }
-        }
     }
 
     /// Send one non-rendezvous datagram from this client's socket. Consumers
@@ -972,8 +836,8 @@ async fn run_coordinator_with_metrics(
     mut coord: Coordinator,
     metrics: CoordinatorMetrics,
 ) {
-    // Big enough for the largest AuthRequest — an InvitePut wrapping a
-    // full-size invite blob, plus the caller field, authenticator, and cap.
+    // Big enough for the largest AuthRequest — the largest bare Msg plus the
+    // caller field, authenticator, and cap.
     let mut buf = [0u8; AuthRequest::MAX_ENCODED_LEN];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
@@ -1264,67 +1128,6 @@ mod tests {
             miss.is_err() || miss.unwrap().is_err(),
             "unauthenticated register never created a mapping"
         );
-    }
-
-    #[tokio::test]
-    async fn invite_put_then_fetch_roundtrips_over_the_socket() {
-        use crate::auth::AuthPolicy;
-        use commonware_cryptography::{Signer as _, ed25519};
-
-        let policy = AuthPolicy::Open { require_pop: true };
-        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, policy));
-
-        let node_key = |signer: &ed25519::PrivateKey| {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(signer.public_key().as_ref());
-            NodeKey(k)
-        };
-
-        // the inviter publishes a multi-chunk blob under a random lookup id.
-        let inviter_signer = ed25519::PrivateKey::from_seed(11);
-        let inviter = NatClient::bind_multi_auth(
-            node_key(&inviter_signer),
-            vec![coord_addr],
-            inviter_signer,
-            None,
-        )
-        .await
-        .unwrap();
-        let blob = (0..2500u32).map(|i| i as u8).collect::<Vec<u8>>();
-        let id = [0x11; INVITE_ID_LEN];
-        assert!(
-            timeout(
-                Duration::from_secs(5),
-                inviter.invite_put(id, crate::auth::now_secs() + 3600, blob.clone()),
-            )
-            .await
-            .expect("no timeout")
-            .expect("put")
-        );
-
-        // a SECOND, different-keyed client fetches and reassembles it.
-        let joiner_signer = ed25519::PrivateKey::from_seed(12);
-        let joiner = NatClient::bind_multi_auth(
-            node_key(&joiner_signer),
-            vec![coord_addr],
-            joiner_signer,
-            None,
-        )
-        .await
-        .unwrap();
-        let fetched = timeout(Duration::from_secs(5), joiner.invite_fetch(id))
-            .await
-            .expect("no timeout")
-            .expect("fetch");
-        assert_eq!(fetched, Some(blob));
-        // an unknown id is the honest "link is dead" None.
-        let missing = timeout(Duration::from_secs(5), joiner.invite_fetch([0xEE; INVITE_ID_LEN]))
-            .await
-            .expect("no timeout")
-            .expect("fetch");
-        assert_eq!(missing, None);
     }
 
     #[tokio::test]
