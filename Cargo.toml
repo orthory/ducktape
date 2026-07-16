@@ -236,5 +236,8 @@ rand_core = "0.6.4"
 # (AccessKit adapter, tree push, synthetic event injection), dev-only via the
 # `agent` feature. Lives in the
 # byeongsu-hong/iced-agent-browser repo (git dep; AGENT-FORK.md inside).
+# Supply-chain pin: Cargo.lock records the exact rev (bump via `cargo update`)
+# and ops/iced-agent executes that same lock-pinned rev — one pin authority,
+# no silent HEAD tracking anywhere.
 [patch.crates-io]
 iced_winit = { git = "https://github.com/byeongsu-hong/iced-agent-browser" }
