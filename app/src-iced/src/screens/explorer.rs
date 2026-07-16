@@ -1,11 +1,11 @@
 //! Native block explorer. Presentation state is transport-free: the host
 //! loads the finalized block ring and returns it through [`ServiceEvent`].
 
-use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Alignment, Background, Border, Element, Length};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS, SANS_SEMIBOLD};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource<T> {
@@ -188,10 +188,10 @@ fn blocks_view(resource: &Resource<Vec<BlockRecord>>, p: Palette) -> Element<'_,
         Resource::Error(error) => {
             let body = column![
                 text("Block explorer unavailable")
-                    .font(SANS)
-                    .size(13)
+                    .font(SANS_SEMIBOLD)
+                    .size(theme::BODY_LG)
                     .color(p.ink),
-                text(error).font(SANS).size(11.5).color(p.danger),
+                selectable_text("error", error, SANS, theme::BODY, p.danger, p),
                 outline_button("Retry", Message::Load, p),
             ]
             .spacing(8);
@@ -310,7 +310,7 @@ fn block_row(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
     btn.into()
 }
 
-fn block_detail(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
+fn block_detail<'a>(block: &'a BlockRecord, p: Palette) -> Element<'a, Message> {
     let empty = block.ops.is_empty();
     let rejected = block
         .ops
@@ -335,20 +335,20 @@ fn block_detail(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
         bare_button("← Blocks", Message::Back, p),
         text(format!("#{}", block.height))
             .font(MONO)
-            .size(14)
+            .size(theme::BODY_LG)
             .color(p.ink),
         Space::new().width(Length::Fill),
         text(status)
             .font(SANS)
-            .size(10.5)
+            .size(theme::CAPTION)
             .color(if rejected > 0 { p.red } else { p.green }),
     ]
     .spacing(12)
     .align_y(Alignment::Center);
     let digests = card(
         column![
-            digest_line("HASH", &block.hash, p),
-            digest_line("COMMIT", &block.commit_hash, p),
+            selectable_value("HASH", &block.hash, p),
+            selectable_value("COMMIT", &block.commit_hash, p),
         ]
         .spacing(7),
         p,
@@ -358,14 +358,14 @@ fn block_detail(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
         content = content.push(
             text("Idle block — no ops committed in this window (a heartbeat nop).")
                 .font(SANS)
-                .size(12)
+                .size(theme::BODY)
                 .color(p.muted_2),
         );
     } else {
         content = content.push(
             text(format!("OPS ({})", block.ops.len()))
-                .font(SANS)
-                .size(10.5)
+                .font(SANS_SEMIBOLD)
+                .size(theme::LABEL)
                 .color(p.muted),
         );
         for (index, op) in block.ops.iter().enumerate() {
@@ -377,25 +377,24 @@ fn block_detail(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-fn op_section(op: &RootOp, index: usize, p: Palette) -> Element<'static, Message> {
-    let proposer_label = op
-        .proposer_name
-        .as_ref()
-        .map(|name| format!("{name} · {}", op.proposer))
-        .unwrap_or_else(|| op.proposer.clone());
+fn op_section<'a>(op: &'a RootOp, index: usize, p: Palette) -> Element<'a, Message> {
     let header = row![
         text(format!("OP {index}"))
             .font(MONO)
-            .size(10.5)
+            .size(theme::CAPTION)
             .color(p.muted_2),
-        text(op.target.clone()).font(SANS).size(12.5).color(p.ink),
-        text(op.disposition.label()).font(SANS).size(10.5).color(
-            if op.disposition == Disposition::Rejected {
+        text(op.target.clone())
+            .font(SANS)
+            .size(theme::BODY)
+            .color(p.ink),
+        text(op.disposition.label())
+            .font(SANS)
+            .size(theme::CAPTION)
+            .color(if op.disposition == Disposition::Rejected {
                 p.red
             } else {
                 p.green
-            }
-        ),
+            }),
         Space::new().width(Length::Fill),
         text(
             op.proposer_name
@@ -403,18 +402,18 @@ fn op_section(op: &RootOp, index: usize, p: Palette) -> Element<'static, Message
                 .unwrap_or_else(|| short_hex(&op.proposer)),
         )
         .font(SANS)
-        .size(11)
+        .size(theme::CAPTION)
         .color(p.muted_3),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
     let mut body = column![
         header,
-        digest_line("PROPOSER", &proposer_label, p),
-        digest_line("OP HASH", &op.op_hash, p),
+        selectable_value("PROPOSER", &op.proposer, p),
+        selectable_value("OP HASH", &op.op_hash, p),
         text(format!("TRANSACTIONS ({})", op.operations.len()))
-            .font(SANS)
-            .size(10.5)
+            .font(SANS_SEMIBOLD)
+            .size(theme::LABEL)
             .color(p.muted),
     ]
     .spacing(8);
@@ -426,7 +425,7 @@ fn op_section(op: &RootOp, index: usize, p: Palette) -> Element<'static, Message
                 "No dispatches recorded."
             })
             .font(SANS)
-            .size(12)
+            .size(theme::BODY)
             .color(p.muted_2),
         );
     } else {
@@ -436,14 +435,21 @@ fn op_section(op: &RootOp, index: usize, p: Palette) -> Element<'static, Message
     }
     if !op.payload.is_empty() {
         body = body
-            .push(text("PAYLOAD").font(SANS).size(10.5).color(p.muted))
             .push(
-                container(
-                    text(op.payload.clone())
-                        .font(MONO)
-                        .size(11)
-                        .color(p.ink_softer),
-                )
+                text("PAYLOAD")
+                    .font(SANS_SEMIBOLD)
+                    .size(theme::LABEL)
+                    .color(p.muted),
+            )
+            .push(
+                container(selectable_text(
+                    "PAYLOAD",
+                    &op.payload,
+                    MONO,
+                    theme::BODY,
+                    p.ink_softer,
+                    p,
+                ))
                 .width(Length::Fill)
                 .padding([9, 11])
                 .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_MD)),
@@ -462,19 +468,19 @@ fn dispatch_row(dispatch: &DispatchInfo, index: usize, p: Palette) -> Element<'s
     }
     container(
         row![
-            text(index).font(MONO).size(11).color(p.muted_2),
+            text(index).font(MONO).size(theme::CAPTION).color(p.muted_2),
             text(dispatch.module.clone())
                 .font(SANS)
-                .size(12)
+                .size(theme::BODY)
                 .color(p.ink),
             text(dispatch.origin.clone())
                 .font(MONO)
-                .size(11)
+                .size(theme::CAPTION)
                 .color(p.muted_2),
             Space::new().width(Length::Fill),
             text(fanout.join("  "))
                 .font(MONO)
-                .size(10.5)
+                .size(theme::CAPTION)
                 .color(p.muted_3),
         ]
         .spacing(12)
@@ -486,21 +492,58 @@ fn dispatch_row(dispatch: &DispatchInfo, index: usize, p: Palette) -> Element<'s
     .into()
 }
 
-fn digest_line(label: &'static str, value: &str, p: Palette) -> Element<'static, Message> {
+/// A labeled digest row whose full value is a copy target: the value renders in
+/// a borderless read-only text input, so the user can select and copy the whole
+/// hash/key even though the table rows above truncate it. Mirrors the
+/// `selectable_error` idiom (`screens/workspace.rs`).
+fn selectable_value<'a>(label: &'static str, value: &'a str, p: Palette) -> Element<'a, Message> {
     row![
-        text(label).font(SANS).size(10.5).color(p.muted).width(72),
-        text(if value.is_empty() {
-            "—".to_string()
-        } else {
-            value.to_string()
-        })
-        .font(MONO)
-        .size(11.5)
-        .color(p.ink_softer),
+        text(label)
+            .font(SANS_SEMIBOLD)
+            .size(theme::LABEL)
+            .color(p.muted)
+            .width(72),
+        selectable_text(label, value, MONO, theme::BODY, p.ink_softer, p),
     ]
     .spacing(10)
     .align_y(Alignment::Center)
     .into()
+}
+
+/// A read-only, transparent, borderless text input: reads as plain text but the
+/// user can select and copy the full value. `name` tags it for the agent's
+/// semantic layer so a screen test can address it as a copy target.
+fn selectable_text<'a>(
+    name: &'static str,
+    value: &'a str,
+    font: iced::Font,
+    size: f32,
+    color: Color,
+    p: Palette,
+) -> Element<'a, Message> {
+    let display: &str = if value.is_empty() { "—" } else { value };
+    let input = text_input("", display)
+        .font(font)
+        .size(size)
+        .padding(0)
+        .width(Length::Fill)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: color,
+            placeholder: p.muted_2,
+            value: color,
+            selection: theme::ACCENTS[0],
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(display.to_string())
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    {
+        let _ = name;
+        input.into()
+    }
 }
 
 fn state_view(title: &'static str, detail: &'static str, p: Palette) -> Element<'static, Message> {
@@ -513,8 +556,11 @@ fn state_view(title: &'static str, detail: &'static str, p: Palette) -> Element<
     container(
         column![
             badge,
-            text(title).font(SANS).size(14).color(p.muted_3),
-            text(detail).font(SANS).size(11.5).color(p.muted_2),
+            text(title)
+                .font(SANS_SEMIBOLD)
+                .size(theme::BODY_LG)
+                .color(p.muted_3),
+            text(detail).font(SANS).size(theme::BODY).color(p.muted_2),
         ]
         .spacing(9)
         .align_x(Alignment::Center)
@@ -530,8 +576,8 @@ fn state_view(title: &'static str, detail: &'static str, p: Palette) -> Element<
 
 fn header_cell(label: &'static str, width: f32, p: Palette) -> Element<'static, Message> {
     text(label)
-        .font(SANS)
-        .size(10.5)
+        .font(SANS_SEMIBOLD)
+        .size(theme::LABEL)
         .color(p.muted)
         .width(width)
         .into()
@@ -539,8 +585,8 @@ fn header_cell(label: &'static str, width: f32, p: Palette) -> Element<'static, 
 
 fn fill_header(label: &'static str, p: Palette) -> Element<'static, Message> {
     text(label)
-        .font(SANS)
-        .size(10.5)
+        .font(SANS_SEMIBOLD)
+        .size(theme::LABEL)
         .color(p.muted)
         .width(Length::Fill)
         .into()
@@ -554,7 +600,7 @@ fn fixed_cell(
 ) -> Element<'static, Message> {
     text(value)
         .font(if mono { MONO } else { SANS })
-        .size(if mono { 11.5 } else { 11.0 })
+        .size(theme::BODY)
         .color(color)
         .width(width)
         .into()
@@ -563,7 +609,7 @@ fn fixed_cell(
 fn fill_cell(value: String, color: iced::Color, mono: bool) -> Element<'static, Message> {
     text(value)
         .font(if mono { MONO } else { SANS })
-        .size(11.5)
+        .size(theme::BODY)
         .color(color)
         .width(Length::Fill)
         .into()
@@ -578,10 +624,15 @@ fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Me
 }
 
 fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(11.5).color(p.muted_3))
-        .padding(0)
-        .style(|_, _| iced::widget::button::Style::default())
-        .on_press(message);
+    let btn = button(
+        text(label)
+            .font(SANS)
+            .size(theme::LABEL)
+            .color(p.muted_3),
+    )
+    .padding([2, 0])
+    .style(|_, _| iced::widget::button::Style::default())
+    .on_press(message);
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -589,7 +640,7 @@ fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, 
 }
 
 fn outline_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(11.5))
+    let btn = button(text(label).font(SANS).size(theme::LABEL))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(p.paper)),
