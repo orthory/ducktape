@@ -205,6 +205,11 @@ pub struct State {
     pub drag_hover: Option<usize>,
     pub pending_block_delete: Option<String>,
     pub pending_page_delete: bool,
+    // Which block the cursor is over (reveals its hover gutter) and which
+    // block's actions menu is open. Both are id-keyed, so a stale id after a
+    // reorder simply matches nothing.
+    pub hovered_block: Option<String>,
+    pub menu_open_block: Option<String>,
     editors: Vec<(String, EditorState)>,
     comment_draft: EditorState,
     comment_target: Option<CommentTarget>,
@@ -230,6 +235,8 @@ impl Default for State {
             drag_hover: None,
             pending_block_delete: None,
             pending_page_delete: false,
+            hovered_block: None,
+            menu_open_block: None,
             editors: Vec::new(),
             comment_draft: EditorState::default(),
             comment_target: None,
@@ -276,6 +283,8 @@ pub enum Message {
     CloseActiveTab,
     BeginBlockDrag(usize),
     HoverBlock(usize),
+    BlockRowExited(usize),
+    ToggleBlockMenu(usize),
     DropDraggedBlock,
     PasteFromClipboard(usize),
     PasteBlocks(usize, String),
@@ -289,6 +298,10 @@ pub enum Message {
     CommentEditAction(text_editor::Action),
     CommitCommentEdit,
     CancelCommentEdit,
+    // Re-parenting a page is a rail-tree drag gesture (not yet ported); the
+    // per-document parent picker was removed (G6). The effect/command plumbing
+    // below stays so that drag can emit this once the rail tree grows it.
+    #[allow(dead_code)]
     SetPageParent(Option<String>),
 }
 
@@ -563,6 +576,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
         Message::Undo => apply_page_edit(state, false),
         Message::Redo => apply_page_edit(state, true),
         Message::SetBlockKind(index, kind) => {
+            state.menu_open_block = None;
             let block = page_document(state)?.blocks.get(index)?;
             Some(Effect::SetBlockKind {
                 block: block.id.clone(),
@@ -577,6 +591,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             })
         }
         Message::RequestRemoveBlock(index) => {
+            state.menu_open_block = None;
             state.pending_block_delete = Some(page_document(state)?.blocks.get(index)?.id.clone());
             None
         }
@@ -653,9 +668,36 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             None
         }
         Message::HoverBlock(index) => {
+            if let Some(id) = page_document(state)
+                .and_then(|document| document.blocks.get(index))
+                .map(|block| block.id.clone())
+            {
+                state.hovered_block = Some(id);
+            }
             if state.dragging_block.is_some() {
                 state.drag_hover = Some(index);
             }
+            None
+        }
+        Message::BlockRowExited(index) => {
+            let id = page_document(state)
+                .and_then(|document| document.blocks.get(index))
+                .map(|block| block.id.clone());
+            // Only the row we're actually leaving clears the flag, so an
+            // enter/exit pair while crossing between two rows can't blank the
+            // gutter on the row we just entered.
+            if id.is_some() && state.hovered_block == id {
+                state.hovered_block = None;
+            }
+            None
+        }
+        Message::ToggleBlockMenu(index) => {
+            let id = page_document(state)?.blocks.get(index)?.id.clone();
+            state.menu_open_block = if state.menu_open_block.as_deref() == Some(&id) {
+                None
+            } else {
+                Some(id)
+            };
             None
         }
         Message::DropDraggedBlock => drop_dragged(state),
@@ -1488,6 +1530,8 @@ fn reset_page_transients(state: &mut State) {
     state.pending_block_delete = None;
     state.pending_page_delete = false;
     state.comment_target = None;
+    state.hovered_block = None;
+    state.menu_open_block = None;
 }
 
 fn reveal_page_block(state: &mut State, id: &str) {
@@ -1695,23 +1739,6 @@ const fn block_kind_label(kind: BlockKind) -> &'static str {
         BlockKind::Code => "</>",
         BlockKind::Callout => "!",
         BlockKind::Divider => "—",
-    }
-}
-
-const fn next_block_kind(kind: BlockKind) -> BlockKind {
-    match kind {
-        BlockKind::Paragraph => BlockKind::Heading1,
-        BlockKind::Heading1 => BlockKind::Heading2,
-        BlockKind::Heading2 => BlockKind::Heading3,
-        BlockKind::Heading3 => BlockKind::Bulleted,
-        BlockKind::Bulleted => BlockKind::Numbered,
-        BlockKind::Numbered => BlockKind::Todo,
-        BlockKind::Todo => BlockKind::Toggle,
-        BlockKind::Toggle => BlockKind::Quote,
-        BlockKind::Quote => BlockKind::Code,
-        BlockKind::Code => BlockKind::Callout,
-        BlockKind::Callout => BlockKind::Divider,
-        BlockKind::Divider => BlockKind::Paragraph,
     }
 }
 
