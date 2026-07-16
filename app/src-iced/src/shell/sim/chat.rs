@@ -40,9 +40,9 @@ fn create_channel_and_post_message_round_trip() {
         "channel is committed node-side: {channels}"
     );
 
-    // CreateChannel does not set `active_channel` (only SelectChannel does),
-    // and the composer's Submit is a silent no-op without one — so select the
-    // freshly committed channel from the rail before posting.
+    // Selection-wise this click is redundant — ChatLoaded auto-selects the
+    // first non-archived channel — but it drives the real rail path
+    // (SelectChannel → LoadChannel), which is coverage the lane wants.
     ui.click(Role::ListItem, "qa-lane");
 
     // The composer is a Sem-wrapped `text_editor`; simulated typewrite does not
@@ -118,6 +118,6 @@ fn duplicate_channel_rejection_lands_in_error_and_chains_no_refresh() {
     // The rejected submit chained no refresh and corrupted nothing.
     assert!(ui.has(Role::ListItem, "dup"));
     let channels = ui.node_query("chat", serde_json::json!("channels"));
-    let listed = channels.to_string().matches("dup").count();
-    assert!(listed >= 1, "committed list unchanged: {channels}");
+    let listed = channels["channels"].as_array().map_or(0, Vec::len);
+    assert_eq!(listed, 1, "committed list unchanged — exactly one channel: {channels}");
 }
