@@ -1482,6 +1482,29 @@ fn review_card(review: &Review, p: Palette) -> Element<'static, Message> {
     ]
     .spacing(6)
     .padding([10, 12]);
+    // Enumerate every submitted comment. The diff anchors New-side, in-window
+    // comments under their line, but out-of-window and Old-side comments never
+    // get anchored — so listing them all here is the only place they always show.
+    for comment in &review.comments {
+        let side = match comment.side {
+            ReviewSide::Old => "old",
+            ReviewSide::New => "new",
+        };
+        content = content.push(
+            column![
+                text(format!("{}:{} ({side})", comment.path, comment.line))
+                    .font(MONO)
+                    .size(CAPTION)
+                    .color(p.blue),
+                text(comment.body.clone())
+                    .font(SANS)
+                    .size(LABEL)
+                    .color(p.ink_soft),
+            ]
+            .spacing(3)
+            .padding([0, 12]),
+        );
+    }
     let footer = if count == 0 {
         format!("reviewed {}", short_hash(Some(&review.commit_oid)))
     } else {
@@ -1658,7 +1681,7 @@ fn diff_file_card<'a>(
                 let line = new_line;
                 new_line = new_line.saturating_add(1);
                 let bg = mix(p.paper, p.green, 0.11);
-                let has_comment = existing.iter().any(|comment| comment.line == line);
+                let has_comment = existing.iter().any(|c| anchors_new(c, line));
                 let row = diff_line(raw, Some(line), bg, p.ink_soft, p);
                 if stageable && !busy && !has_comment {
                     lines = lines.push(
@@ -1674,8 +1697,8 @@ fn diff_file_card<'a>(
                 } else {
                     lines = lines.push(row);
                 }
-                // Anchor any existing review comment right under its line.
-                for comment in existing.iter().filter(|comment| comment.line == line) {
+                // Anchor any existing New-side comment right under its line.
+                for comment in existing.iter().filter(|c| anchors_new(c, line)) {
                     lines = lines.push(anchored_comment(comment, p));
                 }
             }
@@ -1686,6 +1709,11 @@ fn diff_file_card<'a>(
                 let line = new_line;
                 new_line = new_line.saturating_add(1);
                 lines = lines.push(diff_line(raw, Some(line), p.paper, p.ink_softer, p));
+                // Context lines carry valid new-file numbers too, so a New-side
+                // comment on an unchanged line anchors here.
+                for comment in existing.iter().filter(|c| anchors_new(c, line)) {
+                    lines = lines.push(anchored_comment(comment, p));
+                }
             }
         }
     }
@@ -1730,6 +1758,12 @@ fn diff_line<'a>(
         ..Default::default()
     })
     .into()
+}
+
+/// A comment anchors under a diff line only when it targets the new file at that
+/// exact line — Old-side comments track old-file numbers and never anchor here.
+fn anchors_new(comment: &ReviewComment, new_line: u32) -> bool {
+    comment.side == ReviewSide::New && comment.line == new_line
 }
 
 fn anchored_comment(comment: &ReviewComment, p: Palette) -> Element<'static, Message> {
