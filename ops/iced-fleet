@@ -45,14 +45,32 @@ up_one() { # up_one <id> <preset>
   mkdir -p "$dir/home" "$dir/run"
   chmod 700 "$dir/run"
 
+  # ui-live is not a fixture preset: seed a real workspace into the instance
+  # HOME (a plaintext user key boots the app unlocked) and launch WITHOUT
+  # DUCKTAPE_PRESET so the app runs its real backend + app-managed node. This
+  # is the only lane that exercises transactions end-to-end.
+  local preset_env=(DUCKTAPE_PRESET="$preset")
+  if [ "$preset" = "ui-live" ]; then
+    preset_env=()
+    mkdir -p "$dir/home/.ducktape"
+    (cd "$dir/home/.ducktape" && "$NODE_BIN" user-key >/dev/null 2>&1) \
+      || { echo "instance $id: user-key mint failed" >&2; return 1; }
+    # demo-seed's gateway-route publish step currently 400s (wire drift,
+    # tracked separately); the module seeding this lane needs finishes first.
+    HOME="$dir/home" DUCKTAPE_NODE_BIN="$NODE_BIN" \
+      bash "$ROOT/ops/demo-seed.sh" >"$dir/seed.log" 2>&1 || true
+    [ -d "$dir/home/.ducktape/workspaces/demo" ] \
+      || { echo "instance $id: ui-live seed failed; see $dir/seed.log" >&2; return 1; }
+  fi
+
   setsid Xvfb "$display" -screen 0 1400x900x24 -nolisten tcp >"$dir/xvfb.log" 2>&1 &
   echo $! > "$dir/xvfb.pid"
 
   # dbus-run-session owns the app; killing the session group tears both down.
   DISPLAY="$display" HOME="$dir/home" XDG_RUNTIME_DIR="$dir/run" \
-  DUCKTAPE_NODE_BIN="$NODE_BIN" DUCKTAPE_PRESET="$preset" \
+  DUCKTAPE_NODE_BIN="$NODE_BIN" \
   RUST_LOG="${RUST_LOG:-ducktape=info,ducktape_iced=info}" \
-    setsid dbus-run-session -- "$BIN" >"$dir/app.log" 2>&1 &
+    setsid dbus-run-session -- env "${preset_env[@]}" "$BIN" >"$dir/app.log" 2>&1 &
   echo $! > "$dir/session.pid"
 
   local waited=0
@@ -90,6 +108,20 @@ down_one() { # down_one <id>
   fi
   [ -f "$dir/xvfb.pid" ] && verified_kill "$(cat "$dir/xvfb.pid")" "Xvfb"
   sleep 1
+  # A ui-live instance's app-managed workspace node inherits the app's cwd,
+  # not the instance dir — identify it by the daemon's EXACT argv shape:
+  # exe basename ducktape-node AND argv == [exe, --config, <path under this
+  # instance>]. A one-shot CLI (`ducktape-node <subcommand> --config …`) has
+  # the subcommand at argv[1] and never matches; no substring sweeps.
+  local pid exe a0 a1 a2
+  for pid in $(pgrep -x ducktape-node 2>/dev/null || true); do
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    [ "$(basename "${exe% (deleted)}")" = "ducktape-node" ] || continue
+    { IFS= read -r -d '' a0 && IFS= read -r -d '' a1 && IFS= read -r -d '' a2; } \
+      < "/proc/$pid/cmdline" 2>/dev/null || continue
+    case "$a1" in --config) ;; *) continue ;; esac
+    case "$a2" in "$dir/"*) kill "$pid" 2>/dev/null || true ;; esac
+  done
   rm -rf "$dir"
 }
 

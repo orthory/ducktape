@@ -188,6 +188,7 @@ pub enum Command {
         joined: bool,
     },
     CreatePage {
+        id: String,
         parent: Option<String>,
     },
     LoadPage(String),
@@ -398,7 +399,7 @@ fn update_pages(state: &mut PagesState, message: PagesMessage) -> Option<Command
 
 fn page_effect(effect: pages::Effect) -> Command {
     match effect {
-        pages::Effect::CreatePage { parent } => Command::CreatePage { parent },
+        pages::Effect::CreatePage { id, parent } => Command::CreatePage { id, parent },
         pages::Effect::LoadPages { active, open_tabs } => Command::LoadPages { active, open_tabs },
         pages::Effect::LoadPage(page) => Command::LoadPage(page),
         pages::Effect::RenamePage { page, title } => Command::RenamePage { page, title },
@@ -757,15 +758,23 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
                 Screen::Pages => {
                     state.pages.error = error;
                     if state.pages.error.is_none() {
-                        let (active, open_tabs) = match &state.pages.data {
+                        let (mut active, mut open_tabs) = match &state.pages.data {
                             Resource::Ready(data) => (
                                 data.document.as_ref().map(|document| document.id.clone()),
                                 data.open_tabs.clone(),
                             ),
                             _ => (None, Vec::new()),
                         };
+                        // A committed create opens the new page: activate the
+                        // pending id only now that the write succeeded.
+                        if let Some(created) = state.pages.pending_create.take() {
+                            open_tabs.push(created.clone());
+                            active = Some(created);
+                        }
                         return Some(Command::LoadPages { active, open_tabs });
                     }
+                    // A failed create leaves no phantom selection behind.
+                    state.pages.pending_create = None;
                 }
                 Screen::Files => {
                     state.files.error = error;

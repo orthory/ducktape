@@ -4,7 +4,48 @@ use super::super::*;
 use super::SimShell;
 use crate::screens::chat::ChatMessageEvent;
 use crate::screens::user::Resource;
-use iced_agent_plugin::Role;
+use iced_agent_plugin::{Role, SemProbe};
+use iced_test::selector::{Candidate, Target};
+
+/// Click the nth semantic match when a message row and its panel action share
+/// a label (the thread composer and delete confirmation both do this).
+fn click_nth(ui: &mut SimShell, role: Role, name: &str, nth: usize) {
+    let messages: Vec<Message> = {
+        let mut matches = 0;
+        let mut app = iced_test::simulator(view::view(&ui.state, ui.id));
+        app.click(|candidate: Candidate<'_>| {
+            let Candidate::Custom {
+                bounds,
+                visible_bounds,
+                state,
+                ..
+            } = candidate
+            else {
+                return None;
+            };
+            let SemProbe::Enter {
+                role: candidate_role,
+                name: candidate_name,
+                ..
+            } = state.downcast_ref::<SemProbe>()?
+            else {
+                return None;
+            };
+            if *candidate_role != role || !candidate_name.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            matches += 1;
+            (matches == nth).then_some(Target::Custom {
+                id: None,
+                bounds,
+                visible_bounds,
+            })
+        })
+        .unwrap_or_else(|error| panic!("click {role:?} {name:?} match #{nth}: {error:?}"));
+        app.into_messages().collect()
+    };
+    ui.dispatch(messages);
+}
 
 /// Create a channel through the UI. The name input is a bare TextInput
 /// (no Sem wrapper), so the draft change message is injected; the toggle
@@ -205,4 +246,195 @@ fn duplicate_channel_rejection_lands_in_error_and_chains_no_refresh() {
     let channels = ui.node_query("chat", serde_json::json!("channels"));
     let listed = channels["channels"].as_array().map_or(0, Vec::len);
     assert_eq!(listed, 1, "committed list unchanged — exactly one channel: {channels}");
+}
+
+#[test]
+fn edit_message() {
+    let mut ui = SimShell::boot();
+    ui.inject(Message::Navigate(Screen::Chat));
+    create_channel(&mut ui, "edit-lane");
+    assert!(
+        ui.shell().user_screens.chat.error.is_none(),
+        "create failed: {:?}",
+        ui.shell().user_screens.chat.error
+    );
+    ui.click(Role::ListItem, "edit-lane");
+    post_message(&mut ui, "before edit");
+
+    let original = match &ui.shell().user_screens.chat.data {
+        Resource::Ready(data) => data.messages.last().cloned(),
+        other => panic!("message not loaded into the render model: {other:?}"),
+    }
+    .expect("posted message");
+    ui.click(Role::Button, "Edit");
+    assert_eq!(
+        ui.shell().user_screens.chat.editing,
+        Some((original.sequence, original.revision)),
+        "Edit drives BeginEdit with the committed revision"
+    );
+    ui.inject(Message::UserScreen(user_screens::Message::Chat(
+        ChatMessageEvent::EditChanged("after edit".into()),
+    )));
+    ui.click(Role::Button, "Save");
+    assert!(
+        ui.shell().user_screens.chat.error.is_none(),
+        "edit failed: {:?}",
+        ui.shell().user_screens.chat.error
+    );
+
+    let rendered = match &ui.shell().user_screens.chat.data {
+        Resource::Ready(data) => data
+            .messages
+            .iter()
+            .find(|message| message.sequence == original.sequence),
+        _ => None,
+    }
+    .expect("edited message reloaded into the render model");
+    assert_eq!(rendered.body, "after edit");
+    assert_eq!(rendered.revision, original.revision + 1);
+
+    let latest = ui.node_query(
+        "chat",
+        serde_json::json!({"messages_latest": {"channel_id": "edit-lane", "limit": 20}}),
+    );
+    let node_message = latest["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["seq"].as_u64() == Some(original.sequence))
+        })
+        .expect("edited message remains node-side");
+    assert_eq!(
+        node_message["head"]["blocks"][0]["paragraph"][0]["text"],
+        "after edit"
+    );
+    assert_eq!(
+        node_message["head"]["rev"].as_u64(),
+        Some(original.revision + 1)
+    );
+}
+
+#[test]
+fn delete_message() {
+    let mut ui = SimShell::boot();
+    ui.inject(Message::Navigate(Screen::Chat));
+    create_channel(&mut ui, "delete-lane");
+    assert!(
+        ui.shell().user_screens.chat.error.is_none(),
+        "create failed: {:?}",
+        ui.shell().user_screens.chat.error
+    );
+    ui.click(Role::ListItem, "delete-lane");
+    post_message(&mut ui, "delete me");
+
+    let sequence = match &ui.shell().user_screens.chat.data {
+        Resource::Ready(data) => data.messages.last().map(|message| message.sequence),
+        _ => None,
+    }
+    .expect("posted message");
+    ui.click(Role::Button, "Delete");
+    assert_eq!(ui.shell().user_screens.chat.pending_delete, Some(sequence));
+    click_nth(&mut ui, Role::Button, "Delete", 2);
+    assert!(
+        ui.shell().user_screens.chat.error.is_none(),
+        "delete failed: {:?}",
+        ui.shell().user_screens.chat.error
+    );
+
+    // Chat deletion is a tombstone: the original row/body is gone while the
+    // sequence remains as the thread-safe "Message deleted" skeleton.
+    let rendered = match &ui.shell().user_screens.chat.data {
+        Resource::Ready(data) => data
+            .messages
+            .iter()
+            .find(|message| message.sequence == sequence),
+        _ => None,
+    }
+    .expect("deleted sequence reloaded as a tombstone");
+    assert_eq!(rendered.body, "Message deleted");
+    assert_ne!(rendered.body, "delete me");
+
+    let latest = ui.node_query(
+        "chat",
+        serde_json::json!({"messages_latest": {"channel_id": "delete-lane", "limit": 20}}),
+    );
+    let tombstone = latest["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["seq"].as_u64() == Some(sequence))
+        })
+        .expect("deleted sequence remains node-side as a tombstone");
+    assert_eq!(tombstone["head"]["deleted"].as_bool(), Some(true));
+    assert!(
+        tombstone["head"]["blocks"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "deleted content is gone node-side: {tombstone}"
+    );
+}
+
+#[test]
+fn thread_reply() {
+    let mut ui = SimShell::boot();
+    ui.inject(Message::Navigate(Screen::Chat));
+    create_channel(&mut ui, "thread-lane");
+    assert!(
+        ui.shell().user_screens.chat.error.is_none(),
+        "create failed: {:?}",
+        ui.shell().user_screens.chat.error
+    );
+    ui.click(Role::ListItem, "thread-lane");
+    post_message(&mut ui, "thread root");
+
+    let root = match &ui.shell().user_screens.chat.data {
+        Resource::Ready(data) => data.messages.last().map(|message| message.sequence),
+        _ => None,
+    }
+    .expect("thread root");
+    ui.click(Role::Button, "Reply");
+    assert!(
+        matches!(
+            &ui.shell().user_screens.chat.data,
+            Resource::Ready(data)
+                if data.thread.as_ref().map(|thread| thread.root.sequence) == Some(root)
+        ),
+        "OpenThread loads the committed root"
+    );
+
+    use crate::screens::chat_composer;
+    use iced::widget::text_editor;
+    ui.inject(Message::UserScreen(user_screens::Message::Chat(
+        ChatMessageEvent::Composer {
+            thread: true,
+            message: chat_composer::Message::Edit(text_editor::Action::Edit(
+                text_editor::Edit::Paste(std::sync::Arc::new("thread child".into())),
+            )),
+        },
+    )));
+    click_nth(&mut ui, Role::Button, "Reply", 2);
+    assert!(
+        ui.shell().user_screens.chat.error.is_none(),
+        "reply failed: {:?}",
+        ui.shell().user_screens.chat.error
+    );
+
+    let latest = ui.node_query(
+        "chat",
+        serde_json::json!({"messages_latest": {"channel_id": "thread-lane", "limit": 20}}),
+    );
+    let reply = latest["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["head"]["thread"].as_u64() == Some(root))
+        })
+        .expect("thread reply committed node-side");
+    assert_eq!(
+        reply["head"]["blocks"][0]["paragraph"][0]["text"],
+        "thread child"
+    );
 }

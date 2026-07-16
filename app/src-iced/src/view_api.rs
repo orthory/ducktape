@@ -19,6 +19,16 @@ pub enum ViewId {
     Files,
 }
 
+/// Mint a fresh client-side entity id. Pure (clock only) so capability-free
+/// screens may mint ids for optimistic selection (e.g. pages create-and-open).
+pub(crate) fn fresh_id(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{prefix}-{nanos:x}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource<T> {
     Loading,

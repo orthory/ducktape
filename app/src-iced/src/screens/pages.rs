@@ -5,7 +5,7 @@
 
 use iced::widget::text_editor;
 
-use crate::view_api::Resource;
+use crate::view_api::{Resource, fresh_id};
 
 mod view;
 
@@ -205,6 +205,9 @@ pub struct State {
     pub drag_hover: Option<usize>,
     pub pending_block_delete: Option<String>,
     pub pending_page_delete: bool,
+    /// A create in flight: the minted page id, activated only after the
+    /// commit succeeds. A failed create must leave no phantom document.
+    pub pending_create: Option<String>,
     // Which block the cursor is over (reveals its hover gutter) and which
     // block's actions menu is open. Both are id-keyed, so a stale id after a
     // reorder simply matches nothing.
@@ -235,6 +238,7 @@ impl Default for State {
             drag_hover: None,
             pending_block_delete: None,
             pending_page_delete: false,
+            pending_create: None,
             hovered_block: None,
             menu_open_block: None,
             editors: Vec::new(),
@@ -249,6 +253,7 @@ impl Default for State {
 pub enum Message {
     QueryChanged(String),
     NewPage,
+    DismissError,
     Refresh,
     OpenPage(String),
     OpenPageAt { page: String, block: String },
@@ -316,6 +321,7 @@ pub enum BlockMove {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     CreatePage {
+        id: String,
         parent: Option<String>,
     },
     LoadPages {
@@ -512,7 +518,11 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             state.query = value;
             None
         }
-        Message::NewPage => Some(Effect::CreatePage { parent: None }),
+        Message::NewPage => Some(begin_page_create(state, None)),
+        Message::DismissError => {
+            state.error = None;
+            None
+        }
         Message::Refresh => {
             let (active, open_tabs) = location(state);
             Some(Effect::LoadPages { active, open_tabs })
@@ -606,9 +616,10 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             page: page_document(state)?.id.clone(),
             kind,
         }),
-        Message::CreateChildPage => Some(Effect::CreatePage {
-            parent: Some(page_document(state)?.id.clone()),
-        }),
+        Message::CreateChildPage => {
+            let parent = page_document(state)?.id.clone();
+            Some(begin_page_create(state, Some(parent)))
+        }
         Message::RequestDeletePage => {
             page_document(state)?;
             state.pending_page_delete = true;
@@ -1523,6 +1534,15 @@ fn location(state: &State) -> (Option<String>, Vec<String>) {
         ),
         _ => (None, Vec::new()),
     }
+}
+
+fn begin_page_create(state: &mut State, parent: Option<String>) -> Effect {
+    let id = fresh_id("page");
+    reset_page_transients(state);
+    // No optimistic document: the id stays pending and is activated by the
+    // post-commit reload; a failed create leaves the surface untouched.
+    state.pending_create = Some(id.clone());
+    Effect::CreatePage { id, parent }
 }
 
 fn reset_page_transients(state: &mut State) {

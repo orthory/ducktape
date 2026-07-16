@@ -145,6 +145,13 @@ fn shell<'a>(
     .style(move |_| bottom_border(p.sidebar, p.border_soft));
     let main = override_body
         .unwrap_or_else(|| data.map_or_else(|| no_page(p), |data| pages_main(state, data, p)));
+    // A write failure must be visible in EVERY pages state — a create can fail
+    // with no document open (or none existing yet), and an error rendered only
+    // inside an open document reads as a dead New page button.
+    let main: Element<'_, Message> = match &state.error {
+        Some(error) => column![error_banner(error, p), main].into(),
+        None => main,
+    };
     row![
         rail,
         container(main).width(Length::Fill).height(Length::Fill)
@@ -281,9 +288,6 @@ fn document_view<'a>(
             ),
             p,
         ));
-    }
-    if let Some(error) = &state.error {
-        body = body.push(selectable_error(error, p));
     }
     column![
         header,
@@ -1471,6 +1475,23 @@ fn notice_owned(copy: String, p: Palette) -> Element<'static, Message> {
         ui::alert::AlertVariant::Default,
         &t,
     )
+    .into()
+}
+
+/// Dismissible write-failure banner, rendered by `shell` above the body so it
+/// is visible in every pages state, not only inside an open document.
+fn error_banner<'a>(error: &'a str, p: Palette) -> Element<'a, Message> {
+    container(
+        row![
+            selectable_error(error, p),
+            Space::new().width(Length::Fill),
+            outline("Dismiss", Message::DismissError, p),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([10, 14])
+    .width(Length::Fill)
     .into()
 }
 

@@ -2,12 +2,13 @@
 
 use super::harness::*;
 use crate::screens::members::{
-    self, BoundAccount, Command, Member, MemberAction, MembersData, Message, Provider, Resource,
-    State, Tier,
+    self, BoundAccount, Command, Filter, Member, MemberAction, MembersData, Message, Provider,
+    Resource, State, Tier,
 };
 use crate::theme;
 
 const LOCAL: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PEER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const RESIDENT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 fn member(key: &str, tier: Tier, local: bool) -> Member {
@@ -115,4 +116,185 @@ fn an_unrelated_write_still_lets_other_rows_open_a_confirm_card() {
         members::update(&mut state, Message::ConfirmAction),
         Some(Command::PromoteMember(RESIDENT.into()))
     );
+}
+
+/// A removable peer: a non-local validator (so Demote is offered) alongside the
+/// resident. `invite_blob` stays `None` to keep the admin cards compact so the
+/// member rows land on-screen for the simulator's clicks.
+fn with_peer() -> State {
+    State {
+        data: Resource::Ready(MembersData {
+            members: vec![
+                member(LOCAL, Tier::Validator, true),
+                member(PEER, Tier::Validator, false),
+                member(RESIDENT, Tier::Resident, false),
+            ],
+            can_admin: true,
+            workspace_role: "Genesis".into(),
+            invite_blob: None,
+            invite_short: None,
+            pending_joins: Vec::new(),
+        }),
+        ..State::default()
+    }
+}
+
+#[test]
+fn loading_hides_retry() {
+    let state = State {
+        data: Resource::Loading,
+        ..State::default()
+    };
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    assert!(ui.find("Loading members").is_ok());
+    assert!(
+        !has(&mut ui, Role::Button, "Retry"),
+        "an in-progress load is not retryable"
+    );
+}
+
+#[test]
+fn empty_offers_retry() {
+    let state = State {
+        data: Resource::Empty,
+        ..State::default()
+    };
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    assert!(ui.find("No validators to show").is_ok());
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("the empty state offers a retry");
+    assert!(emitted(ui, &Message::Load));
+}
+
+#[test]
+fn error_surfaces_reason_and_retry() {
+    // The class of gap that hid the pages bug: the error render variant plus its
+    // recovery affordance.
+    let state = State {
+        data: Resource::Error("valset offline".into()),
+        ..State::default()
+    };
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find("valset offline").is_ok(),
+        "the load-failure reason is shown, not swallowed"
+    );
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("the error state offers a retry");
+    assert!(emitted(ui, &Message::Load));
+}
+
+#[test]
+fn filter_segment_emits_set_filter() {
+    let state = ready();
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Validators"))
+        .expect("a filter segment is clickable");
+    assert!(emitted(ui, &Message::SetFilter(Filter::Validators)));
+}
+
+#[test]
+fn reveal_invite_create_affordance_emits() {
+    // With no invite yet revealed, a valid join code enables the create button.
+    let mut state = ready();
+    if let Resource::Ready(data) = &mut state.data {
+        data.invite_blob = None;
+        data.invite_short = None;
+    }
+    state.invitee_code = RESIDENT.into(); // 64-hex → a valid join code
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Reveal invite"))
+        .expect("a valid join code enables Reveal invite");
+    assert!(emitted(ui, &Message::RevealInvite));
+}
+
+#[test]
+fn copy_invite_link_emits_copy() {
+    // ready() carries a coordinator-minted short link; the primary copy yields it.
+    let state = ready();
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Copy link"))
+        .expect("the invite copy action is clickable");
+    assert!(emitted(
+        ui,
+        &Message::Copy {
+            id: "invite".into(),
+            value: "duck://short-link".into(),
+        }
+    ));
+}
+
+#[test]
+fn resident_row_offers_promote_and_revoke() {
+    // Role rendering: a resident row exposes Promote + Revoke, and the local
+    // validator offers no self-Remove.
+    let state = ready();
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    assert!(has(&mut ui, Role::Button, "Promote"));
+    assert!(has(&mut ui, Role::Button, "Revoke"));
+    assert!(
+        !has(&mut ui, Role::Button, "Remove"),
+        "the local validator cannot demote itself"
+    );
+}
+
+#[test]
+fn member_row_is_a_selectable_list_item() {
+    let mut state = ready();
+    if let Resource::Ready(data) = &mut state.data {
+        data.can_admin = false; // keep the surface compact
+    }
+    {
+        let mut ui = sim(members::view(&state, theme::Mode::Light));
+        assert!(
+            has(&mut ui, Role::ListItem, "Joiner"),
+            "each member row is a selectable list item"
+        );
+    }
+    // The list-item's own click isn't reachable headless (the `sem()` probe
+    // reports zero height inside the scrollable), so drive the Select it carries.
+    assert_eq!(
+        members::update(&mut state, Message::Select(RESIDENT.into())),
+        None
+    );
+    assert_eq!(state.selected_key.as_deref(), Some(RESIDENT));
+}
+
+#[test]
+fn detail_pane_renders_and_closes() {
+    let mut state = ready();
+    if let Resource::Ready(data) = &mut state.data {
+        data.can_admin = false;
+    }
+    state.selected_key = Some(RESIDENT.into());
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find("RUNS ON").is_ok(),
+        "the selected member's detail pane renders"
+    );
+    ui.click(by::role(Role::Button, "×"))
+        .expect("the detail pane closes");
+    assert!(emitted(ui, &Message::CloseDetail));
+}
+
+#[test]
+fn removing_a_validator_asks_then_confirms() {
+    // The member-removal confirmation flow, driven through the view: the row
+    // button only ASKS, and the confirm card commits.
+    let mut state = with_peer();
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::Button, "Remove"))
+        .expect("a peer validator offers Remove");
+    assert!(emitted(
+        ui,
+        &Message::AskAction(MemberAction::Demote, PEER.into())
+    ));
+
+    members::update(&mut state, Message::AskAction(MemberAction::Demote, PEER.into()));
+    assert!(state.pending.is_some(), "the ask opens a confirm card");
+    let mut ui = sim(members::view(&state, theme::Mode::Light));
+    assert!(has(&mut ui, Role::Button, "Cancel"));
+    ui.click(by::role(Role::Button, "Remove from validators"))
+        .expect("the confirm card commits the removal");
+    assert!(emitted(ui, &Message::ConfirmAction));
 }

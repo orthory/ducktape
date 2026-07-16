@@ -55,10 +55,15 @@ pub(crate) async fn delete_file(
         backend,
         Some(node),
         ContentTarget::Files,
+        // The files module takes externally-tagged ops; a bare commit body is
+        // rejected with `unknown variant base_snapshot` (caught by
+        // shell::sim::files::delete_folder).
         json!({
-            "base_snapshot": head,
-            "message": format!("rm {path}"),
-            "changes": [{ "rm": { "path": path } }]
+            "commit": {
+                "base_snapshot": head,
+                "message": format!("rm {path}"),
+                "changes": [{ "rm": { "path": path } }]
+            }
         }),
     )
     .await

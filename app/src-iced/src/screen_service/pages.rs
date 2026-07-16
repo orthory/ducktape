@@ -148,6 +148,7 @@ pub(super) fn page_ancestry(pages: &[PageMeta], page: &str) -> Vec<PageMeta> {
 pub(super) async fn create_page(
     backend: Option<&Backend>,
     client: Option<&NodeClient>,
+    page_id: String,
     parent: Option<String>,
 ) -> Result<(), String> {
     pages_write(
@@ -155,7 +156,7 @@ pub(super) async fn create_page(
         client,
         json!({
             "create_page": {
-                "page_id": fresh_id("page"),
+                "page_id": page_id,
                 "title": "Untitled",
                 "parent": parent
             }

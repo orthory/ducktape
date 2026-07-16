@@ -1,7 +1,9 @@
 //! Settings screen: render variants, interactions, local update transitions.
 
 use super::harness::*;
-use crate::screens::settings::{self, DangerAction, Message, Resource, SettingsData, State};
+use crate::screens::settings::{
+    self, Command, DangerAction, Message, Resource, ServiceEvent, SettingsData, State,
+};
 
 fn ready() -> State {
     State {
@@ -78,4 +80,81 @@ fn danger_action_requires_confirmation() {
         Some(DangerAction::Leave),
         "danger actions arm a confirmation instead of firing"
     );
+}
+
+#[test]
+fn empty_state_offers_retry() {
+    let state = State {
+        data: Resource::Empty,
+        ..State::default()
+    };
+    let mut ui = sim(settings::view(&state));
+    assert!(ui.find("No active network").is_ok());
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("the empty resolved state offers a reload");
+    assert!(emitted(ui, &Message::Load));
+}
+
+#[test]
+fn error_state_surfaces_detail_and_retries() {
+    let state = State {
+        data: Resource::Error("node handshake refused".into()),
+        ..State::default()
+    };
+    let mut ui = sim(settings::view(&state));
+    assert!(ui.find("Settings unavailable").is_ok());
+    assert!(
+        ui.find("node handshake refused").is_ok(),
+        "the backend error is shown selectable so it can be copied into a report"
+    );
+    ui.click(by::role(Role::Button, "Retry"))
+        .expect("an errored settings load offers retry");
+    assert!(emitted(ui, &Message::Load));
+}
+
+// A failed preferences write must surface inline — the class of silent-write
+// regression the campaign exists to catch.
+#[test]
+fn save_failure_surfaces_an_inline_error() {
+    let mut state = ready();
+    state.saving = true;
+    let command = settings::update(
+        &mut state,
+        Message::Service(ServiceEvent::PreferencesSaved(Err(
+            "preferences write refused".into(),
+        ))),
+    );
+    assert!(command.is_none());
+    assert!(!state.saving, "the failed save clears the in-flight flag");
+    let mut ui = sim(settings::view(&state));
+    assert!(
+        ui.find("preferences write refused").is_ok(),
+        "a failed save renders a dismissible error banner"
+    );
+}
+
+#[test]
+fn theme_switch_toggles_the_mode() {
+    // Light default → the theme switch reads OFF and is the only OFF switch
+    // (every notification pref defaults ON).
+    let state = ready();
+    let mut ui = sim(settings::view(&state));
+    ui.click(by::role(Role::Button, "OFF"))
+        .expect("the theme switch is clickable");
+    assert!(emitted(ui, &Message::ToggleTheme));
+}
+
+#[test]
+fn accent_index_is_bounds_checked() {
+    let mut state = ready();
+    assert!(
+        settings::update(&mut state, Message::SetAccent(5)).is_none(),
+        "an out-of-range accent index is refused"
+    );
+    assert_eq!(state.accent, 0, "the refused index leaves the accent untouched");
+    assert_eq!(
+        settings::update(&mut state, Message::SetAccent(3)),
+        Some(Command::SetAccent(3))
+    );
+    assert_eq!(state.accent, 3);
 }

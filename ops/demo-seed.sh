@@ -155,14 +155,21 @@ submit inbox '{"deliver":{"member":"demo","kind":"welcome","body":"Your demo net
 # automations — a rule that files a task whenever someone says "deploy"
 submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel_id":null,"mention":null,"text_contains":"deploy"},"action":{"create_task":{"task_id_prefix":"deploy","title_template":"Follow up on a deploy mention"}}}}'
 
-# gateway — publish two web-app routes. The helper binds an Identity account to
-# this node, stages the static site into DuckFS, and signs + submits both routes:
+# gateway — publish three web-app routes. The helper binds an Identity account to
+# this node, stages the static site into DuckFS, and signs + submits the routes:
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
-bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" \
-  || die "gateway route publish failed"
+#   • board — the network-visible kanban reference app
+GATEWAY_ROUTES=3
+bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID"
+gateway_status=$?
+case "$gateway_status" in
+  0) ;;
+  78) GATEWAY_ROUTES=0 ;;
+  *) die "gateway route publish failed" ;;
+esac
 
-log "seeded $N ops + 2 gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
+log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
 
 # ── 6. stop the node (state is durable on disk) ────────────────
 kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null; trap - EXIT
@@ -172,6 +179,16 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
+EOF
+
+if [ "$GATEWAY_ROUTES" -eq 0 ]; then
+cat <<EOF
+Gateway web apps were not published: the embedded gateway component still
+expects Identity's retired node-list wire. Regenerate gateway-wasm/component.wasm;
+the seed deliberately does not submit a backwards-compatible payload.
+EOF
+else
+cat <<EOF
 Gateway web apps published on this node (open in the app's browser):
   • site.$ID.duck — a bouncing-DVD web app, served static from DuckFS by
                     consensus. Works now — nothing else to run.
@@ -184,6 +201,9 @@ Gateway web apps published on this node (open in the app's browser):
 
                     Re-run it after every \`make demo-seed\` (a re-seed wipes the
                     workspace and re-mints the loopback binding).
+EOF
+fi
 
+cat <<EOF
 Done with the demo? \`make demo-clear\` removes the workspace entirely.
 EOF

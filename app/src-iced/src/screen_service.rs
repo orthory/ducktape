@@ -190,9 +190,9 @@ pub async fn execute(
             Screen::Chat,
             set_huddle(backend.as_ref(), client.as_ref(), channel, joined).await,
         ),
-        Command::CreatePage { parent } => action(
+        Command::CreatePage { id, parent } => action(
             Screen::Pages,
-            create_page(backend.as_ref(), client.as_ref(), parent).await,
+            create_page(backend.as_ref(), client.as_ref(), id, parent).await,
         ),
         Command::RenamePage { page, title } => action(
             Screen::Pages,
@@ -529,13 +529,7 @@ fn author_name(value: &Value) -> String {
         .to_string()
 }
 
-fn fresh_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{prefix}-{nanos:x}")
-}
+pub(crate) use crate::view_api::fresh_id;
 
 fn clock_time(timestamp: u64) -> String {
     let seconds = timestamp % 86_400;

@@ -8,6 +8,10 @@ mod signing;
 
 // The proof scenarios — chat round-trip + duplicate-channel rejection.
 mod chat;
+mod files;
+mod governance;
+mod members;
+mod pages;
 
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
@@ -20,7 +24,7 @@ use iced_agent_plugin::selector::by;
 use iced_winit::runtime::{Action, task};
 
 use super::*;
-use crate::backend::Backend;
+use crate::backend::{Backend, Workspace, WorkspacePorts};
 
 pub(super) struct SimShell {
     state: Shell,
@@ -36,14 +40,44 @@ impl SimShell {
     /// Self-contained boot: embedded auto-mode sim + in-process signing.
     /// No external binaries, no skip path — failure is a test failure.
     pub(super) fn boot() -> Self {
+        Self::boot_with_opts(simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        })
+    }
+
+    /// Governance-enabled boot whose sole validator is the fixture signer.
+    pub(super) fn boot_with_valset() -> Self {
+        let pubkey = signing::author_pubkey_hex();
+        let mut shell = Self::boot_with_opts(simnode::SimOpts {
+            auto: true,
+            valset_keys: vec![fixture_pubkey_bytes()],
+            node_key: Some(pubkey.clone()),
+            ..Default::default()
+        });
+        shell.state.active_workspace = Some(Workspace {
+            id: "sim".into(),
+            name: "Sim".into(),
+            chain_id: String::new(),
+            pubkey,
+            founder: true,
+            member: true,
+            ports: WorkspacePorts {
+                listen: 0,
+                http: shell.sim.addr().port(),
+                rpc: 0,
+                wireguard: None,
+                invite: None,
+            },
+        });
+        shell
+    }
+
+    fn boot_with_opts(opts: simnode::SimOpts) -> Self {
         signing::install();
         let storage = tempfile::tempdir().expect("sim storage");
-        let sim = simnode::boot(
-            storage.path(),
-            "127.0.0.1:0".parse().expect("addr"),
-            simnode::SimOpts { auto: true, ..Default::default() },
-        )
-        .expect("boot embedded sim");
+        let sim = simnode::boot(storage.path(), "127.0.0.1:0".parse().expect("addr"), opts)
+            .expect("boot embedded sim");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -58,11 +92,18 @@ impl SimShell {
             .expect("backend fixture");
 
         let (mut state, _boot) = preset::ui_demo();
-        state.node_client =
-            Some(NodeClient::local(sim.addr().port()).expect("sim node client"));
+        state.node_client = Some(NodeClient::local(sim.addr().port()).expect("sim node client"));
         state.backend = Some(backend);
         let id = state.desktop.main.expect("preset opens a main window");
-        Self { state, id, rt, sim, queue: VecDeque::new(), _storage: storage, _identity_root: identity_root }
+        Self {
+            state,
+            id,
+            rt,
+            sim,
+            queue: VecDeque::new(),
+            _storage: storage,
+            _identity_root: identity_root,
+        }
     }
 
     pub(super) fn click(&mut self, role: Role, name: &str) {
@@ -82,9 +123,14 @@ impl SimShell {
     }
 
     fn dispatch(&mut self, messages: Vec<Message>) {
-        for message in messages {
-            let task = update(&mut self.state, message);
-            self.queue.push_back(task);
+        {
+            // update() may tokio::spawn directly (e.g. the pages presence
+            // handle); give it the lane's runtime as ambient context.
+            let _enter = self.rt.enter();
+            for message in messages {
+                let task = update(&mut self.state, message);
+                self.queue.push_back(task);
+            }
         }
         self.pump();
     }
@@ -96,7 +142,9 @@ impl SimShell {
     fn pump(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while let Some(queued) = self.queue.pop_front() {
-            let Some(mut stream) = task::into_stream(queued) else { continue };
+            let Some(mut stream) = task::into_stream(queued) else {
+                continue;
+            };
             loop {
                 assert!(
                     Instant::now() < deadline,
@@ -113,7 +161,10 @@ impl SimShell {
                     ),
                     Ok(None) => break,
                     Ok(Some(Action::Output(message))) => {
-                        let follow_up = update(&mut self.state, message);
+                        let follow_up = {
+                            let _enter = self.rt.enter();
+                            update(&mut self.state, message)
+                        };
                         self.queue.push_back(follow_up);
                     }
                     Ok(Some(_)) => {}
@@ -159,6 +210,15 @@ impl SimShell {
         );
         serde_json::from_str(payload).unwrap_or(serde_json::Value::Null)
     }
+}
+
+fn fixture_pubkey_bytes() -> Vec<u8> {
+    let hex = signing::author_pubkey_hex();
+    assert_eq!(hex.len(), 64, "fixture signer must be a 32-byte key");
+    (0..hex.len())
+        .step_by(2)
+        .map(|start| u8::from_str_radix(&hex[start..start + 2], 16).expect("fixture key hex"))
+        .collect()
 }
 
 #[cfg(test)]
