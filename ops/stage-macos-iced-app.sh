@@ -147,7 +147,7 @@ fi
 # boundaries and gives every CEF process the V8/device entitlements it needs.
 while IFS= read -r -d '' candidate; do
   if file -b "$candidate" | grep -q 'Mach-O'; then
-    lipo -verify_arch "$(uname -m)" "$candidate" \
+    lipo "$candidate" -verify_arch "$(uname -m)" \
       || { echo "[macos-app] wrong architecture in $candidate" >&2; exit 1; }
     codesign "${sign_args[@]}" "$candidate"
   fi

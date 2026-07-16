@@ -22,7 +22,9 @@ require_exact_files() {
   expected="$(printf '%s\n' "$@" | LC_ALL=C sort)"
   actual="$(
     for path in "$directory"/*; do
-      [ -f "$path" ] && basename "$path"
+      if [ -f "$path" ]; then
+        basename "$path"
+      fi
     done | LC_ALL=C sort
   )"
   [ "$actual" = "$expected" ] \
@@ -37,9 +39,9 @@ version_not_newer_than() {
     if (actual !~ /^[0-9]+([.][0-9]+){0,2}$/ || limit !~ /^[0-9]+([.][0-9]+){0,2}$/) exit 2
     actual_count = split(actual, actual_parts, ".")
     limit_count = split(limit, limit_parts, ".")
-    for (index = 1; index <= 3; index++) {
-      actual_part = index <= actual_count ? actual_parts[index] + 0 : 0
-      limit_part = index <= limit_count ? limit_parts[index] + 0 : 0
+    for (part_index = 1; part_index <= 3; part_index++) {
+      actual_part = part_index <= actual_count ? actual_parts[part_index] + 0 : 0
+      limit_part = part_index <= limit_count ? limit_parts[part_index] + 0 : 0
       if (actual_part < limit_part) exit 0
       if (actual_part > limit_part) exit 1
     }
@@ -49,10 +51,8 @@ version_not_newer_than() {
 
 check_macos_minimum() {
   local executable="$1" label="$2" versions
-  versions="$(otool -l "$executable" | awk '
-    $1 == "cmd" { command = $2; next }
-    command == "LC_BUILD_VERSION" && $1 == "minos" { print $2; command = ""; next }
-    command == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2; command = "" }
+  versions="$(xcrun vtool -show-build "$executable" | awk '
+    $1 == "minos" { print $2 }
   ')" || fail "could not inspect the macOS deployment target for $label"
   [ -n "$versions" ] || fail "$label has no readable macOS deployment target"
   while IFS= read -r version; do
@@ -91,7 +91,7 @@ macho_count=0
 while IFS= read -r -d '' candidate; do
   if file -b "$candidate" | grep -q 'Mach-O'; then
     label="${candidate#"$contents/"}"
-    lipo -verify_arch "$(uname -m)" "$candidate" >/dev/null \
+    lipo "$candidate" -verify_arch "$(uname -m)" >/dev/null \
       || fail "$label does not contain the host architecture $(uname -m)"
     check_macos_minimum "$candidate" "$label"
     macho_count=$((macho_count + 1))
