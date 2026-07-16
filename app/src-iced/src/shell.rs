@@ -50,8 +50,6 @@ pub(crate) mod agent_wire;
 mod preset;
 #[cfg(all(feature = "agent", debug_assertions, test))]
 mod qa;
-#[cfg(all(feature = "agent", debug_assertions, test))]
-mod sim;
 mod browser_session;
 mod view;
 #[cfg(feature = "cef-browser")]
