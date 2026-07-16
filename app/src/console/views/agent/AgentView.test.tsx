@@ -533,6 +533,10 @@ describe("AgentView", () => {
     ]) {
       fireEvent.change(screen.getByLabelText(label), { target: { value } });
     }
+    // the * page grant is a footgun — the form must call it out loud
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /grants write access to every page/i,
+    );
     fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
 
     expect(spies.registerAgent).toHaveBeenCalledWith(
