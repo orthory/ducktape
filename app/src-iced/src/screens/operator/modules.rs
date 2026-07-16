@@ -72,7 +72,7 @@ pub(super) fn view(state: &ModulesState, p: Palette) -> Element<'_, Message> {
         return resource_screen(
             &state.data,
             "Modules",
-            "Waiting for module roots from the node.",
+            "Connect a node to read its committed module set.",
             Screen::Modules,
             Icon::Modules,
             p,

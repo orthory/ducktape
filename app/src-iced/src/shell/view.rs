@@ -261,7 +261,12 @@ fn main_view(state: &Shell) -> Element<'_, Message> {
     let layered: Element<'_, Message> = if state.search.open {
         stack![
             layered,
-            search::view(&state.search, state.mode).map(Message::Search)
+            search::view(
+                &state.search,
+                state.mode,
+                NETWORK_RAIL_WIDTH + MODULE_RAIL_WIDTH,
+            )
+            .map(Message::Search)
         ]
         .width(Length::Fill)
         .height(Length::Fill)
@@ -843,13 +848,16 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
             .size(10)
             .color(p.muted_2),
         ]
+        .height(Length::Fill)
         .spacing(8)
         .align_y(Alignment::Center),
     )
     .padding([0, 12])
     .width(340)
     .height(28)
-    .on_press_maybe((!state.workspace_overlay).then_some(Message::ToggleSearch))
+    .on_press_maybe(
+        (state.onboarding.is_ready() && !state.workspace_overlay).then_some(Message::ToggleSearch),
+    )
     .style(move |_, status| button::Style {
         background: Some(Background::Color(
             if matches!(status, button::Status::Hovered) {
@@ -895,7 +903,7 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
     }
     let bell = tooltip(
         button(bell_content)
-            .padding([3, 5])
+            .padding([3, 8])
             .on_press(Message::ToggleNotifications)
             .style(move |_, status| button::Style {
                 background: matches!(status, button::Status::Hovered)
@@ -1048,14 +1056,20 @@ fn network_rail(state: &Shell) -> Element<'_, Message> {
     container(networks.padding([10, 0]))
         .width(NETWORK_RAIL_WIDTH)
         .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
         .style(move |_| right_border(p.sidebar, p.border))
         .into()
 }
 
 fn module_rail(state: &Shell) -> Element<'_, Message> {
     let p = theme::palette(state.mode);
-    let local_managed = state.active_workspace.is_some();
-    let tabs = if local_managed {
+    // Follow the section, not just local_managed: shell.rs's navigate() lands on
+    // operator screens (and sets section = Operator) even with no local workspace,
+    // so the rail must reach and highlight operator content whenever we're on it.
+    let on_operator =
+        state.section == Section::Operator || Screen::OPERATOR.contains(&state.screen());
+    let show_operator = state.active_workspace.is_some() || on_operator;
+    let tabs = if show_operator {
         row![
             section_button("USER", Section::User, state),
             section_button("NODE", Section::Operator, state),
@@ -1064,30 +1078,42 @@ fn module_rail(state: &Shell) -> Element<'_, Message> {
     } else {
         row![section_button("USER", Section::User, state)].spacing(2)
     };
-    let screens = match (state.section, local_managed) {
-        (Section::User, _) | (Section::Operator, false) => &Screen::USER[..],
-        (Section::Operator, true) => &Screen::OPERATOR[..],
+    let screens = if on_operator {
+        &Screen::OPERATOR[..]
+    } else {
+        &Screen::USER[..]
     };
     let mut modules = column![tabs].spacing(4).align_x(Alignment::Center);
+    modules = modules.push(Space::new().height(2));
     for &screen in screens {
         modules = modules.push(module_button(screen, state));
     }
     modules = modules
         .push(Space::new().height(Length::Fill))
         .push(module_button(Screen::Settings, state))
-        .push(icon_button(
-            match state.mode {
-                Mode::Light => Icon::Sun,
-                Mode::Dark => Icon::Moon,
-            },
-            match state.mode {
-                Mode::Light => "Use dark theme",
-                Mode::Dark => "Use light theme",
-            },
-            Message::ToggleTheme,
-            true,
-            state,
-        ));
+        .push(
+            button(
+                column![
+                    icons::view(
+                        match state.mode {
+                            Mode::Light => Icon::Sun,
+                            Mode::Dark => Icon::Moon,
+                        },
+                        18.0,
+                        p.icon_idle,
+                    ),
+                    text("Theme").size(9).color(p.muted),
+                ]
+                .spacing(5)
+                .align_x(Alignment::Center)
+                .width(Length::Fill),
+            )
+            .width(66)
+            .height(54)
+            .padding([7, 2])
+            .on_press(Message::ToggleTheme)
+            .style(move |_, s| tab_style(p, false, s)),
+        );
     container(modules.padding([8, 4]))
         .width(MODULE_RAIL_WIDTH)
         .height(Length::Fill)
@@ -1201,7 +1227,7 @@ fn section_button<'a>(
 ) -> Element<'a, Message> {
     let p = theme::palette(state.mode);
     let active = state.section == section;
-    let tab = button(text(label).size(8))
+    let tab = button(container(text(label).size(8)).center_y(Length::Fill))
         .height(28)
         .padding([0, 5])
         .on_press(Message::Section(section))
@@ -1226,6 +1252,7 @@ fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
                 .size(9)
                 .color(if active { p.ink } else { p.muted }),
         ]
+        .width(Length::Fill)
         .spacing(5)
         .align_x(Alignment::Center),
     )

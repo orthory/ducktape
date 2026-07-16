@@ -16,7 +16,7 @@
 //! focused-widget handlers, never subscription shortcuts.
 
 use iced_agent_plugin::selector::by;
-use iced_agent_plugin::{Cond, Lane, Recipe, Role, Step};
+use iced_agent_plugin::{Cond, Lane, Recipe, Step};
 
 use super::*;
 
@@ -26,6 +26,8 @@ pub(super) fn run_recipe(recipe: &Recipe) -> Result<(), String> {
     }
     let (mut state, _boot) = match recipe.preset.as_deref() {
         None | Some("ui-demo") => preset::ui_demo(),
+        Some("ui-operator") => preset::ui_operator(),
+        Some("ui-terminal") => preset::ui_terminal(),
         Some(other) => return Err(format!("unknown preset '{other}'")),
     };
     let id = state.desktop.main.expect("preset opens a main window");

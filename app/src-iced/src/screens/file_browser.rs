@@ -217,7 +217,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             None
         }
         Message::ToggleNewFolder => {
-            if read_only(state) {
+            if write_blocked(state) {
                 return None;
             }
             state.show_new_folder = !state.show_new_folder;
@@ -229,7 +229,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             None
         }
         Message::CreateFolder => {
-            if read_only(state) {
+            if write_blocked(state) {
                 return None;
             }
             let name = nonempty(&state.new_folder_name)?;
@@ -238,20 +238,25 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             state.new_folder_name.clear();
             Some(Effect::CreateFolder { parent, name })
         }
-        Message::ChooseFiles => (!read_only(state)).then(|| Effect::ChooseFiles {
+        Message::ChooseFiles => (!write_blocked(state)).then(|| Effect::ChooseFiles {
             target: listing_path(state).to_owned(),
         }),
-        Message::ChooseFolder => (!read_only(state)).then(|| Effect::ChooseFolder {
+        Message::ChooseFolder => (!write_blocked(state)).then(|| Effect::ChooseFolder {
             target: listing_path(state).to_owned(),
         }),
         Message::DropHovered(active) => {
-            state.drop_active = active && !read_only(state);
+            state.drop_active = active && !write_blocked(state);
             None
         }
         Message::FileDropped(token) => {
             state.drop_active = false;
-            if read_only(state) {
-                state.error = Some("Switch to Live head before uploading dropped files.".into());
+            if write_blocked(state) {
+                state.error = Some(match &state.data {
+                    Resource::Ready(_) => {
+                        "Switch to Live head before uploading dropped files.".into()
+                    }
+                    _ => "Files are unavailable; reconnect before uploading dropped files.".into(),
+                });
                 return None;
             }
             Some(Effect::UploadDropped {
@@ -281,16 +286,22 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             })
         }
         Message::RequestDelete(entry) => {
-            if read_only(state) {
+            if write_blocked(state) {
                 return None;
             }
             state.pending_delete = Some(entry);
             None
         }
-        Message::ConfirmDelete => state
-            .pending_delete
-            .take()
-            .map(|entry| Effect::Delete(entry.path)),
+        Message::ConfirmDelete => {
+            if write_blocked(state) {
+                state.pending_delete = None;
+                return None;
+            }
+            state
+                .pending_delete
+                .take()
+                .map(|entry| Effect::Delete(entry.path))
+        }
         Message::CancelDelete => {
             state.pending_delete = None;
             None
@@ -385,8 +396,8 @@ fn snapshot(state: &State) -> Option<String> {
     }
 }
 
-fn read_only(state: &State) -> bool {
-    matches!(&state.data, Resource::Ready(listing) if listing.read_only)
+fn write_blocked(state: &State) -> bool {
+    !matches!(&state.data, Resource::Ready(listing) if !listing.read_only)
 }
 
 fn find_entry(state: &State, path: &str) -> Option<FileEntry> {
@@ -422,6 +433,7 @@ fn path_depth(path: &str) -> usize {
 }
 
 pub fn view(state: &State, p: Palette) -> Element<'_, Message> {
+    let available = matches!(state.data, Resource::Ready(_));
     let (path, read_only) = match &state.data {
         Resource::Ready(listing) => (listing.path.as_str(), listing.read_only),
         _ => ("/shared", false),
@@ -437,10 +449,20 @@ pub fn view(state: &State, p: Palette) -> Element<'_, Message> {
             breadcrumb(path, p),
             snapshot_badge,
             Space::new().width(Length::Fill),
-            outline_enabled("New folder", Message::ToggleNewFolder, !read_only, p),
-            outline_enabled("Upload", Message::ChooseFiles, !read_only, p),
-            outline_enabled("Folder", Message::ChooseFolder, !read_only, p),
-            outline("History", Message::ToggleHistory, p),
+            outline_enabled(
+                "New folder",
+                Message::ToggleNewFolder,
+                available && !read_only,
+                p
+            ),
+            outline_enabled("Upload", Message::ChooseFiles, available && !read_only, p),
+            outline_enabled(
+                "Upload folder",
+                Message::ChooseFolder,
+                available && !read_only,
+                p
+            ),
+            outline_enabled("History", Message::ToggleHistory, available, p),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -688,11 +710,7 @@ fn entry_row(
     .on_press(Message::OpenEntry(entry.path.clone(), entry.kind))
     .width(Length::Fill);
     #[cfg(all(feature = "agent", debug_assertions))]
-    let open = iced_agent_plugin::sem(
-        iced_agent_plugin::Role::ListItem,
-        entry.name.clone(),
-        open,
-    );
+    let open = iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, entry.name.clone(), open);
     let actions: Element<'static, Message> = if is_dir {
         outline_enabled(
             "Delete",
@@ -1370,6 +1388,53 @@ mod tests {
             snapshot: snapshot.map(str::to_owned),
             history: Vec::new(),
             diff: Vec::new(),
+        }
+    }
+
+    fn assert_writes_blocked(data: Resource<FileListing>) {
+        let entry = FileEntry {
+            path: "/shared/child".into(),
+            name: "child".into(),
+            kind: FileKind::Directory,
+            size: 0,
+            executable: false,
+        };
+        let token = crate::view_api::test_drop_token();
+        let mut state = State {
+            data,
+            new_folder_name: "draft".into(),
+            ..State::default()
+        };
+
+        assert_eq!(update(&mut state, Message::ToggleNewFolder), None);
+        assert!(!state.show_new_folder);
+        assert_eq!(update(&mut state, Message::CreateFolder), None);
+        assert_eq!(update(&mut state, Message::ChooseFiles), None);
+        assert_eq!(update(&mut state, Message::ChooseFolder), None);
+        assert_eq!(update(&mut state, Message::DropHovered(true)), None);
+        assert!(!state.drop_active);
+        assert_eq!(update(&mut state, Message::FileDropped(token)), None);
+        assert!(!state.drop_active);
+        assert_eq!(
+            update(&mut state, Message::RequestDelete(entry.clone())),
+            None
+        );
+        assert!(state.pending_delete.is_none());
+
+        state.pending_delete = Some(entry);
+        assert_eq!(update(&mut state, Message::ConfirmDelete), None);
+        assert!(state.pending_delete.is_none());
+    }
+
+    #[test]
+    fn unavailable_and_read_only_states_reject_all_writes() {
+        for data in [
+            Resource::Loading,
+            Resource::Empty,
+            Resource::Error("offline".into()),
+            Resource::Ready(listing("/shared", Some("snap-7"))),
+        ] {
+            assert_writes_blocked(data);
         }
     }
 

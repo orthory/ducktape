@@ -1,6 +1,6 @@
 {
   "name": "section-switch",
-  "preset": "ui-demo",
+  "preset": "ui-operator",
   "steps": [
     { "expect": { "state_path": { "path": "section", "equals": "user" } } },
     { "intent": { "section": { "name": "operator" } } },

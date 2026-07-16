@@ -911,7 +911,7 @@ fn create_view(state: &State, p: Palette) -> Element<'_, Message> {
             ),
             credentials,
         ]
-        .spacing(16),
+        .spacing(10),
         p,
     )
 }
@@ -942,7 +942,7 @@ fn touch_id_create_view(state: &State, p: Palette) -> Element<'_, Message> {
                 p
             ),
         ]
-        .spacing(16),
+        .spacing(10),
         p,
     )
 }

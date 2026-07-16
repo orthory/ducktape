@@ -88,7 +88,11 @@ fn header<'a>(state: &'a State, data: Option<&'a AgentData>, p: Colors) -> Eleme
                 .padding(3)
             )
             .style(move |_| rounded_surface(p.sidebar, p.border, RADIUS_MD)),
-            primary_button("+ Add agent", Some(Message::StartAdding), p)
+            primary_button(
+                "+ Add agent",
+                data.is_some().then_some(Message::StartAdding),
+                p
+            )
         ]
         .spacing(12)
         .align_y(Alignment::Center),

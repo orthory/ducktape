@@ -357,7 +357,7 @@ fn decode_hits<T: for<'de> Deserialize<'de>>(reply: &Value) -> Result<Vec<T>, St
         .collect()
 }
 
-pub fn view(state: &State, mode: Mode) -> Element<'_, Message> {
+pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, Message> {
     let p = *theme::palette(mode);
     let query = state.query.trim().to_ascii_lowercase();
     let members = (!query.is_empty() && !state.catalog.client_mode)
@@ -575,6 +575,12 @@ pub fn view(state: &State, mode: Mode) -> Element<'_, Message> {
         ])
         .width(Length::Fill)
         .height(Length::Fill)
+        .padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: content_left_inset,
+        })
         .center_x(Length::Fill)
     ]
     .width(Length::Fill)

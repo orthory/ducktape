@@ -19,7 +19,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="${ICED_FLEET_HOME:-$HOME/.cache/iced-fleet}"
 BIN="$ROOT/target/debug/ducktape-iced"
 NODE_BIN="$ROOT/target/debug/ducktape-node"
-BASE_DISPLAY=80   # instance i uses DISPLAY=:8i — clear of the :99 dev display
+BASE_DISPLAY="${ICED_FLEET_BASE_DISPLAY:-80}" # instance i uses BASE+i
 
 die() { echo "iced-fleet: $*" >&2; exit 1; }
 
@@ -45,7 +45,7 @@ up_one() { # up_one <id> <preset>
   mkdir -p "$dir/home" "$dir/run"
   chmod 700 "$dir/run"
 
-  Xvfb "$display" -screen 0 1400x900x24 -nolisten tcp >"$dir/xvfb.log" 2>&1 &
+  setsid Xvfb "$display" -screen 0 1400x900x24 -nolisten tcp >"$dir/xvfb.log" 2>&1 &
   echo $! > "$dir/xvfb.pid"
 
   # dbus-run-session owns the app; killing the session group tears both down.

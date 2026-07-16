@@ -438,7 +438,7 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
     let pane_copy = if let Some(error) = &state.error {
         error.as_str()
     } else if state.is_idle() {
-        "Enter net.duck, <account>.duck, or <label>.<account>.duck."
+        "Press Enter for net.duck, or type <account>.duck or <label>.<account>.duck."
     } else if !cef_ready {
         "Starting the isolated browser…"
     } else if state.loading {

@@ -4,6 +4,7 @@
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Background, Border, Element, Length};
 
+use crate::icons::{self, Icon};
 use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +157,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     )
     .height(56)
     .padding([0, 17])
-    .center_y(Length::Fill)
+    .align_y(Alignment::Center)
     .style(move |_| bottom_rule(p.paper, p.border_soft));
 
     let body = if let Some(block) = &state.open {
@@ -173,9 +174,14 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
 
 fn blocks_view(resource: &Resource<Vec<BlockRecord>>, p: Palette) -> Element<'_, Message> {
     match resource {
-        Resource::Loading => state_view("Loading blocks…", p),
+        Resource::Loading => state_view(
+            "Loading blocks…",
+            "Reading the finalized block ring.",
+            p,
+        ),
         Resource::Empty => state_view(
-            "No blocks yet — empty heartbeat blocks are skipped, so rows appear once real ops commit.",
+            "No blocks yet",
+            "Empty heartbeat blocks are skipped, so rows appear once real ops commit.",
             p,
         ),
         Resource::Error(error) => {
@@ -496,11 +502,29 @@ fn digest_line(label: &'static str, value: &str, p: Palette) -> Element<'static,
     .into()
 }
 
-fn state_view(copy: &'static str, p: Palette) -> Element<'static, Message> {
-    container(text(copy).font(SANS).size(12).color(p.muted_2))
-        .padding(17)
-        .width(Length::Fill)
-        .into()
+fn state_view(title: &'static str, detail: &'static str, p: Palette) -> Element<'static, Message> {
+    let badge = container(icons::view(Icon::Explorer, 23.0, p.ink_soft))
+        .width(42)
+        .height(42)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_| rounded_surface(p.hover, p.border_soft, RADIUS_SM));
+    container(
+        column![
+            badge,
+            text(title).font(SANS).size(14).color(p.muted_3),
+            text(detail).font(SANS).size(11.5).color(p.muted_2),
+        ]
+        .spacing(9)
+        .align_x(Alignment::Center)
+        .max_width(420),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .padding(24)
+    .into()
 }
 
 fn header_cell(label: &'static str, width: f32, p: Palette) -> Element<'static, Message> {

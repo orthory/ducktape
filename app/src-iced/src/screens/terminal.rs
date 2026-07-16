@@ -341,6 +341,7 @@ fn bounded_command(mut value: String) -> String {
 
 pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     let p = theme::palette(mode);
+    let terminal_p = &theme::DARK;
     let mode_switch = container(
         row![
             mode_button("Single", SessionMode::Single, state.session_mode, *p),
@@ -380,23 +381,43 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     let terminal: Element<'_, Message> =
         iced_agent_plugin::sem(iced_agent_plugin::Role::Region, "terminal", terminal);
     let body: Element<'_, Message> = match state.status {
-        Status::Idle | Status::Starting => stack![
+        Status::Idle => stack![
             terminal,
-            terminal_notice("starting codex session…", p.muted, None, p)
+            terminal_notice(
+                "codex session is not running",
+                terminal_p.muted_2,
+                None,
+                terminal_p
+            )
+        ]
+        .into(),
+        Status::Starting => stack![
+            terminal,
+            terminal_notice(
+                "starting codex session…",
+                terminal_p.muted_2,
+                None,
+                terminal_p
+            )
         ]
         .into(),
         Status::Reconnecting => stack![
             terminal,
-            terminal_notice("reconnecting terminal session…", p.amber, None, p)
+            terminal_notice(
+                "reconnecting terminal session…",
+                terminal_p.amber,
+                None,
+                terminal_p
+            )
         ]
         .into(),
         Status::Failed => stack![
             terminal,
             terminal_notice(
                 state.error.as_deref().unwrap_or("terminal session failed"),
-                p.danger,
+                terminal_p.danger,
                 Some(Message::Retry),
-                p,
+                terminal_p,
             )
         ]
         .into(),
