@@ -1,3 +1,4 @@
 {
-  "ui": "src/ui"
+  "ui": "src/ui",
+  "pin": "byeongsu-hong/ducktape-ui@4a8d208e3008a117ce166b1fd978de1833b55177"
 }
