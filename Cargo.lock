@@ -2942,8 +2942,8 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "web-sys",
- "windows 0.62.2",
- "windows-core 0.62.2",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -3777,7 +3777,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -3923,6 +3923,7 @@ dependencies = [
  "html5ever",
  "iced",
  "iced-agent-plugin",
+ "iced_test",
  "iced_winit",
  "image",
  "libc",
@@ -5486,7 +5487,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -5518,10 +5519,11 @@ dependencies = [
 [[package]]
 name = "iced-agent-plugin"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/iced-agent-browser#98264824cbf56803ac90a8257f4e266be3e8fb2b"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f7a6f63bed03fcd67f03121e6bfeae74c5d85dea"
 dependencies = [
  "base64",
  "iced",
+ "iced_selector",
  "iced_winit",
  "serde",
  "serde_json",
@@ -5632,6 +5634,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced_selector"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1442ccc30959cc48b3a624233521ef7f3bc3e06528b6fe306c3a775fbddc4fe"
+dependencies = [
+ "iced_core",
+]
+
+[[package]]
+name = "iced_test"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b56c26cc6e63958ce6be06a68fa3136fd5f646da6302ee12abf1a0f311dd0166"
+dependencies = [
+ "iced_futures",
+ "iced_program",
+ "iced_renderer",
+ "iced_runtime",
+ "iced_selector",
+ "nom 8.0.0",
+ "png 0.18.1",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5687,7 +5715,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
-source = "git+https://github.com/byeongsu-hong/iced-agent-browser#98264824cbf56803ac90a8257f4e266be3e8fb2b"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f7a6f63bed03fcd67f03121e6bfeae74c5d85dea"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -7446,7 +7474,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -8700,7 +8728,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
