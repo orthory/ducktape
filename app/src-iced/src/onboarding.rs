@@ -5,7 +5,7 @@
 //! a [`ServiceEvent`]. This keeps account custody and transport outside the UI.
 
 use iced::widget::{
-    Button, Column, Space, TextInput, button, column, container, row, text, text_input,
+    Column, Space, TextInput, button, column, container, row, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 use zeroize::Zeroize as _;

@@ -27,9 +27,9 @@ pub use runtime::futures;
 pub use winit;
 
 // AGENT SEAM: dev-only agent instrumentation (adapter, tree push, injection).
-#[cfg(feature = "agent")]
+#[cfg(all(feature = "agent", debug_assertions))]
 pub mod agent;
-#[cfg(feature = "agent")]
+#[cfg(all(feature = "agent", debug_assertions))]
 pub use accesskit;
 
 pub mod clipboard;
@@ -217,7 +217,7 @@ where
             );
 
             // AGENT SEAM: adapters see every window event (activation, focus).
-            #[cfg(feature = "agent")]
+            #[cfg(all(feature = "agent", debug_assertions))]
             crate::agent::process_event(window_id, &event);
 
             self.process_event(
@@ -416,7 +416,7 @@ where
                                 // AGENT SEAM: attach the AccessKit adapter
                                 // while the window is still invisible (the
                                 // adapter requires pre-visibility creation).
-                                #[cfg(feature = "agent")]
+                                #[cfg(all(feature = "agent", debug_assertions))]
                                 crate::agent::attach(event_loop, id, &window);
 
                                 self.process_event(
@@ -1146,7 +1146,7 @@ async fn run_instance<P>(
                         // AGENT SEAM: synthetic events enter the same
                         // per-window vector real input lands in; cursor moves
                         // also update the window's hit-test cursor state.
-                        #[cfg(feature = "agent")]
+                        #[cfg(all(feature = "agent", debug_assertions))]
                         for (id, event) in crate::agent::drain_injected() {
                             if let Some(window) = window_manager.get_mut(id) {
                                 if let core::Event::Mouse(

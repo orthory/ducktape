@@ -3,19 +3,32 @@
 //! real OS AccessKit, fed from one source through the vendored `iced_winit`
 //! fork's seam API.
 //!
-//! The crate is inert unless the app calls into it: the app depends on it only
-//! under `#[cfg(all(feature = "agent", debug_assertions))]`, so a release
-//! binary links it but never boots the server or attaches an adapter.
+//! The entire crate is gated on `debug_assertions`: the fork's `agent` seam
+//! module only exists in debug builds, so in release this crate compiles to an
+//! empty shell (and the app's own wiring is cfg'd out anyway). No feature
+//! combination can put the bridge, the seams, or an adapter in a release
+//! binary.
 
+#[cfg(debug_assertions)]
 pub mod bridge;
+#[cfg(debug_assertions)]
 pub mod collect;
+#[cfg(debug_assertions)]
 pub mod logs;
+#[cfg(debug_assertions)]
 pub mod protocol;
+#[cfg(debug_assertions)]
 pub mod sem;
+#[cfg(debug_assertions)]
 pub mod tools;
 
+#[cfg(debug_assertions)]
 pub use bridge::{AgentHandle, Shared, UiCommand};
-pub use collect::{to_accesskit, Collector, FlatNode, SnapshotSlot, WindowSnapshot};
-pub use logs::{ring_layer, LogLine, LogsHandle, RingLayer};
+#[cfg(debug_assertions)]
+pub use collect::{Collector, FlatNode, SnapshotSlot, WindowSnapshot, to_accesskit};
+#[cfg(debug_assertions)]
+pub use logs::{LogLine, LogsHandle, RingLayer, ring_layer};
+#[cfg(debug_assertions)]
 pub use protocol::{Cmd, Cond, Intent, Rect, Request, Response, Role, SemNode, Target};
-pub use sem::{sem, Sem, SemProbe};
+#[cfg(debug_assertions)]
+pub use sem::{Sem, SemProbe, sem};

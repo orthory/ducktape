@@ -117,7 +117,7 @@ where
 
     // AGENT SEAM: synthetic input must move the hit-test cursor exactly like
     // real input; widgets hit-test against this state, not the event stream.
-    #[cfg(feature = "agent")]
+    #[cfg(all(feature = "agent", debug_assertions))]
     pub fn agent_set_cursor(&mut self, position: crate::core::Point) {
         let scale = f64::from(self.viewport.scale_factor());
         self.cursor_position = Some(winit::dpi::PhysicalPosition::new(
