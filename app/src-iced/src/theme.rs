@@ -1,13 +1,32 @@
 use iced::{Color, Font, Theme, font};
 
 pub const SANS: Font = Font::with_name("Geist");
-// ponytail: Geist weight-500 falls back to serif in the cosmic-text render path; alias to Regular. Restore Weight::Medium once 500 resolves.
-pub const SANS_MEDIUM: Font = SANS;
+// Geist weight-500 falls back to serif in the cosmic-text render path, so
+// medium-intent text aliases to the semibold face (600 loads fine) — aliasing
+// to Regular collapsed the app's entire weight hierarchy into one flat weight.
+pub const SANS_MEDIUM: Font = SANS_SEMIBOLD;
 pub const SANS_SEMIBOLD: Font = Font {
     weight: font::Weight::Semibold,
     ..SANS
 };
 pub const MONO: Font = Font::with_name("Geist Mono");
+
+/// The type scale. Every `.size()` in the app uses one of these — ad-hoc px
+/// sizes are a defect. Matches the original React app's ~13px body rhythm.
+/// (dead_code allows drop out with the parallel module migration that
+/// consumes them — remove in the merge sweep.)
+#[allow(dead_code)]
+pub const CAPTION: f32 = 10.5;
+#[allow(dead_code)]
+pub const LABEL: f32 = 12.0;
+#[allow(dead_code)]
+pub const BODY: f32 = 13.0;
+#[allow(dead_code)]
+pub const BODY_LG: f32 = 14.0;
+#[allow(dead_code)]
+pub const TITLE: f32 = 15.5;
+#[allow(dead_code)]
+pub const HEADING: f32 = 18.0;
 
 pub const FONT_BYTES: [&[u8]; 6] = [
     include_bytes!("../assets/fonts/geist-sans-400.woff2"),
@@ -75,6 +94,11 @@ pub struct Palette {
     pub danger: Color,
     pub danger_soft: Color,
     pub danger_border: Color,
+    /// Base color for card/popover shadows; use sites pick the alpha. Mode-aware
+    /// so dark mode doesn't inherit light mode's warm-brown shadow.
+    /// (allow drops out with the module migration — remove in the merge sweep.)
+    #[allow(dead_code)]
+    pub shadow: Color,
 }
 
 pub const LIGHT: Palette = Palette {
@@ -107,6 +131,7 @@ pub const LIGHT: Palette = Palette {
     danger: rgb(0xc0, 0x48, 0x3c),
     danger_soft: rgb(0xfa, 0xf1, 0xef),
     danger_border: rgb(0xec, 0xcb, 0xc5),
+    shadow: rgb(0x28, 0x26, 0x22),
 };
 
 pub const DARK: Palette = Palette {
@@ -139,6 +164,7 @@ pub const DARK: Palette = Palette {
     danger: rgb(0xd4, 0x65, 0x5a),
     danger_soft: rgb(0x2c, 0x1c, 0x19),
     danger_border: rgb(0x4c, 0x30, 0x2b),
+    shadow: Color::BLACK,
 };
 
 pub const ACCENTS: [Color; 3] = [
