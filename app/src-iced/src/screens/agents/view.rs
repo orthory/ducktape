@@ -99,6 +99,7 @@ fn header<'a>(state: &'a State, data: Option<&'a AgentData>, p: Colors) -> Eleme
     )
     .height(HEADER_HEIGHT)
     .padding([0, 22])
+    .align_y(Alignment::Center)
     .style(move |_| bottom_rule(p.paper, p.border_soft))
     .into()
 }
