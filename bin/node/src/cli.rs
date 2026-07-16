@@ -530,50 +530,59 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite [--config node.toml] [--ttl-days N]` — emit the one-line paste
-/// blob: the whole join credential. minting IS the admission decision — the
-/// blob carries the descriptor with THIS member's dial hint folded in (and
-/// persisted, so every future invite carries it), the inviter's WireGuard
-/// bootstrap when the reachability plane is configured (`wireguard_listen`),
-/// an expiry, and a single-use INVITE TOKEN, the whole envelope signed by
-/// this member's identity. the joiner's node redeems the token automatically
-/// (governance `Redeem`) — no member approval step follows.
+/// `invite --target <pubkey-hex> [--role resident|client] [--config
+/// node.toml] [--ttl-days N]` — emit the one-line paste blob: the whole
+/// join credential. minting IS the admission decision — the blob carries
+/// the descriptor with THIS member's dial hint folded in (and persisted, so
+/// every future invite carries it), the inviter's WireGuard bootstrap when
+/// the reachability plane is configured (`wireguard_listen`), an expiry, and
+/// a single-use INVITE TOKEN, the whole envelope signed by this member's
+/// identity. the joiner's node redeems the token automatically (governance
+/// `Redeem`) — no member approval step follows.
+///
+/// `--role client` grants submit-only CLIENT standing (redeemed via
+/// `user-redeem-invite`, never `join`); WITHOUT `--target` that is a BEARER
+/// invite — single-use, 1-day default TTL, first valid redeemer wins. the
+/// resident role always requires a target.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    // `--client` mints a BEARER Client invite: no target lock, submit-only
-    // standing, 1-day default TTL. everything else stays a targeted Resident
-    // invite locked to the ONE key it admits.
-    let bearer_client = flags.contains_key("client");
+    // `--role client` mints a CLIENT invite (submit-only standing, redeemed
+    // via `user-redeem-invite`): with `--target` it locks to that key, and
+    // WITHOUT one it is a BEARER invite — single-use, 1-day default TTL.
+    // the default role stays a targeted Resident invite locked to the ONE
+    // key it admits; a bearer resident does not exist anywhere.
+    let role = match flags.get("role").map(String::as_str) {
+        None | Some("resident") => config::InviteRole::Resident,
+        Some("client") => config::InviteRole::Client,
+        Some(other) => return Err(format!("--role must be resident or client, got {other:?}").into()),
+    };
+    let target = match flags.get("target") {
+        Some(t) => Some(config::decode_key(t)?),
+        // a resident invite is locked to the ONE key it admits — no bearer
+        // path onto the resident plane exists.
+        None if role == config::InviteRole::Resident => {
+            return Err(
+                "--target <invitee-pubkey-hex> is required: every resident invite is locked \
+                 to the person it admits (mint a bearer CLIENT invite with --role client). \
+                 the invitee gets their code from the app's join screen or `ducktape-node \
+                 keygen --dir <workspace>`"
+                    .into(),
+            );
+        }
+        None => None,
+    };
+    let bearer = target.is_none();
     let ttl_days: u64 = match flags.get("ttl-days") {
         Some(v) => v.parse().map_err(|e| format!("--ttl-days {v:?}: {e}"))?,
-        None if bearer_client => config::DEFAULT_BEARER_INVITE_TTL_DAYS,
+        None if bearer => config::DEFAULT_BEARER_INVITE_TTL_DAYS,
         None => config::DEFAULT_INVITE_TTL_DAYS,
     };
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
-    let target = if bearer_client {
-        if flags.contains_key("target") {
-            return Err(
-                "--client mints a bearer invite — it has no --target; drop one of the flags"
-                    .into(),
-            );
-        }
-        None
-    } else {
-        // a resident invite is locked to the ONE key it admits — no bearer
-        // path onto the resident plane exists.
-        let target = flags.get("target").ok_or(
-            "--target <invitee-pubkey-hex> is required: every resident invite is locked \
-             to the person it admits (mint a bearer CLIENT invite with --client). the \
-             invitee gets their code from the app's join screen or `ducktape-node keygen \
-             --dir <workspace>`",
-        )?;
-        Some(config::decode_key(target)?)
-    };
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
@@ -733,14 +742,14 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .as_secs()
         + ttl_days * 24 * 60 * 60;
     // the expiry now lives INSIDE the token (signed), not as a separate blob
-    // field; targeted mints against the invitee's key with Resident role,
-    // `--client` mints a bearer Client token.
+    // field; a targeted mint locks to the invitee's key, `--role client`
+    // without a target mints a bearer Client token.
     let token = match &target {
         Some(target) => config::mint_invite_token(
             &key,
             descriptor.genesis_namespace().as_bytes(),
             target,
-            config::InviteRole::Resident,
+            role,
             expires,
         ),
         None => config::mint_bearer_client_token(
@@ -756,11 +765,12 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &fronts,
         &key,
     )?;
-    if bearer_client {
+    if role == config::InviteRole::Client {
         eprintln!(
-            "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
+            "[invite] {} CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
              redeem with: ducktape-node user-redeem-invite <blob> --node <member-http-url> \
-             --key <user.key>"
+             --key <user.key>",
+            if bearer { "bearer" } else { "targeted" },
         );
     }
     println!("{blob_string}");

@@ -105,7 +105,7 @@ with the source. App-hash flag day: pre-existing networks must re-seed
 
 ## 3. Node: mint + guards (the lobby gate does NOT change)
 
-- `cmd_invite` gains `--client`: mints a bearer Client token (no `--target`),
+- `cmd_invite` gains `--role client`: with `--target` a targeted Client invite, without one a BEARER Client token,
   default TTL 1 day. The blob envelope is otherwise unchanged (descriptor +
   token + WG/fronts; the WG half is simply unused by a client redeemer).
 - `cmd_join` (a NODE joining) refuses a client/bearer blob with a pointer at
