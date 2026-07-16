@@ -1,10 +1,10 @@
 //! Native Browser chrome. The page pane itself is a direct CEF child window.
 
-use iced::widget::{button, column, container, row, text, text_input};
-use iced::{Alignment, Background, Border, Element, Length};
+use iced::widget::{button, column, container, row, text, text_input, Space};
+use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::duck_url::validate_duck_host;
-use crate::theme::{self, MONO, Mode, SANS};
+use crate::theme::{self, BODY, CAPTION, LABEL, MONO, Mode, SANS, SANS_SEMIBOLD, TITLE};
 
 pub const IDLE_URL: &str = "about:blank";
 pub const TAB_BAR_HEIGHT: f32 = 36.0;
@@ -315,31 +315,43 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
     let mut tab_items = row![].spacing(3).align_y(Alignment::End);
     for (index, tab) in state.tabs.iter().enumerate() {
         let active = index == state.active_tab;
-        let select = button(text(&tab.current).font(SANS).size(10.5))
+        // Left-aligned label, vertically centered via inner container (iced
+        // `button` pins its content to the top-left otherwise).
+        let select = button(
+            container(
+                text(&tab.current)
+                    .font(SANS)
+                    .size(CAPTION)
+                    .color(if active { p.ink } else { p.muted_3 })
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
             .width(Length::Fill)
-            .height(28)
-            .padding([0, 8])
-            .on_press(Message::SelectTab(index))
-            .style(move |_, status| tab_style(p, active, status));
+            .center_y(Length::Fill)
+            .padding([0, 9]),
+        )
+        .width(Length::Fill)
+        .height(28)
+        .padding(0)
+        .on_press(Message::SelectTab(index))
+        .style(move |_, status| tab_style(p, active, status));
         #[cfg(all(feature = "agent", debug_assertions))]
         let select =
             iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, tab.current.clone(), select);
-        let close = button(text("×").font(SANS).size(12))
-            .width(24)
-            .height(28)
-            .padding(0)
-            .on_press(Message::CloseTab(index))
-            .style(move |_, status| tab_style(p, active, status));
-        #[cfg(all(feature = "agent", debug_assertions))]
-        let close = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Close tab", close);
+        let close = icon_button("×", BODY, 24.0, 28.0, Some(Message::CloseTab(index)), "Close tab", move |status| {
+            tab_style(p, active, status)
+        });
         tab_items = tab_items.push(
             container(row![select, close].spacing(0).align_y(Alignment::Center))
                 .width(180)
                 .height(30)
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(if active { p.paper } else { p.panel })),
+                    background: Some(Background::Color(if active {
+                        p.paper
+                    } else {
+                        p.sidebar
+                    })),
                     border: Border {
-                        color: p.border,
+                        color: if active { p.border_strong } else { p.border_soft },
                         width: 1.0,
                         radius: iced::border::top(theme::RADIUS_MD),
                     },
@@ -347,9 +359,21 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
                 }),
         );
     }
-    tab_items = tab_items.push(chrome_button("+", Some(Message::NewTab), p));
+    tab_items = tab_items.push(icon_button(
+        "+",
+        BODY,
+        30.0,
+        28.0,
+        Some(Message::NewTab),
+        "New tab",
+        move |status| chrome_style(p, status),
+    ));
+    // Section height is TAB_BAR_HEIGHT - 1 so the trailing 1px `divider` lands
+    // the seam exactly on the CEF-child boundary (browser_session::bounds sums
+    // the untouched TAB_BAR_HEIGHT + TOOLBAR_HEIGHT constants).
     let tabs = container(tab_items)
-        .height(TAB_BAR_HEIGHT)
+        .width(Length::Fill)
+        .height(TAB_BAR_HEIGHT - 1.0)
         .padding(iced::Padding {
             top: 5.0,
             right: 10.0,
@@ -357,125 +381,233 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
             left: 10.0,
         })
         .align_y(iced::alignment::Vertical::Bottom)
-        .style(move |_| bottom_border(p.canvas, p.border_soft));
+        .style(move |_| section_bg(p.canvas));
 
+    let has_error = state.error.is_some();
     let address = text_input("net.duck", &state.address)
         .font(MONO)
-        .size(11.5)
-        .padding([0, 3])
+        .size(LABEL)
+        .padding([0, 2])
         .on_input(Message::AddressChanged)
         .on_submit(Message::Open)
-        .style(move |_, status| {
-            let active = matches!(
-                status,
-                text_input::Status::Focused { .. } | text_input::Status::Hovered
-            );
-            text_input::Style {
-                background: Background::Color(p.paper),
-                border: Border {
-                    color: if state.error.is_some() {
-                        p.danger_border
-                    } else if active {
-                        p.border_strong
-                    } else {
-                        p.border
-                    },
-                    width: 1.0,
-                    radius: theme::RADIUS_MD.into(),
-                },
-                icon: p.muted_2,
-                placeholder: p.muted,
-                value: p.ink,
-                selection: p.chip,
-            }
+        .style(move |_, _| text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.muted_2,
+            placeholder: p.muted,
+            value: p.ink,
+            selection: p.chip,
         });
     let address = sem_input("Address", &state.address, address);
-    let reload = button(text("↻").font(SANS).size(14).color(p.muted_3))
-        .width(30)
-        .height(30)
-        .padding(8)
-        .on_press_maybe((!state.is_idle()).then_some(Message::Reload))
-        .style(move |_, status| chrome_style(p, status));
-    #[cfg(all(feature = "agent", debug_assertions))]
-    let reload = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Reload", reload);
+
+    // Trust chip: derived from the committed host — SNAPSHOT (network) vs
+    // SIGNED (account route). Shown only once a page has committed.
+    let mut pill = row![].spacing(6).align_y(Alignment::Center);
+    if !state.is_idle() {
+        let network = is_network_url(state.runtime_url());
+        let (label, fg) = if network {
+            ("SNAPSHOT", p.blue)
+        } else {
+            ("SIGNED", p.green)
+        };
+        let chip = container(text(label).font(MONO).size(CAPTION).color(fg))
+            .padding([2, 6])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(Color { a: 0.14, ..fg })),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 999.0.into(),
+                },
+                ..container::Style::default()
+            });
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let chip = iced_agent_plugin::sem(iced_agent_plugin::Role::Label, label, chip);
+        pill = pill.push(chip);
+    }
+    if !state
+        .address
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("duck://"))
+    {
+        pill = pill.push(text("duck://").font(MONO).size(LABEL).color(p.muted_2));
+    }
+    pill = pill.push(address);
+    let pill = container(pill)
+        .width(Length::Fill)
+        .height(31)
+        .padding([0, 10])
+        .align_y(Alignment::Center)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(p.paper)),
+            border: Border {
+                color: if has_error {
+                    p.danger_border
+                } else {
+                    p.border_strong
+                },
+                width: 1.0,
+                radius: theme::RADIUS_MD.into(),
+            },
+            ..container::Style::default()
+        });
+
     let toolbar = container(
         row![
-            text("Browser").font(SANS).size(14).color(p.filled),
-            chrome_button("‹", state.can_go_back().then_some(Message::Back), p,),
-            chrome_button("›", state.can_go_forward().then_some(Message::Forward), p,),
-            reload,
-            container(
-                row![
-                    text(
-                        if state
-                            .address
-                            .get(..7)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("duck://"))
-                        {
-                            ""
-                        } else {
-                            "duck://"
-                        }
-                    )
-                    .font(MONO)
-                    .size(11)
-                    .color(p.muted_2),
-                    address,
-                ]
-                .spacing(2)
-                .align_y(Alignment::Center),
-            )
-            .width(Length::Fill),
+            text("Browser").font(SANS_SEMIBOLD).size(TITLE).color(p.filled),
+            icon_button(
+                "‹",
+                BODY,
+                30.0,
+                30.0,
+                state.can_go_back().then_some(Message::Back),
+                "Back",
+                move |status| chrome_style(p, status),
+            ),
+            icon_button(
+                "›",
+                BODY,
+                30.0,
+                30.0,
+                state.can_go_forward().then_some(Message::Forward),
+                "Forward",
+                move |status| chrome_style(p, status),
+            ),
+            icon_button(
+                "↻",
+                TITLE,
+                30.0,
+                30.0,
+                (!state.is_idle()).then_some(Message::Reload),
+                "Reload",
+                move |status| chrome_style(p, status),
+            ),
+            pill,
         ]
         .spacing(7)
         .align_y(Alignment::Center),
     )
-    .height(TOOLBAR_HEIGHT)
+    .width(Length::Fill)
+    .height(TOOLBAR_HEIGHT - 1.0)
     .padding([0, 12])
     .align_y(Alignment::Center)
-    .style(move |_| bottom_border(p.sidebar, p.border_soft));
+    .style(move |_| section_bg(p.sidebar));
 
-    let pane_copy = if let Some(error) = &state.error {
-        error.as_str()
-    } else if state.is_idle() {
-        "Press Enter for net.duck, or type <account>.duck or <label>.<account>.duck."
-    } else if !cef_ready {
-        "Starting the isolated browser…"
-    } else if state.loading {
-        "Resolving route…"
+    // Refused route → a real alert card the user reads; other states → a hint.
+    let pane_body: Element<'_, Message> = if let Some(error) = &state.error {
+        container(
+            column![
+                text("Route refused")
+                    .font(SANS_SEMIBOLD)
+                    .size(TITLE)
+                    .color(p.filled),
+                selectable_error(error, p),
+            ]
+            .spacing(7),
+        )
+        .max_width(480)
+        .padding(18)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(p.paper)),
+            border: Border {
+                color: p.danger_border,
+                width: 1.0,
+                radius: theme::RADIUS_LG.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
     } else {
-        ""
+        let hint = if state.is_idle() {
+            "Press Enter for net.duck, or type <account>.duck or <label>.<account>.duck."
+        } else if !cef_ready {
+            "Starting the isolated browser…"
+        } else if state.loading {
+            "Resolving route…"
+        } else {
+            ""
+        };
+        text(hint).font(SANS).size(BODY).color(p.muted).into()
     };
-    let pane = container(text(pane_copy).font(SANS).size(11).color(p.muted))
+    let pane = container(pane_body)
         .width(Length::Fill)
         .height(Length::Fill)
+        .padding(24)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .style(move |_| container::Style::default().background(p.canvas));
     #[cfg(all(feature = "agent", debug_assertions))]
     let pane = iced_agent_plugin::sem(iced_agent_plugin::Role::Region, "browser", pane);
-    column![tabs, toolbar, pane].spacing(0).into()
+    column![
+        tabs,
+        divider(p.border_soft),
+        toolbar,
+        divider(p.border_soft),
+        pane,
+    ]
+    .spacing(0)
+    .into()
 }
 
-fn chrome_button<'a>(
-    label: &'a str,
+/// The one icon-button shape: a glyph centered in a fixed `width`×`height` box
+/// (iced `button` pins content top-left otherwise) with `on_press_maybe` and a
+/// caller-supplied style catalog. Back/Forward/Reload/New-tab/Close all route
+/// through it, so they share one grid and one centering rule.
+fn icon_button<'a>(
+    glyph: &'a str,
+    size: f32,
+    width: f32,
+    height: f32,
     message: Option<Message>,
-    p: &'a theme::Palette,
+    name: &'a str,
+    style: impl Fn(button::Status) -> button::Style + 'a,
 ) -> Element<'a, Message> {
-    #[cfg(all(feature = "agent", debug_assertions))]
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS).size(13))
-        .width(30)
-        .height(30)
-        .padding(0)
-        .on_press_maybe(message)
-        .style(move |_, status| chrome_style(p, status));
+    let btn = button(
+        container(text(glyph).font(SANS).size(size))
+            .center_x(width)
+            .center_y(height),
+    )
+    .padding(0)
+    .on_press_maybe(message)
+    .style(move |_, status| style(status));
     #[cfg(all(feature = "agent", debug_assertions))]
-    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, name, btn)
         .disabled(!enabled)
         .into();
     #[cfg(not(all(feature = "agent", debug_assertions)))]
-    btn.into()
+    {
+        let _ = (enabled, name);
+        btn.into()
+    }
+}
+
+/// Selectable, read-only error text (the `workspace.rs::selectable_error`
+/// idiom, module-local) so a refused-route message can be copied.
+fn selectable_error<'a>(message: &'a str, p: &'a theme::Palette) -> Element<'a, Message> {
+    text_input("", message)
+        .font(SANS)
+        .size(LABEL)
+        .padding(0)
+        .style(move |_, _| text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.muted_3,
+            placeholder: p.muted_3,
+            value: p.muted_3,
+            selection: p.chip,
+        })
+        .into()
+}
+
+/// A 1px filled hairline between chrome sections (mandate #6: the card owns the
+/// frame, rows are borderless, dividers are 1px filled containers).
+fn divider(color: Color) -> Element<'static, Message> {
+    container(Space::new().width(Length::Fill).height(1))
+        .width(Length::Fill)
+        .height(1)
+        .style(move |_| container::Style::default().background(color))
+        .into()
 }
 
 /// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
@@ -500,6 +632,20 @@ fn sem_input<'a>(
 }
 
 fn chrome_style(p: &theme::Palette, status: button::Status) -> button::Style {
+    // Disabled controls must read disabled (mandate #4): dim the glyph and drop
+    // the border/hover so a greyed nav arrow doesn't look pressable.
+    if matches!(status, button::Status::Disabled) {
+        return button::Style {
+            background: Some(Background::Color(p.paper)),
+            text_color: p.muted_2,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: theme::RADIUS_SM.into(),
+            },
+            ..button::Style::default()
+        };
+    }
     button::Style {
         background: Some(Background::Color(
             if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -528,14 +674,11 @@ fn tab_style(p: &theme::Palette, active: bool, status: button::Status) -> button
     }
 }
 
-fn bottom_border(background: iced::Color, border: iced::Color) -> container::Style {
+/// Background-only section fill; the seam between sections is a real 1px
+/// `divider`, never a 4-side `Border` masquerading as an underline.
+fn section_bg(background: Color) -> container::Style {
     container::Style {
         background: Some(Background::Color(background)),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
         ..container::Style::default()
     }
 }
