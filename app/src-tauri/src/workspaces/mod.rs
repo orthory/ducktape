@@ -485,17 +485,6 @@ fn workspace_join_blocking(
 
 /// the one-line invite blob to hand a friend, refreshed with this member's dial
 /// hint. requires the workspace to have been founded/joined (it reads config).
-///
-/// The short link is the coordinator-hosted `🦆://<name>/<id>` URL; the full
-/// blob is the self-contained fallback that works without any coordinator.
-/// `short` is `None` when the coordinator was unreachable/refused — the blob
-/// still works.
-#[derive(Serialize, Clone)]
-pub struct InviteForms {
-    pub short: Option<String>,
-    pub blob: String,
-}
-
 #[tauri::command]
 pub async fn workspace_invite_blob(
     app: crate::rt::AppHandle,
@@ -503,7 +492,7 @@ pub async fn workspace_invite_blob(
     control: tauri::State<'_, NodeControl>,
     id: String,
     target: String,
-) -> Result<InviteForms, String> {
+) -> Result<String, String> {
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
@@ -515,7 +504,7 @@ fn workspace_invite_blob_blocking(
     app: crate::rt::AppHandle,
     id: String,
     target: String,
-) -> Result<InviteForms, String> {
+) -> Result<String, String> {
     let target = target.trim().to_string();
     if target.is_empty() {
         return Err(
@@ -526,31 +515,7 @@ fn workspace_invite_blob_blocking(
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
     let cfg_s = cfg.to_string_lossy().to_string();
-    match run_verb(&["invite", "--config", &cfg_s, "--target", &target, "--short"]) {
-        Ok(out) => {
-            // `--short` prints the full blob line, then the short URL as the
-            // LAST line. Recover the blob line (`🦆…`, but never the `🦆://` URL).
-            let short = last_line(&out);
-            let blob = out
-                .lines()
-                .rev()
-                .find(|l| l.trim_start().starts_with('🦆') && !l.contains("://"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            Ok(InviteForms {
-                short: Some(short),
-                blob,
-            })
-        }
-        // coordinator unreachable/refusing: the full blob must still work.
-        Err(_) => {
-            run_verb(&["invite", "--config", &cfg_s, "--target", &target]).map(|out| InviteForms {
-                short: None,
-                blob: last_line(&out),
-            })
-        }
-    }
+    run_verb(&["invite", "--config", &cfg_s, "--target", &target]).map(|out| last_line(&out))
 }
 
 /// the invitee's JOIN CODE: pre-mint the identity a future `workspace_join`
