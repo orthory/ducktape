@@ -99,8 +99,11 @@ pub struct LogTail {
 pub enum AccountLink {
     #[default]
     Hidden,
+    #[allow(dead_code)]
     Locked,
+    #[allow(dead_code)]
     PendingApproval,
+    #[allow(dead_code)]
     WillLink,
 }
 

@@ -572,17 +572,13 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
     .on_submit(Message::ActivateSelection)
     .padding(0)
     .size(15)
-    .style(move |_, status| text_input::Style {
+    .style(move |_, _status| text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
         border: Border::default(),
         icon: p.muted_2,
         placeholder: p.muted_2,
         value: p.ink,
-        selection: if matches!(status, text_input::Status::Focused { .. }) {
-            p.hover
-        } else {
-            p.hover
-        },
+        selection: p.hover,
     });
     #[cfg(all(feature = "agent", debug_assertions))]
     let query_field = iced_agent_plugin::Sem::new(

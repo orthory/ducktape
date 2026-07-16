@@ -82,6 +82,7 @@ pub enum Message {
     Refresh,
     Open(u64),
     Back,
+    #[allow(dead_code)]
     Focus(u64),
     Service(ServiceEvent),
 }

@@ -293,6 +293,7 @@ impl Default for State {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Load,
     SelectRepository(String),
@@ -476,12 +477,12 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         }
         Message::ToggleDirectory(path) => {
             let id = state.selected_repo.clone()?;
-            if let Resource::Ready(data) = &mut state.repository {
-                if let Some(entry) = data.tree.iter_mut().find(|entry| entry.path == path) {
-                    entry.open = !entry.open;
-                    if !entry.open {
-                        return None;
-                    }
+            if let Resource::Ready(data) = &mut state.repository
+                && let Some(entry) = data.tree.iter_mut().find(|entry| entry.path == path)
+            {
+                entry.open = !entry.open;
+                if !entry.open {
+                    return None;
                 }
             }
             Some(Command::LoadDirectory {
@@ -738,9 +739,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             None
         }
         Message::QueueReviewComment => {
-            let Some(path) = state.review_comment_file.clone() else {
-                return None;
-            };
+            let path = state.review_comment_file.clone()?;
             let Ok(line) = state.review_comment_line.parse::<u32>() else {
                 state.error = Some("Enter a positive new-file line number.".into());
                 return None;
@@ -983,9 +982,11 @@ mod tests {
 
     #[test]
     fn repository_selection_resets_browser_and_loads_content() {
-        let mut state = State::default();
-        state.repositories = Resource::Ready(vec![repo()]);
-        state.selected_file = Some("old.rs".into());
+        let mut state = State {
+            repositories: Resource::Ready(vec![repo()]),
+            selected_file: Some("old.rs".into()),
+            ..State::default()
+        };
         assert_eq!(
             update(&mut state, Message::SelectRepository("core".into())),
             Some(Command::LoadRepository {
@@ -1010,9 +1011,11 @@ mod tests {
 
     #[test]
     fn issue_submit_trims_title_and_keeps_markdown_body() {
-        let mut state = State::default();
-        state.selected_repo = Some("core".into());
-        state.tab = Tab::Issues;
+        let mut state = State {
+            selected_repo: Some("core".into()),
+            tab: Tab::Issues,
+            ..State::default()
+        };
         state.new_item.title = "  broken build  ".into();
         state.new_item.body = "**details**".into();
         assert_eq!(
@@ -1028,36 +1031,38 @@ mod tests {
 
     #[test]
     fn directory_results_replace_only_existing_descendants() {
-        let mut state = State::default();
-        state.repository = Resource::Ready(RepositoryData {
-            branches: vec![],
-            tree: vec![
-                TreeEntry {
-                    path: "src".into(),
-                    name: "src".into(),
-                    kind: TreeKind::Directory,
-                    depth: 0,
-                    open: true,
-                },
-                TreeEntry {
-                    path: "src/old.rs".into(),
-                    name: "old.rs".into(),
-                    kind: TreeKind::File,
-                    depth: 1,
-                    open: false,
-                },
-                TreeEntry {
-                    path: "README.md".into(),
-                    name: "README.md".into(),
-                    kind: TreeKind::File,
-                    depth: 0,
-                    open: false,
-                },
-            ],
-            commits: vec![],
-            commits_have_more: false,
-            items: vec![],
-        });
+        let mut state = State {
+            repository: Resource::Ready(RepositoryData {
+                branches: vec![],
+                tree: vec![
+                    TreeEntry {
+                        path: "src".into(),
+                        name: "src".into(),
+                        kind: TreeKind::Directory,
+                        depth: 0,
+                        open: true,
+                    },
+                    TreeEntry {
+                        path: "src/old.rs".into(),
+                        name: "old.rs".into(),
+                        kind: TreeKind::File,
+                        depth: 1,
+                        open: false,
+                    },
+                    TreeEntry {
+                        path: "README.md".into(),
+                        name: "README.md".into(),
+                        kind: TreeKind::File,
+                        depth: 0,
+                        open: false,
+                    },
+                ],
+                commits: vec![],
+                commits_have_more: false,
+                items: vec![],
+            }),
+            ..State::default()
+        };
         update(
             &mut state,
             Message::Service(ServiceEvent::DirectoryLoaded {
@@ -1081,14 +1086,16 @@ mod tests {
 
     #[test]
     fn file_paging_appends_without_losing_existing_text() {
-        let mut state = State::default();
-        state.file = Resource::Ready(FilePage {
-            path: "README.md".into(),
-            text: "first".into(),
-            loaded_bytes: 5,
-            total_bytes: 11,
-            has_more: true,
-        });
+        let mut state = State {
+            file: Resource::Ready(FilePage {
+                path: "README.md".into(),
+                text: "first".into(),
+                loaded_bytes: 5,
+                total_bytes: 11,
+                has_more: true,
+            }),
+            ..State::default()
+        };
         update(
             &mut state,
             Message::Service(ServiceEvent::FileLoaded(Ok(FilePage {

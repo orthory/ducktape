@@ -290,6 +290,7 @@ impl Default for State {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Load,
     Refresh,

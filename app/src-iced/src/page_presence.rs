@@ -24,6 +24,7 @@ pub enum Control {
         anchor: usize,
         head: usize,
     },
+    #[allow(dead_code)]
     Stop,
 }
 

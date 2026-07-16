@@ -129,10 +129,10 @@ fn validate_registry(registry: &Registry) -> Result<(), String> {
             }
         }
     }
-    if let Some(active) = registry.active.as_deref() {
-        if !ids.contains(active) {
-            return Err(format!("active workspace {active:?} does not exist"));
-        }
+    if let Some(active) = registry.active.as_deref()
+        && !ids.contains(active)
+    {
+        return Err(format!("active workspace {active:?} does not exist"));
     }
     Ok(())
 }

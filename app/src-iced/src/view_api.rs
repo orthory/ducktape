@@ -29,6 +29,9 @@ pub enum Resource<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
+    // Modules can request the root route even though the built-in views do not
+    // currently emit it.
+    #[allow(dead_code)]
     Home,
     Chat {
         channel: Option<String>,

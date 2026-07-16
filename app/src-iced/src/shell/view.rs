@@ -545,8 +545,6 @@ fn tray_node_detail(state: &Shell, text_color: Color, dim: Color) -> Element<'_,
         "Connected"
     } else if state.node_client.is_some() {
         "Reconnecting"
-    } else if state.active_workspace.is_some() {
-        "Stopped"
     } else {
         "Stopped"
     };

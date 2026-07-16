@@ -56,6 +56,7 @@ pub struct HomeEffect(user::Command);
 pub struct ChatCommand(user::Command);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ChatEffect {
     Command(ChatCommand),
     Intent(AppIntent),
@@ -76,6 +77,7 @@ pub enum Effect {
 }
 
 impl Effect {
+    #[allow(dead_code)]
     pub const fn view(&self) -> ViewId {
         match self {
             Self::Home(_) => ViewId::Home,

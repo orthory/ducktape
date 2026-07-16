@@ -78,7 +78,10 @@ const CLEAN_CONTENT_TAGS: &[&str] = &[
 pub(crate) struct LocalDocument {
     pub(crate) url: String,
     pub(crate) bytes: Arc<[u8]>,
+    // Retained as provenance for the pending local-document handoff.
+    #[allow(dead_code)]
     pub(crate) snapshot: String,
+    #[allow(dead_code)]
     pub(crate) title: String,
 }
 

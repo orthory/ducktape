@@ -98,6 +98,7 @@ impl State {
         self.generation
     }
 
+    #[allow(dead_code)]
     pub const fn status(&self) -> Status {
         self.status
     }

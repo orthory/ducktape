@@ -1,3 +1,6 @@
+// The probe intentionally exercises only the minimal CEF lifecycle surface of
+// the production browser module.
+#[allow(dead_code)]
 #[path = "../browser/mod.rs"]
 mod browser;
 #[path = "../duck_url.rs"]

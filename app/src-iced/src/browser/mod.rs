@@ -607,6 +607,9 @@ pub struct BrowserRuntime {
 }
 
 impl BrowserRuntime {
+    // The standalone CEF probe includes this module directly, while the shell
+    // uses `create_with_gateway` so the first navigation is workspace-scoped.
+    #[allow(dead_code)]
     pub fn create(parent: ParentWindow, bounds: Bounds, url: &str) -> Result<Self, String> {
         Self::create_with_gateway(parent, bounds, url, None)
     }

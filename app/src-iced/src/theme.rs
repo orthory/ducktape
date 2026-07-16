@@ -21,6 +21,7 @@ pub const FONT_BYTES: [&[u8]; 6] = [
 pub const RADIUS_SM: f32 = 7.0;
 pub const RADIUS_MD: f32 = 9.0;
 pub const RADIUS_LG: f32 = 11.0;
+#[allow(dead_code)]
 pub const RADIUS_WINDOW: f32 = 13.0;
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {

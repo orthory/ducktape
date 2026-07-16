@@ -191,6 +191,7 @@ impl GatewayProxy {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear_local_documents(&self) {
         self.next_generation.fetch_add(1, Ordering::Relaxed);
         self.state

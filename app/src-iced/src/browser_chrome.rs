@@ -571,8 +571,10 @@ mod tests {
 
     #[test]
     fn tabs_keep_independent_history_and_close_without_leaving_zero_tabs() {
-        let mut state = State::default();
-        state.address = "docs.demo.duck".into();
+        let mut state = State {
+            address: "docs.demo.duck".into(),
+            ..State::default()
+        };
         assert_eq!(
             update(&mut state, Message::Open),
             Some("duck://docs.demo.duck/".into())
@@ -657,8 +659,10 @@ mod tests {
         assert!(!is_network_url("about:blank"));
 
         assert!(State::default().url().is_ok());
-        let mut reserved = State::default();
-        reserved.address = "agents.duck".into();
+        let mut reserved = State {
+            address: "agents.duck".into(),
+            ..State::default()
+        };
         assert!(reserved.url().is_err());
         reserved.address = "api.net.duck".into();
         assert!(reserved.url().is_err());
