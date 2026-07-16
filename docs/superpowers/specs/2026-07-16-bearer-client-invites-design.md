@@ -69,10 +69,12 @@ The kind byte is signature-covered, so a targeted token cannot be replayed
 as bearer or vice versa. All outstanding invites die with the preimage bump
 (they live ≤7 days; flag-day precedent is standing law here).
 
-**Invariant, enforced at every layer:** bearer ⇒ `role == Client`.
-`mint_invite_token` refuses to mint a bearer Resident; `verify_invite_token`
-refuses to verify one; `handle_redeem` deterministically rejects one. Belt,
-suspenders, and the consensus copy is the authority.
+**Invariant:** bearer ⇒ `role == Client`. Minting enforces it by
+construction (`mint_bearer_client_token` is the only bearer constructor);
+`handle_redeem` deterministically rejects a bearer Resident; the admission
+doors (join paste, lobby V8, intro) role-gate everything else.
+`verify_invite_token` stays pure signature math. The consensus copy is the
+authority.
 
 **Packed forms.** The 153-byte fixed token layout (`invite.token` file,
 blob envelope) gains the kind byte and drops the target bytes when bearer.
@@ -162,7 +164,7 @@ session, no quorum, no gateway control. Revocation = `ClientsMsg::Revoke`
   bearer grant + single-use race + bearer-resident reject at consensus.
 - **lobby/gate pins**: bearer token over `GateMsg` ⇒ `RoleUnsupported`
   terminal; codec roundtrip of the optional-target token file and blob.
-- **e2e (bin/node tests)**: mint `--client` → `user-redeem-invite` against a
+- **e2e (bin/node tests)**: mint `--role client` → `user-redeem-invite` against a
   live single-node net over HTTP → clients query shows the key → second
   redeem of the same blob by another key rejects. (`invite_e2e::live_quorum`
   is known-broken on pristine dev — not this PR's gate.)
