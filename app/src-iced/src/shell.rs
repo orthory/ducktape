@@ -61,7 +61,7 @@ use browser_session::{
     sync_visibility as sync_browser_visibility,
 };
 #[cfg(test)]
-use view::{titlebar_connection, workspace_initials};
+use view::{titlebar_mode, workspace_initials};
 
 const TITLEBAR_HEIGHT: f32 = 44.0;
 const NETWORK_RAIL_WIDTH: f32 = 62.0;
@@ -2790,6 +2790,9 @@ fn refresh_search_members(state: &mut Shell) {
 }
 
 fn execute_agents(state: &Shell, command: agents_screen::Command) -> Task<Message> {
+    if let agents_screen::Command::CopyText(value) = command {
+        return iced::clipboard::write(value).map(|()| Message::ClipboardWritten);
+    }
     Task::perform(
         forge_agents_service::execute_agents(
             state.backend.clone(),
@@ -3382,17 +3385,17 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_does_not_label_remote_or_disconnected_sessions_local() {
+    fn titlebar_mode_never_labels_a_remote_session_local() {
         let mut shell = Shell::default();
-        let palette = theme::palette(shell.mode);
-        assert_eq!(titlebar_connection(&shell, palette).0, "OFFLINE");
+        assert_eq!(titlebar_mode(&shell), "OFFLINE");
+        // A client/remote node with no local workspace reads USER, never LOCAL —
+        // and the mode word no longer folds in connection state (that liveness
+        // moved to the right-hand status dot), so it is USER whether or not the
+        // stream has connected yet.
         shell.replace_node_client(Some(NodeClient::new("https://node.example").unwrap()));
-        assert_eq!(
-            titlebar_connection(&shell, palette).0,
-            "REMOTE · RECONNECTING"
-        );
+        assert_eq!(titlebar_mode(&shell), "USER");
         shell.node_stream_connected = true;
-        assert_eq!(titlebar_connection(&shell, palette).0, "REMOTE · CONNECTED");
+        assert_eq!(titlebar_mode(&shell), "USER");
     }
 
     #[test]
@@ -3427,10 +3430,9 @@ mod tests {
             },
         ));
         assert!(!shell.node_stream_connected);
-        assert_eq!(
-            titlebar_connection(&shell, theme::palette(shell.mode)).0,
-            "REMOTE · RECONNECTING"
-        );
+        // The remote client with no local workspace stays labelled USER; the
+        // dropped stream is reflected by the status dot, not the mode word.
+        assert_eq!(titlebar_mode(&shell), "USER");
     }
 
     #[test]

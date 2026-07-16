@@ -78,13 +78,16 @@ pub(super) fn view(state: &ModulesState, p: Palette) -> Element<'_, Message> {
             p,
         );
     };
-    let header = screen_header("Modules", Some(modules.len()), p);
+    let header = section_header("Modules", Some(modules.len()), None, p);
     let intro = row![
         icon_tile(Icon::Modules, 36.0, p),
         column![
-            text("Node module set").font(SANS).size(19).color(p.ink),
+            text("Node module set")
+                .font(SANS_SEMIBOLD)
+                .size(BODY_LG)
+                .color(p.ink),
             text("These are the genesis modules this node runs, with each module's committed Merkle root.")
-                .font(SANS).size(13).color(p.muted),
+                .font(SANS).size(BODY).color(p.muted),
         ].spacing(3),
     ].spacing(11).align_y(Alignment::Start);
     let mut body = column![intro].spacing(18);
@@ -96,17 +99,21 @@ pub(super) fn view(state: &ModulesState, p: Palette) -> Element<'_, Message> {
         if rows.is_empty() {
             continue;
         }
+        // Category divider: label · rule line · count, so groups read as
+        // sections rather than a flat stack of cards.
         let mut group = column![row![
             text(category.label())
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(category_color(category, p)),
-            Space::new().width(Length::Fill),
+            divider_soft(p),
             text(rows.len().to_string())
                 .font(MONO)
-                .size(11)
+                .size(CAPTION)
                 .color(p.muted_2),
-        ]]
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)]
         .spacing(10);
         for module in rows {
             group = group.push(module_card(
@@ -136,7 +143,7 @@ fn module_card(module: &ModuleRoot, copied: bool, p: Palette) -> Element<'static
             short(&module.root, 10, 8)
         })
         .font(MONO)
-        .size(11),
+        .size(LABEL),
     )
     .padding([4, 8])
     .style(move |_, _| iced::widget::button::Style {
@@ -171,21 +178,21 @@ fn module_card(module: &ModuleRoot, copied: bool, p: Palette) -> Element<'static
                         .to_ascii_uppercase()
                 )
                 .font(MONO)
-                .size(13)
+                .size(BODY)
                 .color(p.on_filled)
             )
             .width(40)
             .height(40)
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
-            .style(move |_| rounded_surface(p.filled, p.filled, 10.0)),
+            .style(move |_| rounded_surface(p.filled, p.filled, RADIUS_MD)),
             column![
                 row![
-                    text(label).font(SANS).size(13.5).color(p.ink),
-                    text(module.id.clone()).font(MONO).size(11).color(p.muted_2),
+                    text(label).font(SANS_SEMIBOLD).size(BODY_LG).color(p.ink),
+                    text(module.id.clone()).font(MONO).size(LABEL).color(p.muted_2),
                 ]
                 .spacing(7),
-                text(detail).font(SANS).size(12).color(p.muted),
+                text(detail).font(SANS).size(BODY).color(p.muted),
                 copy_btn,
             ]
             .spacing(5),

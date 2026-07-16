@@ -6,7 +6,10 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, font};
 
 use crate::icons::Icon;
-use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{
+    self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS,
+    SANS_SEMIBOLD, TITLE,
+};
 use crate::view_api::Resource;
 
 use super::chat_composer;
@@ -223,7 +226,7 @@ pub enum ChatMessageEvent {
     DismissError,
 }
 
-pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option<Command> {
+pub(crate) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option<Command> {
     state.error = None;
     match message {
         ChatMessageEvent::SelectChannel(id) => {
@@ -266,12 +269,23 @@ pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option
         }
         ChatMessageEvent::CreateChannel => {
             let name = nonempty(&state.channel_draft)?;
+            let id = channel_id(&name);
+            // A name with no ASCII alphanumerics slugs to "" — the original
+            // bails here too (an empty channelIdOf means no create), so refuse
+            // rather than mint a channel nobody can address.
+            if id.is_empty() {
+                return None;
+            }
+            let policy = state.channel_policy;
             state.channel_draft.clear();
             state.creating_channel = false;
-            Some(Command::CreateChannel {
-                name,
-                policy: state.channel_policy,
-            })
+            // Reset to Open so the next create starts fresh instead of silently
+            // inheriting the last "Members" choice.
+            state.channel_policy = PostPolicy::Open;
+            // Select the new channel up front; the follow-up reload enters it via
+            // LoadChat { active }, matching the original's enterChannel(channelId).
+            state.active_channel = Some(id);
+            Some(Command::CreateChannel { name, policy })
         }
         ChatMessageEvent::Composer { thread, message } => {
             let destination = if matches!(&message, chat_composer::Message::Submit) {
@@ -469,6 +483,31 @@ pub(super) fn update(state: &mut ChatState, message: ChatMessageEvent) -> Option
     }
 }
 
+/// Derive the canonical channel id from a display name — the same `[a-z0-9-]`
+/// slug the original `channelIdOf` produces. Deterministic and possibly empty (a
+/// name with no ASCII alphanumerics yields ""), so the update layer can predict
+/// the id it selects and the wire adapter reuses this exact function.
+pub(crate) fn channel_id(name: &str) -> String {
+    let mut id = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while id.contains("--") {
+        id = id.replace("--", "-");
+    }
+    let mut id = id.trim_matches('-').to_string();
+    id.truncate(64);
+    id
+}
+
 fn destructive_confirmation(
     description: String,
     confirm: Message,
@@ -478,10 +517,10 @@ fn destructive_confirmation(
     container(
         column![
             text("Confirm deletion")
-                .font(SANS)
-                .size(12.5)
+                .font(SANS_SEMIBOLD)
+                .size(BODY)
                 .color(p.danger),
-            text(description).font(SANS).size(11).color(p.muted),
+            text(description).font(SANS).size(BODY).color(p.muted),
             row![
                 outline("Cancel", cancel, p),
                 danger_outline("Delete", confirm, p),
@@ -539,33 +578,23 @@ fn chat_empty_shell<'a>(
         .find(|channel| Some(&channel.id) == state.active_channel.as_ref());
     let mut rail = column![
         row![
-            text("CHANNELS").font(SANS).size(11).color(p.muted),
+            text("CHANNELS")
+                .font(SANS_SEMIBOLD)
+                .size(LABEL)
+                .color(p.muted),
             Space::new().width(Length::Fill),
-            outline("+", Message::Chat(ChatMessageEvent::ToggleNewChannel), p)
+            with_hint(
+                outline("+", Message::Chat(ChatMessageEvent::ToggleNewChannel), p),
+                "New channel",
+                p,
+            ),
         ]
         .align_y(Alignment::Center),
     ]
     .spacing(7)
     .padding([13, 8]);
     if state.creating_channel {
-        rail = rail.push(
-            column![
-                field(
-                    "channel name",
-                    &state.channel_draft,
-                    |value| Message::Chat(ChatMessageEvent::ChannelNameChanged(value)),
-                    p
-                ),
-                policy_toggle(state.channel_policy, p),
-                filled(
-                    "Create channel",
-                    Message::Chat(ChatMessageEvent::CreateChannel),
-                    !state.channel_draft.trim().is_empty(),
-                    p
-                ),
-            ]
-            .spacing(6),
-        );
+        rail = rail.push(channel_create_form(state, 6.0, p));
     }
     let visible: Vec<_> = channels
         .iter()
@@ -575,7 +604,7 @@ fn chat_empty_shell<'a>(
         rail = rail.push(
             text("No channels yet — create one.")
                 .font(SANS)
-                .size(11.5)
+                .size(LABEL)
                 .color(p.muted_2),
         );
     } else {
@@ -591,8 +620,8 @@ fn chat_empty_shell<'a>(
     if !archived.is_empty() {
         rail = rail.push(
             text(format!("ARCHIVED · {}", archived.len()))
-                .font(SANS)
-                .size(11)
+                .font(SANS_SEMIBOLD)
+                .size(LABEL)
                 .color(p.muted),
         );
         for channel in archived {
@@ -622,14 +651,17 @@ fn chat_empty_shell<'a>(
                     .any(|member| member.user.eq_ignore_ascii_case(key))
             });
         let mut header_row = row![
-            text("#").font(SANS).size(15).color(p.muted),
-            text(&channel.name).font(SANS).size(15).color(p.ink),
+            text("#").font(SANS).size(TITLE).color(p.muted),
+            text(&channel.name)
+                .font(SANS_SEMIBOLD)
+                .size(TITLE)
+                .color(p.ink),
             text(format!(
                 "· {roots} {}",
                 if roots == 1 { "message" } else { "messages" }
             ))
             .font(SANS)
-            .size(12)
+            .size(LABEL)
             .color(p.muted_2),
             Space::new().width(Length::Fill),
             outline("# Tags", Message::Chat(ChatMessageEvent::LoadTags), p),
@@ -714,7 +746,7 @@ fn chat_empty_shell<'a>(
                         ),
                     ]
                     .spacing(8),
-                    text(member_summary).font(MONO).size(10.5).color(p.muted_2),
+                    text(member_summary).font(MONO).size(CAPTION).color(p.muted_2),
                 ]
                 .spacing(8),
             )
@@ -735,7 +767,7 @@ fn chat_empty_shell<'a>(
                         data.map(|data| data.hits.len()).unwrap_or_default()
                     ))
                     .font(SANS)
-                    .size(12.5)
+                    .size(BODY)
                     .color(theme::ACCENTS[0]),
                     Space::new().width(Length::Fill),
                     outline("Clear", Message::Chat(ChatMessageEvent::ClearTag), p),
@@ -749,11 +781,11 @@ fn chat_empty_shell<'a>(
                             column![
                                 text(format!("{} · #{}", hit.author, hit.sequence))
                                     .font(MONO)
-                                    .size(10.5)
+                                    .size(CAPTION)
                                     .color(p.muted_2),
                                 text(hit.text.clone())
                                     .font(SANS)
-                                    .size(13.5)
+                                    .size(BODY)
                                     .color(p.ink_soft),
                             ]
                             .spacing(3),
@@ -817,7 +849,7 @@ fn chat_empty_shell<'a>(
                 row![
                     text("This channel is archived — posting and reactions are disabled.")
                         .font(SANS)
-                        .size(12)
+                        .size(BODY)
                         .color(p.muted),
                     Space::new().width(Length::Fill),
                     outline(
@@ -862,16 +894,19 @@ fn chat_empty_shell<'a>(
             main.into()
         }
     } else {
-        let has_channels = !channels.is_empty();
-        let center = column![
+        // hasChannels counts only visible (non-archived) channels; the wire
+        // already drops module/term lanes. An all-archived workspace shows the
+        // create form so the network can start a first conversation.
+        let has_channels = channels.iter().any(|channel| !channel.archived);
+        let mut center = column![
             icon_tile(Icon::Chat, 48.0, p),
             text(if has_channels {
                 "Pick a channel"
             } else {
                 "No channels yet"
             })
-            .font(SANS)
-            .size(14)
+            .font(SANS_SEMIBOLD)
+            .size(TITLE)
             .color(p.ink),
             text(if has_channels {
                 "Choose a channel from the list to start reading and posting."
@@ -879,12 +914,18 @@ fn chat_empty_shell<'a>(
                 "Create the first channel to start the conversation."
             })
             .font(SANS)
-            .size(12.5)
+            .size(BODY)
             .color(p.muted_2),
         ]
         .spacing(10)
         .align_x(Alignment::Center)
         .max_width(260);
+        // The reported "create is broken": the only working create path was the
+        // rail's 20px `+`. Render the same form dead-center under the CTA so it
+        // is discoverable (matches the original EmptyChannelState form).
+        if !has_channels {
+            center = center.push(container(channel_create_form(state, 8.0, p)).width(240));
+        }
         container(center)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -913,7 +954,7 @@ fn chat_error_banner<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
         row![
             text_input("", message)
                 .font(MONO)
-                .size(11.5)
+                .size(BODY)
                 .padding(0)
                 .style(move |_, _| iced::widget::text_input::Style {
                     background: Background::Color(Color::TRANSPARENT),
@@ -943,10 +984,63 @@ fn chat_error_banner<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
     .into()
 }
 
+/// The shared create-channel form: name input (Enter submits), the Open/Members
+/// policy toggle, and the Create button. Rendered in BOTH the rail and the
+/// empty-state center so the two can never drift.
+fn channel_create_form<'a>(state: &'a ChatState, spacing: f32, p: Palette) -> Element<'a, Message> {
+    column![
+        field(
+            "channel name",
+            &state.channel_draft,
+            |value| Message::Chat(ChatMessageEvent::ChannelNameChanged(value)),
+            p,
+        )
+        .on_submit(Message::Chat(ChatMessageEvent::CreateChannel))
+        .width(Length::Fill),
+        policy_toggle(state.channel_policy, p),
+        filled(
+            "Create channel",
+            Message::Chat(ChatMessageEvent::CreateChannel),
+            !state.channel_draft.trim().is_empty(),
+            p,
+        ),
+    ]
+    .spacing(spacing)
+    .into()
+}
+
+/// Wrap a control in a hover tooltip styled as a filled dark chip.
+fn with_hint<'a>(content: Element<'a, Message>, hint: &'a str, p: Palette) -> Element<'a, Message> {
+    iced::widget::tooltip(
+        content,
+        container(text(hint).font(SANS).size(CAPTION).color(p.on_filled))
+            .padding([4, 8])
+            .style(move |_| iced::widget::container::Style {
+                background: Some(Background::Color(p.filled)),
+                border: Border {
+                    radius: RADIUS_SM.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .gap(4)
+    .into()
+}
+
 fn policy_toggle(active: PostPolicy, p: Palette) -> Element<'static, Message> {
     row![
-        policy_button("Open", PostPolicy::Open, active, p),
-        policy_button("Members", PostPolicy::MembersOnly, active, p)
+        with_hint(
+            policy_button("Open", PostPolicy::Open, active, p),
+            "Any member of the network can post",
+            p,
+        ),
+        with_hint(
+            policy_button("Members", PostPolicy::MembersOnly, active, p),
+            "Only channel members can post",
+            p,
+        ),
     ]
     .spacing(3)
     .into()
@@ -957,7 +1051,7 @@ fn policy_button(
     active: PostPolicy,
     p: Palette,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS).size(11))
+    let btn = button(text(label).font(SANS).size(LABEL))
         .width(Length::FillPortion(1))
         .padding([4, 8])
         .style(move |_, _| iced::widget::button::Style {
@@ -978,10 +1072,10 @@ fn policy_button(
 fn channel_button(channel: &Channel, active: bool, p: Palette) -> Element<'static, Message> {
     let btn = button(
         row![
-            text("#").font(SANS).size(13).color(p.muted_2),
+            text("#").font(SANS).size(BODY).color(p.muted_2),
             text(channel.name.clone())
                 .font(SANS)
-                .size(13.5)
+                .size(BODY)
                 .color(if active {
                     p.ink
                 } else if channel.archived {
@@ -1019,7 +1113,10 @@ fn channel_button(channel: &Channel, active: bool, p: Palette) -> Element<'stati
 fn channel_intro<'a>(name: &'a str, empty: bool, p: Palette) -> Element<'a, Message> {
     column![
         icon_tile(Icon::Chat, 46.0, p),
-        text(format!("#{name}")).font(SANS).size(18).color(p.ink),
+        text(format!("#{name}"))
+            .font(SANS_SEMIBOLD)
+            .size(HEADING)
+            .color(p.ink),
         text(format!(
             "This is the very beginning of the #{name} channel.{}",
             if empty {
@@ -1029,7 +1126,7 @@ fn channel_intro<'a>(name: &'a str, empty: bool, p: Palette) -> Element<'a, Mess
             }
         ))
         .font(SANS)
-        .size(13.5)
+        .size(BODY)
         .color(p.muted_2)
     ]
     .spacing(9)
@@ -1039,7 +1136,7 @@ fn channel_intro<'a>(name: &'a str, empty: bool, p: Palette) -> Element<'a, Mess
 fn day_divider<'a>(day: &'a str, p: Palette) -> Element<'a, Message> {
     row![
         divider(p),
-        text(day).font(MONO).size(11).color(p.muted_2),
+        text(day).font(MONO).size(CAPTION).color(p.muted_2),
         divider(p)
     ]
     .spacing(12)
@@ -1157,16 +1254,16 @@ fn message_row<'a>(
             column![
                 row![
                     text(message.author.clone())
-                        .font(SANS)
-                        .size(13)
+                        .font(SANS_SEMIBOLD)
+                        .size(BODY)
                         .color(p.ink),
                     text(message.time.clone())
                         .font(MONO)
-                        .size(10)
+                        .size(CAPTION)
                         .color(p.muted_2),
                     text(if message.edited { "edited" } else { "" })
                         .font(MONO)
-                        .size(9)
+                        .size(CAPTION)
                         .color(p.muted_3)
                 ]
                 .spacing(7),
@@ -1199,7 +1296,7 @@ fn chat_message_body(message: &ChatMessage, p: Palette) -> Element<'static, Mess
     if message.rich.is_empty() {
         return text(message.body.clone())
             .font(SANS)
-            .size(13.5)
+            .size(BODY)
             .color(p.ink_soft)
             .into();
     }
@@ -1228,7 +1325,7 @@ fn chat_message_body(message: &ChatMessage, p: Palette) -> Element<'static, Mess
     }
     rich_text(spans)
         .font(SANS)
-        .size(13.5)
+        .size(BODY)
         .on_link_click(|link| Message::Chat(ChatMessageEvent::OpenLink(link)))
         .into()
 }
@@ -1275,7 +1372,7 @@ fn thread_panel<'a>(
     };
     container(column![
         container(row![
-            text("Thread").font(SANS).size(14).color(p.ink),
+            text("Thread").font(SANS_SEMIBOLD).size(BODY_LG).color(p.ink),
             Space::new().width(Length::Fill),
             outline("Close", Message::Chat(ChatMessageEvent::CloseThread), p),
         ])

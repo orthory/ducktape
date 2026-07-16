@@ -13,19 +13,11 @@ pub const MONO: Font = Font::with_name("Geist Mono");
 
 /// The type scale. Every `.size()` in the app uses one of these — ad-hoc px
 /// sizes are a defect. Matches the original React app's ~13px body rhythm.
-/// (dead_code allows drop out with the parallel module migration that
-/// consumes them — remove in the merge sweep.)
-#[allow(dead_code)]
 pub const CAPTION: f32 = 10.5;
-#[allow(dead_code)]
 pub const LABEL: f32 = 12.0;
-#[allow(dead_code)]
 pub const BODY: f32 = 13.0;
-#[allow(dead_code)]
 pub const BODY_LG: f32 = 14.0;
-#[allow(dead_code)]
 pub const TITLE: f32 = 15.5;
-#[allow(dead_code)]
 pub const HEADING: f32 = 18.0;
 
 pub const FONT_BYTES: [&[u8]; 6] = [
@@ -96,8 +88,6 @@ pub struct Palette {
     pub danger_border: Color,
     /// Base color for card/popover shadows; use sites pick the alpha. Mode-aware
     /// so dark mode doesn't inherit light mode's warm-brown shadow.
-    /// (allow drops out with the module migration — remove in the merge sweep.)
-    #[allow(dead_code)]
     pub shadow: Color,
 }
 

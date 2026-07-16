@@ -4,7 +4,7 @@ use iced::keyboard;
 use iced::widget::{button, column, container, row, text, text_editor};
 use iced::{Alignment, Background, Border, Element};
 
-use crate::theme::{self, Palette, RADIUS_SM, SANS};
+use crate::theme::{self, BODY, LABEL, Palette, RADIUS_SM, SANS};
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -154,7 +154,7 @@ pub fn view<'a>(
             }
         })
         .padding([8, 10])
-        .size(12.5)
+        .size(BODY)
         .font(SANS)
         .min_height(38)
         .max_height(112)
@@ -240,7 +240,7 @@ fn outline_enabled<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(12))
+    let button = button(text(label.clone()).font(SANS).size(LABEL))
         .padding([7, 10])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(

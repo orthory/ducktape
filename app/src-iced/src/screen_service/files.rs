@@ -53,6 +53,8 @@ pub(super) async fn load_files(
                 kind,
                 size: entry.size,
                 executable: entry.exec,
+                object: entry.object,
+                meta: entry.meta,
             })
         })
         .collect();

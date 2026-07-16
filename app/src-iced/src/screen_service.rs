@@ -416,11 +416,6 @@ pub async fn execute(
             Screen::Files,
             choose_download(client.as_ref(), &path, size, snapshot.as_deref()).await,
         ),
-        Command::BeginFileDragOut { path: _, size: _, snapshot: _ } => {
-            ServiceEvent::FileDragOutUnavailable(
-                "Native file drag-out is unavailable in this build; use Download instead.".into(),
-            )
-        }
         Command::DeleteFile(path) => action(
             Screen::Files,
             user_content_service::delete_file(backend.as_ref(), client.as_ref(), &path).await,
@@ -630,25 +625,5 @@ mod tests {
         assert!(decode_hex("").is_err());
         assert!(decode_hex("abc").is_err());
         assert!(decode_hex("zz").is_err());
-    }
-
-    #[tokio::test]
-    async fn drag_out_contract_fails_closed_when_the_host_has_no_platform_adapter() {
-        let event = execute(
-            None,
-            None,
-            None,
-            Command::BeginFileDragOut {
-                path: "/shared/design.svg".into(),
-                size: 42,
-                snapshot: Some("snapshot-7".into()),
-            },
-        )
-        .await;
-        assert!(matches!(
-            event,
-            ServiceEvent::FileDragOutUnavailable(reason)
-                if reason.contains("unavailable") && reason.contains("Download")
-        ));
     }
 }

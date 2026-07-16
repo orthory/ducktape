@@ -12,7 +12,8 @@ use zeroize::Zeroize as _;
 
 use crate::icons::{self, Icon};
 use crate::theme::{
-    self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM, SANS_SEMIBOLD,
+    self, BODY, CAPTION, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM,
+    SANS_SEMIBOLD, TITLE,
 };
 
 const CARD_WIDTH: f32 = 440.0;
@@ -430,6 +431,13 @@ impl Drop for State {
 pub fn update(state: &mut State, message: Message) -> Option<Command> {
     match message {
         Message::SelectMode(mode) => {
+            // Switching modes mid-flight would clear_secrets + reset stage while a
+            // custody op is still in flight; its late ServiceEvent would then land
+            // in the wrong stage (e.g. yanking a Restore user onto a RecoveryPhrase
+            // they never asked to create). Mirror submit()'s own busy guard.
+            if state.busy {
+                return None;
+            }
             clear_secrets(state);
             state.mode = mode;
             state.stage = match mode {
@@ -839,7 +847,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
         Stage::Loading => gate_card(
             "Loading your account",
             Some("Reading the account key stored on this device…"),
-            column![text("Please wait").font(MONO).size(11).color(p.muted)],
+            column![text("Please wait").font(MONO).size(LABEL).color(p.muted)],
             p,
         ),
         Stage::LoadError => gate_card(
@@ -865,7 +873,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     };
 
     let body = if state.first_run && !state.is_ready() {
-        column![step_rail(p), content]
+        column![step_rail(1, p), content]
             .align_x(Alignment::Center)
             .spacing(18)
     } else {
@@ -890,7 +898,7 @@ fn create_view(state: &State, p: Palette) -> Element<'_, Message> {
     let mut credentials =
         password_fields(state, "Password (min 8 characters)", "Confirm password", p);
     if let Some(error) = state.error.as_deref() {
-        credentials = credentials.push(text(error).font(MONO).size(11.5).color(p.red));
+        credentials = credentials.push(selectable_error(error, p));
     }
     credentials = credentials.push(primary(
         if state.busy {
@@ -908,12 +916,16 @@ fn create_view(state: &State, p: Palette) -> Element<'_, Message> {
         ),
         column![
             mode_tabs(state, p),
-            field(
-                "Your name (optional)",
+            sem_input(
+                "Your name",
                 &state.display_name,
-                Message::DisplayNameChanged,
-                false,
-                p
+                field(
+                    "Your name (optional)",
+                    &state.display_name,
+                    Message::DisplayNameChanged,
+                    false,
+                    p
+                )
             ),
             credentials,
         ]
@@ -930,12 +942,16 @@ fn touch_id_create_view(state: &State, p: Palette) -> Element<'_, Message> {
         ),
         column![
             mode_tabs(state, p),
-            field(
-                "Your name (optional)",
+            sem_input(
+                "Your name",
                 &state.display_name,
-                Message::DisplayNameChanged,
-                false,
-                p
+                field(
+                    "Your name (optional)",
+                    &state.display_name,
+                    Message::DisplayNameChanged,
+                    false,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -959,14 +975,17 @@ fn restore_view(state: &State, p: Palette) -> Element<'_, Message> {
         Some("Enter your 24-word recovery phrase and set a new password for this device."),
         column![
             mode_tabs(state, p),
-            field(
-                "24-word recovery phrase, separated by spaces",
-                &state.restore_words,
-                Message::RestoreWordsChanged,
-                false,
-                p
-            )
-            .font(MONO),
+            sem_secret(
+                "Recovery phrase",
+                field(
+                    "24-word recovery phrase, separated by spaces",
+                    &state.restore_words,
+                    Message::RestoreWordsChanged,
+                    false,
+                    p
+                )
+                .font(MONO)
+            ),
             password_fields(state, "New password", "Confirm new password", p),
             error_line(state, p),
             primary(
@@ -1061,12 +1080,15 @@ fn recovery_view(state: &State, p: Palette) -> Element<'_, Message> {
 fn confirm_recovery_view(state: &State, p: Palette) -> Element<'_, Message> {
     let mut fields = Column::new().spacing(10);
     for (slot, index) in state.confirm_indices.iter().copied().enumerate() {
-        fields = fields.push(field(
-            &format!("Word #{}", index + 1),
-            &state.confirm_answers[slot],
-            move |value| Message::ConfirmWordChanged(slot, value),
-            false,
-            p,
+        fields = fields.push(sem_secret(
+            format!("Word #{}", index + 1),
+            field(
+                &format!("Word #{}", index + 1),
+                &state.confirm_answers[slot],
+                move |value| Message::ConfirmWordChanged(slot, value),
+                false,
+                p,
+            ),
         ));
     }
     gate_card(
@@ -1094,24 +1116,31 @@ fn link_challenge_view(state: &State, p: Palette) -> Element<'_, Message> {
         column![
             row![
                 icons::view(Icon::Link, 16.0, p.muted),
-                text("Link challenge").font(SANS).size(11).color(p.muted)
+                text("Link challenge").font(SANS).size(LABEL).color(p.muted)
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-            field(
-                "Paste the link code — or type the http:// address",
-                &state.link_challenge,
-                Message::LinkChallengeChanged,
-                false,
-                p
-            )
-            .font(MONO),
-            field(
-                "Device label (optional, e.g. work laptop)",
+            sem_secret(
+                "Link challenge",
+                field(
+                    "Paste the link code — or type the http:// address",
+                    &state.link_challenge,
+                    Message::LinkChallengeChanged,
+                    false,
+                    p
+                )
+                .font(MONO)
+            ),
+            sem_input(
+                "Device label",
                 &state.device_label,
-                Message::DeviceLabelChanged,
-                false,
-                p
+                field(
+                    "Device label (optional, e.g. work laptop)",
+                    &state.device_label,
+                    Message::DeviceLabelChanged,
+                    false,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -1149,7 +1178,7 @@ fn link_response_view(state: &State, p: Palette) -> Element<'_, Message> {
         },
         Some(hint),
         column![
-            container(text(code).font(MONO).size(10.5).color(p.ink))
+            container(text(code).font(MONO).size(CAPTION).color(p.ink))
                 .padding(10)
                 .width(Length::Fill)
                 .style(move |_| input_container_style(p, false)),
@@ -1186,12 +1215,15 @@ fn unlock_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     let unlock_label: &'a str = if state.busy { "Unlocking…" } else { "Unlock" };
     let skip_label: &'a str = "Skip for now";
     content = content
-        .push(field(
+        .push(sem_secret(
             "Password",
-            &state.password,
-            Message::PasswordChanged,
-            true,
-            p,
+            field(
+                "Password",
+                &state.password,
+                Message::PasswordChanged,
+                true,
+                p,
+            ),
         ))
         .push(error_line(state, p))
         .push(primary(
@@ -1203,7 +1235,7 @@ fn unlock_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
         .push(
             text("Until you unlock, nodes you start stay unlinked to your account.")
                 .font(SANS)
-                .size(10.5)
+                .size(BODY)
                 .color(p.muted_2),
         );
     gate_card(
@@ -1221,12 +1253,15 @@ fn resume_view(state: &State, p: Palette) -> Element<'_, Message> {
             "You created this account but never confirmed its recovery phrase. Enter your password to view it and finish.",
         ),
         column![
-            field(
+            sem_secret(
                 "Password",
-                &state.password,
-                Message::PasswordChanged,
-                true,
-                p
+                field(
+                    "Password",
+                    &state.password,
+                    Message::PasswordChanged,
+                    true,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -1285,12 +1320,15 @@ fn reveal_legacy_view(state: &State, p: Palette) -> Element<'_, Message> {
             "Enter your password to view your 24-word recovery phrase, or do this later from the Account view.",
         ),
         column![
-            field(
+            sem_secret(
                 "Password",
-                &state.password,
-                Message::PasswordChanged,
-                true,
-                p
+                field(
+                    "Password",
+                    &state.password,
+                    Message::PasswordChanged,
+                    true,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -1316,19 +1354,25 @@ fn password_fields<'a>(
     p: Palette,
 ) -> Column<'a, Message> {
     column![
-        field(
-            password_placeholder,
-            &state.password,
-            Message::PasswordChanged,
-            true,
-            p
+        sem_secret(
+            "Password",
+            field(
+                password_placeholder,
+                &state.password,
+                Message::PasswordChanged,
+                true,
+                p
+            )
         ),
-        field(
-            confirm_placeholder,
-            &state.confirm_password,
-            Message::ConfirmPasswordChanged,
-            true,
-            p
+        sem_secret(
+            "Confirm password",
+            field(
+                confirm_placeholder,
+                &state.confirm_password,
+                Message::ConfirmPasswordChanged,
+                true,
+                p
+            )
         ),
     ]
     .spacing(10)
@@ -1345,7 +1389,15 @@ fn mode_tabs(state: &State, p: Palette) -> Element<'static, Message> {
     ]);
     let mut items = row![].spacing(4).padding(4);
     for (mode, label) in tabs {
-        items = items.push(tab(label, mode == state.mode, Message::SelectMode(mode), p));
+        // While a custody op is in flight the tabs are guarded (ON-G1); render
+        // them disabled so the block reads as intentional, not a dead click.
+        items = items.push(tab(
+            label,
+            mode == state.mode,
+            !state.busy,
+            Message::SelectMode(mode),
+            p,
+        ));
     }
     container(items)
         .width(Length::Fill)
@@ -1360,49 +1412,76 @@ fn mode_tabs(state: &State, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-fn step_rail(p: Palette) -> Element<'static, Message> {
-    let mut items = row![].align_y(Alignment::Center).spacing(9);
+/// The onboarding chrome's Account → Workspace → Connect progress rail.
+///
+/// One parameterized implementation shared by the identity gate (`active = 1`)
+/// and workspace join-progress (`active = 3`); steps before `active` render a
+/// green ✓ done marker, the `active` step renders filled/current, later steps
+/// pending. Message-agnostic (no interactive elements) so both screens reuse it.
+pub fn step_rail<'a, M: 'a>(active: u8, p: Palette) -> Element<'a, M> {
+    let green_tint = Color { a: 0.12, ..p.green };
+    let mut rail = row![].align_y(Alignment::Center).spacing(9);
     for (index, label) in ["Account", "Workspace", "Connect"].into_iter().enumerate() {
-        if index > 0 {
-            items = items.push(container(Space::new().width(22).height(1)).style(move |_| {
+        let step = (index + 1) as u8;
+        let done = step < active;
+        let current = step == active;
+        let marker = container(
+            text(if done {
+                "✓".to_string()
+            } else {
+                step.to_string()
+            })
+            .font(MONO)
+            .size(CAPTION)
+            .color(if current {
+                p.on_filled
+            } else if done {
+                p.green
+            } else {
+                p.muted_2
+            }),
+        )
+        .width(17)
+        .height(17)
+        .center_x(17)
+        .center_y(17)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(if current {
+                p.filled
+            } else if done {
+                green_tint
+            } else {
+                Color::TRANSPARENT
+            })),
+            border: Border {
+                color: if current {
+                    p.filled
+                } else if done {
+                    p.green
+                } else {
+                    p.border_strong
+                },
+                width: 1.0,
+                radius: 9.0.into(),
+            },
+            ..Default::default()
+        });
+        rail = rail.push(marker).push(
+            text(label)
+                .font(SANS_SEMIBOLD)
+                .size(CAPTION)
+                .color(if current { p.ink } else { p.muted_2 }),
+        );
+        if step < 3 {
+            rail = rail.push(container(Space::new().width(22).height(1)).style(move |_| {
                 container::Style {
                     background: Some(Background::Color(p.border_strong)),
                     ..Default::default()
                 }
             }));
         }
-        let active = index == 0;
-        items = items.push(
-            row![
-                container(
-                    text((index + 1).to_string())
-                        .font(MONO)
-                        .size(9)
-                        .color(if active { p.on_filled } else { p.muted_2 })
-                )
-                .width(17)
-                .height(17)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .style(move |_| container::Style {
-                    background: active.then_some(Background::Color(p.filled)),
-                    border: Border {
-                        color: if active { p.filled } else { p.border_strong },
-                        width: 1.0,
-                        radius: 99.0.into()
-                    },
-                    ..Default::default()
-                }),
-                text(label)
-                    .font(SANS)
-                    .size(10.5)
-                    .color(if active { p.ink } else { p.muted_2 }),
-            ]
-            .spacing(9)
-            .align_y(Alignment::Center),
-        );
     }
-    items.into()
+    rail.into()
 }
 
 fn gate_card<'a>(
@@ -1411,12 +1490,12 @@ fn gate_card<'a>(
     content: Column<'a, Message>,
     p: Palette,
 ) -> Element<'a, Message> {
-    let mut header = column![text(title).font(SANS_SEMIBOLD).size(16).color(p.ink)].spacing(5);
+    let mut header = column![text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink)].spacing(5);
     if let Some(subtitle) = subtitle {
         header = header.push(
             text(subtitle)
                 .font(SANS_MEDIUM)
-                .size(13)
+                .size(BODY)
                 .line_height(1.4)
                 .color(p.muted),
         );
@@ -1433,10 +1512,7 @@ fn gate_card<'a>(
                 radius: RADIUS_LG.into(),
             },
             shadow: Shadow {
-                color: Color {
-                    a: 0.20,
-                    ..Color::from_rgb8(40, 38, 34)
-                },
+                color: Color { a: 0.20, ..p.shadow },
                 offset: Vector::new(0.0, 18.0),
                 blur_radius: 48.0,
             },
@@ -1456,7 +1532,7 @@ fn field<'a>(
         .on_input(on_input)
         .secure(secure)
         .padding([9, 11])
-        .size(12.5)
+        .size(BODY)
         .font(SANS_MEDIUM)
         .style(move |_, status| iced::widget::text_input::Style {
             background: Background::Color(p.sunken),
@@ -1476,10 +1552,51 @@ fn field<'a>(
         })
 }
 
+/// Dev-only text-input tagging: wraps a non-secret input in a `TextInput`
+/// semantic node carrying its `value`, so the agent bridge can address it by
+/// name. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: impl Into<String>,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: impl Into<String>,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
+/// Secret-field variant: tags the input with a stable name so the bridge can
+/// focus + type into it, but OMITS `.value` — the semantic tree is read by the
+/// bridge and (per this module's zeroize/redaction design) must never mirror a
+/// password, recovery word, or link challenge.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_secret<'a>(
+    name: impl Into<String>,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input).into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_secret<'a>(
+    _name: impl Into<String>,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let enabled = message.is_some();
     let button = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12.5))
+        container(text(label).font(SANS_SEMIBOLD).size(BODY))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1514,7 +1631,7 @@ fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<
 
 fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let button = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1552,30 +1669,36 @@ fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Elemen
 fn tab(
     label: &'static str,
     active: bool,
+    enabled: bool,
     message: Message,
     p: Palette,
 ) -> Element<'static, Message> {
     let tab = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
     .width(Length::FillPortion(1))
     .padding([8, 0])
+    .on_press_maybe(enabled.then_some(message))
     .style(move |_, status| iced::widget::button::Style {
-        background: (active || matches!(status, iced::widget::button::Status::Hovered))
-            .then_some(Background::Color(if active { p.paper } else { p.hover })),
-        text_color: if active { p.ink } else { p.muted },
+        background: (enabled
+            && (active || matches!(status, iced::widget::button::Status::Hovered)))
+        .then_some(Background::Color(if active { p.paper } else { p.hover })),
+        text_color: if !enabled {
+            p.muted_3
+        } else if active {
+            p.ink
+        } else {
+            p.muted
+        },
         border: Border {
             radius: RADIUS_SM.into(),
             ..Default::default()
         },
-        shadow: if active {
+        shadow: if active && enabled {
             Shadow {
-                color: Color {
-                    a: 0.05,
-                    ..Color::from_rgb8(40, 38, 34)
-                },
+                color: Color { a: 0.05, ..p.shadow },
                 offset: Vector::new(0.0, 1.0),
                 blur_radius: 2.0,
             }
@@ -1583,17 +1706,18 @@ fn tab(
             Shadow::default()
         },
         ..Default::default()
-    })
-    .on_press(message);
+    });
     #[cfg(all(feature = "agent", debug_assertions))]
-    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, tab);
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Tab, label, tab)
+        .disabled(!enabled)
+        .into();
     #[cfg(not(all(feature = "agent", debug_assertions)))]
     tab.into()
 }
 
 fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
     let link = button(
-        container(text(label).font(SANS_SEMIBOLD).size(11).color(p.muted))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL).color(p.muted))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1609,9 +1733,28 @@ fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, 
 
 fn error_line<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     match state.error.as_deref() {
-        Some(error) => text(error).font(MONO).size(11.5).color(p.red).into(),
+        Some(error) => selectable_error(error, p),
         None => Space::new().height(0).into(),
     }
+}
+
+/// Error text the user can select and copy. iced 0.14 `text` is not
+/// selectable; a read-only `text_input` (no `on_input`) stays focusable and
+/// supports select + copy while rendering like the inline error it replaces.
+fn selectable_error<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
+    text_input("", message)
+        .font(MONO)
+        .size(BODY)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.red,
+            placeholder: p.red,
+            value: p.red,
+            selection: theme::ACCENTS[0],
+        })
+        .into()
 }
 
 fn word_cell<'a>(index: usize, word: &'a str, p: Palette) -> Element<'a, Message> {
@@ -1619,10 +1762,10 @@ fn word_cell<'a>(index: usize, word: &'a str, p: Palette) -> Element<'a, Message
         row![
             text(index.to_string())
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(p.muted_2)
                 .width(16),
-            text(word).font(MONO).size(12).color(p.ink),
+            text(word).font(MONO).size(BODY).color(p.ink),
         ]
         .spacing(6)
         .align_y(Alignment::Center),

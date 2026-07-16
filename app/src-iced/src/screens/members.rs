@@ -4,15 +4,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, image, row, scrollable, text, text_input,
+    Space, button, column, container, image, row, scrollable, text, text_input, tooltip,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{
+    self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM,
+    SANS, SANS_SEMIBOLD, TITLE,
+};
 
 const MAX_DISPLAY_NAME_LEN: usize = 64;
+
+/// Genesis-provenance policy copy. Genesis marks the founding cohort; it is a
+/// historical fact, not a live governance grant.
+const GENESIS_TOOLTIP: &str =
+    "Genesis marks a founding member. It records provenance only and confers no governance authority.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource<T> {
@@ -217,6 +226,11 @@ pub struct State {
     pub rename_draft: String,
     pub pending: Option<PendingAction>,
     pub busy: bool,
+    /// Which control has a write in flight — a normalized member key for row
+    /// actions, or the sentinels `"invite"` / `"admit"` for the admin cards.
+    /// Scopes the working state to the acting row instead of the whole surface.
+    pub in_flight: Option<String>,
+    pub invite_expanded: bool,
     pub error: Option<String>,
     pub copied: Option<String>,
 }
@@ -235,6 +249,8 @@ impl Default for State {
             rename_draft: String::new(),
             pending: None,
             busy: false,
+            in_flight: None,
+            invite_expanded: false,
             error: None,
             copied: None,
         }
@@ -253,6 +269,7 @@ pub enum Message {
     InviteeCodeChanged(String),
     JoinerKeyChanged(String),
     RevealInvite,
+    ToggleInviteFull,
     Copy { id: String, value: String },
     AdmitJoiner,
     ApproveJoin(String),
@@ -329,8 +346,13 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             }
             let key = valid_public_key(&state.invitee_code)?;
             state.busy = true;
+            state.in_flight = Some("invite".into());
             state.error = None;
             Some(Command::RevealInvite(key))
+        }
+        Message::ToggleInviteFull => {
+            state.invite_expanded = !state.invite_expanded;
+            None
         }
         Message::Copy { id, value } => {
             if value.is_empty() {
@@ -346,6 +368,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             let key = valid_public_key(&state.joiner_key)?;
             state.joiner_key.clear();
             state.busy = true;
+            state.in_flight = Some("admit".into());
             state.error = None;
             Some(Command::AdmitMember(key))
         }
@@ -355,6 +378,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             }
             let key = valid_public_key(&key)?;
             state.busy = true;
+            state.in_flight = Some(key.clone());
             state.error = None;
             Some(Command::AdmitMember(key))
         }
@@ -388,6 +412,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             }
             state.rename_key = None;
             state.busy = true;
+            state.in_flight = Some(key);
             state.error = None;
             Some(Command::SetDisplayName(next))
         }
@@ -412,6 +437,12 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             None
         }
         Message::ConfirmAction => {
+            // Only one member write in flight at a time. If one already is, keep
+            // the confirm card up (the Confirm button is disabled meanwhile) so
+            // the intent survives and submits once `busy` clears.
+            if state.busy {
+                return None;
+            }
             let pending = state.pending.take()?;
             let member = member_by_key(state, &pending.key)?;
             if !action_allowed(state, pending.action, member) {
@@ -424,6 +455,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
                 state.selected_key = None;
             }
             state.busy = true;
+            state.in_flight = Some(pending.key.clone());
             state.error = None;
             Some(match pending.action {
                 MemberAction::Demote => Command::DemoteMember(key),
@@ -458,10 +490,12 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
                 Err(error) => Resource::Error(error),
             };
             state.busy = false;
+            state.in_flight = None;
             consume_focus(state)
         }
         ServiceEvent::InviteRevealed(result) => {
             state.busy = false;
+            state.in_flight = None;
             match result {
                 Ok((blob, short)) => {
                     if let Resource::Ready(data) = &mut state.data {
@@ -476,6 +510,7 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
         }
         ServiceEvent::ActionFinished(result) => {
             state.busy = false;
+            state.in_flight = None;
             match result {
                 Ok(()) => Some(Command::Load),
                 Err(error) => {
@@ -534,7 +569,10 @@ fn can_admin(state: &State) -> bool {
 }
 
 fn action_allowed(state: &State, action: MemberAction, member: &Member) -> bool {
-    if !can_admin(state) || state.busy {
+    // Eligibility only — NOT `busy`. `AskAction` uses this to open a local
+    // confirm card (no write), so an unrelated in-flight write must not block it
+    // (M1). The actual write is serialized at `ConfirmAction`.
+    if !can_admin(state) {
         return false;
     }
     match action {
@@ -558,7 +596,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
         filter_bar(state, p),
         admin_actions(state, data, p),
         if let Some(pending) = &state.pending {
-            confirm_card(pending, p)
+            confirm_card(pending, state.busy, p)
         } else {
             Space::new().height(0).into()
         },
@@ -594,8 +632,8 @@ fn resource_view(resource: &Resource<MembersData>, p: Palette) -> Element<'_, Me
     };
     let mut body = column![
         icons::view(Icon::Members, 26.0, p.icon_idle),
-        text(title).font(SANS).size(13).color(p.ink),
-        text(detail).font(SANS).size(11.5).color(p.muted_2),
+        text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink),
+        text(detail).font(SANS).size(BODY).color(p.muted_2),
     ]
     .spacing(7)
     .align_x(Alignment::Center);
@@ -611,19 +649,28 @@ fn resource_view(resource: &Resource<MembersData>, p: Palette) -> Element<'_, Me
 }
 
 fn header(data: &MembersData, p: Palette) -> Element<'static, Message> {
+    let role_pill = pill(
+        data.workspace_role.clone(),
+        if data.can_admin { p.green } else { p.amber },
+        p,
+    );
+    let role_pill = if data.workspace_role.eq_ignore_ascii_case("genesis") {
+        tip(role_pill, GENESIS_TOOLTIP, p)
+    } else {
+        role_pill
+    };
     container(
         row![
-            text("Members").font(SANS).size(16).color(p.ink),
+            text("Members")
+                .font(SANS_SEMIBOLD)
+                .size(HEADING)
+                .color(p.ink),
             text(data.members.len())
                 .font(MONO)
-                .size(13)
+                .size(LABEL)
                 .color(p.muted_2),
             Space::new().width(Length::Fill),
-            pill(
-                data.workspace_role.clone(),
-                if data.can_admin { p.green } else { p.amber },
-                p
-            ),
+            role_pill,
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -649,16 +696,18 @@ fn filter_bar(state: &State, p: Palette) -> Element<'_, Message> {
         row![
             filters,
             Space::new().width(Length::Fill),
-            sem_input(
+            container(sem_input(
                 "Search",
                 &state.query,
                 text_input("Search name or key…", &state.query)
                     .on_input(Message::SearchChanged)
                     .font(SANS)
-                    .size(11.5)
+                    .size(BODY)
                     .padding([7, 10])
-                    .width(260),
-            ),
+                    .width(Length::Fill),
+            ))
+            .width(Length::Fill)
+            .max_width(260),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
@@ -672,7 +721,10 @@ fn admin_actions<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Ele
     let mut body = column![
         row![
             icons::view(Icon::Members, 13.0, p.muted_2),
-            text("ADMIN ACTIONS").font(MONO).size(9.5).color(p.muted_2),
+            text("ADMIN ACTIONS")
+                .font(SANS_SEMIBOLD)
+                .size(CAPTION)
+                .color(p.muted_2),
         ]
         .spacing(7)
         .align_y(Alignment::Center)
@@ -685,7 +737,7 @@ fn admin_actions<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Ele
         ));
     } else {
         if !data.pending_joins.is_empty() {
-            body = body.push(pending_joins(data, state.busy, p));
+            body = body.push(pending_joins(data, state.in_flight.as_deref(), p));
         }
         body = body.push(
             row![invite_card(state, data, p), admit_card(state, p)]
@@ -694,7 +746,7 @@ fn admin_actions<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Ele
         );
     }
     if let Some(error) = &state.error {
-        body = body.push(text(error).font(SANS).size(10.5).color(p.danger));
+        body = body.push(selectable_error(error, p));
     }
     container(body)
         .width(Length::Fill)
@@ -703,48 +755,58 @@ fn admin_actions<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Ele
         .into()
 }
 
-fn pending_joins(data: &MembersData, busy: bool, p: Palette) -> Element<'static, Message> {
+fn pending_joins(
+    data: &MembersData,
+    in_flight: Option<&str>,
+    p: Palette,
+) -> Element<'static, Message> {
     let mut rows = column![
         row![
             text("Joining Nodes")
-                .font(SANS)
-                .size(12.5)
+                .font(SANS_SEMIBOLD)
+                .size(TITLE)
                 .color(p.ink_soft),
             text(data.pending_joins.len())
                 .font(MONO)
-                .size(11)
+                .size(LABEL)
                 .color(p.muted_2),
             Space::new().width(Length::Fill),
             text("Invites redeem automatically; Approve forces the ballot manually.")
                 .font(SANS)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.muted_2),
         ]
         .spacing(8)
         .align_y(Alignment::Center)
     ];
     for request in &data.pending_joins {
+        let working = in_flight == Some(normalize_key(&request.joiner).as_str());
+        let action: Element<'static, Message> = if working {
+            working_pill("Approving…", p)
+        } else {
+            filled_button(
+                "Approve",
+                Message::ApproveJoin(request.joiner.clone()),
+                in_flight.is_none(),
+                p,
+            )
+        };
         rows = rows.push(
             container(
                 row![
                     column![
                         text(short_key(&request.joiner))
                             .font(MONO)
-                            .size(11.5)
+                            .size(LABEL)
                             .color(p.ink),
                         text(format!("invited by {}", short_key(&request.issuer)))
                             .font(SANS)
-                            .size(10.5)
+                            .size(CAPTION)
                             .color(p.muted_2),
                     ]
                     .spacing(1),
                     Space::new().width(Length::Fill),
-                    filled_button(
-                        "Approve",
-                        Message::ApproveJoin(request.joiner.clone()),
-                        !busy,
-                        p,
-                    ),
+                    action,
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
@@ -761,19 +823,29 @@ fn pending_joins(data: &MembersData, busy: bool, p: Palette) -> Element<'static,
 
 fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Element<'a, Message> {
     let valid = valid_public_key(&state.invitee_code).is_some();
-    let reveal_label = if data.invite_blob.is_some() {
-        "Refresh invite"
+    let revealing = state.in_flight.as_deref() == Some("invite");
+    let reveal: Element<'a, Message> = if revealing {
+        working_pill("Revealing…", p)
     } else {
-        "Reveal invite"
+        filled_button(
+            if data.invite_blob.is_some() {
+                "Refresh invite"
+            } else {
+                "Reveal invite"
+            },
+            Message::RevealInvite,
+            valid && !state.busy,
+            p,
+        )
     };
     let mut body = column![
-        text("Invite a Member")
-            .font(SANS)
-            .size(12.5)
+        text("Invite a member")
+            .font(SANS_SEMIBOLD)
+            .size(TITLE)
             .color(p.ink_soft),
         text("Paste the invitee's 64-hex join code, then reveal a fresh invite locked to that person.")
             .font(SANS)
-            .size(10.5)
+            .size(LABEL)
             .color(p.muted_2),
         row![
             sem_input(
@@ -782,16 +854,11 @@ fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
                 text_input("invitee join code (64 hex)", &state.invitee_code)
                     .on_input(Message::InviteeCodeChanged)
                     .font(MONO)
-                    .size(10.5)
+                    .size(LABEL)
                     .padding([8, 9])
                     .width(Length::Fill),
             ),
-            filled_button(
-                reveal_label,
-                Message::RevealInvite,
-                valid && !state.busy,
-                p
-            ),
+            reveal,
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -799,63 +866,102 @@ fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
     .spacing(9);
     if !state.invitee_code.trim().is_empty() && !valid {
         body = body.push(
-            text("a join code is 64 hex characters")
+            text("A join code is 64 hex characters.")
                 .font(SANS)
-                .size(10)
+                .size(CAPTION)
                 .color(p.muted_2),
         );
     }
     if let Some(blob) = &data.invite_blob {
-        let primary = data.invite_short.as_ref().unwrap_or(blob);
-        let mut actions = row![
-            Space::new().width(Length::Fill),
-            outline_button(
-                if data.invite_short.is_some() {
-                    "Copy link"
-                } else {
-                    "Copy invite"
-                },
-                Message::Copy {
-                    id: "invite".into(),
-                    value: primary.clone(),
-                },
-                true,
-                p,
-            ),
+        // Short link (when the coordinator minted one) is the primary, quiet
+        // value; the full blob lives behind a disclosure that works offline.
+        let primary = data.invite_short.as_deref().unwrap_or(blob.as_str());
+        let has_short = data.invite_short.is_some();
+        let mut primary_actions = row![Space::new().width(Length::Fill)]
+            .spacing(7)
+            .align_y(Alignment::Center);
+        if state.copied.as_deref() == Some("invite") {
+            primary_actions = primary_actions
+                .push(text("Copied").font(SANS).size(CAPTION).color(p.green));
+        }
+        primary_actions = primary_actions.push(outline_button(
+            if has_short { "Copy link" } else { "Copy invite" },
+            Message::Copy {
+                id: "invite".into(),
+                value: primary.to_string(),
+            },
+            true,
+            p,
+        ));
+        let mut block = column![
+            text(primary.to_string())
+                .font(MONO)
+                .size(LABEL)
+                .color(p.ink_soft)
+                .wrapping(Wrapping::WordOrGlyph)
+                .width(Length::Fill),
+            text(if has_short {
+                "One person, expires in 7 days. The full invite below works even if the coordinator restarts."
+            } else {
+                "Coordinator-free workspace invite."
+            })
+            .font(SANS)
+            .size(CAPTION)
+            .color(p.muted_2),
+            primary_actions,
         ]
         .spacing(7);
-        if data.invite_short.is_some() {
-            actions = actions.push(outline_button(
-                "Copy full invite",
-                Message::Copy {
-                    id: "invite-full".into(),
-                    value: blob.clone(),
-                },
-                true,
-                p,
-            ));
+        if has_short {
+            block = block.push(
+                bare_button(
+                    if state.invite_expanded {
+                        "Hide full invite"
+                    } else {
+                        "Full invite — works without the coordinator"
+                    },
+                    Message::ToggleInviteFull,
+                    p,
+                ),
+            );
+            if state.invite_expanded {
+                let mut full_actions = row![Space::new().width(Length::Fill)]
+                    .spacing(7)
+                    .align_y(Alignment::Center);
+                if state.copied.as_deref() == Some("invite-full") {
+                    full_actions = full_actions
+                        .push(text("Copied").font(SANS).size(CAPTION).color(p.green));
+                }
+                full_actions = full_actions.push(outline_button(
+                    "Copy full invite",
+                    Message::Copy {
+                        id: "invite-full".into(),
+                        value: blob.clone(),
+                    },
+                    true,
+                    p,
+                ));
+                block = block.push(
+                    container(
+                        column![
+                            text(blob.clone())
+                                .font(MONO)
+                                .size(LABEL)
+                                .color(p.ink_soft)
+                                .wrapping(Wrapping::WordOrGlyph)
+                                .width(Length::Fill),
+                            full_actions,
+                        ]
+                        .spacing(7),
+                    )
+                    .padding([8, 10])
+                    .style(move |_| rounded_surface(p.sunken, p.border_soft, RADIUS_SM)),
+                );
+            }
         }
         body = body.push(
-            container(
-                column![
-                    text(primary.clone())
-                        .font(MONO)
-                        .size(10.5)
-                        .color(p.ink_soft),
-                    text(if data.invite_short.is_some() {
-                        "One person, expires in 7 days. Full invite remains available without the coordinator."
-                    } else {
-                        "Coordinator-free workspace invite."
-                    })
-                    .font(SANS)
-                    .size(10)
-                    .color(p.muted_2),
-                    actions,
-                ]
-                .spacing(7),
-            )
-            .padding([10, 12])
-            .style(move |_| rounded_surface(p.paper, p.border_soft, RADIUS_SM)),
+            container(block)
+                .padding([10, 12])
+                .style(move |_| rounded_surface(p.paper, p.border_soft, RADIUS_SM)),
         );
     }
     card(body, p)
@@ -863,15 +969,21 @@ fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
 
 fn admit_card(state: &State, p: Palette) -> Element<'_, Message> {
     let valid = valid_public_key(&state.joiner_key).is_some();
+    let admitting = state.in_flight.as_deref() == Some("admit");
+    let admit: Element<'_, Message> = if admitting {
+        working_pill("Admitting…", p)
+    } else {
+        outline_button("Admit", Message::AdmitJoiner, valid && !state.busy, p)
+    };
     card(
         column![
-            text("Admit a Joiner")
-                .font(SANS)
-                .size(12.5)
+            text("Admit a joiner")
+                .font(SANS_SEMIBOLD)
+                .size(TITLE)
                 .color(p.ink_soft),
             text("Promote a parked workspace by its public key.")
                 .font(SANS)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.muted_2),
             row![
                 sem_input(
@@ -880,11 +992,11 @@ fn admit_card(state: &State, p: Palette) -> Element<'_, Message> {
                     text_input("Paste joiner public key…", &state.joiner_key)
                         .on_input(Message::JoinerKeyChanged)
                         .font(MONO)
-                        .size(11)
+                        .size(LABEL)
                         .padding([8, 9])
                         .width(Length::Fill),
                 ),
-                outline_button("Admit", Message::AdmitJoiner, valid && !state.busy, p,),
+                admit,
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -907,11 +1019,11 @@ fn member_list<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
                 icons::view(Icon::Members, 26.0, p.icon_idle),
                 text(format!("No {} to show.", state.filter.empty_label()))
                     .font(SANS)
-                    .size(12.5)
+                    .size(TITLE)
                     .color(p.muted_2),
                 text("This view only lists keys reported by the valset module.")
                     .font(SANS)
-                    .size(11)
+                    .size(LABEL)
                     .color(p.muted_2),
             ]
             .spacing(6)
@@ -931,14 +1043,14 @@ fn member_list<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
                 list = list.push(
                     container(
                         row![
-                            text(name).font(SANS).size(11.5).color(p.ink_soft),
+                            text(name).font(SANS_SEMIBOLD).size(LABEL).color(p.ink_soft),
                             text(format!(
                                 "{} device{}",
                                 members.len(),
                                 if members.len() == 1 { "" } else { "s" }
                             ))
                             .font(MONO)
-                            .size(9.5)
+                            .size(CAPTION)
                             .color(p.muted_2),
                         ]
                         .spacing(8),
@@ -1021,17 +1133,18 @@ fn member_row<'a>(
 ) -> Element<'a, Message> {
     let key = member.normalized_key();
     if state.rename_key.as_deref() == Some(key.as_str()) {
+        let rename_placeholder = short_key(&member.key);
         return container(
             row![
                 avatar(member, 32.0, p),
                 sem_input(
                     "device key",
                     &state.rename_draft,
-                    text_input("device key", &state.rename_draft)
+                    text_input(&rename_placeholder, &state.rename_draft)
                         .on_input(Message::RenameChanged)
                         .on_submit(Message::CommitRename)
                         .font(SANS)
-                        .size(13.5)
+                        .size(BODY)
                         .padding([7, 10])
                         .width(Length::Fill),
                 ),
@@ -1049,7 +1162,7 @@ fn member_row<'a>(
     let selected = state.selected_key.as_deref() == Some(key.as_str());
     let mut labels = row![].spacing(7).align_y(Alignment::Center);
     if member.is_founder {
-        labels = labels.push(pill("Genesis", p.ink, p));
+        labels = labels.push(tip(pill("Genesis", p.ink, p), GENESIS_TOOLTIP, p));
     }
     labels = labels.push(pill(
         member.tier.pill(),
@@ -1060,34 +1173,35 @@ fn member_row<'a>(
         },
         p,
     ));
+    let mut name_line = row![
+        text(if device_row {
+            short_key(&member.key)
+        } else {
+            member.display_name.clone()
+        })
+        .font(SANS_SEMIBOLD)
+        .size(BODY_LG)
+        .color(p.ink),
+    ]
+    .spacing(7)
+    .align_y(Alignment::Center);
+    if member.is_local {
+        name_line = name_line.push(pill("this node", p.blue, p));
+    }
     let open = button(
         row![
             avatar(member, 32.0, p),
             column![
-                row![
-                    text(if device_row {
-                        short_key(&member.key)
-                    } else {
-                        member.display_name.clone()
-                    })
-                    .font(SANS)
-                    .size(13.5)
-                    .color(p.ink),
-                    text(if member.is_local { "this node" } else { "" })
-                        .font(SANS)
-                        .size(9.5)
-                        .color(p.muted_2),
-                ]
-                .spacing(7),
+                name_line,
                 text(format!(
                     "{} · {}",
                     short_key(&member.key),
                     member.tier.status()
                 ))
                 .font(MONO)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.muted_2),
-                provider_line(member, p),
+                provider_chips(member, p),
             ]
             .spacing(3)
             .width(Length::Fill),
@@ -1121,43 +1235,50 @@ fn member_row<'a>(
     );
 
     let mut line = row![open].align_y(Alignment::Center);
-    if member.is_local && member.bound_account.is_some() {
-        line = line.push(
-            container(bare_button(
-                "Rename",
-                Message::BeginRename(member.key.clone()),
-                p,
-            ))
-            .padding([0, 12]),
-        );
-    }
-    if can_admin(state) && member.tier == Tier::Resident {
-        line = line
-            .push(filled_button(
-                "Promote",
-                Message::AskAction(MemberAction::Promote, member.key.clone()),
-                !state.busy,
-                p,
-            ))
-            .push(
-                container(outline_button(
-                    "Revoke",
-                    Message::AskAction(MemberAction::Revoke, member.key.clone()),
-                    !state.busy,
+    if state.in_flight.as_deref() == Some(key.as_str()) {
+        // Only the acting row shows a working state; the rest stay live (M1).
+        line = line.push(container(working_pill("Working…", p)).padding([0, 12]));
+    } else {
+        if member.is_local && member.bound_account.is_some() {
+            line = line.push(
+                container(bare_button(
+                    "Rename",
+                    Message::BeginRename(member.key.clone()),
                     p,
                 ))
                 .padding([0, 12]),
             );
-    } else if can_admin(state) && member.tier == Tier::Validator && !member.is_local {
-        line = line.push(
-            container(outline_button(
-                "Remove",
-                Message::AskAction(MemberAction::Demote, member.key.clone()),
-                !state.busy,
-                p,
-            ))
-            .padding([0, 12]),
-        );
+        }
+        // AskAction only opens the confirm card, so it stays enabled regardless
+        // of an unrelated in-flight write; the submit itself is still serialized.
+        if can_admin(state) && member.tier == Tier::Resident {
+            line = line
+                .push(filled_button(
+                    "Promote",
+                    Message::AskAction(MemberAction::Promote, member.key.clone()),
+                    true,
+                    p,
+                ))
+                .push(
+                    container(outline_button(
+                        "Revoke",
+                        Message::AskAction(MemberAction::Revoke, member.key.clone()),
+                        true,
+                        p,
+                    ))
+                    .padding([0, 12]),
+                );
+        } else if can_admin(state) && member.tier == Tier::Validator && !member.is_local {
+            line = line.push(
+                container(outline_button(
+                    "Remove",
+                    Message::AskAction(MemberAction::Demote, member.key.clone()),
+                    true,
+                    p,
+                ))
+                .padding([0, 12]),
+            );
+        }
     }
     container(line)
         .width(Length::Fill)
@@ -1165,28 +1286,52 @@ fn member_row<'a>(
         .into()
 }
 
-fn provider_line(member: &Member, p: Palette) -> Element<'static, Message> {
+fn provider_chips(member: &Member, p: Palette) -> Element<'static, Message> {
     if member.providers.is_empty() {
         return Space::new().height(0).into();
     }
-    text(
-        member
-            .providers
-            .iter()
-            .map(|provider| provider.label.as_str())
-            .collect::<Vec<_>>()
-            .join(" · "),
-    )
-    .font(MONO)
-    .size(9.5)
-    .color(p.muted_3)
-    .into()
+    let mut chips = row![].spacing(6).align_y(Alignment::Center);
+    for provider in &member.providers {
+        let mut chip = row![
+            text(provider.label.clone())
+                .font(SANS)
+                .size(CAPTION)
+                .color(p.ink_soft),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center);
+        if provider.models.len() > 1 {
+            chip = chip.push(
+                container(
+                    text(provider.models.len().to_string())
+                        .font(MONO)
+                        .size(CAPTION)
+                        .color(p.muted_2),
+                )
+                .padding([0, 4])
+                .style(move |_| rounded_surface(p.sunken, p.border_soft, RADIUS_SM)),
+            );
+        }
+        let chip = container(chip)
+            .padding([2, 7])
+            .style(move |_| rounded_surface(p.paper, p.border_soft, RADIUS_SM));
+        let models = if provider.models.is_empty() {
+            "default executor".to_string()
+        } else {
+            provider.models.join("\n")
+        };
+        chips = chips.push(tip(chip, models, p));
+    }
+    chips.wrap().into()
 }
 
 fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static, Message> {
     let header = container(
         row![
-            text("Member").font(SANS).size(13).color(p.ink),
+            text("Member")
+                .font(SANS_SEMIBOLD)
+                .size(TITLE)
+                .color(p.ink),
             Space::new().width(Length::Fill),
             bare_button("×", Message::CloseDetail, p),
         ]
@@ -1196,6 +1341,8 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
     .padding([0, 16])
     .align_y(Alignment::Center)
     .style(move |_| ruled_surface(p.sidebar, p.border_soft));
+
+    // 1. Identity — the only centered block (avatar, name, standing pills).
     let mut status = row![pill(
         if member.tier == Tier::Resident {
             "Resident standing"
@@ -1211,19 +1358,27 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
     )]
     .spacing(6);
     if member.is_founder {
-        status = status.push(pill("Genesis", p.ink, p));
+        status = status.push(tip(pill("Genesis", p.ink, p), GENESIS_TOOLTIP, p));
     }
-    let mut info = column![
+    let identity = column![
         avatar(member, 54.0, p),
         text(member.display_name.clone())
-            .font(SANS)
-            .size(16)
-            .color(p.ink),
+            .font(SANS_SEMIBOLD)
+            .size(HEADING)
+            .color(p.ink)
+            .wrapping(Wrapping::WordOrGlyph),
         status,
+    ]
+    .spacing(8)
+    .align_x(Alignment::Center);
+
+    // 2. Info grid — left-aligned; long hex values wrap inside the pane (B1).
+    let info = column![
         info_row(
             "profile",
             member.profile_name.as_deref().unwrap_or("not available"),
             None,
+            false,
             p
         ),
         info_row(
@@ -1233,43 +1388,50 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
                 id: "public-key".into(),
                 value: member.key.clone()
             }),
+            state.copied.as_deref() == Some("public-key"),
             p
         ),
-        info_row("short key", &short_key(&member.key), None, p),
-        info_row("role", &member.role, None, p),
-        info_row("kind", member.tier.kind(), None, p),
-        info_row("status", member.tier.status(), None, p),
+        info_row("short key", &short_key(&member.key), None, false, p),
+        info_row("role", &member.role, None, false, p),
+        info_row("kind", member.tier.kind(), None, false, p),
+        info_row("status", member.tier.status(), None, false, p),
         info_row(
             "genesis",
             if member.is_founder { "yes" } else { "no" },
             None,
+            false,
             p
         ),
         info_row(
             "this node",
             if member.is_local { "yes" } else { "no" },
             None,
+            false,
             p
         ),
-        info_row("presence", "not exposed by this node", None, p),
-        text("RUNS ON").font(MONO).size(9.5).color(p.muted_2),
     ]
-    .spacing(8)
-    .align_x(Alignment::Center);
+    .spacing(8);
+
+    // 3. Runs-on — left-aligned executor list.
+    let mut runs_on = column![text("RUNS ON")
+        .font(SANS_SEMIBOLD)
+        .size(CAPTION)
+        .color(p.muted_2)]
+    .spacing(8);
     if member.providers.is_empty() {
-        info = info.push(
+        runs_on = runs_on.push(
             text("No executors announced by this node.")
                 .font(SANS)
-                .size(11.5)
+                .size(LABEL)
                 .color(p.muted_2),
         );
     } else {
         for provider in &member.providers {
-            info = info.push(
+            runs_on = runs_on.push(
                 column![
                     text(provider.label.clone())
                         .font(SANS)
-                        .size(11.5)
+                        .size(BODY)
                         .color(p.ink_soft),
                     text(if provider.models.is_empty() {
                         "default executor".into()
@@ -1277,19 +1439,20 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
                         provider.models.join(" · ")
                     })
                     .font(MONO)
-                    .size(10)
-                    .color(p.muted_3),
+                    .size(LABEL)
+                    .color(p.muted_3)
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .width(Length::Fill),
                 ]
                 .spacing(4),
             );
         }
     }
-    if state.copied.as_deref() == Some("public-key") {
-        info = info.push(text("Copied").font(SANS).size(10).color(p.green));
-    }
+
+    let body = column![identity, info, runs_on].spacing(18);
     container(column![
         header,
-        scrollable(container(info).padding([18, 16]))
+        scrollable(container(body).padding([18, 16]))
     ])
     .width(332)
     .height(Length::Fill)
@@ -1297,7 +1460,7 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
     .into()
 }
 
-fn confirm_card(pending: &PendingAction, p: Palette) -> Element<'static, Message> {
+fn confirm_card(pending: &PendingAction, busy: bool, p: Palette) -> Element<'static, Message> {
     container(
         row![
             column![
@@ -1306,21 +1469,23 @@ fn confirm_card(pending: &PendingAction, p: Palette) -> Element<'static, Message
                     pending.action.title(),
                     pending.display_name
                 ))
-                .font(SANS)
-                .size(14)
+                .font(SANS_SEMIBOLD)
+                .size(BODY_LG)
                 .color(p.ink),
                 text(pending.action.detail())
                     .font(SANS)
-                    .size(11.5)
+                    .size(BODY)
                     .color(p.muted_3),
             ]
             .spacing(5)
             .width(Length::Fill),
             outline_button("Cancel", Message::CancelAction, true, p),
+            // Disabled while a write is in flight so the enabled state matches
+            // `ConfirmAction`'s `busy` guard — no live-but-inert control (M1).
             if pending.action == MemberAction::Promote {
-                filled_button(pending.action.confirm(), Message::ConfirmAction, true, p)
+                filled_button(pending.action.confirm(), Message::ConfirmAction, !busy, p)
             } else {
-                danger_button(pending.action.confirm(), Message::ConfirmAction, true, p)
+                danger_button(pending.action.confirm(), Message::ConfirmAction, !busy, p)
             },
         ]
         .spacing(10)
@@ -1336,17 +1501,22 @@ fn info_row(
     label: &str,
     value: &str,
     action: Option<Message>,
+    copied: bool,
     p: Palette,
 ) -> Element<'static, Message> {
     let mut value_row = row![
-        Space::new().width(Length::Fill),
         text(value.to_string())
             .font(MONO)
-            .size(11)
-            .color(p.ink_soft),
+            .size(LABEL)
+            .color(p.ink_soft)
+            .wrapping(Wrapping::WordOrGlyph)
+            .width(Length::Fill),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    if copied {
+        value_row = value_row.push(text("Copied").font(SANS).size(CAPTION).color(p.green));
+    }
     if let Some(message) = action {
         value_row = value_row.push(outline_button("Copy", message, true, p));
     }
@@ -1354,7 +1524,7 @@ fn info_row(
         row![
             text(label.to_string())
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(p.muted_2)
                 .width(82),
             value_row,
@@ -1383,27 +1553,44 @@ fn avatar(member: &Member, size: f32, p: Palette) -> Element<'static, Message> {
         .style(move |_| rounded_surface(p.sunken, p.border, 999.0))
         .into();
     }
+    // Founder → filled graphite; local node → accent tint; else a quiet chip.
+    let (bg, fg) = if member.is_founder {
+        (p.filled, p.on_filled)
+    } else if member.is_local {
+        (p.chip, p.ink)
+    } else {
+        (p.sunken, p.ink_soft)
+    };
     container(
         text(if member.initials.is_empty() {
             "?".into()
         } else {
             member.initials.clone()
         })
-        .font(SANS)
+        .font(SANS_SEMIBOLD)
         .size(size * 0.34)
-        .color(p.ink_soft),
+        .color(fg),
     )
     .width(size)
     .height(size)
     .center(Length::Fill)
-    .style(move |_| rounded_surface(p.sunken, p.border, 999.0))
+    .style(move |_| rounded_surface(bg, p.border, 999.0))
     .into()
 }
 
 fn pill(label: impl ToString, tone: Color, p: Palette) -> Element<'static, Message> {
-    container(text(label.to_string()).font(SANS).size(10.5).color(tone))
+    container(text(label.to_string()).font(SANS).size(CAPTION).color(tone))
         .padding([3, 8])
         .style(move |_| rounded_surface(p.paper, tone, RADIUS_SM))
+        .into()
+}
+
+/// In-flight marker shown in place of a row's action button while its own write
+/// is pending — scopes the "working" state to the acting row (M1).
+fn working_pill(label: &'static str, p: Palette) -> Element<'static, Message> {
+    container(text(label).font(SANS).size(LABEL).color(p.amber))
+        .padding([7, 12])
+        .style(move |_| rounded_surface(p.sunken, p.border_soft, RADIUS_SM))
         .into()
 }
 
@@ -1411,7 +1598,7 @@ fn notice(copy: &'static str, p: Palette) -> Element<'static, Message> {
     container(
         row![
             icons::view(Icon::Node, 15.0, p.amber),
-            text(copy).font(SANS).size(12).color(p.amber),
+            text(copy).font(SANS).size(BODY).color(p.amber),
         ]
         .spacing(9)
         .align_y(Alignment::Center),
@@ -1427,6 +1614,46 @@ fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Me
         .width(Length::Fill)
         .padding([12, 13])
         .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_LG))
+        .into()
+}
+
+/// Native hover tooltip carrying policy copy or a full value the row truncates.
+fn tip<'a>(
+    control: impl Into<Element<'a, Message>>,
+    label: impl ToString,
+    p: Palette,
+) -> Element<'a, Message> {
+    tooltip(
+        control,
+        container(
+            text(label.to_string())
+                .font(SANS)
+                .size(CAPTION)
+                .color(p.ink),
+        )
+        .padding([4, 8])
+        .style(move |_| rounded_surface(p.paper, p.border, 6.0)),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
+/// A read-only `text_input` — focusable and selectable so a member can copy an
+/// error, but never editable. Mirrors the `workspace.rs` `selectable_error`.
+fn selectable_error(message: &str, p: Palette) -> Element<'static, Message> {
+    text_input("", message)
+        .font(SANS)
+        .size(LABEL)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.danger,
+            placeholder: p.danger,
+            value: p.danger,
+            selection: theme::ACCENTS[0],
+        })
         .into()
 }
 
@@ -1457,7 +1684,7 @@ fn segment_button<'a>(
     message: Message,
     p: Palette,
 ) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(11.5))
+    let btn = button(text(label).font(SANS).size(LABEL))
         .padding([5, 11])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.chip } else { p.paper })),
@@ -1476,7 +1703,7 @@ fn segment_button<'a>(
 }
 
 fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(11.5).color(p.muted_3))
+    let btn = button(text(label).font(SANS).size(LABEL).color(p.muted_3))
         .padding(6)
         .style(|_, _| iced::widget::button::Style::default())
         .on_press(message);
@@ -1492,7 +1719,7 @@ fn outline_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(11.5))
+    let control = button(text(label).font(SANS).size(BODY))
         .padding([7, 12])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -1504,7 +1731,7 @@ fn outline_button<'a>(
             )),
             text_color: if enabled { p.ink_soft } else { p.muted_2 },
             border: Border {
-                color: p.border_strong,
+                color: if enabled { p.border_strong } else { p.border_soft },
                 width: 1.0,
                 radius: RADIUS_SM.into(),
             },
@@ -1529,7 +1756,7 @@ fn filled_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(11.5))
+    let control = button(text(label).font(SANS).size(BODY))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if enabled { p.filled } else { p.sunken })),
@@ -1560,7 +1787,7 @@ fn danger_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(11.5))
+    let control = button(text(label).font(SANS).size(BODY))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if enabled { p.danger } else { p.sunken })),

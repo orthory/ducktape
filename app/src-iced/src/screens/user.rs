@@ -299,11 +299,6 @@ pub enum Command {
         size: u64,
         snapshot: Option<String>,
     },
-    BeginFileDragOut {
-        path: String,
-        size: u64,
-        snapshot: Option<String>,
-    },
     DeleteFile(String),
     LoadFileDiff {
         from: String,
@@ -332,7 +327,6 @@ pub enum ServiceEvent {
     FilesLoaded(Result<Option<FileListing>, String>),
     FileLoaded(Result<FilePreview, String>),
     FileDiffLoaded(Result<Vec<FileDiff>, String>),
-    FileDragOutUnavailable(String),
     LinkStarted(Result<LinkSession, String>),
     LinkPolled(Result<Option<LinkReplyPreview>, String>),
     ResponderChallengeResolved(Result<LinkResponderSession, String>),
@@ -524,15 +518,6 @@ fn file_effect(effect: file_browser::Effect) -> Command {
             size,
             snapshot,
         },
-        file_browser::Effect::BeginDragOut {
-            path,
-            size,
-            snapshot,
-        } => Command::BeginFileDragOut {
-            path,
-            size,
-            snapshot,
-        },
         file_browser::Effect::Delete(path) => Command::DeleteFile(path),
         file_browser::Effect::CompareSnapshot { from, to, prefix } => {
             Command::LoadFileDiff { from, to, prefix }
@@ -691,12 +676,12 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
                 return Some(page_effect(effect));
             }
         }
-        ServiceEvent::FilesLoaded(result) => file_browser::loaded(&mut state.files, result),
+        ServiceEvent::FilesLoaded(result) => {
+            // A freshly loaded snapshot listing auto-diffs against live head.
+            return file_browser::loaded(&mut state.files, result).map(file_effect);
+        }
         ServiceEvent::FileLoaded(result) => file_browser::preview_loaded(&mut state.files, result),
         ServiceEvent::FileDiffLoaded(result) => file_browser::diff_loaded(&mut state.files, result),
-        ServiceEvent::FileDragOutUnavailable(reason) => {
-            file_browser::drag_out_unavailable(&mut state.files, reason)
-        }
         ServiceEvent::LinkStarted(result) => {
             state.home.account.busy = false;
             match result {
@@ -1663,6 +1648,8 @@ mod tests {
             kind: FileKind::File,
             size: 42,
             executable: false,
+            object: String::new(),
+            meta: Default::default(),
         };
         assert_eq!(
             update(

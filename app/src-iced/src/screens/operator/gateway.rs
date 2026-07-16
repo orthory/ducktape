@@ -256,6 +256,11 @@ pub(super) fn update(state: &mut GatewayState, message: GatewayMessage) -> Optio
                 state.note = Some(error);
                 return None;
             }
+            // Busy-guard the trigger so a slow write can't be double-submitted;
+            // the discriminated StarterCreated outcome clears it and, crucially,
+            // does not reload — the editor draft the operator will Save survives.
+            state.busy = true;
+            state.note = None;
             return Some(Command::CreateGatewayStarter(state.draft.clone()));
         }
         GatewayMessage::Save => {
@@ -349,22 +354,27 @@ pub(super) fn view(state: &GatewayState, p: Palette) -> Element<'_, Message> {
         let selected = state.selected.as_deref() == Some(route.key.as_str());
         let entry = button(row![
                 column![
-                    text(&route.address).font(MONO).size(10.5).color(p.ink),
+                    text(&route.address)
+                        .font(MONO)
+                        .size(LABEL)
+                        .color(p.ink)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill),
                     text(if selected {
                         state.health.label()
                     } else {
                         "Published".into()
                     })
                     .font(SANS)
-                    .size(9.5)
+                    .size(CAPTION)
                     .color(if selected {
                         health_color(state.health, p)
                     } else {
                         p.muted
                     }),
                 ]
-                .spacing(3),
-                Space::new().width(Length::Fill),
+                .spacing(3)
+                .width(Length::Fill),
                 column![
                     text(format!(
                         "{} · {}",
@@ -376,16 +386,17 @@ pub(super) fn view(state: &GatewayState, p: Palette) -> Element<'_, Message> {
                         }
                     ))
                     .font(SANS)
-                    .size(9.5)
+                    .size(CAPTION)
                     .color(p.muted_3),
                     text(format!("r{}", route.revision))
                         .font(MONO)
-                        .size(9)
+                        .size(CAPTION)
                         .color(p.muted),
                 ]
                 .spacing(3)
                 .align_x(Alignment::End),
-            ])
+            ]
+            .spacing(10))
             .width(Length::Fill)
             .padding([8, 9])
             .style(move |_, _| iced::widget::button::Style {
@@ -410,9 +421,9 @@ pub(super) fn view(state: &GatewayState, p: Palette) -> Element<'_, Message> {
     let can_mutate =
         data.desktop_signer && data.account_bound && data.managed_workspace && !state.busy;
     let editor = gateway_editor(state, can_mutate, p);
-    let header = screen_header("Gateway", Some(data.routes.len()), p);
+    let header = section_header("Gateway", Some(data.routes.len()), None, p);
     let intro = text("Connect one account address to exact DuckFS content or a local HTTP service. The address, reverse proxy, and signed access policy are saved together.")
-        .font(SANS).size(11).color(p.muted_3);
+        .font(SANS).size(BODY).color(p.muted_3);
     let mut body = column![intro, route_rows, divider(p), editor].spacing(14);
     if data.handle.is_none() && data.account_bound {
         body = body.push(notice("Routes can exist by Account ID. Register a Duck name in Account to make them browsable as .duck addresses.", p));
@@ -508,7 +519,7 @@ fn gateway_editor(state: &GatewayState, can_mutate: bool, p: Palette) -> Element
 
     let mut fields = column![
         row![
-            text(title).font(SANS).size(13).color(p.ink),
+            text(title).font(SANS_SEMIBOLD).size(BODY_LG).color(p.ink),
             Space::new().width(Length::Fill),
             outline_button(
                 "New route",
@@ -523,9 +534,14 @@ fn gateway_editor(state: &GatewayState, can_mutate: bool, p: Palette) -> Element
             draft.revision.map_or_else(|| "—".into(), |v| v.to_string())
         ))
         .font(MONO)
-        .size(9)
+        .size(CAPTION)
         .color(p.muted),
-        text(&draft.address).font(MONO).size(10.5).color(p.ink_soft),
+        text(&draft.address)
+            .font(MONO)
+            .size(LABEL)
+            .color(p.ink_soft)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .width(Length::Fill),
         labeled_input(
             "Route label · blank = account apex",
             "api",
@@ -536,17 +552,17 @@ fn gateway_editor(state: &GatewayState, can_mutate: bool, p: Palette) -> Element
     ]
     .spacing(9);
     if let Some(error) = label_error {
-        fields = fields.push(text(error).font(SANS).size(9.5).color(p.danger));
+        fields = fields.push(text(error).font(SANS).size(CAPTION).color(p.danger));
     }
     fields = fields
-        .push(text("SOURCE").font(MONO).size(9).color(p.muted_2))
+        .push(text("SOURCE").font(MONO).size(CAPTION).color(p.muted_2))
         .push(targets)
-        .push(text("AUDIENCE").font(MONO).size(9).color(p.muted_2))
+        .push(text("AUDIENCE").font(MONO).size(CAPTION).color(p.muted_2))
         .push(audiences)
         .push(
             text(draft.audience.label())
                 .font(SANS)
-                .size(10.5)
+                .size(BODY)
                 .color(p.muted_3),
         );
 
@@ -586,7 +602,7 @@ fn gateway_editor(state: &GatewayState, can_mutate: bool, p: Palette) -> Element
                 |value| Message::Gateway(GatewayMessage::PortChanged(value)),
                 p,
             ))
-            .push(text("ALLOWED METHODS").font(MONO).size(9).color(p.muted_2))
+            .push(text("ALLOWED METHODS").font(MONO).size(CAPTION).color(p.muted_2))
             .push(methods)
             .push(toggle_button(
                 "Allow explicit Authorization forwarding",
@@ -622,7 +638,7 @@ fn gateway_editor(state: &GatewayState, can_mutate: bool, p: Palette) -> Element
             row![
                 text(state.health.label())
                     .font(SANS)
-                    .size(10)
+                    .size(CAPTION)
                     .color(health_color(state.health, p)),
                 Space::new().width(Length::Fill),
                 outline_button(

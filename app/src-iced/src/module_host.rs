@@ -405,7 +405,6 @@ fn is_files_command(command: &user::Command) -> bool {
             | user::Command::UploadDropped { .. }
             | user::Command::LoadSnapshot { .. }
             | user::Command::DownloadFile { .. }
-            | user::Command::BeginFileDragOut { .. }
             | user::Command::DeleteFile(_)
             | user::Command::LoadFileDiff { .. }
     )
@@ -466,7 +465,6 @@ fn is_files_event(event: &user::ServiceEvent) -> bool {
         user::ServiceEvent::FilesLoaded(_)
             | user::ServiceEvent::FileLoaded(_)
             | user::ServiceEvent::FileDiffLoaded(_)
-            | user::ServiceEvent::FileDragOutUnavailable(_)
             | user::ServiceEvent::ActionFinished {
                 screen: user::Screen::Files,
                 ..

@@ -3,10 +3,13 @@
 //! Settings keeps console preferences and workspace lifecycle. Account identity,
 //! membership, and daemon details remain links to their canonical screens.
 
-use iced::widget::{Button, Column, Space, button, column, container, row, scrollable, text};
+use iced::widget::{Button, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{
+    self, BODY, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS,
+    SANS_SEMIBOLD, TITLE,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource<T> {
@@ -326,15 +329,26 @@ pub fn view(state: &State) -> Element<'_, Message> {
         return resource_view(&state.data, p);
     };
 
+    let mut header = row![
+        text("Settings")
+            .font(SANS_SEMIBOLD)
+            .size(HEADING)
+            .color(p.ink)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    if state.saving {
+        header = header.push(text("Saving…").font(SANS).size(CAPTION).color(p.muted_2));
+    }
+
     let mut content = column![
-        text("Settings").font(SANS).size(16).color(p.ink),
+        header,
         section_label("ACCOUNT", false, p),
         group_card(
-            column![control_row(
+            vec![control_row(
                 "Your account",
                 "Display name, recovery phrase, linked devices, and your nodes.",
-                outline_button("Open Account", Message::OpenAccount, true, p),
-                true,
+                outline_button("Open account", Message::OpenAccount, true, p),
                 p,
             )],
             p,
@@ -360,16 +374,26 @@ pub fn view(state: &State) -> Element<'_, Message> {
         content = content.push(confirm_card(action, data, p));
     }
     content = content.push(Space::new().height(22));
-    container(scrollable(container(content).padding(22)))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| surface(p.canvas))
-        .into()
+
+    container(
+        scrollable(container(content).padding(22))
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(10)
+                    .scroller_width(4)
+                    .margin(3),
+            ))
+            .style(scrollbar_style(p)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(move |_| surface(p.canvas))
+    .into()
 }
 
 fn preferences_card(state: &State, p: Palette) -> Element<'_, Message> {
     let mut accents = row![].spacing(7).align_y(Alignment::Center);
-    for index in 0..5 {
+    for index in 0..theme::ACCENTS.len() {
         accents = accents.push(accent_button(
             index,
             state.accent == index,
@@ -378,7 +402,7 @@ fn preferences_card(state: &State, p: Palette) -> Element<'_, Message> {
         ));
     }
     group_card(
-        column![
+        vec![
             control_row(
                 "Theme",
                 "Dark mode",
@@ -386,17 +410,15 @@ fn preferences_card(state: &State, p: Palette) -> Element<'_, Message> {
                     state.mode == theme::Mode::Dark,
                     Message::ToggleTheme,
                     true,
-                    accent_color(state.accent, p),
+                    accent_color(state.accent),
                     p,
                 ),
-                false,
                 p,
             ),
             control_row(
                 "Accent",
                 "Used for active navigation, focus, and primary controls.",
                 accents,
-                true,
                 p,
             ),
         ],
@@ -409,8 +431,8 @@ fn notifications_card<'a>(
     data: &'a SettingsData,
     p: Palette,
 ) -> Element<'a, Message> {
-    let accent = accent_color(state.accent, p);
-    let mut rows = column![control_row(
+    let accent = accent_color(state.accent);
+    let mut rows: Vec<Element<'a, Message>> = vec![control_row(
         "Enable notifications",
         "Allow Ducktape to send native desktop notifications.",
         switch_button(
@@ -420,32 +442,28 @@ fn notifications_card<'a>(
             accent,
             p,
         ),
-        false,
         p,
     )];
-    let visible: Vec<_> = NotificationCategory::ALL
+    let categories = NotificationCategory::ALL
         .into_iter()
-        .filter(|category| !data.client_mode || *category != NotificationCategory::Governance)
-        .collect();
-    for (index, category) in visible.iter().enumerate() {
-        let last = index == visible.len() - 1 && data.active_channel.is_none();
-        rows = rows.push(control_row(
+        .filter(|category| !data.client_mode || *category != NotificationCategory::Governance);
+    for category in categories {
+        rows.push(control_row(
             category.title(),
             category.detail(),
             switch_button(
-                state.notifications.get(*category),
-                Message::ToggleCategory(*category),
+                state.notifications.get(category),
+                Message::ToggleCategory(category),
                 state.notifications.enabled,
                 accent,
                 p,
             ),
-            last,
             p,
         ));
     }
     if let Some(channel) = &data.active_channel {
         let muted = state.notifications.muted_channels.contains(channel);
-        rows = rows.push(control_row(
+        rows.push(control_row(
             if muted {
                 "Unmute current channel"
             } else {
@@ -463,7 +481,6 @@ fn notifications_card<'a>(
                 accent,
                 p,
             ),
-            true,
             p,
         ));
     }
@@ -471,17 +488,15 @@ fn notifications_card<'a>(
 }
 
 fn network_card(data: &SettingsData, p: Palette) -> Element<'_, Message> {
-    let mut rows = column![
+    let mut rows: Vec<Element<'_, Message>> = vec![
         info_row(
             "Network name",
             data.workspace_name.as_deref().unwrap_or("Remote node"),
-            false,
             p,
         ),
         info_row(
             "Network ID",
             data.network_id.as_deref().unwrap_or("not available"),
-            false,
             p,
         ),
         control_row(
@@ -492,25 +507,22 @@ fn network_card(data: &SettingsData, p: Palette) -> Element<'_, Message> {
                 "Create, join, or select another local network."
             },
             outline_button("Networks", Message::OpenNetworks, true, p),
-            data.client_mode && !data.can_control_node,
             p,
         ),
     ];
     if !data.client_mode {
-        rows = rows.push(control_row(
+        rows.push(control_row(
             "Members & invites",
             "Invite, admit, and manage members from the Members view.",
-            outline_button("Open Members", Message::OpenMembers, true, p),
-            !data.can_control_node,
+            outline_button("Open members", Message::OpenMembers, true, p),
             p,
         ));
     }
     if data.can_control_node {
-        rows = rows.push(control_row(
+        rows.push(control_row(
             "Node & daemon",
             "Start or stop the daemon and inspect ports, data dir, and quorum from the Node view.",
-            outline_button("Open Node", Message::OpenNode, true, p),
-            true,
+            outline_button("Open node", Message::OpenNode, true, p),
             p,
         ));
     }
@@ -556,11 +568,7 @@ fn danger_zone<'a>(state: &'a State, data: &'a SettingsData, p: Palette) -> Elem
     rows.into()
 }
 
-fn confirm_card(
-    action: DangerAction,
-    data: &SettingsData,
-    p: Palette,
-) -> Element<'static, Message> {
+fn confirm_card(action: DangerAction, data: &SettingsData, p: Palette) -> Element<'static, Message> {
     let name = data.workspace_name.as_deref().unwrap_or("this workspace");
     let (title, detail) = match action {
         DangerAction::Leave => (
@@ -578,11 +586,11 @@ fn confirm_card(
     };
     container(
         column![
-            text(title).font(SANS).size(14).color(p.ink),
-            text(detail).font(SANS).size(11.5).color(p.muted_3),
+            text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink),
+            text(detail).font(SANS).size(BODY).color(p.muted_3),
             row![
                 outline_button("Cancel", Message::CancelDanger, true, p),
-                danger_button(action.confirm_label(), Message::ConfirmDanger, true, p,),
+                danger_button(action.confirm_label(), Message::ConfirmDanger, true, p),
             ]
             .spacing(7),
         ]
@@ -595,23 +603,30 @@ fn confirm_card(
 }
 
 fn resource_view<'a>(resource: &'a Resource<SettingsData>, p: Palette) -> Element<'a, Message> {
-    let (title, detail, retry) = match resource {
+    let (title, detail, retry, is_error) = match resource {
         Resource::Loading => (
             "Loading Settings",
             "Reading preferences and workspace state…",
+            false,
             false,
         ),
         Resource::Empty => (
             "No active network",
             "Choose a network before opening Settings.",
             true,
+            false,
         ),
-        Resource::Error(error) => ("Settings unavailable", error.as_str(), true),
+        Resource::Error(error) => ("Settings unavailable", error.as_str(), true, true),
         Resource::Ready(_) => unreachable!(),
     };
+    let detail: Element<'a, Message> = if is_error {
+        selectable_error(detail, p)
+    } else {
+        text(detail).font(SANS).size(BODY).color(p.muted_2).into()
+    };
     let mut body = column![
-        text(title).font(SANS).size(15).color(p.ink),
-        text(detail).font(SANS).size(11.5).color(p.muted_2),
+        text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink),
+        detail,
     ]
     .spacing(8)
     .align_x(Alignment::Center);
@@ -632,8 +647,8 @@ fn resource_view<'a>(resource: &'a Resource<SettingsData>, p: Palette) -> Elemen
 fn section_label(label: &'static str, danger: bool, p: Palette) -> Element<'static, Message> {
     let heading = container(
         text(label)
-            .font(MONO)
-            .size(9)
+            .font(SANS_SEMIBOLD)
+            .size(CAPTION)
             .color(if danger { p.danger } else { p.muted_2 }),
     )
     .padding([11, 0]);
@@ -643,10 +658,26 @@ fn section_label(label: &'static str, danger: bool, p: Palette) -> Element<'stat
     heading.into()
 }
 
-fn group_card<'a>(content: Column<'a, Message>, p: Palette) -> Element<'a, Message> {
-    container(content)
+/// One card owns the frame; rows are borderless and separated by a 1px filled
+/// divider — never a 4-side `Border` painted per row.
+fn group_card<'a>(rows: Vec<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
+    let count = rows.len();
+    let mut body = column![].width(Length::Fill);
+    for (index, element) in rows.into_iter().enumerate() {
+        body = body.push(element);
+        if index + 1 < count {
+            body = body.push(divider(p));
+        }
+    }
+    container(body)
         .width(Length::Fill)
         .style(move |_| rounded_surface(p.paper, p.border, RADIUS_LG))
+        .into()
+}
+
+fn divider(p: Palette) -> Element<'static, Message> {
+    container(Space::new().width(Length::Fill).height(1))
+        .style(move |_| surface(p.border_soft))
         .into()
 }
 
@@ -654,16 +685,15 @@ fn control_row<'a>(
     title: &'a str,
     detail: &'a str,
     control: impl Into<Element<'a, Message>>,
-    last: bool,
     p: Palette,
 ) -> Element<'a, Message> {
     container(
         row![
             column![
-                text(title).font(SANS).size(12.5).color(p.ink_soft),
-                text(detail).font(SANS).size(10.5).color(p.muted_2),
+                text(title).font(SANS).size(BODY).color(p.ink_soft),
+                text(detail).font(SANS).size(CAPTION).color(p.muted_2),
             ]
-            .spacing(2),
+            .spacing(3),
             Space::new().width(Length::Fill),
             control.into(),
         ]
@@ -672,23 +702,20 @@ fn control_row<'a>(
     )
     .width(Length::Fill)
     .padding([13, 15])
-    .style(move |_| row_surface(last, p))
     .into()
 }
 
-fn info_row<'a>(label: &'a str, value: &'a str, last: bool, p: Palette) -> Element<'a, Message> {
+fn info_row<'a>(label: &'a str, value: &'a str, p: Palette) -> Element<'a, Message> {
     container(
         row![
-            text(label).font(SANS).size(12.5).color(p.ink_soft),
-            Space::new().width(Length::Fill),
-            text(value).font(MONO).size(12).color(p.muted),
+            text(label).font(SANS).size(BODY).color(p.ink_soft),
+            selectable_value(value, p),
         ]
         .spacing(16)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .padding([13, 15])
-    .style(move |_| row_surface(last, p))
     .into()
 }
 
@@ -703,10 +730,10 @@ fn danger_row<'a>(
     container(
         row![
             column![
-                text(title).font(SANS).size(12.5).color(p.ink_soft),
-                text(detail).font(SANS).size(10.5).color(p.muted_2),
+                text(title).font(SANS).size(BODY).color(p.ink_soft),
+                text(detail).font(SANS).size(CAPTION).color(p.muted_2),
             ]
-            .spacing(2),
+            .spacing(3),
             Space::new().width(Length::Fill),
             danger_button(label, message, enabled, p),
         ]
@@ -719,6 +746,9 @@ fn danger_row<'a>(
     .into()
 }
 
+/// The pill switch. Disabled reads disabled: recessed track, muted ink, soft
+/// border, no accent, no press — so a category switch is unmistakably inert
+/// while notifications are off.
 fn switch_button<'a>(
     checked: bool,
     message: Message,
@@ -726,29 +756,31 @@ fn switch_button<'a>(
     accent: Color,
     p: Palette,
 ) -> Element<'a, Message> {
+    let (track, border_color, ink) = if !enabled {
+        (p.sunken, p.border_soft, p.muted_2)
+    } else if checked {
+        (accent, accent, p.paper)
+    } else {
+        (p.paper, p.border_strong, p.muted_2)
+    };
     let button = button(
         row![
-            container(Space::new().width(12).height(12)).style(move |_| {
-                rounded_surface(
-                    if checked { p.paper } else { p.muted_2 },
-                    Color::TRANSPARENT,
-                    99.0,
-                )
-            }),
+            container(Space::new().width(12).height(12))
+                .style(move |_| rounded_surface(ink, Color::TRANSPARENT, 99.0)),
             text(if checked { "ON" } else { "OFF" })
                 .font(MONO)
-                .size(8)
-                .color(if checked { p.paper } else { p.muted_2 }),
+                .size(CAPTION)
+                .color(ink),
         ]
         .spacing(4)
         .align_y(Alignment::Center),
     )
     .padding([3, 6])
     .style(move |_, _| iced::widget::button::Style {
-        background: Some(Background::Color(if checked { accent } else { p.paper })),
-        text_color: p.ink,
+        background: Some(Background::Color(track)),
+        text_color: ink,
         border: Border {
-            color: if checked { accent } else { p.border_strong },
+            color: border_color,
             width: 1.0,
             radius: 99.0.into(),
         },
@@ -777,7 +809,7 @@ fn accent_button<'a>(
     message: Message,
     p: Palette,
 ) -> Button<'a, Message> {
-    let color = accent_color(index, p);
+    let color = accent_color(index);
     button(Space::new().width(14).height(14))
         .padding(3)
         .style(move |_, _| iced::widget::button::Style {
@@ -799,7 +831,7 @@ fn outline_button<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(11.5))
+    let button = button(text(label.clone()).font(SANS).size(LABEL))
         .padding([7, 13])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -841,11 +873,11 @@ fn danger_button<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(11.5))
+    let button = button(text(label.clone()).font(SANS).size(LABEL))
         .padding([8, 15])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if enabled {
-                p.red
+                p.danger
             } else {
                 p.border_soft
             })),
@@ -870,11 +902,90 @@ fn danger_button<'a>(
 }
 
 fn error_banner<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.danger))
+    container(
+        text_input("", copy)
+            .font(SANS)
+            .size(BODY)
+            .padding(0)
+            .width(Length::Fill)
+            .style(move |_, _| selectable_style(p, p.danger)),
+    )
+    .width(Length::Fill)
+    .padding([10, 13])
+    .style(move |_| rounded_surface(p.danger_soft, p.danger_border, RADIUS_MD))
+    .into()
+}
+
+/// A read-only, selectable info value (network id, network name). Right-aligned
+/// mono; a long unbreakable id scrolls inside its box instead of overflowing.
+fn selectable_value<'a>(value: &'a str, p: Palette) -> Element<'a, Message> {
+    text_input("", value)
+        .font(MONO)
+        .size(LABEL)
+        .padding(0)
+        .align_x(iced::alignment::Horizontal::Right)
         .width(Length::Fill)
-        .padding([10, 13])
-        .style(move |_| rounded_surface(p.danger_soft, p.danger_border, RADIUS_MD))
+        .style(move |_, _| selectable_style(p, p.muted))
         .into()
+}
+
+/// The error message in the empty/error resource view — distinct (danger) and
+/// selectable, so a backend error string can be copied.
+fn selectable_error<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
+    text_input("", message)
+        .font(SANS)
+        .size(BODY)
+        .padding(0)
+        .align_x(iced::alignment::Horizontal::Center)
+        .width(Length::Fixed(360.0))
+        .style(move |_, _| selectable_style(p, p.danger))
+        .into()
+}
+
+/// Shared transparent, borderless read-only text-input style. `ink` colors the
+/// value; selection is always the primary accent.
+fn selectable_style(_p: Palette, ink: Color) -> iced::widget::text_input::Style {
+    iced::widget::text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        icon: ink,
+        placeholder: ink,
+        value: ink,
+        selection: theme::ACCENTS[0],
+    }
+}
+
+/// The scrollbar the whole surface uses: a 10px rail, a rounded `border_strong`
+/// thumb inset 3px, brightening to `icon_idle` on hover/drag. (Design brief §2.)
+fn scrollbar_style(p: Palette) -> impl Fn(&iced::Theme, scrollable::Status) -> scrollable::Style {
+    move |theme, status| {
+        let active = matches!(
+            status,
+            scrollable::Status::Hovered {
+                is_vertical_scrollbar_hovered: true,
+                ..
+            } | scrollable::Status::Dragged {
+                is_vertical_scrollbar_dragged: true,
+                ..
+            }
+        );
+        let rail = scrollable::Rail {
+            background: None,
+            border: Border::default(),
+            scroller: scrollable::Scroller {
+                background: Background::Color(if active { p.icon_idle } else { p.border_strong }),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+            },
+        };
+        let mut style = scrollable::default(theme, status);
+        style.vertical_rail = rail;
+        style.horizontal_rail = rail;
+        style
+    }
 }
 
 fn surface(color: Color) -> iced::widget::container::Style {
@@ -896,25 +1007,9 @@ fn rounded_surface(color: Color, border: Color, radius: f32) -> iced::widget::co
     }
 }
 
-fn row_surface(last: bool, p: Palette) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        border: Border {
-            color: p.border_soft,
-            width: if last { 0.0 } else { 1.0 },
-            radius: 0.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
-fn accent_color(index: usize, p: Palette) -> Color {
-    match index {
-        0 => theme::ACCENTS[0],
-        1 => theme::ACCENTS[1],
-        2 => theme::ACCENTS[2],
-        3 => p.purple,
-        _ => p.red,
-    }
+fn accent_color(index: usize) -> Color {
+    let accents = theme::ACCENTS;
+    accents[index.min(accents.len() - 1)]
 }
 
 #[cfg(test)]

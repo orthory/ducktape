@@ -7,6 +7,8 @@ mod view;
 
 pub use view::view;
 
+use iced::widget::text_editor;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource<T> {
     Loading,
@@ -14,6 +16,35 @@ pub enum Resource<T> {
     Error(String),
     Ready(T),
 }
+
+/// Read-only multi-line buffer backing the file viewer's selectable code pane.
+///
+/// iced's `text_editor` needs a persistent `Content` in state to keep its
+/// selection across frames, but `Content` is neither `Clone`-cheap nor
+/// `PartialEq`/`Eq`. This wrapper compares by rendered text — the same idiom
+/// `screens/pages.rs::EditorState` uses — so `State` can keep its derives.
+#[derive(Debug, Clone)]
+pub struct CodeContent(pub text_editor::Content);
+
+impl CodeContent {
+    fn set(&mut self, text: &str) {
+        self.0 = text_editor::Content::with_text(text);
+    }
+}
+
+impl Default for CodeContent {
+    fn default() -> Self {
+        Self(text_editor::Content::new())
+    }
+}
+
+impl PartialEq for CodeContent {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.text() == other.0.text()
+    }
+}
+
+impl Eq for CodeContent {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -197,6 +228,9 @@ pub struct RepositoryData {
     pub commits: Vec<Commit>,
     pub commits_have_more: bool,
     pub items: Vec<ForgeItem>,
+    /// True when this repository is browsed over the network mirror rather than
+    /// the node's own on-disk forge (drives the REMOTE/DESKTOP pill and copy).
+    pub remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,13 +270,22 @@ pub struct State {
     pub branch_menu_open: bool,
     pub selected_file: Option<String>,
     pub file: Resource<FilePage>,
+    /// Selectable, read-only buffer mirroring the loaded file text.
+    pub file_content: CodeContent,
+    /// Commit whose per-file diff is expanded in a commit log, if any.
+    pub selected_commit: Option<String>,
+    /// Loaded parent→commit diff for `selected_commit`.
+    pub commit_diff: Resource<Vec<ChangedFile>>,
+    /// Changed-file paths the reviewer has collapsed in the Files-changed tab.
+    pub collapsed_files: Vec<String>,
     pub item_filter: ItemFilter,
     pub new_item_open: bool,
     pub new_item: NewItemDraft,
     pub selected_item: Option<u64>,
     pub item_detail: Resource<ItemDetail>,
     pub pull_tab: PullTab,
-    pub comment_draft: String,
+    /// Multi-line composer buffer for a new discussion comment.
+    pub comment_content: CodeContent,
     pub editing_item: bool,
     pub edit_title: String,
     pub edit_body: String,
@@ -269,13 +312,17 @@ impl Default for State {
             branch_menu_open: false,
             selected_file: None,
             file: Resource::Empty,
+            file_content: CodeContent::default(),
+            selected_commit: None,
+            commit_diff: Resource::Empty,
+            collapsed_files: Vec::new(),
             item_filter: ItemFilter::Open,
             new_item_open: false,
             new_item: NewItemDraft::default(),
             selected_item: None,
             item_detail: Resource::Empty,
             pull_tab: PullTab::Conversation,
-            comment_draft: String::new(),
+            comment_content: CodeContent::default(),
             editing_item: false,
             edit_title: String::new(),
             edit_body: String::new(),
@@ -292,7 +339,9 @@ impl Default for State {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `text_editor::Action` (carried by the read-only file pane and the comment
+// composer) is `PartialEq` but not `Eq`, so `Message` cannot derive `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Message {
     Load,
@@ -304,8 +353,16 @@ pub enum Message {
     SelectTab(Tab),
     ToggleDirectory(String),
     SelectFile(String),
+    /// Read-only selection/scroll action on the file viewer; edits are dropped.
+    FileAction(text_editor::Action),
     LoadMoreFile,
     LoadMoreCommits,
+    /// Expand/collapse a commit's per-file diff in a commit log.
+    ToggleCommit(String),
+    /// Expand/collapse one changed file in the Files-changed tab.
+    ToggleChangedFile(String),
+    /// Stage a pending inline review comment on a clicked new-side line.
+    StartLineComment { path: String, line: u32 },
     SetItemFilter(ItemFilter),
     ToggleNewItem,
     NewTitleChanged(String),
@@ -333,7 +390,8 @@ pub enum Message {
     CancelReviewComment,
     RemoveReviewComment(usize),
     SubmitReview,
-    CommentChanged(String),
+    /// Editable action on the multi-line comment composer.
+    CommentAction(text_editor::Action),
     SubmitComment,
     Service(ServiceEvent),
 }
@@ -360,6 +418,10 @@ pub enum Command {
         repository_id: String,
         reference: Option<String>,
         after: String,
+    },
+    LoadCommitDiff {
+        repository_id: String,
+        commit_id: String,
     },
     OpenIssue {
         repository_id: String,
@@ -417,6 +479,10 @@ pub enum ServiceEvent {
     },
     FileLoaded(Result<FilePage, String>),
     MoreCommitsLoaded(Result<(Vec<Commit>, bool), String>),
+    CommitDiffLoaded {
+        commit_id: String,
+        result: Result<Vec<ChangedFile>, String>,
+    },
     WriteFinished(Result<(), String>),
     ItemLoaded(Result<Option<ItemDetail>, String>),
 }
@@ -473,6 +539,8 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             state.tab = tab;
             state.selected_item = None;
             state.new_item_open = false;
+            state.selected_commit = None;
+            state.commit_diff = Resource::Empty;
             None
         }
         Message::ToggleDirectory(path) => {
@@ -517,6 +585,13 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
                 offset: file.loaded_bytes,
             })
         }
+        Message::FileAction(action) => {
+            // Read-only pane: apply selection and scroll, drop every edit.
+            if !action.is_edit() {
+                state.file_content.0.perform(action);
+            }
+            None
+        }
         Message::LoadMoreCommits => {
             let id = state.selected_repo.clone()?;
             let Resource::Ready(data) = &state.repository else {
@@ -530,6 +605,41 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
                 reference: state.selected_branch.clone(),
                 after: data.commits.last()?.id.clone(),
             })
+        }
+        Message::ToggleCommit(commit_id) => {
+            let repository_id = state.selected_repo.clone()?;
+            let same = state.selected_commit.as_deref() == Some(commit_id.as_str());
+            // Re-clicking (or retrying) a failed diff reloads it; re-clicking a
+            // loaded one collapses it.
+            if same && !matches!(state.commit_diff, Resource::Error(_)) {
+                state.selected_commit = None;
+                state.commit_diff = Resource::Empty;
+                return None;
+            }
+            state.selected_commit = Some(commit_id.clone());
+            state.commit_diff = Resource::Loading;
+            Some(Command::LoadCommitDiff {
+                repository_id,
+                commit_id,
+            })
+        }
+        Message::ToggleChangedFile(path) => {
+            if let Some(index) = state.collapsed_files.iter().position(|item| item == &path) {
+                state.collapsed_files.remove(index);
+            } else {
+                state.collapsed_files.push(path);
+            }
+            None
+        }
+        Message::StartLineComment { path, line } => {
+            if !state.review_open || state.busy {
+                return None;
+            }
+            state.review_comment_file = Some(path);
+            state.review_comment_line = line.to_string();
+            state.review_comment_body.clear();
+            state.error = None;
+            None
         }
         Message::SetItemFilter(filter) => {
             state.item_filter = filter;
@@ -595,6 +705,9 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             state.pull_tab = PullTab::Conversation;
             state.editing_item = false;
             state.review_open = false;
+            state.selected_commit = None;
+            state.commit_diff = Resource::Empty;
+            state.collapsed_files.clear();
             clear_review_draft(state);
             Some(Command::LoadItem {
                 repository_id: id,
@@ -604,9 +717,12 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         Message::CloseItem => {
             state.selected_item = None;
             state.item_detail = Resource::Empty;
-            state.comment_draft.clear();
+            state.comment_content.set("");
             state.editing_item = false;
             state.review_open = false;
+            state.selected_commit = None;
+            state.commit_diff = Resource::Empty;
+            state.collapsed_files.clear();
             clear_review_draft(state);
             None
         }
@@ -810,14 +926,14 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
                 comments: state.review_comments.clone(),
             })
         }
-        Message::CommentChanged(value) => {
-            state.comment_draft = value;
+        Message::CommentAction(action) => {
+            state.comment_content.0.perform(action);
             None
         }
         Message::SubmitComment => {
             let id = state.selected_repo.clone()?;
             let number = state.selected_item?;
-            let body = state.comment_draft.trim().to_owned();
+            let body = state.comment_content.0.text().trim().to_owned();
             if body.is_empty() || state.busy {
                 return None;
             }
@@ -851,7 +967,10 @@ fn service(state: &mut State, event: ServiceEvent) -> Option<Command> {
                 if let Resource::Ready(data) = &mut state.repository {
                     data.tree.retain(|entry| !is_child_of(&entry.path, &path));
                     data.tree.append(&mut entries);
-                    data.tree.sort_by(|a, b| a.path.cmp(&b.path));
+                    // P9: keep the dirs-before-files grouping the root load uses;
+                    // a plain path sort intermixes a lazily-loaded subdir's dirs
+                    // and files.
+                    data.tree.sort_by_cached_key(tree_order_key);
                 }
             }
             Err(error) => state.error = Some(error),
@@ -866,7 +985,9 @@ fn service(state: &mut State, event: ServiceEvent) -> Option<Command> {
                     current.loaded_bytes = page.loaded_bytes;
                     current.total_bytes = page.total_bytes;
                     current.has_more = page.has_more;
+                    state.file_content.set(&current.text);
                 } else {
+                    state.file_content.set(&page.text);
                     state.file = Resource::Ready(page);
                 }
             }
@@ -881,6 +1002,16 @@ fn service(state: &mut State, event: ServiceEvent) -> Option<Command> {
             }
             Err(error) => state.error = Some(error),
         },
+        ServiceEvent::CommitDiffLoaded { commit_id, result } => {
+            // Ignore a stale reply after the reviewer collapsed or switched rows.
+            if state.selected_commit.as_deref() == Some(commit_id.as_str()) {
+                state.commit_diff = match result {
+                    Ok(files) if files.is_empty() => Resource::Empty,
+                    Ok(files) => Resource::Ready(files),
+                    Err(error) => Resource::Error(error),
+                };
+            }
+        }
         ServiceEvent::WriteFinished(result) => {
             state.busy = false;
             match result {
@@ -888,7 +1019,7 @@ fn service(state: &mut State, event: ServiceEvent) -> Option<Command> {
                     state.new_item_open = false;
                     state.new_item.title.clear();
                     state.new_item.body.clear();
-                    state.comment_draft.clear();
+                    state.comment_content.set("");
                     state.editing_item = false;
                     state.review_open = false;
                     state.review_body.clear();
@@ -929,6 +1060,23 @@ fn clear_review_draft(state: &mut State) {
     state.review_comment_line.clear();
     state.review_comment_body.clear();
     state.review_comments.clear();
+}
+
+/// Sort key that yields a DFS pre-order with siblings grouped dirs-first then
+/// by name: each path component becomes `(0 for a directory, 1 for a file, name)`
+/// — intermediate components are always directories, and the last takes the
+/// entry's own kind. Ancestors sort before descendants (prefix keys sort first).
+fn tree_order_key(entry: &TreeEntry) -> Vec<(u8, String)> {
+    let components: Vec<&str> = entry.path.split('/').collect();
+    let last = components.len().saturating_sub(1);
+    components
+        .iter()
+        .enumerate()
+        .map(|(index, component)| {
+            let is_dir = index != last || entry.kind == TreeKind::Directory;
+            (u8::from(!is_dir), (*component).to_owned())
+        })
+        .collect()
 }
 
 fn is_child_of(candidate: &str, parent: &str) -> bool {
@@ -1060,6 +1208,7 @@ mod tests {
                 commits: vec![],
                 commits_have_more: false,
                 items: vec![],
+                remote: false,
             }),
             ..State::default()
         };
@@ -1145,6 +1294,7 @@ mod tests {
                 commits: vec![],
                 commits_have_more: false,
                 items: vec![],
+                remote: false,
             }),
             item_detail: Resource::Ready(pull_detail()),
             ..State::default()
@@ -1181,6 +1331,7 @@ mod tests {
                 commits: vec![],
                 commits_have_more: false,
                 items: vec![],
+                remote: false,
             }),
             item_detail: Resource::Ready(pull_detail()),
             ..State::default()
@@ -1210,5 +1361,89 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn commit_toggle_loads_diff_then_collapses() {
+        let mut state = State {
+            selected_repo: Some("core".into()),
+            ..State::default()
+        };
+        assert_eq!(
+            update(&mut state, Message::ToggleCommit("abc123".into())),
+            Some(Command::LoadCommitDiff {
+                repository_id: "core".into(),
+                commit_id: "abc123".into(),
+            })
+        );
+        assert_eq!(state.selected_commit.as_deref(), Some("abc123"));
+        assert!(matches!(state.commit_diff, Resource::Loading));
+        // Toggling the same commit collapses it and issues no reload.
+        assert_eq!(update(&mut state, Message::ToggleCommit("abc123".into())), None);
+        assert_eq!(state.selected_commit, None);
+        assert!(matches!(state.commit_diff, Resource::Empty));
+    }
+
+    #[test]
+    fn commit_toggle_retries_a_failed_diff_instead_of_collapsing() {
+        let mut state = State {
+            selected_repo: Some("core".into()),
+            selected_commit: Some("abc123".into()),
+            commit_diff: Resource::Error("diff failed".into()),
+            ..State::default()
+        };
+        assert_eq!(
+            update(&mut state, Message::ToggleCommit("abc123".into())),
+            Some(Command::LoadCommitDiff {
+                repository_id: "core".into(),
+                commit_id: "abc123".into(),
+            })
+        );
+        assert!(matches!(state.commit_diff, Resource::Loading));
+    }
+
+    #[test]
+    fn file_action_ignores_edits_but_the_pane_stays_read_only() {
+        let mut state = State::default();
+        state.file_content.set("fn main() {}");
+        update(
+            &mut state,
+            Message::FileAction(text_editor::Action::Edit(text_editor::Edit::Insert('X'))),
+        );
+        assert!(
+            !state.file_content.0.text().contains('X'),
+            "the read-only file pane must drop every edit action"
+        );
+        assert!(state.file_content.0.text().starts_with("fn main() {}"));
+    }
+
+    #[test]
+    fn clicking_an_added_line_stages_a_comment_there() {
+        let mut state = State {
+            review_open: true,
+            ..State::default()
+        };
+        update(
+            &mut state,
+            Message::StartLineComment {
+                path: "src/lib.rs".into(),
+                line: 42,
+            },
+        );
+        assert_eq!(state.review_comment_file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(state.review_comment_line, "42");
+    }
+
+    #[test]
+    fn line_staging_is_inert_until_a_review_is_open() {
+        let mut state = State::default();
+        update(
+            &mut state,
+            Message::StartLineComment {
+                path: "src/lib.rs".into(),
+                line: 42,
+            },
+        );
+        assert_eq!(state.review_comment_file, None);
     }
 }
