@@ -12,7 +12,7 @@ use zeroize::Zeroize as _;
 
 use crate::icons::{self, Icon};
 use crate::theme::{
-    self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM, SANS_SEMIBOLD,
+    self, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM, SANS_SEMIBOLD,
 };
 
 const CARD_WIDTH: f32 = 440.0;
@@ -430,6 +430,13 @@ impl Drop for State {
 pub fn update(state: &mut State, message: Message) -> Option<Command> {
     match message {
         Message::SelectMode(mode) => {
+            // Switching modes mid-flight would clear_secrets + reset stage while a
+            // custody op is still in flight; its late ServiceEvent would then land
+            // in the wrong stage (e.g. yanking a Restore user onto a RecoveryPhrase
+            // they never asked to create). Mirror submit()'s own busy guard.
+            if state.busy {
+                return None;
+            }
             clear_secrets(state);
             state.mode = mode;
             state.stage = match mode {
@@ -908,12 +915,16 @@ fn create_view(state: &State, p: Palette) -> Element<'_, Message> {
         ),
         column![
             mode_tabs(state, p),
-            field(
-                "Your name (optional)",
+            sem_input(
+                "Your name",
                 &state.display_name,
-                Message::DisplayNameChanged,
-                false,
-                p
+                field(
+                    "Your name (optional)",
+                    &state.display_name,
+                    Message::DisplayNameChanged,
+                    false,
+                    p
+                )
             ),
             credentials,
         ]
@@ -930,12 +941,16 @@ fn touch_id_create_view(state: &State, p: Palette) -> Element<'_, Message> {
         ),
         column![
             mode_tabs(state, p),
-            field(
-                "Your name (optional)",
+            sem_input(
+                "Your name",
                 &state.display_name,
-                Message::DisplayNameChanged,
-                false,
-                p
+                field(
+                    "Your name (optional)",
+                    &state.display_name,
+                    Message::DisplayNameChanged,
+                    false,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -959,14 +974,17 @@ fn restore_view(state: &State, p: Palette) -> Element<'_, Message> {
         Some("Enter your 24-word recovery phrase and set a new password for this device."),
         column![
             mode_tabs(state, p),
-            field(
-                "24-word recovery phrase, separated by spaces",
-                &state.restore_words,
-                Message::RestoreWordsChanged,
-                false,
-                p
-            )
-            .font(MONO),
+            sem_secret(
+                "Recovery phrase",
+                field(
+                    "24-word recovery phrase, separated by spaces",
+                    &state.restore_words,
+                    Message::RestoreWordsChanged,
+                    false,
+                    p
+                )
+                .font(MONO)
+            ),
             password_fields(state, "New password", "Confirm new password", p),
             error_line(state, p),
             primary(
@@ -1061,12 +1079,15 @@ fn recovery_view(state: &State, p: Palette) -> Element<'_, Message> {
 fn confirm_recovery_view(state: &State, p: Palette) -> Element<'_, Message> {
     let mut fields = Column::new().spacing(10);
     for (slot, index) in state.confirm_indices.iter().copied().enumerate() {
-        fields = fields.push(field(
-            &format!("Word #{}", index + 1),
-            &state.confirm_answers[slot],
-            move |value| Message::ConfirmWordChanged(slot, value),
-            false,
-            p,
+        fields = fields.push(sem_secret(
+            format!("Word #{}", index + 1),
+            field(
+                &format!("Word #{}", index + 1),
+                &state.confirm_answers[slot],
+                move |value| Message::ConfirmWordChanged(slot, value),
+                false,
+                p,
+            ),
         ));
     }
     gate_card(
@@ -1098,20 +1119,27 @@ fn link_challenge_view(state: &State, p: Palette) -> Element<'_, Message> {
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-            field(
-                "Paste the link code — or type the http:// address",
-                &state.link_challenge,
-                Message::LinkChallengeChanged,
-                false,
-                p
-            )
-            .font(MONO),
-            field(
-                "Device label (optional, e.g. work laptop)",
+            sem_secret(
+                "Link challenge",
+                field(
+                    "Paste the link code — or type the http:// address",
+                    &state.link_challenge,
+                    Message::LinkChallengeChanged,
+                    false,
+                    p
+                )
+                .font(MONO)
+            ),
+            sem_input(
+                "Device label",
                 &state.device_label,
-                Message::DeviceLabelChanged,
-                false,
-                p
+                field(
+                    "Device label (optional, e.g. work laptop)",
+                    &state.device_label,
+                    Message::DeviceLabelChanged,
+                    false,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -1186,12 +1214,15 @@ fn unlock_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     let unlock_label: &'a str = if state.busy { "Unlocking…" } else { "Unlock" };
     let skip_label: &'a str = "Skip for now";
     content = content
-        .push(field(
+        .push(sem_secret(
             "Password",
-            &state.password,
-            Message::PasswordChanged,
-            true,
-            p,
+            field(
+                "Password",
+                &state.password,
+                Message::PasswordChanged,
+                true,
+                p,
+            ),
         ))
         .push(error_line(state, p))
         .push(primary(
@@ -1221,12 +1252,15 @@ fn resume_view(state: &State, p: Palette) -> Element<'_, Message> {
             "You created this account but never confirmed its recovery phrase. Enter your password to view it and finish.",
         ),
         column![
-            field(
+            sem_secret(
                 "Password",
-                &state.password,
-                Message::PasswordChanged,
-                true,
-                p
+                field(
+                    "Password",
+                    &state.password,
+                    Message::PasswordChanged,
+                    true,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -1285,12 +1319,15 @@ fn reveal_legacy_view(state: &State, p: Palette) -> Element<'_, Message> {
             "Enter your password to view your 24-word recovery phrase, or do this later from the Account view.",
         ),
         column![
-            field(
+            sem_secret(
                 "Password",
-                &state.password,
-                Message::PasswordChanged,
-                true,
-                p
+                field(
+                    "Password",
+                    &state.password,
+                    Message::PasswordChanged,
+                    true,
+                    p
+                )
             ),
             error_line(state, p),
             primary(
@@ -1316,19 +1353,25 @@ fn password_fields<'a>(
     p: Palette,
 ) -> Column<'a, Message> {
     column![
-        field(
-            password_placeholder,
-            &state.password,
-            Message::PasswordChanged,
-            true,
-            p
+        sem_secret(
+            "Password",
+            field(
+                password_placeholder,
+                &state.password,
+                Message::PasswordChanged,
+                true,
+                p
+            )
         ),
-        field(
-            confirm_placeholder,
-            &state.confirm_password,
-            Message::ConfirmPasswordChanged,
-            true,
-            p
+        sem_secret(
+            "Confirm password",
+            field(
+                confirm_placeholder,
+                &state.confirm_password,
+                Message::ConfirmPasswordChanged,
+                true,
+                p
+            )
         ),
     ]
     .spacing(10)
@@ -1345,7 +1388,15 @@ fn mode_tabs(state: &State, p: Palette) -> Element<'static, Message> {
     ]);
     let mut items = row![].spacing(4).padding(4);
     for (mode, label) in tabs {
-        items = items.push(tab(label, mode == state.mode, Message::SelectMode(mode), p));
+        // While a custody op is in flight the tabs are guarded (ON-G1); render
+        // them disabled so the block reads as intentional, not a dead click.
+        items = items.push(tab(
+            label,
+            mode == state.mode,
+            !state.busy,
+            Message::SelectMode(mode),
+            p,
+        ));
     }
     container(items)
         .width(Length::Fill)
@@ -1476,6 +1527,47 @@ fn field<'a>(
         })
 }
 
+/// Dev-only text-input tagging: wraps a non-secret input in a `TextInput`
+/// semantic node carrying its `value`, so the agent bridge can address it by
+/// name. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: impl Into<String>,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: impl Into<String>,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
+/// Secret-field variant: tags the input with a stable name so the bridge can
+/// focus + type into it, but OMITS `.value` — the semantic tree is read by the
+/// bridge and (per this module's zeroize/redaction design) must never mirror a
+/// password, recovery word, or link challenge.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_secret<'a>(
+    name: impl Into<String>,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input).into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_secret<'a>(
+    _name: impl Into<String>,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let enabled = message.is_some();
     let button = button(
@@ -1552,30 +1644,36 @@ fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Elemen
 fn tab(
     label: &'static str,
     active: bool,
+    enabled: bool,
     message: Message,
     p: Palette,
 ) -> Element<'static, Message> {
     let tab = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
     .width(Length::FillPortion(1))
     .padding([8, 0])
+    .on_press_maybe(enabled.then_some(message))
     .style(move |_, status| iced::widget::button::Style {
-        background: (active || matches!(status, iced::widget::button::Status::Hovered))
-            .then_some(Background::Color(if active { p.paper } else { p.hover })),
-        text_color: if active { p.ink } else { p.muted },
+        background: (enabled
+            && (active || matches!(status, iced::widget::button::Status::Hovered)))
+        .then_some(Background::Color(if active { p.paper } else { p.hover })),
+        text_color: if !enabled {
+            p.muted_3
+        } else if active {
+            p.ink
+        } else {
+            p.muted
+        },
         border: Border {
             radius: RADIUS_SM.into(),
             ..Default::default()
         },
-        shadow: if active {
+        shadow: if active && enabled {
             Shadow {
-                color: Color {
-                    a: 0.05,
-                    ..Color::from_rgb8(40, 38, 34)
-                },
+                color: Color { a: 0.05, ..p.shadow },
                 offset: Vector::new(0.0, 1.0),
                 blur_radius: 2.0,
             }
@@ -1583,10 +1681,11 @@ fn tab(
             Shadow::default()
         },
         ..Default::default()
-    })
-    .on_press(message);
+    });
     #[cfg(all(feature = "agent", debug_assertions))]
-    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, tab);
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Tab, label, tab)
+        .disabled(!enabled)
+        .into();
     #[cfg(not(all(feature = "agent", debug_assertions)))]
     tab.into()
 }
