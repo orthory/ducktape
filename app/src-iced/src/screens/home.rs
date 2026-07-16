@@ -8,7 +8,7 @@ use qrcode::{QrCode, types::Color as QrColor};
 use zeroize::Zeroize as _;
 
 use crate::icons::Icon;
-use crate::theme::{BODY, CAPTION, LABEL, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{BODY, BODY_LG, CAPTION, LABEL, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS, TITLE};
 use crate::view_api::{MemberKeyKind, Resource, decode_link_response, encode_link_response};
 
 use super::user::{
@@ -739,10 +739,10 @@ pub(super) fn view(state: &HomeState, p: Palette) -> Element<'_, Message> {
         Resource::Empty => container(
             column![
                 icon_tile(Icon::Home, 42.0, p),
-                text("No networks yet").font(SANS).size(14).color(p.ink),
+                text("No networks yet").font(SANS).size(BODY_LG).color(p.ink),
                 text("Add a network to get started.")
                     .font(SANS)
-                    .size(11.5)
+                    .size(BODY)
                     .color(p.muted_2),
                 outline("+ Add network", Message::Home(HomeMessage::AddNetwork), p),
             ]
@@ -757,7 +757,7 @@ pub(super) fn view(state: &HomeState, p: Palette) -> Element<'_, Message> {
         Resource::Error(error) => error_state("Couldn't load Home", error, Screen::Home, p),
         Resource::Ready(data) => home_content(state, data, p),
     };
-    container(column![text("Home").font(SANS).size(16).color(p.filled), content].spacing(9))
+    container(column![text("Home").font(SANS).size(TITLE).color(p.filled), content].spacing(9))
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(HOME_PAD)
@@ -775,10 +775,10 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
         };
         let registered = profile.duck_name.is_some();
         let mut duck = column![
-            text("Duck name").font(SANS).size(12).color(p.ink),
+            text("Duck name").font(SANS).size(BODY).color(p.ink),
             text("Optional account name — your identity works without one.")
                 .font(SANS)
-                .size(11)
+                .size(BODY)
                 .color(p.muted),
             row![
                 field_enabled(
@@ -793,7 +793,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
                         .then_some(Message::Home(HomeMessage::CommitDuckName)),
                 )
                 .width(150),
-                text(".duck").font(MONO).size(12).color(p.muted),
+                text(".duck").font(MONO).size(LABEL).color(p.muted),
                 outline_enabled(
                     if registered { "Update" } else { "Register" },
                     Message::Home(HomeMessage::CommitDuckName),
@@ -814,7 +814,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             ));
         }
         if let Some(error) = state.duck_name_error.as_deref() {
-            duck = duck.push(text(error).font(SANS).size(10.5).color(p.danger));
+            duck = duck.push(text(error).font(SANS).size(BODY).color(p.danger));
         }
         card(
             column![
@@ -831,7 +831,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
                         .on_submit_maybe(
                             linked.then_some(Message::Home(HomeMessage::CommitDisplayName)),
                         ),
-                        text(account_line).font(MONO).size(10.5).color(p.muted),
+                        text(account_line).font(MONO).size(CAPTION).color(p.muted),
                     ]
                     .spacing(3)
                     .width(Length::Fill),
@@ -855,7 +855,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             column![
                 text("not linked to an account yet")
                     .font(MONO)
-                    .size(11)
+                    .size(CAPTION)
                     .color(p.muted)
             ],
             p,
@@ -884,14 +884,14 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             ));
         }
         let mut editor = column![
-            text("Profile").font(SANS).size(12).color(p.ink),
+            text("Profile").font(SANS).size(BODY).color(p.ink),
             row![
                 profile_avatar(profile, &state.avatar_edit, 56.0, p),
                 column![
                     actions,
                     text("Global to your account — shown on every network you join.")
                         .font(SANS)
-                        .size(11)
+                        .size(BODY)
                         .color(p.muted),
                 ]
                 .spacing(6)
@@ -899,7 +899,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             ]
             .spacing(13)
             .align_y(Alignment::Start),
-            text("Bio / status").font(SANS).size(11).color(p.muted),
+            text("Bio / status").font(SANS).size(BODY).color(p.muted),
             field_enabled(
                 "A short line about you",
                 &state.bio_draft,
@@ -920,7 +920,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
                 ),
                 text(format!("{}/280", state.bio_draft.chars().count()))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.muted),
             ]
             .spacing(9)
@@ -931,12 +931,12 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             editor = editor.push(
                 text("Bind this node to an account first.")
                     .font(SANS)
-                    .size(10.5)
+                    .size(BODY)
                     .color(p.muted),
             );
         }
         if let Some(error) = state.error.as_deref() {
-            editor = editor.push(text(error).font(SANS).size(10.5).color(p.danger));
+            editor = editor.push(text(error).font(SANS).size(BODY).color(p.danger));
         }
         card(editor, p)
     });
@@ -951,7 +951,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             container(
                 text("No networks yet — add one to get started.")
                     .font(SANS)
-                    .size(12)
+                    .size(BODY)
                     .color(p.muted),
             )
             .padding([9, 12]),
@@ -1256,7 +1256,7 @@ fn account_item_row(
     action: Option<(&'static str, HomeMessage, bool)>,
     p: Palette,
 ) -> Element<'static, Message> {
-    let mut value_row = row![text(value.to_string()).font(MONO).size(10.5).color(p.muted)]
+    let mut value_row = row![text(value.to_string()).font(MONO).size(CAPTION).color(p.muted)]
         .spacing(8)
         .align_y(Alignment::Center);
     if let Some((label, message, danger)) = action {
@@ -1269,7 +1269,7 @@ fn account_item_row(
     }
     container(
         row![
-            text(label.to_string()).font(SANS).size(12).color(p.ink),
+            text(label.to_string()).font(SANS).size(BODY).color(p.ink),
             Space::new().width(Length::Fill),
             value_row,
         ]
@@ -1300,7 +1300,7 @@ fn device_item_row<'a>(
             }
         ))
         .font(MONO)
-        .size(10.5)
+        .size(CAPTION)
         .color(p.muted),
         standing_chip(device.standing, p),
     ]
@@ -1353,7 +1353,7 @@ fn device_item_row<'a>(
     }
     container(
         row![
-            text(device.label.clone()).font(SANS).size(12).color(p.ink),
+            text(device.label.clone()).font(SANS).size(BODY).color(p.ink),
             Space::new().width(Length::Fill),
             value,
         ]
@@ -1375,7 +1375,7 @@ fn standing_chip(standing: Standing, p: Palette) -> Element<'static, Message> {
     container(
         text(standing.label().to_uppercase())
             .font(MONO)
-            .size(9)
+            .size(CAPTION)
             .color(foreground),
     )
     .padding([2, 6])
@@ -1414,7 +1414,7 @@ fn link_responder_panel(state: &AccountActionsState, p: Palette) -> Element<'_, 
         .push(
             text("Paste the LAN address for automatic delivery, or the manual challenge code.")
                 .font(SANS)
-                .size(11)
+                .size(BODY)
                 .color(p.muted),
         )
         .push(field(
@@ -1453,7 +1453,7 @@ fn link_responder_panel(state: &AccountActionsState, p: Palette) -> Element<'_, 
         .push(
             text("Confirm these details match the device that showed the code. This device will then prove possession of its own key.")
                 .font(SANS)
-                .size(11)
+                .size(BODY)
                 .color(p.muted),
         )
         .push(field(
@@ -1499,7 +1499,7 @@ fn link_inviter_panel(state: &AccountActionsState, p: Palette) -> Element<'_, Me
                 "The link code could not be created."
             })
             .font(SANS)
-            .size(11.5)
+            .size(BODY)
             .color(p.muted),
         );
         return panel.into();
@@ -1507,7 +1507,7 @@ fn link_inviter_panel(state: &AccountActionsState, p: Palette) -> Element<'_, Me
     panel = panel.push(
         text("1 · On the new device, choose Link device. Use the LAN address or paste the challenge code.")
             .font(SANS)
-            .size(11)
+            .size(BODY)
             .color(p.muted),
     );
     if let Some(url) = link.relay_url.as_deref() {
@@ -1523,7 +1523,7 @@ fn link_inviter_panel(state: &AccountActionsState, p: Palette) -> Element<'_, Me
         .push(
             text("2 · The LAN reply arrives automatically, or paste it here. Approve only after the key below matches the new device.")
                 .font(SANS)
-                .size(11)
+                .size(BODY)
                 .color(p.muted),
         )
         .push(field(
@@ -1551,7 +1551,7 @@ fn link_inviter_panel(state: &AccountActionsState, p: Palette) -> Element<'_, Me
                     .unwrap_or_default()
             ))
             .font(MONO)
-            .size(10.5)
+            .size(CAPTION)
             .color(p.ink),
         );
         actions = actions.push(outline_enabled(
@@ -1578,7 +1578,7 @@ fn phone_enrollment_panel(state: &AccountActionsState, p: Palette) -> Element<'_
                 "The phone enrollment could not be started."
             })
             .font(SANS)
-            .size(11.5)
+            .size(BODY)
             .color(p.muted),
         );
         return panel.into();
@@ -1588,13 +1588,13 @@ fn phone_enrollment_panel(state: &AccountActionsState, p: Palette) -> Element<'_
             .push(
                 text("Your phone created a key. Approving signs the account authorizer on this desktop.")
                     .font(SANS)
-                    .size(11)
+                    .size(BODY)
                     .color(p.muted),
             )
             .push(
                 text(format!("Security key · {}", short(&candidate.key)))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.ink),
             )
             .push(field(
@@ -1614,7 +1614,7 @@ fn phone_enrollment_panel(state: &AccountActionsState, p: Palette) -> Element<'_
             .push(
                 text("Scan with your phone on the same Wi-Fi. The key is generated on the phone and nothing lands until you approve it here.")
                     .font(SANS)
-                    .size(11)
+                    .size(BODY)
                     .color(p.muted),
             )
             .push(qr_image(&enrollment.url, 190.0, p))
@@ -1639,11 +1639,11 @@ fn account_confirmation(
         column![
             text(title.to_string())
                 .font(SANS)
-                .size(12.5)
+                .size(BODY)
                 .color(p.danger),
             text(description.to_string())
                 .font(SANS)
-                .size(11)
+                .size(BODY)
                 .color(p.muted),
             row![
                 outline("Cancel", Message::Home(HomeMessage::CancelConfirmation), p),
@@ -1763,9 +1763,9 @@ fn profile_avatar(
 fn info_row(label: impl ToString, value: impl ToString, p: Palette) -> Element<'static, Message> {
     container(
         row![
-            text(label.to_string()).font(SANS).size(12).color(p.ink),
+            text(label.to_string()).font(SANS).size(BODY).color(p.ink),
             Space::new().width(Length::Fill),
-            text(value.to_string()).font(MONO).size(10.5).color(p.muted)
+            text(value.to_string()).font(MONO).size(CAPTION).color(p.muted)
         ]
         .align_y(Alignment::Center),
     )
@@ -1784,8 +1784,8 @@ fn control_row<'a>(
     container(
         row![
             column![
-                text(title).font(SANS).size(12).color(p.ink),
-                text(description).font(SANS).size(10.5).color(p.muted)
+                text(title).font(SANS).size(BODY).color(p.ink),
+                text(description).font(SANS).size(BODY).color(p.muted)
             ]
             .spacing(3)
             .width(Length::Fill),
@@ -1808,7 +1808,7 @@ fn table_header<const N: usize>(
         cells = cells.push(
             text(label)
                 .font(MONO)
-                .size(9.5)
+                .size(CAPTION)
                 .color(p.muted)
                 .width(Length::FillPortion(1)),
         );

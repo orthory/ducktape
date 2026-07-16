@@ -12,8 +12,8 @@ use zeroize::Zeroize as _;
 
 use crate::icons::{self, Icon};
 use crate::theme::{
-    self, CAPTION, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM,
-    SANS_SEMIBOLD,
+    self, BODY, CAPTION, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM,
+    SANS_SEMIBOLD, TITLE,
 };
 
 const CARD_WIDTH: f32 = 440.0;
@@ -847,7 +847,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
         Stage::Loading => gate_card(
             "Loading your account",
             Some("Reading the account key stored on this device…"),
-            column![text("Please wait").font(MONO).size(11).color(p.muted)],
+            column![text("Please wait").font(MONO).size(LABEL).color(p.muted)],
             p,
         ),
         Stage::LoadError => gate_card(
@@ -898,7 +898,7 @@ fn create_view(state: &State, p: Palette) -> Element<'_, Message> {
     let mut credentials =
         password_fields(state, "Password (min 8 characters)", "Confirm password", p);
     if let Some(error) = state.error.as_deref() {
-        credentials = credentials.push(text(error).font(MONO).size(11.5).color(p.red));
+        credentials = credentials.push(selectable_error(error, p));
     }
     credentials = credentials.push(primary(
         if state.busy {
@@ -1116,7 +1116,7 @@ fn link_challenge_view(state: &State, p: Palette) -> Element<'_, Message> {
         column![
             row![
                 icons::view(Icon::Link, 16.0, p.muted),
-                text("Link challenge").font(SANS).size(11).color(p.muted)
+                text("Link challenge").font(SANS).size(LABEL).color(p.muted)
             ]
             .spacing(7)
             .align_y(Alignment::Center),
@@ -1178,7 +1178,7 @@ fn link_response_view(state: &State, p: Palette) -> Element<'_, Message> {
         },
         Some(hint),
         column![
-            container(text(code).font(MONO).size(10.5).color(p.ink))
+            container(text(code).font(MONO).size(CAPTION).color(p.ink))
                 .padding(10)
                 .width(Length::Fill)
                 .style(move |_| input_container_style(p, false)),
@@ -1235,7 +1235,7 @@ fn unlock_view<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
         .push(
             text("Until you unlock, nodes you start stay unlinked to your account.")
                 .font(SANS)
-                .size(10.5)
+                .size(BODY)
                 .color(p.muted_2),
         );
     gate_card(
@@ -1490,12 +1490,12 @@ fn gate_card<'a>(
     content: Column<'a, Message>,
     p: Palette,
 ) -> Element<'a, Message> {
-    let mut header = column![text(title).font(SANS_SEMIBOLD).size(16).color(p.ink)].spacing(5);
+    let mut header = column![text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink)].spacing(5);
     if let Some(subtitle) = subtitle {
         header = header.push(
             text(subtitle)
                 .font(SANS_MEDIUM)
-                .size(13)
+                .size(BODY)
                 .line_height(1.4)
                 .color(p.muted),
         );
@@ -1512,10 +1512,7 @@ fn gate_card<'a>(
                 radius: RADIUS_LG.into(),
             },
             shadow: Shadow {
-                color: Color {
-                    a: 0.20,
-                    ..Color::from_rgb8(40, 38, 34)
-                },
+                color: Color { a: 0.20, ..p.shadow },
                 offset: Vector::new(0.0, 18.0),
                 blur_radius: 48.0,
             },
@@ -1535,7 +1532,7 @@ fn field<'a>(
         .on_input(on_input)
         .secure(secure)
         .padding([9, 11])
-        .size(12.5)
+        .size(BODY)
         .font(SANS_MEDIUM)
         .style(move |_, status| iced::widget::text_input::Style {
             background: Background::Color(p.sunken),
@@ -1599,7 +1596,7 @@ fn sem_secret<'a>(
 fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let enabled = message.is_some();
     let button = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12.5))
+        container(text(label).font(SANS_SEMIBOLD).size(BODY))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1634,7 +1631,7 @@ fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<
 
 fn secondary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let button = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1720,7 +1717,7 @@ fn tab(
 
 fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
     let link = button(
-        container(text(label).font(SANS_SEMIBOLD).size(11).color(p.muted))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL).color(p.muted))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1736,9 +1733,28 @@ fn link_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, 
 
 fn error_line<'a>(state: &'a State, p: Palette) -> Element<'a, Message> {
     match state.error.as_deref() {
-        Some(error) => text(error).font(MONO).size(11.5).color(p.red).into(),
+        Some(error) => selectable_error(error, p),
         None => Space::new().height(0).into(),
     }
+}
+
+/// Error text the user can select and copy. iced 0.14 `text` is not
+/// selectable; a read-only `text_input` (no `on_input`) stays focusable and
+/// supports select + copy while rendering like the inline error it replaces.
+fn selectable_error<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
+    text_input("", message)
+        .font(MONO)
+        .size(BODY)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.red,
+            placeholder: p.red,
+            value: p.red,
+            selection: theme::ACCENTS[0],
+        })
+        .into()
 }
 
 fn word_cell<'a>(index: usize, word: &'a str, p: Palette) -> Element<'a, Message> {
@@ -1746,10 +1762,10 @@ fn word_cell<'a>(index: usize, word: &'a str, p: Palette) -> Element<'a, Message
         row![
             text(index.to_string())
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(p.muted_2)
                 .width(16),
-            text(word).font(MONO).size(12).color(p.ink),
+            text(word).font(MONO).size(BODY).color(p.ink),
         ]
         .spacing(6)
         .align_y(Alignment::Center),
