@@ -6,6 +6,9 @@
 // In-process frame signing (dev-deps only → test builds only).
 mod signing;
 
+// The proof scenarios — chat round-trip + duplicate-channel rejection.
+mod chat;
+
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -19,9 +22,6 @@ use iced_winit::runtime::{Action, task};
 use super::*;
 use crate::backend::Backend;
 
-// The click/type/query surface (and the `id`/`sim` fields it reads) is what
-// Task 4's scenario tests are written against; until they land it reads as dead.
-#[allow(dead_code)]
 pub(super) struct SimShell {
     state: Shell,
     id: window::Id,
@@ -32,7 +32,6 @@ pub(super) struct SimShell {
     _identity_root: tempfile::TempDir,
 }
 
-#[allow(dead_code)]
 impl SimShell {
     /// Self-contained boot: embedded auto-mode sim + in-process signing.
     /// No external binaries, no skip path — failure is a test failure.
@@ -71,17 +70,6 @@ impl SimShell {
             let mut ui = iced_test::simulator(view::view(&self.state, self.id));
             ui.click(by::role(role, name.to_owned()))
                 .unwrap_or_else(|error| panic!("click {role:?} \"{name}\": {error:?}"));
-            ui.into_messages().collect()
-        };
-        self.dispatch(messages);
-    }
-
-    pub(super) fn click_and_type(&mut self, role: Role, name: &str, text: &str) {
-        let messages: Vec<Message> = {
-            let mut ui = iced_test::simulator(view::view(&self.state, self.id));
-            ui.click(by::role(role, name.to_owned()))
-                .unwrap_or_else(|error| panic!("focus {role:?} \"{name}\": {error:?}"));
-            let _ = ui.typewrite(text);
             ui.into_messages().collect()
         };
         self.dispatch(messages);
