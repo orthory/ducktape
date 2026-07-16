@@ -18,6 +18,7 @@
 //! the sim lane (`src/shell/sim/`, `cargo test -p ducktape-iced shell::sim`).
 
 mod chat;
+mod forge;
 mod harness;
 mod onboarding;
 mod settings;
