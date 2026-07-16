@@ -108,6 +108,29 @@ so the runner treats recipe `expect` as "eventually within 3 s"; in-process
 keeps single-shot asserts. Fleet instances are cattle — `run` re-boots the
 slot with each recipe's `preset`, so recipes never see each other's state.
 
+## Sim lane — transaction round-trips against an embedded node
+
+`app/src-iced/src/shell/sim/` (`cargo test -p ducktape-iced shell::sim`) — the
+iced twin of the TS `app/src/test/sim/` suites, foundry-style. `SimShell::boot()`
+EMBEDS a deterministic node via `simnode::boot`, points the app's real
+`NodeClient` at the in-process listener, and runs a task pump that executes
+`update()` Tasks on a private tokio runtime. Self-contained: no external
+binaries, no env vars. Deterministic: no timers, no subscriptions — timer
+refreshes are injected messages. `make ui-qa` runs it first.
+
+What belongs here: submit → commit → re-render flows, module rejections
+surfacing in UI state. What does NOT: anything needing a real window
+(`lane: fleet`), pure view variants (`src/test/`), recipe-provable navigation
+(`lane: both`).
+
+Harness surface is `boot/click/inject/has/sees_text/shell/node_query` — there is
+no `click_and_type`: simulated typewrite does not reach a `text_editor`, so
+composer text is injected as a `Paste` edit. Message BODIES render as
+`rich_text`, which exposes no operation/text hook, so `sees_text` can never
+match a body — assert the body via the render model
+(`shell().user_screens.chat.data`) and confirm the row materialized with a
+`sees_text` on its plain-text author label.
+
 ## Headless bring-up (Linux)
 
 ```bash

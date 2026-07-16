@@ -429,6 +429,7 @@ clean:
 ## Recipe-backed UI QA: the in-process lane (cargo test, no display), then the
 ## fleet lane (2 live headless instances run every recipe over the bridge).
 ui-qa:
+	CARGO_INCREMENTAL=0 $(CARGO) test -p ducktape-iced shell::sim
 	CARGO_INCREMENTAL=0 $(CARGO) test -p ducktape-iced qa_recipes
 	$(CARGO) build -p ducktape-iced --bin ducktape-iced
 	ops/iced-fleet up 2 --preset ui-demo
