@@ -34,8 +34,8 @@ make app   # release package in target/release/bundle (agent bridge compiled out
 
 | Piece | Where |
 |---|---|
-| Fork seams (AccessKit adapter, tree push, event injection) | `third_party/iced-winit` (`[patch.crates-io]`), feature `agent`, marked `// AGENT SEAM` |
-| Semantic layer + bridge + tools | `app/iced-agent-plugin` (`sem()` tags, Operation collector, loopback JSON-lines server) |
+| Fork seams (AccessKit adapter, tree push, event injection) | `third_party/iced-agent-browser/iced-winit` (submodule, `[patch.crates-io]`), feature `agent`, marked `// AGENT SEAM` |
+| Semantic layer + bridge + tools | `third_party/iced-agent-browser/plugin` (`sem()` tags, Operation collector, loopback JSON-lines server) |
 | App wiring (150 ms snapshot loop, intents, a11y-action routing) | `app/src-iced/src/shell/agent_wire.rs` |
 | CLI | `ops/iced-agent <cmd>` (bun shim) |
 | MCP | `.mcp.json` server `iced-agent`, tools `iced_*` |

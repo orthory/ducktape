@@ -1,0 +1,3 @@
+[submodule "third_party/iced-agent-browser"]
+	path = third_party/iced-agent-browser
+	url = https://github.com/byeongsu-hong/iced-agent-browser

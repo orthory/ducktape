@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec bun "$repo_root/app/iced-agent-plugin/bin/iced-agent.ts" "$@"
+exec bun "$repo_root/third_party/iced-agent-browser/plugin/bin/iced-agent.ts" "$@"
