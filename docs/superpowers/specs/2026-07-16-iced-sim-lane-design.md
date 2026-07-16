@@ -39,9 +39,12 @@ Approaches rejected:
 
 ## Components
 
-New module `app/src-iced/src/test/sim/` (in-crate `#[cfg(test)]`, same pattern
-as the #646 screen tests). Per-surface test files with short names, mirroring
-the TS `app/src/test/sim/` layout.
+New module `app/src-iced/src/shell/sim/`, gated
+`#[cfg(all(feature = "agent", debug_assertions, test))]` exactly like
+`shell/qa.rs`. It must be a `shell` child (not `src/test/`): `Shell`,
+`Message`, and `update` are module-private to `shell`, which is why `qa.rs`
+and `preset.rs` live there too. Per-surface test files with short names,
+mirroring the TS `app/src/test/sim/` layout.
 
 ### `SimNode` — spawn/control (~100 lines)
 
@@ -55,12 +58,29 @@ branches converge):
   waits on `/v1/status`. `Drop` kills its own verified child — never `pkill`.
 - **Vacuous-gate guard:** a missing binary skips loudly (eprintln naming the
   suite and the build command) and the existing `ui-qa` Make target gains a
-  `cargo build -p simnode` step before the test run. A silent skip must never
-  read as green.
+  `cargo build -p simnode -p node-bin` step before the test run, plus
+  `DUCKTAPE_SIM_REQUIRE=1` so a skip there is a hard failure. A silent skip
+  must never read as green.
+
+### Identity fixture — chat writes are signed frames
+
+Chat writes do NOT use `NodeClient::submit(target, payload, origin)`; they go
+through the account-signed frame lane: `submit_signed` →
+`backend.sign_content_frame(...)` → `NodeClient::submit_frame` (POST
+`v1/submit/frame`), and `submit_signed` early-returns when `Shell.backend` is
+`None`. Signing shells out to the `user-sign-frame` verb of the
+**`ducktape-node` binary** (package `node-bin`), resolved via
+`DUCKTAPE_NODE_BIN` (the sibling-of-exe fallback does not work under `cargo
+test`, so the harness sets the env var once, from the same
+`target/{debug,release}` resolution as simnode). The fixture per test:
+`Backend::at_root(tempdir)` + `create_identity(PASSWORD)` — `create_identity`
+caches the password, so signing works immediately; all tests share one
+constant password because the cache is process-global.
 
 ### `SimShell` — the app-loop harness
 
-- Boot: `preset::ui_demo()` + `replace_node_client(NodeClient::new(sim_base))`.
+- Boot: `preset::ui_demo()` + `NodeClient::local(sim_port)` into
+  `Shell.node_client` + the identity fixture (below) into `Shell.backend`.
   No new preset; the fixture stays pure.
 - `act(...)` — Simulator interaction via `by::role` (the existing selector
   authority), feeds resulting messages through `update()`, then pumps.
@@ -96,7 +116,8 @@ assert the view/state renders it.
    no state.
 
 Gates: `cargo clippy -p ducktape-iced --tests --no-deps`; the new suite runs
-under `cargo test -p ducktape-iced` (with simnode prebuilt by the Make target).
+under `cargo test -p ducktape-iced` (with `simnode` and `node-bin` prebuilt by
+the Make target).
 
 ## Cut on purpose
 
