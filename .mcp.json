@@ -1,3 +1,8 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "iced-agent": {
+      "command": "bun",
+      "args": ["app/iced-agent-plugin/bin/iced-agent-mcp.ts"]
+    }
+  }
 }
