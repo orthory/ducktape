@@ -2790,6 +2790,9 @@ fn refresh_search_members(state: &mut Shell) {
 }
 
 fn execute_agents(state: &Shell, command: agents_screen::Command) -> Task<Message> {
+    if let agents_screen::Command::CopyText(value) = command {
+        return iced::clipboard::write(value).map(|()| Message::ClipboardWritten);
+    }
     Task::perform(
         forge_agents_service::execute_agents(
             state.backend.clone(),

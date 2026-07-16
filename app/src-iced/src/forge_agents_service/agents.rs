@@ -103,6 +103,9 @@ pub async fn execute_agents(
         Command::ReassignRun { run_id, attempt } => ServiceEvent::WriteFinished(
             reassign_run(backend.as_ref(), node.as_ref(), run_id, attempt).await,
         ),
+        // Copy-to-clipboard is a shell-side runtime action (`execute_agents`
+        // intercepts it before the service runs); the service never sees it.
+        Command::CopyText(_) => ServiceEvent::WriteFinished(Ok(())),
     }
 }
 

@@ -144,6 +144,17 @@ fn append_run_log(log: &mut RunLog, entry: RunLogEntry) {
     log.entries.push(entry);
 }
 
+/// Flatten the rendered log into copyable plain text — one line per visible
+/// row, matching what the pane shows. The operator's whole reason to open the
+/// pane is to lift a command, stack trace, or error line out of it.
+pub(super) fn flatten_for_copy(log: &RunLog) -> String {
+    semantic_log_rows(&log.entries)
+        .iter()
+        .map(|row| row.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) fn semantic_log_rows(entries: &[RunLogEntry]) -> Vec<SemanticLogRow> {
     let mut rows = Vec::new();
     let mut started = BTreeMap::<String, usize>::new();
