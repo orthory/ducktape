@@ -147,12 +147,14 @@ pub(super) fn view(state: &NodeState, p: Palette) -> Element<'_, Message> {
             "Loading node",
             "Reading committed node state…",
             Icon::Node,
+            None,
             p,
         ),
         Resource::Empty => center_state(
-            "No node state",
-            "Connect a workspace or remote node.",
+            "No node connected",
+            "Connect a workspace or remote node, then reload.",
             Icon::Node,
+            Some(Screen::Node),
             p,
         ),
         Resource::Error(error) => {

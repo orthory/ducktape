@@ -959,7 +959,7 @@ fn header(state: &State, data: &GovernanceData, p: Palette) -> Element<'static, 
     )
     .height(56)
     .padding([0, 22])
-    .center_y(Length::Fill)
+    .align_y(Alignment::Center)
     .style(move |_| ruled_surface(p.paper, p.border_soft))
     .into()
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use iced::widget::{Space, button, container, mouse_area, scrollable, text};
 use iced::{
@@ -186,6 +186,7 @@ enum Message {
     Section(Section),
     ToggleTheme,
     ToggleSearch,
+    CloseOverlays,
     Search(search::Message),
     Onboarding(onboarding::Message),
     UserView(module_host::Message),
@@ -977,10 +978,27 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
             state.settings.mode = state.mode;
             return execute_settings(state, settings_screen::Command::SetTheme(state.mode));
         }
+        Message::CloseOverlays => {
+            if state.search.open {
+                let _ = search::update(&mut state.search, search::Message::Close);
+                return sync_browser_visibility(state);
+            }
+            if state.notifications.open {
+                state.notifications.close();
+                return Task::none();
+            }
+            if state.workspace_overlay {
+                state.workspace_overlay = false;
+                return sync_browser_visibility(state);
+            }
+        }
         Message::ToggleSearch => {
             if state.search.open {
                 let _ = search::update(&mut state.search, search::Message::Close);
                 return sync_browser_visibility(state);
+            }
+            if !state.onboarding.is_ready() || state.workspace_overlay {
+                return Task::none();
             }
             hide_browser(state);
             let catalog = search_catalog(state);
@@ -1337,7 +1355,7 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
 
 fn subscription(state: &Shell) -> Subscription<Message> {
     if state.quit_exit_ready {
-        return iced::time::every(std::time::Duration::from_millis(10)).map(|_| Message::ExitReady);
+        return iced::time::every(Duration::from_millis(10)).map(|_| Message::ExitReady);
     }
     let mut subscriptions = vec![
         window::events().map(|(id, event)| Message::WindowEvent(id, event)),
@@ -1345,33 +1363,33 @@ fn subscription(state: &Shell) -> Subscription<Message> {
     ];
     #[cfg(all(feature = "agent", debug_assertions))]
     subscriptions.push(
-        iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::AgentTick),
+        iced::time::every(Duration::from_millis(150)).map(|_| Message::AgentTick),
     );
     if state.screen() == Screen::Metrics && !state.operator.metrics.paused {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::MetricsTick),
+            iced::time::every(Duration::from_secs(2)).map(|_| Message::MetricsTick),
         );
     }
     if user_screens::account_polling(&state.user_screens) {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_millis(1_200))
+            iced::time::every(Duration::from_millis(1_200))
                 .map(|_| Message::UserScreen(user_screens::Message::AccountTick)),
         );
     }
     if state.huddle.is_active() {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_millis(33))
+            iced::time::every(Duration::from_millis(33))
                 .map(|_| Message::Huddle(huddle_ui::Message::Tick)),
         );
     }
     if state.terminal.is_some() || state.terminal_closing.is_some() {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::TerminalTick),
+            iced::time::every(Duration::from_millis(16)).map(|_| Message::TerminalTick),
         );
     }
     if state.page_presence.is_some() {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_millis(250))
+            iced::time::every(Duration::from_millis(250))
                 .map(|_| Message::PagePresenceTick),
         );
     }
@@ -1392,20 +1410,20 @@ fn subscription(state: &Shell) -> Subscription<Message> {
     }
     match state.screen() {
         Screen::Members => subscriptions.push(
-            iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::CommunityTick),
+            iced::time::every(Duration::from_secs(5)).map(|_| Message::CommunityTick),
         ),
         Screen::Governance | Screen::Explorer => subscriptions.push(
-            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::CommunityTick),
+            iced::time::every(Duration::from_secs(2)).map(|_| Message::CommunityTick),
         ),
         _ => {}
     }
     #[cfg(target_os = "macos")]
     subscriptions
-        .push(iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::TrayTick));
+        .push(iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick));
     #[cfg(feature = "cef-browser")]
     if state.browser.is_some() {
         subscriptions.push(
-            iced::time::every(std::time::Duration::from_millis(8)).map(|_| Message::BrowserPump),
+            iced::time::every(Duration::from_millis(8)).map(|_| Message::BrowserPump),
         );
     }
     Subscription::batch(subscriptions)
@@ -1554,7 +1572,7 @@ fn poll_page_presence(state: &mut Shell) {
     }
     presence
         .peers
-        .retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(5));
+        .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(5));
     if let user_screens::Resource::Ready(data) = &mut state.user_screens.pages.data
         && let Some(document) = &mut data.document
         && document.id == presence.page
@@ -1654,7 +1672,7 @@ fn global_shortcut(
         iced::keyboard::Key::Named(Named::Enter) if modifiers.command() => {
             Some(Message::PageShortcut(PageShortcut::Activate))
         }
-        iced::keyboard::Key::Named(Named::Escape) => Some(Message::Search(search::Message::Close)),
+        iced::keyboard::Key::Named(Named::Escape) => Some(Message::CloseOverlays),
         _ => None,
     }
 }
@@ -1722,7 +1740,7 @@ fn quit(state: &mut Shell) -> Task<Message> {
                         joined: false,
                     },
                 );
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), leave).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
             }
         },
         |_| Message::QuitReady,
@@ -2315,7 +2333,7 @@ fn execute_user_screen(state: &mut Shell, command: user_screens::Command) -> Tas
         user_screens::Command::CommitPageAfter { block, generation } => {
             return Task::perform(
                 async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+                    tokio::time::sleep(Duration::from_millis(550)).await;
                     (block, generation)
                 },
                 |(block, generation)| {
@@ -2890,7 +2908,7 @@ fn execute_workspace(state: &mut Shell, command: workspace_screens::Command) -> 
         workspace_screens::Command::ClearCopiedAfter { millis } => {
             return Task::perform(
                 async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+                    tokio::time::sleep(Duration::from_millis(millis)).await;
                 },
                 |()| Message::Workspace(workspace_screens::Message::ClearCopied),
             );
@@ -2921,7 +2939,10 @@ fn execute_workspace(state: &mut Shell, command: workspace_screens::Command) -> 
             }
         },
         workspace_screens::Command::Dismiss => {
-            state.workspace_overlay = state.node_client.is_none();
+            // Dismiss always closes: trapping the user in the network picker
+            // when they have no node was an inescapable modal. The empty-state
+            // screens carry the "enter a network" path back.
+            state.workspace_overlay = false;
             return sync_browser_visibility(state);
         }
         workspace_screens::Command::ActivateWorkspace { .. } => {
@@ -3036,6 +3057,59 @@ mod tests {
             vec![Screen::Chat, Screen::Pages, Screen::Forge]
         );
         assert_eq!(shell.screen(), Screen::Forge);
+    }
+
+    #[test]
+    fn search_stays_closed_without_app_content() {
+        let mut shell = Shell::default();
+        drop(update(&mut shell, Message::ToggleSearch));
+        assert!(!shell.search.open);
+
+        shell.onboarding.stage = onboarding::Stage::Ready;
+        shell.workspace_overlay = true;
+        drop(update(&mut shell, Message::ToggleSearch));
+        assert!(!shell.search.open);
+
+        shell.workspace_overlay = false;
+        drop(update(&mut shell, Message::ToggleSearch));
+        assert!(shell.search.open);
+    }
+
+    #[test]
+    fn escape_closes_overlays_in_z_order() {
+        let mut shell = Shell::default();
+        shell.search.open = true;
+        shell.notifications.open = true;
+        shell.workspace_overlay = true;
+
+        drop(update(&mut shell, Message::CloseOverlays));
+        assert!(!shell.search.open && shell.notifications.open && shell.workspace_overlay);
+        drop(update(&mut shell, Message::CloseOverlays));
+        assert!(!shell.notifications.open && shell.workspace_overlay);
+        drop(update(&mut shell, Message::CloseOverlays));
+        assert!(!shell.workspace_overlay);
+    }
+
+    #[test]
+    fn escape_dismisses_the_network_overlay_even_without_a_node() {
+        // Regression: with no node client, Dismiss re-asserted the overlay, so
+        // Close/X/Escape could never leave the network picker (an inescapable
+        // modal). Escape must close it regardless of node state.
+        let mut shell = Shell::default();
+        shell.onboarding.stage = onboarding::Stage::Ready;
+        shell.workspace_overlay = true;
+        assert!(shell.node_client.is_none());
+
+        drop(update(&mut shell, Message::CloseOverlays));
+        assert!(!shell.workspace_overlay, "Escape must close the picker");
+
+        // And the Close button's Dismiss command is unconditional too.
+        shell.workspace_overlay = true;
+        drop(execute_workspace(
+            &mut shell,
+            workspace_screens::Command::Dismiss,
+        ));
+        assert!(!shell.workspace_overlay, "Close must dismiss the picker");
     }
 
     #[test]

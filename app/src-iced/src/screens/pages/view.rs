@@ -63,7 +63,7 @@ fn shell<'a>(
             .align_y(Alignment::Center)
         )
         .height(52)
-        .padding([0, 14])
+        .padding(0)
         .align_y(Alignment::Center)
         .style(move |_| bottom_border(p.sidebar, p.border_soft)),
         container(
@@ -119,7 +119,9 @@ fn shell<'a>(
     let rail = container(scrollable(rail))
         .width(PAGES_RAIL_WIDTH)
         .height(Length::Fill)
-        .style(move |_| panel(p.sidebar, p.border_soft));
+        // Square full-height side panel butted against the module rail / window edge.
+        // bottom_border == panel with radius 0, so reuse it rather than a rounded panel.
+        .style(move |_| bottom_border(p.sidebar, p.border_soft));
     let main = override_body
         .unwrap_or_else(|| data.map_or_else(|| no_page(p), |data| pages_main(state, data, p)));
     row![

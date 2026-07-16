@@ -1,10 +1,8 @@
 use iced::{Color, Font, Theme, font};
 
 pub const SANS: Font = Font::with_name("Geist");
-pub const SANS_MEDIUM: Font = Font {
-    weight: font::Weight::Medium,
-    ..SANS
-};
+// ponytail: Geist weight-500 falls back to serif in the cosmic-text render path; alias to Regular. Restore Weight::Medium once 500 resolves.
+pub const SANS_MEDIUM: Font = SANS;
 pub const SANS_SEMIBOLD: Font = Font {
     weight: font::Weight::Semibold,
     ..SANS
@@ -82,9 +80,9 @@ pub const LIGHT: Palette = Palette {
     ink: rgb(0x2c, 0x2b, 0x27),
     ink_soft: rgb(0x3f, 0x3e, 0x39),
     ink_softer: rgb(0x4a, 0x48, 0x43),
-    muted: rgb(0x87, 0x87, 0x87),
-    muted_2: rgb(0xa1, 0xa1, 0xa1),
-    muted_3: rgb(0x67, 0x67, 0x67),
+    muted: rgb(0x60, 0x60, 0x60),
+    muted_2: rgb(0x64, 0x64, 0x64),
+    muted_3: rgb(0x5c, 0x5c, 0x5c),
     icon_idle: rgb(0xc5, 0xc5, 0xc5),
     paper: rgb(0xff, 0xff, 0xff),
     canvas: rgb(0xfc, 0xfc, 0xfc),
@@ -114,8 +112,8 @@ pub const DARK: Palette = Palette {
     ink: rgb(0xec, 0xea, 0xe4),
     ink_soft: rgb(0xd4, 0xd2, 0xcb),
     ink_softer: rgb(0xbf, 0xbd, 0xb5),
-    muted: rgb(0x91, 0x8f, 0x88),
-    muted_2: rgb(0x72, 0x6f, 0x69),
+    muted: rgb(0x9f, 0x9c, 0x95),
+    muted_2: rgb(0x9c, 0x99, 0x92),
     muted_3: rgb(0xa7, 0xa4, 0x9d),
     icon_idle: rgb(0x5b, 0x59, 0x52),
     paper: rgb(0x1b, 0x1a, 0x17),
@@ -188,5 +186,54 @@ mod tests {
         assert_eq!(LIGHT.titlebar, rgb(0xf1, 0xf1, 0xf1));
         assert_eq!(DARK.titlebar, rgb(0x24, 0x23, 0x1f));
         assert_eq!(ACCENTS[0], rgb(0xa0, 0x5a, 0x3c));
+    }
+
+    #[test]
+    fn small_muted_text_meets_contrast_on_app_surfaces() {
+        fn luminance(color: Color) -> f32 {
+            let linear = |channel: f32| {
+                if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+        }
+        fn contrast(a: Color, b: Color) -> f32 {
+            let (light, dark) = if luminance(a) > luminance(b) {
+                (luminance(a), luminance(b))
+            } else {
+                (luminance(b), luminance(a))
+            };
+            (light + 0.05) / (dark + 0.05)
+        }
+
+        for palette in [LIGHT, DARK] {
+            for foreground in [palette.muted, palette.muted_2, palette.muted_3] {
+                for background in [
+                    palette.paper,
+                    palette.canvas,
+                    palette.sidebar,
+                    palette.titlebar,
+                    palette.hover,
+                    palette.sunken,
+                    palette.panel,
+                    palette.chip,
+                    palette.border_soft,
+                ] {
+                    assert!(contrast(foreground, background) >= 4.5);
+                }
+            }
+        }
+        let terminal_overlay = Color {
+            r: DARK.canvas.r * 0.94,
+            g: DARK.canvas.g * 0.94,
+            b: DARK.canvas.b * 0.94,
+            a: 1.0,
+        };
+        for foreground in [DARK.muted_2, DARK.amber, DARK.danger] {
+            assert!(contrast(foreground, terminal_overlay) >= 4.5);
+        }
     }
 }

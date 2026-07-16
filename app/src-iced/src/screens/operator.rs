@@ -256,9 +256,11 @@ fn resource_screen<'a, T>(
 ) -> Element<'a, Message> {
     match resource {
         Resource::Loading => {
-            center_state(&format!("Loading {title}"), "Reading node state…", icon, p)
+            center_state(&format!("Loading {title}"), "Reading node state…", icon, None, p)
         }
-        Resource::Empty => center_state(title, empty, icon, p),
+        // Empty is a resolved state, not a spinner: carry a Reload CTA so it is
+        // visually and interactively distinct from Loading (which passes None).
+        Resource::Empty => center_state(title, empty, icon, Some(screen), p),
         Resource::Error(error) => {
             error_state(&format!("{title} unavailable"), error, screen, icon, p)
         }
@@ -266,25 +268,33 @@ fn resource_screen<'a, T>(
     }
 }
 
-fn center_state<'a>(title: &str, detail: &str, icon: Icon, p: Palette) -> Element<'a, Message> {
-    container(
-        column![
-            icon_tile(icon, 42.0, p),
-            text(title.to_string()).font(SANS).size(14).color(p.muted_3),
-            text(detail.to_string())
-                .font(SANS)
-                .size(11.5)
-                .color(p.muted_2)
-        ]
-        .spacing(9)
-        .align_x(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .align_x(Alignment::Center)
-    .align_y(Alignment::Center)
-    .padding(24)
-    .into()
+fn center_state<'a>(
+    title: &str,
+    detail: &str,
+    icon: Icon,
+    retry: Option<Screen>,
+    p: Palette,
+) -> Element<'a, Message> {
+    let mut body = column![
+        icon_tile(icon, 42.0, p),
+        text(title.to_string()).font(SANS).size(14).color(p.muted_3),
+        text(detail.to_string())
+            .font(SANS)
+            .size(11.5)
+            .color(p.muted_2)
+    ]
+    .spacing(9)
+    .align_x(Alignment::Center);
+    if let Some(screen) = retry {
+        body = body.push(outline_button("Reload", Message::Load(screen), true, p));
+    }
+    container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .padding(24)
+        .into()
 }
 
 fn error_state<'a>(

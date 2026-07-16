@@ -630,7 +630,7 @@ fn header(data: &MembersData, p: Palette) -> Element<'static, Message> {
     )
     .height(56)
     .padding([0, 22])
-    .center_y(Length::Fill)
+    .align_y(Alignment::Center)
     .style(move |_| ruled_surface(p.paper, p.border_soft))
     .into()
 }
@@ -1194,7 +1194,7 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
     )
     .height(56)
     .padding([0, 16])
-    .center_y(Length::Fill)
+    .align_y(Alignment::Center)
     .style(move |_| ruled_surface(p.sidebar, p.border_soft));
     let mut status = row![pill(
         if member.tier == Tier::Resident {
