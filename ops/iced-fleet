@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Headless fleet for the native iced shell: N isolated app instances driven
+# through the agent bridge, for recipe-backed UI QA (see
+# docs/superpowers/specs/2026-07-16-iced-recipe-qa-design.md).
+#
+#   ops/iced-fleet up 2 --preset ui-demo   # boot 2 headless instances
+#   ops/iced-fleet status
+#   ops/iced-fleet run qa/recipes/*.json   # fan recipes across instances
+#   ops/iced-fleet down                    # verified-pidfile teardown
+#
+# Teardown discipline: pids are recorded at spawn and verified against
+# /proc/<pid>/exe before any signal — never pkill by pattern.
+#
+# Instances are cattle: `run` re-boots the slot with each recipe's declared
+# preset, so every recipe starts from exactly the state it assumes.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE="${ICED_FLEET_HOME:-$HOME/.cache/iced-fleet}"
+BIN="$ROOT/target/debug/ducktape-iced"
+NODE_BIN="$ROOT/target/debug/ducktape-node"
+BASE_DISPLAY=80   # instance i uses DISPLAY=:8i — clear of the :99 dev display
+
+die() { echo "iced-fleet: $*" >&2; exit 1; }
+
+instance_ids() { ls "$STATE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n; }
+
+verified_kill() { # verified_kill <pid> <expected-exe-substring>
+  local pid="$1" want="$2" exe
+  [ -d "/proc/$pid" ] || return 0
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  case "$exe" in
+    *"$want"*) kill "$pid" 2>/dev/null || true ;;
+    *) echo "iced-fleet: pid $pid is not $want (exe=$exe); leaving it alone" >&2 ;;
+  esac
+}
+
+up_one() { # up_one <id> <preset>
+  local id="$1" preset="$2" dir="$STATE/$id" display=":$((BASE_DISPLAY + id))"
+  local endpoint="$dir/run/iced-agent/com.ducktape.app/endpoint.json"
+  if [ -f "$endpoint" ]; then
+    echo "instance $id: already up"
+    return 0
+  fi
+  mkdir -p "$dir/home" "$dir/run"
+  chmod 700 "$dir/run"
+
+  Xvfb "$display" -screen 0 1400x900x24 -nolisten tcp >"$dir/xvfb.log" 2>&1 &
+  echo $! > "$dir/xvfb.pid"
+
+  # dbus-run-session owns the app; killing the session group tears both down.
+  DISPLAY="$display" HOME="$dir/home" XDG_RUNTIME_DIR="$dir/run" \
+  DUCKTAPE_NODE_BIN="$NODE_BIN" DUCKTAPE_PRESET="$preset" \
+  RUST_LOG="${RUST_LOG:-ducktape=info,ducktape_iced=info}" \
+    setsid dbus-run-session -- "$BIN" >"$dir/app.log" 2>&1 &
+  echo $! > "$dir/session.pid"
+
+  local waited=0
+  until [ -f "$endpoint" ]; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$waited" -ge 60 ]; then
+      echo "instance $id: endpoint never appeared; log tail:" >&2
+      tail -5 "$dir/app.log" >&2 || true
+      return 1
+    fi
+    if ! kill -0 "$(cat "$dir/session.pid")" 2>/dev/null; then
+      echo "instance $id: app exited during boot; log tail:" >&2
+      tail -5 "$dir/app.log" >&2 || true
+      return 1
+    fi
+  done
+  echo "instance $id: up (display $display, port $(python3 -c "import json;print(json.load(open('$endpoint'))['port'])" 2>/dev/null || echo '?'))"
+}
+
+down_one() { # down_one <id>
+  local id="$1" dir="$STATE/$id"
+  [ -d "$dir" ] || return 0
+  if [ -f "$dir/session.pid" ]; then
+    local sid
+    sid="$(cat "$dir/session.pid")"
+    if [ -d "/proc/$sid" ]; then
+      local exe
+      exe="$(readlink "/proc/$sid/exe" 2>/dev/null || true)"
+      case "$exe" in
+        *dbus*) kill -- "-$sid" 2>/dev/null || kill "$sid" 2>/dev/null || true ;;
+        *) echo "iced-fleet: session pid $sid is not dbus-run-session (exe=$exe); skipping" >&2 ;;
+      esac
+    fi
+  fi
+  [ -f "$dir/xvfb.pid" ] && verified_kill "$(cat "$dir/xvfb.pid")" "Xvfb"
+  sleep 1
+  rm -rf "$dir"
+}
+
+run_slot() { # run_slot <slot-index> <slot-count> <tmp> <recipes...>
+  local slot="$1" n="$2" tmp="$3"
+  shift 3
+  local recipes=("$@")
+  local id="${SLOT_IDS[$slot]}" fail=0 i="$slot"
+  while [ "$i" -lt "${#recipes[@]}" ]; do
+    local recipe="${recipes[$i]}"
+    local preset
+    preset=$(python3 -c "import json;print(json.load(open('$recipe')).get('preset') or 'ui-demo')" 2>/dev/null || echo ui-demo)
+    if {
+      down_one "$id"
+      up_one "$id" "$preset"
+      XDG_RUNTIME_DIR="$STATE/$id/run" "$ROOT/ops/iced-agent" run "$recipe"
+    } >"$tmp/$(basename "$recipe").log" 2>&1; then
+      echo "PASS  $recipe  (slot $id, preset $preset)" >> "$tmp/results"
+    else
+      fail=1
+      echo "FAIL  $recipe  (slot $id, preset $preset)" >> "$tmp/results"
+    fi
+    i=$((i + n))
+  done
+  return "$fail"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  up)
+    count="${1:-1}"; shift || true
+    preset="ui-demo"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --preset) preset="$2"; shift 2 ;;
+        *) die "unknown up flag: $1" ;;
+      esac
+    done
+    [ -x "$BIN" ] || die "no debug binary at $BIN (cargo build -p ducktape-iced first)"
+    mkdir -p "$STATE"
+    fail=0
+    for id in $(seq 1 "$count"); do up_one "$id" "$preset" || fail=1; done
+    exit "$fail"
+    ;;
+  down)
+    if [ $# -gt 0 ]; then for id in "$@"; do down_one "$id"; echo "instance $id: down"; done
+    else for id in $(instance_ids); do down_one "$id"; echo "instance $id: down"; done; fi
+    ;;
+  status)
+    for id in $(instance_ids); do
+      dir="$STATE/$id"
+      ep="$dir/run/iced-agent/com.ducktape.app/endpoint.json"
+      alive=down
+      [ -f "$dir/session.pid" ] && kill -0 "$(cat "$dir/session.pid")" 2>/dev/null && alive=up
+      port="-"
+      [ -f "$ep" ] && port=$(python3 -c "import json;print(json.load(open('$ep'))['port'])" 2>/dev/null || echo '?')
+      echo "$id  $alive  display=:$((BASE_DISPLAY + id))  port=$port"
+    done
+    ;;
+  run)
+    [ $# -gt 0 ] || die "run needs recipe files"
+    ids=$(instance_ids)
+    [ -n "$ids" ] || die "no instances up (ops/iced-fleet up N first)"
+    mapfile -t SLOT_IDS <<< "$ids"
+    n=${#SLOT_IDS[@]}
+    tmp="$(mktemp -d)"
+    slot_pids=()
+    for slot in $(seq 0 $((n - 1))); do
+      run_slot "$slot" "$n" "$tmp" "$@" &
+      slot_pids+=("$!")
+    done
+    fail=0
+    for pid in "${slot_pids[@]}"; do wait "$pid" || fail=1; done
+    sort "$tmp/results" 2>/dev/null || true
+    if [ "$fail" -ne 0 ]; then
+      for f in "$tmp"/*.log; do
+        grep -q "FAIL" "$f" 2>/dev/null && { echo "--- $(basename "$f" .log)"; tail -8 "$f" | sed 's/^/      /'; }
+      done
+    fi
+    rm -rf "$tmp"
+    exit "$fail"
+    ;;
+  *)
+    die "usage: iced-fleet up <n> [--preset <name>] | down [ids...] | status | run <recipes...>"
+    ;;
+esac

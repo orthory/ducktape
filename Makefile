@@ -38,7 +38,7 @@ ifeq ($(HOST_OS),Darwin)
 export MACOSX_DEPLOYMENT_TARGET ?= 14.0
 endif
 
-.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
+.PHONY: all dev ui-qa demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
 
 all: app
 
@@ -425,3 +425,11 @@ wasm-modules-check:
 clean:
 	$(CARGO) clean
 	rm -rf app/dist app/node_modules
+
+## Recipe-backed UI QA: the in-process lane (cargo test, no display), then the
+## fleet lane (2 live headless instances run every recipe over the bridge).
+ui-qa:
+	CARGO_INCREMENTAL=0 $(CARGO) test -p ducktape-iced qa_recipes
+	$(CARGO) build -p ducktape-iced --bin ducktape-iced
+	ops/iced-fleet up 2 --preset ui-demo
+	ops/iced-fleet run qa/recipes/*.json; status=$$?; ops/iced-fleet down; exit $$status

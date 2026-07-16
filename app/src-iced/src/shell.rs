@@ -48,6 +48,8 @@ use crate::workspace_service;
 pub(crate) mod agent_wire;
 #[cfg(all(feature = "agent", debug_assertions))]
 mod preset;
+#[cfg(all(feature = "agent", debug_assertions, test))]
+mod qa;
 mod browser_session;
 mod view;
 #[cfg(feature = "cef-browser")]
