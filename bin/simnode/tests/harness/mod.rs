@@ -239,7 +239,7 @@ impl Sim {
     }
 }
 
-fn try_request(
+pub fn try_request(
     port: u16,
     method: &str,
     path: &str,
